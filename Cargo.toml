@@ -174,7 +174,7 @@ zeroize     = { version = "=1.8.2", features = ["derive"] }
 argon2      = "=0.5.3"
 rand        = "=0.8.6"
 ed25519-dalek = { version = "=2.1.1", features = ["pkcs8", "rand_core", "pem", "zeroize"] }
-jsonwebtoken  = { version = "=9.3.1", default-features = false }
+jsonwebtoken  = { version = "=10.3.0", default-features = false }
 # PR-5 NOTE : jsonwebtoken 10.x nécessite feature rust_crypto (sha2 ^0.10.7) — incompatible
 # avec sha2 =0.11.0 déjà bumpé dans cette PR. Migration 9→10 reportée à PR-6/TOML ou PR-X dédié.
 pkcs8         = "=0.10.2"
