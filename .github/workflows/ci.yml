@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # lint — formatting + clippy
+  # ─────────────────────────────────────────────────────────────────────────
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain with rustfmt + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-lint-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # test — build + test suite
+  # ─────────────────────────────────────────────────────────────────────────
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install SQLite dev headers
+        run: sudo apt-get update -qq && sudo apt-get install -y libsqlite3-dev
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-test-${{ runner.os }}-
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: Install cargo-nextest
+        run: |
+          cargo install cargo-nextest --locked 2>/dev/null \
+            || cargo install cargo-nextest 2>/dev/null \
+            || true
+
+      - name: cargo test --workspace
+        run: |
+          if command -v cargo-nextest &>/dev/null || cargo nextest --version &>/dev/null 2>&1; then
+            cargo nextest run --workspace
+          else
+            cargo test --workspace
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # leak-scan — anti-leak detector (homelab/personal pattern guard)
+  # ─────────────────────────────────────────────────────────────────────────
+  leak-scan:
+    name: leak-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run leak detector
+        run: bash scripts/pre-commit-leak-scrub.sh

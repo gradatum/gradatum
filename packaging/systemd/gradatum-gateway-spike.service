@@ -1,0 +1,23 @@
+[Unit]
+Description=Gradatum gateway — spike engine routing (additif, non-LIVE)
+Documentation=https://gradatum.org
+After=network-online.target gradatum-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gradatum
+Group=gradatum
+Environment=GATEWAY_CONFIG_PATH=/etc/gradatum/gateway-spike.toml
+ExecStart=/opt/gradatum/bin/gradatum-gateway
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/gradatum/
+MemorySwapMax=0
+
+[Install]
+WantedBy=multi-user.target

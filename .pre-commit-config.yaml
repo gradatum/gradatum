@@ -1,0 +1,30 @@
+# Pre-commit hooks for Gradatum.
+# See https://pre-commit.com for installation instructions.
+#
+# Install:
+#   pip install pre-commit  # or: brew install pre-commit
+#   pre-commit install
+#
+# Run manually:
+#   pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      - id: leak-scrub
+        name: Detect homelab/personal patterns
+        entry: bash scripts/pre-commit-leak-scrub.sh --staged-only
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=500']

@@ -1,0 +1,456 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly at 04:00 UTC
+    - cron: "0 4 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # lint — formatting + clippy
+  # Trigger: PR + push main
+  # ─────────────────────────────────────────────────────────────────────────
+  lint:
+    name: lint
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install stable toolchain with rustfmt + clippy
+        run: |
+          rustup toolchain install stable --component rustfmt --component clippy --no-self-update
+          rustup default stable
+
+      - name: Cache cargo registry + build
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-lint-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # test — cargo nextest (stable)
+  # Trigger: PR + push main
+  # ─────────────────────────────────────────────────────────────────────────
+  test:
+    name: test
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    needs: lint
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Cache cargo registry + build
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-test-${{ runner.os }}-
+
+      - name: Install cargo-nextest
+        run: |
+          cargo install cargo-nextest --locked 2>/dev/null || true
+
+      - name: cargo nextest run --workspace
+        # --all-features exclut fastembed-cpu (ort-2.0.0-rc.9 build failure, T08 Concern Phase 1)
+        run: cargo nextest run --workspace
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # storage-features — OpenDAL backend feature gate matrix (C12)
+  # Validates each backend compiles in isolation + all-cloud combination.
+  # Trigger: PR + push main
+  # ─────────────────────────────────────────────────────────────────────────
+  storage-features:
+    name: storage-features (${{ matrix.features }})
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    needs: lint
+    strategy:
+      matrix:
+        features: ["fs", "s3", "gcs", "azure", "all-cloud"]
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Cache cargo registry + build
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-storage-${{ matrix.features }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-storage-${{ matrix.features }}-${{ runner.os }}-
+
+      - name: cargo build gradatum-storage --no-default-features --features ${{ matrix.features }}
+        run: cargo build -p gradatum-storage --no-default-features --features ${{ matrix.features }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # audit — cargo audit + cargo deny
+  # Trigger: PR + push main + nightly cron
+  # BLOCKING: fail-on-finding (C8 — no continue-on-error)
+  # ─────────────────────────────────────────────────────────────────────────
+  audit:
+    name: audit
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Cache cargo registry
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-audit-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-audit-${{ runner.os }}-
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked 2>/dev/null || true
+
+      - name: cargo deny check advisories
+        # BLOCKING — single source of truth via deny.toml ignore list (C8 security caveat)
+        # Replaces cargo audit --deny warnings: deny.toml ignore list documents exceptions with justification
+        run: cargo deny check advisories
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # deny — license + ban + source check
+  # Trigger: PR + push main + nightly cron
+  # BLOCKING: fail-on-finding (C8)
+  # ─────────────────────────────────────────────────────────────────────────
+  deny:
+    name: deny
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Cache cargo registry
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deny-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-deny-${{ runner.os }}-
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked 2>/dev/null || true
+
+      - name: cargo deny check
+        # BLOCKING — no continue-on-error (C8 security caveat)
+        run: cargo deny check
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # dead-deps — cargo machete (unused dependency detection)
+  # Trigger: PR + push main
+  # ─────────────────────────────────────────────────────────────────────────
+  dead-deps:
+    name: dead-deps
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    # Phase 0bis-bis : trigger uniquement schedule (nightly) car les crates stubs ont des deps
+    # pré-déclarées pour Phase 1+ que cargo-machete voit comme unused. `continue-on-error: true`
+    # ne suffit pas : Forgejo Actions agrège quand même le job failed en run failure.
+    # À ré-activer en `push` Phase 1 (suppression `if`) quand le code utilisera ses deps.
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Cache cargo registry
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-machete-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-machete-${{ runner.os }}-
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked 2>/dev/null || true
+
+      - name: cargo machete --with-metadata
+        # --with-metadata : analyse via Cargo.lock résolu (pas seulement Cargo.toml lexer)
+        # évite faux positifs sur stubs Phase 0bis-bis (deps pré-déclarées pour Phase 1+)
+        run: cargo machete --with-metadata
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # public-api — diff public API surface
+  # Trigger: PR only
+  # Behavior: informational on PR, blocking on push main
+  # Note: cargo public-api requires nightly for rustdoc JSON
+  # ─────────────────────────────────────────────────────────────────────────
+  public-api:
+    name: public-api
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install nightly toolchain (required for rustdoc JSON)
+        run: |
+          rustup toolchain install nightly --no-self-update
+          rustup default nightly
+
+      - name: Cache cargo registry
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-public-api-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-public-api-${{ runner.os }}-
+
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api --locked 2>/dev/null || true
+
+      - name: Diff public API (gradatum-core — informational)
+        # Informational on PR: continue-on-error allowed
+        # On push main this job is skipped entirely (if condition above)
+        continue-on-error: true
+        run: |
+          cargo public-api --diff-git-checkouts \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" \
+            -p gradatum-core
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # semver — semver compatibility check for gradatum-core
+  # Trigger: PR touching crates/gradatum-core/** only
+  # ─────────────────────────────────────────────────────────────────────────
+  semver:
+    name: semver
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Cache cargo registry
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-semver-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-semver-${{ runner.os }}-
+
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked 2>/dev/null || true
+
+      - name: Detect changes in gradatum-core
+        id: changes
+        run: |
+          CHANGED=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" \
+            | grep '^crates/gradatum-core/' | head -1)
+          echo "touched=${CHANGED}" >> "$GITHUB_OUTPUT"
+
+      - name: cargo semver-checks (gradatum-core)
+        if: steps.changes.outputs.touched != ''
+        run: cargo semver-checks check-release -p gradatum-core
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # coverage — llvm-cov (nightly cron only)
+  # Trigger: nightly cron only
+  # ─────────────────────────────────────────────────────────────────────────
+  coverage:
+    name: coverage
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install stable toolchain + llvm-tools
+        run: |
+          rustup toolchain install stable \
+            --component llvm-tools-preview \
+            --no-self-update
+          rustup default stable
+
+      - name: Cache cargo registry + build
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-cov-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-cov-${{ runner.os }}-
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked 2>/dev/null || true
+
+      - name: Generate LCOV coverage report
+        run: |
+          cargo llvm-cov --workspace \
+            --lcov \
+            --output-path coverage.lcov
+
+      - name: Upload coverage artifact
+        uses: https://code.forgejo.org/actions/upload-artifact@v3
+        with:
+          name: coverage-lcov-${{ github.sha }}
+          path: coverage.lcov
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # leak-detector — homelab/personal pattern detection
+  # Trigger: PR + push main
+  # BLOCKING: exit 1 on any match (no continue-on-error)
+  # Patterns kept in sync with scripts/pre-commit-leak-scrub.sh
+  # ─────────────────────────────────────────────────────────────────────────
+  leak-detector:
+    name: Leak detection (homelab patterns)
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - name: Scan for sensitive patterns
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Removed from pattern (legitimate public references):
+          #   vault-mem: OSS parity target name
+          #   obsidian-memory-vaults: predecessor project name (public)
+          # Homelab agent names added 2026-05-28 — anti-leak Pilier 1 extension.
+          # Excluded due to lexical conflicts: Bob (test fixture "Bob Martin"),
+          #   Backend/Frontend/Tester (common tech terms), Clouds/Pulse (general terms).
+          # Operator identity patterns added 2026-06-02 — anti-leak Art.11 v0.3.0 gate:
+          #   operator first name pattern (accented and non-accented variants)
+          #   operator username variant pattern
+          #   operator org handle pattern
+          #   Note: the former email-anchored username pattern is superseded by the broader username variant pattern above.
+          # Infrastructure patterns added 2026-06-03 — anti-leak Tier 2 extension:
+          #   IP ranges (private homelab: 192.168.x.x, 10.77.x.x)
+          #   inference host alias, hypervisor, NAS, monitoring, SSO, DNS resolver, hardware model names
+          #   pre-commit-leak-scrub.sh excluded: contains patterns for detection purposes
+          # Round 2 additions 2026-06-03 — close gate gap:
+          #   LXC[ -]?NNN: container ID in any case/separator form (LXC 500, LXC-500, lxc500)
+          #   Radeon: GPU model name specific to homelab hardware
+          # Round 3 additions 2026-06-03 — extend scan to .sql and .txt:
+          #   Gap revealed by historical rewrite: 0001_phase1.sql and curator-classifier-v1.txt were not scanned.
+          #   SYNC: --include list must match scripts/pre-commit-leak-scrub.sh exactly.
+          # OSS-flip 2026-06-05 — added ZeroClaw: internal agent runtime codename removed from RFC-0003/gen-stubs/tests.
+          # OSS-flip 2026-06-05 round 2 — added vault-mem/Monarch/nexus: internal system names scrubbed from HEAD.
+          #   vault-mem: predecessor Markdown vault system (now "legacy vault" in public docs)
+          #   Monarch: internal agent harness codename (now "external agent" in public docs)
+          #   nexus: internal knowledge base codename (now "example-app" in fixtures)
+          PATTERNS='\bst[ée]phane\b|\bmotreffs?\b|\bmymomot\b|\blxc-[0-9]{3,4}\b|\bLXC[ -]?[0-9]{2,4}\b|\bmaintainer-org\b|\bJarvis\b|\bBigBrother\b|\bHubMQ\b|\bkellnr(-proxy)?\b|\bforgejo\.lab\.|\bGMKTEC\b|\bKnox\b|\bAuditeur\b|\bLyra\b|\bSecurityAuditor\b|\bArchiviste\b|192\.168\.|10\.77\.|\bllmcore\b|\bProxmox\b|\bTrueNAS\b|\bWazuh\b|\bAuthentik\b|\bAdGuard\b|\bMinisForum\b|Evo X-2|\bRadeon\b|\bZeroClaw\b|vault-mem|\bMonarch\b|\bnexus\b'
+          if grep -rEn "$PATTERNS" \
+             --include="*.md" --include="*.rs" --include="*.toml" \
+             --include="*.yml" --include="*.yaml" --include="*.sh" \
+             --include="*.sql" --include="*.txt" \
+             --exclude-dir=target --exclude-dir=.git --exclude-dir=node_modules \
+             --exclude="ci.yml" --exclude="pre-commit-leak-scrub.sh" \
+             . ; then
+            echo "::error::Leak detected — see grep output above"
+            echo "If false positive (e.g., legitimate technical reference), update the pattern in .forgejo/workflows/ci.yml leak-detector job."
+            exit 1
+          fi
+          echo "✓ No homelab/personal leaks detected"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # sbom — CycloneDX SBOM generation
+  # Trigger: nightly cron + tag v*
+  # ─────────────────────────────────────────────────────────────────────────
+  sbom:
+    name: sbom
+    runs-on: [self-hosted, linux, x64, gradatum-ci]
+    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Cache cargo registry
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-sbom-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-sbom-${{ runner.os }}-
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked 2>/dev/null || true
+
+      - name: Generate SBOM (CycloneDX JSON)
+        run: cargo cyclonedx --format json --output-cdx
+
+      - name: Upload SBOM artifact
+        uses: https://code.forgejo.org/actions/upload-artifact@v3
+        with:
+          name: sbom-${{ github.sha }}
+          path: "**/*.cdx.json"
+          retention-days: 90

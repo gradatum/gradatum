@@ -1,0 +1,19 @@
+[package]
+name = "gradatum-cli"
+version = "0.0.1"
+edition = "2021"
+authors = ["Gradatum Maintainers <maintainer@gradatum.org>"]
+license = "Apache-2.0"
+description = "End-user CLI — write/read/search via gradatum-server HTTP API"
+repository = "https://github.com/gradatum/gradatum"
+homepage = "https://gradatum.org"
+readme = "README.md"
+keywords = ["memory", "agents", "knowledge-base", "cli", "server"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "gradatum-cli"
+path = "src/main.rs"
+
+# Déclare explicitement que ce mini-crate n'appartient pas au workspace parent.
+[workspace]

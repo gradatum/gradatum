@@ -1,0 +1,17 @@
+[package]
+name = "gradatum"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Umbrella SDK facade — re-exports curated subsets of focused crates via Cargo features"
+
+[features]
+client = ["dep:gradatum-sdk-rs"]
+core = ["dep:gradatum-core"]
+
+[dependencies]
+gradatum-sdk-rs = { workspace = true, optional = true }
+gradatum-core = { workspace = true, optional = true }

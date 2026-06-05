@@ -1,0 +1,32 @@
+[Unit]
+Description=Gradatum engine — instance %i
+Documentation=https://gradatum.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gradatum
+Group=gradatum
+EnvironmentFile=/etc/gradatum/engine-secrets.env
+ExecStart=/opt/gradatum/bin/gradatum-engine /etc/gradatum/conf.d/70-engine-%i.toml
+Restart=on-failure
+RestartSec=10s
+# SP-P0-1 : KillMode=control-group assure que llama-server (enfant dans le cgroup du service)
+# est tué au stop/restart de l'unité, y compris en cas de crash dur du superviseur (panic=abort,
+# OOM-kill, SIGSEGV) où kill_on_drop ne s'exécute pas.
+# Delegate=yes garantit que le cgroup est propre AVANT re-ExecStart (pas de double chargement
+# modèle GPU pendant la fenêtre de restart).
+KillMode=control-group
+Delegate=yes
+LimitNOFILE=65536
+OOMScoreAdjust=100
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/gradatum/
+MemorySwapMax=0
+NotifyAccess=main
+
+[Install]
+WantedBy=multi-user.target

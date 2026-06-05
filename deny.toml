@@ -1,0 +1,178 @@
+# cargo-deny configuration — Gradatum monorepo
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Policy:
+#   - Vulnerabilities and unsound code: DENY
+#   - Unmaintained crates: WARN (monitored, not blocking)
+#   - Licenses: allow-list only (Apache-2.0 compatible stack)
+#   - Sources: crates.io only, no unknown registries or git deps
+#   - Banned crates: gradatum-llm / gradatum-acl (deleted in W1), *-sys without explicit allow
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [advisories] — RustSec advisory database
+# ─────────────────────────────────────────────────────────────────────────────
+[advisories]
+# cargo-deny 0.19+ syntax (post-migration 2026-05-03 — ci.yml fix débloqué)
+# - Vulnerabilities: DENY by default (no field needed)
+# - Yanked versions: DENY by default (no field needed)
+# - Unsound code: handled via RUSTSEC advisories (DENY by default)
+# - Notice-level: removed in v2
+# Unmaintained crates: scope filter — "all" = workspace + transitive (strict)
+unmaintained = "all"
+
+# Ignored advisory IDs (RUSTSEC-YYYY-NNNN format)
+# RUSTSEC-2024-0436 — `paste` crate (proc-macro): unsound use of transmute on non-repr(C) types.
+#   Transitive dep: paste → tokenizers 0.21.4 → fastembed 4.6.0 → gradatum-embed.
+#   fastembed-cpu feature is OFF by default (feature gate, not compiled in default build).
+#   No fix available upstream as of 2026-05-05. Impact: none in default build (CPU embedder gated).
+#   Revisit when fastembed upgrades tokenizers or tokenizers drops paste.
+# RUSTSEC-2025-0141 — `bincode` v2 unmaintained (team ceased development permanently).
+#   Transitive dep: bincode 2.0.1 → gradatum-queue + gradatum-server.
+#   No security vulnerability — unmaintained classification only. API stable, no known issues.
+#   Migration to alternative (postcard/bitcode/rkyv) deferred to Phase 2.1+ when data format
+#   is stabilised. Tracked as debt in CHANGELOG deny.toml migrate-bincode Phase 2.1+.
+ignore = [
+    # RUSTSEC-2024-0436 (paste) — supprimé de l'arbre de dépendances post-bump reqwest 0.13
+    # (paste n'est plus tiré transitivement depuis fastembed 4.6.0 avec default-features=false).
+    # Entrée conservée en commentaire pour traçabilité — PR-3 HTTP stack bump.
+    { id = "RUSTSEC-2025-0141", reason = "bincode v2 unmaintained (no security issue) — migration to alternative deferred Phase 2.1+ after data format stabilisation" },
+    # RUSTSEC-2025-0068 — serde_yml 0.0.12 unsound (emitter segfault).
+    # Introduit par PR-1 (serde_yaml → serde_yml drop-in, commit 32eb2c9).
+    # Usage : lecture YAML uniquement via Deserializer — le Serializer/emitter non-sûr n'est pas activé.
+    # Pas de fix upstream disponible (dépôt archivé). Migration serde-yaml-ng prévue PR-5+ si stable.
+    { id = "RUSTSEC-2025-0068", reason = "serde_yml 0.0.12 : seul le Deserializer est utilisé (lecture config YAML) — Serializer/emitter non sûr non activé. Dépôt archivé, migration planifiée PR-5+ supply chain hardening." },
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [licenses] — SPDX license allow-list
+# Justifications per identifier:
+#   Apache-2.0           — Gradatum's own license; all direct deps must be compatible
+#   MIT                  — permissive, compatible with Apache-2.0
+#   Apache-2.0 WITH LLVM-exception
+#                        — used by compiler-builtins and LLVM artifacts bundled in Rust toolchain
+#   BSD-3-Clause         — permissive, compatible; used by several foundational crates
+#   Unicode-DFS-2016     — Unicode data tables embedded in chrono/regex/unicode-normalization
+#   Zlib                 — permissive, used by miniz_oxide (compression in rustls stack)
+#   ISC                  — OpenBSD-style permissive; used by ring crypto primitives
+#   0BSD                 — zero-clause BSD, maximally permissive; used by some proc-macro crates
+# ─────────────────────────────────────────────────────────────────────────────
+[licenses]
+# cargo-deny 0.19+ syntax (post-migration 2026-05-03 — PR #611)
+# - unlicensed: removed; crates without license = DENY by default
+# - deny list: removed; tout ce qui n'est pas dans allow = DENY implicite
+# Allow-list strict (Apache-2.0 compatible stack)
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+    "ISC",
+    "0BSD",
+]
+
+# Minimum confidence for license detection (SPDX heuristics)
+confidence-threshold = 0.8
+
+# Exceptions for dual-licensed crates that include a non-standard identifier
+exceptions = []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [bans] — forbidden and restricted crates
+# ─────────────────────────────────────────────────────────────────────────────
+[bans]
+# Deny multiple versions of the same crate (forces deduplication)
+# "warn" here to avoid false positives during Phase 0bis scaffolding;
+# escalate to "deny" once dep graph is stabilized in Phase 1.
+multiple-versions = "warn"
+
+# Wildcarded semver deps (e.g. version = "*")
+# "warn" en Phase 0bis-bis car les workspace internal deps utilisent souvent path = ".." sans version
+# Escalate to "deny" + allow-wildcard-paths = true Phase 1 si cargo-deny v2 supporte
+wildcards = "warn"
+
+# Highlight crates that are only in the build graph via deny-listed paths
+highlight = "all"
+
+# ── DAG enforcement note (Phase 1, spec §1.1, constraint C3) ──────────────
+#
+# Layered DAG: L0 (core) → L1 (markdown/storage/index/cache) →
+#              L2 (vault/queue/embed/chat) → L3 (search/curator/engine) →
+#              L4 (server/worker/admin/cli/sdk/mcp-stub)
+#
+# cargo-deny `deny + wrappers` is NOT the right tool for enforcing "crate A
+# must not depend on crate B": `wrappers` means "these crates are EXEMPT from
+# the ban" (inverse semantics). Real inverse-DAG enforcement requires a custom
+# CI step or cargo-deny `graph` checks (not yet in stable cargo-deny 0.19).
+#
+# DAG is therefore enforced at the source level:
+#   1. Each crate-level Cargo.toml only imports crates from lower layers.
+#   2. CI lint job validates this with a targeted grep per layer.
+#      (to be added in T15 / ci.yml update)
+#   3. `cargo tree --invert <crate>` surfaces violations manually.
+#
+# ── Deleted crates (must NOT reappear after W1 refactor) ──────────────────
+deny = [
+    # gradatum-llm was split into gradatum-chat + gradatum-embed (W1 / D7)
+    { name = "gradatum-llm", reason = "Deleted in Phase 0bis W1 — use gradatum-chat or gradatum-embed" },
+    # gradatum-acl was split into gradatum-acl-policy + gradatum-acl-auth (W1 / R13)
+    { name = "gradatum-acl", reason = "Deleted in Phase 0bis W1 — use gradatum-acl-policy or gradatum-acl-auth" },
+]
+
+# ── Apalis version pin enforcement (D-09 BLOQUANT — ARCH-D15) ────────────
+#
+# ARCH-D15 mandates exact version pins for the Apalis job queue stack.
+# Rationale: Apalis rc-series may introduce breaking storage schema changes
+# across rc versions. Any upgrade must be explicitly reviewed and approved.
+#
+# Version lock (pinned 2026-05-29) :
+#   apalis        = "=1.0.0-rc.9"   (latest stable rc as of 2026-05-29)
+#   apalis-sql    = "=1.0.0-rc.9"   (Diesel compat layer)
+#   apalis-sqlite = "=1.0.0-rc.8"   (rc.9 not published on crates.io)
+#   apalis-cron   = "=1.0.0-rc.8"   (rc.9 not published on crates.io)
+#
+# Enforcement mechanism:
+#   1. Workspace Cargo.toml uses exact `=version` pins — Cargo enforces single version.
+#   2. deny.toml lists these crates in `skip` to suppress spurious multiple-version
+#      warnings from transitive sub-deps within the apalis ecosystem itself.
+#   3. Any addition of apalis* without `=` pin fails CI (wildcards = "warn" escalating
+#      to "deny" in Phase 1 per policy above).
+#
+# Upgrade path: update workspace Cargo.toml pin + update this comment block.
+# Refs: docs/decisions/ARCH-D15-apalis-embedded.md §D-09
+
+# ── *-sys crates: warn unless explicitly allow-listed ─────────────────────
+# Raw FFI bindings introduce unsafe code and platform-specific build deps.
+# Policy: any *-sys crate must be explicitly reviewed and added to the
+# skip list below. Default = warn so we are notified without blocking CI
+# on crates already present (e.g. libsqlite3-sys bundled with rusqlite).
+skip = [
+    # rusqlite uses bundled SQLite via libsqlite3-sys — reviewed, approved
+    # (no system libsqlite3 dependency, reproducible build, no FFI leakage)
+    { name = "libsqlite3-sys" },
+    # apalis ecosystem: apalis-sqlite pulls apalis-sql + apalis-core as transitive deps.
+    # Multiple versions may appear across apalis/apalis-sql/apalis-sqlite/apalis-cron
+    # sub-dependency resolution — skip to suppress false-positive multiple-version warns.
+    # Real version enforcement: exact `=` pins in workspace Cargo.toml (see D-09 block above).
+    { name = "apalis-core" },
+    { name = "apalis-sql" },
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [sources] — allowed crate sources
+# Only crates.io is trusted. Reject unknown registries and unapproved git deps.
+# ─────────────────────────────────────────────────────────────────────────────
+[sources]
+# Deny crates from registries not in the allow-list
+unknown-registry = "deny"
+
+# Deny git dependencies not in the allow-list
+unknown-git = "deny"
+
+# Deny crates from unknown source types (e.g. path deps outside the workspace)
+# Path deps inside the workspace are always allowed (they are our own crates).
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

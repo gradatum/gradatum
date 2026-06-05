@@ -1,0 +1,38 @@
+[package]
+name = "gradatum-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multi-mode reader (BM25 + semantic + graph) + RRF fusion"
+
+[features]
+default = []
+# alpha.12 Task 14 — Jina cross-encoder reranker via ONNX Runtime.
+# ATTENTION : ort = "=2.0.0-rc.9" STRICT (cf. spec rev2 §10.1, RC fragile).
+# ndarray volontairement retiré : ort rc.9 Tensor::from_array attend `(shape, Vec<T>)`,
+# pas `Array2` directement. Cf. amend §10.1 dans le commit message.
+onnx-reranker = ["dep:ort", "dep:tokenizers"]
+
+[dependencies]
+gradatum-core.workspace = true
+gradatum-index.workspace = true
+gradatum-cache.workspace = true
+tracing.workspace = true
+
+# Optionnels — feature `onnx-reranker` (Task 14)
+ort = { version = "=2.0.0-rc.9", optional = true, default-features = false, features = [
+    "download-binaries",
+] }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = [
+    "onig",
+] }
+
+[dev-dependencies]
+tempfile      = { workspace = true }
+tokio         = { workspace = true, features = ["full"] }
+gradatum-core = { workspace = true }
+chrono        = { workspace = true }
+smallvec      = { workspace = true }

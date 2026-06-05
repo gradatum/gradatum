@@ -1,0 +1,71 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+**/Cargo.lock.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets - NEVER commit
+**/.env
+**/.env.*
+!**/.env.example
+**/secrets/
+**/*.key
+**/*.pem
+**/bearer.toml
+!examples/presets/*.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Local Claude state
+.claude/local/
+.claude/cache/
+.claude/history.jsonl
+
+# Test artifacts
+**/test-output/
+**/coverage/
+**/tarpaulin-report.html
+
+# Local dev databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+!examples/**/*.db.example
+
+# Backups
+*.bak
+*.bak-*
+backups/
+
+# Snapshot DB v1-parity-tests — régénéré à la demande, jamais commité (confidentialité notes vault personnel)
+# Le fichier *.db racine couvre déjà ce chemin, mais on l'explicite ici pour la lisibilité.
+crates/v1-parity-tests/tests/fixtures/*.db
+
+# Datasets bench — contiennent données personnelles du mainteneur, JAMAIS commités
+crates/gradatum-bench/datasets/*.jsonl
+crates/gradatum-bench/datasets/*.csv
+
+# Stubs crates.io générés (regénérables via scripts/gen-stubs-v*.sh) — pas de code source réel
+crates-publish-stubs/
+crates-publish-stubs-v*/
+
+# MCP config sample — généré dynamiquement par scripts/install-gradatum-stub-mcp.sh
+# avec valeurs runtime (--server-url, --api-key-file) et timestamp régénéré à chaque install.
+# Voir scripts/install-gradatum-stub-mcp.sh §5 pour le template heredoc canonique.
+scripts/mcp.json.sample
+.gradatum-meta
+.worktrees/
+docs/internal/
+RELEASE-MANIFEST.yaml

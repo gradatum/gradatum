@@ -1,0 +1,16 @@
+[package]
+name = "gradatum-sdk-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust SDK for direct integration with gradatum-server HTTP API"
+
+[dependencies]
+gradatum-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

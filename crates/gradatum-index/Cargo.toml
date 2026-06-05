@@ -1,0 +1,28 @@
+[package]
+name = "gradatum-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite + FTS5 + drift detection Phase A — index layer Gradatum Phase 1"
+
+[dependencies]
+gradatum-core    = { workspace = true }
+gradatum-storage = { workspace = true }
+async-trait      = { workspace = true }
+rusqlite      = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+chrono        = { workspace = true }
+sha2          = { workspace = true }
+ulid          = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "rt"] }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["full"] }
+smallvec = { workspace = true }

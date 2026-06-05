@@ -1,0 +1,20 @@
+[package]
+name = "gradatum-sdk-rs"
+version = "0.0.1"
+edition = "2021"
+authors = ["Gradatum Maintainers <maintainer@gradatum.org>"]
+license = "Apache-2.0"
+description = "Rust SDK for direct integration with gradatum-server HTTP API"
+repository = "https://github.com/gradatum/gradatum"
+homepage = "https://gradatum.org"
+readme = "README.md"
+keywords = ["memory", "agents", "knowledge-base", "markdown", "embedded"]
+categories = ["database", "memory-management"]
+
+[lib]
+path = "src/lib.rs"
+
+# Déclare explicitement que ce mini-crate n'appartient pas au workspace parent.
+# Sans cela, cargo remonte jusqu'à /home/maintainer-user/projects/gradatum/Cargo.toml
+# et refuse de compiler "outside workspace".
+[workspace]

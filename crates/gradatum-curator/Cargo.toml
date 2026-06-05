@@ -1,0 +1,34 @@
+[package]
+name = "gradatum-curator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LLM-powered note curation layer: admits, routes, classifies, organises and retires notes within a vault"
+
+[dependencies]
+gradatum-core  = { path = "../gradatum-core" }
+gradatum-chat  = { path = "../gradatum-chat" }
+async-trait.workspace = true
+chrono.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strsim.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+tokio      = { workspace = true, features = ["full"] }
+smallvec.workspace = true
+proptest.workspace = true
+wiremock.workspace = true
+secrecy.workspace = true

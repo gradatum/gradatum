@@ -1,0 +1,57 @@
+# gradatum curator configuration — example template
+#
+# Default install: heuristic CPU only — no LLM required, no network calls.
+# Optional LLM tier improves F1 weighted by ~3pp on the legacy vault v1.6.2 baseline
+# (heuristic 0.7871 → Qwen3-4B-Instruct-2507 Q4_K_M 0.7938 measured 2026-05-05 dataset gradatum-natif 147 notes).
+# System prompt + few-shot are embedded only when backend != "heuristic".
+
+[curator]
+backend = "heuristic"   # default — minimal install, no LLM, fully offline
+
+# === Optional LLM tier ===
+# Uncomment ONE backend section matching your endpoint.
+# All LLM backends share: temperature=0.0, max_tokens=128 (L-01 arbitrage the maintainer:
+# 64 trop court pour duplicate_hint long, 256 gaspilleur — 128 équilibre confirmé Gate 3).
+
+# --- OpenAI-compatible (Ollama OAI mode, llama.cpp, OpenRouter, OpenAI cloud) ---
+# [curator.llm]
+# backend = "openai_compat"
+# base_url = "http://your-llm-host:8082/v1"   # URL de votre endpoint OpenAI-compatible
+# model = "Qwen3-4B-Instruct-2507"               # tier light recommandé (Q4_K_M ~2.5 GB RAM)
+# api_key_env = "GRADATUM_LLM_API_KEY"            # nom de la var env portant le bearer token
+# timeout_ms = 30000
+#
+# [curator.llm.fallback]
+# on_error_after_seconds = 60
+# backoff_seconds = [30, 60, 120, 300]
+# half_open_success_threshold = 2
+
+# --- Anthropic API ---
+# [curator.llm]
+# backend = "anthropic_compat"
+# base_url = "https://api.anthropic.com"
+# model = "claude-haiku-4-5"
+# api_key_env = "ANTHROPIC_API_KEY"
+# timeout_ms = 30000
+#
+# [curator.llm.fallback]
+# on_error_after_seconds = 60
+# backoff_seconds = [30, 60, 120, 300]
+# half_open_success_threshold = 2
+
+# --- Google Gemini API ---
+# [curator.llm]
+# backend = "gemini_compat"
+# base_url = "https://generativelanguage.googleapis.com"
+# model = "gemini-2.0-flash"
+# api_key_env = "GEMINI_API_KEY"
+# timeout_ms = 30000
+#
+# [curator.llm.fallback]
+# on_error_after_seconds = 60
+# backoff_seconds = [30, 60, 120, 300]
+# half_open_success_threshold = 2
+
+# === Fallback circuit-breaker ===
+# Configuré dans [curator.llm.fallback] (voir sections commentées ci-dessus).
+# En mode heuristic (défaut), aucun fallback n'est nécessaire.

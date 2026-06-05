@@ -1,0 +1,4 @@
+# Les fichiers *.db ne sont PAS commités dans ce répertoire.
+# Le snapshot legacy vault est régénéré à la demande via :
+#   crates/v1-parity-tests/scripts/regenerate-snapshot.sh
+# Voir crates/v1-parity-tests/README.md section "Snapshot DB regeneration".

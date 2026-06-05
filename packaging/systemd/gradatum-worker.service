@@ -1,0 +1,44 @@
+[Unit]
+Description=Gradatum background worker (curator cascade + job queue)
+Documentation=https://gradatum.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gradatum
+Group=gradatum
+StateDirectory=gradatum
+RuntimeDirectory=gradatum
+ConfigurationDirectory=gradatum
+LogsDirectory=gradatum
+ExecStart=/usr/bin/gradatum-worker --db /var/lib/gradatum/db/queue.sqlite --config /var/lib/gradatum/config/server.toml
+# Fichier d'environnement optionnel — absent = ignoré (EnvironmentFile=- préfixe).
+# Créer /etc/gradatum/env avec le contenu suivant pour activer les logs détaillés :
+#   RUST_LOG=gradatum_worker=info,gradatum_curator=info,gradatum_db_sqlite=debug
+# Note : sans RUST_LOG, le worker tourne en niveau "info" (défaut init_tracing).
+EnvironmentFile=-/etc/gradatum/env
+# Restart=always (vs on-failure) — couvre l'exit 0 "pas leader" : si une lease
+# leadership est tenue par un autre worker, l'exit propre est intentionnel mais
+# nécessite un retry périodique pour takeover post-expiration. Sans always, le
+# service reste inactive après stop+start rapide (lease pas encore expirée).
+# RestartSec=15s : lease leadership TTL ~60s, 15s = retry suffisamment fréquent
+# sans spinner inutile (4 cycles avant takeover dans le pire cas).
+Restart=always
+RestartSec=15s
+LimitNOFILE=65536
+OOMScoreAdjust=-100
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/gradatum /var/log/gradatum
+MemoryMax=1G
+# Caveat : sans cette ligne, le worker peut etre pousse en swap si la memoire est saturee.
+# Sans cette ligne, le worker peut etre pousse en swap si curator+LLM tirent la RAM.
+# On prefere un OOM kill propre plutot qu'une degradation silencieuse en swap.
+MemorySwapMax=0
+CPUWeight=100
+
+[Install]
+WantedBy=multi-user.target

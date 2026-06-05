@@ -1,0 +1,71 @@
+[package]
+name = "gradatum-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stateless HTTP/MCP façade :19090 — handles read/search + enqueues writes"
+
+[[bin]]
+name = "gradatum-server"
+path = "src/main.rs"
+
+[lib]
+name = "gradatum_server"
+path = "src/lib.rs"
+
+[dependencies]
+gradatum-core.workspace = true
+gradatum-dto.workspace = true
+rusqlite.workspace = true
+gradatum-embed.workspace = true
+gradatum-vault.workspace = true
+gradatum-storage.workspace = true
+gradatum-index.workspace = true
+gradatum-search.workspace = true
+gradatum-queue.workspace = true
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite" }
+gradatum-cache.workspace = true
+gradatum-acl-policy.workspace = true
+gradatum-acl-auth.workspace = true
+gradatum-auth.workspace = true
+gradatum-chat.workspace = true
+gradatum-curator.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+gradatum-warden.workspace = true
+rmcp.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+figment.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+prometheus-client.workspace = true
+bincode.workspace = true
+sqlx.workspace = true
+ulid.workspace = true
+async-trait.workspace = true
+secrecy.workspace     = true
+tokio-stream = { version = "=0.1.18", features = ["sync"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = "0.4"
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
+nix.workspace = true
+gradatum-worker.workspace = true
+gradatum-curator.workspace = true
+secrecy.workspace = true
+toml.workspace = true
+http-body-util = "0.1"

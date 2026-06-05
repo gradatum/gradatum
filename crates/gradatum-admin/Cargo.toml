@@ -1,0 +1,51 @@
+[package]
+name = "gradatum-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI ops — init/migrate/backup/restore + vault create/list/swap/delete"
+
+[lib]
+name = "gradatum_admin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gradatum-admin"
+path = "src/main.rs"
+
+[dependencies]
+gradatum-core.workspace = true
+gradatum-curator.workspace = true
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite" }
+gradatum-queue.workspace = true
+gradatum-vault.workspace = true
+gradatum-storage.workspace = true
+gradatum-index.workspace = true
+gradatum-acl-policy.workspace = true
+gradatum-acl-auth.workspace = true
+gradatum-auth.workspace = true
+clap.workspace = true
+sqlx.workspace = true
+ulid.workspace = true
+argon2.workspace = true
+rand.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+pkcs8.workspace = true
+rusqlite.workspace = true
+chrono = { workspace = true }
+hex = "=0.4.3"
+toml_edit = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite = { workspace = true }

@@ -1,0 +1,3 @@
+# Minimal config — relies on defaults everywhere
+[vault]
+default_tenant_id = "main"

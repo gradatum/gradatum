@@ -1,0 +1,21 @@
+[package]
+name = "gradatum-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-user CLI — write/read/search via gradatum-server HTTP API"
+
+[[bin]]
+name = "gradatum-cli"
+path = "src/main.rs"
+
+[dependencies]
+gradatum-core.workspace = true
+reqwest.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

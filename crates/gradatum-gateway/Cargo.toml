@@ -1,0 +1,75 @@
+[package]
+name = "gradatum-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LLM proxy gateway — multi-provider routing with circuit-breaker, F-08 reranker, and engine supervisor integration"
+publish = false
+
+[features]
+default = []
+# opt-in : active FastEmbedCpu comme backend embedding de fallback in-process.
+# Nécessite ort runtime ONNX (~300MB binary overhead).
+fastembed-cpu = ["gradatum-embed/fastembed-cpu"]
+
+[dependencies]
+# Workspace crates
+gradatum-core    = { workspace = true }
+gradatum-embed   = { workspace = true }
+gradatum-search  = { workspace = true }
+
+# Async runtime
+tokio            = { workspace = true }
+async-trait      = { workspace = true }
+
+# Serialization
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+toml             = { workspace = true }
+
+# HTTP server / client
+axum             = { workspace = true }
+http             = { workspace = true }
+tower            = { workspace = true }
+tower-http       = { workspace = true }
+reqwest          = { workspace = true }
+
+# Config loading
+figment          = { workspace = true }
+
+# Database
+rusqlite         = { workspace = true }
+
+# Errors
+thiserror        = { workspace = true }
+anyhow           = { workspace = true }
+
+# Observability
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Time + IDs
+chrono           = { workspace = true }
+ulid             = { workspace = true }
+
+# Secrets
+secrecy          = { workspace = true }
+
+# Util
+once_cell        = { workspace = true }
+futures          = { workspace = true }
+
+# Timing constant-time compare (bearerauth)
+subtle           = "2"
+
+# Bytes streaming
+bytes            = "1"
+
+[dev-dependencies]
+tokio            = { workspace = true, features = ["full"] }
+tempfile         = { workspace = true }
+wiremock         = { workspace = true }
+tower            = { workspace = true }

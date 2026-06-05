@@ -1,0 +1,38 @@
+# Full config exercising every section + every D-perf-1/2/3 field
+
+[vault]
+default_tenant_id = "main"
+schema_version = 1
+
+[embed]
+embeddable_status = ["live", "pending-review", "staging"]
+embedder_id = "bge-m3"
+dim = 1024
+backend = "http"
+fallback_backend = "fastembed"
+http_url = "http://127.0.0.1:8432/embed"
+http_timeout_ms = 5000
+http_model = "bge-m3"
+
+[curator]
+heuristic_admit_threshold = 0.6
+heuristic_default_status = "pending-review"
+llm_review_enabled = true
+confidence_threshold = 0.7
+llm_review_endpoint = "http://127.0.0.1:8435/v1"
+llm_review_model = "qwen3.6-35b-a3b-q4-k-xl"
+llm_review_timeout_ms = 30000
+llm_review_max_tokens = 512
+llm_review_fallback = "pending-review-fallback"
+
+[index]
+backend = "sqlite"
+fts_tokenizer = "unicode61"
+
+[drift]
+scan_interval_seconds = 3600
+
+[audit]
+rotation = "daily"
+retention_days = 0
+strict_mode = false

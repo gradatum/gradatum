@@ -1,0 +1,103 @@
+# Gradatum preset — hierarchical
+#
+# Pattern: human + main agent + typed sub-agents (writers / validators / experts).
+# Mirrors a typical multi-agent pipeline (orchestrator + specialized sub-agents).
+#
+# Apply with:
+#   gradatum-admin init --preset=hierarchical --projects=projecta,projectb
+#
+# The init command materializes consumer-templates into concrete consumers,
+# substituting ${PROJECT}, ${AGENT}, ${THEME} based on --projects flags.
+#
+# ACL pattern syntax (globset):
+#   "*"                   match all loci
+#   "projecta/*"          match all loci under "projecta/"
+#   "*/briefing"          match any "X/briefing" locus
+#   "!personal-classified" exclude (negation)
+#   "${VAR}"              variable substituted at init time
+
+# ─── Human (top of hierarchy) ─────────────────────────────────────────
+# identity="maintainer" — human admin, accès complet, voit personal-classified.
+[[consumer]]
+identity = "maintainer"
+description = "Human owner — full read/write, sees personal-classified"
+read_patterns  = ["**"]
+write_patterns = ["**"]
+sees_personal_classified = true
+
+# ─── Main agent (orchestrator) ────────────────────────────────────────
+# identity="main-agent" — orchestrateur LLM, accès global sauf personal-classified.
+# Caveat B3 : sees_personal_classified=false → court-circuit DenyExplicit sur tout locus
+# contenant "personal-classified", avant même l'évaluation des patterns.
+[[consumer]]
+identity = "main-agent"
+description = "Orchestrator (any LLM-based agent) — sees everything except personal-classified, writes briefings"
+read_patterns  = ["**"]
+write_patterns = ["**"]
+sees_personal_classified = false
+
+# ─── Sub-agent writer : project-a ────────────────────────────────────
+# identity="sub-agent-a" — agent writer limité au projet project-a.
+[[consumer]]
+identity = "sub-agent-a"
+description = "Writer sub-agent scoped to project-a"
+read_patterns  = ["project-a/**"]
+write_patterns = ["project-a/**"]
+sees_personal_classified = false
+
+# ─── Sub-agent validator (cross-project read-only) ────────────────────
+# identity="validator" — lecture cross-project, aucune écriture.
+[[consumer]]
+identity = "validator"
+description = "Validator sub-agent — cross-reads any project, writes nothing"
+read_patterns  = ["**"]
+write_patterns = []
+sees_personal_classified = false
+
+# ─── Domain expert : Rust theme ───────────────────────────────────────
+# identity="expert-rust" — lecture limitée au thème rust/, aucune écriture.
+[[consumer]]
+identity = "expert-rust"
+description = "Domain expert scoped to rust theme"
+read_patterns  = ["rust/**", "**/rust/**"]
+write_patterns = []
+sees_personal_classified = false
+
+# ─── Sub-agent template: writers (coder agents, prompt-engineer, etc.) ──
+[[consumer-template]]
+id = "sub-agent-writer"
+description = "Writer sub-agent — writes only its own locus, reads briefings + own work"
+read_patterns = ["main-agent", "${PROJECT}/briefing", "${PROJECT}/${AGENT}"]
+write_patterns = ["${PROJECT}/${AGENT}"]
+
+# ─── Sub-agent template: validators (tester, reviewer, security-auditor) ─
+[[consumer-template]]
+id = "sub-agent-validator"
+description = "Validator sub-agent — cross-reads project for audit, writes own findings"
+read_patterns = ["main-agent", "${PROJECT}/*"]
+write_patterns = ["${PROJECT}/${AGENT}"]
+
+# ─── Expert template (domain specialists, monitoring) ────────────────
+[[consumer-template]]
+id = "expert"
+description = "Thematic expert — reads main-agent + their theme scope, writes findings"
+read_patterns = ["main-agent", "${THEME}/*"]
+write_patterns = ["${THEME}/${AGENT}"]
+
+# ─── Comments ──────────────────────────────────────────────────────────
+#
+# After init, the resulting bearer.toml will have one [[consumer]] block per
+# (project × agent) pair derived from --projects and standard agent names.
+#
+# Example expansion for --projects=projecta,projectb with default agents:
+#
+#   [[consumer]] id = "projecta-backend"          (writer template)
+#   [[consumer]] id = "projecta-frontend"         (writer template)
+#   [[consumer]] id = "projecta-tester"           (validator template)
+#   [[consumer]] id = "projecta-reviewer"          (validator template)
+#   [[consumer]] id = "projectb-backend"       (writer template)
+#   [[consumer]] id = "projectb-frontend"      (writer template)
+#   ...
+#
+# Each gets a freshly generated argon2id token_hash.
+# Tokens are displayed once in cleartext at init for distribution to consumers.

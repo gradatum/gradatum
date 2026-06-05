@@ -1,0 +1,19 @@
+[package]
+name = "gradatum-server"
+version = "0.0.1"
+edition = "2021"
+authors = ["Gradatum Maintainers <maintainer@gradatum.org>"]
+license = "Apache-2.0"
+description = "Stateless HTTP/MCP façade :19090 — handles read/search + enqueues writes"
+repository = "https://github.com/gradatum/gradatum"
+homepage = "https://gradatum.org"
+readme = "README.md"
+keywords = ["memory", "agents", "knowledge-base", "cli", "server"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "gradatum-server"
+path = "src/main.rs"
+
+# Déclare explicitement que ce mini-crate n'appartient pas au workspace parent.
+[workspace]
