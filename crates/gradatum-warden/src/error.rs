@@ -1,0 +1,22 @@
+//! Warden error types and decision enum.
+
+/// Construction error for the warden.
+#[derive(Debug, thiserror::Error)]
+pub enum WardenError {
+    /// Invalid rate limit configuration: `per_minute` or `burst` is zero.
+    #[error("rate limit invalide: per_minute={0} burst={1} (les deux doivent être > 0)")]
+    InvalidRateLimit(u32, u32),
+}
+
+/// Warden decision for an incoming request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WardenDecision {
+    /// Request is allowed — passed to the next handler.
+    Allow,
+    /// Loopback bypass — forwarded directly to the handler, skipping rate limiting and IP filters.
+    Bypass,
+    /// IP denied by the CIDR filter → 403 Forbidden.
+    DenyIp,
+    /// Rate limit exceeded → 429 Too Many Requests.
+    DenyRateLimit,
+}

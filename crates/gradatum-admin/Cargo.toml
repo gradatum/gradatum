@@ -1,0 +1,54 @@
+[package]
+name = "gradatum-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Operator CLI: init, token, api-key, backfill-embeddings, backfill-titles, jobs, vault rename/forget"
+
+[lib]
+name = "gradatum_admin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gradatum-admin"
+path = "src/main.rs"
+
+[dependencies]
+gradatum-core.workspace = true
+gradatum-curator.workspace = true
+# BLOCAGE CRATES.IO : gradatum-db-sqlite est publish=false. gradatum-admin non publiable.
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "0.5.2" }
+gradatum-queue.workspace = true
+gradatum-vault.workspace = true
+gradatum-storage.workspace = true
+gradatum-index.workspace = true
+# Code-ingest pipeline (publish=false, tree-sitter isolé ici).
+gradatum-ingest = { path = "../gradatum-ingest", version = "0.5.2" }
+gradatum-acl-policy.workspace = true
+gradatum-acl-auth.workspace = true
+gradatum-auth.workspace = true
+clap.workspace = true
+sqlx.workspace = true
+ulid.workspace = true
+argon2.workspace = true
+rand.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+pkcs8.workspace = true
+rusqlite.workspace = true
+chrono = { workspace = true }
+hex = "=0.4.3"
+toml_edit = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite = { workspace = true }

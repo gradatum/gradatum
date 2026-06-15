@@ -1,0 +1,33 @@
+override_type = "metadata"
+schema_version = 1
+owner_crate = "gradatum-vault"
+phase = 1
+status = "stable"
+
+[fields.section]
+type = "enum:Section"
+required = false
+
+[fields.tags_add]
+type = "array:Tag"
+required = false
+
+[fields.tags_remove]
+type = "array:Tag"
+required = false
+
+[fields.status]
+type = "enum:NoteStatus"
+required = false
+
+[fields.author_override]
+type = "AuthorRef"
+required = false
+
+[fields.status_reason]
+type = "string"
+required = false
+max_len = 500
+
+[migration]
+to_v2 = []

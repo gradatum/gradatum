@@ -1,0 +1,23 @@
+[package]
+name = "index-parity-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Crate test-only — suite de parité backend-agnostique pour le trait `Index`
+# (W2 v0.4.5). Les invariants critiques sont écrits contre `Arc<dyn Index>` via
+# la factory `make_index()` (tests/common/mod.rs), paramétrable par la variable
+# d'environnement `GRADATUM_INDEX_BACKEND` (défaut : "sqlite" in-memory).
+#
+# Ajouter un backend alternatif = 1 bras `match` dans la factory + 1 entrée dans
+# la matrix CI `index-backends`. Aucun test à dupliquer.
+
+[dependencies]
+
+[dev-dependencies]
+gradatum-core  = { path = "../gradatum-core" }
+gradatum-index = { path = "../gradatum-index" }
+chrono         = { workspace = true }
+tokio          = { workspace = true, features = ["macros", "rt-multi-thread"] }
+ulid           = { workspace = true }

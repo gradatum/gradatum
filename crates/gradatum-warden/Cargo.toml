@@ -1,0 +1,28 @@
+[package]
+name        = "gradatum-warden"
+version.workspace = true
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "L0 network guard for Gradatum: IP filter + rate limit + loopback bypass (MVP)"
+repository.workspace = true
+
+[dependencies]
+axum       = { workspace = true }
+tower      = { workspace = true }
+tower-http = { workspace = true }
+http       = { workspace = true }
+
+governor = { workspace = true }
+ipnet    = { version = "2", features = ["serde"] }
+dashmap  = { workspace = true }
+
+tokio   = { workspace = true }
+tracing = { workspace = true }
+
+thiserror   = { workspace = true }
+serde       = { workspace = true, features = ["derive"] }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+http-body-util = "0.1"

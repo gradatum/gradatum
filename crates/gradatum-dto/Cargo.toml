@@ -1,0 +1,20 @@
+[package]
+name = "gradatum-dto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DTOs partagés contrats wire HTTP gradatum (single source of truth Vault*Request structs)"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+schemars = { workspace = true, optional = true }
+
+[features]
+default = []
+schemars = ["dep:schemars"]
+
+[dev-dependencies]
+serde_json.workspace = true

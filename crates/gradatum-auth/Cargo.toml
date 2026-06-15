@@ -1,0 +1,30 @@
+[package]
+name = "gradatum-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JWT (Ed25519, audience-scoped, mandatory kid) + OIDC + API-key"
+
+[dependencies]
+gradatum-core.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+ed25519-dalek.workspace = true
+jsonwebtoken.workspace = true
+pkcs8.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

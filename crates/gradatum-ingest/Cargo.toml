@@ -1,0 +1,32 @@
+[package]
+name = "gradatum-ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Code-ingest pipeline : tree-sitter parse → symboles dérivés → notes index-only (v0.5.2)"
+publish = false
+
+# Feature flags
+# code-rust : active le parser tree-sitter Rust (lien statique, build-time).
+#   Isolé dans ce crate pour ne pas polluer gradatum-admin ou gradatum-server
+#   avec la dépendance C tree-sitter-rust.
+[features]
+default = ["code-rust"]
+code-rust = ["dep:tree-sitter", "dep:tree-sitter-rust"]
+
+[dependencies]
+gradatum-core.workspace = true
+gradatum-index.workspace = true
+sha2.workspace          = true
+serde_json.workspace    = true
+thiserror.workspace     = true
+tracing.workspace       = true
+tree-sitter     = { version = "=0.26.9", optional = true }
+tree-sitter-rust = { version = "=0.24.2", optional = true }
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["full"] }
+tempfile.workspace = true

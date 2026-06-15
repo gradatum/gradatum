@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+.forgejo/
+docs/
+crates/v1-parity-tests/tests/fixtures/*.db
+crates/gradatum-bench/datasets/
+*.md
+.env*
+*.log

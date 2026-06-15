@@ -1,0 +1,69 @@
+[package]
+name = "gradatum-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Async queue consumer — curator LLM + maintenance jobs"
+
+[[bin]]
+name = "gradatum-worker"
+path = "src/main.rs"
+
+[lib]
+name = "gradatum_worker"
+path = "src/lib.rs"
+
+[dependencies]
+gradatum-core.workspace = true
+gradatum-dto.workspace = true
+# BLOCAGE CRATES.IO : gradatum-db-sqlite est publish=false. gradatum-worker non publiable.
+gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "0.5.2" }
+gradatum-embed.workspace = true
+gradatum-index.workspace = true
+gradatum-queue.workspace = true
+gradatum-vault.workspace = true
+gradatum-curator.workspace = true
+gradatum-chat.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+bincode.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+clap = { workspace = true, features = ["derive"] }
+sqlx = { workspace = true, features = ["sqlite", "runtime-tokio"] }
+tokio = { workspace = true, features = ["full", "signal"] }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+ulid.workspace = true
+chrono.workspace = true
+figment.workspace = true
+serde.workspace = true
+apalis       = { workspace = true }
+apalis-cron  = { workspace = true }
+prometheus   = { workspace = true }
+axum         = { workspace = true, features = [] }
+tower        = { workspace = true }
+futures      = { workspace = true }
+# cron 0.16.0 : dep transitive d'apalis-cron — nécessaire pour Schedule::from_str
+# dans monitor.rs + schedules.rs.
+cron         = "=0.16.0"
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+smallvec.workspace = true
+async-trait.workspace = true
+# Tests d'intégration worker_repoll : drive un VRAI Monitor Apalis (non-régression
+# worker-hang). apalis/futures/sqlx/tokio/gradatum-* sont déjà des deps non-dev,
+# re-déclarées ici pour être visibles depuis tests/.
+apalis        = { workspace = true }
+futures       = { workspace = true }
+gradatum-core.workspace = true
+tokio = { workspace = true, features = ["full"] }
+sqlx = { workspace = true, features = ["sqlite", "runtime-tokio"] }
+ulid.workspace = true
+chrono.workspace = true

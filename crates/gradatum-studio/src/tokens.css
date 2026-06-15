@@ -1,0 +1,291 @@
+/* Design tokens — gradatum Studio (direction LEDGER — normatif F-37 S0.2) */
+/* Source : s02-ux-normatif.md §2-4 — NE PAS modifier sans council */
+
+/* === Fonts : self-hosted via @fontsource (D3.2 — pas de Google Fonts) ===
+   Imports effectués dans main.tsx pour que Vite les bundle correctement. */
+
+:root {
+  /* === Backgrounds === */
+  --color-bg:            #f7f7f5;
+  --color-surface:       #ffffff;
+  --color-code-bg:       #fbfbf9;
+  --color-nav-hover:     #f2f1ed;
+  --color-nav-active:    #f2f1ed;
+
+  /* === Bordures === */
+  --color-border:        #e0ded8;
+  --color-border-soft:   #efeee9;
+  --color-border-input:  #d8d6cf;
+  --color-border-header: #e6e4df;
+
+  /* === Texte === */
+  --color-text-primary:  #1d1c19;
+  --color-text-2:        #33312c;
+  --color-text-3:        #55524a;
+  --color-text-muted:    #66635b;
+  --color-text-dim:      #8a857c;
+  --color-text-faint:    #a39f94;
+  --color-text-vfaint:   #77736a;
+
+  /* === Accent (bleu) === */
+  --color-accent:        #2a5db0;
+  --color-accent-hover:  #234e96;
+  --color-accent-bg:     #eef2f9;
+  --color-accent-bd:     #c4d3ec;
+
+  /* === Danger (rouge) === */
+  --color-danger:        #b42318;
+  --color-danger-hover:  #9c1d13;
+  --color-danger-bg:     #fdf1f0;
+  --color-danger-bd:     #f5cdc8;
+
+  /* === Warning (orange) === */
+  --color-warn:          #b54708;
+  --color-warn-bg:       #fef0e6;
+  --color-warn-bd:       #f5d9c1;
+  --color-warn-subtle:   #fef9f4;
+
+  /* === OK (vert) === */
+  --color-ok:            #15803d;
+  --color-ok-bg:         #ecf8ef;
+
+  /* === Modal === */
+  --color-scrim:         rgba(29, 28, 25, 0.45);
+
+  /* === Familles typographiques === */
+  --font-ui:    'IBM Plex Sans', sans-serif;
+  --font-mono:  'JetBrains Mono', monospace;
+  --font-brand: 'Spectral', serif;
+
+  /* === Échelle typographique === */
+  --text-xs:     10px;
+  --text-sm:     11px;
+  --text-base:   11.5px;
+  --text-md:     12px;
+  --text-body:   13px;
+  --text-body-p: 13.5px;
+  --text-lg:     14px;
+  --text-xl:     14.5px;
+  --text-2xl:    15.5px;
+  --text-3xl:    16px;
+  --text-4xl:    20px;
+  --text-hero:   26px;
+
+  /* === Rayons === */
+  --radius-card:  9px;
+  --radius-input: 6px;
+  --radius-badge: 4px;
+  --radius-pill:  999px;
+  --radius-modal: 12px;
+  --radius-logo:  6px;
+
+  /* === Layout === */
+  --sidebar-width:    216px;
+  --header-height:    58px;
+  --content-max-w:    1180px;
+  --content-min-w:    960px;
+}
+
+/* Reset minimal */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-ui);
+  color: var(--color-text-primary);
+  background: var(--color-bg);
+  font-size: var(--text-body);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: #d6e2f5;
+}
+
+/* Chiffres tabulaires sur colonnes numériques */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Focus visible global */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Lien retour */
+.back-link {
+  font-size: var(--text-body);
+  font-weight: 600;
+  color: var(--color-accent);
+  cursor: pointer;
+  width: fit-content;
+  text-decoration: none;
+  background: none;
+  border: none;
+}
+.back-link:hover {
+  text-decoration: underline;
+}
+
+/* Bouton action primaire */
+.btn-primary {
+  font-family: var(--font-ui);
+  font-size: var(--text-body-p);
+  font-weight: 600;
+  background: var(--color-text-primary);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-input);
+  padding: 7px 16px;
+  cursor: pointer;
+  white-space: nowrap;
+  min-height: 32px;
+}
+.btn-primary:hover {
+  background: var(--color-text-2);
+}
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Bouton danger */
+.btn-danger {
+  font-family: var(--font-ui);
+  font-size: var(--text-body-p);
+  font-weight: 600;
+  background: #fff;
+  color: var(--color-danger);
+  border: 1px solid var(--color-danger-bd);
+  border-radius: var(--radius-input);
+  padding: 6px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  min-height: 32px;
+}
+.btn-danger:hover {
+  background: var(--color-danger-bg);
+}
+
+/* Bouton neutre */
+.btn-neutral {
+  font-family: var(--font-ui);
+  font-size: var(--text-body-p);
+  font-weight: 600;
+  background: #fff;
+  color: #44423c;
+  border: 1px solid var(--color-border-input);
+  border-radius: var(--radius-input);
+  padding: 6px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  min-height: 32px;
+}
+.btn-neutral:hover {
+  background: var(--color-nav-hover);
+}
+
+/* Bouton outline accent */
+.btn-outline {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  background: #fff;
+  color: var(--color-accent);
+  border: 1px solid var(--color-accent-bd);
+  border-radius: var(--radius-input);
+  padding: 5px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  min-height: 32px;
+}
+.btn-outline:hover {
+  background: var(--color-accent-bg);
+}
+
+/* Link inline */
+.link-accent {
+  font-size: var(--text-body-p);
+  font-weight: 600;
+  color: var(--color-accent);
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.link-accent:hover {
+  text-decoration: underline;
+}
+
+/* Table header */
+.table-header {
+  display: grid;
+  padding: 9px 18px;
+  border-bottom: 1px solid var(--color-border-header);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--color-text-faint);
+  background: var(--color-surface);
+}
+
+/* Table row */
+.table-row {
+  display: grid;
+  padding: 11px 18px;
+  border-bottom: 1px solid #f3f2ee;
+  align-items: center;
+  cursor: pointer;
+}
+.table-row:hover {
+  background: #fafaf8;
+}
+
+/* Card */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+}
+
+/* Section title dans une card */
+.card-title {
+  font-size: var(--text-lg);
+  font-weight: 600;
+}
+
+/* Pagination */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 18px;
+  font-size: 12px;
+  color: var(--color-text-dim);
+}
+
+/* Séparateur */
+.divider {
+  height: 1px;
+  background: var(--color-border-soft);
+}
+
+/* Transitions */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

@@ -1,0 +1,29 @@
+[Unit]
+Description=Gradatum HTTP/MCP server
+Documentation=https://gradatum.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=gradatum
+Group=gradatum
+StateDirectory=gradatum
+RuntimeDirectory=gradatum
+LogsDirectory=gradatum
+ExecStartPre=/usr/local/bin/gradatum-pre-migration-backup
+ExecStart=/usr/bin/gradatum-server --config /var/lib/gradatum/config/server.toml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+OOMScoreAdjust=-200
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/gradatum /var/log/gradatum
+MemoryMax=512M
+CPUWeight=200
+
+[Install]
+WantedBy=multi-user.target

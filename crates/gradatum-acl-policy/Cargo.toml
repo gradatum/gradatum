@@ -1,0 +1,17 @@
+[package]
+name = "gradatum-acl-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AclPolicy trait + globset matching + ACLFilter visibility marker"
+
+[dependencies]
+gradatum-core.workspace = true
+globset.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

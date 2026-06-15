@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # lint — formatting + clippy
+  # ─────────────────────────────────────────────────────────────────────────
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain with rustfmt + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-lint-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # test — build + test suite
+  # ─────────────────────────────────────────────────────────────────────────
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install SQLite dev headers
+        run: sudo apt-get update -qq && sudo apt-get install -y libsqlite3-dev
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-test-${{ runner.os }}-
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: Install cargo-nextest
+        run: |
+          cargo install cargo-nextest --locked 2>/dev/null \
+            || cargo install cargo-nextest 2>/dev/null \
+            || true
+
+      - name: cargo test --workspace
+        run: |
+          if command -v cargo-nextest &>/dev/null || cargo nextest --version &>/dev/null 2>&1; then
+            cargo nextest run --workspace
+          else
+            cargo test --workspace
+          fi
+
+  # index-backends — suite de parité backend-agnostique du trait Index (W2 v0.4.5).
+  # Job splitté + matrix. Ajouter un backend = 1 entrée matrix + 1 bras factory
+  # make_index (crates/index-parity-tests/tests/common/mod.rs).
+  index-backends:
+    name: index-backends (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        backend: ["sqlite"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install SQLite dev headers
+        run: sudo apt-get update -qq && sudo apt-get install -y libsqlite3-dev
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-index-parity-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-index-parity-${{ matrix.backend }}-${{ runner.os }}-
+
+      - name: cargo test index-parity-tests (backend=${{ matrix.backend }})
+        env:
+          GRADATUM_INDEX_BACKEND: ${{ matrix.backend }}
+        run: cargo test -p index-parity-tests
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # studio-build — gradatum-studio React/TS/Vite (F-37 S2.1)
+  # Steps : npm ci → npm audit (high/critical = fail) → npm run build
+  # ─────────────────────────────────────────────────────────────────────────
+  studio-build:
+    name: studio-build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/gradatum-studio
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: crates/gradatum-studio/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: npm audit (fail on high/critical)
+        run: npm audit --audit-level=high
+
+      - name: npm run build
+        run: npm run build
+
+      - name: npm test
+        run: npm test

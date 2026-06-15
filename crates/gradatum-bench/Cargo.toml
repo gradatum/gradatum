@@ -1,0 +1,90 @@
+[package]
+name = "gradatum-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Benchmarks criterion Phase 1 — baseline pre-tag v0.1.0-alpha"
+
+[lib]
+name = "gradatum_bench"
+path = "src/lib.rs"
+
+[dependencies]
+gradatum-core      = { path = "../gradatum-core" }
+gradatum-cache     = { path = "../gradatum-cache" }
+gradatum-chat      = { path = "../gradatum-chat" }
+gradatum-curator   = { path = "../gradatum-curator" }
+gradatum-embed     = { path = "../gradatum-embed" }
+gradatum-index     = { path = "../gradatum-index" }
+gradatum-storage   = { path = "../gradatum-storage" }
+tokio              = { workspace = true, features = ["full"] }
+chrono             = { workspace = true }
+smallvec           = { workspace = true }
+sha2               = { workspace = true }
+ulid               = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+reqwest            = { workspace = true }
+async-trait        = { workspace = true }
+once_cell          = { workspace = true }
+regex              = { workspace = true }
+tempfile           = { workspace = true }
+
+[[bin]]
+name = "curator_f1"
+path = "src/bin/curator_f1.rs"
+
+[[bin]]
+name = "search_golden"
+path = "src/bin/search_golden.rs"
+
+[dev-dependencies]
+criterion          = { workspace = true, features = ["async_tokio"] }
+wiremock           = { workspace = true }
+
+[features]
+default = []
+fastembed-cpu = ["gradatum-embed/fastembed-cpu"]
+
+[[bench]]
+name = "b01_jcs_hash"
+harness = false
+
+[[bench]]
+name = "b02a_fastembed_cpu"
+harness = false
+required-features = ["fastembed-cpu"]
+
+[[bench]]
+name = "b02b_http_embedder"
+harness = false
+
+[[bench]]
+name = "b03_sqlite_wal_insert"
+harness = false
+
+[[bench]]
+name = "b04_drift_phase_a"
+harness = false
+
+[[bench]]
+name = "b05_cache_checksum"
+harness = false
+
+[[bench]]
+name = "b06_get_effective_note"
+harness = false
+
+[[bench]]
+name = "b07_jsonl_audit"
+harness = false
+
+[[bench]]
+name = "b08a_curator_fast_path"
+harness = false
+
+[[bench]]
+name = "b08b_curator_mixed"
+harness = false

@@ -1,0 +1,36 @@
+[package]
+name = "gradatum-embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Trait Embedder + HTTP remote backends + embedder_id/dim invariants (local impl provided by gradatum-engine)"
+
+# Feature flags
+# fastembed-cpu : active FastEmbedCpu (inférence locale ONNX via fastembed).
+#   Désactivé par défaut car fastembed dépend d'ort (ONNX Runtime) qui nécessite
+#   soit download-binaries (TLS build-time) soit un ORT système installé.
+#   Activer manuellement pour le dev local avec ORT disponible.
+[features]
+default  = []
+fastembed-cpu = ["dep:fastembed", "dep:ort-sys"]
+# See gradatum-chat feature `windows-native-tls`. Same rationale (RFC-0002 §4.6).
+windows-native-tls = ["reqwest/native-tls"]
+
+[dependencies]
+gradatum-core.workspace = true
+async-trait  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+reqwest      = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true }
+fastembed    = { workspace = true, optional = true }
+# PR-Z1: pin ort-sys =rc.9 (ureq ^2.1) pour éviter rc.12 (ureq ^3) via résolution ^rc.9 d'ort.
+ort-sys      = { workspace = true, optional = true }
+
+[dev-dependencies]
+wiremock     = { workspace = true }
+tokio        = { workspace = true, features = ["full"] }

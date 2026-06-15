@@ -1,0 +1,39 @@
+[package]
+name = "gradatum-chat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Trait Chat + 3 impls (Heuristic/HttpChat/Noop) + CircuitBreaker — OpenAI-compatible backend pour curator LLM gating"
+
+[features]
+default = []
+# Cross-platform Windows cert store fallback (RFC-0002 §4.6).
+# Default OFF — Linux/macOS/Windows users with Tailscale-injected certs use rustls.
+# Windows users in corporate environments (proxy, custom certs not in rustls store)
+# enable this to fall back to the Windows native cert store via reqwest's native-tls
+# (schannel) backend.
+windows-native-tls = ["reqwest/native-tls"]
+
+[dependencies]
+gradatum-core = { path = "../gradatum-core", version = "0.5.2" }
+async-trait   = { workspace = true }
+chrono        = { workspace = true }
+once_cell     = { workspace = true }
+regex         = { workspace = true }
+reqwest       = { workspace = true }
+secrecy       = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+chrono    = { workspace = true }
+mockito   = { workspace = true }
+smallvec  = { workspace = true }
+tokio     = { workspace = true }
+wiremock  = { workspace = true }

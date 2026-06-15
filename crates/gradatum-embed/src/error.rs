@@ -1,0 +1,48 @@
+//! Error types for the gradatum-embed crate.
+
+use gradatum_core::error::GradatumError;
+use thiserror::Error;
+
+/// Converts `EmbedError` into `GradatumError::Inference`.
+///
+/// The orphan rule allows this `impl` on the `gradatum-embed` side because
+/// `gradatum-embed` depends on `gradatum-core`.
+///
+/// Enables `?` propagation in handlers returning `GradatumError`
+/// and provides a single conversion point for `EmbedError -> GradatumError`.
+impl From<EmbedError> for GradatumError {
+    fn from(err: EmbedError) -> Self {
+        // Preserves the rich `Display` of `EmbedError` (variant prefix + message).
+        GradatumError::Inference(err.to_string())
+    }
+}
+
+/// Errors that can occur during embedder initialization or use.
+#[derive(Debug, Error)]
+pub enum EmbedError {
+    /// Embedder initialization error (model load, ONNX init, …).
+    #[error("init: {0}")]
+    Init(String),
+
+    /// Embedding computation error (inference failure, batch failure, …).
+    #[error("embed: {0}")]
+    Embed(String),
+
+    /// HTTP error when calling a remote backend.
+    #[error("http: {0}")]
+    Http(#[from] reqwest::Error),
+
+    /// Unexpected or malformed HTTP response (invalid JSON, missing fields, …).
+    #[error("invalid response: {0}")]
+    InvalidResponse(String),
+
+    /// Dimension count returned by the backend does not match the expected value.
+    /// Guards against silent model swaps on the server side.
+    #[error("dim mismatch: expected {expected}, got {got}")]
+    DimMismatch {
+        /// Expected dimensions (configured by the caller).
+        expected: u16,
+        /// Dimensions received in the response.
+        got: u16,
+    },
+}
