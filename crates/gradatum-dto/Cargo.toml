@@ -1,0 +1,25 @@
+[package]
+name = "gradatum-dto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DTOs partagés contrats wire HTTP gradatum (single source of truth Vault*Request structs)"
+
+[dependencies]
+serde      = { workspace = true, features = ["derive"] }
+schemars   = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+# `schemars` active la dérivation JsonSchema sur les structs DTO + la SSOT
+# des helpers de schéma MCP (`mcp_schema` module).
+# `serde_json` est bundlé avec `schemars` : la construction des Map JSON
+# requiert serde_json ; rien dans gradatum-dto ne l'utilise sans schemars.
+schemars = ["dep:schemars", "dep:serde_json"]
+
+[dev-dependencies]
+serde_json.workspace = true

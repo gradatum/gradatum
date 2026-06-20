@@ -1,0 +1,17 @@
+[package]
+name = "gradatum-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Moka LRU in-process EffectiveNote cache, key=(NoteId, scope_hash)"
+
+[dependencies]
+gradatum-core.workspace = true
+moka.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true

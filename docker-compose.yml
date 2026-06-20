@@ -1,0 +1,56 @@
+version: "3.9"
+
+# NOTE: Docker images are not published yet. Use the pre-built binaries from GitHub Releases (see README/INSTALL).
+# The image tags below are historical and not available on ghcr.io. This docker-compose.yml is for reference only.
+
+services:
+  gradatum-server:
+    # image: ghcr.io/gradatum/gradatum:0.1.0-alpha.4  # NOT AVAILABLE — use pre-built binaries from GitHub Releases
+    container_name: gradatum-server
+    restart: unless-stopped
+    ports:
+      - "19090:19090"
+    volumes:
+      - gradatum-config:/etc/gradatum
+      - gradatum-state:/var/lib/gradatum
+      - gradatum-audit:/var/log/gradatum
+    environment:
+      - GRADATUM_LOG=info
+      - RUST_BACKTRACE=1
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:19090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  gradatum-worker:
+    # image: ghcr.io/gradatum/gradatum:0.1.0-alpha.4  # NOT AVAILABLE — use pre-built binaries from GitHub Releases
+    container_name: gradatum-worker
+    restart: unless-stopped
+    depends_on:
+      gradatum-server:
+        condition: service_healthy
+    volumes:
+      - gradatum-config:/etc/gradatum:ro
+      - gradatum-state:/var/lib/gradatum
+      - gradatum-audit:/var/log/gradatum
+    entrypoint: ["/usr/local/bin/gradatum-worker"]
+    command: ["--config", "/etc/gradatum/server.toml"]
+    environment:
+      - GRADATUM_LOG=info
+
+  # Conteneur d'initialisation — exécuter une seule fois avant le démarrage nominal
+  # Usage : docker compose --profile init up gradatum-init
+  gradatum-init:
+    # image: ghcr.io/gradatum/gradatum:0.1.0-alpha.4  # NOT AVAILABLE — use pre-built binaries from GitHub Releases
+    container_name: gradatum-init
+    volumes:
+      - gradatum-config:/etc/gradatum
+    entrypoint: ["/usr/local/bin/gradatum-admin"]
+    command: ["init", "--force-skip-if-exists"]
+    profiles: ["init"]
+
+volumes:
+  gradatum-config:
+  gradatum-state:
+  gradatum-audit:

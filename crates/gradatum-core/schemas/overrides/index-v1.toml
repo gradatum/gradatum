@@ -1,0 +1,9 @@
+override_type = "index"
+schema_version = 1
+owner_crate = "gradatum-index"
+phase = 3
+status = "experimental"
+
+[fields]
+
+[migration]

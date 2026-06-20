@@ -1,0 +1,102 @@
+# Full config exercising every section + every D-perf-1/2/3 field
+
+[vault]
+default_tenant_id = "main"
+schema_version = 1
+
+[embed]
+embeddable_status = ["live", "pending-review", "staging"]
+embedder_id = "bge-m3"
+dim = 1024
+backend = "http"
+fallback_backend = "fastembed"
+http_url = "http://127.0.0.1:8432/embed"
+http_timeout_ms = 5000
+http_model = "bge-m3"
+
+[curator]
+heuristic_admit_threshold = 0.6
+heuristic_default_status = "pending-review"
+llm_review_enabled = true
+confidence_threshold = 0.7
+llm_review_endpoint = "http://127.0.0.1:8435/v1"
+llm_review_model = "qwen3.6-35b-a3b-q4-k-xl"
+llm_review_timeout_ms = 30000
+llm_review_max_tokens = 512
+llm_review_fallback = "pending-review-fallback"
+
+[index]
+backend = "sqlite"
+fts_tokenizer = "unicode61"
+
+[drift]
+scan_interval_seconds = 3600
+
+[audit]
+rotation = "daily"
+retention_days = 0
+strict_mode = false
+
+# Politique de rétention des snapshots CoW .history/ (F-32A)
+# max_versions : cap count par note (défaut 50 = comportement pré-F-32A)
+# ttl_days     : purge des snapshots plus vieux que N jours (absent = pas de purge)
+[history]
+max_versions = 50
+ttl_days = 90
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SCHEDULE CRON — Purge lifecycle nightly (F-32C)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# INTENTIONNELLEMENT DÉSACTIVÉ.
+#
+# Prérequis BLOQUANT avant activation :
+#   - Stratégie backup nocturne définie et testée (spec §1.4)
+#   - ExecStartPre backup vérifié dans le service systemd worker
+#   - Validation opérateur du grace_days et du périmètre vault_id
+#   - Test dry-run manuel préalable confirmé (POST /api/v1/jobs/trigger, Job::Purge, dry_run=true)
+#
+# Activation = décision opérateur séparée — Ne PAS décommenter sans validation opérateur explicite.
+#
+# [[apalis.schedules]]
+# name = "purge_nightly"
+# cron = "0 2 * * *"    # 02h00 UTC tous les jours
+# retention_days = 30   # champ hérité ScheduleConfig — non utilisé par handle_purge
+#                       # (grace_days est dans PurgeSpec, transmis via le job payload)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SCHEDULE CRON — Distill semantic (F-22)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# INTENTIONNELLEMENT DÉSACTIVÉ — JAMAIS actif par défaut.
+#
+# La distillation produit de l'ÉCRITURE LLM/synthèse AUTOMATISÉE dans le vault
+# (notes de synthèse en PendingReview). Même en PendingReview, l'activation d'un
+# cron implique une production continue de notes à valider.
+#
+# Prérequis BLOQUANT avant activation :
+#   - Scope `Locus` précis défini (JAMAIS VaultWide ni Locus vide en mode réel — refusés par le handler)
+#   - batch_limit dimensionné (clustering O(n²) ; cap dur interne MAX_DISTILL_BATCH = 2000)
+#   - Capacité de revue humaine du flux PendingReview produit
+#
+# Activation = décision opérateur séparée — Ne PAS décommenter sans validation explicite.
+#
+# ⚠️ ÉTAT D'ACTIVATION RÉEL (honnêteté — P1-2 audit) :
+#   Le handler `handle_distill` est implémenté (clustering → synthèse → PendingReview),
+#   MAIS il N'EXISTE AUCUN chemin d'activation LIVE à ce jour, même en dry-run :
+#     - `POST /api/v1/jobs/trigger` FORCE `Job::Curate` (le payload `kind` n'est pas
+#       respecté) jusqu'à la généralisation du trigger arbitraire (F-16, v0.5.0).
+#     - Le schedule cron ci-dessous reste commenté ET le câblage trigger→Distill
+#       n'est pas encore branché.
+#   En clair : la distillation n'est PAS déclenchable en production tant que F-16
+#   n'a pas livré le routage de `kind` arbitraire. Le câblage du déclencheur reste backlog F-16.
+#
+# DistillSource attendu (pour mémoire, quand F-16 débloquera le trigger) :
+#   { mode = "Semantic", scope = { Locus = "..." }, batch_limit, confidence_threshold }
+#
+# [[apalis.schedules]]
+# name = "distill_semantic_nightly"
+# cron = "0 3 * * *"    # 03h00 UTC — DÉSACTIVÉ, exemple uniquement
+# retention_days = 0    # champ hérité ScheduleConfig — non pertinent pour distill
+# ──────────────────────────────────────────────────────────────────────────────

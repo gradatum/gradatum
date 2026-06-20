@@ -1,0 +1,33 @@
+[package]
+name = "gradatum-queue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite-backed jobs queue with atomic UPDATE...RETURNING leases"
+
+[dependencies]
+gradatum-core      = { path = "../gradatum-core", version = "0.6.4" }
+# BLOCAGE CRATES.IO : gradatum-db-sqlite est publish=false (implémentation SQLite interne).
+# gradatum-queue ne peut pas être publié sur crates.io tant que cette dep n'est pas retirée
+# ou que db-sqlite n'est pas rendu publiable. Voir Tâche B livrable pour les options.
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "0.6.4" }
+# P2.0b dependencies (sqlx-based async Queue trait + SqliteQueue)
+async-trait   = { workspace = true }
+sqlx          = { workspace = true, features = ["sqlite", "runtime-tokio", "macros"] }
+bincode       = { workspace = true }
+chrono        = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+ulid          = { workspace = true }
+# Phase 1 legacy (rusqlite-based LegacyQueue struct)
+rusqlite      = { workspace = true }
+
+[dev-dependencies]
+tempfile      = { workspace = true }
+tokio         = { workspace = true, features = ["full", "test-util"] }

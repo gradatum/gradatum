@@ -1,0 +1,39 @@
+[package]
+name = "gradatum-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared primitives: errors, IDs, types"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace      = true
+secrecy.workspace     = true
+http.workspace        = true
+serde.workspace       = true
+serde_json.workspace  = true
+serde_jcs.workspace   = true
+serde_yml.workspace   = true
+sha2.workspace        = true
+smallvec.workspace    = true
+thiserror.workspace   = true
+toml.workspace        = true
+tokio.workspace       = true
+ulid.workspace        = true
+include_dir.workspace = true
+stability.workspace   = true
+
+[features]
+## Expose InMemorySink pour les crates consommateurs en contexte de test.
+## Ne jamais activer en production.
+test-utils = []
+
+[dev-dependencies]
+proptest.workspace   = true
+serde_test.workspace = true
+serde_yml.workspace  = true
+tempfile.workspace   = true
+tokio.workspace      = true

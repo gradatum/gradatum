@@ -1,0 +1,35 @@
+[package]
+name = "gradatum-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Storage trait + OpenDAL backends + NFS reject guard (caveat C11)"
+
+[dependencies]
+gradatum-core = { path = "../gradatum-core", version = "0.6.4" }
+async-trait   = { workspace = true }
+opendal       = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix           = { workspace = true }
+
+[dev-dependencies]
+tempfile      = { workspace = true }
+tokio         = { workspace = true, features = ["full"] }
+
+[features]
+# Par défaut : backend filesystem uniquement.
+# Surface d'attaque minimale, aucun SDK cloud tiré dans l'arbre de dépendances.
+# Activer les backends cloud via features opt-in (C12 — design spec P2.0).
+default   = ["fs"]
+fs        = ["opendal/services-fs"]
+s3        = ["opendal/services-s3"]
+gcs       = ["opendal/services-gcs"]
+azure     = ["opendal/services-azblob"]
+all-cloud = ["s3", "gcs", "azure"]

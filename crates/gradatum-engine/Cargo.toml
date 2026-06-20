@@ -1,0 +1,76 @@
+[package]
+name = "gradatum-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Managed model runtime — axum OpenAI-compat server supervising a llama-server subprocess (PIVOT v2)."
+
+[[bin]]
+name = "gradatum-engine"
+path = "src/bin/gradatum-engine.rs"
+required-features = ["serve"]
+
+[features]
+# Feature principale : serveur axum + superviseur llama-server.
+serve = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:reqwest",
+    "dep:prometheus-client",
+    "dep:thiserror",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:toml",
+    "dep:figment",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:async-trait",
+    "dep:chrono",
+    "dep:zeroize",
+    "dep:gradatum-dto",
+    "dep:anyhow",
+    "dep:url",
+    "dep:nix",
+]
+# test-utils : expose test_app_with_mock + MockGen pour les tests d'intégration
+test-utils   = ["serve"]
+
+[dependencies]
+# Cœur — toujours présent (pas de feature gate, anti-cycle : ce crate ne dépend que de gradatum-core)
+gradatum-core.workspace = true
+
+# Toutes les dépendances sont optionnelles — compilées uniquement avec feature `serve`
+axum              = { workspace = true, optional = true }
+tokio             = { workspace = true, optional = true }
+reqwest           = { workspace = true, optional = true }
+prometheus-client = { workspace = true, optional = true }
+thiserror         = { workspace = true, optional = true }
+serde             = { workspace = true, optional = true }
+serde_json        = { workspace = true, optional = true }
+toml              = { workspace = true, optional = true }
+figment           = { workspace = true, optional = true }
+tracing           = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+async-trait       = { workspace = true, optional = true }
+# P0-1 : chrono requis pour timestamp RFC3339 dans QaEventDto
+chrono            = { workspace = true, optional = true }
+# P0-8 : zeroize pour Zeroizing<String> JWT
+zeroize           = { workspace = true, optional = true }
+# P0-1 : gradatum-dto requis pour QaEventDto complet (parse-don't-validate)
+gradatum-dto      = { workspace = true, optional = true }
+anyhow            = { workspace = true, optional = true }
+# S2 : url::Url::parse pour validate_loopback_url (anti-SSRF robuste — P2-4)
+url               = { version = "=2.5.8", optional = true }
+# SP-P0-1 : nix pour killpg (SIGTERM/SIGKILL process group enfant sans unsafe direct)
+nix               = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio      = { workspace = true, features = ["full"] }
+serde_json.workspace = true
+axum.workspace = true
+tower      = { workspace = true, features = ["util"] }
+# test-utils : expose InMemorySink de gradatum-core pour les tests d'intégration engine
+gradatum-core = { workspace = true, features = ["test-utils"] }

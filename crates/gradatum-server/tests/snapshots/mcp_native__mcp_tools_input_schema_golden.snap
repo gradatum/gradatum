@@ -1,0 +1,825 @@
+---
+source: crates/gradatum-server/tests/mcp_native.rs
+assertion_line: 611
+expression: schema_map
+---
+{
+  "code_scope": {
+    "$defs": {
+      "CodeSelectorDto": {
+        "additionalProperties": false,
+        "description": "Selector for a `code_scope` request — explicit discriminant.\n\n`kind` ∈ {`query`, `path`, `symbol`}:\n- `query`: FTS5 full-text search (BM25) over the symbol corpus.\n- `path`: all symbols in a file or directory (prefix match on `source_path`).\n- `symbol`: symbols whose `qualified_name` contains `value` (substring match).",
+        "properties": {
+          "kind": {
+            "description": "Selector type: `query` | `path` | `symbol`. Any other value → 400.",
+            "type": "string"
+          },
+          "value": {
+            "description": "Criterion value (keywords, path, or symbol name).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `POST /api/v1/code_scope` (frozen wire contract).\n\n## Additive `include_body` fields (fully backward-compatible)\n\n- `include_body` (default `false`): if `true`, each entry receives a `body` field\n  containing the exact source span of the symbol. `false` = strictly unchanged\n  behavior, byte-for-byte identical JSON.\n- `body_budget_tokens` (default 4000, clamped to \\[1, 32000\\]): body budget independent\n  of `budget_tokens` (orthogonal). Cuts at whole-body boundaries; never truncates\n  mid-body. Entries without a body (stale or span absent): `body=null` omitted from\n  JSON (`skip_serializing_if`).\n\n## Additive `include_callers` field (fully backward-compatible, v0.6.3)\n\n- `include_callers` (default `false`): if `true`, each entry receives a `callers` field\n  listing the qualified names of symbols that declare this symbol in their outgoing `deps`\n  (i.e., reverse-dependency lookup). `false` = strictly unchanged behavior.\n- Results are limited by the same `budget_tokens` cap. The `callers` list is bounded\n  to [`MAX_CALLERS_PER_ENTRY`] entries to prevent payload explosion on widely-used symbols.\n- No lexical scoring: callers are returned in `qualified_name` ASC order (deterministic).\n\n## Mandatory two-pass pattern\n\n**Pass 1**: `include_body=false` (default) → rank the N relevant symbols by signature.\n**Pass 2**: `include_body=true` on the selected symbols only, with a targeted `selector`.\nUsing `include_body=true` on a broad query negates the token savings.",
+    "properties": {
+      "body_budget_tokens": {
+        "description": "Token budget reserved for bodies (default [`DEFAULT_BODY_BUDGET_TOKENS`], clamped to \\[1, 32000\\]).\n\nIndependent of `budget_tokens`. Cuts at whole-body boundaries.\nIgnored if `include_body=false`.",
+        "format": "uint",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "budget_tokens": {
+        "description": "Response token budget (default [`DEFAULT_BUDGET_TOKENS`], clamped server-side).\nEntries are cut to K whole entries such that Σ tokens ≤ budget.",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "include_body": {
+        "default": false,
+        "description": "If `true`, each entry receives `body` = exact source span of the symbol (tree-sitter).\n\nDefault `false` — strictly unchanged behavior.\nSee the two-pass pattern in the struct-level documentation.",
+        "type": "boolean"
+      },
+      "include_callers": {
+        "default": false,
+        "description": "If `true`, each entry receives a `callers` field listing qualified names of symbols\nthat declare this symbol in their outgoing dependencies (reverse-dependency lookup).\n\nDefault `false` — strictly unchanged behavior (callers field absent from JSON).\nSee module documentation for the `include_callers` field semantics.",
+        "type": "boolean"
+      },
+      "selector": {
+        "$ref": "#/$defs/CodeSelectorDto",
+        "description": "Search criterion (discriminant `kind` + `value`)."
+      },
+      "vault": {
+        "description": "Target logical vault — MUST start with `code-` (e.g. `code-gradatum`).\nAny other vault (`main`, arbitrary vault_id) → 400 (security invariant).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "vault",
+      "selector"
+    ],
+    "title": "CodeScopeRequest",
+    "type": "object"
+  },
+  "vault_authors": {
+    "properties": {},
+    "type": "object"
+  },
+  "vault_classify": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_classify` — synchronous heuristic re-classification of an existing note.\n\nSerialized via `bincode::serde::encode_to_vec` for the queue payload.",
+    "properties": {
+      "note_id": {
+        "description": "ULID identifier of the note to re-classify.",
+        "type": "string"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Target tenant (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "note_id"
+    ],
+    "title": "VaultClassifyRequest",
+    "type": "object"
+  },
+  "vault_context": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_context` — legacy vault v1.6.2 `VaultContextArgs` parity.",
+    "properties": {
+      "max_tokens": {
+        "description": "Maximum number of context tokens (default 2000, max 8000).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "query": {
+        "description": "Query for which to build the LLM context.",
+        "type": "string"
+      },
+      "section": {
+        "description": "Section filter (optional).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "title": "VaultContextRequest",
+    "type": "object"
+  },
+  "vault_diff": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_diff` — raw line-by-line diff between two versions.\n\n`a` and `b` are Unix ms timestamps (obtained from `vault_history`)\nor the literal string `\"current\"` for the current version.\nReturns a list of lines prefixed with ` ` (common), `-` (removed), `+` (added).",
+    "properties": {
+      "a": {
+        "description": "Version A: Unix ms timestamp or `\"current\"`.",
+        "type": "string"
+      },
+      "b": {
+        "description": "Version B: Unix ms timestamp or `\"current\"`.",
+        "type": "string"
+      },
+      "note_id": {
+        "description": "Note ULID.",
+        "type": "string"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "note_id",
+      "a",
+      "b"
+    ],
+    "title": "VaultDiffRequest",
+    "type": "object"
+  },
+  "vault_downgrade": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request body for `vault_downgrade` — downgrades a note.\n\nSerialized via `bincode::serde::encode_to_vec` for the queue payload.\n\nPOST `/api/v1/vault_downgrade`. Idempotent: downgrading an already-downgraded\nnote returns 200 with the current status.",
+    "properties": {
+      "note_id": {
+        "description": "ULID identifier of the note to downgrade.",
+        "type": "string"
+      },
+      "reason": {
+        "description": "Reason for the downgrade (e.g. `\"obsolete\"`, `\"duplicate\"`, `\"revised\"`).\nMaximum 500 characters.",
+        "type": "string"
+      },
+      "replaced_by": {
+        "default": null,
+        "description": "Replacement note (ULID, optional).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Target tenant (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "note_id",
+      "reason"
+    ],
+    "title": "VaultDowngradeRequest",
+    "type": "object"
+  },
+  "vault_forget": {
+    "$defs": {
+      "ForgetScopeDto": {
+        "description": "Forget resolution scope — HTTP wire representation.\n\nL0 DTO: same structure as `ForgetScope` (gradatum-core) but without a dependency\non the domain crate (intentional decoupling).\n\nThe 3 variants are identified by the `type` field:\n- `\"topic\"`: FTS search.\n- `\"locus\"`: locus prefix.\n- `\"agent\"`: all notes from an agent.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "Resolution by FTS search over an optional vault.",
+            "properties": {
+              "limit": {
+                "description": "Result cap (default 50, max 200).",
+                "format": "uint",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "query": {
+                "description": "FTS query (e.g. `\"secrets api-key\"`).",
+                "type": "string"
+              },
+              "type": {
+                "const": "topic",
+                "type": "string"
+              },
+              "vault": {
+                "description": "Target vault (optional — `None` = `\"main\"`).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "query"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Resolution by locus prefix.",
+            "properties": {
+              "locus": {
+                "description": "locus prefix (e.g. `\"inbox/old/\"`).",
+                "type": "string"
+              },
+              "type": {
+                "const": "locus",
+                "type": "string"
+              },
+              "vault": {
+                "description": "Target vault.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "vault",
+              "locus"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Resolution by agent — all notes from an `agent_id`.",
+            "properties": {
+              "agent_id": {
+                "description": "Agent identifier (the `author_id` column).",
+                "type": "string"
+              },
+              "type": {
+                "const": "agent",
+                "type": "string"
+              },
+              "vaults": {
+                "default": [],
+                "description": "List of target vaults (`[]` → `[\"main\"]`).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "type",
+              "agent_id"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_forget` — semantic forgetting of notes.\n\n# Dry-run required (default `true`)\n\nA forget without a prior preview is not possible in real mode:\n`dry_run = false` requires `confirm_ulids` to exactly match the ULIDs\nfrom a previous preview. Any discrepancy → **400 Bad Request**.\n\n# Recommended workflow\n\n1. `POST /vault_forget { scope, dry_run: true }` → `ForgetPreview { ulids, count, excluded }`\n2. Verify the preview (exact list of notes that will be forgotten).\n3. `POST /vault_forget { scope, dry_run: false, confirm_ulids: <ulids from preview> }`\n   → `ForgetJobResponse { job_id, status: \"queued\", poll_url, preview }` (202 Accepted —\n   mutations applied asynchronously by the worker)",
+    "properties": {
+      "confirm_ulids": {
+        "description": "Confirmation ULIDs (required when `dry_run = false`).\n\nMust exactly match the ULIDs returned by the preview.\nAny discrepancy (addition, omission, different order) → **400 Bad Request**.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "dry_run": {
+        "default": true,
+        "description": "Dry-run (simulation without mutation) — default `true`.\n\nIn dry-run mode, no note is modified. The response contains the exact list\nof ULIDs that would be forgotten, plus exclusions (protected sections).",
+        "type": "boolean"
+      },
+      "forgotten_by": {
+        "description": "Actor triggering the forget (recorded as `forgotten_by`).\n\nOptional — `None` if not provided.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "scope": {
+        "$ref": "#/$defs/ForgetScopeDto",
+        "description": "Resolution scope — determines the target notes."
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Target tenant (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "scope"
+    ],
+    "title": "VaultForgetRequest",
+    "type": "object"
+  },
+  "vault_graph": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_graph` — legacy vault v1.6.2 `VaultGraphArgs` parity.",
+    "properties": {
+      "depth": {
+        "description": "Traversal depth (default 2, max 5).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "include_backlinks": {
+        "description": "Include incoming links (`backlinks`).",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "root": {
+        "description": "Starting note (path).",
+        "type": "string"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "root"
+    ],
+    "title": "VaultGraphRequest",
+    "type": "object"
+  },
+  "vault_history": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_history` — lists the copy-on-write snapshots of a note.\n\nReturns the Unix millisecond timestamps of snapshots stored in\n`.history/<note_id>/` for the note identified by `note_id`.",
+    "properties": {
+      "note_id": {
+        "description": "Note ULID (e.g. `\"01JTEXAMPLE\"`).",
+        "type": "string"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "note_id"
+    ],
+    "title": "VaultHistoryRequest",
+    "type": "object"
+  },
+  "vault_history_get": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_history_get` — reads a specific historical snapshot.\n\nReturns the note content at the time of snapshot `ts_ms`.\n`ts_ms` must be a timestamp obtained from `vault_history`.",
+    "properties": {
+      "note_id": {
+        "description": "Note ULID.",
+        "type": "string"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      },
+      "ts_ms": {
+        "description": "Unix ms timestamp of the snapshot (obtained from `vault_history`).",
+        "format": "int64",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "note_id",
+      "ts_ms"
+    ],
+    "title": "VaultHistoryGetRequest",
+    "type": "object"
+  },
+  "vault_lessons_recall": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request for lesson recall.\n\nUsed to generate the `inputSchema` for the `vault_lessons_recall` MCP tool.\nOn the HTTP server side, these fields are received as query params (`?class=&limit=`).",
+    "properties": {
+      "class": {
+        "description": "Controlled vocabulary class (one of [`LESSON_CLASSES`]):\n`deploy`, `release`, `migration`, `crates-io`, `anti-leak`, `api-external`,\n`archi`, `git-hygiene`, `ci-cd`, `auth-secrets`, `data-integrity`,\n`process-discipline`. Any other value is rejected (400).",
+        "type": "string"
+      },
+      "limit": {
+        "description": "Maximum number of lessons (server default 5, clamped to `[1, 20]`).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "class"
+    ],
+    "title": "LessonsRecallRequest",
+    "type": "object"
+  },
+  "vault_links": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_links` — thin alias over `vault_graph` with `depth=1`.",
+    "properties": {
+      "include_backlinks": {
+        "description": "Include incoming links (`backlinks`).",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "path": {
+        "description": "Target note for which to list links.",
+        "type": "string"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "path"
+    ],
+    "title": "VaultLinksRequest",
+    "type": "object"
+  },
+  "vault_list": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_list` — legacy vault v1.6.2 `VaultListArgs` parity.",
+    "properties": {
+      "cursor": {
+        "description": "Pagination cursor (opaque token).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "description": "Maximum number of entries (default 100, max 1000).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "pattern": {
+        "description": "Optional glob filter pattern (e.g. `\"decisions/*\"`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "section": {
+        "description": "Section to list (optional — if absent, lists all sections).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "title": "VaultListRequest",
+    "type": "object"
+  },
+  "vault_read": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_read` — legacy vault v1.6.2 `VaultReadArgs` parity.",
+    "properties": {
+      "path": {
+        "description": "Path of the note to read (e.g. `\"decisions/my-note\"`).",
+        "type": "string"
+      },
+      "section": {
+        "description": "Target section (optional — if absent, reads from the vault root).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "path"
+    ],
+    "title": "VaultReadRequest",
+    "type": "object"
+  },
+  "vault_restore": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_restore` — restores a note from a snapshot.\n\nWrites snapshot `ts_ms` as the new current version.\nTriggers a copy-on-write (the previous current version is saved to `.history/`).\nReturns the SHA-256 hex hash of the restored version.",
+    "properties": {
+      "note_id": {
+        "description": "ULID of the note to restore.",
+        "type": "string"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      },
+      "ts_ms": {
+        "description": "Unix ms timestamp of the snapshot to restore.",
+        "format": "int64",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "note_id",
+      "ts_ms"
+    ],
+    "title": "VaultRestoreRequest",
+    "type": "object"
+  },
+  "vault_search": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_search`.\n\n## Optional fields (backward-compatible)\n\n- `locus`: filter by physical path prefix (e.g. `\"council/\"` restricts to notes\n  whose `locus` starts with `council/`). Applied to both FTS and semantic paths.\n  The prefix is escaped against LIKE injection (metacharacters `%`, `_`, `\\`).\n- `vault_id`: cross-vault read — allows querying a vault other than `tenant_id`.\n  Writes remain unchanged (single-tenant). Validation: non-empty, max 128 chars.",
+    "properties": {
+      "include_corpus_count": {
+        "default": false,
+        "description": "If `true`, includes in the response the total count of notes matching\nthe **FTS5/BM25 lexical** query within the filtered scope, unbounded by K.\n\nAllows distinguishing \"topic absent from the corpus\" (`corpus_match_count == 0`)\nfrom \"notes present but ranked below K\" (`corpus_match_count > len(results)`).\n\nDoes NOT indicate semantic ANN hit count.\nOpt-in (default `false`): zero overhead when absent — no COUNT is executed.",
+        "type": "boolean"
+      },
+      "include_downgraded": {
+        "default": false,
+        "description": "If `true`, includes notes with `status = 'downgraded'`\nin the results with a penalized BM25 score (×0.1). Default `false`.",
+        "type": "boolean"
+      },
+      "include_scores": {
+        "default": false,
+        "description": "If `true`, enriches each result with a `scores` object detailing\nthe composite score breakdown.\n\nOpt-in (default `false`): only consumers that need it pay the payload overhead.\nExisting clients are unaffected — the `scores` field is omitted from the\nresponse when `false`.",
+        "type": "boolean"
+      },
+      "limit": {
+        "description": "Maximum number of results (default 10, max 50).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "locus": {
+        "description": "locus prefix filter (optional).\n\nE.g. `\"council/\"` → restricts to notes whose `locus` starts with\n`council/`. LIKE metacharacters (`%`, `_`, `\\`) are automatically\nescaped — no SQL injection risk.\n\nAbsent or `null`: no locus filter (unchanged behavior).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "query": {
+        "description": "Full-text or semantic search query.",
+        "type": "string"
+      },
+      "section": {
+        "description": "Section filter (optional).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "status": {
+        "description": "Lifecycle status filter (optional).\n\nAccepted values: the 6 kebab-case `NoteStatus` variants (`draft`, `staging`,\n`pending-review`, `live`, `deprecated`, `garbage`) plus the legacy SQL value\n`downgraded` (tolerated for backward-compatible filtering). Any other value\n→ `400 Bad Request`. Applied at the SQL level (FTS + semantic), consistent\nwith the `section` filter.\n\nAbsent or `null`: no status filter (unchanged behavior).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      },
+      "vault_id": {
+        "description": "vault to query in read mode (optional).\n\nLifts the single-tenant constraint **for reads only** — allows querying\na vault other than `tenant_id`. Writes remain unchanged.\nValidation: non-empty, max 128 chars.\n\nAbsent or `null`: uses `tenant_id` (unchanged behavior).",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "title": "VaultSearchRequest",
+    "type": "object"
+  },
+  "vault_status": {
+    "properties": {},
+    "type": "object"
+  },
+  "vault_tags": {
+    "properties": {},
+    "type": "object"
+  },
+  "vault_timeline": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_timeline` — paginated temporal read.\n\nAll fields are optional except defaults. Server sort order: `anchor_ms DESC,\nnote_id DESC`.\n\n## Validity windowing\n\nThe `(as_of_ms, include_expired)` pair controls temporal filtering:\n\n| `as_of_ms` | `include_expired` | Behavior |\n|---|---|---|\n| absent | `false` (default) | No filter — **baseline behavior** |\n| absent | `true` | No filter (`include_expired` has no effect without reference T) |\n| present | `false` (default) | Strict filter: notes valid at T |\n| present | `true` | Historical filter: notes created before T, including expired |",
+    "properties": {
+      "as_of_ms": {
+        "description": "As-of reference instant for validity filtering (epoch ms UTC).\n\nActivates temporal filtering. Combined with `include_expired`:\n\n- `as_of_ms=t, include_expired=false` (default): **strict filter** — notes valid at T\n  (`anchor_ms ≤ t AND (valid_until IS NULL OR t < valid_until)`).\n- `as_of_ms=t, include_expired=true`: **historical filter** — notes created before T,\n  including expired ones (`anchor_ms ≤ t` only). Useful for reconstructing past state.\n- absent: no validity filter (unchanged baseline behavior).",
+        "format": "int64",
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "cursor": {
+        "description": "Opaque pagination cursor (obtained from `next_cursor`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "doc_kind": {
+        "description": "`doc_kind` filter (`\"Static\"` / `\"Event\"`). Absent = all.",
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "from_ms": {
+        "description": "Lower bound on `anchor_ms`, inclusive (epoch ms).",
+        "format": "int64",
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "include_expired": {
+        "default": false,
+        "description": "Enables inclusion of expired notes **when `as_of_ms` is present**.\n\nDefault `false`. No effect if `as_of_ms` is absent.\n\n`true` → historical filter: `anchor_ms ≤ t` only (notes expired at T\nare included — useful for reconstructing a past state).",
+        "type": "boolean"
+      },
+      "limit": {
+        "description": "Maximum number of rows (default 50, clamped to max 200 server-side).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant (default `\"main\"`).",
+        "type": "string"
+      },
+      "to_ms": {
+        "description": "Upper bound on `anchor_ms`, inclusive (epoch ms).",
+        "format": "int64",
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "vault_id": {
+        "description": "vault to query in read mode (default = `tenant_id`). Max 128 chars.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "title": "VaultTimelineRequest",
+    "type": "object"
+  },
+  "vault_trace": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_trace` — legacy vault v1.6.2 `VaultTraceArgs` parity.",
+    "properties": {
+      "limit": {
+        "description": "Result limit (default 20, max 100).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "query": {
+        "description": "Trace query (tags, sections, pattern).",
+        "type": "string"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "title": "VaultTraceRequest",
+    "type": "object"
+  },
+  "vault_write": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request body for `vault_write` — creates a note via the async queue.\n\nSerialized via `bincode::serde::encode_to_vec` for the queue payload.",
+    "properties": {
+      "author": {
+        "default": null,
+        "description": "Author (optional).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "body": {
+        "description": "Markdown body of the note.",
+        "type": "string"
+      },
+      "expected_sha256": {
+        "default": null,
+        "description": "Expected SHA-256 hash for optimistic locking (optional, hexadecimal).\n\nWhen present, the worker checks that the current hash of the note matches\nbefore writing. On mismatch: terminal job `Conflict` (note not overwritten).\n`None` = unconditional write (backward-compatible).\n\nFormat: 64 lowercase hexadecimal characters (SHA-256 = 32 bytes).\nExample: `\"a3f1c2d4...\"`",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "note_id": {
+        "default": null,
+        "description": "Pre-allocated ULID — honored by the legacy `SqliteQueue` dispatcher if present\nand parseable as a valid ULID.\n\n`None` = backward-compatible behavior: the dispatcher generates a fresh ULID.\n\n## Bincode field-order invariant\n\nThis field is at **position 8** (last) — AFTER `tenant_id` (pos 6) and\n`expected_sha256` (pos 7). Bincode v2 (`config::standard()`) is positional:\ndeclaration order determines serialization order.\nNever move this field without updating all encoders.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "section_hint": {
+        "default": null,
+        "description": "Suggested section (optional — the curator may override).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tags": {
+        "default": [],
+        "description": "Initial tags (optional — the curator may add more).",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Target tenant (default `\"main\"`).",
+        "type": "string"
+      },
+      "title": {
+        "description": "Title of the note.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "title",
+      "body"
+    ],
+    "title": "VaultWriteRequest",
+    "type": "object"
+  }
+}

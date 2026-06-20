@@ -1,0 +1,14 @@
+[package]
+name = "gradatum-studio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "gradatum Studio web UI — React+TS bundle served at /ui/*"
+publish = false
+
+[lib]
+name = "gradatum_studio"
+path = "src/lib.rs"

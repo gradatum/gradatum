@@ -1,0 +1,45 @@
+[package]
+name = "gradatum-ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Code-ingest pipeline: tree-sitter parse → derived code symbols → index-only notes"
+readme = "README.md"
+
+# Feature flags
+# code-rust       : active le parser tree-sitter Rust (lien statique, build-time).
+#   Isolé dans ce crate pour ne pas polluer gradatum-admin ou gradatum-server
+#   avec la dépendance C tree-sitter-rust.
+# code-python     : active le parser tree-sitter Python (lien statique, build-time).
+#   Partage le core tree-sitter avec code-rust (dep:tree-sitter optionnel partagé).
+# code-bash       : active le parser tree-sitter Bash (lien statique, build-time).
+# code-typescript : active le parser tree-sitter TypeScript (lien statique, build-time).
+[features]
+default = ["code-rust"]
+code-rust       = ["dep:tree-sitter", "dep:tree-sitter-rust"]
+code-python     = ["dep:tree-sitter", "dep:tree-sitter-python"]
+code-bash       = ["dep:tree-sitter", "dep:tree-sitter-bash"]
+code-typescript = ["dep:tree-sitter", "dep:tree-sitter-typescript"]
+
+[dependencies]
+gradatum-core.workspace = true
+gradatum-index.workspace = true
+sha2.workspace          = true
+serde_json.workspace    = true
+thiserror.workspace     = true
+tracing.workspace       = true
+tree-sitter           = { version = "=0.26.9", optional = true }
+tree-sitter-rust      = { version = "=0.24.2", optional = true }
+tree-sitter-python    = { version = "=0.25.0", optional = true }
+tree-sitter-bash      = { version = "=0.25.1", optional = true }
+tree-sitter-typescript = { version = "=0.23.2", optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["full"] }
+tempfile.workspace = true

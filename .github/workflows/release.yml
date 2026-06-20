@@ -1,0 +1,216 @@
+name: Release
+
+# Déclenché sur un tag de version (ex. v0.3.6) ou manuellement pour test.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag de version (ex. v0.3.6) — laisser vide pour utiliser le SHA'
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-release:
+    name: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ───────────────────────────────────────────────────────────────────
+      # 1. Checkout
+      # ───────────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # ───────────────────────────────────────────────────────────────────
+      # 2. Toolchain Rust stable
+      # ───────────────────────────────────────────────────────────────────
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # ───────────────────────────────────────────────────────────────────
+      # 3. Cache cargo (registry + build artefacts release)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-
+
+      # ───────────────────────────────────────────────────────────────────
+      # 4. Dépendances système (aligné sur ci.yml)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y libsqlite3-dev
+
+      # ───────────────────────────────────────────────────────────────────
+      # 5. Build release — binaires distribués du workspace
+      #    Exclus : gradatum-bench (publish = false, outil benchmark interne)
+      #             gradatum-cli   (scaffold non-fonctionnel, main.rs = stub)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Build release binaries
+        run: |
+          cargo build --release \
+            --bin gradatum-server  \
+            --bin gradatum-worker  \
+            --bin gradatum-admin   \
+            --bin gradatum-mcp-stub \
+            --bin gradatum-gateway
+          # gradatum-engine binary is gated behind the `serve` feature
+          cargo build --release -p gradatum-engine --features serve --bin gradatum-engine
+
+      # ───────────────────────────────────────────────────────────────────
+      # 6. Déterminer le nom du tag (push tag ou workflow_dispatch)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Resolve tag name
+        id: tag
+        # Toutes les valeurs issues de github.event.inputs.* passent par
+        # des variables d'environnement pour éviter l'injection de commandes.
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_TAG}" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="dev-$(git rev-parse --short HEAD)"
+          fi
+          # Valider le format du tag (lettres, chiffres, tirets, points, dev-)
+          if ! printf '%s' "${TAG}" | grep -qE '^(v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?|dev-[0-9a-f]+)$'; then
+            echo "::error::Tag invalide : '${TAG}' — format attendu vX.Y.Z ou dev-<sha>"
+            exit 1
+          fi
+          echo "name=${TAG}" >> "$GITHUB_OUTPUT"
+
+      # ───────────────────────────────────────────────────────────────────
+      # 7. Packaging — 3 tarballs par rôle + SHA256SUMS commun
+      #
+      #    gradatum-server-<TAG>-x86_64 : server + worker + admin
+      #    gradatum-llm-<TAG>-x86_64    : gateway + engine
+      #    gradatum-mcp-<TAG>-x86_64    : mcp-stub
+      #    SHA256SUMS                   : couvre les 3 tarballs
+      # ───────────────────────────────────────────────────────────────────
+      - name: Package binaries
+        id: package
+        # Les sorties d'étapes passent par env: pour éviter l'injection.
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          TAG="${RELEASE_TAG}"
+          TARGET="x86_64-unknown-linux-gnu"
+          DIST="${GITHUB_WORKSPACE}/dist"
+          mkdir -p "${DIST}"
+
+          # ── Groupe server : gradatum-server + gradatum-worker + gradatum-admin ──
+          GROUP_SERVER="gradatum-server-${TAG}-${TARGET}"
+          mkdir -p "/tmp/${GROUP_SERVER}"
+          for BIN in gradatum-server gradatum-worker gradatum-admin; do
+            cp "target/release/${BIN}" "/tmp/${GROUP_SERVER}/"
+          done
+          (cd /tmp && tar -czf "${DIST}/${GROUP_SERVER}.tar.gz" "${GROUP_SERVER}/")
+
+          # ── Groupe llm : gradatum-gateway + gradatum-engine ──
+          GROUP_LLM="gradatum-llm-${TAG}-${TARGET}"
+          mkdir -p "/tmp/${GROUP_LLM}"
+          for BIN in gradatum-gateway gradatum-engine; do
+            cp "target/release/${BIN}" "/tmp/${GROUP_LLM}/"
+          done
+          (cd /tmp && tar -czf "${DIST}/${GROUP_LLM}.tar.gz" "${GROUP_LLM}/")
+
+          # ── Groupe mcp : gradatum-mcp-stub ──
+          GROUP_MCP="gradatum-mcp-${TAG}-${TARGET}"
+          mkdir -p "/tmp/${GROUP_MCP}"
+          cp "target/release/gradatum-mcp-stub" "/tmp/${GROUP_MCP}/"
+          (cd /tmp && tar -czf "${DIST}/${GROUP_MCP}.tar.gz" "${GROUP_MCP}/")
+
+          # ── SHA256SUMS couvrant les 3 tarballs ──
+          (cd "${DIST}" && sha256sum \
+            "${GROUP_SERVER}.tar.gz" \
+            "${GROUP_LLM}.tar.gz"    \
+            "${GROUP_MCP}.tar.gz"    \
+            > SHA256SUMS)
+
+          echo "dist=${DIST}" >> "$GITHUB_OUTPUT"
+
+      # ───────────────────────────────────────────────────────────────────
+      # 8. Attestation SLSA (provenance cryptographique) — 3 tarballs
+      #    subject-path accepte un glob (actions/attest-build-provenance v2)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      # ───────────────────────────────────────────────────────────────────
+      # 9. Extraire les notes de version depuis CHANGELOG.md
+      # ───────────────────────────────────────────────────────────────────
+      - name: Extract release notes
+        id: notes
+        # RELEASE_TAG passe par env: — jamais interpolé directement dans run:.
+        # VERSION est dérivé côté shell de RELEASE_TAG (sans interpolation GitHub).
+        # Le script Python reçoit VERSION via os.environ — pas d'injection possible.
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          TAG="${RELEASE_TAG}"
+          # Retire le préfixe "v" pour matcher le format CHANGELOG "[0.3.6]"
+          VERSION="${TAG#v}"
+
+          NOTES=$(VERSION="${VERSION}" python3 - <<'PYEOF'
+          import re, os
+
+          version = os.environ["VERSION"]
+          try:
+              with open("CHANGELOG.md", "r") as f:
+                  content = f.read()
+
+              # Cherche le bloc "## [X.Y.Z]" jusqu'au prochain "## ["
+              pattern = rf'## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## \[|\Z)'
+              m = re.search(pattern, content, re.DOTALL)
+              if m:
+                  block = m.group(1).strip()
+                  print(block if block else "See CHANGELOG.md for details.")
+              else:
+                  print("See CHANGELOG.md for details.")
+          except Exception:
+              print("See CHANGELOG.md for details.")
+          PYEOF
+          )  # fin python3
+
+          # Écrire dans un fichier pour éviter les problèmes d'échappement multilignes
+          printf '%s\n' "${NOTES}" > /tmp/release_notes.md
+          echo "notes_file=/tmp/release_notes.md" >> "$GITHUB_OUTPUT"
+
+      # ───────────────────────────────────────────────────────────────────
+      # 10. Créer la GitHub Release et attacher les artefacts
+      # ───────────────────────────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          body_path: ${{ steps.notes.outputs.notes_file }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS

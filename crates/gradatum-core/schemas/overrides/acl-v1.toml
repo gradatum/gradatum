@@ -1,0 +1,9 @@
+override_type = "acl"
+schema_version = 1
+owner_crate = "gradatum-acl-policy"
+phase = 2
+status = "experimental"
+
+[fields]
+
+[migration]

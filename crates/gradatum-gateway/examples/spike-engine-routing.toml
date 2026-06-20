@@ -1,0 +1,89 @@
+# Config de spike — câblage providers engine-curator / engine-embed avec fallback legacy.
+#
+# ATTENTION : ce fichier est un EXEMPLE — ne pas déployer tel quel.
+# Adaptez les ports et endpoints à votre déploiement.
+#
+# Architecture cible (spike) :
+#   gradatum-server → curator  : via alias "curator" gateway → engine-curator → fallback legacy-curator
+#   gradatum-server → embed    : via alias "embed" gateway → engine-embed → fallback legacy-embed
+#
+# Pour activer, gradatum-server.toml devrait pointer sur :8436 :
+#   [curator.llm]
+#   base_url = "http://localhost:8436"
+#   model = "curator"          # alias dans ce fichier
+#
+#   [embed]
+#   endpoint = "http://localhost:8436/v1/embeddings"
+#   model = "embed"            # alias dans ce fichier
+#
+# Les loopback 127.0.0.1:11435/11436 sont les endpoints gradatum-engine (spike POC).
+# Les loopback 127.0.0.1:8435/8431 sont des exemples d'endpoints legacy (à adapter).
+
+[server]
+listen = "127.0.0.1:8436"
+trust_localhost = true
+rate_limit_per_minute = 120
+circuit_threshold = 5
+circuit_window_secs = 60
+circuit_cooldown_secs = 30
+max_total_tokens = 0
+enable_slot_passthrough = false
+allowed_origins = []
+max_tools_per_request = 64
+
+[logging]
+level = "info"
+
+# ── Providers ────────────────────────────────────────────────────────────────
+
+# gradatum-engine chat (spike) — loopback générique
+[providers.engine-curator]
+endpoint = "http://127.0.0.1:11435"
+timeout_secs = 30
+
+# Legacy curator fallback (standalone LLM gateway)
+[providers.legacy-curator]
+endpoint = "http://127.0.0.1:8435"
+timeout_secs = 60
+# api_key_env = "GRADATUM_LLM_BEARER"   # décommenter si auth requise
+
+# gradatum-engine embed (spike) — loopback générique
+[providers.engine-embed]
+endpoint = "http://127.0.0.1:11436"
+timeout_secs = 10
+
+# Legacy embed fallback (standalone embeddings service)
+[providers.legacy-embed]
+endpoint = "http://127.0.0.1:8431"
+timeout_secs = 10
+
+# ── Aliases ──────────────────────────────────────────────────────────────────
+
+# Alias curator : engine primary → legacy fallback (texte seul, pas de vision)
+[aliases.curator]
+provider = "engine-curator"
+model = "curator-model"
+fallback_provider = "legacy-curator"
+fallback_model = "extract"
+# vision_capable = false  # défaut — ne pas activer pour les modèles texte
+
+# Alias embed : engine primary → legacy fallback
+[aliases.embed]
+provider = "engine-embed"
+model = "embed-model"
+fallback_provider = "legacy-embed"
+fallback_model = "bge-m3-Q8_0"
+# vision_capable = false  # défaut
+
+# Exemple d'alias vision (à adapter selon le backend mmproj disponible) :
+# [aliases.default-vl]
+# provider = "engine-vision"
+# model = "Qwen3-VL-30B-A3B-Instruct"
+# vision_capable = true   # OBLIGATOIRE pour router des requêtes images
+
+# ── VaultAware hook ───────────────────────────────────────────────────────────
+# Désactivé pour le spike (endpoint absent = no-op silencieux)
+# [vault_aware]
+# event_log_endpoint = "http://127.0.0.1:19090/api/v1/event-log"
+# batch_size = 10
+# flush_interval_secs = 5

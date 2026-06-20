@@ -1,0 +1,41 @@
+[package]
+name = "v1-parity-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Crate test-only — ne publie rien, pas de lib ni de bin.
+# Les tests vivent dans tests/*.rs (Cargo les découvre automatiquement).
+
+[dependencies]
+
+[dev-dependencies]
+gradatum-core    = { path = "../gradatum-core" }
+gradatum-markdown = { path = "../gradatum-markdown" }
+gradatum-cache   = { path = "../gradatum-cache" }
+gradatum-queue   = { path = "../gradatum-queue" }
+gradatum-chat    = { path = "../gradatum-chat" }
+gradatum-embed   = { path = "../gradatum-embed" }
+gradatum-index   = { path = "../gradatum-index" }
+gradatum-storage = { path = "../gradatum-storage" }
+gradatum-vault   = { path = "../gradatum-vault" }
+gradatum-curator = { path = "../gradatum-curator" }
+gradatum-worker  = { path = "../gradatum-worker" }
+# T12 — shape parity tests : gradatum-server lib + auth
+gradatum-server  = { path = "../gradatum-server" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite" }
+sqlx             = { workspace = true, features = ["sqlite", "runtime-tokio"] }
+gradatum-auth    = { path = "../gradatum-auth" }
+gradatum-acl-policy = { path = "../gradatum-acl-policy" }
+axum             = { workspace = true }
+reqwest          = { workspace = true }
+tempfile         = { workspace = true }
+tokio            = { workspace = true, features = ["full"] }
+chrono           = { workspace = true }
+smallvec         = { workspace = true }
+serde_json       = { workspace = true }
+async-trait      = { workspace = true }
+ulid             = { workspace = true }
+bincode          = { workspace = true }
+gradatum-dto     = { path = "../gradatum-dto" }

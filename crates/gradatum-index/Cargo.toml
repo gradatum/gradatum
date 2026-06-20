@@ -1,0 +1,41 @@
+[package]
+name = "gradatum-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite + FTS5 + drift detection Phase A — index layer Gradatum Phase 1"
+
+[dependencies]
+gradatum-core    = { workspace = true }
+gradatum-storage = { workspace = true }
+async-trait      = { workspace = true }
+rusqlite      = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+chrono        = { workspace = true }
+sha2          = { workspace = true }
+ulid          = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "rt"] }
+tracing       = { workspace = true }
+# ANN sqlite-vec (v0.5.3 ANN-1) — liée inconditionnellement pour compiler la static lib.
+# L'unsafe d'enregistrement (sqlite3_auto_extension) est délégué aux bin crates.
+# La feature gate `sqlite-vec-ann` conditionne uniquement les modules Rust qui
+# utilisent le module sqlite_vec (requêtes ANN, backfill). Sans la feature,
+# le symbole C est quand même lié (build.rs sqlite-vec compile sqlite_vec0)
+# mais les appels SQL sur vec0 retournent "no such module" si non chargé au runtime.
+sqlite-vec    = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["full"] }
+smallvec = { workspace = true }
+
+[features]
+# Active le module sqlite_vec (requêtes ANN sur note_embeddings_ann).
+# L'enregistrement de l'extension au runtime (unsafe sqlite3_auto_extension)
+# reste à la charge des bin crates ; cette feature n'implique aucun unsafe.
+sqlite-vec-ann = ["dep:sqlite-vec"]
