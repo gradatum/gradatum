@@ -21,6 +21,7 @@ mod code_scope;
 mod event_log;
 mod internal;
 mod lessons_recall;
+mod proactive_recall;
 mod session_trace;
 mod vault_classify;
 mod vault_context;
@@ -49,11 +50,15 @@ pub use code_scope::{
 };
 pub use event_log::{EventLogResponse, QaEventDto};
 pub use lessons_recall::{
-    LESSON_CLASSES, LessonHit, LessonsRecallRequest, LessonsRecallResponse, is_valid_lesson_class,
+    LESSON_CLASSES, LessonHit, LessonsRecallRequest, LessonsRecallResponse, RankMode,
+    is_valid_lesson_class,
+};
+pub use proactive_recall::{
+    ProactiveHit, ProactiveRecallFeedbackRequest, ProactiveRecallRequest, ProactiveRecallResponse,
 };
 pub use session_trace::{SessionTraceRequest, SessionTraceResponse};
 pub use vault_classify::{VaultClassifyRequest, VaultClassifyResponse};
-pub use vault_context::VaultContextRequest;
+pub use vault_context::{ContextMode, ScoringWeights, VaultContextRequest};
 pub use vault_downgrade::{NoteStatusPatch, VaultDowngradeRequest, VaultDowngradeResponse};
 pub use vault_forget::{
     ExcludedNote, ForgetPreview, ForgetScopeDto, ForgottenListResponse, ForgottenNoteEntry,

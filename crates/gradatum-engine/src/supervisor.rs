@@ -123,6 +123,8 @@ const ALLOWED_EXTRA_FLAGS: &[&str] = &[
     "-ctk",
     "--cache-type-v",
     "-ctv",
+    // Unified KV cache (required for prompt-cache LCP with --parallel ≥ 2 on llama.cpp b9780+)
+    "--kv-unified",
     // NUMA
     "--numa",
     // Logging
@@ -266,14 +268,14 @@ impl LlamaServerSupervisor {
 
         if config.child_port <= 1024 {
             return Err(EngineError::ModelLoad(format!(
-                "child_port {} invalide — doit être > 1024 (SP-P0-4)",
+                "child_port {} is invalid — must be > 1024 (SP-P0-4)",
                 config.child_port
             )));
         }
 
         if config.child_port == config.port {
             return Err(EngineError::ModelLoad(format!(
-                "child_port {} doit être différent de port {} — collision de port",
+                "child_port {} must differ from port {} — port collision",
                 config.child_port, config.port
             )));
         }
@@ -284,7 +286,7 @@ impl LlamaServerSupervisor {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()
-            .map_err(|e| EngineError::ModelLoad(format!("construction client HTTP : {e}")))?;
+            .map_err(|e| EngineError::ModelLoad(format!("failed to build HTTP client: {e}")))?;
 
         Ok(Arc::new(Self {
             child: Mutex::new(None),
@@ -345,13 +347,13 @@ impl LlamaServerSupervisor {
         inject_allowed_env(&mut cmd);
 
         let child = cmd.spawn().map_err(|e| {
-            EngineError::ModelLoad(format!("spawn llama-server échoué (bin={bin:?}) : {e}"))
+            EngineError::ModelLoad(format!("failed to spawn llama-server (bin={bin:?}): {e}"))
         })?;
 
         tracing::info!(
             child_port = self.child_port,
             model = %cfg.model_path,
-            "llama-server spawné (PID={})",
+            "llama-server spawned (PID={})",
             child.id().unwrap_or(0)
         );
 
@@ -378,7 +380,7 @@ impl LlamaServerSupervisor {
                 Ok(resp) if resp.status().is_success() => {
                     tracing::info!(
                         child_port = self.child_port,
-                        "llama-server prêt (HTTP {})",
+                        "llama-server ready (HTTP {})",
                         resp.status()
                     );
                     health.set_ready();
@@ -387,16 +389,14 @@ impl LlamaServerSupervisor {
                 Ok(resp) => {
                     tracing::debug!(
                         status = %resp.status(),
-                        "llama-server /health non-prêt, attente..."
+                        "llama-server /health not ready, waiting..."
                     );
                 }
                 Err(e) if is_connection_refused(&e) => {
-                    tracing::debug!(
-                        "llama-server /health : connection refused, démarrage en cours"
-                    );
+                    tracing::debug!("llama-server /health: connection refused, starting up");
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "llama-server /health : erreur poll");
+                    tracing::warn!(error = %e, "llama-server /health: poll error");
                 }
             }
             sleep(Duration::from_millis(500)).await;
@@ -404,7 +404,7 @@ impl LlamaServerSupervisor {
 
         tracing::error!(
             timeout_secs = self.config.startup_timeout_secs,
-            "llama-server n'a pas répondu dans le timeout de démarrage"
+            "llama-server did not respond within the startup timeout"
         );
         ChildState::StartupTimeout
     }
@@ -447,7 +447,7 @@ impl LlamaServerSupervisor {
 
         loop {
             if self.shutdown_requested.load(Ordering::Relaxed) {
-                tracing::info!("supervise_loop : shutdown demandé, sortie");
+                tracing::info!("supervise_loop: shutdown requested, exiting");
                 break;
             }
 
@@ -455,7 +455,7 @@ impl LlamaServerSupervisor {
                 let mut guard = self.child.lock().await;
                 match guard.as_mut() {
                     None => {
-                        tracing::warn!("supervise_loop : pas d'enfant à surveiller");
+                        tracing::warn!("supervise_loop: no child process to monitor");
                         break;
                     }
                     Some(child) => child.wait().await,
@@ -468,10 +468,10 @@ impl LlamaServerSupervisor {
 
             match exit_status {
                 Ok(status) => {
-                    tracing::warn!(status = ?status, "llama-server s'est arrêté");
+                    tracing::warn!(status = ?status, "llama-server exited");
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "erreur wait() sur llama-server");
+                    tracing::error!(error = %e, "wait() error on llama-server");
                 }
             }
 
@@ -483,7 +483,7 @@ impl LlamaServerSupervisor {
             if uptime_stable {
                 tracing::info!(
                     min_stable_secs = self.config.min_stable_uptime_secs,
-                    "uptime stable avant crash → reset budget + backoff"
+                    "stable uptime before crash — resetting budget and backoff"
                 );
                 restart_budget = self.config.child_restart_max;
                 backoff_ms = BACKOFF_INIT_MS;
@@ -495,7 +495,7 @@ impl LlamaServerSupervisor {
             if restart_budget == 0 {
                 tracing::error!(
                     max_restarts = self.config.child_restart_max,
-                    "llama-server : budget restart épuisé — moteur unhealthy (fallback gateway)"
+                    "llama-server: restart budget exhausted — engine unhealthy (fallback gateway)"
                 );
                 health.set_unhealthy();
                 break;
@@ -506,23 +506,26 @@ impl LlamaServerSupervisor {
             tracing::warn!(
                 backoff_ms = current_backoff,
                 restarts_remaining = restart_budget,
-                "llama-server : restart dans {}ms",
+                "llama-server: restarting in {}ms",
                 current_backoff
             );
             sleep(Duration::from_millis(current_backoff)).await;
 
             // Re-check AFTER the sleep, BEFORE spawn_child().
             if self.shutdown_requested.load(Ordering::Relaxed) {
-                tracing::info!("supervise_loop : shutdown pendant backoff, pas de respawn");
+                tracing::info!("supervise_loop: shutdown during backoff, skipping respawn");
                 break;
             }
 
             match self.spawn_child().await {
                 Ok(()) => {
-                    tracing::info!(restarts_remaining = restart_budget, "llama-server restarté");
+                    tracing::info!(
+                        restarts_remaining = restart_budget,
+                        "llama-server restarted"
+                    );
                     let child_state = self.wait_ready(&health).await;
                     if child_state == ChildState::StartupTimeout {
-                        tracing::error!("llama-server : timeout redémarrage — unhealthy");
+                        tracing::error!("llama-server: restart timed out — engine unhealthy");
                         health.set_unhealthy();
                         break;
                     }
@@ -530,7 +533,7 @@ impl LlamaServerSupervisor {
                     backoff_ms = (backoff_ms * 2).min(BACKOFF_MAX_MS);
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "llama-server : re-spawn échoué — unhealthy");
+                    tracing::error!(error = %e, "llama-server: re-spawn failed — engine unhealthy");
                     health.set_unhealthy();
                     break;
                 }
@@ -556,9 +559,9 @@ impl LlamaServerSupervisor {
             };
             let pgid = Pid::from_raw(pid as i32);
             if let Err(e) = killpg(pgid, Signal::SIGTERM) {
-                tracing::warn!(pid, error = %e, "SIGTERM vers process group de llama-server échoué");
+                tracing::warn!(pid, error = %e, "SIGTERM to llama-server process group failed");
             } else {
-                tracing::info!(pid, "SIGTERM envoyé à llama-server");
+                tracing::info!(pid, "SIGTERM sent to llama-server");
             }
         }
 
@@ -567,16 +570,16 @@ impl LlamaServerSupervisor {
 
         match result {
             Ok(Ok(status)) => {
-                tracing::info!(status = ?status, "llama-server terminé proprement");
+                tracing::info!(status = ?status, "llama-server shut down cleanly");
             }
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, "wait() après SIGTERM échoué — SIGKILL");
+                tracing::warn!(error = %e, "wait() after SIGTERM failed — SIGKILL");
                 let _ = child.kill().await;
             }
             Err(_timeout) => {
                 tracing::warn!(
                     grace_secs = SHUTDOWN_GRACE_SECS,
-                    "llama-server n'a pas répondu au SIGTERM — SIGKILL"
+                    "llama-server did not respond to SIGTERM — SIGKILL"
                 );
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -605,21 +608,54 @@ fn is_prefix_allowed(path_str: &str) -> bool {
         .any(|prefix| path_str.starts_with(prefix))
 }
 
+/// Returns `true` if `name` matches the allowed llama-server filename pattern.
+///
+/// Accepted forms:
+/// - `"llama-server"` — exact unversioned binary
+/// - `"llama-server-<suffix>"` — versioned wrapper where `<suffix>` is non-empty
+///   and consists solely of ASCII alphanumeric characters (e.g. `b9549`, `b9780`)
+///
+/// Rejected: `"llama-serverXYZ"` (glued, no dash separator), `"llama-server.bak"` (dot),
+/// `"llama-server-evil-shim"` (dash inside suffix), `"bash"`.
+///
+/// Internal helper — called only by [`is_binary_allowed`]. Pure, no filesystem access.
+fn is_llama_server_name(name: &str) -> bool {
+    match name.strip_prefix("llama-server") {
+        // exact "llama-server"
+        Some("") => true,
+        // "llama-server-<suffix>" — suffix must be non-empty ASCII alphanumeric only
+        Some(suffix) if suffix.starts_with('-') => {
+            let tail = &suffix[1..];
+            !tail.is_empty() && tail.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        _ => false,
+    }
+}
+
 /// Returns `true` if `path` passes both the allowlist prefix check **and** the filename check.
 ///
 /// Two cumulative conditions (both required):
 /// 1. The canonicalized path string starts with one of [`ALLOWED_BIN_PREFIXES`].
-/// 2. The final path component (`file_name()`) is **exactly** `"llama-server"`.
+/// 2. The final path component (`file_name()`) satisfies [`is_llama_server_name`]:
+///    exact `"llama-server"` or `"llama-server-<alphanum>"` versioned wrapper.
 ///
-/// Condition 2 prevents deep sub-path matches where a malicious binary is placed under
-/// an allowed prefix with an arbitrary name (e.g. `/opt/llama-b9549/bin/evil`).
+/// Non-UTF8 filenames are rejected fail-closed (`.to_str()` returns `None`).
+///
+/// The prefix guard (condition 1) remains the primary security control: only explicitly
+/// trusted directories are accepted, so a `llama-server-*` filename under an untrusted
+/// path is still rejected.
 ///
 /// Call on the canonicalized path (canonicalization must happen before this check — TOCTOU).
 fn is_binary_allowed(path: &Path) -> bool {
     let Some(file_name) = path.file_name() else {
         return false;
     };
-    if file_name != "llama-server" {
+    // Fail-closed on non-UTF8 filenames; then apply the strict name pattern.
+    if !file_name
+        .to_str()
+        .map(is_llama_server_name)
+        .unwrap_or(false)
+    {
         return false;
     }
     let Some(path_str) = path.to_str() else {
@@ -639,19 +675,19 @@ fn is_binary_allowed(path: &Path) -> bool {
 pub fn canonicalize_bin_path(bin: &Path) -> Result<PathBuf, EngineError> {
     let canonical = bin.canonicalize().map_err(|e| {
         EngineError::ModelLoad(format!(
-            "llama_server_bin canonicalize échoué ({bin:?}) : {e}"
+            "llama_server_bin canonicalize failed ({bin:?}): {e}"
         ))
     })?;
 
     let canonical_str = canonical
         .to_str()
-        .ok_or_else(|| EngineError::ModelLoad("llama_server_bin chemin non-UTF8".into()))?;
+        .ok_or_else(|| EngineError::ModelLoad("llama_server_bin path is non-UTF8".into()))?;
 
     if !is_binary_allowed(&canonical) {
         return Err(EngineError::ModelLoad(format!(
-            "llama_server_bin hors préfixe autorisé ou nom de fichier invalide \
-             ({canonical_str:?}) — préfixes acceptés : {ALLOWED_BIN_PREFIXES:?}, \
-             nom requis : llama-server (SP-P0-4)"
+            "llama_server_bin is outside the allowed prefix or has an invalid filename \
+             ({canonical_str:?}) — accepted prefixes: {ALLOWED_BIN_PREFIXES:?}, \
+             required name: must start with \"llama-server\" (SP-P0-4)"
         )));
     }
 
@@ -680,9 +716,10 @@ pub fn validate_extra_args(extra_args: &[String]) -> Result<(), EngineError> {
         let key = arg.split('=').next().unwrap_or(arg.as_str());
         if !ALLOWED_EXTRA_FLAGS.contains(&key) {
             return Err(EngineError::BadRequest(format!(
-                "extra_args : flag '{key}' non autorisé — \
-                 seuls les flags de l'allow-list ALLOWED_EXTRA_FLAGS sont acceptés. \
-                 Toute extension est une décision de sécurité explicite."
+                "extra_args: flag '{key}' is not allowed — \
+                 only allow-listed flags (ALLOWED_EXTRA_FLAGS) are accepted; \
+                 flags managed by dedicated config fields must use those fields \
+                 (e.g. gpu_layers for --n-gpu-layers)"
             )));
         }
     }
@@ -882,6 +919,16 @@ mod tests {
     fn extra_args_rejects_lora_path() {
         let result = validate_extra_args(&["--lora".into(), "/tmp/evil.bin".into()]);
         assert!(result.is_err(), "--lora doit être rejeté");
+    }
+
+    #[test]
+    fn extra_args_accepts_kv_unified() {
+        // --kv-unified est requis pour activer le prompt-cache LCP avec --parallel ≥ 2
+        // (llama.cpp b9780+). Extension explicite de l'allow-list — décision F-75 PERF.
+        assert!(
+            validate_extra_args(&["--kv-unified".into()]).is_ok(),
+            "--kv-unified doit être accepté (allow-list F-75 PERF)"
+        );
     }
 
     #[test]
@@ -1087,10 +1134,10 @@ mod tests {
         );
     }
 
-    /// Blocker 1 — initial_ready_at seedé : 1er crash après uptime stable → budget NON décrémenté.
+    /// When `initial_ready_at` is seeded: first crash after stable uptime → budget NOT decremented.
     ///
-    /// Vérifie que si last_ready_at est seedé avec un Instant "il y a 35s" (> 30s seuil),
-    /// le premier crash est classé "stable" et le budget est reset, pas décrémenté.
+    /// Verifies that if `last_ready_at` is seeded with an Instant "35 s ago" (> 30 s threshold),
+    /// the first crash is classified as "stable" and the budget is reset, not decremented.
     #[test]
     fn initial_ready_at_seed_prevents_false_flapping() {
         let config = make_test_config();
@@ -1127,9 +1174,9 @@ mod tests {
         );
     }
 
-    /// Blocker 1 — sans seed (last_ready_at = None) : premier crash classé flapping.
+    /// Without a seed (`last_ready_at = None`): first crash classified as flapping.
     ///
-    /// C'est le bug corrigé — sans seed, last_ready_at.is_none() → uptime_stable=false.
+    /// Without a seed, `last_ready_at.is_none()` → `uptime_stable=false`.
     #[test]
     fn without_seed_first_crash_is_flapping() {
         let last_ready_at: Option<Instant> = None; // pas de seed
@@ -1268,24 +1315,24 @@ mod tests {
 
     #[test]
     fn binary_allowed_rejects_wrong_filename() {
-        // B — suffixe exact : le composant final DOIT être "llama-server".
+        // Le composant final NE commence PAS par "llama-server" → rejeté.
         assert!(
             !is_binary_allowed(Path::new("/opt/llama-b9549/bin/evil-binary")),
-            "/opt/llama-b9549/bin/evil-binary doit être rejeté (file_name != llama-server)"
+            "/opt/llama-b9549/bin/evil-binary doit être rejeté (file_name sans préfixe llama-server)"
         );
         assert!(
-            !is_binary_allowed(Path::new("/usr/local/bin/llama-server-evil")),
-            "/usr/local/bin/llama-server-evil doit être rejeté (file_name != llama-server)"
+            !is_binary_allowed(Path::new("/opt/gradatum/bin/bash")),
+            "/opt/gradatum/bin/bash doit être rejeté (file_name != llama-server*)"
         );
         assert!(
-            !is_binary_allowed(Path::new("/opt/gradatum/bin/llama-serverx")),
-            "file_name doit être exact, pas un préfixe"
+            !is_binary_allowed(Path::new("/usr/local/bin/not-llama-server")),
+            "/usr/local/bin/not-llama-server doit être rejeté"
         );
     }
 
     #[test]
     fn binary_allowed_accepts_valid_paths() {
-        // Régression + nouveaux cas : préfixe OK + file_name=="llama-server".
+        // Régression : préfixe OK + file_name commence par "llama-server".
         assert!(
             is_binary_allowed(Path::new("/opt/llama-b9549/llama-server")),
             "/opt/llama-b9549/llama-server doit être accepté"
@@ -1305,6 +1352,24 @@ mod tests {
     }
 
     #[test]
+    fn binary_allowed_accepts_versioned_wrappers() {
+        // Régression F-75 : wrappers versionnés llama-server-b9549, llama-server-b9780
+        // dans /opt/gradatum/bin/ (préfixe autorisé).
+        assert!(
+            is_binary_allowed(Path::new("/opt/gradatum/bin/llama-server-b9549")),
+            "/opt/gradatum/bin/llama-server-b9549 doit être accepté (wrapper versionné)"
+        );
+        assert!(
+            is_binary_allowed(Path::new("/opt/gradatum/bin/llama-server-b9780")),
+            "/opt/gradatum/bin/llama-server-b9780 doit être accepté (wrapper versionné)"
+        );
+        assert!(
+            is_binary_allowed(Path::new("/usr/local/bin/llama-server-b9549")),
+            "/usr/local/bin/llama-server-b9549 doit être accepté"
+        );
+    }
+
+    #[test]
     fn binary_allowed_rejects_wrong_prefix_even_good_filename() {
         // Préfixe invalide même si file_name est correct.
         assert!(
@@ -1314,6 +1379,73 @@ mod tests {
         assert!(
             !is_binary_allowed(Path::new("/opt/evil/llama-server")),
             "/opt/evil/llama-server rejeté (préfixe invalide)"
+        );
+    }
+
+    // --- is_llama_server_name (helper strict — resserrement caveat security-reviewer) ---
+
+    #[test]
+    fn llama_server_name_accepts_exact_and_versioned() {
+        // Acceptés : exact + suffixes alphanum après tiret.
+        assert!(
+            is_llama_server_name("llama-server"),
+            "\"llama-server\" exact doit être accepté"
+        );
+        assert!(
+            is_llama_server_name("llama-server-b9549"),
+            "\"llama-server-b9549\" doit être accepté"
+        );
+        assert!(
+            is_llama_server_name("llama-server-b9780"),
+            "\"llama-server-b9780\" doit être accepté"
+        );
+        assert!(
+            is_llama_server_name("llama-server-1234"),
+            "\"llama-server-1234\" (numérique pur) doit être accepté"
+        );
+    }
+
+    #[test]
+    fn llama_server_name_rejects_collated_and_invalid_suffixes() {
+        // Rejetés : collé (pas de tiret), point, tiret interne dans suffix, nom quelconque.
+        assert!(
+            !is_llama_server_name("llama-serverXYZ"),
+            "\"llama-serverXYZ\" (collé sans tiret) doit être rejeté"
+        );
+        assert!(
+            !is_llama_server_name("llama-server.bak"),
+            "\"llama-server.bak\" (point) doit être rejeté"
+        );
+        assert!(
+            !is_llama_server_name("llama-server-evil-shim"),
+            "\"llama-server-evil-shim\" (tiret dans le suffixe) doit être rejeté"
+        );
+        assert!(!is_llama_server_name("bash"), "\"bash\" doit être rejeté");
+        assert!(
+            !is_llama_server_name("llama-server-"),
+            "\"llama-server-\" (tiret terminal sans suffixe) doit être rejeté"
+        );
+    }
+
+    #[test]
+    fn binary_allowed_rejects_collated_and_invalid_suffixes() {
+        // is_binary_allowed doit propager le resserrement is_llama_server_name
+        // même sous un préfixe autorisé.
+        assert!(
+            !is_binary_allowed(Path::new("/opt/gradatum/bin/llama-serverXYZ")),
+            "/opt/gradatum/bin/llama-serverXYZ (collé) doit être rejeté"
+        );
+        assert!(
+            !is_binary_allowed(Path::new("/opt/gradatum/bin/llama-server.bak")),
+            "/opt/gradatum/bin/llama-server.bak (point) doit être rejeté"
+        );
+        assert!(
+            !is_binary_allowed(Path::new("/opt/gradatum/bin/llama-server-evil-shim")),
+            "/opt/gradatum/bin/llama-server-evil-shim (tiret dans suffixe) doit être rejeté"
+        );
+        assert!(
+            !is_binary_allowed(Path::new("/usr/local/bin/bash")),
+            "/usr/local/bin/bash doit être rejeté"
         );
     }
 

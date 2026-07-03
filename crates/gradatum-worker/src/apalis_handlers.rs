@@ -59,11 +59,12 @@ use toml::Value as TomlValue;
 use gradatum_core::{
     CurateSpec, DryRunAware, EmbedSpec, ForgetScope, GradatumJob, Job, JobClass, JobLifecycle,
     JobLineage, JobMode, JobOutput, JobPriority, JobRecord, JobRetry, JobScheduling, JobScope,
-    JobSpec, JobStatus, QueueStore, TriggerSource,
+    JobSpec, JobStatus, QueueStore, TriggerSource, ValidateSpec,
     author::AuthorRef,
     frontmatter::{ExtraFields, Frontmatter},
     identity::{ContentHash, NoteId},
     index::AnchorSrc,
+    job_kind_str,
     scope::VaultId,
     section::{Section, section_to_doc_kind},
     status::NoteStatus,
@@ -215,6 +216,33 @@ pub async fn handle_curate(
                 .get_note(&id_str)
                 .await
                 .map_err(|e| HandlerError::Business(format!("read_note: {e}")))?;
+
+            // Guard P1-A (audit reviewer v0.7.3, sécu A2/C6) : section=identity → no-op.
+            //
+            // Une âme est gérée exclusivement via vault_write + injection MCP (F-34 v0.7.3).
+            // La laisser passer dans le curator risque de :
+            //   1. Re-sectionner la note hors `identity` (changement ACL, perte protection).
+            //   2. Clobber le title canonique `identity/<agent>` via extract_h1_title.
+            //
+            // Retourner un JobOutput vide (no-op) préserve section + title intacts.
+            if existing_dto.section == "identity" {
+                tracing::info!(
+                    job_id = %job.record.id,
+                    note_id = %spec.note_id,
+                    "curate: note identity — reclassification ignorée (no-op F-34 v0.7.3)"
+                );
+                return Ok(JobOutput {
+                    notes_created: vec![],
+                    notes_modified: vec![],
+                    files: vec![],
+                    result_note_md: format!(
+                        "curate: note identity {} — reclassification no-op \
+                         (section protégée F-34 v0.7.3)",
+                        spec.note_id
+                    ),
+                });
+            }
+
             let title_for_curator = gradatum_curator::extract_h1_title(&existing_dto.body)
                 .unwrap_or_else(|| existing_dto.section.clone());
             let curator_note = gradatum_curator::Note {
@@ -310,29 +338,63 @@ pub async fn handle_curate(
                     provenance,
                 )
             };
-            let (curate_anchor_ms, curate_anchor_src, curate_doc_kind, curate_valid_until_ms) =
+            // Ancre temporelle — correctif C-1 (P1, 2026-06-29).
+            // `doc_kind` est partagé entre les deux branches (factorisé hors if/else).
+            let curate_doc_kind = section_to_doc_kind(
+                &section_from_str(&curate_section_str).unwrap_or(Section::Reference),
+            )
+            .to_string();
+            // `Option<(anchor_ms, anchor_src)>` :
+            //   Some(_) → écriture TemporalEntryDto dans persist_curated.
+            //   None    → court-circuit : INSERT OR REPLACE non exécuté → ancre existante préservée.
+            let curate_temporal_opt: Option<(i64, AnchorSrc)> =
                 if let Some(_existing_note_id) = note_id_for_vault {
-                    // For reclassification we don't have a full note — use created default
-                    (
-                        Utc::now().timestamp_millis(),
-                        AnchorSrc::Created,
-                        section_to_doc_kind(
-                            &section_from_str(&curate_section_str).unwrap_or(Section::Reference),
-                        )
-                        .to_string(),
-                        None::<i64>,
-                    )
+                    // Reclassification/RMW (C-1) : honorer occurred_at si fourni (symétrie CREATE).
+                    // Sans occurred_at : court-circuit (temporal: None) → zéro clobber de l'ancre
+                    // existante dans temporal_index (INSERT OR REPLACE non déclenché).
+                    // ECON: lecture préalable temporal_index évitée (+1 DB read inutile ici).
+                    // Une note sans entrée préalable et sans occurred_at reste sans entrée
+                    // (temporal_index optionnel). Upgrade: lire l'entrée existante pour fallback
+                    // Created précis si ce besoin devient réel.
+                    spec.occurred_at.as_ref().map(|occ| {
+                        let mut extra_for_anchor = ExtraFields::empty();
+                        extra_for_anchor
+                            .insert("occurred_at".to_string(), toml::Value::String(occ.clone()));
+                        let created_ms = Utc::now().timestamp_millis();
+                        resolve_temporal_anchor(&extra_for_anchor, created_ms)
+                    })
                 } else {
-                    // For vault_write path, temporal data will be computed post-write by server
-                    (
-                        Utc::now().timestamp_millis(),
-                        AnchorSrc::Created,
-                        section_to_doc_kind(
-                            &section_from_str(&curate_section_str).unwrap_or(Section::Reference),
-                        )
-                        .to_string(),
-                        None::<i64>,
-                    )
+                    // vault_write path (CREATE + RMW update in-place) — correctif C-1 (P1, REV.2).
+                    //
+                    // Discriminateur CREATE vs RMW : `curate_expected_sha256` (hérite de
+                    // spec.expected_sha256 déjà consommé ci-dessus par ContentHash).
+                    //   None = CREATE (ULID neuf, pas de lock optimiste)
+                    //   Some = RMW UPDATE (lock optimiste, API rejette sans sha)
+                    //
+                    // Contrat (spec design 2026-06-29-c1-temporal-anchor-preservation-design.md) :
+                    //   1. occurred_at fourni  → resolve_temporal_anchor (SSOT). Vaut CREATE et RMW.
+                    //   2. occurred_at absent + RMW (sha Some) → court-circuit (temporal: None).
+                    //      L'ancre existante dans temporal_index est préservée ; INSERT OR REPLACE
+                    //      non déclenché. ECON: discriminateur sha évite toute lecture temporal_index.
+                    //   3. occurred_at absent + CREATE (sha None) → (now(), Created). Comportement
+                    //      historique préservé pour la création neuve.
+                    if let Some(occ) = &spec.occurred_at {
+                        // Cas 1 : occurred_at fourni — ancre événementielle.
+                        // Valeur TOML::String (Datetime INTERDIT — frontmatter.rs:63).
+                        let mut extra_for_anchor = ExtraFields::empty();
+                        extra_for_anchor
+                            .insert("occurred_at".to_string(), toml::Value::String(occ.clone()));
+                        let created_ms = Utc::now().timestamp_millis();
+                        Some(resolve_temporal_anchor(&extra_for_anchor, created_ms))
+                    } else if curate_expected_sha256.is_some() {
+                        // Cas 2 : RMW sans occurred_at → court-circuit (C-1 fix).
+                        // temporal: None → persist_curated ne déclenche pas write_temporal_entry.
+                        None
+                    } else {
+                        // Cas 3 : CREATE sans occurred_at → (now(), Created).
+                        let created_ms = Utc::now().timestamp_millis();
+                        Some(resolve_temporal_anchor(&ExtraFields::empty(), created_ms))
+                    }
                 };
             let note_id_str = spec.note_id.to_string();
             // B5 wikilinks — résolution parallèle AVANT persist_curated (non-fatale).
@@ -351,11 +413,11 @@ pub async fn handle_curate(
                 status: curate_status_str,
                 trust: curate_trust,
                 expected_sha256: curate_expected_sha256,
-                temporal: Some(TemporalEntryDto {
-                    anchor_ms: curate_anchor_ms,
-                    anchor_src: curate_anchor_src.as_db_str().to_string(),
+                temporal: curate_temporal_opt.map(|(anchor_ms, anchor_src)| TemporalEntryDto {
+                    anchor_ms,
+                    anchor_src: anchor_src.as_db_str().to_string(),
                     doc_kind: curate_doc_kind,
-                    valid_until_ms: curate_valid_until_ms,
+                    valid_until_ms: None,
                 }),
                 links,
                 provenance: curate_provenance,
@@ -1432,6 +1494,7 @@ pub async fn handle_distill(
     client: Data<Arc<dyn InternalClient>>,
     embedder: Data<Arc<dyn Embedder + Send + Sync>>,
     synthesizer: Data<Arc<dyn DistillSynthesizer + Send + Sync>>,
+    queue: Data<Arc<dyn QueueStore>>,
 ) -> Result<JobOutput, HandlerError> {
     // ── Spec extraction — first instruction ──────────────────────────────────
     let spec = match &job.record.spec.kind {
@@ -1566,11 +1629,8 @@ pub async fn handle_distill(
         return Ok(JobOutput::dry_run(clusters.len(), &description));
     }
 
-    // ── Real mode: synthesis + PendingReview write per cluster ───────────────
+    // ── Real mode: synthesis per cluster → enqueue Job::Validate ────────────
     let mut notes_created: Vec<ulid::Ulid> = Vec::new();
-    let mut notes_modified: Vec<ulid::Ulid> = Vec::new();
-    // Source-marking failure counter (visible in the job summary).
-    let mut mark_failures: usize = 0;
 
     for cluster in &clusters {
         // Cluster notes (titles + bodies for synthesis).
@@ -1624,6 +1684,11 @@ pub async fn handle_distill(
                 trust_map.insert(src.0, t);
             }
         }
+        // Snapshot source trusts before trust_map is moved into MapTrustLookup.
+        let source_trusts: Vec<f32> = source_ids
+            .iter()
+            .map(|n| trust_map.get(&n.0).copied().unwrap_or(0.6))
+            .collect();
         let lookup = MapTrustLookup(trust_map);
         let trust = gradatum_core::provenance::compute_distill_trust(
             &source_ids.iter().map(|n| n.0).collect::<Vec<_>>(),
@@ -1631,74 +1696,48 @@ pub async fn handle_distill(
             confidence_threshold,
         );
 
-        // Write synthesis note via server persist_distill (handles vault + title + trust).
-        let synth_id_str = synth_id.to_string();
-        let persist_req = PersistDistillRequest {
-            note_id: synth_id_str.clone(),
+        // Build the validation payload and hand off to Job::Validate.
+        // Persistence (note write + source marking) is delegated to handle_validate.
+        let validate_spec = ValidateSpec {
+            note_id: synth_id.0,
             tenant_id: vault_id.clone(),
             title: synthesis.title.clone(),
             body: synthesis.body.clone(),
-            section: "reference".to_string(),
-            trust: Some(trust),
-            expected_sha256: None,
-            mark_processed: false,
-            derived_into: None,
-            derived_from: source_ids.iter().map(|id| id.to_string()).collect(),
+            source_ids: source_ids.iter().map(|n| n.0).collect(),
+            // Bodies of source notes — needed by the quality scorer (num/entity penalties).
+            source_texts: cluster_pairs.iter().map(|(_, b)| b.clone()).collect(),
+            // Trusts pre-snapshotted above from trust_map before it was moved.
+            source_trusts,
+            base_trust: trust,
+            threshold: ValidateSpec::default_threshold(),
         };
-        match client.persist_distill(&persist_req).await {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(HandlerError::Business(format!(
-                    "distill: write synthèse: {e}"
-                )));
-            }
+        let record = build_validate_job_record(validate_spec, &vault_id, job.record.id);
+        if let Err(e) = queue.enqueue(record).await {
+            tracing::warn!(
+                note_id = %synth_id,
+                error = %e,
+                "distill: enqueue Job::Validate failed — synthesis not validated (best-effort)"
+            );
+        } else {
+            notes_created.push(synth_id.0);
         }
-        notes_created.push(synth_id.0);
-
-        // ── Mark sources: processed=true + derived-into ───────────────────────
-        for src_id in &source_ids {
-            match client
-                .persist_distill(&PersistDistillRequest {
-                    note_id: src_id.to_string(),
-                    tenant_id: vault_id.clone(),
-                    title: String::new(),
-                    body: String::new(),
-                    section: String::new(),
-                    trust: None,
-                    expected_sha256: None,
-                    mark_processed: true,
-                    derived_into: Some(synth_id_str.clone()),
-                    derived_from: vec![],
-                })
-                .await
-            {
-                Ok(_) => notes_modified.push(src_id.0),
-                Err(e) => {
-                    mark_failures += 1;
-                    tracing::warn!(note_id = %src_id, error = %e, "distill: marquage source échoué — non fatal");
-                }
-            }
-        }
+        // Source `processed` marking is moved into handle_validate.
     }
 
     tracing::info!(
         job_id = %job.record.id,
         clusters = clusters.len(),
-        notes_created = notes_created.len(),
-        sources_marked = notes_modified.len(),
-        mark_failures = mark_failures,
+        enqueued = notes_created.len(),
         "distill: terminé"
     );
 
-    let created_count = notes_created.len();
-    let modified_count = notes_modified.len();
+    let enqueued_count = notes_created.len();
     Ok(JobOutput {
         notes_created,
-        notes_modified,
+        notes_modified: vec![],
         files: vec![],
         result_note_md: format!(
-            "distill: {} cluster(s) → {created_count} synthèse(s) PendingReview, \
-             {modified_count} source(s) marquée(s) processed, mark_failures: {mark_failures}",
+            "distill: {} cluster(s) → {enqueued_count} synthèse(s) enqueued for validation",
             clusters.len()
         ),
     })
@@ -1831,6 +1870,64 @@ fn build_embed_job_record(
     }
 }
 
+/// Builds a [`JobRecord`] for a `Job::Validate(ValidateSpec)` job (F-43).
+///
+/// Mirrors `build_embed_job_record` and the pattern of `build_curate_job_record` in
+/// `gradatum-server/src/api_v1/write.rs`.
+///
+/// The tenant is already embedded in `spec.tenant_id`; the `_tenant` parameter is
+/// retained for interface symmetry with the other build helpers.
+///
+/// # Parameters
+///
+/// - `spec`: Full [`ValidateSpec`] carrying the synthesis payload + source metadata.
+/// - `_tenant`: tenant string (already in `spec.tenant_id` — interface symmetry only).
+/// - `parent_id`: ULID of the parent distill job (`lineage.parent_job`).
+pub fn build_validate_job_record(
+    spec: ValidateSpec,
+    _tenant: &str,
+    parent_id: ulid::Ulid,
+) -> JobRecord {
+    let now = Utc::now();
+    let class = JobClass::Agent;
+    JobRecord {
+        id: ulid::Ulid::new(),
+        spec: JobSpec {
+            kind: Job::Validate(spec),
+            class,
+            mode: JobMode::Batch,
+            scope: JobScope::VaultWide,
+            priority: JobPriority::High,
+        },
+        scheduling: JobScheduling {
+            trigger: TriggerSource::Demand,
+            scheduled_at: now,
+            // Must be empty — the cascade engine is not yet implemented in gradatum_queue.rs.
+            // A non-empty await_jobs would leave this job stuck in Waiting indefinitely.
+            await_jobs: vec![],
+            deadline: None,
+            cron_expr: None,
+        },
+        lifecycle: JobLifecycle {
+            status: JobStatus::Pending,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+            lease_until: None,
+            result: None,
+        },
+        retry: JobRetry::default(),
+        lineage: JobLineage {
+            triggered_by: None,
+            parent_job: Some(parent_id),
+            pipeline_id: None,
+            pipeline_step: None,
+            children: vec![],
+            cost_usd: None,
+        },
+    }
+}
+
 /// Converts a kebab-case section string into a `Section` enum via `serde_json`.
 ///
 /// Returns `None` if the string is not a valid canonical section.
@@ -1926,16 +2023,18 @@ fn build_frontmatter_from_spec(
 
 /// Parses an `ExtraFields` field as a UTC epoch in milliseconds.
 ///
-/// Accepted formats:
+/// Accepted formats (delegated to the SSOT [`gradatum_core::parse_temporal_str_as_ms`]):
 /// - ISO 8601 / RFC 3339 (with time): `2024-03-15T10:00:00Z`
 /// - Date-only YYYY-MM-DD → start of day UTC: `2024-03-15`
+///
+/// Non-`String` `toml::Value` variants (Integer, Float, etc.) are rejected (`None`)
+/// per the JCS constraint on `ExtraFields` — only the String case delegates to the SSOT.
 ///
 /// Returns `None` if the field is absent, non-`String`, or malformed.
 ///
 /// # Side effects
 ///
 /// None. Pure function.
-#[allow(dead_code)]
 pub(crate) fn parse_extra_field_as_ms(extra: &ExtraFields, key: &str) -> Option<i64> {
     let val = extra.get(key)?;
     let s = match val {
@@ -1943,20 +2042,10 @@ pub(crate) fn parse_extra_field_as_ms(extra: &ExtraFields, key: &str) -> Option<
         // Non-String formats (Integer, Float, etc.) → ignored (JCS constraint)
         _ => return None,
     };
-    // Attempt RFC 3339 (with time)
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp_millis());
-    }
-    // Attempt date-only YYYY-MM-DD → start of day UTC
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        use chrono::TimeZone as _;
-        let dt = chrono::Utc.from_utc_datetime(
-            &d.and_hms_opt(0, 0, 0)
-                .expect("hms(0,0,0) est un horaire valide — ne peut pas échouer"),
-        );
-        return Some(dt.timestamp_millis());
-    }
-    None
+    // Délègue au SSOT partagé serveur+worker — garantit la parité des formats acceptés.
+    // Un format accepté par le serveur (HTTP 202) DOIT produire le même résultat ici
+    // pour éviter un fallback silencieux anchor_src=Created dans le worker.
+    gradatum_core::parse_temporal_str_as_ms(s)
 }
 
 /// Resolves the temporal anchor of a note according to the field priority order.
@@ -1980,7 +2069,6 @@ pub(crate) fn parse_extra_field_as_ms(extra: &ExtraFields, key: &str) -> Option<
 /// # Side effects
 ///
 /// None. Pure function.
-#[allow(dead_code)]
 pub(crate) fn resolve_temporal_anchor(extra: &ExtraFields, created_ms: i64) -> (i64, AnchorSrc) {
     if let Some(ms) = parse_extra_field_as_ms(extra, "occurred_at") {
         return (ms, AnchorSrc::OccurredAt);
@@ -2026,6 +2114,213 @@ pub(crate) fn extract_valid_until(extra: &ExtraFields, anchor_ms: i64) -> Option
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Handler — Job::Validate (F-43)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Deterministic validation gate for a distilled note before persistence.
+///
+/// Computes a quality_score (grounding × f17 × f47 × num/entity penalties); if the score
+/// is below `spec.threshold`, the note is stored with degraded trust and the `quality-low`
+/// tag. The gate is **non-blocking**: any scoring error falls back to `base_trust` so no
+/// note is ever lost due to an embedder failure.
+///
+/// # Steps
+///
+/// 1. Compute quality via [`compute_quality`] (embedder + heuristics).
+/// 2. Determine disposition: `pass` (score ≥ threshold) or `degrade`.
+/// 3. Persist synthesis note via `client.persist_distill` (mark_processed=false).
+/// 4. Mark each source processed=true + derived-into (non-fatal on per-source failure).
+///
+/// # Errors
+///
+/// Returns [`HandlerError::Business`] if the synthesis persist call fails.
+pub async fn handle_validate(
+    job: GradatumJob,
+    client: Data<Arc<dyn InternalClient>>,
+    embedder: Data<Arc<dyn Embedder + Send + Sync>>,
+) -> Result<JobOutput, HandlerError> {
+    let spec = match &job.record.spec.kind {
+        Job::Validate(s) => s.clone(),
+        other => {
+            return Err(HandlerError::Business(format!(
+                "validate: unexpected variant {}",
+                job_kind_str(other)
+            )));
+        }
+    };
+
+    // Cross-tenant guard: terminally reject if tenant ≠ main (defense-in-depth).
+    ensure_main_tenant(&spec.tenant_id)?;
+
+    // Grounding + score — best-effort; any error ⇒ neutral score (pass, no note loss).
+    let (quality, mode) = match compute_quality(&embedder, &spec).await {
+        Ok(q) => (q, "ok"),
+        Err(e) => {
+            tracing::warn!(note_id = %spec.note_id, error = %e,
+                "validate: degraded scoring — falling back to base trust");
+            (
+                crate::quality_score::QualityScore {
+                    score: 1.0, // neutral: pass, no degradation
+                    grounding: -1.0,
+                    num_penalty: 1.0,
+                    entity_penalty: 1.0,
+                },
+                "degraded",
+            )
+        }
+    };
+
+    let pass = quality.score >= spec.threshold;
+    let (final_trust, tags) = if pass {
+        (spec.base_trust, Vec::new())
+    } else {
+        (
+            (spec.base_trust * quality.score).clamp(0.0, 1.0),
+            vec!["quality-low".to_string()],
+        )
+    };
+
+    tracing::info!(
+        note_id = %spec.note_id,
+        quality_score = quality.score,
+        grounding = quality.grounding,
+        num_penalty = quality.num_penalty,
+        entity_penalty = quality.entity_penalty,
+        base_trust = spec.base_trust,
+        final_trust,
+        disposition = if pass { "accept" } else { "degrade" },
+        grounding_mode = mode,
+        "validate: quality_score"
+    );
+
+    // Persist the synthesis note.
+    let persist_req = PersistDistillRequest {
+        note_id: spec.note_id.to_string(),
+        tenant_id: spec.tenant_id.clone(),
+        title: spec.title.clone(),
+        body: spec.body.clone(),
+        section: "reference".to_string(),
+        trust: Some(final_trust),
+        expected_sha256: None,
+        mark_processed: false,
+        derived_into: None,
+        derived_from: spec.source_ids.iter().map(|id| id.to_string()).collect(),
+        tags,
+    };
+    if let Err(e) = client.persist_distill(&persist_req).await {
+        return Err(HandlerError::Business(format!(
+            "validate: persist synthesis: {e}"
+        )));
+    }
+
+    // Mark sources processed=true + derived-into (non-fatal per source).
+    let synth_id_str = spec.note_id.to_string();
+    let mut modified = Vec::new();
+    for src_id in &spec.source_ids {
+        if let Err(e) = client
+            .persist_distill(&PersistDistillRequest {
+                note_id: src_id.to_string(),
+                tenant_id: spec.tenant_id.clone(),
+                title: String::new(),
+                body: String::new(),
+                section: String::new(),
+                trust: None,
+                expected_sha256: None,
+                mark_processed: true,
+                derived_into: Some(synth_id_str.clone()),
+                derived_from: vec![],
+                tags: vec![],
+            })
+            .await
+        {
+            tracing::warn!(note_id = %src_id, error = %e, "validate: source marking failed — non-fatal");
+        } else {
+            // src_id: &Ulid; Ulid is Copy — use dereference, not .0 (which yields u128).
+            modified.push(*src_id);
+        }
+    }
+
+    Ok(JobOutput {
+        notes_created: vec![spec.note_id],
+        notes_modified: modified,
+        files: vec![],
+        result_note_md: format!(
+            "validate: note {} — score {:.3} → {}",
+            spec.note_id,
+            quality.score,
+            if pass {
+                "accept"
+            } else {
+                "degrade(quality-low)"
+            }
+        ),
+    })
+}
+
+/// Compute the quality_score for a distilled note: embedding grounding + temporal
+/// recency (f17) + source trust (f47) + numeric / entity penalties.
+///
+/// Returns `Err(String)` on any embedder failure; the caller falls back to neutral score.
+async fn compute_quality(
+    embedder: &Arc<dyn Embedder + Send + Sync>,
+    spec: &ValidateSpec,
+) -> Result<crate::quality_score::QualityScore, String> {
+    if spec.source_texts.is_empty() {
+        return Err("no source to compare against".to_string());
+    }
+
+    let synth_emb = embedder
+        .embed(&spec.body)
+        .await
+        .map_err(|e| e.to_string())?;
+    let src_refs: Vec<&str> = spec.source_texts.iter().map(String::as_str).collect();
+    let src_embs = embedder
+        .embed_batch(&src_refs)
+        .await
+        .map_err(|e| e.to_string())?;
+    let centroid = crate::quality_score::centroid(&src_embs);
+
+    // f17: mean of recency_factor over source ULID timestamps.
+    // Formula mirrors gradatum_search::scoring::recency_factor (dep not wired to this crate).
+    // half-life ≈ 69 days (LAMBDA = 0.01 day⁻¹).
+    let now_ms = Utc::now().timestamp_millis();
+    let f17 = if spec.source_ids.is_empty() {
+        1.0f32
+    } else {
+        const LAMBDA: f64 = 0.01;
+        const MS_PER_DAY: f64 = 86_400_000.0;
+        let sum: f64 = spec
+            .source_ids
+            .iter()
+            .map(|id| {
+                let created_ms = id.timestamp_ms() as i64;
+                let delta_ms = (now_ms - created_ms).max(0);
+                (-LAMBDA * (delta_ms as f64 / MS_PER_DAY)).exp()
+            })
+            .sum();
+        (sum / spec.source_ids.len() as f64) as f32
+    };
+
+    // f47: mean of source trust scores.
+    let f47 = if spec.source_trusts.is_empty() {
+        0.6f32
+    } else {
+        spec.source_trusts.iter().sum::<f32>() / spec.source_trusts.len() as f32
+    };
+
+    Ok(crate::quality_score::score_quality(
+        &crate::quality_score::QualityInputs {
+            synth_embedding: &synth_emb,
+            source_centroid: &centroid,
+            synth_body: &spec.body,
+            source_texts: &spec.source_texts,
+            f17_sources: f17,
+            f47_sources: f47,
+        },
+    ))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Unit tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2036,7 +2331,7 @@ mod tests {
     use gradatum_core::{
         CurateSpec, EmbedSpec, GradatumJob, Job, JobClass, JobLifecycle, JobLineage, JobMode,
         JobPriority, JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, PurgeSpec,
-        ReIndexMode, TriggerSource,
+        ReIndexMode, TriggerSource, ValidateSpec,
     };
     use ulid::Ulid;
 
@@ -2124,10 +2419,10 @@ mod tests {
         assert!(job.record.is_dry_run());
     }
 
-    /// handle_reindex en mode Batch retourne Err(HandlerError::Business) — jamais Ok.
+    /// `handle_reindex` in Batch mode returns `Err(HandlerError::Business)` — never `Ok`.
     ///
-    /// Les modes FtsOnly/MissingOnly/VectorsOnly/Full sont tous différés en v0.4.x.
-    /// Le handler rejette explicitement le job pour éviter un Ok silencieux trompeur.
+    /// All modes (FtsOnly/MissingOnly/VectorsOnly/Full) are deferred.
+    /// The handler explicitly rejects the job to avoid a silent misleading `Ok`.
     #[tokio::test]
     async fn handle_reindex_batch_returns_err_not_implemented() {
         use gradatum_embed::Noop;
@@ -2323,7 +2618,7 @@ mod tests {
 
     // ── Tests Job::Purge ──────────────────────────────────────────────────────
 
-    /// DryRunAware::is_dry_run() détecte JobMode::DryRun pour Job::Purge.
+    /// `DryRunAware::is_dry_run()` detects `JobMode::DryRun` for `Job::Purge`.
     #[tokio::test]
     async fn purge_dry_run_via_job_mode_is_detected() {
         let job = make_job(
@@ -2340,7 +2635,7 @@ mod tests {
         );
     }
 
-    /// spec.dry_run=true (défaut) active le dry-run même en mode Batch.
+    /// `spec.dry_run=true` (default) activates dry-run even in Batch mode.
     #[tokio::test]
     async fn purge_dry_run_via_spec_is_detected() {
         let job = make_job(
@@ -2359,16 +2654,16 @@ mod tests {
         );
     }
 
-    /// Job::Purge avec variant inattendu → HandlerError::UnexpectedVariant.
+    /// `Job::Purge` with an unexpected variant → `HandlerError::UnexpectedVariant`.
     ///
-    /// Vérifie le guard variant : Job::Backup ≠ Job::Purge.
+    /// Verifies the variant guard: `Job::Backup` ≠ `Job::Purge`.
     #[tokio::test]
     async fn purge_unexpected_variant_is_not_purge() {
         let job = make_job(Job::Backup, JobMode::Batch);
         assert!(!matches!(&job.record.spec.kind, Job::Purge(_)));
     }
 
-    /// PurgeSpec::default() : valeurs prudentes par défaut.
+    /// `PurgeSpec::default()`: conservative default values.
     #[test]
     fn purge_spec_default_values_in_handler_tests() {
         let spec = PurgeSpec::default();
@@ -2392,7 +2687,7 @@ mod tests {
         );
     }
 
-    /// Priorité occurred_at > event-date > valid_from > created.
+    /// Priority: `occurred_at` > `event-date` > `valid_from` > `created`.
     #[test]
     fn resolve_temporal_anchor_priority_occurred_at_wins() {
         let mut extra = ExtraFields::empty();
@@ -2425,7 +2720,7 @@ mod tests {
         assert_eq!(ms, expected, "anchor_ms doit correspondre à occurred_at");
     }
 
-    /// Priorité : sans occurred_at, event-date prend le relais.
+    /// Without `occurred_at`, `event-date` takes precedence.
     #[test]
     fn resolve_temporal_anchor_priority_event_date_second() {
         let mut extra = ExtraFields::empty();
@@ -2446,7 +2741,7 @@ mod tests {
         );
     }
 
-    /// Priorité : sans occurred_at ni event-date, valid_from prend le relais.
+    /// Without `occurred_at` or `event-date`, `valid_from` takes precedence.
     #[test]
     fn resolve_temporal_anchor_priority_valid_from_third() {
         let mut extra = ExtraFields::empty();
@@ -2463,7 +2758,7 @@ mod tests {
         );
     }
 
-    /// Format date seule YYYY-MM-DD accepté et parsé comme début du jour UTC.
+    /// A date-only string `YYYY-MM-DD` is accepted and parsed as the start of that UTC day.
     #[test]
     fn resolve_temporal_anchor_date_only_format() {
         let mut extra = ExtraFields::empty();
@@ -2485,7 +2780,7 @@ mod tests {
         assert_eq!(ms, expected, "date seule → début du jour UTC");
     }
 
-    /// Format invalide → fallback silencieux vers champ inférieur ou created.
+    /// An invalid format silently falls back to the next lower-priority field or `created`.
     #[test]
     fn resolve_temporal_anchor_invalid_format_falls_back() {
         let mut extra = ExtraFields::empty();
@@ -2508,7 +2803,7 @@ mod tests {
         assert_eq!(ms, created_ms, "anchor_ms doit être created_ms en fallback");
     }
 
-    /// Champ ExtraFields non-String (Integer) → ignoré, fallback vers created.
+    /// A non-`String` `ExtraFields` value (e.g. `Integer`) is ignored; falls back to `created`.
     #[test]
     fn resolve_temporal_anchor_non_string_value_ignored() {
         let mut extra = ExtraFields::empty();
@@ -2525,7 +2820,7 @@ mod tests {
         assert_eq!(ms, created_ms);
     }
 
-    /// AnchorSrc::as_db_str() retourne les chaînes canoniques attendues par la migration 0013.
+    /// `AnchorSrc::as_db_str()` returns the canonical strings expected by migration 0013.
     #[test]
     fn anchor_src_as_db_str_canonical_values() {
         assert_eq!(AnchorSrc::OccurredAt.as_db_str(), "occurred_at");
@@ -2536,7 +2831,7 @@ mod tests {
 
     // ── Tests Lot 1 — extraction valid_until (v0.5.1) ────────────────────────
 
-    /// Cas a — note sans `valid_until` → `None`.
+    /// No `valid_until` field → `None`.
     #[test]
     fn extract_valid_until_absent_returns_none() {
         let extra = ExtraFields::empty();
@@ -2545,7 +2840,7 @@ mod tests {
         assert!(result.is_none(), "sans valid_until → None");
     }
 
-    /// Cas b — `valid_until` futur par rapport à anchor → Some(ms).
+    /// `valid_until` in the future relative to `anchor` → `Some(ms)`.
     #[test]
     fn extract_valid_until_future_returns_some() {
         let mut extra = ExtraFields::empty();
@@ -2563,7 +2858,7 @@ mod tests {
         assert_eq!(result.unwrap(), expected);
     }
 
-    /// Cas b — format date seule YYYY-MM-DD accepté pour valid_until.
+    /// Date-only `YYYY-MM-DD` format accepted for `valid_until`.
     #[test]
     fn extract_valid_until_date_only_format() {
         let mut extra = ExtraFields::empty();
@@ -2583,7 +2878,7 @@ mod tests {
         assert_eq!(result.unwrap(), expected);
     }
 
-    /// Cas f — `valid_until ≤ anchor` → None + warn (fenêtre invalide ignorée).
+    /// `valid_until ≤ anchor` → `None` (invalid window, silently ignored).
     #[test]
     fn extract_valid_until_equal_to_anchor_returns_none() {
         let mut extra = ExtraFields::empty();
@@ -2608,7 +2903,7 @@ mod tests {
         );
     }
 
-    /// Cas f — `valid_until < anchor` → None (fenêtre invalide).
+    /// `valid_until < anchor` → `None` (invalid window).
     #[test]
     fn extract_valid_until_before_anchor_returns_none() {
         let mut extra = ExtraFields::empty();
@@ -2625,7 +2920,7 @@ mod tests {
         );
     }
 
-    /// Format invalide pour valid_until → None (fallback silencieux).
+    /// Invalid `valid_until` format → `None` (silent fallback).
     #[test]
     fn extract_valid_until_invalid_format_returns_none() {
         let mut extra = ExtraFields::empty();
@@ -2635,5 +2930,82 @@ mod tests {
         );
         let result = extract_valid_until(&extra, 1_000i64);
         assert!(result.is_none(), "format invalide → None");
+    }
+
+    // ── Tests parité SSOT serveur/worker ────────────────────────────────────
+
+    /// `parse_extra_field_as_ms` delegates to `gradatum_core::parse_temporal_str_as_ms` —
+    /// formats accepted by the server (HTTP 202) produce exactly the same millisecond
+    /// values as those accepted by the worker, eliminating any risk of a silent
+    /// `anchor_src=Created` fallback after a server 202 response.
+    #[test]
+    fn parse_extra_field_as_ms_ssot_parity_rfc3339_and_date_only() {
+        let formats = [
+            "2026-01-15T10:00:00Z",
+            "2026-01-15T00:00:00+00:00",
+            "2026-01-15",
+        ];
+        for s in formats {
+            let mut extra = ExtraFields::empty();
+            extra.insert("occurred_at".to_string(), TomlValue::String(s.to_string()));
+            let worker_result = parse_extra_field_as_ms(&extra, "occurred_at");
+            let server_result = gradatum_core::parse_temporal_str_as_ms(s);
+            assert_eq!(
+                worker_result, server_result,
+                "parité worker/serveur échouée pour le format `{s}`"
+            );
+            assert!(
+                worker_result.is_some(),
+                "format `{s}` doit être accepté par les deux couches"
+            );
+        }
+    }
+
+    // ── Tests F-43 build_validate_job_record ─────────────────────────────────
+
+    /// build_validate_job_record produces kind=Validate with an empty await_jobs.
+    #[test]
+    fn validate_job_record_has_validate_kind() {
+        let spec = ValidateSpec {
+            note_id: Ulid::new(),
+            tenant_id: "main".to_string(),
+            title: "test title".to_string(),
+            body: "test body".to_string(),
+            source_ids: vec![],
+            source_texts: vec![],
+            source_trusts: vec![],
+            base_trust: 0.6,
+            threshold: ValidateSpec::default_threshold(),
+        };
+        let rec = build_validate_job_record(spec, "main", Ulid::new());
+        assert_eq!(
+            gradatum_core::job::job_kind_str(&rec.spec.kind),
+            "Validate",
+            "job kind must be Validate"
+        );
+        assert!(
+            matches!(rec.scheduling.await_jobs.as_slice(), []),
+            "await_jobs must be empty (cascade engine not yet implemented)"
+        );
+    }
+
+    /// Invalid format → both layers return `None` (SSOT parity on rejections).
+    #[test]
+    fn parse_extra_field_as_ms_ssot_parity_invalid_returns_none() {
+        let invalids = ["pas-une-date", "", "2026-13-45"];
+        for s in invalids {
+            let mut extra = ExtraFields::empty();
+            extra.insert("occurred_at".to_string(), TomlValue::String(s.to_string()));
+            let worker_result = parse_extra_field_as_ms(&extra, "occurred_at");
+            let server_result = gradatum_core::parse_temporal_str_as_ms(s);
+            assert_eq!(
+                worker_result, server_result,
+                "parité rejet worker/serveur échouée pour `{s}`"
+            );
+            assert!(
+                worker_result.is_none(),
+                "format invalide `{s}` → None attendu"
+            );
+        }
     }
 }

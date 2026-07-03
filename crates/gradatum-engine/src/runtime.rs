@@ -84,7 +84,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::{net::TcpListener, sync::Mutex};
 
-    /// Démarre un stub qui CAPTURE le body brut reçu et renvoie une réponse fixe + content-type.
+    /// Starts a stub that CAPTURES the raw request body and returns a fixed response + content-type.
     async fn start_capture_stub(
         path: &'static str,
         status: u16,

@@ -1,10 +1,11 @@
 //! C3 caveat: bind/TLS validation must fail-closed when binding non-loopback w/o TLS.
 
 use gradatum_server::config::{
-    AclConfig, AuthConfig, ConfigError, CuratorConfig, EmbedConfig, EventLogConfig, HttpConfig,
-    LogConfig, RateLimitConfig, ScoringConfig, SearchConfig, ServerConfig, SessionTraceConfig,
-    StorageConfig, StudioConfig, TlsConfig,
+    AclConfig, AuthConfig, ConfigError, ContextConfig, CuratorConfig, EmbedConfig, EventLogConfig,
+    HttpConfig, LogConfig, RateLimitConfig, ReviewPromoteConfig, ScoringConfig, SearchConfig,
+    ServerConfig, SessionTraceConfig, StorageConfig, StudioConfig, TlsConfig,
 };
+use gradatum_server::proactive_recall::ProactiveRecallConfig;
 use std::path::PathBuf;
 
 fn cfg(bind: &str, tls: Option<TlsConfig>) -> ServerConfig {
@@ -44,6 +45,9 @@ fn cfg(bind: &str, tls: Option<TlsConfig>) -> ServerConfig {
         studio: StudioConfig::default(),
         internal_api: gradatum_server::config::InternalApiConfig::default(),
         search: SearchConfig::default(),
+        review_promote: ReviewPromoteConfig::default(),
+        context: ContextConfig::default(),
+        proactive_recall: ProactiveRecallConfig::default(),
     }
 }
 

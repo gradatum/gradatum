@@ -6,6 +6,7 @@
 //!
 //! Only types actually used in this crate are included.
 
+pub mod anthropic;
 pub mod chat;
 pub mod circuit_breaker;
 pub mod embeddings;

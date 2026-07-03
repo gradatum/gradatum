@@ -379,7 +379,7 @@ mod vault_id_parse_tests {
 mod locus_parse_tests {
     use super::*;
 
-    /// F-37 S1.4 — `LocusId::parse` accepte les locus valides.
+    /// `LocusId::parse` accepts well-formed locus strings.
     #[test]
     fn locus_parse_accepts_valid() {
         for ok in ["knowledge", "knowledge/rust", "a", "a-b/c-d/e9", "x/y/z"] {
@@ -387,7 +387,7 @@ mod locus_parse_tests {
         }
     }
 
-    /// F-37 S1.4 — rejette vide, charset interdit, traversal, slash terminal, trop long.
+    /// `LocusId::parse` rejects empty, forbidden charset, path traversal, trailing slash, and over-length inputs.
     #[test]
     fn locus_parse_rejects_invalid() {
         let bad = [

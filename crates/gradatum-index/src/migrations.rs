@@ -102,6 +102,30 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0021_project_map_section_backfill",
         include_str!("../migrations/0021_project_map_section_backfill.sql"),
     ),
+    (
+        "0022_proactive_surface",
+        include_str!("../migrations/0022_proactive_surface.sql"),
+    ),
+    (
+        "0023_proactive_recall_sessions",
+        include_str!("../migrations/0023_proactive_recall_sessions.sql"),
+    ),
+    (
+        "0024_identity_section_backfill",
+        include_str!("../migrations/0024_identity_section_backfill.sql"),
+    ),
+    (
+        "0025_identity_title_backfill",
+        include_str!("../migrations/0025_identity_title_backfill.sql"),
+    ),
+    (
+        "0026_scheduled_task_health",
+        include_str!("../migrations/0026_scheduled_task_health.sql"),
+    ),
+    (
+        "0027_metric_sample",
+        include_str!("../migrations/0027_metric_sample.sql"),
+    ),
 ];
 
 /// Migrations dont l'application nécessite une extension SQLite chargée.

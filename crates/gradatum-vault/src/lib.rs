@@ -93,6 +93,29 @@ pub trait Registry: Send + Sync {
         note_id: &str,
     ) -> Result<gradatum_core::note::Note, gradatum_core::error::GradatumError>;
 
+    /// Indicates whether a note is present in the index, regardless of the on-disk `.md`.
+    ///
+    /// Distinguishes a **phantom** note (index entry present but `.md` file absent —
+    /// `read_note_by_id` returns `NoteNotFound`) from a **genuinely new** note (never
+    /// indexed). Used by the server overwrite guard to reject a
+    /// `vault_write { note_id = phantom, expected_sha256 = Some }` (the `expected_sha256`
+    /// cannot be matched against any content) instead of silently bypassing the
+    /// optimistic lock downstream.
+    ///
+    /// ## Default
+    ///
+    /// `Ok(false)` — a registry without a real index (placeholder) knows no note.
+    ///
+    /// ## Errors
+    ///
+    /// - `GradatumError::Storage` if the index query fails.
+    async fn note_indexed(
+        &self,
+        _note_id: &str,
+    ) -> Result<bool, gradatum_core::error::GradatumError> {
+        Ok(false)
+    }
+
     /// Lists the timestamps (Unix ms) of historical snapshots for a note.
     ///
     /// Returns a `Vec<i64>` sorted in ascending order (oldest first).
@@ -290,6 +313,21 @@ impl Registry for Vault {
                 hash
             )),
         })
+    }
+
+    async fn note_indexed(
+        &self,
+        note_id: &str,
+    ) -> Result<bool, gradatum_core::error::GradatumError> {
+        // Existence index-level (table `notes`), indépendante de la présence du `.md`.
+        // `get_note_status` renvoie `Some(_)` pour toute ligne présente (fantôme inclus),
+        // `None` si la note n'est pas indexée. Le `tenant_id` du vault est l'autorité
+        // de scoping — cohérent avec `read_note_by_id`/`write_note_with_id` (sans tenant).
+        let status = self
+            .index
+            .get_note_status(self.tenant_id.as_str(), note_id)
+            .await?;
+        Ok(status.is_some())
     }
 
     async fn history_versions(

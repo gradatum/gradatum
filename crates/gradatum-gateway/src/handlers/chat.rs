@@ -301,7 +301,10 @@ pub async fn handler(
 /// deterministically skipped and an explicit 503 is returned.
 /// A text-only fallback without an mmproj model would produce silently wrong output
 /// on a content-array image. Deterministic skip is the only safe guarantee.
-async fn dispatch_with_fallback(
+///
+/// `pub(crate)` : partagé avec `handlers::messages` pour éviter la duplication
+/// de la logique de dispatch (ADN 3 Factorisé).
+pub(crate) async fn dispatch_with_fallback(
     state: &AppState,
     body: ChatCompletionRequest,
     alias: &crate::config::AliasTarget,
@@ -401,6 +404,138 @@ async fn dispatch_with_fallback(
             }
         }
     }
+}
+
+/// Dispatches an OpenAI chunk stream with fallback — returns the raw `ChatCompletionStream`.
+///
+/// Unlike `dispatch_with_fallback`, this function returns the chunk stream
+/// **before** SSE serialization. It is intended for the `messages.rs` handler,
+/// which re-translates chunks into the Anthropic SSE event format.
+///
+/// # Differences from `dispatch_with_fallback`
+/// - Returns `LlmResult<(ChatCompletionStream, String)>` (`stream`, `model_used`)
+/// - No slot-passthrough support (opaque format, incompatible with re-translation)
+/// - Vision gate included (same semantics as `dispatch_with_fallback`)
+///
+/// `pub(crate)`: shared with `handlers::messages`.
+pub(crate) async fn dispatch_stream_with_fallback(
+    state: &AppState,
+    body: ChatCompletionRequest,
+    alias: &crate::config::AliasTarget,
+    has_image: bool,
+) -> Result<(crate::commons::provider::ChatCompletionStream, String), ApiError> {
+    let primary_result =
+        try_provider_stream(state, body.clone(), &alias.provider, &alias.model).await;
+
+    match primary_result {
+        Ok(stream) => {
+            // FIX 1 : débloquer le circuit breaker HalfOpen sur succès stream primaire.
+            state
+                .providers
+                .circuit_breakers
+                .record_success(&alias.provider);
+            Ok((stream, alias.model.clone()))
+        }
+        Err(e) if !is_backend_error(&e) => Err(e),
+        Err(primary_err) => {
+            if let ApiError::Backend(ref llm_err) = primary_err {
+                state
+                    .providers
+                    .circuit_breakers
+                    .record_failure(&alias.provider, llm_err);
+            }
+
+            // Vision gate : même sémantique que dispatch_with_fallback.
+            if has_image {
+                tracing::warn!(
+                    primary = %alias.provider,
+                    error = %primary_err,
+                    "primary vision provider échoué (stream) — fallback skipé"
+                );
+                return Err(ApiError::ServiceUnavailable {
+                    message: format!(
+                        "vision provider '{}' unavailable, no vision-capable fallback",
+                        alias.provider
+                    ),
+                });
+            }
+
+            let Some(fb_provider) = &alias.fallback_provider else {
+                return Err(primary_err);
+            };
+
+            let fb_model = alias.fallback_model.as_deref().unwrap_or(&alias.model);
+            tracing::warn!(
+                primary = %alias.provider,
+                fallback = %fb_provider,
+                error = %primary_err,
+                "primary provider échoué (stream) — tentative fallback"
+            );
+
+            let fb_result = try_provider_stream(state, body, fb_provider, fb_model).await;
+            match fb_result {
+                Ok(stream) => {
+                    tracing::info!(fallback = %fb_provider, "fallback provider OK (stream)");
+                    // FIX 1 : débloquer le circuit breaker HalfOpen sur succès stream fallback.
+                    state.providers.circuit_breakers.record_success(fb_provider);
+                    Ok((stream, fb_model.to_string()))
+                }
+                Err(fb_err) => {
+                    tracing::warn!(
+                        fallback = %fb_provider,
+                        error = %fb_err,
+                        "fallback provider également échoué (stream)"
+                    );
+                    // FIX 1 : comptabiliser l'échec du fallback stream dans le circuit breaker.
+                    if let ApiError::Backend(ref llm_err) = fb_err {
+                        state
+                            .providers
+                            .circuit_breakers
+                            .record_failure(fb_provider, llm_err);
+                    }
+                    Err(fb_err)
+                }
+            }
+        }
+    }
+}
+
+/// Tente un appel streaming à un provider spécifique.
+///
+/// Retourne le `ChatCompletionStream` brut (avant sérialisation SSE).
+/// Ne supporte pas le slot-passthrough (format opaque incompatible).
+///
+/// # Errors
+/// - `ApiError::Backend(LlmError::ProviderUnavailable)` si le circuit breaker est ouvert.
+/// - `ApiError::ProviderNotFound` si le provider est absent de la config.
+/// - `ApiError::Backend(...)` si le provider retourne une erreur.
+async fn try_provider_stream(
+    state: &AppState,
+    mut body: ChatCompletionRequest,
+    provider_name: &str,
+    model: &str,
+) -> Result<crate::commons::provider::ChatCompletionStream, ApiError> {
+    if !state.providers.circuit_breakers.should_allow(provider_name) {
+        tracing::warn!(
+            provider = %provider_name,
+            "circuit breaker ouvert (stream)"
+        );
+        return Err(ApiError::Backend(LlmError::ProviderUnavailable {
+            provider: provider_name.to_string(),
+            reason: "circuit breaker ouvert".to_string(),
+        }));
+    }
+
+    body.model = model.to_string();
+    body.stream = Some(true);
+
+    let provider = state
+        .providers
+        .get(provider_name)
+        .ok_or_else(|| ApiError::ProviderNotFound(provider_name.to_string()))?;
+
+    let stream = provider.stream(body).await?;
+    Ok(stream)
 }
 
 fn is_backend_error(e: &ApiError) -> bool {
@@ -702,6 +837,7 @@ mod tests {
             gateway: HashMap::new(),
             logging: LoggingConfig::default(),
             vault_aware: VaultAwareConfig::default(),
+            messages: Default::default(),
         };
 
         AppState::for_test(config)

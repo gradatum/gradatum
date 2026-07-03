@@ -26,7 +26,8 @@ use tempfile::TempDir;
 use async_trait::async_trait;
 use gradatum_dto::{
     EmbeddingOkResponse, PersistCuratedRequest, PersistDistillRequest, PersistEmbeddingRequest,
-    PersistForgetRequest, PersistOkResponse,
+    PersistForgetRequest, PersistOkResponse, VaultClassifyRequest, VaultDowngradeRequest,
+    VaultWriteRequest,
 };
 use gradatum_worker::internal_client::{
     EmbeddingReadDto, InternalClientError, NoteIdDto, NoteReadDto,
@@ -298,103 +299,67 @@ impl InternalClient for TestClient {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-/// Payload bincode pour VaultWriteRequest — miroir de `gradatum_dto::VaultWriteRequest`.
+/// Encode un `VaultWriteRequest` en payload bincode (sans note_id préalloué).
 ///
-/// INVARIANT D'ORDRE (bincode positionnel — pas de noms de champs) :
-/// pos 6 = `tenant_id`, pos 7 = `expected_sha256`, pos 8 = `note_id`.
-/// Ne jamais modifier l'ordre sans aligner `dispatch.rs` + `gradatum-dto`.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-struct WriteReq {
-    title: String,
-    body: String,
-    #[serde(default)]
-    author: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    section_hint: Option<String>,
-    #[serde(default = "default_main_write")]
-    tenant_id: String,
-    #[serde(default)]
-    expected_sha256: Option<String>,
-    /// ULID préalloué (optionnel — alignement bug C v0.3.7).
-    #[serde(default)]
-    note_id: Option<String>,
-}
-
-fn default_main_write() -> String {
-    "main".into()
-}
-
-/// Encode un VaultWriteRequest en payload bincode (sans note_id préalloué).
+/// Utilise le VRAI `gradatum_dto::VaultWriteRequest` — pas de miroir local.
+/// Tout nouveau champ dans le DTO est automatiquement synchronisé ici.
 fn encode_write_payload(title: &str, body: &str, section_hint: Option<&str>) -> Vec<u8> {
-    let req = WriteReq {
-        title: title.into(),
-        body: body.into(),
+    let req = VaultWriteRequest {
+        title: title.to_string(),
+        body: body.to_string(),
         author: None,
         tags: vec![],
         section_hint: section_hint.map(|s| s.to_string()),
-        tenant_id: "main".into(),
+        tenant_id: "main".to_string(),
         expected_sha256: None,
         note_id: None,
+        occurred_at: None,
     };
-    bincode::serde::encode_to_vec(&req, bincode_std()).unwrap()
+    bincode::serde::encode_to_vec(&req, bincode_std()).expect("encode VaultWriteRequest bincode")
 }
 
-/// Encode un VaultWriteRequest avec `note_id` préalloué — test alignement bug C.
+/// Encode un `VaultWriteRequest` avec `note_id` préalloué — test alignement bug C.
+///
+/// Utilise le VRAI `gradatum_dto::VaultWriteRequest` — pas de miroir local.
 fn encode_write_payload_with_note_id(title: &str, body: &str, note_id: &str) -> Vec<u8> {
-    let req = WriteReq {
-        title: title.into(),
-        body: body.into(),
+    let req = VaultWriteRequest {
+        title: title.to_string(),
+        body: body.to_string(),
         author: None,
         tags: vec![],
         section_hint: None,
-        tenant_id: "main".into(),
+        tenant_id: "main".to_string(),
         expected_sha256: None,
         note_id: Some(note_id.to_string()),
+        occurred_at: None,
     };
-    bincode::serde::encode_to_vec(&req, bincode_std()).unwrap()
+    bincode::serde::encode_to_vec(&req, bincode_std())
+        .expect("encode VaultWriteRequest with note_id bincode")
 }
 
-/// Encode un VaultClassifyRequest en payload bincode.
+/// Encode un `VaultClassifyRequest` en payload bincode.
+///
+/// Utilise le VRAI `gradatum_dto::VaultClassifyRequest` — pas de miroir local.
 fn encode_classify_payload(note_id: &str) -> Vec<u8> {
-    #[derive(serde::Serialize, serde::Deserialize, Debug)]
-    struct ClassifyReq {
-        note_id: String,
-        #[serde(default = "default_main")]
-        tenant_id: String,
-    }
-    fn default_main() -> String {
-        "main".into()
-    }
-    let req = ClassifyReq {
-        note_id: note_id.into(),
-        tenant_id: "main".into(),
+    let req = VaultClassifyRequest {
+        note_id: note_id.to_string(),
+        tenant_id: "main".to_string(),
     };
-    bincode::serde::encode_to_vec(&req, bincode_std()).unwrap()
+    bincode::serde::encode_to_vec(&req, bincode_std()).expect("encode VaultClassifyRequest bincode")
 }
 
-/// Encode un VaultDowngradeRequest en payload bincode.
+/// Encode un `VaultDowngradeRequest` en payload bincode.
+///
+/// Utilise le VRAI `gradatum_dto::VaultDowngradeRequest` — pas de miroir local.
 fn encode_downgrade_payload(note_id: &str, reason: &str) -> Vec<u8> {
-    #[derive(serde::Serialize, serde::Deserialize, Debug)]
-    struct DowngradeReq {
-        note_id: String,
-        reason: String,
-        #[serde(default)]
-        replaced_by: Option<String>,
-        #[serde(default = "default_main")]
-        tenant_id: String,
-    }
-    fn default_main() -> String {
-        "main".into()
-    }
-    let req = DowngradeReq {
-        note_id: note_id.into(),
-        reason: reason.into(),
+    let req = VaultDowngradeRequest {
+        note_id: note_id.to_string(),
+        reason: reason.to_string(),
         replaced_by: None,
-        tenant_id: "main".into(),
+        tenant_id: "main".to_string(),
     };
-    bincode::serde::encode_to_vec(&req, bincode_std()).unwrap()
+    bincode::serde::encode_to_vec(&req, bincode_std())
+        .expect("encode VaultDowngradeRequest bincode")
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

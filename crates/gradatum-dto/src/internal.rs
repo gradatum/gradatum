@@ -115,6 +115,13 @@ pub struct PersistDistillRequest {
     /// `mark_processed = false`). Inséré dans les ExtraFields de la note.
     #[serde(default)]
     pub derived_from: Vec<String>,
+    /// Tags to apply to the note frontmatter on creation (e.g. `["quality-low"]`).
+    ///
+    /// Applied only when the note does not yet exist in the vault (first call).
+    /// On an existing note, tags are preserved as-is (non-destructive update).
+    /// Passed through `parse_tags` (normalize + deduplicate).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Entrée temporelle inline — évite l'import de `TemporalEntry` core dans le DTO.

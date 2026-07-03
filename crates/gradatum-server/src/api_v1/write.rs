@@ -133,6 +133,9 @@ pub(crate) fn build_curate_job_record(
                 section_hint: req.section_hint.clone(),
                 // F-41 — hash attendu pour l'optimistic-lock (None = inconditionnel).
                 expected_sha256,
+                // F-74 — ancre temporelle événementielle (None = created, comportement historique).
+                // Déjà validée par vault_write_impl avant cet appel (400 si invalide).
+                occurred_at: req.occurred_at.clone(),
             }),
             class,
             mode: JobMode::Batch,
@@ -272,6 +275,87 @@ pub(crate) async fn emit_write_rejection_audit(
     };
     if let Err(e) = state.audit.record(evt).await {
         tracing::warn!(error = %e, outcome = outcome, "audit emit vault_write_rejected échoué");
+    }
+}
+
+/// Emits a `write_check_category_section` audit event when a section-category drift is detected.
+///
+/// **Non-bloquant par construction** (WARN-ONLY ABSOLU) — cette fonction ne peut jamais
+/// faire échouer un `vault_write`. Sink I/O errors sont non-fatales (logged WARN).
+///
+/// Fournit une trace SIEM distincte de `vault_write_rejected` (les dérives sont des
+/// avertissements, pas des rejets) — outcome = `"drift:<CAT>→expected:<section>"`.
+pub(crate) async fn emit_drift_audit(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant_id: &str,
+    request_id: &str,
+    warning: &gradatum_core::write_check::DriftWarning,
+) {
+    let evt = HttpAuditEvent {
+        ts: chrono::Utc::now(),
+        event: "write_check_category_section".into(),
+        actor: actor_from_trust(trust),
+        tenant_id: tenant_id.into(),
+        locus: format!("{}/main", tenant_id),
+        note_id: None,
+        content_hash: None,
+        outcome: format!(
+            "drift:{}→expected:{}",
+            warning.category, warning.expected_section
+        ),
+        curator: Some(serde_json::json!({
+            "rule": warning.rule,
+            "category": warning.category,
+            "expected_section": warning.expected_section,
+            "actual_section": warning.actual_section,
+        })),
+        request_id: request_id.into(),
+    };
+    if let Err(e) = state.audit.record(evt).await {
+        tracing::warn!(
+            error = %e,
+            rule = warning.rule,
+            "audit emit write_check_drift échoué — non fatal"
+        );
+    }
+}
+
+/// Emits a `vault_read_rejected` audit event when a read-restrictive guard denies a read.
+///
+/// Symmetric counterpart to [`emit_write_rejection_audit`]: traces denied reads of
+/// access-restricted sections (currently `identity`, since v0.7.3 — the soul of an agent
+/// is private) so that cross-agent soul read attempts leave a SIEM trail.
+///
+/// - `outcome`: distinct reason code (e.g. `identity_read_denied_foreign_agent`) for
+///   SIEM correlation.
+/// - `note_id`: the resolved note id whose read was denied, `None` if unavailable.
+///
+/// A fresh request id is generated because the read path carries no `X-Request-ID`
+/// correlation header. Sink I/O errors are non-fatal — logged at WARN and not
+/// propagated (the handler still returns the 403 even if the audit write fails).
+pub(crate) async fn emit_read_rejection_audit(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant_id: &str,
+    locus: &str,
+    outcome: &str,
+    note_id: Option<String>,
+) {
+    let evt = HttpAuditEvent {
+        ts: chrono::Utc::now(),
+        event: "vault_read_rejected".into(),
+        actor: actor_from_trust(trust),
+        tenant_id: tenant_id.into(),
+        locus: locus.into(),
+        note_id,
+        content_hash: None,
+        outcome: outcome.into(),
+        curator: None,
+        request_id: Ulid::new().to_string(),
+    };
+    if let Err(e) = state.audit.record(evt).await {
+        tracing::warn!(error = %e, outcome = outcome, "audit emit vault_read_rejected échoué");
     }
 }
 
@@ -441,6 +525,7 @@ mod build_record_tests {
             tenant_id: "main".into(),
             expected_sha256: None,
             note_id,
+            occurred_at: None,
         }
     }
 

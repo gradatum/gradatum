@@ -15,7 +15,20 @@ import { getBadgeStyle } from '../components/StatusBadge';
 import { Toast } from '../components/Toast';
 import type { SearchHit, NoteStatus, MoveRequest } from '../types/api';
 import { parseSearchResponse } from '../lib/searchHit';
+import { parseByStatusResponse } from '../lib/byStatus';
 import { apiFetch } from '../hooks/useAuth';
+
+// Statuts archivés non présents dans le FTS5 (downgraded retiré par vault_downgrade).
+// Pour ces buckets, NotesPage liste via /api/v1/notes/by-status (métadonnées).
+const ARCHIVED_STATUSES = new Set(['downgraded', 'deprecated']);
+
+function statusListOf(filterStatus: string): string[] {
+  return filterStatus.split(',').map(s => s.trim()).filter(Boolean);
+}
+function isArchivedFilter(filterStatus: string): boolean {
+  if (filterStatus === 'all') return false;
+  return statusListOf(filterStatus).some(s => ARCHIVED_STATUSES.has(s));
+}
 
 // D3.3 : onUnauthorized retiré — intercepteur centralisé dans apiFetch (useAuth)
 
@@ -51,6 +64,29 @@ export function NotesPage() {
     setLoading(true);
     setError(null);
 
+    // Bucket archivé (downgraded/deprecated) → métadonnées (FTS5 ne les contient pas).
+    // Note : le filtre texte `query` est ignoré en mode archivé (endpoint sans full-text).
+    if (isArchivedFilter(filterStatus)) {
+      const params = new URLSearchParams();
+      params.set('status', filterStatus);
+      params.set('limit', String(FETCH_LIMIT));
+      if (filterSection !== 'all') params.set('section', filterSection);
+      apiFetch(`/api/v1/notes/by-status?${params.toString()}`, { method: 'GET' })
+        .then(async res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json() as unknown;
+          if (!cancelled) {
+            const hits = parseByStatusResponse(data);
+            setAllNotes(hits);
+            setSaturated(hits.length >= FETCH_LIMIT);
+          }
+        })
+        .catch(err => { if (!cancelled) setError(String(err)); })
+        .finally(() => { if (!cancelled) setLoading(false); });
+      return () => { cancelled = true; };
+    }
+
+    // Chemin FTS standard (inchangé).
     const body: Record<string, unknown> = {
       query: query || '*',
       limit: FETCH_LIMIT,
@@ -71,12 +107,8 @@ export function NotesPage() {
           setSaturated(hits.length >= FETCH_LIMIT);
         }
       })
-      .catch(err => {
-        if (!cancelled) setError(String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      .catch(err => { if (!cancelled) setError(String(err)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [query, filterStatus, filterSection]);
 
@@ -149,7 +181,7 @@ export function NotesPage() {
             <option value="staging">staging</option>
             <option value="pending-review">pending-review</option>
             <option value="draft">draft</option>
-            <option value="deprecated">deprecated</option>
+            <option value="downgraded">downgraded</option>
             <option value="garbage">garbage</option>
           </select>
 
@@ -261,7 +293,7 @@ export function NotesPage() {
                 <span>
                   <span style={getBadgeStyle(note.status as NoteStatus)}>
                     {note.status === 'pending-review' ? 'REVIEW'
-                     : note.status === 'downgraded' ? 'DEPRECATED'
+                     : note.status === 'downgraded' ? 'DOWNGRADED'
                      : note.status.toUpperCase()}
                   </span>
                   {note.forgotten && (

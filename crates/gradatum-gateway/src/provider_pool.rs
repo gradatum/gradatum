@@ -199,6 +199,7 @@ mod tests {
             aliases,
             gateway: HashMap::new(),
             vault_aware: Default::default(),
+            messages: Default::default(),
         }
     }
 

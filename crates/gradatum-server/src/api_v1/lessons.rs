@@ -51,6 +51,8 @@ pub async fn lessons_recall(
         .await
         .map(Json)
         .map_err(|e| {
+            // TEMPORAIRE DEBUG — à supprimer après diagnostic 500
+            eprintln!("[DEBUG] lessons_recall error: {e:?}");
             if matches!(e, gradatum_core::error::GradatumError::Storage(_)) {
                 tracing::error!(err = %e, "lessons_recall: backend failed");
             }

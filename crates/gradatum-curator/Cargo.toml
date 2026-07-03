@@ -9,9 +9,9 @@ repository.workspace = true
 description = "LLM-powered note curation layer: admits, routes, classifies, organises and retires notes within a vault"
 
 [dependencies]
-gradatum-core  = { path = "../gradatum-core", version = "0.6.4" }
-gradatum-chat  = { path = "../gradatum-chat", version = "0.6.4" }
-gradatum-index = { path = "../gradatum-index", version = "0.6.4" }
+gradatum-core  = { path = "../gradatum-core", version = "0.7.0" }
+gradatum-chat  = { path = "../gradatum-chat", version = "0.7.0" }
+gradatum-index = { path = "../gradatum-index", version = "0.7.0" }
 async-trait.workspace = true
 chrono.workspace = true
 once_cell.workspace = true

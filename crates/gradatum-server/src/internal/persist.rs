@@ -47,9 +47,9 @@ use crate::state::AppState;
 ///
 /// ## DT-INTERNAL-1 — dette multi-tenant
 ///
-/// En v0.6.x (Slice 2b VaultRegistry), le tenant sera dérivé du claim JWT
-/// du token interne (`X-Gradatum-Internal`). La constante sera retirée et
-/// remplacée par l'extraction de claim.
+/// In a future multi-tenant revision, the tenant will be derived from the JWT claim
+/// of the internal token (`X-Gradatum-Internal`). This constant will then be removed
+/// and replaced with claim extraction.
 const INTERNAL_TENANT_ID: &str = "main";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -533,7 +533,7 @@ pub(crate) async fn handle_persist_distill(
                 status: NoteStatus::PendingReview,
                 status_reason: Some("distilled — en attente de revue".to_string()),
                 status_changed: None,
-                tags: smallvec::SmallVec::new(),
+                tags: parse_tags(&req.tags),
                 author: Some(AuthorRef {
                     kind: AuthorKind::System,
                     id: "vault-distiller".to_string(),

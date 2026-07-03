@@ -451,7 +451,7 @@ impl CuratorPipeline {
         // ── Étape 0 : hint fort — section_hint explicite valide (B3 piste a) ──────
         //
         // Si le créateur a fourni un `section_hint` ET que ce hint correspond à
-        // l'une des 12 sections canoniques (via `Section::ALL`), on admet directement
+        // l'une des 13 sections canoniques (via `Section::ALL`), on admet directement
         // sans consulter l'heuristique ni le LLM. Un hint invalide est ignoré avec un warn.
         if let Some(ref hint) = note.section_hint {
             if routing::is_valid_hint_section(hint) {

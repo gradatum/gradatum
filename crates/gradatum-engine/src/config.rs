@@ -286,15 +286,13 @@ fn validate_bind_addr(addr: IpAddr) -> Result<(), anyhow::Error> {
                 // Pure V6 (non-mapped)
                 if v6.is_unspecified() {
                     anyhow::bail!(
-                        "bind_addr '::' interdit (C1 fail-closed) — \
-                         bind wildcard IPv6 expose l'engine sur toutes les interfaces. \
-                         Utiliser ::1 (loopback) ou l'IP unicast LAN spécifique."
+                        "bind_addr '::' is not allowed (C1 fail-closed) — \
+                         wildcard IPv6 bind exposes the engine on all interfaces. \
+                         Use ::1 (loopback) or a specific LAN unicast IP."
                     );
                 }
                 if v6.is_multicast() {
-                    anyhow::bail!(
-                        "bind_addr '{addr}' interdit — adresse multicast IPv6 non autorisée."
-                    );
+                    anyhow::bail!("bind_addr '{addr}' is not allowed — IPv6 multicast address.");
                 }
             }
         }
@@ -312,10 +310,10 @@ fn validate_bind_addr(addr: IpAddr) -> Result<(), anyhow::Error> {
 fn validate_model_prefix(path: &std::path::Path) -> Result<(), anyhow::Error> {
     let canonical = path
         .canonicalize()
-        .map_err(|e| anyhow::anyhow!("canonicalize échoué pour {} : {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("canonicalize failed for {} : {e}", path.display()))?;
     if !canonical.starts_with("/opt/gradatum/models/") {
         anyhow::bail!(
-            "chemin doit être sous /opt/gradatum/models/ (P1-6) : {}",
+            "path must be under /opt/gradatum/models/ (P1-6): {}",
             canonical.display()
         );
     }
@@ -329,16 +327,16 @@ fn validate_model_prefix(path: &std::path::Path) -> Result<(), anyhow::Error> {
 fn check_v4_addr(v4: std::net::Ipv4Addr, display: &str) -> Result<(), anyhow::Error> {
     if v4.is_unspecified() {
         anyhow::bail!(
-            "bind_addr '{display}' interdit (C1 fail-closed) — \
-             bind wildcard expose l'engine sur toutes les interfaces. \
-             Utiliser 127.0.0.1 (loopback) ou l'IP unicast LAN spécifique."
+            "bind_addr '{display}' is not allowed (C1 fail-closed) — \
+             wildcard bind exposes the engine on all interfaces. \
+             Use 127.0.0.1 (loopback) or a specific LAN unicast IP."
         );
     }
     if v4.is_broadcast() {
-        anyhow::bail!("bind_addr '{display}' interdit — adresse broadcast non autorisée.");
+        anyhow::bail!("bind_addr '{display}' is not allowed — broadcast address.");
     }
     if v4.is_multicast() {
-        anyhow::bail!("bind_addr '{display}' interdit — adresse multicast non autorisée.");
+        anyhow::bail!("bind_addr '{display}' is not allowed — multicast address.");
     }
     Ok(())
 }
@@ -372,7 +370,7 @@ impl EngineConfig {
         const MAX_BODY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
         if self.body_limit_bytes > MAX_BODY_LIMIT_BYTES {
             anyhow::bail!(
-                "body_limit_bytes {} dépasse le plafond {} (256 MiB)",
+                "body_limit_bytes {} exceeds the cap {} (256 MiB)",
                 self.body_limit_bytes,
                 MAX_BODY_LIMIT_BYTES
             );
@@ -568,9 +566,9 @@ extra_args       = ["--flash-attn"]
         );
     }
 
-    /// validate() doit rejeter un model_path hors /opt/gradatum/models/.
+    /// `validate()` rejects a `model_path` outside `/opt/gradatum/models/`.
     ///
-    /// /tmp est toujours présent sur Linux (canonicalize réussit) mais hors préfixe.
+    /// `/tmp` is always present on Linux (`canonicalize` succeeds) but falls outside the prefix.
     #[test]
     fn validate_rejects_model_path_outside_prefix() {
         // Écrire un fichier réel dans /tmp pour que canonicalize() réussisse
@@ -646,8 +644,8 @@ extra_args       = ["--flash-attn"]
         assert!(result.is_err(), "0.0.0.0 doit être rejeté (C1 fail-closed)");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("0.0.0.0") && msg.contains("interdit"),
-            "message d'erreur doit citer 0.0.0.0 et 'interdit' : {msg}"
+            msg.contains("0.0.0.0") && msg.contains("not allowed"),
+            "error message must cite 0.0.0.0 and 'not allowed': {msg}"
         );
     }
 
@@ -660,8 +658,8 @@ extra_args       = ["--flash-attn"]
         assert!(result.is_err(), ":: doit être rejeté (C1 fail-closed)");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("::") && msg.contains("interdit"),
-            "message d'erreur doit citer :: et 'interdit' : {msg}"
+            msg.contains("::") && msg.contains("not allowed"),
+            "error message must cite :: and 'not allowed': {msg}"
         );
     }
 
@@ -674,10 +672,10 @@ extra_args       = ["--flash-attn"]
         assert!(result.is_err(), "adresse multicast doit être rejetée");
     }
 
-    /// P0 — bypass IPv4-mapped unspecified : ::ffff:0.0.0.0 doit être REJETÉ.
+    /// IPv4-mapped unspecified `::ffff:0.0.0.0` must be REJECTED.
     ///
-    /// Sur Linux avec net.ipv6.bindv6only=0 (défaut), bind(::ffff:0.0.0.0) équivaut
-    /// à bind(0.0.0.0) — écoute sur toutes les interfaces IPv4.
+    /// On Linux with `net.ipv6.bindv6only=0` (default), `bind(::ffff:0.0.0.0)` is
+    /// equivalent to `bind(0.0.0.0)` — listening on all IPv4 interfaces.
     #[test]
     fn bind_addr_ipv4_mapped_unspecified_rejected() {
         let addr: IpAddr = "::ffff:0.0.0.0".parse().unwrap();
@@ -688,12 +686,12 @@ extra_args       = ["--flash-attn"]
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("interdit"),
-            "message d'erreur doit contenir 'interdit' : {msg}"
+            msg.contains("not allowed"),
+            "error message must contain 'not allowed': {msg}"
         );
     }
 
-    /// P1 — broadcast IPv4 : 255.255.255.255 doit être REJETÉ.
+    /// IPv4 broadcast `255.255.255.255` must be REJECTED.
     #[test]
     fn bind_addr_broadcast_rejected() {
         let addr: IpAddr = "255.255.255.255".parse().unwrap();
@@ -704,12 +702,12 @@ extra_args       = ["--flash-attn"]
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("interdit"),
-            "message doit contenir 'interdit' : {msg}"
+            msg.contains("not allowed"),
+            "error message must contain 'not allowed': {msg}"
         );
     }
 
-    /// P1 — broadcast IPv4-mapped : ::ffff:255.255.255.255 doit être REJETÉ.
+    /// IPv4-mapped broadcast `::ffff:255.255.255.255` must be REJECTED.
     #[test]
     fn bind_addr_ipv4_mapped_broadcast_rejected() {
         let addr: IpAddr = "::ffff:255.255.255.255".parse().unwrap();
@@ -720,11 +718,11 @@ extra_args       = ["--flash-attn"]
         );
     }
 
-    /// Non-régression — ::ffff:203.0.113.5 (unicast mappé RFC5737) doit être ACCEPTÉ.
+    /// `::ffff:203.0.113.5` (IPv4-mapped unicast, RFC 5737 TEST-NET-3) must be ACCEPTED.
     ///
-    /// Une adresse IPv4-mapped unicast est une IP routable valide — l'opérateur peut
-    /// légitimement configurer un bind en notation mappée. Les règles unspecified/broadcast/
-    /// multicast ne s'appliquent pas à 203.0.113.5.
+    /// An IPv4-mapped unicast address is a valid routable IP — an operator may legitimately
+    /// configure a bind using mapped notation. The unspecified/broadcast/multicast rules
+    /// do not apply to `203.0.113.5`.
     #[test]
     fn bind_addr_ipv4_mapped_unicast_accepted() {
         // ::ffff:203.0.113.5 = TEST-NET-3 (RFC 5737) en notation IPv4-mapped
@@ -766,7 +764,7 @@ extra_args       = ["--flash-attn"]
         assert_eq!(c.timeout_secs, 60);
     }
 
-    /// M3 — régression : max_tokens parsé depuis le TOML + défaut 512.
+    /// `max_tokens` is parsed from TOML with a default of 512.
     #[test]
     fn parses_max_tokens_with_default() {
         let toml_default = "[engine]\nmodel_path=\"x\"\nmodel_kind=\"chat\"\nport=1\n";

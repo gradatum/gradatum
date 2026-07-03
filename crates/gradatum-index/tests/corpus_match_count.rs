@@ -482,6 +482,8 @@ async fn parity_count_equals_nonsemantic_results() {
             section,
             locus,
             status,
+            None,
+            None,
         )
         .await
         .unwrap();

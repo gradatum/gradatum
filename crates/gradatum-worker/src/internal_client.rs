@@ -1,27 +1,27 @@
-//! Client HTTP loopback vers l'API `/internal` du server gradatum (v0.5.3 worker-flip).
+//! Loopback HTTP client for the gradatum server's `/internal` API.
 //!
 //! ## Architecture
 //!
-//! Le worker connaît seulement :
-//! - `server_url` — URL de base du listener interne (`:19092`)
-//! - `token` — `GRADATUM_INTERNAL_TOKEN` (Bearer token, jamais loggué)
+//! The worker only needs:
+//! - `server_url` — base URL of the internal listener (`:19092`)
+//! - `token` — `GRADATUM_INTERNAL_TOKEN` (Bearer token, never logged)
 //!
-//! Toutes les mutations (vault + index) passent par le server via ce client.
-//! Le worker ne touche plus `SqliteIndex` ni `Vault` directement.
+//! All mutations (vault + index) flow through the server via this client.
+//! The worker no longer accesses `SqliteIndex` or `Vault` directly.
 //!
 //! ## Auth
 //!
-//! Header `X-Gradatum-Internal: Bearer <token>` sur chaque requête.
+//! `X-Gradatum-Internal: Bearer <token>` header on every request.
 //!
 //! ## Retry
 //!
-//! Retry sur 5xx : max 3 tentatives, backoff exponentiel 100ms/200ms/400ms.
-//! Pas de retry sur 409 (Conflict) ni 404.
+//! Retries on 5xx: max 3 attempts, exponential backoff 100ms/200ms/400ms.
+//! No retry on 409 (Conflict) or 404.
 //!
-//! ## NB sur les ports
+//! ## Ports
 //!
-//! - `:19090` — API publique
-//! - `:19092` — API `/internal` (ce client, loopback-only)
+//! - `:19090` — public API
+//! - `:19092` — `/internal` API (this client, loopback-only)
 
 use std::time::Duration;
 
@@ -35,23 +35,23 @@ use secrecy::{ExposeSecret as _, SecretString};
 // Erreurs
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Erreur retournée par [`InternalPersistClient`] et [`InternalClient`].
+/// Error returned by [`InternalPersistClient`] and [`InternalClient`].
 #[derive(thiserror::Error, Debug)]
 pub enum InternalClientError {
-    /// Échec de la requête HTTP (réseau, timeout, parse).
+    /// HTTP request failure (network, timeout, parse).
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// Conflit optimistic-lock (409) — le worker doit appeler `mark_conflict`.
+    /// Optimistic-lock conflict (409) — the worker must call `mark_conflict`.
     /// `current_sha256_hex` is the current SHA-256 of the note (64 hex chars) when known.
     #[error("Server returned conflict (409)")]
     Conflict { current_sha256_hex: Option<String> },
 
-    /// Note absente (404).
+    /// Note not found (404).
     #[error("Note not found (404): {ulid}")]
     NotFound { ulid: String },
 
-    /// Erreur serveur (5xx ou autre code inattendu).
+    /// Server error (5xx or other unexpected status code).
     #[error("Server error {status}: {body}")]
     ServerError { status: u16, body: String },
 }
@@ -60,77 +60,77 @@ pub enum InternalClientError {
 // DTOs de réponse locaux (indépendants de gradatum-server)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Note complète retournée par `GET /internal/v1/note/:ulid`.
+/// Full note returned by `GET /internal/v1/note/:ulid`.
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct NoteReadDto {
-    /// ULID de la note.
+    /// ULID of the note.
     pub note_id: String,
-    /// SHA-256 hex 64 chars.
+    /// SHA-256 hex, 64 chars.
     pub sha256_hex: String,
-    /// Corps Markdown.
+    /// Markdown body.
     pub body: String,
-    /// Section kebab-case.
+    /// Section in kebab-case.
     pub section: String,
-    /// Statut kebab-case.
+    /// Status in kebab-case.
     pub status: String,
     /// Tags.
     pub tags: Vec<String>,
-    /// Si `true`, la note a été oubliée (frontmatter `forgotten = true`).
+    /// `true` if the note has been forgotten (frontmatter `forgotten = true`).
     pub forgotten: bool,
-    /// Si `true`, la note a déjà été distillée (extra["processed"] = true).
+    /// `true` if the note has already been distilled (`extra["processed"] = true`).
     pub processed: bool,
 }
 
-/// Embedding retourné par `GET /internal/v1/note/:ulid/embedding`.
+/// Embedding returned by `GET /internal/v1/note/:ulid/embedding`.
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct EmbeddingReadDto {
-    /// ULID de la note.
+    /// ULID of the note.
     pub note_id: String,
-    /// Identifiant du modèle.
+    /// Model identifier.
     pub embedder_id: String,
-    /// Dimension.
+    /// Vector dimension.
     pub dim: usize,
-    /// Vecteur f32.
+    /// f32 embedding vector.
     pub vector: Vec<f32>,
 }
 
-/// Trust retourné par `GET /internal/v1/note/:ulid/trust`.
+/// Trust score returned by `GET /internal/v1/note/:ulid/trust`.
 #[derive(Debug, serde::Deserialize)]
 struct TrustReadDto {
-    /// Score trust.
+    /// Trust score.
     trust: f32,
 }
 
-/// Title-lookup retourné par `GET /internal/v1/title-lookup`.
+/// Title-lookup result returned by `GET /internal/v1/title-lookup`.
 #[derive(Debug, serde::Deserialize)]
 struct TitleLookupDto {
-    /// ULID résolu, ou `None` si le titre est inconnu.
+    /// Resolved ULID, or `None` if the title is unknown.
     note_id: Option<String>,
 }
 
-/// Id-lookup retourné par `GET /internal/v1/id-lookup`.
+/// ID-lookup result returned by `GET /internal/v1/id-lookup`.
 #[derive(Debug, serde::Deserialize)]
 struct IdLookupDto {
-    /// ULID confirmé si la note existe et est live, ou `None` sinon.
+    /// Confirmed ULID if the note exists and is live, or `None` otherwise.
     note_id: Option<String>,
 }
 
-/// Identifiant de note dans une liste.
+/// Note identifier in a listing response.
 #[derive(Debug, serde::Deserialize, Clone)]
 #[allow(dead_code)]
 pub struct NoteIdDto {
-    /// ULID de la note.
+    /// ULID of the note.
     pub note_id: String,
-    /// Section (peut être vide pour `list_garbage`).
+    /// Section (may be empty for `list_garbage`).
     pub section: String,
 }
 
-/// Liste de notes retournée par les endpoints de listing.
+/// List of notes returned by listing endpoints.
 #[derive(Debug, serde::Deserialize)]
 struct NoteListDto {
-    /// Notes listées.
+    /// Listed notes.
     note_ids: Vec<NoteIdDto>,
 }
 
@@ -138,13 +138,13 @@ struct NoteListDto {
 // Trait InternalClient (injectable pour les tests)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Trait abstrayant les appels HTTP vers l'API interne du server.
+/// Trait abstracting HTTP calls to the server's internal API.
 ///
-/// Permet d'injecter un mock dans les tests sans dépendre de `reqwest`.
+/// Enables injecting a mock in tests without depending on `reqwest`.
 ///
-/// ## Contrat
+/// ## Contract
 ///
-/// Chaque méthode mappe 1:1 vers un endpoint `/internal/v1/...`.
+/// Each method maps 1:1 to an `/internal/v1/...` endpoint.
 #[async_trait::async_trait]
 pub trait InternalClient: Send + Sync + 'static {
     // ── Writes ──
@@ -198,11 +198,11 @@ pub trait InternalClient: Send + Sync + 'static {
         title: &str,
     ) -> Result<Option<String>, InternalClientError>;
 
-    /// `GET /internal/v1/id-lookup?tenant=<t>&note_id=<ulid>` — vérifie qu'une note existe et est live.
+    /// `GET /internal/v1/id-lookup?tenant=<t>&note_id=<ulid>` — checks that a note exists and is live.
     ///
-    /// Utilisé pour la résolution ULID-first des wikilinks `[[section:ULID]]`.
-    /// Retourne `Ok(Some(id))` si la note existe et est live, `Ok(None)` sinon.
-    /// Non-fatal : tout échec doit être géré par le caller.
+    /// Used for ULID-first resolution of `[[section:ULID]]` wikilinks.
+    /// Returns `Ok(Some(id))` if the note exists and is live, `Ok(None)` otherwise.
+    /// Non-fatal: any failure must be handled by the caller.
     async fn id_lookup(
         &self,
         tenant: &str,
@@ -251,10 +251,10 @@ pub trait InternalClient: Send + Sync + 'static {
 // Implémentation concrète — reqwest
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Client HTTP concret vers l'API `/internal` du server gradatum.
+/// Concrete HTTP client for the gradatum server's `/internal` API.
 ///
-/// Le token est stocké dans `SecretString` — jamais affiché dans les logs.
-/// `Debug` implémenté manuellement pour masquer le token.
+/// The token is stored in a `SecretString` — never printed in logs.
+/// `Debug` is implemented manually to mask the token.
 pub struct InternalPersistClient {
     client: reqwest::Client,
     base_url: String,
@@ -271,14 +271,14 @@ impl std::fmt::Debug for InternalPersistClient {
 }
 
 impl InternalPersistClient {
-    /// Construit un client HTTP avec timeout global 30s.
+    /// Builds an HTTP client with a 30-second global timeout.
     ///
-    /// `server_url` : URL de base du listener interne (ex: `http://127.0.0.1:19092`).
-    /// `token` : token Bearer — doit correspondre à `GRADATUM_INTERNAL_TOKEN` côté server.
+    /// `server_url`: base URL of the internal listener (e.g. `http://127.0.0.1:19092`).
+    /// `token`: Bearer token — must match `GRADATUM_INTERNAL_TOKEN` on the server side.
     ///
     /// # Errors
     ///
-    /// Retourne une erreur si `reqwest::Client` ne peut pas être construit.
+    /// Returns an error if `reqwest::Client` cannot be constructed.
     pub fn new(
         server_url: impl Into<String>,
         token: impl Into<String>,
@@ -293,14 +293,14 @@ impl InternalPersistClient {
         })
     }
 
-    /// Valeur du header d'auth interne.
+    /// Value of the internal authentication header.
     fn auth_value(&self) -> String {
         format!("Bearer {}", self.token.expose_secret())
     }
 
-    /// Exécute une requête avec retry sur 5xx (max 3 tentatives, backoff exponentiel).
+    /// Executes a request with retries on 5xx responses (max 3 attempts, exponential backoff).
     ///
-    /// Pas de retry sur 409 (Conflict), 404, ni sur les 4xx en général.
+    /// No retry on 409 (Conflict), 404, or 4xx responses in general.
     async fn execute_with_retry(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
@@ -354,7 +354,7 @@ impl InternalPersistClient {
         Err(last_err.expect("MAX_ATTEMPTS > 0 — last_err est toujours Some ici"))
     }
 
-    /// Parse la réponse JSON, ou retourne une erreur sémantique (409, 404, 5xx).
+    /// Parses the JSON response, or returns a semantic error (409, 404, 5xx).
     async fn parse_json<T: serde::de::DeserializeOwned>(
         resp: reqwest::Response,
         key_for_err: &str,
@@ -383,7 +383,7 @@ impl InternalPersistClient {
         Ok(resp.json::<T>().await?)
     }
 
-    /// Vérifie le statut sans body attendu (ex: 204 No Content pour DELETE).
+    /// Checks the response status when no body is expected (e.g. 204 No Content for DELETE).
     async fn check_no_body(
         resp: reqwest::Response,
         key_for_err: &str,

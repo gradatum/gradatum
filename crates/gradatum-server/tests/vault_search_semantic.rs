@@ -7,10 +7,13 @@
 //!
 //! # Architecture des tests
 //!
-//! - `FakeEmbedder` : embedder de test `EmbedBackend::Http` qui retourne un vecteur connu.
+//! - `helpers::FakeEmbedder` : embedder de test `EmbedBackend::Http` déterministe (factorisé helpers).
 //! - `ErrorEmbedder` : embedder de test qui retourne toujours une erreur `embed()`.
 //! - `AppState` construit manuellement avec injection `with_embedder` + seed SqliteIndex.
 //! - ACL autorisant `search-tester` en lecture.
+
+#[path = "helpers/mod.rs"]
+mod helpers;
 
 use std::sync::Arc;
 
@@ -38,47 +41,6 @@ identity = "search-tester"
 read_patterns  = ["main/*", "main/main", "*/reference", "reference/*"]
 write_patterns = []
 "#;
-
-// ── Fake embedders ────────────────────────────────────────────────────────────
-
-/// Embedder de test : retourne un vecteur non-nul ([1.0, 0.0, ...] dim=8).
-///
-/// `backend_kind()` = `Http` → non-Noop → active le path sémantique dans vault_search.
-/// `embedder_id()` = `"test-embedder"` → cohérent avec les embeddings insérés en DB.
-struct FakeEmbedder;
-
-#[async_trait]
-impl Embedder for FakeEmbedder {
-    fn embedder_id(&self) -> &str {
-        "test-embedder"
-    }
-
-    fn dim(&self) -> u16 {
-        8
-    }
-
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
-        let mut v = vec![0.0f32; 8];
-        v[0] = 1.0;
-        Ok(v)
-    }
-
-    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        Ok(texts
-            .iter()
-            .map(|_| {
-                let mut v = vec![0.0f32; 8];
-                v[0] = 1.0;
-                v
-            })
-            .collect())
-    }
-
-    fn backend_kind(&self) -> EmbedBackend {
-        // Http = non-Noop → active le path sémantique.
-        EmbedBackend::Http
-    }
-}
 
 /// Embedder de test : retourne une erreur sur `embed()`.
 ///
@@ -223,7 +185,8 @@ async fn vault_search_noop_embedder_returns_bm25_only() {
 async fn vault_search_fake_embedder_calls_semantic() {
     use gradatum_core::identity::NoteId;
 
-    let fake = Arc::new(FakeEmbedder);
+    // FakeEmbedder factorisé dans helpers/mod.rs (dim=8, cohérent avec les embeddings DB).
+    let fake = Arc::new(helpers::FakeEmbedder { dim: 8 });
     let (app, state, idx) = build_app_with_embedder(fake).await;
 
     let token = state
@@ -254,9 +217,11 @@ async fn vault_search_fake_embedder_calls_semantic() {
         v[0] = 1.0;
         v
     };
+    // "fake-embedder" = embedder_id() de helpers::FakeEmbedder — doit correspondre
+    // à l'ID que le handler utilise lors de la recherche sémantique.
     state
         .search
-        .insert_note_embedding(&note_id, "test-embedder", 8, &emb)
+        .insert_note_embedding(&note_id, "fake-embedder", 8, &emb)
         .await
         .expect("insert_note_embedding — invariant test");
 

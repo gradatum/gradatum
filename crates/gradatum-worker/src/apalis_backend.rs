@@ -507,9 +507,9 @@ mod tests {
         let _ack2 = ack.clone(); // doit compiler
     }
 
-    /// D-21 : vérifie que l'Instant est injecté dans parts.data par record_to_task.
+    /// Verifies that the `Instant` is injected into `parts.data` by `record_to_task`.
     ///
-    /// L'Instant est utilisé par GradatumAcknowledger::ack() pour calculer duration_ms réel.
+    /// The `Instant` is used by `GradatumAcknowledger::ack()` to compute the real `duration_ms`.
     #[test]
     fn record_to_task_injects_instant_for_duration_measurement() {
         let record = make_record();

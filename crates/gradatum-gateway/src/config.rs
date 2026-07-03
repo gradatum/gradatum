@@ -38,6 +38,57 @@ pub struct Config {
     /// VaultAware hook configuration (fire-and-forget `QaEvent`).
     #[serde(default)]
     pub vault_aware: VaultAwareConfig,
+    /// Anthropic Messages API inbound configuration (`[messages]` section).
+    ///
+    /// Absent from TOML → serde default (sensible defaults, backward compat).
+    #[serde(default)]
+    pub messages: MessagesConfig,
+}
+
+/// Configuration for the Anthropic Messages API inbound gateway (`/v1/messages`).
+///
+/// Controls how inbound `model` names from Anthropic clients are mapped to internal
+/// gateway aliases, without hardcoding any model or family names.
+///
+/// Example TOML:
+/// ```toml
+/// [messages]
+/// default_alias = "default"
+///
+/// [messages.model_map]
+/// "claude-3-5-sonnet-20241022" = "my-sonnet-alias"
+/// "glm-4.6"                   = "my-glm-alias"
+/// "gemini-2.0-flash"          = "my-gemini-alias"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct MessagesConfig {
+    /// Alias used when the inbound `model` name is not found in `model_map`.
+    ///
+    /// Default: `"default"` — matches the conventional gateway alias name.
+    #[serde(default = "default_messages_alias")]
+    pub default_alias: String,
+
+    /// Map from inbound Anthropic model names to gateway alias names.
+    ///
+    /// Key: any model identifier the client may send (e.g. `"claude-3-5-sonnet-20241022"`).
+    /// Value: a gateway alias name that must exist in `[aliases]`.
+    ///
+    /// Models absent from this map are routed to `default_alias`.
+    #[serde(default)]
+    pub model_map: HashMap<String, String>,
+}
+
+impl Default for MessagesConfig {
+    fn default() -> Self {
+        Self {
+            default_alias: default_messages_alias(),
+            model_map: HashMap::new(),
+        }
+    }
+}
+
+fn default_messages_alias() -> String {
+    "default".to_string()
 }
 
 /// Server configuration.
@@ -278,7 +329,17 @@ impl Config {
     }
 
     /// Validates configuration consistency after parsing.
+    ///
+    /// Vérifie :
+    /// 1. Chaque alias référence un provider existant dans `[providers]`.
+    /// 2. `messages.default_alias` ∈ clés `[aliases]` (P1-A — typo = erreur au boot).
+    /// 3. Chaque valeur de `messages.model_map` ∈ clés `[aliases]` (P1-A).
+    ///
+    /// # Errors
+    /// Retourne une erreur descriptive nommant l'alias fautif, permettant un diagnostic
+    /// immédiat sans relecture du TOML complet.
     fn validate(&self) -> anyhow::Result<()> {
+        // ── Validation providers ────────────────────────────────────────────
         for (alias, target) in &self.aliases {
             if !self.providers.contains_key(&target.provider) {
                 anyhow::bail!(
@@ -297,11 +358,228 @@ impl Config {
                 );
             }
         }
+
+        // ── Validation aliases messages (P1-A relâché) ─────────────────────
+        // La validation n'est déclenchée QUE si la section [messages] a été
+        // explicitement configurée par l'utilisateur, c'est-à-dire si :
+        //   - model_map est non vide (entrées explicites), OU
+        //   - default_alias a été surchargé (différent de la valeur serde default).
+        //
+        // Raison : MessagesConfig::default() produit default_alias = "default" + model_map
+        // vide. Une config qui omet entièrement [messages] (ex. chat-only, embeddings-only)
+        // n'a pas nécessairement d'alias "default" — la valider serait une régression.
+        // Les instances qui configurent [messages] voient toujours la validation complète
+        // (fail-fast pour vraies typos).
+        let messages_is_customised = !self.messages.model_map.is_empty()
+            || self.messages.default_alias != default_messages_alias();
+
+        if messages_is_customised {
+            if !self.aliases.contains_key(&self.messages.default_alias) {
+                anyhow::bail!(
+                    "[messages] default_alias '{}' absent de [aliases] — alias disponibles : {:?}",
+                    self.messages.default_alias,
+                    {
+                        let mut keys: Vec<_> = self.aliases.keys().cloned().collect();
+                        keys.sort();
+                        keys
+                    }
+                );
+            }
+
+            // Vérifier chaque valeur de model_map ∈ clés aliases.
+            // On ne valide PAS les clés (noms de modèles Anthropic arbitraires).
+            for (model_name, target_alias) in &self.messages.model_map {
+                if !self.aliases.contains_key(target_alias) {
+                    anyhow::bail!(
+                        "[messages.model_map] entrée '{}' pointe vers l'alias '{}' absent de [aliases]",
+                        model_name,
+                        target_alias
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// Returns the names of configured providers.
     pub fn provider_names(&self) -> Vec<String> {
         self.providers.keys().cloned().collect()
+    }
+}
+
+// ── Tests unitaires config ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Construit une `Config` minimale valide pour les tests de validation.
+    ///
+    /// Un provider "p" + alias "real-alias" pointant sur "p".
+    fn base_config() -> Config {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "p".to_string(),
+            ProviderConfig {
+                endpoint: "http://127.0.0.1:8080".to_string(),
+                timeout_secs: 30,
+                api_key_env: None,
+            },
+        );
+
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "real-alias".to_string(),
+            AliasTarget::simple("p", "model-x"),
+        );
+
+        Config {
+            server: ServerConfig {
+                listen: "127.0.0.1:18436".to_string(),
+                registry_db: None,
+                bearer_token_env: None,
+                rate_limit_per_minute: 60,
+                circuit_threshold: 5,
+                circuit_window_secs: 60,
+                circuit_cooldown_secs: 30,
+                max_total_tokens: 0,
+                trust_localhost: true,
+                enable_slot_passthrough: true,
+                allowed_origins: vec![],
+                max_tools_per_request: 64,
+            },
+            providers,
+            aliases,
+            gateway: HashMap::new(),
+            logging: LoggingConfig::default(),
+            vault_aware: VaultAwareConfig::default(),
+            messages: MessagesConfig {
+                default_alias: "real-alias".to_string(),
+                model_map: HashMap::new(),
+            },
+        }
+    }
+
+    /// P1-A — default_alias inconnu → erreur de validation avec le nom de l'alias fautif.
+    #[test]
+    fn config_validation_rejects_unknown_default_alias() {
+        let mut config = base_config();
+        config.messages.default_alias = "ghost".to_string();
+        let result = config.validate();
+        assert!(result.is_err(), "default_alias inexistant doit être rejeté");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("ghost"),
+            "le message d'erreur doit nommer l'alias fautif 'ghost', obtenu: {}",
+            msg
+        );
+    }
+
+    /// P1-A — valeur de model_map pointant vers un alias inexistant → erreur de validation.
+    #[test]
+    fn config_validation_rejects_unknown_model_map_alias() {
+        let mut config = base_config();
+        config.messages.model_map.insert(
+            "claude-3-5-sonnet-20241022".to_string(),
+            "ghost".to_string(),
+        );
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "model_map avec alias inexistant doit être rejeté"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("ghost"),
+            "le message d'erreur doit nommer l'alias fautif 'ghost', obtenu: {}",
+            msg
+        );
+    }
+
+    /// P1-A — config entièrement valide (aliases existants) → validation OK.
+    #[test]
+    fn config_validation_accepts_valid_aliases() {
+        let mut config = base_config();
+        // Ajouter une deuxième entrée de model_map pointant sur un alias existant.
+        config.messages.model_map.insert(
+            "claude-3-5-sonnet-20241022".to_string(),
+            "real-alias".to_string(),
+        );
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "config avec aliases valides doit passer la validation, erreur: {:?}",
+            result.err()
+        );
+    }
+
+    /// Non-régression P1-A relâché — config sans section [messages] (défauts purs)
+    /// avec aliases ne contenant PAS "default" → validation doit réussir.
+    ///
+    /// Reproduit le cas d'une instance chat/embeddings-only (ex. spike-engine-routing.toml)
+    /// qui n'expose pas /v1/messages et n'a donc pas d'alias "default".
+    #[test]
+    fn config_without_messages_section_boots_without_default_alias() {
+        // Config inspirée de spike-engine-routing.toml : aliases "curator" + "embed" uniquement.
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "engine-curator".to_string(),
+            ProviderConfig {
+                endpoint: "http://127.0.0.1:11435".to_string(),
+                timeout_secs: 30,
+                api_key_env: None,
+            },
+        );
+        providers.insert(
+            "engine-embed".to_string(),
+            ProviderConfig {
+                endpoint: "http://127.0.0.1:11436".to_string(),
+                timeout_secs: 10,
+                api_key_env: None,
+            },
+        );
+
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "curator".to_string(),
+            AliasTarget::simple("engine-curator", "curator-model"),
+        );
+        aliases.insert(
+            "embed".to_string(),
+            AliasTarget::simple("engine-embed", "embed-model"),
+        );
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "127.0.0.1:8436".to_string(),
+                registry_db: None,
+                bearer_token_env: None,
+                rate_limit_per_minute: 120,
+                circuit_threshold: 5,
+                circuit_window_secs: 60,
+                circuit_cooldown_secs: 30,
+                max_total_tokens: 0,
+                trust_localhost: true,
+                enable_slot_passthrough: false,
+                allowed_origins: vec![],
+                max_tools_per_request: 64,
+            },
+            providers,
+            aliases,
+            gateway: HashMap::new(),
+            logging: LoggingConfig::default(),
+            vault_aware: VaultAwareConfig::default(),
+            // Section [messages] absente → serde default : default_alias = "default", model_map vide.
+            // "default" n'est PAS dans aliases → aurait échoué avec P1-A non relâché.
+            messages: MessagesConfig::default(),
+        };
+
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "config sans [messages] (défauts purs) doit passer la validation même sans alias 'default', erreur: {:?}",
+            result.err()
+        );
     }
 }

@@ -24,6 +24,8 @@ use gradatum_core::{
         AuthorRow, CodeScopeEntryRaw, CodeSelector, LessonHitRaw, Lineage, ReviewQueueRow,
         SearchHitRaw,
     },
+    metric_sample::MetricSamplePoint,
+    scheduled_health::{ScheduledTaskHealth, TaskOutcome},
     scope::{OverrideScope, VaultId},
     status::NoteStatus,
 };
@@ -107,6 +109,9 @@ impl IndexStore for SqliteIndex {
     // method (higher priority than the trait method), no infinite recursion.
 
     /// FTS5 search with snippet — delegates to `SqliteIndex::search_fts_with_snippet`.
+    // 10 non-self args: orthogonal search filters — trait method signature cannot change.
+    // #[allow] not #[expect]: clippy does not trigger too_many_arguments on trait impls.
+    #[allow(clippy::too_many_arguments)]
     async fn search_fts_with_snippet(
         &self,
         vault_id: &VaultId,
@@ -116,6 +121,8 @@ impl IndexStore for SqliteIndex {
         section: Option<&str>,
         locus: Option<&str>,
         status: Option<&str>,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
     ) -> Result<Vec<SearchHitRaw>, GradatumError> {
         self.search_fts_with_snippet(
             vault_id,
@@ -125,6 +132,8 @@ impl IndexStore for SqliteIndex {
             section,
             locus,
             status,
+            from_ms,
+            to_ms,
         )
         .await
     }
@@ -143,6 +152,15 @@ impl IndexStore for SqliteIndex {
             .await
     }
 
+    /// Batch anchor_ms lookup — delegates to `SqliteIndex::get_anchor_ms_batch` (F-65).
+    async fn get_anchor_ms_batch(
+        &self,
+        vault_id: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>, GradatumError> {
+        self.get_anchor_ms_batch(vault_id, ids).await
+    }
+
     /// Lesson recall — delegates to `SqliteIndex::recall_lessons`.
     async fn recall_lessons(
         &self,
@@ -151,6 +169,15 @@ impl IndexStore for SqliteIndex {
         limit: usize,
     ) -> Result<Vec<LessonHitRaw>, GradatumError> {
         self.recall_lessons(vault_id, class, limit).await
+    }
+
+    /// Hydrate lessons by ULID — delegates to `SqliteIndex::hydrate_lessons_by_ulids`.
+    async fn hydrate_lessons_by_ulids(
+        &self,
+        vault_id: &VaultId,
+        ulids: &[&str],
+    ) -> Result<Vec<LessonHitRaw>, GradatumError> {
+        self.hydrate_lessons_by_ulids(vault_id, ulids).await
     }
 
     /// Review queue listing — delegates to `SqliteIndex::list_review_queue`.
@@ -166,6 +193,15 @@ impl IndexStore for SqliteIndex {
     /// Review queue count — delegates to `SqliteIndex::count_review_queue`.
     async fn count_review_queue(&self, vault_id: &VaultId) -> Result<u64, GradatumError> {
         self.count_review_queue(vault_id).await
+    }
+
+    /// Promotable notes from review statuses — delegates to `SqliteIndex::find_promotable`.
+    async fn find_promotable(
+        &self,
+        cutoff_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, gradatum_core::status::NoteStatus)>, GradatumError> {
+        self.find_promotable(cutoff_ms, limit).await
     }
 
     /// Title-based lookup — delegates to `SqliteIndex::title_lookup`.
@@ -230,6 +266,29 @@ impl IndexStore for SqliteIndex {
         cursor: Option<&str>,
     ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
         self.list_notes(vault_id, section, limit, cursor).await
+    }
+
+    /// Status-filtered note listing (inclut downgraded) — delegates to
+    /// `SqliteIndex::list_notes_by_status`.
+    async fn list_notes_by_status(
+        &self,
+        vault_id: &str,
+        statuses: &[&str],
+        section: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        self.list_notes_by_status(vault_id, statuses, section, limit, cursor)
+            .await
+    }
+
+    /// Lists `k` most recently active notes — delegates to `SqliteIndex::list_recent_notes`.
+    async fn list_recent_notes(
+        &self,
+        vault_id: &str,
+        k: usize,
+    ) -> Result<Vec<NoteRecord>, GradatumError> {
+        self.list_recent_notes(vault_id, k).await
     }
 
     /// Total `body_text` size in bytes — delegates to `SqliteIndex::total_body_size_bytes`.
@@ -556,6 +615,65 @@ impl IndexStore for SqliteIndex {
     async fn backfill_ann_index(&self) -> Result<u64, GradatumError> {
         crate::sqlite_vec::backfill_ann_from_conn(&self.conn).await
     }
+
+    // ── Santé des tâches récurrentes (v0.7.5 F-85) ──────────────────────────
+
+    /// Délègue à `SqliteIndex::record_task_run` (inherent).
+    async fn record_task_run(
+        &self,
+        task_name: &str,
+        outcome: TaskOutcome,
+        duration_ms: i64,
+        error: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), GradatumError> {
+        self.record_task_run(task_name, outcome, duration_ms, error, now_ms)
+            .await
+    }
+
+    /// Délègue à `SqliteIndex::seed_scheduled_task` (inherent).
+    async fn seed_scheduled_task(&self, task_name: &str) -> Result<(), GradatumError> {
+        self.seed_scheduled_task(task_name).await
+    }
+
+    /// Délègue à `SqliteIndex::list_scheduled_health` (inherent).
+    async fn list_scheduled_health(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<ScheduledTaskHealth>, GradatumError> {
+        self.list_scheduled_health(now_ms).await
+    }
+
+    /// Délègue à `SqliteIndex::insert_metric_samples` (inherent).
+    async fn insert_metric_samples(
+        &self,
+        ts_ms: i64,
+        samples: &[(String, f64)],
+    ) -> Result<usize, GradatumError> {
+        self.insert_metric_samples(ts_ms, samples).await
+    }
+
+    /// Délègue à `SqliteIndex::query_metric_timeseries` (inherent).
+    async fn query_metric_timeseries(
+        &self,
+        series: &[String],
+        from_ms: i64,
+        to_ms: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<MetricSamplePoint>, GradatumError> {
+        self.query_metric_timeseries(series, from_ms, to_ms, bucket_ms)
+            .await
+    }
+
+    /// Délègue à `SqliteIndex::purge_metric_samples` (inherent).
+    async fn purge_metric_samples(&self, cutoff_ms: i64) -> Result<usize, GradatumError> {
+        self.purge_metric_samples(cutoff_ms).await
+    }
+
+    /// Délègue à `SqliteIndex::list_distinct_metric_series` (inherent).
+    async fn list_distinct_metric_series(&self) -> Result<Vec<String>, GradatumError> {
+        self.list_distinct_metric_series().await
+    }
 }
 
 // ── Tests TDD F-47 get_trust ─────────────────────────────────────────────────────────────────
@@ -570,9 +688,9 @@ mod tests {
 
     use crate::SqliteIndex;
 
-    /// F-47 — get_trust retourne la valeur de la colonne notes.trust.
+    /// `get_trust` returns the value of the `notes.trust` column.
     ///
-    /// Teste found (0.95) et not-found (None) sur une DB in-memory migrée.
+    /// Tests found (0.95) and not-found (`None`) on a migrated in-memory DB.
     #[tokio::test]
     async fn get_trust_returns_column_value() {
         let idx = SqliteIndex::open_in_memory()
@@ -630,7 +748,7 @@ mod tests {
 
         // search_fts_with_snippet — base vide → vec vide
         let hits = store
-            .search_fts_with_snippet(&vault, "foo", 10, false, None, None, None)
+            .search_fts_with_snippet(&vault, "foo", 10, false, None, None, None, None, None)
             .await
             .expect("search_fts_with_snippet dyn");
         assert!(hits.is_empty(), "base vide → 0 hits");

@@ -1,6 +1,5 @@
 ---
 source: crates/gradatum-server/tests/mcp_native.rs
-assertion_line: 611
 expression: schema_map
 ---
 {
@@ -81,7 +80,7 @@ expression: schema_map
   "vault_classify": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Request body for `vault_classify` — synchronous heuristic re-classification of an existing note.\n\nSerialized via `bincode::serde::encode_to_vec` for the queue payload.",
+    "description": "Request body for `vault_classify` — synchronous heuristic re-classification of an existing note.\n\nThe **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.\nThe bincode serialization (`bincode::serde::encode_to_vec`) is used only by the\nlegacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.",
     "properties": {
       "note_id": {
         "description": "ULID identifier of the note to re-classify.",
@@ -100,12 +99,64 @@ expression: schema_map
     "type": "object"
   },
   "vault_context": {
+    "$defs": {
+      "ContextMode": {
+        "description": "Assembly mode for the context produced by `vault_context`.\n\n- `Assembled` (default): the pipeline produces a pre-formatted LLM Markdown block.\n- `Raw`: returns raw hits without narrative assembly.\n- `Compact`: folded view — the most relevant notes stay inline, the rest are\n  folded into dereferenceable stubs. Requires a `session_id`.",
+        "oneOf": [
+          {
+            "const": "assembled",
+            "description": "Assembles hits into a ready-to-use LLM context block (default).",
+            "type": "string"
+          },
+          {
+            "const": "raw",
+            "description": "Returns raw hits without narrative assembly.",
+            "type": "string"
+          },
+          {
+            "const": "compact",
+            "description": "Folded view: the most relevant notes stay inline; the rest are folded into\ndereferenceable stubs. Replaces the context block on the client side (one cache reset).\nRequires a `session_id`.",
+            "type": "string"
+          }
+        ]
+      },
+      "ScoringWeights": {
+        "description": "Optional scoring weights for context-hit ranking.\n\nAll fields are optional — only the provided weights override pipeline defaults.\nAbsent fields leave the pipeline's internal values unchanged.",
+        "properties": {
+          "pagerank": {
+            "description": "PageRank weight in the composite ranking score.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "recency": {
+            "description": "Recency weight in the composite ranking score.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "trust": {
+            "description": "Trust weight in the composite ranking score.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
     "description": "Request body for `vault_context` — legacy vault v1.6.2 `VaultContextArgs` parity.",
     "properties": {
-      "max_tokens": {
-        "description": "Maximum number of context tokens (default 2000, max 8000).",
+      "budget_tokens": {
+        "description": "Token budget for context assembly (v0.7.0+).\n\nTakes precedence over `max_tokens` when both are present.",
         "format": "uint32",
         "minimum": 0,
         "type": [
@@ -113,12 +164,62 @@ expression: schema_map
           "null"
         ]
       },
+      "inject_skills": {
+        "default": false,
+        "description": "Inject available skills into the context (default: `false`).",
+        "type": "boolean"
+      },
+      "max_tokens": {
+        "description": "Maximum number of context tokens (legacy — see `budget_tokens` for v0.7.0+).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "mode": {
+        "$ref": "#/$defs/ContextMode",
+        "default": "assembled",
+        "description": "Context assembly mode (default: `Assembled`)."
+      },
       "query": {
         "description": "Query for which to build the LLM context.",
         "type": "string"
       },
+      "reference_mode": {
+        "default": false,
+        "description": "Enable reference mode: candidates that do not fit the inline budget are returned\nas dereferenceable stubs in the response's `references` field.\n\n`false` (default): `references` is always empty (backward-compatible behaviour).\n`true`: the inline/stub split is exposed in the response.\n\n**Additive field**: existing clients that omit it receive `false`\ndespite `deny_unknown_fields` (absent field → default value, no error).",
+        "type": "boolean"
+      },
+      "scoring": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ScoringWeights"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Optional scoring weights for hit ranking."
+      },
       "section": {
         "description": "Section filter (optional).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "session_id": {
+        "default": null,
+        "description": "Session identifier for incremental context filtering.\n\nExpected format: ULID Crockford base32, 26 ASCII alphanumeric characters —\naligned with the `POST /api/v1/session-log/trace` handler validation.\n\n`None` (default): no session filter — all matching notes are candidates.\n`Some(id)`: notes already sent inline in this session are demoted to stubs\n(frozen snippet from `session_trace`); new inline notes are marked via\n`mark_sent` for subsequent turns (no re-promotion).\n\n**Additive field**: existing clients that omit it receive `None`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "skill_query": {
+        "description": "Skill selection query (active when `inject_skills = true`).",
         "type": [
           "string",
           "null"
@@ -169,7 +270,7 @@ expression: schema_map
   },
   "vault_downgrade": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request body for `vault_downgrade` — downgrades a note.\n\nSerialized via `bincode::serde::encode_to_vec` for the queue payload.\n\nPOST `/api/v1/vault_downgrade`. Idempotent: downgrading an already-downgraded\nnote returns 200 with the current status.",
+    "description": "Request body for `vault_downgrade` — downgrades a note.\n\nThe **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.\nThe bincode serialization (`bincode::serde::encode_to_vec`) is used only by the\nlegacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.\n\nPOST `/api/v1/vault_downgrade`. Idempotent: downgrading an already-downgraded\nnote returns 200 with the current status.",
     "properties": {
       "note_id": {
         "description": "ULID identifier of the note to downgrade.",
@@ -419,6 +520,23 @@ expression: schema_map
     "type": "object"
   },
   "vault_lessons_recall": {
+    "$defs": {
+      "RankMode": {
+        "description": "Ranking mode for [`LessonsRecallRequest`].\n\nControls the final ordering of BM25 results after `recall_lessons`.\nWhen absent or `Relevance`, the legacy BM25 order is preserved (rétro-compat).\n\n# Wire encoding\n`\"relevance\"` or `\"recency-boosted\"` (kebab-case, serde `rename_all`).\n\n# Comportement par défaut\n`None` / absent → BM25 order inchangé (hook LIVE `lesson-recall.sh` en dépend).",
+        "oneOf": [
+          {
+            "const": "relevance",
+            "description": "Legacy BM25 order — default when the field is absent.\n\nA `rank=relevance` request is a no-op: it produces the same result as omitting\nthe field entirely. This preserves the rétro-compat invariant bit-for-bit.",
+            "type": "string"
+          },
+          {
+            "const": "recency-boosted",
+            "description": "Multiply each BM25 rank-proxy score by `recency_factor(anchor_ms, now_ms)`,\nthen re-sort descending. Fresh lessons surface first.\n\n`recency_factor` uses λ = 0.01 (half-life ≈ 69 days, same as vault search).",
+            "type": "string"
+          }
+        ]
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
     "description": "Request for lesson recall.\n\nUsed to generate the `inputSchema` for the `vault_lessons_recall` MCP tool.\nOn the HTTP server side, these fields are received as query params (`?class=&limit=`).",
@@ -433,6 +551,31 @@ expression: schema_map
         "minimum": 0,
         "type": [
           "integer",
+          "null"
+        ]
+      },
+      "query": {
+        "description": "Requête textuelle pour la recherche sémantique (opt-in, `semantic = true`).\n\nSi absent quand `semantic = true`, la classe (`class`) est utilisée comme requête\npar défaut. Ignoré si `semantic = false` / absent.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "rank": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/RankMode"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Optional ranking mode.\n\n- absent / `\"relevance\"` → BM25 order (legacy behaviour, hook LIVE en dépend).\n- `\"recency-boosted\"` → rank-proxy × `recency_factor`, then sort descending.\n\nThe field is optional and `deny_unknown_fields` is already set on this struct,\nso the addition is rétro-compat: existing callers that omit the field continue\nto receive BM25-ordered results without any change."
+      },
+      "semantic": {
+        "description": "Opt-in semantic (embedding) recall mode.\n\n- absent / `false` → chemin BM25 `recall_lessons` INCHANGÉ (rétro-compat absolue).\n  Les callers LIVE (hook `lesson-recall.sh`, agents, MCP) qui n'envoient pas ce champ\n  continuent à recevoir les résultats BM25 sans modification.\n- `true` → retrieval hybride RRF (`retrieve_candidates`) + hydratation ULID +\n  filtres `codified` / `class` en Rust. Si embed KO → fallback silencieux BM25.",
+        "type": [
+          "boolean",
           "null"
         ]
       }
@@ -515,6 +658,75 @@ expression: schema_map
     "title": "VaultListRequest",
     "type": "object"
   },
+  "vault_proactive_recall": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request to pull the proactive memory surface or trigger contextual recall.\n\nWhen `context` is absent, the server returns the pre-computed proactive surface\n(`mode = \"proactive\"`). When `context` is present, the server runs an on-demand\ncontextual RRF retrieval (`mode = \"contextual\"`).\n\n# Wire notes\n`#[serde(deny_unknown_fields)]` rejects unrecognised fields — forward-compat\ndiscipline: consumers must stay within the declared contract.",
+    "properties": {
+      "context": {
+        "description": "Optional context text for contextual recall.\n\nWhen present, the server computes an on-demand RRF retrieval using this text\nas the query and returns `mode = \"contextual\"`. When absent, the server returns\nthe pre-computed proactive surface (`mode = \"proactive\"`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "description": "Maximum number of items to return (server default 10, clamped to `[1, 20]`).\n\nAbsent or `null`: server-default applies.",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "sections": {
+        "description": "Optional section filter — restricts surfaced notes to this set of sections.\n\nAbsent or `null`: no section restriction (all sections surfaced).",
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "title": "ProactiveRecallRequest",
+    "type": "object"
+  },
+  "vault_proactive_recall_feedback": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request to submit feedback on a proactive recall session.\n\n`recall_id` must match a `recall_id` previously returned by the recall endpoint.\n`accepted_ulids` should be a subset of the ULIDs present in that response.\n\n# Wire notes\n`#[serde(deny_unknown_fields)]` enforces contract discipline (same as request).",
+    "properties": {
+      "accepted_ulids": {
+        "description": "ULIDs of notes accepted (acted on) by the user.\n\nMust be a subset of the ULIDs present in the corresponding\n[`ProactiveRecallResponse::items`]. An empty vec is valid (no note accepted).",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "recall_id": {
+        "description": "Recall session identifier returned by the recall endpoint.",
+        "type": "string"
+      },
+      "tenant_id": {
+        "default": "main",
+        "description": "Tenant identifier (default `\"main\"`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "recall_id",
+      "accepted_ulids"
+    ],
+    "title": "ProactiveRecallFeedbackRequest",
+    "type": "object"
+  },
   "vault_read": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
@@ -575,6 +787,15 @@ expression: schema_map
     "additionalProperties": false,
     "description": "Request body for `vault_search`.\n\n## Optional fields (backward-compatible)\n\n- `locus`: filter by physical path prefix (e.g. `\"council/\"` restricts to notes\n  whose `locus` starts with `council/`). Applied to both FTS and semantic paths.\n  The prefix is escaped against LIKE injection (metacharacters `%`, `_`, `\\`).\n- `vault_id`: cross-vault read — allows querying a vault other than `tenant_id`.\n  Writes remain unchanged (single-tenant). Validation: non-empty, max 128 chars.",
     "properties": {
+      "from_ms": {
+        "default": null,
+        "description": "Earliest temporal anchor (inclusive), Unix epoch milliseconds.\n\nIf provided, restricts results to notes whose `temporal_index.anchor_ms >= from_ms`.\nApplied as an AND filter after all other filters (ACL, section, locus, status).\nNotes without a `temporal_index` entry are excluded when this bound is set.\n\nAbsent or `null`: no lower bound (unchanged behavior).",
+        "format": "int64",
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
       "include_corpus_count": {
         "default": false,
         "description": "If `true`, includes in the response the total count of notes matching\nthe **FTS5/BM25 lexical** query within the filtered scope, unbounded by K.\n\nAllows distinguishing \"topic absent from the corpus\" (`corpus_match_count == 0`)\nfrom \"notes present but ranked below K\" (`corpus_match_count > len(results)`).\n\nDoes NOT indicate semantic ANN hit count.\nOpt-in (default `false`): zero overhead when absent — no COUNT is executed.",
@@ -628,6 +849,15 @@ expression: schema_map
         "default": "main",
         "description": "Tenant identifier (default `\"main\"`).",
         "type": "string"
+      },
+      "to_ms": {
+        "default": null,
+        "description": "Latest temporal anchor (inclusive), Unix epoch milliseconds.\n\nIf provided, restricts results to notes whose `temporal_index.anchor_ms <= to_ms`.\nApplied as an AND filter after all other filters (ACL, section, locus, status).\nNotes without a `temporal_index` entry are excluded when this bound is set.\n\nAbsent or `null`: no upper bound (unchanged behavior).\n\nValidation: `from_ms` and `to_ms` may be provided independently; if both are\npresent, `from_ms` must be ≤ `to_ms` (otherwise `400 Bad Request`).",
+        "format": "int64",
+        "type": [
+          "integer",
+          "null"
+        ]
       },
       "vault_id": {
         "description": "vault to query in read mode (optional).\n\nLifts the single-tenant constraint **for reads only** — allows querying\na vault other than `tenant_id`. Writes remain unchanged.\nValidation: non-empty, max 128 chars.\n\nAbsent or `null`: uses `tenant_id` (unchanged behavior).",
@@ -759,7 +989,7 @@ expression: schema_map
   },
   "vault_write": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request body for `vault_write` — creates a note via the async queue.\n\nSerialized via `bincode::serde::encode_to_vec` for the queue payload.",
+    "description": "Request body for `vault_write` — creates a note via the async queue.\n\nThe **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.\nThe bincode serialization (`bincode::serde::encode_to_vec`) is used only by the\nlegacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.",
     "properties": {
       "author": {
         "default": null,
@@ -784,6 +1014,14 @@ expression: schema_map
       "note_id": {
         "default": null,
         "description": "Pre-allocated ULID — honored by the legacy `SqliteQueue` dispatcher if present\nand parseable as a valid ULID.\n\n`None` = backward-compatible behavior: the dispatcher generates a fresh ULID.\n\n## Bincode field-order invariant\n\nThis field is at **position 8** (last) — AFTER `tenant_id` (pos 6) and\n`expected_sha256` (pos 7). Bincode v2 (`config::standard()`) is positional:\ndeclaration order determines serialization order.\nNever move this field without updating all encoders.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "occurred_at": {
+        "default": null,
+        "description": "Temporal anchor — event date of the note (ISO 8601 UTC or YYYY-MM-DD).\n\nWhen present and parseable, the worker sets `anchor_src = occurred_at` and\n`anchor_ms` to this date's epoch milliseconds, instead of the creation time.\n\nAbsent or `null` → `anchor_src = created` (backward-compatible behaviour).\n\n## Accepted formats\n\n- ISO 8601 / RFC 3339 with time: `\"2026-01-15T10:00:00Z\"`\n- Date-only YYYY-MM-DD → start of day UTC: `\"2026-01-15\"`\n\nAn unparseable value is rejected by the server with **400 InvalidInput**.\n\nDates arbitraires (passé/futur) acceptées by-design — pas de borne sémantique.",
         "type": [
           "string",
           "null"

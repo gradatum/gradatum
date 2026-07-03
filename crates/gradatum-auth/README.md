@@ -2,7 +2,7 @@
 
 > JWT verification (Ed25519, audience-scoped, mandatory `kid`), API key exchange, and token revocation.
 
-**Status**: Alpha (v0.4.x) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: 0.x — API not yet stable. Apache-2.0.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -21,13 +21,22 @@ Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone fo
 
 ```toml
 [dependencies]
-gradatum-auth = "0.4.0"
+gradatum-auth = "0.7.6"
 ```
 
 ```rust
-use gradatum_auth::jwt::{verify_jwt, Claims};
+use ed25519_dalek::SigningKey;
+use gradatum_auth::jwt::{JwtService, TokenScope, Claims};
 
-let claims: Claims = verify_jwt(&token, &public_key, "gradatum-api")?;
+// Build a JwtService with an Ed25519 signing key.
+let signing = SigningKey::generate(&mut rand::rngs::OsRng);
+let svc = JwtService::new(signing, "kid-2026".into(), "gradatum".into(), 3600, 86400);
+
+// Sign a token.
+let token = svc.sign("consumer-id", &["read".into()], TokenScope::Service, "main")?;
+
+// Verify — validates signature, kid, audience, and expiry.
+let claims: Claims = svc.verify(&token)?;
 println!("consumer: {}, scopes: {:?}", claims.sub, claims.scopes);
 ```
 

@@ -119,23 +119,23 @@ impl SqliteQueueStore {
         }
     }
 
-    /// Promove les dépendants d'un job `done_id` qui vient de passer `Done`.
+    /// Promotes dependants of a job `done_id` that has just transitioned to `Done`.
     ///
-    /// Pour chaque job en `Waiting` dont `await_jobs` contient `done_id` :
-    /// - Relit les dépendances complètes depuis le payload.
-    /// - Vérifie que TOUS les IDs référencés sont en statut `Done` dans la base.
-    /// - Si oui → appelle `set_pending(dependent_id)`.
+    /// For each job in `Waiting` whose `await_jobs` contains `done_id`:
+    /// - Re-reads the complete dependencies from the payload.
+    /// - Verifies that ALL referenced IDs are in `Done` status in the database.
+    /// - If so → calls `set_pending(dependent_id)`.
     ///
-    /// # Garantie d'inertie
+    /// # Inertia guarantee
     ///
-    /// Si `find_awaiting` retourne une liste vide (aucun job dépendant), la
-    /// méthode retourne immédiatement sans aucune modification. Le comportement
-    /// des jobs sans `await_jobs` est strictement inchangé.
+    /// If `find_awaiting` returns an empty list (no dependent jobs), the method
+    /// returns immediately without any mutation. The behavior of jobs without
+    /// `await_jobs` is strictly unchanged.
     ///
-    /// # Erreurs
+    /// # Errors
     ///
-    /// Retourne la première erreur de storage rencontrée. Les appels `set_pending`
-    /// partiellement effectués avant l'erreur ne sont pas annulés (best-effort).
+    /// Returns the first storage error encountered. Any `set_pending` calls that
+    /// completed before the error are not rolled back (best-effort).
     pub(crate) async fn cascade_check_and_promote(&self, done_id: Ulid) -> Result<(), QueueError> {
         let dependents = self.find_awaiting(done_id).await?;
 
@@ -159,14 +159,14 @@ impl SqliteQueueStore {
         Ok(())
     }
 
-    /// Vérifie que tous les jobs dans `ids` ont le statut `Done`.
+    /// Returns `true` if all jobs in `ids` have status `Done`.
     ///
-    /// Retourne `true` si la liste est vide (vacuité logique — pas de contrainte
-    /// → immédiatement satisfait) ou si tous les IDs sont Done.
+    /// Returns `true` for an empty list (vacuous truth — no constraint, immediately satisfied)
+    /// or when all IDs are `Done`.
     ///
     /// # Errors
     ///
-    /// Retourne `QueueError::Storage` en cas d'erreur SQLite.
+    /// Returns `QueueError::Storage` on SQLite error.
     async fn all_jobs_done(&self, ids: &[Ulid]) -> Result<bool, QueueError> {
         if ids.is_empty() {
             return Ok(true);
@@ -1172,18 +1172,18 @@ impl QueueStore for SqliteQueueStore {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
-    /// Rattrapage DAG (DT-DAG-1) : promeuvet les jobs `Waiting` dont toutes les
-    /// dependances sont `Done` mais dont la cascade post-commit a echoue.
+    /// DAG recovery: promotes `Waiting` jobs whose all dependencies are `Done`
+    /// but whose post-commit cascade failed.
     ///
-    /// Surcharge de la default impl du trait (qui retourne `Ok(0)`).
-    /// Appelle `all_jobs_done` (methode inherent `SqliteQueueStore`) pour chaque
-    /// job `Waiting` avec `await_jobs` non-vide, puis `set_pending` si eligible.
+    /// Overrides the default trait impl (which returns `Ok(0)`).
+    /// Calls `all_jobs_done` (inherent method on `SqliteQueueStore`) for each
+    /// `Waiting` job with a non-empty `await_jobs`, then calls `set_pending` if eligible.
     ///
     /// # Errors
     ///
-    /// Retourne `QueueError::Storage` en cas d'erreur SQLite. Les promotions
-    /// deja effectuees avant l'erreur ne sont pas annulees (best-effort, coherent
-    /// avec `cascade_check_and_promote`).
+    /// Returns `QueueError::Storage` on SQLite error. Promotions already applied
+    /// before the error are not rolled back (best-effort, consistent with
+    /// `cascade_check_and_promote`).
     async fn promote_stranded_waiting_jobs(&self) -> Result<u32, QueueError> {
         // Requete utilisant l'index partiel `idx_gradatum_jobs_waiting` (status='Waiting').
         // Filtre `await_jobs != '[]'` elimine les jobs sans contrainte de chaininge.
@@ -1479,11 +1479,11 @@ mod tests {
     use sqlx::SqlitePool;
     use ulid::Ulid;
 
-    /// Crée un pool SQLite in-memory pour les tests.
+    /// Creates an in-memory SQLite pool for tests.
     ///
-    /// Applique les migrations 006 + 007 + 008 + 009 + 010 directement via `include_str!`
-    /// (sqlx migrate! requiert les fichiers sur disque lors de la macro expansion,
-    /// pas disponible dans les tests in-memory).
+    /// Applies migrations 006 + 007 + 008 + 009 + 010 directly via `include_str!`
+    /// (`sqlx migrate!` requires files on disk at macro expansion time,
+    /// which is unavailable in in-memory tests).
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:")
             .await
@@ -1649,11 +1649,12 @@ mod tests {
         assert_eq!(fetched.lifecycle.status, JobStatus::Done);
     }
 
-    /// F-41 — `complete()` ne doit PAS écraser un job déjà en état terminal `Conflict`.
+    /// `complete()` must not overwrite a job already in the terminal `Conflict` state.
     ///
-    /// Reproduit le seam LIVE : `mark_conflict` pose `Conflict`, puis l'ack apalis
-    /// (qui voit le `Ok` du handler) appelle `complete()`. Sans la garde anti-clobber,
-    /// le status finirait `Done` → l'appelant RMW ne peut plus détecter le conflit.
+    /// Reproduces the real-world interleaving: `mark_conflict` sets `Conflict`, then the
+    /// apalis acknowledgement (which sees the handler's `Ok`) calls `complete()`. Without the
+    /// anti-clobber guard the status would become `Done`, making the conflict undetectable
+    /// by the caller's read-modify-write path.
     #[tokio::test]
     async fn complete_preserves_terminal_conflict() {
         let pool = test_pool().await;
@@ -1731,7 +1732,11 @@ mod tests {
         let pool = test_pool().await;
         let store = SqliteQueueStore::new(pool);
 
-        let mut record = make_record(Job::Validate, JobClass::System, JobStatus::Pending);
+        let mut record = make_record(
+            Job::Validate(gradatum_core::ValidateSpec::default()),
+            JobClass::System,
+            JobStatus::Pending,
+        );
         record.retry.max = 1; // max 1 retry pour le test
         let id = record.id;
         store.enqueue(record).await.expect("enqueue doit réussir");
@@ -1814,8 +1819,8 @@ mod tests {
         assert!(results.iter().all(|r| r.spec.class == JobClass::Agent));
     }
 
-    /// Construit un `JobRecord` Backup dont l'`id` ULID et le `created_at` dérivent
-    /// de `dt` — id monotone corrélé à la date (testable ASC/DESC + plages).
+    /// Builds a Backup `JobRecord` whose ULID `id` and `created_at` both derive from `dt`
+    /// — monotone ID correlated with the date (testable ASC/DESC + range queries).
     fn make_record_at(dt: chrono::DateTime<Utc>) -> JobRecord {
         let mut r = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
         r.id = Ulid::from_datetime(dt.into());
@@ -1823,7 +1828,7 @@ mod tests {
         r
     }
 
-    /// Enqueue 4 jobs à T+0,1,2,3 et retourne leurs ids dans l'ordre chronologique.
+    /// Enqueues 4 jobs at T+0, 1, 2, 3 and returns their IDs in chronological order.
     async fn seed_four(store: &SqliteQueueStore) -> Vec<Ulid> {
         let base = Utc::now() - chrono::Duration::hours(1);
         let mut ids = Vec::with_capacity(4);
@@ -1990,7 +1995,7 @@ mod tests {
 
     // ── Tests régression E-12 — get() synchronise le statut SQL ─────────────
 
-    /// Régression E-12 — enqueue → get : statut doit être Pending.
+    /// `enqueue` → `get`: status must be `Pending`.
     #[tokio::test]
     async fn e12_get_after_enqueue_is_pending() {
         let pool = test_pool().await;
@@ -2012,7 +2017,7 @@ mod tests {
         );
     }
 
-    /// Régression E-12 — enqueue → dequeue → get : statut doit être Running, pas Pending stale.
+    /// `enqueue` → `dequeue` → `get`: status must be `Running`, not stale `Pending`.
     #[tokio::test]
     async fn e12_get_after_dequeue_is_running() {
         let pool = test_pool().await;
@@ -2046,7 +2051,7 @@ mod tests {
         );
     }
 
-    /// Régression E-12 — enqueue → dequeue → complete → get : statut doit être Done.
+    /// `enqueue` → `dequeue` → `complete` → `get`: status must be `Done`.
     #[tokio::test]
     async fn e12_get_after_complete_is_done() {
         let pool = test_pool().await;
@@ -2087,11 +2092,10 @@ mod tests {
 
     // ── Tests fix routing DLQ (bug dequeue_by_kind) ──────────────────────────
 
-    /// Test d'isolation par kind — cœur du fix routing DLQ.
+    /// Kind isolation test — core of the DLQ routing fix.
     ///
-    /// Enqueue 1 Curate + 1 Embed → `dequeue_by_kind("Curate")` ne rend QUE le Curate,
-    /// jamais l'Embed. Même isolement dans l'autre sens.
-    /// C'est LE test qui prouve que le bug de routing est résolu.
+    /// Enqueue 1 Curate + 1 Embed → `dequeue_by_kind("Curate")` returns ONLY the Curate,
+    /// never the Embed. Same isolation in the other direction.
     #[tokio::test]
     async fn dequeue_by_kind_isolates_curate_from_embed() {
         let pool = test_pool().await;
@@ -2148,8 +2152,8 @@ mod tests {
         );
     }
 
-    /// Symétrique : `dequeue_by_kind("Embed")` ne prend pas un Curate, même si c'est
-    /// le seul job disponible et qu'il est prioritaire.
+    /// Symmetric: `dequeue_by_kind("Embed")` does not steal a Curate, even when
+    /// it is the only available job and has priority.
     #[tokio::test]
     async fn dequeue_by_kind_embed_worker_cannot_steal_curate() {
         let pool = test_pool().await;
@@ -2174,8 +2178,8 @@ mod tests {
         );
     }
 
-    /// `enqueue()` persiste la colonne `kind` avec la valeur correcte — régression du bug racine.
-    /// Sans ce test, un enqueue sans `kind` ferait silencieusement échouer le routing.
+    /// `enqueue()` persists the `kind` column with the correct value — root-bug regression.
+    /// Without this test, an enqueue without `kind` would silently break routing.
     #[tokio::test]
     async fn enqueue_persists_kind_column() {
         let pool = test_pool().await;
@@ -2202,8 +2206,8 @@ mod tests {
         );
     }
 
-    /// Vérifie que la migration 010 backfille `kind` correctement depuis un payload réaliste.
-    /// Simule les 41 jobs prod avec kind='' qui ont été enqueués sans la colonne.
+    /// Verifies that migration 010 backfills `kind` correctly from a realistic payload.
+    /// Simulates jobs that were enqueued without the `kind` column (empty string).
     #[tokio::test]
     async fn migration_010_backfills_kind_from_payload() {
         let pool = test_pool().await;
@@ -2259,11 +2263,11 @@ mod tests {
         );
     }
 
-    /// `job_kind_str` couvre tous les variants de `Job` sans wildcard.
+    /// `job_kind_str` covers all `Job` variants without a wildcard arm.
     ///
-    /// L'exhaustivité du `match` est imposée par le compilateur (pas de `_ =>`).
-    /// Ce test vérifie les valeurs retournées pour les variants facilement constructibles
-    /// et garantit la correspondance avec le payload JSON (`serde(tag = "type")`).
+    /// Match exhaustiveness is enforced by the compiler (no `_ =>`).
+    /// Verifies the returned values for easily constructible variants and asserts
+    /// their correspondence with the JSON payload (`serde(tag = "type")`).
     #[test]
     fn job_kind_str_covers_all_variants() {
         use gradatum_core::ReIndexMode;
@@ -2282,7 +2286,10 @@ mod tests {
             "Purge"
         );
         assert_eq!(job_kind_str(&Job::Summarize), "Summarize");
-        assert_eq!(job_kind_str(&Job::Validate), "Validate");
+        assert_eq!(
+            job_kind_str(&Job::Validate(gradatum_core::ValidateSpec::default())),
+            "Validate"
+        );
         assert_eq!(job_kind_str(&Job::Audit), "Audit");
         assert_eq!(job_kind_str(&Job::Consolidate), "Consolidate");
         assert_eq!(
@@ -2353,19 +2360,23 @@ mod tests {
 
     // ── Tests fix worker-hang-busy-timeout ────────────────────────────────────
 
-    /// Régression : `promote_retries` utilisait le BLOB stale (retry.count=0) au lieu
-    /// de `attempt_count` SQL pour la garde DLQ → les jobs dépassant max_retries
-    /// étaient remis en Pending indéfiniment au lieu d'aller en DLQ.
+    /// `promote_retries` reads the SQL `attempt_count` column (not the stale BLOB `retry.count`)
+    /// for the DLQ guard, so jobs that exceed `max_retries` are moved to DLQ rather than
+    /// being reset to `Pending` indefinitely.
     ///
-    /// Ce test vérifie que `promote_retries` lit bien `attempt_count` SQL et envoie
-    /// le job en DLQ quand `attempt_count >= retry.max`.
+    /// Verifies that `promote_retries` reads `attempt_count` from SQL and sends the job to
+    /// DLQ when `attempt_count >= retry.max`.
     #[tokio::test]
     async fn promote_retries_uses_sql_attempt_count_for_dlq_guard() {
         let pool = test_pool().await;
         let store = SqliteQueueStore::new(pool.clone());
 
         // max=2 — après 2 tentatives le job doit partir en DLQ.
-        let mut record = make_record(Job::Validate, JobClass::System, JobStatus::Pending);
+        let mut record = make_record(
+            Job::Validate(gradatum_core::ValidateSpec::default()),
+            JobClass::System,
+            JobStatus::Pending,
+        );
         record.retry.max = 2;
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
@@ -2415,18 +2426,22 @@ mod tests {
         );
     }
 
-    /// Régression : `replay_single` remettait en Pending sans reset `attempt_count`.
-    /// Un job replayed avec attempt_count >= max_retries serait aussitôt renvoyé en DLQ
-    /// par le prochain sweep sans jamais être exécuté.
+    /// `replay_single` was resetting to `Pending` without clearing `attempt_count`.
+    /// A replayed job with `attempt_count >= max_retries` would be immediately sent
+    /// to DLQ on the next sweep without ever executing.
     ///
-    /// Ce test vérifie directement que `attempt_count` et `last_error` sont remis à 0/NULL
-    /// après un replay SQL (même requête que jobs_cmd::replay_single).
+    /// Verifies directly that `attempt_count` and `last_error` are reset to 0/NULL
+    /// after a replay SQL (same query used by `jobs_cmd::replay_single`).
     #[tokio::test]
     async fn replay_dlq_resets_attempt_count() {
         let pool = test_pool().await;
         let store = SqliteQueueStore::new(pool.clone());
 
-        let record = make_record(Job::Validate, JobClass::System, JobStatus::Pending);
+        let record = make_record(
+            Job::Validate(gradatum_core::ValidateSpec::default()),
+            JobClass::System,
+            JobStatus::Pending,
+        );
         let id = record.id;
         let id_str = id.to_string();
         store.enqueue(record).await.expect("enqueue");
@@ -2482,14 +2497,18 @@ mod tests {
         assert_eq!(status, "Pending", "status doit être Pending après replay");
     }
 
-    /// Vérifie que `promote_retries` remet bien un job en Pending quand
-    /// attempt_count < max_retries (chemin heureux — non régressé par le fix).
+    /// Verifies that `promote_retries` resets a job to `Pending` when
+    /// `attempt_count < max_retries` (happy path — not regressed by the fix).
     #[tokio::test]
     async fn promote_retries_pending_when_below_max() {
         let pool = test_pool().await;
         let store = SqliteQueueStore::new(pool);
 
-        let mut record = make_record(Job::Validate, JobClass::System, JobStatus::Pending);
+        let mut record = make_record(
+            Job::Validate(gradatum_core::ValidateSpec::default()),
+            JobClass::System,
+            JobStatus::Pending,
+        );
         record.retry.max = 3; // max 3, on ne fait qu'1 tentative
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
@@ -2523,7 +2542,7 @@ mod tests {
 
     // ── Helpers de seeding ────────────────────────────────────────────────────
 
-    /// Construit un `JobRecord` avec `await_jobs = [job_trigger]` et `status = Waiting`.
+    /// Builds a `JobRecord` with `await_jobs = [job_trigger]` and `status = Waiting`.
     fn make_waiting_record_with_dep(dep_id: Ulid) -> JobRecord {
         let mut rec = make_record(Job::Summarize, JobClass::System, JobStatus::Waiting);
         rec.scheduling.await_jobs = vec![JobTrigger {
@@ -2535,7 +2554,7 @@ mod tests {
 
     // ── find_awaiting ─────────────────────────────────────────────────────────
 
-    /// `find_awaiting` retourne les jobs Waiting dont `await_jobs` contient `job_id`.
+    /// `find_awaiting` returns `Waiting` jobs whose `await_jobs` contains `job_id`.
     #[tokio::test]
     async fn find_awaiting_returns_dependents_when_job_matches() {
         let pool = test_pool().await;
@@ -2558,7 +2577,7 @@ mod tests {
         );
     }
 
-    /// `find_awaiting` retourne un vecteur vide si aucun job ne dépend de `job_id`.
+    /// `find_awaiting` returns an empty vec when no job depends on `job_id`.
     #[tokio::test]
     async fn find_awaiting_returns_empty_when_no_dependents() {
         let pool = test_pool().await;
@@ -2576,11 +2595,11 @@ mod tests {
         assert!(result.is_empty(), "aucun dépendant attendu");
     }
 
-    /// `find_awaiting` n'effectue pas de correspondance partielle : un ULID qui
-    /// est un préfixe d'un autre ULID ne matche pas.
+    /// `find_awaiting` does not perform partial matching: a ULID that is a prefix
+    /// of another ULID does not match.
     ///
-    /// Le pattern LIKE `%"<id>"%` (guillemets inclus) garantit que seul l'ULID
-    /// exact matche — un sous-préfixe sans guillemets fermants ne matche pas.
+    /// The `LIKE '%"<id>"%'` pattern (quotes included) ensures only an exact ULID
+    /// matches — a sub-prefix without closing quotes does not match.
     #[tokio::test]
     async fn find_awaiting_no_partial_match() {
         let pool = test_pool().await;
@@ -2607,7 +2626,7 @@ mod tests {
 
     // ── set_pending ───────────────────────────────────────────────────────────
 
-    /// `set_pending` fait passer un job `Waiting` en `Pending`.
+    /// `set_pending` transitions a `Waiting` job to `Pending`.
     #[tokio::test]
     async fn set_pending_transitions_waiting_to_pending() {
         let pool = test_pool().await;
@@ -2630,7 +2649,7 @@ mod tests {
         );
     }
 
-    /// `set_pending` est idempotent : deux appels successifs ne retournent pas d'erreur.
+    /// `set_pending` is idempotent: two successive calls do not return an error.
     #[tokio::test]
     async fn set_pending_is_idempotent_when_already_pending() {
         let pool = test_pool().await;
@@ -2654,8 +2673,8 @@ mod tests {
         );
     }
 
-    /// `set_pending` est no-op sur un job en état terminal (`Done`) : retourne OK
-    /// sans modifier le statut.
+    /// `set_pending` is a no-op on a terminal-state job (`Done`): returns `Ok`
+    /// without modifying the status.
     #[tokio::test]
     async fn set_pending_no_op_when_not_waiting() {
         let pool = test_pool().await;
@@ -2696,7 +2715,7 @@ mod tests {
 
     // ── cascade_check_and_promote ─────────────────────────────────────────────
 
-    /// Cascade : job B attend [A], A est Done → B passe Pending.
+    /// Cascade: job B waits on [A], A is Done → B transitions to Pending.
     #[tokio::test]
     async fn cascade_promotes_when_all_deps_done() {
         let pool = test_pool().await;
@@ -2744,7 +2763,7 @@ mod tests {
         );
     }
 
-    /// Cascade : job B attend [A, C], A est Done mais C est Pending → B reste Waiting.
+    /// Cascade: job B waits on [A, C], A is Done but C is Pending → B remains Waiting.
     #[tokio::test]
     async fn cascade_does_not_promote_when_dep_not_done() {
         let pool = test_pool().await;
@@ -2803,7 +2822,7 @@ mod tests {
         );
     }
 
-    /// Cascade d'inertie : aucun dépendant → aucune mutation, retour OK.
+    /// Cascade inertia: no dependants → no mutations, returns `Ok`.
     #[tokio::test]
     async fn cascade_inertia_no_deps() {
         let pool = test_pool().await;
@@ -2821,14 +2840,13 @@ mod tests {
 
     // ── C1 : transitions queue atomiques — pas de double-complete ────────────
 
-    /// C1 — Deux appels `complete` concurrents sur le même job : exactement 1
-    /// doit réussir et laisser le job en Done. Le second doit aussi réussir
-    /// (idempotent au niveau SQL — pas d'erreur NotFound car le job existe encore)
-    /// mais le statut final doit rester Done et le résultat du premier être
-    /// préservé (pas de corruption).
+    /// Two concurrent `complete` calls on the same job: exactly one must succeed and
+    /// leave the job in `Done`. The second must also succeed (SQL-level idempotent —
+    /// no `NotFound` error because the job still exists) but the final status must
+    /// remain `Done` and the first caller's result must be preserved (no corruption).
     ///
-    /// Ce test vérifie que la transaction BEGIN IMMEDIATE sérialise correctement
-    /// les deux appels sans perdre de données.
+    /// Verifies that `BEGIN IMMEDIATE` transactions correctly serialize both calls
+    /// without losing data.
     #[tokio::test]
     async fn c1_concurrent_complete_no_double_write() {
         let pool = test_pool().await;
@@ -2880,8 +2898,8 @@ mod tests {
         );
     }
 
-    /// C1 — Deux appels `fail` concurrents sur le même job : le statut final
-    /// doit être Failed (pas Pending ou autre état corrompu).
+    /// Two concurrent `fail` calls on the same job: the final status must be
+    /// `Failed` (not `Pending` or another corrupted state).
     #[tokio::test]
     async fn c1_concurrent_fail_no_corruption() {
         let pool = test_pool().await;
@@ -2915,8 +2933,8 @@ mod tests {
 
     // ── C3 : recover_stale_leases — TTL invalide ne doit pas mass-recover ────
 
-    /// C3 — TTL = Duration::MAX (hors plage chrono) → 0 job récupéré, pas de
-    /// panic, pas de mass-recovery catastrophique.
+    /// `TTL = Duration::MAX` (outside chrono range) → 0 jobs recovered, no panic,
+    /// no catastrophic mass-recovery.
     #[tokio::test]
     async fn c3_recover_stale_leases_invalid_ttl_returns_empty() {
         let pool = test_pool().await;
@@ -2955,7 +2973,7 @@ mod tests {
         );
     }
 
-    /// C3 — TTL valide (0s) continue de fonctionner normalement (non-régression).
+    /// A valid TTL (0s) continues to work normally (non-regression).
     #[tokio::test]
     async fn c3_recover_stale_leases_valid_ttl_works() {
         let pool = test_pool().await;
@@ -2984,15 +3002,14 @@ mod tests {
         );
     }
 
-    /// Régression dashboard `last_job` — `latest_job()` doit renvoyer le job le
-    /// PLUS RÉCENT (ORDER BY id DESC), jamais le plus ancien.
+    /// `latest_job()` must return the MOST RECENT job (ORDER BY id DESC), never the oldest.
     ///
-    /// Bug d'origine : le dashboard appelait `list(JobFilter{limit:1})` qui ordonne
-    /// `id ASC` → renvoyait le plus vieux job (ex. 314h) au lieu du job du jour,
-    /// donnant l'illusion d'un worker mort.
+    /// Root bug: the dashboard called `list(JobFilter{limit:1})` which orders `id ASC`
+    /// → returned the oldest job (e.g. 314h old) instead of today's job,
+    /// creating the illusion of a dead worker.
     ///
-    /// Test déterministe : 3 jobs avec des ULID à timestamps croissants explicites
-    /// (pas de dépendance à la monotonie de `Ulid::new()` ni à des sleeps).
+    /// Deterministic test: 3 jobs with ULID timestamps at explicit increasing offsets
+    /// (no dependency on `Ulid::new()` monotonicity or sleeps).
     #[tokio::test]
     async fn latest_job_returns_most_recent_not_oldest() {
         use std::time::{Duration as StdDuration, UNIX_EPOCH};
@@ -3034,8 +3051,8 @@ mod tests {
         );
     }
 
-    /// `latest_job()` sur une file vide dégrade proprement en `None` (le dashboard
-    /// affiche alors « pas de last_job » sans erreur).
+    /// `latest_job()` on an empty queue degrades cleanly to `None`
+    /// (the dashboard shows "no last_job" without error).
     #[tokio::test]
     async fn latest_job_empty_returns_none() {
         let pool = test_pool().await;
@@ -3051,9 +3068,13 @@ mod tests {
 
     // ── D1.3 — prune DLQ ──────────────────────────────────────────────────────
 
-    /// Helper : enqueue un job puis le force en DLQ.
+    /// Enqueues a job and forces it into the DLQ.
     async fn seed_dlq(store: &SqliteQueueStore) -> Ulid {
-        let record = make_record(Job::Validate, JobClass::System, JobStatus::Pending);
+        let record = make_record(
+            Job::Validate(gradatum_core::ValidateSpec::default()),
+            JobClass::System,
+            JobStatus::Pending,
+        );
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
         let _ = store.dequeue().await.expect("dequeue");
@@ -3061,12 +3082,16 @@ mod tests {
         id
     }
 
-    /// Helper : enqueue un job en DLQ avec un `created_at` arbitraire.
+    /// Enqueues a job in the DLQ with an arbitrary `created_at`.
     ///
-    /// `fail_dlq` ne change pas `created_at` (seul le statut), donc on contrôle
-    /// l'ancienneté via le record initial — utile pour tester `--older-than`.
+    /// `fail_dlq` does not change `created_at` (only the status), so age is controlled
+    /// via the initial record — useful for testing `--older-than`.
     async fn seed_dlq_at(store: &SqliteQueueStore, created_at: DateTime<Utc>) -> Ulid {
-        let mut record = make_record(Job::Validate, JobClass::System, JobStatus::Pending);
+        let mut record = make_record(
+            Job::Validate(gradatum_core::ValidateSpec::default()),
+            JobClass::System,
+            JobStatus::Pending,
+        );
         record.lifecycle.created_at = created_at;
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
@@ -3075,10 +3100,10 @@ mod tests {
         id
     }
 
-    /// P2 audit — `count_dlq_jobs(None)` compte TOUS les DLQ, sans borne `LIMIT`.
+    /// `count_dlq_jobs(None)` counts ALL DLQ jobs, without a `LIMIT` cap.
     ///
-    /// Régression du bug `list(limit: 200)` : avec > 200 jobs DLQ, l'ancien dry-run
-    /// sous-comptait. Ce test seede 205 jobs DLQ et exige un compte exact de 205.
+    /// Regression of the `list(limit: 200)` bug: with > 200 DLQ jobs, the old dry-run
+    /// under-counted. This test seeds 205 DLQ jobs and asserts an exact count of 205.
     #[tokio::test]
     async fn count_dlq_jobs_exact_above_200() {
         let pool = test_pool().await;
@@ -3099,9 +3124,9 @@ mod tests {
         assert_eq!(deleted, counted, "count == delete (même clause WHERE)");
     }
 
-    /// P2 audit — `--older-than` cible des jobs anciens hors de la fenêtre des 200
-    /// premiers : l'ancien `list(limit: 200)` pouvait early-return « rien à
-    /// supprimer ». Le `COUNT(*)` dédié les voit → prune s'exécute.
+    /// `--older-than` targets old jobs outside the first-200 window: the old
+    /// `list(limit: 200)` could early-return "nothing to delete". The dedicated
+    /// `COUNT(*)` sees them → prune executes.
     #[tokio::test]
     async fn count_dlq_jobs_older_than_beyond_200() {
         let pool = test_pool().await;
@@ -3138,7 +3163,7 @@ mod tests {
         );
     }
 
-    /// `delete_dlq_jobs(None)` supprime tous les jobs DLQ → 0 restant.
+    /// `delete_dlq_jobs(None)` removes all DLQ jobs → 0 remaining.
     #[tokio::test]
     async fn delete_dlq_jobs_prunes_all() {
         let pool = test_pool().await;
@@ -3173,9 +3198,8 @@ mod tests {
         assert_eq!(after.len(), 0, "0 job DLQ après prune total");
     }
 
-    /// `delete_dlq_jobs(Some(cutoff))` respecte la fenêtre d'ancienneté :
-    /// un cutoff dans le passé ne supprime rien (jobs créés à `now`), un cutoff
-    /// dans le futur supprime tout.
+    /// `delete_dlq_jobs(Some(cutoff))` respects the age window:
+    /// a past cutoff deletes nothing (jobs created at `now`); a future cutoff deletes all.
     #[tokio::test]
     async fn delete_dlq_jobs_respects_older_than() {
         let pool = test_pool().await;
@@ -3207,12 +3231,12 @@ mod tests {
 
     // ── promote_stranded_waiting_jobs (DT-DAG-1) ─────────────────────────────
 
-    /// DAG recovery : un job `Waiting` dont toutes les dépendances sont `Done`
-    /// mais dont la cascade post-`complete` a été ratée (crash ou erreur storage)
-    /// est rattrapé par `promote_stranded_waiting_jobs` → passe `Pending`.
+    /// DAG recovery: a `Waiting` job whose all dependencies are `Done` but whose
+    /// post-`complete` cascade failed (crash or storage error) is recovered by
+    /// `promote_stranded_waiting_jobs` → transitions to `Pending`.
     ///
-    /// Cas simulé : job B est enqueuté directement en `Waiting` avec `await_jobs=[A]`,
-    /// alors que A est déjà Done — sans passer par `cascade_check_and_promote`.
+    /// Simulated case: job B is enqueued directly in `Waiting` with `await_jobs=[A]`,
+    /// while A is already `Done` — without going through `cascade_check_and_promote`.
     #[tokio::test]
     async fn promotes_waiting_job_when_all_deps_done() {
         let pool = test_pool().await;
@@ -3271,11 +3295,11 @@ mod tests {
         );
     }
 
-    /// DAG recovery inertie : aucun job `Waiting` avec `await_jobs` non-vide
-    /// -> `promote_stranded_waiting_jobs` retourne 0 sans aucune mutation.
+    /// DAG recovery inertia: no `Waiting` job with a non-empty `await_jobs`
+    /// → `promote_stranded_waiting_jobs` returns 0 with zero mutations.
     ///
-    /// Correspond a la situation de production actuelle : `await_jobs = '[]'`
-    /// pour tous les jobs (aucun DAG actif) -> le sweep est un no-op strict.
+    /// Matches the current production state where `await_jobs = '[]'` for all
+    /// jobs (no active DAG) → the sweep is a strict no-op.
     #[tokio::test]
     async fn sweep_is_noop_when_no_waiting_jobs() {
         let pool = test_pool().await;
@@ -3303,8 +3327,8 @@ mod tests {
         );
     }
 
-    /// DAG recovery partielle : job B attend [A, C], A est Done mais C est Pending
-    /// -> B reste Waiting (toutes les dependances ne sont pas Done).
+    /// Partial DAG recovery: job B waits on [A, C], A is Done but C is Pending
+    /// → B remains Waiting (not all dependencies are Done).
     #[tokio::test]
     async fn does_not_promote_when_dep_not_done() {
         let pool = test_pool().await;

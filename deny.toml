@@ -41,6 +41,15 @@ ignore = [
     # Usage : lecture YAML uniquement via Deserializer — le Serializer/emitter non-sûr n'est pas activé.
     # Pas de fix upstream disponible (dépôt archivé). Migration serde-yaml-ng prévue PR-5+ si stable.
     { id = "RUSTSEC-2025-0068", reason = "serde_yml 0.0.12 : seul le Deserializer est utilisé (lecture config YAML) — Serializer/emitter non sûr non activé. Dépôt archivé, migration planifiée PR-5+ supply chain hardening." },
+    # RUSTSEC-2026-0194 / -0195 — quick-xml 0.36.2 (2 DoS : quadratic attribute-dup check + unbounded
+    #   namespace allocation dans NsReader). Transitif via opendal 0.51.0 → gradatum-storage.
+    #   NON ATTEIGNABLE : gradatum-storage a `default = ["fs"]` ; les backends cloud s3/gcs/azure
+    #   (seuls à parser du XML de réponse via quick-xml) sont opt-in et activés par AUCUN consommateur
+    #   du workspace (le code n'utilise que `services::Fs`). Le chemin XML vulnérable n'est jamais
+    #   exercé. Bump 0.36→0.41 nécessiterait opendal ≥0.54 (breaking) pour une vuln non-atteignable.
+    #   Revisiter si un backend cloud est activé OU si opendal bump quick-xml ≥0.41.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.36.2 DoS transitif opendal — backends cloud (seuls à parser XML) opt-in non activés (default=fs). Chemin non atteignable. Revisit si backend cloud activé." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.36.2 DoS transitif opendal — backends cloud (seuls à parser XML) opt-in non activés (default=fs). Chemin non atteignable. Revisit si backend cloud activé." },
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────

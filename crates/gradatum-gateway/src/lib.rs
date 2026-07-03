@@ -10,6 +10,7 @@
 //! - SmartRouter: alias default parameters + `AgentAware` overrides
 //! - VaultAware hook: `QaEvent` fire-and-forget
 
+pub mod anthropic;
 pub mod auth;
 pub mod commons;
 pub mod config;
@@ -46,9 +47,11 @@ use vault_aware::VaultAwareSender;
 /// preventing divergence between the two code paths.
 ///
 /// Update this list whenever a route is added or removed in `build_router`.
-pub const KNOWN_ROUTES: [&str; 6] = [
+pub const KNOWN_ROUTES: [&str; 8] = [
     "/v1/chat/completions",
     "/v1/embeddings",
+    "/v1/messages",
+    "/v1/messages/count_tokens",
     "/v1/rerank",
     "/v1/models",
     "/health",
@@ -256,6 +259,11 @@ pub fn build_router(state: AppState) -> axum::Router {
             "/v1/embeddings",
             routing::post(handlers::embeddings::handler),
         )
+        .route("/v1/messages", routing::post(handlers::messages::handler))
+        .route(
+            "/v1/messages/count_tokens",
+            routing::post(handlers::messages::count_tokens_handler),
+        )
         .route("/v1/rerank", routing::post(handlers::rerank::handler))
         // Body limit 4 MB — guards against oversized payloads.
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
@@ -288,13 +296,18 @@ mod tests {
             "missing /v1/chat/completions"
         );
         assert!(routes.contains("/v1/embeddings"), "missing /v1/embeddings");
+        assert!(routes.contains("/v1/messages"), "missing /v1/messages");
+        assert!(
+            routes.contains("/v1/messages/count_tokens"),
+            "missing /v1/messages/count_tokens"
+        );
         assert!(routes.contains("/v1/rerank"), "missing /v1/rerank");
         assert!(routes.contains("/v1/models"), "missing /v1/models");
         assert!(routes.contains("/health"), "missing /health");
         assert!(routes.contains("/metrics"), "missing /metrics");
         assert_eq!(
             KNOWN_ROUTES.len(),
-            6,
+            8,
             "KNOWN_ROUTES length changed — update test"
         );
     }

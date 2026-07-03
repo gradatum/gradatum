@@ -34,6 +34,7 @@ use gradatum_core::index::Index;
 use gradatum_index::SqliteIndex;
 
 use crate::event_log_store::EventLogStore;
+use crate::mcp_usage::McpToolCounters;
 use crate::metrics::AppMetrics;
 use crate::read_usage_store::ReadUsageCounterStore;
 
@@ -569,6 +570,24 @@ pub struct AppState {
     /// Retention bounded to 90 days via a Tokio interval task (`[session_trace]` config).
     pub session_trace: Option<crate::session_trace_store::SessionTraceStore>,
 
+    /// UPSERT latest-per-tenant store for the `proactive_surface` table (F-46, Active Recall).
+    ///
+    /// `None` by default — wired via `with_proactive_surface_path` in production (same
+    /// `index.db`). When `None`, the proactive refresh task is skipped (noop).
+    ///
+    /// Uses a dedicated connection on `index.db` (WAL, multi-connection safe).
+    /// Written by the `proactive_refresh_once` interval task.
+    pub proactive_surface: Option<crate::proactive_surface_store::ProactiveSurfaceStore>,
+
+    /// Sessions + feedback store pour le rappel proactif (F-46, Active Recall v0.7.1).
+    ///
+    /// `None` par défaut — câblé via `with_proactive_recall_path` en production (même
+    /// `index.db`). Quand `None`, les handlers de feedback proactif retournent 503.
+    ///
+    /// Connexion WAL dédiée (safe multi-connexion SQLite).
+    /// Written by `insert_session` and `record_feedback`.
+    pub proactive_recall: Option<crate::proactive_recall_store::ProactiveRecallStore>,
+
     /// Trust-decay configuration for search scoring.
     ///
     /// Default: decay enabled (`distilled = 90 days`). Disable via `[scoring]` config
@@ -601,6 +620,43 @@ pub struct AppState {
     /// `None` = listener interne désactivé (opt-in via `[internal_api]` config).
     /// wired: `gradatum-server/src/main.rs` + `internal/auth.rs`
     pub internal_api_token: Option<Arc<secrecy::SecretString>>,
+
+    /// Compteurs atomiques par outil MCP — télémétrie feat/usage-telemetry-19091.
+    ///
+    /// Map fermée pré-peuplée (21 outils). `record(name)` est un no-op sur nom inconnu.
+    /// Swappé toutes les 60s par la tâche flush pour UPSERT dans `read_usage_counters`
+    /// (clés `mcp:<tool>`) et fan-out dans la famille Prometheus `mcp_tool_calls`.
+    pub mcp_tool_counters: Arc<McpToolCounters>,
+
+    /// In-memory cache of the skills index (section `"skills"`).
+    ///
+    /// `None` avant le premier appel `vault_context` avec `inject_skills=true`.
+    /// Construit paresseusement (lazy) par `context::skills::build_skill_index` :
+    /// scan SQL section `"skills"` + `embed_batch`. Stocké comme `Arc<SkillIndex>`
+    /// pour cloner la référence hors du `RwLock` sans copier les vecteurs d'embedding.
+    ///
+    /// # Invalidation
+    ///
+    /// Aucun hook `vault_write` pour l'instant (ECON: rebuild lazy à chaque cache miss).
+    /// Le cache persiste pour la durée de vie du serveur tant que le build réussit.
+    pub skills_index: Arc<tokio::sync::RwLock<Option<Arc<crate::context::skills::SkillIndex>>>>,
+
+    /// Configuration du serveur (intervalles des tâches, options avancées).
+    ///
+    /// Utilisé par `GET /api/v1/system/scheduled` pour exposer `interval_secs` via
+    /// `task_interval_secs(name, &server_config)` — SSOT T4 (zéro divergence entre
+    /// intervalles réels et intervalles rapportés).
+    /// Défaut : `ServerConfig::default()` (valeurs de production par défaut).
+    /// Wired via `AppState::with_server_config` dans `main.rs`.
+    pub server_config: Arc<crate::config::ServerConfig>,
+
+    /// Configuration for the context assembly pipeline.
+    ///
+    /// Governs `assemble_assembled`: default budget, top_n candidates, max skills,
+    /// skills budget fraction, embed timeout.
+    /// Defaults: budget=2000, top_n=50, max_skills=3, frac=0.15, embed=800ms.
+    /// Wired via `AppState::with_context` in `main.rs`.
+    pub context: Arc<crate::config::ContextConfig>,
 }
 
 impl AppState {
@@ -648,11 +704,17 @@ impl AppState {
             jobs_pool: None,
             event_log: None,
             session_trace: None,
+            proactive_surface: None,
+            proactive_recall: None,
             scoring: Arc::new(gradatum_search::TrustDecayConfig::default()),
             wal_path: None,
             read_usage: None,
             read_usage_accumulators: Arc::new(ReadUsageAccumulators::default()),
             internal_api_token: None,
+            mcp_tool_counters: Arc::new(McpToolCounters::new()),
+            skills_index: Arc::new(tokio::sync::RwLock::new(None)),
+            server_config: Arc::new(crate::config::ServerConfig::default()),
+            context: Arc::new(crate::config::ContextConfig::default()),
         }
     }
 
@@ -685,11 +747,17 @@ impl AppState {
             jobs_pool: None,
             event_log: None,
             session_trace: None,
+            proactive_surface: None,
+            proactive_recall: None,
             scoring: Arc::new(gradatum_search::TrustDecayConfig::default()),
             wal_path: None,
             read_usage: None,
             read_usage_accumulators: Arc::new(ReadUsageAccumulators::default()),
             internal_api_token: None,
+            mcp_tool_counters: Arc::new(McpToolCounters::new()),
+            skills_index: Arc::new(tokio::sync::RwLock::new(None)),
+            server_config: Arc::new(crate::config::ServerConfig::default()),
+            context: Arc::new(crate::config::ContextConfig::default()),
         }
     }
 
@@ -1049,15 +1117,95 @@ impl AppState {
         Ok(self)
     }
 
-    /// Injects a pre-built `SessionTraceStore` (for tests).
+    /// Injecte un `SessionTraceStore` pré-construit (dev/test uniquement).
     ///
     /// Pattern: `state.with_session_trace(SessionTraceStore::open_in_memory().await?)`
-    #[cfg(test)]
+    ///
+    /// **Ne pas utiliser en production** — utiliser [`AppState::with_session_trace_path`].
+    /// Méthode disponible sans gate `#[cfg(test)]` pour permettre son usage depuis
+    /// les tests d'intégration externes (`tests/`).
+    #[allow(dead_code)]
     pub fn with_session_trace(
         mut self,
         store: crate::session_trace_store::SessionTraceStore,
     ) -> Self {
         self.session_trace = Some(store);
+        self
+    }
+
+    /// Ouvre un `ProactiveSurfaceStore` à `path` et l'injecte dans l'état (câblage production).
+    ///
+    /// `path` doit pointer vers le même fichier `index.db` que `with_search_path`
+    /// (la migration 0022 ajoute la table `proactive_surface`).
+    ///
+    /// Ouvre une connexion dédiée en mode WAL (safe multi-connexion SQLite).
+    /// Used by the proactive refresh task and the recall handlers.
+    ///
+    /// # Errors
+    ///
+    /// Retourne une erreur si le fichier SQLite est inaccessible.
+    pub async fn with_proactive_surface_path(
+        mut self,
+        path: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        use crate::proactive_surface_store::ProactiveSurfaceStore;
+        let store = ProactiveSurfaceStore::open(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("ProactiveSurfaceStore init failed: {e}"))?;
+        self.proactive_surface = Some(store);
+        Ok(self)
+    }
+
+    /// Injecte un `ProactiveSurfaceStore` pré-construit (pour les tests).
+    ///
+    /// Pattern : `state.with_proactive_surface(ProactiveSurfaceStore::open_in_memory().await?)`
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn with_proactive_surface(
+        mut self,
+        store: crate::proactive_surface_store::ProactiveSurfaceStore,
+    ) -> Self {
+        self.proactive_surface = Some(store);
+        self
+    }
+
+    /// Ouvre un `ProactiveRecallStore` à `path` et l'injecte dans l'état (câblage production).
+    ///
+    /// `path` doit pointer vers le même fichier `index.db` que `with_search_path`
+    /// (la migration 0023 ajoute les tables `proactive_recall_sessions` et
+    /// `proactive_recall_feedback`).
+    ///
+    /// Ouvre une connexion dédiée en mode WAL (safe multi-connexion SQLite).
+    /// Used by the proactive recall feedback handlers.
+    ///
+    /// # Errors
+    ///
+    /// Retourne une erreur si le fichier SQLite est inaccessible.
+    pub async fn with_proactive_recall_path(
+        mut self,
+        path: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        use crate::proactive_recall_store::ProactiveRecallStore;
+        let store = ProactiveRecallStore::open(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("ProactiveRecallStore init failed: {e}"))?;
+        self.proactive_recall = Some(store);
+        Ok(self)
+    }
+
+    /// Injecte un `ProactiveRecallStore` pré-construit (dev/test uniquement).
+    ///
+    /// Pattern : `state.with_proactive_recall(ProactiveRecallStore::open_in_memory().await?)`
+    ///
+    /// **Ne pas utiliser en production** — utiliser [`AppState::with_proactive_recall_path`]
+    /// qui ouvre le fichier depuis la config. Méthode disponible sans gate `cfg(test)` pour
+    /// permettre son usage depuis les tests d'intégration externes (`tests/`).
+    #[allow(dead_code)] // Utilisé dans tests/mcp_native.rs (test d'intégration externe).
+    pub fn with_proactive_recall(
+        mut self,
+        store: crate::proactive_recall_store::ProactiveRecallStore,
+    ) -> Self {
+        self.proactive_recall = Some(store);
         self
     }
 
@@ -1067,6 +1215,28 @@ impl AppState {
     #[must_use]
     pub fn with_scoring(mut self, scoring: gradatum_search::TrustDecayConfig) -> Self {
         self.scoring = Arc::new(scoring);
+        self
+    }
+
+    /// Injecte la `ServerConfig` de production dans l'état.
+    ///
+    /// Permet à l'endpoint `GET /api/v1/system/scheduled` d'accéder aux intervalles
+    /// réels des tâches via `task_interval_secs(name, &state.server_config)` — SSOT T4.
+    /// Sans appel explicite, le défaut est `ServerConfig::default()` (valeurs de production
+    /// par défaut). Wired via `main.rs` après le parsing du config.toml de production.
+    #[must_use]
+    pub fn with_server_config(mut self, cfg: crate::config::ServerConfig) -> Self {
+        self.server_config = Arc::new(cfg);
+        self
+    }
+
+    /// Injects the context assembly pipeline configuration.
+    ///
+    /// Wired depuis `[context]` dans la config serveur en production.
+    /// En l'absence d'appel, les valeurs par défaut (`ContextConfig::default()`) s'appliquent.
+    #[must_use]
+    pub fn with_context(mut self, context: crate::config::ContextConfig) -> Self {
+        self.context = Arc::new(context);
         self
     }
 

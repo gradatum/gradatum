@@ -63,7 +63,7 @@ impl HttpEventSink {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
-            .expect("construction client HTTP — ne devrait pas échouer");
+            .expect("HTTP client construction — should not fail");
         Self {
             base_url,
             jwt,
@@ -122,9 +122,9 @@ impl EventSink for HttpEventSink {
                     tracing::warn!(
                         route = %route,
                         error_kind = "event_log_post_failed",
-                        "HttpEventSink: POST /api/v1/event-log échoué (best-effort)"
+                        "HttpEventSink: POST /api/v1/event-log failed (best-effort)"
                     );
-                    let _ = e; // erreur silencieuse — pas de détail pour éviter leak JWT
+                    let _ = e; // silent drop — no detail to avoid JWT leak
                 }
             }
             other => {
@@ -142,7 +142,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    /// Serveur stub axum sur port éphémère pour capturer les POSTs.
+    /// Axum stub server on an ephemeral port for capturing POST bodies.
     async fn start_stub_server() -> (u16, Arc<Mutex<Vec<serde_json::Value>>>) {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
@@ -220,7 +220,7 @@ mod tests {
         );
     }
 
-    /// F-19 M2 : une requête /v1/embeddings produit feature_id="embed".
+    /// A `/v1/embeddings` request produces `feature_id = "embed"`.
     #[tokio::test]
     async fn embeddings_route_yields_feature_id_embed() {
         let (port, captured) = start_stub_server().await;
@@ -250,7 +250,7 @@ mod tests {
         assert_eq!(arr[0]["agent_id"], "engine-embed");
     }
 
-    /// F-19 M1 : agent_id=None (legacy) → champ absent du JSON (skip_serializing_if).
+    /// When `agent_id` is `None`, the field is absent from the serialized JSON (`skip_serializing_if`).
     #[tokio::test]
     async fn agent_id_none_omits_field() {
         let (port, captured) = start_stub_server().await;

@@ -86,7 +86,7 @@ pub enum Job {
     /// Content summarisation — bincode position 7.
     Summarize,
     /// Memory validation and healing — bincode position 8.
-    Validate,
+    Validate(ValidateSpec),
     /// Vault scoring and deduplication — bincode position 9.
     Audit,
     /// Mental model consolidation — bincode position 10.
@@ -195,6 +195,15 @@ pub struct CurateSpec {
     /// Payload overhead: +33 bytes (1 bincode discriminant + 32-byte hash) — negligible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_sha256: Option<[u8; 32]>,
+    /// Temporal anchor — event date of the note (ISO 8601 UTC or YYYY-MM-DD string).
+    ///
+    /// When `Some`, the curate worker inserts this value into `ExtraFields["occurred_at"]`
+    /// and calls `resolve_temporal_anchor` to compute `anchor_ms + anchor_src = OccurredAt`.
+    ///
+    /// `None` → `anchor_src = Created` (backward-compatible: all existing jobs without
+    /// this field deserialize with `None` via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
 }
 
 fn default_tenant_main() -> String {
@@ -685,6 +694,60 @@ impl Default for DistillSource {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ValidateSpec — Job::Validate payload (F-43)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Payload for `Job::Validate` (F-43) — deterministic validation of a distilled note
+/// before persistence. Carries the synthesis + its sources (texts + trusts) so the worker
+/// can score purely, without re-reading the vault.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateSpec {
+    /// Pre-allocated ULID of the synthesis note to validate then persist.
+    pub note_id: Ulid,
+    /// Owning tenant identifier (default: `"main"`).
+    pub tenant_id: String,
+    /// Title of the synthesis note.
+    pub title: String,
+    /// Markdown body of the synthesis note.
+    pub body: String,
+    /// ULIDs of the source notes (`derived-from`).
+    pub source_ids: Vec<Ulid>,
+    /// Bodies of the source notes (parallel to `source_ids`) — for num/entity penalties + embedding.
+    pub source_texts: Vec<String>,
+    /// Trust of the sources (parallel to `source_ids`) — for the f47 factor.
+    pub source_trusts: Vec<f32>,
+    /// Base trust computed by distillation (`compute_distill_trust`).
+    pub base_trust: f32,
+    /// Gate threshold (default 0.75).
+    #[serde(default = "ValidateSpec::default_threshold")]
+    pub threshold: f32,
+}
+
+impl ValidateSpec {
+    /// Default gate threshold for quality scoring (0.75).
+    #[must_use]
+    pub fn default_threshold() -> f32 {
+        0.75
+    }
+}
+
+impl Default for ValidateSpec {
+    fn default() -> Self {
+        Self {
+            note_id: Ulid::nil(),
+            tenant_id: String::new(),
+            title: String::new(),
+            body: String::new(),
+            source_ids: vec![],
+            source_texts: vec![],
+            source_trusts: vec![],
+            base_trust: 0.0,
+            threshold: Self::default_threshold(),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // job_kind_str — helper de routing
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -713,7 +776,7 @@ pub fn job_kind_str(job: &Job) -> &'static str {
         Job::Purge(_) => "Purge",
         Job::ReIndex(_) => "ReIndex",
         Job::Summarize => "Summarize",
-        Job::Validate => "Validate",
+        Job::Validate(_) => "Validate",
         Job::Audit => "Audit",
         Job::Consolidate => "Consolidate",
         Job::Curate(_) => "Curate",
@@ -2228,5 +2291,55 @@ mod tests {
         assert_eq!(src.mode, DistillMode::Semantic);
         assert_eq!(src.batch_limit, 500);
         assert!((src.confidence_threshold - 0.75).abs() < f32::EPSILON);
+    }
+
+    // ── Tests F-43 ValidateSpec ───────────────────────────────────────────────
+
+    /// ValidateSpec round-trips through serde-json and job_kind_str returns "Validate".
+    /// Also verifies that the threshold serde default (0.75) is preserved.
+    #[test]
+    fn validate_spec_roundtrip_and_kind() {
+        let spec = ValidateSpec {
+            note_id: Ulid::new(),
+            tenant_id: "main".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            source_ids: vec![Ulid::new()],
+            source_texts: vec!["s".to_string()],
+            source_trusts: vec![0.6],
+            base_trust: 0.6,
+            threshold: ValidateSpec::default_threshold(),
+        };
+        let job = Job::Validate(spec);
+        assert_eq!(job_kind_str(&job), "Validate");
+        let json = serde_json::to_string(&job).unwrap();
+        let back: Job = serde_json::from_str(&json).unwrap();
+        assert_eq!(job_kind_str(&back), "Validate");
+    }
+
+    // ── Tests F-74 occurred_at CurateSpec ────────────────────────────────────
+
+    /// occurred_at présent → round-trip serde conserve la valeur.
+    #[test]
+    fn curate_spec_occurred_at_serde_roundtrip_with_value() {
+        let spec = CurateSpec {
+            occurred_at: Some("2026-01-15T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&spec).expect("serialization CurateSpec");
+        let decoded: CurateSpec = serde_json::from_str(&json).expect("deserialization CurateSpec");
+        assert_eq!(
+            decoded.occurred_at,
+            Some("2026-01-15T00:00:00Z".to_string())
+        );
+    }
+
+    /// occurred_at absent dans le JSON → None (backward-compat jobs existants).
+    #[test]
+    fn curate_spec_occurred_at_absent_deserializes_as_none() {
+        // Payload minimal sans occurred_at — simule un job en queue pré-feature.
+        let json = r#"{"note_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","tenant_id":"main"}"#;
+        let spec: CurateSpec = serde_json::from_str(json).expect("deserialization CurateSpec");
+        assert_eq!(spec.occurred_at, None);
     }
 }

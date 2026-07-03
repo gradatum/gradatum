@@ -7,7 +7,316 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.4] - 2026-06-20
+## [0.7.6] — 2026-07-03
+
+Upgrade from v0.6.4: one breaking server API change — `vault_context` is redesigned; its
+response schema changes from `{ context, estimated_tokens, sources }` to `{ assembled_text,
+included, budget_used, diagnostics, … }` and the default output is now assembled Markdown
+(`mode: "raw"` retains the v0.6.4 dump text, inside the new schema). All other endpoints are
+drop-in: new request fields are optional and omitting them preserves prior behavior. Operators
+running `gradatum-engine` should review the breaking changes below before upgrading.
+
+### Breaking changes (API)
+
+- **`vault_context`: response schema replaced and default output changed.**
+  - **Old response (v0.6.4)**: `{ context, estimated_tokens, sources }`.
+  - **New response (v0.7.6)**: `{ assembled_text, included, budget_used, diagnostics,
+    references, counts, cache_breakpoint_hint }`. `references` and `counts` are always
+    present (`[]` / zeroed when `reference_mode` is off).
+  - **Default output changed**: the request `mode` field defaults to `"assembled"` —
+    `assembled_text` is a structured Markdown context block, not the raw FTS dump.
+  - **Migration**: clients parsing the old shape must read `assembled_text` (and
+    `included` instead of `sources`). To keep the v0.6.4 dump text itself, send
+    `mode: "raw"` — `assembled_text` then reproduces the old `context` value
+    byte-for-byte, inside the new schema.
+
+### Breaking changes (operator)
+
+- **`gradatum-engine`: `extra_args` is now validated against an allow-list**
+  (`ALLOWED_EXTRA_FLAGS`). Flags that are managed by dedicated configuration fields are
+  rejected — in particular `--n-gpu-layers` (and its aliases), which is controlled
+  exclusively by the `gpu_layers` config field. An existing configuration such as
+  `extra_args = ["--n-gpu-layers", "0"]` now fails at boot with
+  `EngineError::BadRequest` from the `LlamaServerSupervisor`; migrate it to
+  `gpu_layers = 0`.
+- **`gradatum-engine`: new loopback-only `/metrics` listener on `port + 1` by default**,
+  configurable via `metrics_port`. The listener always binds `127.0.0.1` regardless of
+  `bind_addr`. When running multiple engine instances on contiguous ports (e.g. 11435
+  and 11436), the `port + 1` default can collide with the neighbouring instance's main
+  port — set `metrics_port` explicitly in that case.
+
+### Added
+
+#### Context assembly pipeline (`vault_context`)
+
+`vault_context` is redesigned from a raw FTS dump into a full retrieval and assembly pipeline.
+
+- **Retrieval**: Reciprocal Rank Fusion over BM25 (FTS5) and semantic embedding signals
+  (`k=60`, configurable candidate cap).
+- **Composite scoring**: `recency × PageRank × trust` applied after RRF fusion; reuses the
+  `gradatum-search` scoring infrastructure.
+- **Budget-aware selection**: notes are sorted by score and inlined until the `budget_tokens`
+  limit; bodies are fetched lazily (only for retained notes).
+- **Structured Markdown output**: per-note heading (`### title · section · date · score=X`),
+  `---` separators, `[[ULID]]` source references.
+- **Skill injection** (opt-in): when `inject_skills: true` and `skill_query` are set, top
+  matching notes from the `skills/` section are appended to the assembled context (index-only
+  lookup, no LLM call). Governed by `max_skills` and `skills_budget_fraction`.
+- **New request fields** (all optional, fully backward-compatible): `budget_tokens`,
+  `scoring` (`ScoringWeights`), `mode` (`Assembled` | `Raw`), `inject_skills`, `skill_query`.
+- **New response fields**: `assembled_text`, `included` (`Vec<IncludedNote>` — `ulid`, `title`,
+  `section`, `date`, `score`), `budget_used`, `diagnostics` (`candidates_considered`,
+  `included_count`, `embed_fallback`, `skills_injected`).
+- `mode=Raw` preserves the prior FTS-dump byte-for-byte (backward-compatibility fallback).
+- **`ContextConfig`** TOML block (`[context]`): `default_budget_tokens`, `top_n_candidates`,
+  `max_skills`, `skills_budget_fraction`, `embed_timeout_ms`.
+
+#### Context efficiency — reference mode and session window
+
+- **Reference mode** (`reference_mode: bool`, default `false`): notes are inlined up to the
+  token budget (`budget_tokens` per request, `default_budget_tokens` in config); those beyond
+  are returned as lightweight stubs `{ ulid, title, section, snippet }` up to the
+  `stub_budget_tokens` config limit; stubs are dereferenceable via `vault_read(ulid)`.
+- **Session window** (`session_id`): notes already sent inline in the current session are
+  returned as stubs on repeat calls, never re-inlined. `mode=compact` re-ranks the freshest
+  top-K notes inline and returns all prior-sent notes as stubs — useful for context compaction
+  at session boundaries. Folded notes remain dereferenceable.
+- **`cache_breakpoint_hint`**: boolean hint emitted when assembled context exceeds a configured
+  threshold, signalling the consumer to insert a prompt-cache boundary.
+- **New response field `references`**: `Vec<ReferenceStub>` (additive, default `[]`).
+
+#### Proactive recall
+
+- **Background refresh scheduler**: a `tokio::interval` task enqueues a `ProactiveRefresh`
+  job every 900 s (configurable via `[proactive_recall] refresh_interval_secs`, floor 60 s).
+  The job derives an implicit salience query from the K most recently written notes, runs
+  cross-section retrieval over `lessons-learned`, `reasoning`, and `decisions`, applies
+  composite scoring, and stores the top-N surface (default 8) in `proactive_surface`.
+- **`POST /api/v1/proactive_recall`** — pull endpoint with two modes:
+  - `proactive` (no `context` field) — reads the pre-computed surface (cheap path).
+  - `contextual` (with `context` field) — on-demand RRF over the same sections.
+  - Response: `{ recall_id, mode, items: [{ulid, title, section, snippet, score}] }`.
+- **`POST /api/v1/proactive_recall/feedback`** — acceptance feedback; records which surfaced
+  notes were used (`accepted_ulids ⊆ surfaced_ulids`, 400 otherwise); idempotent.
+- **MCP tools**: `vault_proactive_recall`, `vault_proactive_recall_feedback` (bring MCP
+  surface to **23 tools**).
+- **Lessons recall enrichment**: `/api/v1/lessons/recall` gains two optional parameters —
+  `rank` (`relevance` | `recency-boosted`) and `semantic` (`false` | `true`; degrades
+  gracefully to BM25 when the embedding service is unavailable).
+
+#### Agent identity via MCP
+
+- **`identity` section** (13th canonical section): migration 0024 creates the section;
+  migration 0025 backfills `title` for existing identity notes from their first H1.
+- **Soul validator** (`validate_soul()`): checks structural sections (INVARIANTS / GATES /
+  NARRATIVE); handles `extends:` resolution (bounded depth); accepts `scope` field.
+- **MCP `initialize` identity injection**: on MCP `initialize`, the server injects the
+  tenant's agent identity note from the `identity` section into the MCP `instructions` field.
+  Access to `identity` from `vault_search` is fail-closed for non-privileged callers.
+- **Write ACL for `identity`**: only the bearer whose `agent_id` matches the JWT `sub` may
+  write their own identity note; `doc_kind` is forced to `Static`.
+- **`write_check` drift detection**: `write_check::check_category_section()` detects
+  category↔section drift on note ingestion (warn-only). Metric
+  `gradatum_write_check_total{rule}` incremented on each detected drift.
+- **Worker guard**: reclassification of an `identity` note is a no-op.
+
+#### Temporal search and decay
+
+- **`vault_search` temporal range filter**: new optional request fields `from_ms` and `to_ms`
+  (epoch milliseconds). Applied on both the FTS and semantic paths via `LEFT JOIN
+  temporal_index`. `anchor_ms` is now included in every `SearchHit`.
+- **`vault_write` `occurred_at` field**: optional string (ISO 8601). Validated at write time;
+  propagated through the curation pipeline to populate `anchor_ms` in `temporal_index`.
+- **Recency factor uses `anchor_ms`**: the exponential-decay recency signal in composite
+  scoring now uses the canonical `anchor_ms` from `temporal_index` (fallback: `created_at`
+  when no temporal anchor is set). Applied consistently across `vault_search` and
+  `vault_context`.
+
+#### Review auto-promotion job
+
+- **`review-promote` scheduled job**: notes left in `staging` or `pending-review` are
+  automatically promoted to `live` after 14 days (`age_days`), on an hourly tick
+  (`interval_secs`, floor 60 s) capped at 200 notes per tick (`max_per_tick`).
+  **Enabled by default** — set `[review_promote] enabled = false` to opt out.
+
+#### Scheduled task health observability
+
+- **Migration 0026**: two new tables in `index.db`:
+  - `scheduled_task_health` — one row per task: `task_name` (PK), `last_run_ms`,
+    `last_outcome` (`ok`/`error`), `last_duration_ms`, `last_error`, `run_count`, `updated_at`.
+  - `scheduled_task_error` — append-only errors table; indexed on `(task_name, occurred_ms)`;
+    lazy 7-day purge on each error insert.
+- **`record_task_run` helper** (`gradatum-index`): upserts `scheduled_task_health`, appends to
+  `scheduled_task_error` on error; never panics.
+- **Boot seeding**: all 8 scheduled task names are seeded with `last_run_ms: null` at startup
+  so the System page shows all tasks immediately, before the first tick fires.
+- **All recurring tasks instrumented**: each task body captures duration and outcome and calls
+  `record_task_run`. Task behavior is unchanged — instrumentation is purely additive.
+- **`GET /api/v1/system/scheduled`** (JWT auth): returns all registered tasks with
+  `{ name, last_run_ms, last_outcome, last_duration_ms, last_error, run_count, errors_24h,
+  interval_secs }`. `errors_24h` is a `COUNT` over `scheduled_task_error` in the last
+  86 400 000 ms. `last_error` is sanitized before emission.
+- **Studio System page**: new nav item; renders all tasks with per-task badges
+  (ok / error / overdue), `errors_24h` highlighted in red when > 0, last run as relative
+  time, duration, and last error message.
+- **Studio Dashboard scheduler widget**: compact summary (task count, how many in error or
+  overdue) linking to the System page.
+
+#### Curated metrics timeseries
+
+- **Migration 0027**: table `metric_sample` in `index.db`:
+  ```sql
+  metric_sample (series TEXT NOT NULL, ts_ms INTEGER NOT NULL, value REAL NOT NULL,
+                 PRIMARY KEY (series, ts_ms)) WITHOUT ROWID;
+  CREATE INDEX idx_metric_sample_ts ON metric_sample(ts_ms);
+  ```
+- **Curated collection**: `collect_curated_samples()` re-encodes the Prometheus registry and
+  parses a static allowlist of ~60 series in 4 groups (read-path usage, context efficiency,
+  server health, write pipeline). Counters → direct value; histograms → two separate series
+  (`_sum` / `_count`); high-cardinality `http.*` labels are aggregated.
+- **`metric-sample` scheduled task**: runs every 60 s; collects curated samples, batch-inserts
+  into `metric_sample`, and runs a lazy purge of rows older than 14 days. Errors are logged
+  at `warn` and do not interrupt the task.
+- **`GET /api/v1/system/metrics/catalog`**: returns the full static curated series list
+  `{ series: [{ key, group, kind, unit, instrumented }] }`. No database query.
+- **`GET /api/v1/system/metrics/timeseries`**: query parameters — `series` (comma-separated,
+  validated against the allowlist; 400 if unknown, > `MAX_SERIES=32`, or duplicated),
+  `from_ms` / `to_ms` (inclusive bounds; 400 if `from >= to`), `max_points` (default 500,
+  cap 2000). Server-side downsampling via `GROUP BY (ts_ms / bucket_ms)` when the span
+  exceeds `max_points` raw points. Response: `{ from_ms, to_ms, bucket_secs, series: [{ key,
+  points: [{ ts_ms, value }] }] }`.
+- **Studio metrics charts**: `SystemPage` gains a metrics section below the task health grid.
+  Range selector (1 h / 24 h / 7 d / 14 d, default 24 h), auto-refresh toggle (default on,
+  60 s), and 4 collapsible groups of interactive uPlot charts. Series not yet instrumented
+  are rendered grayed out rather than hidden.
+
+#### Activity and notes browsing in Studio
+
+- **`GET /api/v1/system/traces`** (JWT auth, read scope): paginated, filterable read of the
+  `session_trace` table. Filters: `agent_id`, `session_id`, `action_type`, date range.
+- **Studio Activity page**: table view of session trace records with expandable detail rows
+  and auto-refresh. Accessible from the main navigation.
+- **`GET /api/v1/notes/by-status`** (JWT auth, read scope): paginated listing of notes
+  grouped by status (live, downgraded, pending-review, etc.) using keyset pagination.
+- **Studio Notes page**: lists notes by status bucket, including archived (downgraded) notes;
+  links to per-note detail.
+
+#### Distill validation gate
+
+Synthesized notes now pass through a deterministic scoring gate before being stored.
+
+- **`Job::Validate` + `ValidateSpec`** (`gradatum-core`): new job variant carrying the
+  synthesis note id, body, source texts, source trusts, and base trust. Bincode positional
+  encoding preserved (new variant at position 8; all prior positions stable).
+- **`quality_score` scorer** (`gradatum-worker/src/quality_score.rs`): pure, deterministic,
+  zero I/O. Composite formula: `grounding × recency_sources × trust_sources × num_penalty ×
+  entity_penalty`, clamped to `[0.0, 1.0]`:
+  - `grounding` — cosine similarity between the synthesis embedding and the mean centroid of
+    source embeddings.
+  - `recency_sources` — exponential-decay weight on source `anchor_ms` values.
+  - `trust_sources` — mean trust across sources.
+  - `num_penalty` — numeric-coherence penalty: each number in the synthesis traceable to no
+    source subtracts 0.15 (floor 0.5).
+  - `entity_penalty` — orphan-entity penalty: each uppercase-initial token in the synthesis
+    absent from all sources subtracts 0.10 (floor 0.5).
+- **`handle_validate` worker**: disposition after scoring:
+  - `score ≥ 0.75` → stored with `base_trust`; no extra tag.
+  - `score < 0.75` → stored with `trust = base_trust × score`, `quality-low` tag appended.
+    Sources are marked `processed` + `derived-into` (per-source failures are non-fatal).
+  - Scoring errors fall back to score 1.0 (pass) — no synthesis is ever discarded due to an
+    embedder failure.
+- **`handle_distill` refactored**: enqueues `Job::Validate` instead of persisting directly;
+  persist and source-marking are delegated to `handle_validate`.
+- **`PersistDistillRequest.tags`**: tags supplied in a distill request are now propagated into
+  the persisted note's frontmatter (previously dropped).
+- **Validate worker**: `max_retries = 2` (persist is idempotent on the pre-allocated
+  `note_id`; retries prevent permanent note loss on transient I/O failures).
+  `ensure_main_tenant` cross-tenant guard applied at entry.
+
+### Fixed
+
+- **Phantom-write guard**: `vault_write` now returns `409 Conflict` for notes whose Markdown
+  file is absent from storage (phantom notes). The response body distinguishes a phantom
+  conflict from a `expected_sha256` mismatch.
+- **`vault_read` for phantom notes**: returns `404 Not Found` (previously `500 Internal
+  Server Error`) when a note's body file is missing from storage.
+- **`vault_read` status**: returns the status stored in the index (authoritative) rather than
+  the status extracted from a potentially stale Markdown frontmatter.
+- **Temporal anchor preserved on note update**: the `vault_write` RMW path and the worker
+  reclassify path now preserve an existing `anchor_ms` when updating a note that already has
+  one. An anchor is overwritten only when the note body genuinely changes.
+- **`vault_context` recency aligned with `vault_search`**: the context assembly pipeline now
+  uses `anchor_ms` as the recency reference, in parity with `vault_search`. Previously
+  `vault_context` used `created_at`, causing inconsistent recency ranking between the two
+  surfaces.
+
+### Security
+
+- **Cross-agent identity isolation**: notes in the protected `identity` section are excluded
+  from all search, list, timeline, by-status, review, trace, graph, and link surfaces for
+  non-privileged callers, across the full HTTP API and MCP tool surface. Read and write are
+  guarded per-handler: an agent may only read or write its own identity note (matched by JWT
+  `sub`), and `vault_search` over `identity` is fail-closed for non-privileged callers
+  (empty result set rather than an error, to avoid existence-oracle attacks). See
+  `SECURITY.md` ("Agent identity security") for the full model and its limitations.
+- **PII scrub**: maintainer-specific home-directory paths and personal identifiers removed
+  from test fixtures and public source.
+
+### Tests
+
+3038 passed / 0 failed (`cargo nextest --workspace --release`); `clippy --workspace
+--all-targets -- -D warnings` clean.
+
+## [0.6.9] — 2026-06-26
+
+Consolidates gateway and engine fixes shipped since 0.6.8 — no breaking API or
+configuration changes.
+
+### Fixed
+
+- **Gateway keep-alive SSE on `/v1/messages`** — ping frames are now emitted across
+  the entire prefill window (not only during headers), preventing upstream proxies
+  and supervisors from closing the connection during long cold-start prefills on the
+  local vision engine.
+- **GBNF-bloat sanitisation in `translate_tools`** — `sanitize_schema()` now strips
+  GBNF-incompatible JSON Schema constraints (`maximum`, `maxLength`, `pattern`,
+  `minItems`, …) recursively at every nesting level, including inside
+  `additionalProperties` and `prefixItems`. This allows the full Claude Code
+  tool-set (~50 tools, 832 GBNF rules) to be forwarded to the b9780 engine without
+  parser saturation, while preserving deterministic schema output for prompt-cache
+  reuse.
+- **`tool_choice=auto` enforcement on `/v1/messages`** — when the client sends a
+  `tools` array without an explicit `tool_choice`, the gateway now injects
+  `tool_choice: {type: "auto"}` before forwarding to the engine, preventing
+  unexpected forced-tool behaviour.
+
+## [0.6.8] — 2026-06-24
+
+Consolidates versions 0.6.5–0.6.8 (not previously tagged publicly). Drop-in upgrade
+from 0.6.4 — no breaking API or configuration changes.
+
+### Added
+
+- **Anthropic Messages API gateway** (`POST /v1/messages`) — the gateway now speaks
+  the Anthropic protocol in addition to the OpenAI-compatible surface, enabling a
+  fully local Claude Code experience backed by a local vision model. Includes
+  `count_tokens` support and Anthropic-shaped JSON error envelopes.
+- **Prompt-cache LCP enablement for the vision engine** — the engine supervisor
+  allow-list accepts `--kv-unified`, unlocking llama.cpp's unified-KV prompt cache
+  (b9780+). Multi-turn requests reuse the prior turn's KV via longest-common-prefix
+  matching, collapsing per-turn prefill from O(full context) to O(new tokens).
+- **Project-map integration**: feature backlog cards and roadmap data are now accessible
+  on the project map.
+
+### Fixed
+
+- `gradatum-engine` `is_binary_allowed` accepts versioned `llama-server-<ver>`
+  wrappers via a bounded suffix check (alphanumeric-only after a single dash),
+  while the path-prefix allow-list remains the primary guard.
+- Streaming `message_delta` now reports a non-zero `output_tokens` estimate.
+- Engine config boot validation for `[messages]` aliases (only when configured).
+
+## [0.6.4] — 2026-06-20
 
 This release catches the public version number up with the real deployed version,
 ending a historical gap where internal releases were not tagged publicly. v0.6.4
@@ -162,7 +471,7 @@ historical releases.
 
 2337 passed / 0 failed / 10 skipped (`cargo nextest --workspace --release`); `clippy --workspace --all-targets -- -D warnings` clean.
 
-## [0.5.2] - 2026-06-15
+## [0.5.2] — 2026-06-15
 
 First public release since v0.4.3. No breaking changes; drop-in upgrade. Adds a static code index, a timeline API, action tracing, a proof-of-absence search signal, native TLS termination, and a suite of correctness and security fixes.
 
@@ -263,25 +572,26 @@ Two new at-rest data surfaces in `index.db`:
 
 ## [0.4.6] — 2026-06-11
 
-Studio-MVP milestone (F-37): a read-mostly operator UI over the vault plus the backend surfaces it consumes. Internal release (not published). No breaking changes; drop-in upgrade from v0.4.5. Public READMEs remain at v0.4.3.
+Introduces a read-mostly operator UI over the vault, along with the backend API surfaces it
+consumes. No breaking changes; drop-in upgrade from v0.4.5.
 
 ### Added
 
-- **gradatum Studio MVP** (F-37, direction "LEDGER"): 5 surfaces (React + TypeScript + Vite bundle) served by `ServeDir` under `/ui/*` without auth (LAN — the JS is public). Auth flow: the operator pastes an api-key → `POST /auth/exchange` → JWT stored in `sessionStorage` (never `localStorage`) → `Authorization: Bearer` on every `/api/v1/*` call. Hardened static serving: strict CSP, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy: geolocation=(), microphone=(), camera=()`. SPA fallback (`ServeDir.fallback(ServeFile index.html)`): deep-links / refresh on client-side routes serve `index.html`; a missing bundle still returns a clean 404.
-- **Opt-in score breakdown in `vault_search`** (S1.1): new request field `include_scores: bool` (default `false`, fully backward-compatible under `deny_unknown_fields`) enriches each `SearchHit` with a `ScoreBreakdown` object (`rrf_score`, `recency_factor`, `pagerank_factor`, `in_degree`, `trust_raw`, `trust_decayed`, `composite`, optional `bm25_rank` / `sem_rank`). Signals were already computed by the scoring pipeline and discarded — they are now exposed only when requested. No `rerank` column (NoopReranker by default). The legacy hardcoded `trust: 0.5` field is documented as deprecated. The MCP tool schema auto-derives the new field via schemars.
-- **Review queue endpoint** (S1.2): new `GET /api/v1/review` (auth, paginated by ULID cursor) listing notes with `status IN ('pending-review', 'staging')`, with `provenance` (distinguishing `distilled` from curator) and a distinct legacy `staging` badge. `confidence` is not exposed (not persisted — honest copy).
-- **Dashboard endpoint** (S1.3): new `GET /api/v1/dashboard` (behind auth; `/health` stays unauthenticated) aggregating, with no new table: `notes_by_status` (tolerant of out-of-enum legacy statuses), `forgotten_count`, `jobs_by_status` (`GROUP BY`, DLQ included), `queue_depth`, `wal_size_bytes` (`null` = "n/a", never a lying 0), and the last job summary. New trait methods `count_notes_by_status` (`DocumentStore`) and `count_jobs_by_status` (`QueueStore`, default empty + native `GROUP BY` override in `SqliteQueueStore`).
-- **Move-to-locus endpoint** (S1.4): new `POST /api/v1/notes/{id}/move {locus}` performing an index-level `UPDATE notes.locus` (consistent with `vault_downgrade` / `patch_note_status`); the ULID is preserved (no redirect table). Strict `LocusId::parse` validation: non-empty, charset `[a-z0-9-/]`, ≤128 bytes, anti-traversal. Clean `400` / `404` / `422`. Physical `.md` relocation (and thus `vault_read` consistency) is intentionally deferred (backlog dette) — documented in the handler contract.
+- **gradatum Studio**: 5 surfaces (React + TypeScript + Vite bundle) served by `ServeDir` under `/ui/*` without auth (LAN — the JS is public). Auth flow: the operator pastes an api-key → `POST /auth/exchange` → JWT stored in `sessionStorage` (never `localStorage`) → `Authorization: Bearer` on every `/api/v1/*` call. Hardened static serving: strict CSP, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy: geolocation=(), microphone=(), camera=()`. SPA fallback (`ServeDir.fallback(ServeFile index.html)`): deep-links / refresh on client-side routes serve `index.html`; a missing bundle still returns a clean 404.
+- **Opt-in score breakdown in `vault_search`**: new request field `include_scores: bool` (default `false`, fully backward-compatible under `deny_unknown_fields`) enriches each `SearchHit` with a `ScoreBreakdown` object (`rrf_score`, `recency_factor`, `pagerank_factor`, `in_degree`, `trust_raw`, `trust_decayed`, `composite`, optional `bm25_rank` / `sem_rank`). Signals were already computed by the scoring pipeline and discarded — they are now exposed only when requested. No `rerank` column (NoopReranker by default). The legacy hardcoded `trust: 0.5` field is documented as deprecated. The MCP tool schema auto-derives the new field via schemars.
+- **Review queue endpoint**: new `GET /api/v1/review` (auth, paginated by ULID cursor) listing notes with `status IN ('pending-review', 'staging')`, with `provenance` (distinguishing `distilled` from curator) and a distinct legacy `staging` badge. `confidence` is not exposed (not persisted — honest copy).
+- **Dashboard endpoint**: new `GET /api/v1/dashboard` (behind auth; `/health` stays unauthenticated) aggregating, with no new table: `notes_by_status` (tolerant of out-of-enum legacy statuses), `forgotten_count`, `jobs_by_status` (`GROUP BY`, DLQ included), `queue_depth`, `wal_size_bytes` (`null` = "n/a", never a lying 0), and the last job summary. New trait methods `count_notes_by_status` (`DocumentStore`) and `count_jobs_by_status` (`QueueStore`, default empty + native `GROUP BY` override in `SqliteQueueStore`).
+- **Move-to-locus endpoint**: new `POST /api/v1/notes/{id}/move {locus}` performing an index-level `UPDATE notes.locus` (consistent with `vault_downgrade` / `patch_note_status`); the ULID is preserved (no redirect table). Strict `LocusId::parse` validation: non-empty, charset `[a-z0-9-/]`, ≤128 bytes, anti-traversal. Clean `400` / `404` / `422`. Physical `.md` relocation is intentionally deferred and documented in the handler contract.
 
 ### Changed
 
-- **Curator routes low-confidence notes to `PendingReview`** (S1.2): `CurateOutcome::Pending` now writes `NoteStatus::PendingReview` instead of `Staging` at the four worker sites (dispatch + apalis, create + reclassify), factored through a single source of truth `gradatum_curator::outcome_to_status` (`Admitted→Live`, `Pending→PendingReview`, `Rejected→None`) to close the parity-bug class. Semantically correct: `PendingReview` = awaiting judgement (feeds `/review`); `Staging` = optional human review. Validated by the curator golden-set F1 gate (orthogonal to the status flip — it measures section routing) plus a mapping parity test.
-- **`/health` T12 wiring** (S1.3): the previously stubbed `sqlite_wal_size_bytes` and `queue_depth` are now real — WAL size read from `AppState.wal_path` (`<index.db>-wal`, set by `with_search_path`) and queue depth derived from `count_jobs_by_status` (`Pending`). `queue_oldest_age_secs` stays 0 (deferred — no dedicated `QueueStore` method).
+- **Curator routes low-confidence notes to `PendingReview`**: `CurateOutcome::Pending` now writes `NoteStatus::PendingReview` instead of `Staging` at the four worker sites (dispatch + apalis, create + reclassify), factored through a single source of truth `gradatum_curator::outcome_to_status` (`Admitted→Live`, `Pending→PendingReview`, `Rejected→None`) to close the parity-bug class. Semantically correct: `PendingReview` = awaiting judgement (feeds `/review`); `Staging` = optional human review. Validated by the curator golden-set F1 gate (orthogonal to the status flip — it measures section routing) plus a mapping parity test.
+- **`/health` live metric wiring**: the previously stubbed `sqlite_wal_size_bytes` and `queue_depth` are now real — WAL size read from `AppState.wal_path` (`<index.db>-wal`, set by `with_search_path`) and queue depth derived from `count_jobs_by_status` (`Pending`). `queue_oldest_age_secs` stays 0 (deferred — no dedicated `QueueStore` method).
 
 ### Fixed
 
-- **Locus preserved on re-upsert** (P1-1): `upsert_note` now guards `locus` with `CASE WHEN notes.content_hash IS NOT excluded.content_hash THEN excluded.locus ELSE notes.locus END`. A re-upsert from a stale `.md` (unchanged content hash, as after an index-level `update_note_locus`) no longer clobbers a moved locus; a genuine content change still applies the frontmatter locus. Same spirit as the trust P1-1 fix (`CASE`/`IS NOT`), discriminant = `content_hash`.
-- **Review queue tolerates a malformed id** (R7): `list_review_queue` skips a non-ULID id (data anomaly) with a `warn` instead of failing the whole page with a 500; valid rows keep being served.
+- **Locus preserved on re-upsert**: `upsert_note` now guards `locus` with `CASE WHEN notes.content_hash IS NOT excluded.content_hash THEN excluded.locus ELSE notes.locus END`. A re-upsert from a stale `.md` (unchanged content hash, as after an index-level `update_note_locus`) no longer clobbers a moved locus; a genuine content change still applies the frontmatter locus. Discriminant = `content_hash`.
+- **Review queue tolerates a malformed id**: `list_review_queue` skips a non-ULID id (data anomaly) with a `warn` instead of failing the whole page with a 500; valid rows keep being served.
 
 ### Tests
 
@@ -290,15 +600,16 @@ Studio-MVP milestone (F-37): a read-mostly operator UI over the vault plus the b
 
 ## [0.4.5] — 2026-06-11
 
-Backend-foundations milestone: multi-backend-readiness for the index (testability + decoupling) without shipping an alternative backend. Internal release (not published). No breaking changes; drop-in upgrade from v0.4.4.
+Multi-backend-readiness for the index (testability + decoupling), without shipping an
+alternative backend yet. No breaking changes; drop-in upgrade from v0.4.4.
 
 ### Changed
 
-- **Worker type-erased on `Arc<dyn Index>`** (W1): the worker now depends on the type-erased `Arc<dyn Index>` façade instead of the concrete `Arc<SqliteIndex>`, unifying the composition root with the server. Eight inherent `SqliteIndex` methods used by the worker outside the three storage traits were promoted into `IndexStore` with neutral default implementations (`M-FEATURES-ADDITIVE`): `set_note_trust`, `write_temporal_entry`, `delete_redirect_by_ulid`, `delete_note_from_index`, `list_garbage_older_than`, `get_note_status`, `get_note_section`, `is_note_forgotten`. An alternative backend does not have to implement them to compile; `SqliteIndex` overrides each by delegation. No rusqlite type is exposed in any promoted signature.
+- **Worker type-erased on `Arc<dyn Index>`**: the worker now depends on the type-erased `Arc<dyn Index>` facade instead of the concrete `Arc<SqliteIndex>`, unifying the composition root with the server. Eight inherent `SqliteIndex` methods used by the worker outside the three storage traits were promoted into `IndexStore` with neutral default implementations: `set_note_trust`, `write_temporal_entry`, `delete_redirect_by_ulid`, `delete_note_from_index`, `list_garbage_older_than`, `get_note_status`, `get_note_section`, `is_note_forgotten`. An alternative backend does not have to implement them to compile; `SqliteIndex` overrides each by delegation. No rusqlite type is exposed in any promoted signature.
 
 ### Added
 
-- **Backend-agnostic index parity suite** (W2): new test-only crate `index-parity-tests` locking the observable contract of the `Index` trait (`DocumentStore` + `IndexStore` + `VectorStore` façade). A `make_index() -> Arc<dyn Index>` factory selects the backend via the `GRADATUM_INDEX_BACKEND` env var (default `sqlite` in-memory) — adding a backend is one match arm + one CI matrix entry, zero duplicated tests. 24 tests across 7 invariant families: write→read round-trip + content hash, FTS + semantic cosine (descending order, downgraded exclusion), status state machine / decay, temporal_index idempotence, dynamic-trust preservation on re-upsert, lesson recall, forget lifecycle. New split CI job `index-backends` (matrix `[sqlite]`) on Forgejo + GitHub.
+- **Backend-agnostic index parity suite**: new test-only crate `index-parity-tests` locking the observable contract of the `Index` trait (`DocumentStore` + `IndexStore` + `VectorStore` facade). A `make_index() -> Arc<dyn Index>` factory selects the backend via the `GRADATUM_INDEX_BACKEND` env var (default `sqlite` in-memory) — adding a backend is one match arm + one CI matrix entry, zero duplicated tests. 24 tests across 7 invariant families: write→read round-trip + content hash, FTS + semantic cosine (descending order, downgraded exclusion), status state machine / decay, temporal_index idempotence, dynamic-trust preservation on re-upsert, lesson recall, forget lifecycle. New split CI job `index-backends` (matrix `[sqlite]`) on Forgejo + GitHub.
 
 ### Fixed
 
@@ -311,14 +622,15 @@ Backend-foundations milestone: multi-backend-readiness for the index (testabilit
 
 ## [0.4.4] — 2026-06-11
 
-Distillation milestone: semantic distillation jobs, trust-decay scoring, consumable event-log, and lesson recall. Internal release (not published). No breaking changes; drop-in upgrade from v0.4.3.
+Adds semantic distillation jobs, trust-decay scoring, a consumable event-log, and lesson
+recall. No breaking changes; drop-in upgrade from v0.4.3.
 
 ### Added
 
-- **Semantic distillation** (F-22): new `Distill` job (`DistillSource`, mode `Semantic` only) that clusters non-processed notes of a scope by embedding cosine similarity (threshold 0.75, batch capped at 500) and writes one synthesis note per cluster in `pending-review` with `provenance: "distilled"` and `derived-from` links; source notes are marked `processed` / `derived-into` via copy-on-write-safe extra fields (no parasite versions). Dry-run is the default; the cron schedule is documented but never enabled by default; vault-wide scope is refused outside dry-run. New `TRUST_SCORES["distilled"] = 0.60`.
-- **Trust-decay scoring** (F-17): `composite_score` gains an optional trust-decay multiplier applied at the RRF layer only (never BM25), with per-provenance half-lives configurable (default `distilled` 90 days; `human-decision` no decay). Global flag `trust_decay_enabled` (default **on**; can be disabled) makes scores bit-identical to v0.4.3 when disabled. Modifier order documented: forgotten (short-circuit) > downgraded > [RRF × recency × pagerank × trust_decay]. Gated behind a search golden-set non-regression check.
-- **Consumable event-log** (F-19): engines emit a semantic `agent_id` and a `feature_id` derived from request type (`embed` vs `chat`); the event-log store gains transactional reader methods (`fetch_pending`, `mark_processed`) for the distillation pipeline.
-- **Lesson recall** (F-60): new `GET /api/v1/lessons/recall?class=<x>&limit=<n>` endpoint — BM25-only (no LLM) over the `lessons-learned` section, filtered to a controlled vocabulary of 12 classes (`400` otherwise), excluding lessons tagged `codified` and forgotten notes; returns `{items:[{ulid, title, snippet, tags, anchor_ms}]}` with a sub-50ms target. Also exposed as the `vault_lessons_recall` MCP tool (19th tool).
+- **Semantic distillation**: new `Distill` job (`DistillSource`, mode `Semantic` only) that clusters non-processed notes of a scope by embedding cosine similarity (threshold 0.75, batch capped at 500) and writes one synthesis note per cluster in `pending-review` with `provenance: "distilled"` and `derived-from` links; source notes are marked `processed` / `derived-into` via copy-on-write-safe extra fields (no parasite versions). Dry-run is the default; the cron schedule is documented but never enabled by default; vault-wide scope is refused outside dry-run. New `TRUST_SCORES["distilled"] = 0.60`.
+- **Trust-decay scoring**: `composite_score` gains an optional trust-decay multiplier applied at the RRF layer only (never BM25), with per-provenance half-lives configurable (default `distilled` 90 days; `human-decision` no decay). Global flag `trust_decay_enabled` (default **on**; can be disabled) makes scores bit-identical to v0.4.3 when disabled. Modifier order documented: forgotten (short-circuit) > downgraded > [RRF × recency × pagerank × trust_decay]. Gated behind a search golden-set non-regression check.
+- **Consumable event-log**: engines emit a semantic `agent_id` and a `feature_id` derived from request type (`embed` vs `chat`); the event-log store gains transactional reader methods (`fetch_pending`, `mark_processed`) for the distillation pipeline.
+- **Lesson recall**: new `GET /api/v1/lessons/recall?class=<x>&limit=<n>` endpoint — BM25-only (no LLM) over the `lessons-learned` section, filtered to a controlled vocabulary of 12 classes (`400` otherwise), excluding lessons tagged `codified` and forgotten notes; returns `{items:[{ulid, title, snippet, tags, anchor_ms}]}` with a sub-50ms target. Also exposed as the `vault_lessons_recall` MCP tool.
 - **Migration 0014**: adds a nullable `outcome` column to `event_log` (additive, safe default).
 
 ### Fixed
@@ -397,8 +709,6 @@ Quality and reliability improvements across security, documentation, and correct
 
 Vault durable writes — note history, optimistic locking, stable wikilinks, write provenance.
 
-> **Internal notes removed from public changelog** for clarity. This release implements storage hardening and temporal features planned in the v0.4.x roadmap.
-
 ### Added
 
 - **Provenance Trust** : `provenance` field (String) in note frontmatter ; `trust` column in index.db (confidence score 0.0–1.0). Presets: human-decision 0.95, qa-event 0.75, agent-log 0.50, web-scraped 0.35. Stored for use in scoring; trust decay scoring planned for v0.4.1.
@@ -419,13 +729,7 @@ Vault durable writes — note history, optimistic locking, stable wikilinks, wri
 ### Tests
 
 - **Workspace** : 1178 tests PASS, 0 clippy warnings, 0 regressions.
-- **Caveats** : history pruning policy (v0.4.2), trust decay scoring (v0.4.1).
-
-### Internal
-
-- Crate count: 28 crates.
-- Migrations: 0010 (provenance, redirect, trust).
-- Backlog: history retention policy (v0.4.2), trust decay scoring (v0.4.1), event log retention.
+- **Known limitations**: history pruning policy and trust-decay scoring are deferred to later releases.
 
 ## [0.3.7] — 2026-06-05
 
@@ -450,27 +754,24 @@ Add per-crate README.md for crates.io documentation pages; metadata only, no cod
 
 ## [0.3.5] — 2026-06-03
 
-Enrichissement `title`/`section` des hits sémantique-only dans `vault_search`.
+Enriches `title` and `section` fields for semantic-only hits in `vault_search`.
 
 ### Fixed
 
-- **`vault_search` : `title = null`, `section = ""` pour les hits sémantique-only** :
-  après la fusion RRF, les notes présentes uniquement dans le signal sémantique
-  (absentes de `bm25_map`) conservaient `title = null` et `section = ""` dans la
-  réponse finale. Une passe d'enrichissement batch (`get_titles_sections` — 1 seul
-  `SELECT … WHERE id IN (…)`) récupère désormais `title` et `section` depuis la
-  table `notes` pour tous les hits manquants, juste avant la construction des
-  `SearchHit`. Les enrichissements BM25 existants ne sont pas écrasés.
-  `snippet` reste `None` pour les hits sémantique-only : pas de match FTS5
-  disponible pour générer un extrait localisé.
+- **`vault_search`: `title = null`, `section = ""` for semantic-only hits**: after RRF
+  fusion, notes present only in the semantic signal (absent from `bm25_map`) retained
+  `title = null` and `section = ""` in the final response. A batch enrichment pass
+  (`get_titles_sections` — single `SELECT … WHERE id IN (…)`) now fetches `title` and
+  `section` from the `notes` table for all missing hits, just before `SearchHit`
+  construction. Existing BM25 enrichments are not overwritten. `snippet` remains `None`
+  for semantic-only hits: no FTS5 match is available to generate a localized excerpt.
 
 ### Added
 
-- **`IndexStore::get_titles_sections`** : nouveau helper batch sur le trait
-  `gradatum-core::IndexStore` — `SELECT id, title, section FROM notes WHERE
-  vault_id = ? AND id IN (…)` — utilisé par la passe d'enrichissement ci-dessus.
-  Implémenté dans `gradatum-index::SqliteIndex::get_titles_sections` (délégation
-  via `index_store_impl.rs`).
+- **`IndexStore::get_titles_sections`**: new batch helper on the `gradatum-core::IndexStore`
+  trait — `SELECT id, title, section FROM notes WHERE vault_id = ? AND id IN (…)` — used
+  by the enrichment pass above. Implemented in
+  `gradatum-index::SqliteIndex::get_titles_sections`.
 
 ## [0.3.4] — 2026-06-03
 
@@ -564,12 +865,12 @@ Storage trait decomposition, event-log sink, gateway cost-attribution, cognitive
 
 ### Added
 
-- **Storage trait decomposition**: monolithic `trait Index` decomposed into three granular traits in `gradatum-core` — `DocumentStore` (note CRUD), `IndexStore` (FTS5, scoring, wikilinks), `VectorStore` (embedding + ANN). `trait Index` façade with blanket impl preserves call site compatibility. `AppState.search` uses vtable dispatch (`Arc<dyn Index>`). Types `SearchHitRaw`, `AuthorRow`, `Lineage` made public.
+- **Storage trait decomposition**: monolithic `trait Index` decomposed into three granular traits in `gradatum-core` — `DocumentStore` (note CRUD), `IndexStore` (FTS5, scoring, wikilinks), `VectorStore` (embedding + ANN). `trait Index` facade with blanket impl preserves call site compatibility. `AppState.search` uses vtable dispatch (`Arc<dyn Index>`). Types `SearchHitRaw`, `AuthorRow`, `Lineage` made public.
 - **Event-log sink**: dedicated SQLite table `event_log` (migrations 0006/0007) — append-only, outside notes/notes_fts. Endpoint `POST /api/v1/event-log` with timestamp/payload bounds, log-injection sanitization. `EventLogStore` with `insert_batch` / `purge` / `count`. Retention policy: 30-day TTL, 6-hour purge interval, 5M-row cap. Prometheus metric included.
 - **gradatum-gateway crate**: autonomous LLM proxy service (`:8436`). Routes: `/v1/chat/completions` (+SSE), `/v1/embeddings`, `/v1/rerank` (ONNX cross-encoder), `/v1/models`, `/health`, `/metrics`. Replaces standalone LLM services.
 - **Cost attribution**: `QaEvent` enriched with feature_id, model_used (fallback-aware), tokens_input/output, cost_usd. Streaming paths omit token counts.
 - **Cognitive kind capture** (migration 0008): columns `c_kind` (CoALA categories: episodic / semantic / procedural / reflective) and `doc_kind` (Event / Static) added to `notes`. Derived deterministically from `section` via const functions in `gradatum-core`. Zero LLM runtime cost. `section` remains authoritative; `c_kind`/`doc_kind` are derived metadata. Scoring unchanged (doc_kind usage deferred).
-- **Secrets DI (F-13)**: `SecretsProvider` trait + `SecretBytes` (crate `secrecy`, Drop-zeroize, Debug masked) + `EnvSecretsProvider` + `FileSecretsProvider` in `gradatum-core/src/secrets.rs`. File secrets provider refuses overly-permissive permissions at load time.
+- **Secrets dependency injection**: `SecretsProvider` trait + `SecretBytes` (crate `secrecy`, Drop-zeroize, Debug masked) + `EnvSecretsProvider` + `FileSecretsProvider` in `gradatum-core/src/secrets.rs`. File secrets provider refuses overly-permissive permissions at load time.
 
 ### Changed
 
@@ -594,14 +895,7 @@ Storage trait decomposition, event-log sink, gateway cost-attribution, cognitive
 - **0 FAILED** across 28-crate workspace.
 - Golden search regression: **3/3 diff-zero** maintained across all tranches.
 - `clippy --all-targets`: 0 warnings maintained.
-- Security review findings: all HIGH resolved (F1–F5 event-log endpoint + V1–V5+V8 JWT/secrets).
-
-### Internal
-
-- Crate count: 26 → 28 (added `gradatum-gateway` + `gradatum-db-sqlite`).
-- Migrations: 0006 (event_log), 0007 (agent_id), 0008 (c_kind/doc_kind), 0010 (job routing fix).
-- Design review: storage traits finalized, gateway architecture approved, multi-vault deferred to v1.0.
-- Security review: all high-priority findings resolved.
+- Security review findings: all HIGH severity findings resolved.
 
 ## [0.2.0] — 2026-05-29
 
@@ -609,7 +903,7 @@ Apalis job infrastructure, Dead-Letter Queue, jobs introspection API with SSE, a
 
 ### Added
 
-- **Apalis job infrastructure**: 22 Job variants (`JobKind` enum) covering curator and maintenance flows. `JobRecord` 5-block structure with forward-compatible fields. Custom `GradatumQueue` façade over Apalis `Backend`. `SqliteQueueStore` with atomic lease semantics. Framework-agnostic: future swap to Redis/RabbitMQ/Postgres needs only a new `QueueStore` impl.
+- **Apalis job infrastructure**: 22 Job variants (`JobKind` enum) covering curator and maintenance flows. `JobRecord` 5-block structure with forward-compatible fields. Custom `GradatumQueue` facade over Apalis `Backend`. `SqliteQueueStore` with atomic lease semantics. Framework-agnostic: future swap to Redis/RabbitMQ/Postgres needs only a new `QueueStore` impl.
 - **Dead-Letter Queue + Monitor**: automatic DLQ routing for jobs exceeding max retries. Apalis Monitor for multi-worker coordination with timeout, retry, panic isolation, and load shedding layers. Graceful shutdown with 30s drain.
 - **Jobs introspection API**: five HTTP endpoints for job lifecycle (enqueue, status, stream, cancel) + Prometheus metrics. Server-Sent Events for streaming. Idempotency-Key header support. `gradatum-admin jobs` CLI commands for inspection and control.
 - **Prometheus exporter**: `:19091` pull endpoint, disabled by default (`metrics_enabled = true` in config to enable). Per-job-kind metrics.
@@ -617,77 +911,51 @@ Apalis job infrastructure, Dead-Letter Queue, jobs introspection API with SSE, a
 
 ### Fixed
 
-- **E-12 — `SqliteQueueStore::get()` stale payload**: record lifecycle fields (`started_at`, `completed_at`, `duration_ms`) were desynchronised from authoritative SQL columns. Fix: sync from SQL in `get()` (commit `e739517`).
-- **E-25 — `duration_ms` stub**: `JobResult.duration_ms` was hardcoded 0. Now measured via `std::time::Instant` injected in `record_to_task` and recovered in `GradatumAcknowledger::ack()`. Smoke LIVE confirmed `duration_ms = 990ms` (commit `0a6e51e`, merge `c5d9f98`).
-- **E-23 — Apalis ack/complete wiring**: `apalis::Backend::ack`/`complete` now properly wired via `GradatumAcknowledger` (commit `63dae03`).
-- **E-24 — `enable_tracing` panic**: `enable_tracing` re-enabled + `TaskId` injection in `record_to_task` resolves panic in Apalis rc.9 `make_span`.
+- **`SqliteQueueStore::get()` stale payload**: record lifecycle fields (`started_at`, `completed_at`, `duration_ms`) were desynchronised from authoritative SQL columns. Fixed by syncing from SQL in `get()`.
+- **`duration_ms` stub**: `JobResult.duration_ms` was hardcoded 0. Now measured via `std::time::Instant` injected in `record_to_task` and recovered in `GradatumAcknowledger::ack()`.
+- **Apalis ack/complete wiring**: `apalis::Backend::ack`/`complete` now properly wired via `GradatumAcknowledger`.
+- **`enable_tracing` panic**: `enable_tracing` re-enabled; `TaskId` injection in `record_to_task` resolves a panic in `make_span`.
 
 ### Tests
 
-- Workspace: **886 PASS** (up from 826 alpha.15 baseline, +60 new).
-- **0 FAILED** across workspace.
+- 886 PASS / 0 failed.
 - E2E integration: write note → curator job enqueued → Monitor processes → metric exported → SSE subscribers notified.
-
-### Internal
-
-- Crate count: 25 → 26 (added `gradatum-db-sqlite`).
-- Maintainer review: GO-CAVEATS (2026-05-26); design spec Round 2 APPROVED; Phase 4.2 post-impl audit APPROVED-WITH-CAVEATS (1 P0 + 3 P1 all resolved 4.2bis).
-- Spec: `docs/specs/2026-05-29-v0-2-0-apalis-job-infra-spec.md` (26 écarts §11, all ratified).
 
 ## [0.1.0-alpha.15] — 2026-05-28
 
-Polish Phase 2.x.5 — Tasks 17-24 (8 tasks, TDD, 826 PASS workspace, +22 vs alpha.14 baseline).
-
 ### Security
 
-- **Task 19 — LIKE escape `title_lookup`** : wildcards SQLite `%` et `_` dans un titre sont
-  désormais échappés via `escape_like_pattern` + `ESCAPE '\\'` SQLite — élimine les faux positifs
-  LIKE dans `vault_read` / `vault_trace` / classify (Phase 3 TDD — commit `7f16a8c`).
+- **LIKE wildcard escaping in `title_lookup`**: SQL wildcards (`%` and `_`) in note titles
+  are now escaped via `escape_like_pattern` + SQLite `ESCAPE '\\'`, eliminating false-positive
+  LIKE matches in `vault_read`, `vault_trace`, and classify.
 
 ### Performance
 
-- **Task 20 — `vault_trace` seeds JoinSet** : résolution parallèle des seeds (`tokio::JoinSet`)
-  dans `gradatum-server` — élimine le round-trip séquentiel N×seeds (Phase 2 TDD — commit
-  `f814fc6`).
-- **Task 22 — wikilinks `title_lookup` JoinSet** : résolution parallèle des wikilinks dans
-  `gradatum-worker` via `tokio::JoinSet` — remplace la boucle `.await` séquentielle (Phase 2
-  TDD — commit `6e3b31f`).
-- **Task 23 — reranker tokenize-once** : `encode_batch` pré-tokenisation en une passe dans
-  `gradatum-search` (WONTFIX baseline — commit `fb7b063`).
+- **`vault_trace` parallel seed resolution**: seed entries are now resolved concurrently via
+  `tokio::JoinSet`, eliminating the sequential N×seed round-trip.
+- **Wikilink `title_lookup` parallel resolution**: wikilink resolution in the worker now uses
+  `tokio::JoinSet` instead of a sequential `.await` loop.
+- **Reranker single-pass tokenization**: `encode_batch` pre-tokenizes in one pass.
 
-### Behavior
+### Changed
 
-- **Task 18 — curator classify cascade** : `vault_classify` appelle désormais le curateur LLM
-  en cascade (B3) et applique les caveats C1-C4 (normalisation catégorie, fallback sur erreur
-  curateur, propagation status) (Phase 4 TDD — commit `f29fde7`).
+- **`vault_classify` LLM cascade**: `vault_classify` now invokes the LLM curator in cascade
+  with category normalization, fallback on curator error, and status propagation.
 
-### Data migration
+### Added
 
-- **Task 21 — backfill-titles** : sous-commande `gradatum-admin backfill-titles` ajoutée —
-  renseigne la colonne `title` des notes NULL depuis le champ `body` (M8 alpha.10, 551/552 notes
-  prod backfillées en production) (Phase 5 TDD — commit `18b4ea2`).
+- **`gradatum-admin backfill-titles`**: new CLI subcommand that populates the `title` column
+  for notes where it is null, extracting the value from the note body.
 
-### Cleanup
+### Removed
 
-- **Task 17 — retrait `X-Gradatum-Wait`** : header stub `X-Gradatum-Wait` et logique
-  `sync_wait` supprimés de `gradatum-server` — comportement déjà async-only (Phase 1 TDD —
-  commit `3dce54f`).
-- **Task 24 — audit scoring.rs** : audit dead code `scoring.rs` — 0 dead code détecté, aucune
-  modification nécessaire (Phase 1 — commit `fb2c80a`).
+- **`X-Gradatum-Wait` header**: the stub `X-Gradatum-Wait` header and `sync_wait` logic have
+  been removed from `gradatum-server` — the server is async-only.
 
 ### Tests
 
-- Workspace : **826 PASS** (+22 vs alpha.14 baseline, 0 régression). `cargo test --workspace`
-  PASS. `cargo deny` GREEN. 0 clippy warnings.
-- Smoke E2E `scripts/smoke-alpha-15.sh` : LIKE injection + rate limit WardenLayer validés.
-- V5 (rate limiting `vault_search`) : couvert par WardenLayer existant (même middleware
-  `write`/`curate`).
-
-### Internal
-
-- Backlog post-alpha.15 :
-  - Security review V6-V9 (surface crypto) — dédiée.
-  - Runner Docker CI pour build arm64 + docker buildx ghcr.io.
+- 826 PASS / 0 regressions; `cargo deny` GREEN; 0 clippy warnings.
+- LIKE injection prevention and rate limiting confirmed by integration tests.
 
 ## [0.1.0-alpha.14] — 2026-05-28
 
@@ -703,14 +971,7 @@ Security hardening and CI release infrastructure.
 
 ### Tests
 
-- Cargo workspace : 0 régression. `cargo build --release` PASS local 40s. `cargo test -p gradatum-auth --release` : 13 PASS.
-
-### Internal
-
-- Re-application post-OSS-flip squash (commit historique `5ef3690` 2026-05-26 perdu post-squash Phase E OSS flip readiness, récupérable backup bare `~/tmp/gradatum-backup-pre-filter-repo-20260526_050215.git`).
-- Backlog Phase 2.x.5 :
-  - Runner Docker pour build arm64 + docker buildx ghcr.io
-  - Anti-leak Pilier 1 résiduel — 6 patterns leaks dans tree HEAD (bloque ci.yml main leak-detector)
+- 13 tests pass; `cargo build --release` passes; no regressions.
 
 ## [0.1.0-alpha.13] — 2026-05-10
 
@@ -728,14 +989,10 @@ Endpoints completeness: wikilinks, title lookup, vault trace, and context budget
 - 779 → 796 PASS workspace (+17). 0 clippy, 0 fmt, `cargo deny` GREEN.
 - Smoke E2E: auth exchange, health check, write→curate→read+trace+context integration.
 
-### Internal
+### Changed
 
-- Design review completed. Backlog items for alpha.14:
-  - Title lookup wildcard escape (SQL injection prevention).
-  - vault_trace batch queries (performance optimization).
-  - Title column backfill (551/552 notes).
-  - Wikilink resolution parallelization.
-- Scripts : install script renamed to `install-gradatum-services.sh` (commit `50fa520`) + new `install-gradatum-stub-mcp.sh` (commit `2f845d7`) + `mcp.json.sample` artefact runtime gitignored (commit `6a7580b`).
+- Install script renamed to `install-gradatum-services.sh`; `install-gradatum-stub-mcp.sh`
+  added.
 
 ## [0.1.0-alpha.12-bumps.1] — 2026-05-10
 
@@ -755,12 +1012,7 @@ Dependency upgrades: supply chain hardening (5 sequential PRs).
 
 ### Tests
 
-- 779 PASS / 0 clippy / 0 fmt / `cargo deny` GREEN après chaque merge (TNR strict par PR).
-
-### Internal
-
-- 779 PASS / 0 clippy / 0 fmt / `cargo deny` GREEN per PR.
-- Crypto upgrade chain blocked on upstream stabilisation (`ed25519-dalek 3.x`, `jsonwebtoken 10`). Planned for future cycle.
+- 779 PASS / 0 clippy / 0 fmt / `cargo deny` GREEN on each merge.
 
 ## [0.1.0-alpha.12] — 2026-05-10
 
@@ -780,9 +1032,10 @@ Multi-factor scoring and cross-encoder reranker integration.
 
 - 754 → 779 PASS workspace (+25). 0 clippy, 0 fmt.
 
-### Internal
+### Known limitations
 
-- Backlog: environment variable configuration for reranker model path (currently `NoopReranker` default).
+- The reranker model path is not yet configurable via environment variable;
+  `NoopReranker` is the default.
 
 ## [0.1.0-alpha.11-patch.1] — 2026-05-10
 
@@ -797,9 +1050,9 @@ Design foundations: SearchHit enrichment and error propagation.
 
 - **RRF handler integration** : 4 new E2E tests for RRF fusion path, graceful degradation, and error handling.
 
-### Cosmetic
+### Changed
 
-- `chore(gradatum-index)` clippy fixes pre-existing dans `search_semantic.rs`.
+- Resolved pre-existing clippy warnings in `search_semantic.rs`.
 
 ### Tests
 
@@ -824,410 +1077,470 @@ Vault API completeness: status reporting, pagination, title tracking, and sectio
 ## [0.1.0-alpha.9] — 2026-05-09
 
 ### Added
-- **`vault_downgrade` côté gradatum** : parité avec the legacy vault MCP, prérequis pour migration propre.
-  - Schema : migration `0004_vault_downgrade.sql` ADD COLUMN `replaced_by TEXT REFERENCES notes(id)` + index partiel `idx_notes_status_downgrade WHERE status='downgraded'`.
-  - DTO : `gradatum-dto::VaultDowngradeRequest/Response` + `NoteStatusPatch` + extension `VaultSearchRequest.include_downgraded` (default false).
-  - Endpoints : POST `/api/v1/vault_downgrade` (parité MCP, sync 200) + PATCH `/api/v1/notes/:id` (flexibilité status, 204).
-  - SQL helpers : `SqliteIndex::downgrade_note(id, reason, replaced_by)` + `patch_note_status(id, status?, reason?, replaced_by?)` (idempotent UPDATE, NotFound si rows=0).
-  - SQL helper test : `SqliteIndex::seed_note(id, section, body)` pour tests E2E.
-- **Filter search avec pénalité downgraded** :
-  - `vault_search` exclut `status='downgraded'` par défaut (filtre WHERE).
-  - `include_downgraded=true` → score BM25 multiplié par 10 en Rust (amplifie négativité → score plus mauvais en ordre ASC, sémantiquement équivalent à 10% de pertinence).
-  - `Index::search_fts_scored` trait : ajout param `include_downgraded: bool` + retour `Vec<(NoteId, f64, String_status)>` pour traçabilité.
-- **MCP tool `vault_downgrade`** : exposé via gradatum-mcp-stub (drop-in compatibility with legacy vault) — déjà câblé Tasks 5-6 (tool_def + dispatch + EXPECTED_TOOL_NAMES).
-- **Migration tool `gradatum-admin downgrade-from-legacy-vault-trash`** : porte `.vault-trash/<date>/*.md` du legacy vault vers gradatum (idempotent + dry-run + --limit). Heuristique match : substr(body_text, 1, 200) chars UTF-8-safe.
-- 25+ tests régression : 3 schema migration + 5 DTO + 5 SQL helpers + 4 endpoints E2E + 4 search filter + 2 MCP smoke + 3 migration tool.
+
+- **`vault_downgrade` endpoint**: parity with the legacy vault MCP.
+  - Migration `0004_vault_downgrade.sql`: adds `replaced_by TEXT REFERENCES notes(id)` column
+    and a partial index `idx_notes_status_downgrade WHERE status='downgraded'`.
+  - DTO: `VaultDowngradeRequest/Response`, `NoteStatusPatch`, and
+    `VaultSearchRequest.include_downgraded` extension (default `false`).
+  - Endpoints: `POST /api/v1/vault_downgrade` (synchronous 200) and `PATCH /api/v1/notes/:id`
+    (status patch, 204).
+  - SQL helpers: `SqliteIndex::downgrade_note(id, reason, replaced_by)` and
+    `patch_note_status(id, status?, reason?, replaced_by?)` (idempotent UPDATE; 404 if not
+    found).
+- **Downgraded-note search filter**:
+  - `vault_search` excludes `status='downgraded'` by default.
+  - `include_downgraded=true` penalizes the BM25 score (approximately 10% relative relevance).
+  - `Index::search_fts_scored` trait gains `include_downgraded: bool` parameter; return type
+    extended to `Vec<(NoteId, f64, String_status)>`.
+- **MCP tool `vault_downgrade`**: thin proxy for drop-in compatibility with the legacy vault.
+- **`gradatum-admin downgrade-from-legacy-vault-trash`**: imports `.vault-trash/<date>/*.md`
+  files from the legacy vault into gradatum (idempotent, `--dry-run`, `--limit`).
 
 ### Changed
-- **`Index::search_fts_scored` trait signature** : ajoute `include_downgraded: bool` en 4ème param. Retour étendu `Vec<(NoteId, f64, String_status)>`. Call sites adaptés (handler vault_search, tests fts5_search, MockIndex stub).
-- **Naming `replaced_by`** : aligné DTO + SQL + handlers (pas `superseded_by` du plan initial — corrigé pour cohérence avec module pré-existant `gradatum-dto/src/vault_downgrade.rs` et consommateurs `gradatum-worker/src/dispatch.rs`).
-- **POST `/api/v1/vault_downgrade` sync 200** : remplace l'ancien handler async 202 (write::vault_downgrade conservé en code mais désactivé).
-- **2 tests parity ajustés** : `poll_job_status::vault_downgrade_returns_*` + `write_synthetic::test_19_downgrade_*` mis à jour pour refléter contrat sync 404 (anciennement 202 async queue).
 
-### Internal
-- Décision the maintainer 2026-05-09 : SOFT downgrade only (status='downgraded' + body conservé). DELETE = exception manuelle hors MVP. Search default exclut downgraded. Score BM25 pénalisé pour downgraded.
-- Convention `:id` (axum 0.7.9) au lieu de `{id}` du plan initial pour PATCH /notes/:id.
-- Tests : 639 → **668 PASS** workspace (+29).
-- Spec : `docs/superpowers/specs/2026-05-09-vault-downgrade-design.md`.
-- Plan : `docs/superpowers/plans/2026-05-09-vault-downgrade-plan.md`.
+- `vault_downgrade` endpoint changed from asynchronous (202) to synchronous (200).
+- Field name `replaced_by` aligned across DTO, SQL, and handlers.
+
+### Tests
+
+- 668 PASS / 0 failed (+29).
 
 ## [0.1.0-alpha.8-patch.1] — 2026-05-09
 
 ### Fixed
-- **Template `default_server_toml` (init.rs)** : ajout section `[embed]` manquante. Bug découvert post-deploy alpha.8 smoke Phase 9 : 4 jobs embed_note (3 backfill + 1 chaînage post-curate) drainés `duration_ms=0` skip silencieux car `WorkerEmbedConfig::extract_inner("embed")` retournait défauts → `enabled=None` → embedder=None côté Dispatcher → `process_embed_note` early-return sans appel HTTP. Fix : section `[embed]` ajoutée au template avec defaults explicites (enabled=true, timeout_ms=5000).
-- **Defaults model/dim corrigés** : `EmbedConfig::default()` et template `[embed]` corrigés de `bge-small-en-v1.5/384` → `bge-m3-Q8_0/1024`. Corrigé simultanément dans `config.rs` (`default_embed_model` + `default_embed_dim`) et template `init.rs`.
-- Tests régression ajoutés : `merge_adds_embed_section_when_backup_lacks_it` (`tests/init_merge.rs`) + `embed_defaults_match_documented_values` (`config.rs`) + mise à jour `embed_section_defaults`.
 
-### Internal
-- Cause racine #1 : Backend Tasks 6 (`f6912d7`) + 8 (`f5cb510`) ont ajouté `EmbedConfig` struct à `ServerConfig` mais oublié template TOML init. Pattern à mémoriser : toute nouvelle section serde-serializable de `ServerConfig` doit être propagée au template `generate_server_toml_template` simultanément.
-- Cause racine #2 : valeurs model/dim non vérifiées lors de la spec. Pattern à mémoriser : vérifier `curl <service>/v1/models` AVANT de hardcoder model/dim dans les defaults.
+- **Missing `[embed]` section in generated `server.toml`**: the `[embed]` configuration
+  section was absent from the template, causing all embedding jobs to silently skip
+  (`enabled=None` → embedder resolved to `None` → `process_embed_note` early-returned without
+  an HTTP call). Added `[embed]` section with explicit defaults (`enabled=true`,
+  `timeout_ms=5000`).
+- **Embed model/dimension defaults corrected**: `EmbedConfig::default()` and the `[embed]`
+  template updated from `bge-small-en-v1.5` / 384 dimensions to `bge-m3-Q8_0` / 1024
+  dimensions.
+
+### Tests
+
+- Regression tests added: `merge_adds_embed_section_when_backup_lacks_it`,
+  `embed_defaults_match_documented_values`.
 
 ## [0.1.0-alpha.8] — 2026-05-09
 
 ### Added
-- **`gradatum-warden` v0.0.1** : perimeter defense layer — IP filter CIDR + rate limit per-IP token bucket + loopback bypass. Public API: `WardenLayer`, `WardenConfig`, `WardenError`, `WardenDecision`. Features (audit, threat-intel, geoip, prometheus, hot-reload) deferred to future RFC.
-- **V3 Rate limiting** sur `/api/v1/*` + `/auth/exchange` (exempt `/health`, `/metrics`). Default 60 req/min, burst 10, `exempt_localhost` configurable. Réponse 429 + `Retry-After`. Section `[ratelimit]` server.toml. Implémenté via `gradatum-warden::WardenLayer`.
-- **V4 Auth bearer optionnel `/jobs/:id`** : flag `[auth].require_jwt_jobs_endpoint` (default `false` — invariant réseau privé). Si `true` → bearer JWT requis sur `GET /api/v1/jobs/:id`. Préparation expo réseau public futur.
-- **Embeddings async pipeline** : worker post-curate enqueue automatique `kind="embed_note"` chaîné. Drain → HTTP POST vers l'endpoint embeddings configuré → INSERT `note_embeddings` (UPSERT BLOB f32 LE). Section `[embed]` server.toml (default endpoint `localhost:8431`, model `bge-small-en-v1.5`, dim 384, timeout 5s).
-- **`gradatum-admin backfill-embeddings`** : sous-commande CLI scan notes sans embedding via LEFT JOIN + enqueue `embed_note` jobs idempotent. Args `--root` `--tenant` `--limit`.
-- `SqliteIndex::insert_note_embedding` + `get_note_embedding` helpers (UPSERT BLOB f32 LE, validation `vector.len() == dim`).
-- `AppState.embedder: Arc<dyn Embedder>` (default `Noop`) + builder `with_embedder`.
-- Worker handler `process_embed_note` + `with_embedder` + `with_index` builders.
-- `EmbedConfig` + `RateLimitConfig` dans `ServerConfig` (defaults serde).
-- 19+ tests régression : 6 unit warden + 3 E2E warden Router + 3 ratelimit server + 4 auth-jobs + 3 embed_pipeline worker + 1 chained_jobs server + 2 backfill admin + 1 EmbedConfig + 2 ratelimit config + 2 auth-jobs config + 1 embed config.
+
+- **`gradatum-warden` crate**: perimeter defense layer — CIDR IP filter, per-IP token-bucket
+  rate limiting, loopback bypass. Public API: `WardenLayer`, `WardenConfig`, `WardenError`,
+  `WardenDecision`. Advanced features (audit, GeoIP, hot-reload) deferred to a future release.
+- **Rate limiting** on `/api/v1/*` and `/auth/exchange` (exempt: `/health`, `/metrics`).
+  Default: 60 req/min, burst 10, `exempt_localhost` configurable. Returns `429` +
+  `Retry-After`. Config: `[ratelimit]` block in `server.toml`.
+- **Optional auth on `GET /api/v1/jobs/:id`**: new `[auth].require_jwt_jobs_endpoint` flag
+  (default `false`). When `true`, a Bearer JWT is required.
+- **Asynchronous embedding pipeline**: after note curation, an `embed_note` job is
+  automatically chained. The worker fetches embeddings from the configured HTTP endpoint and
+  stores them in `note_embeddings` (UPSERT, f32 LE). Config: `[embed]` block in `server.toml`
+  (default: `localhost:8431`, model `bge-small-en-v1.5`, 384 dimensions, 5 s timeout).
+- **`gradatum-admin backfill-embeddings`**: CLI subcommand that scans notes without embeddings
+  and enqueues `embed_note` jobs idempotently. Args: `--root`, `--tenant`, `--limit`.
+- `SqliteIndex::insert_note_embedding` and `get_note_embedding` helpers (UPSERT, f32 LE,
+  validates `vector.len() == dim`).
+- `EmbedConfig` and `RateLimitConfig` added to `ServerConfig`.
 
 ### Changed
-- **Bypass loopback fix critique** : régression bloquante évitée — clients loopback :19090 (local MCP stub, monitoring agent, smoke scripts) reçoivent désormais le body handler réel (pas `Body::empty`). Implémenté via `WardenService::call` early return `inner.call(req)`.
-- `gradatum-embed` : feature `fastembed-cpu` confirmée hors `default`. HTTP backend par défaut. Pas de dépendance ORT requise.
-- Pipeline ingestion : embed_note non bloquant (note déjà persistée vault+FTS5 avant enqueue chained, best-effort).
-- 2 tests existants ajustés (`e2e_write.rs` + `v1-parity-tests/write_synthetic.rs`) : `depth==0` → `depth==1` cohérent avec chaînage embed_note post-curate.
+
+- **Loopback bypass fix**: loopback clients (`:19090`) now receive the real handler response
+  instead of `Body::empty`. Fixed via `WardenService::call` early-return `inner.call(req)`.
+- **`gradatum-embed`**: `fastembed-cpu` feature is not enabled by default; the HTTP backend is
+  the default (no ORT dependency required).
+- **Ingestion pipeline**: `embed_note` is non-blocking — the note is persisted to the vault
+  and FTS5 index before the embedding job is chained (best-effort).
 
 ### Removed
-- Dep workspace `tower_governor 0.5` (introduite Tasks 1-2 puis retirée Task W1 — bug archi error_handler termine la chaîne avec body vide → incompatible bypass loopback).
 
-### Internal
-- Nouvelle crate workspace `gradatum-warden` (25 → 26 crates).
-- Tests : 591 → **636 PASS** workspace (+45). 0 régression. Clippy 0 warning.
-- 13 commits Phase 2.1.1 alpha.8.
-- Trace décision : decision record `[DECISIONS][gradatum] Création crate gradatum-warden MVP v0.0.1 — 2026-05-09`.
-- RFC périmètre complet warden (IP filter avancé, circuit breaker périmètre, threat intel, GeoIP, audit jsonl, prometheus, hot-reload SIGHUP) → différée future RFC-0004.
+- `tower_governor 0.5` dependency: its `error_handler` terminated the middleware chain with an
+  empty body, incompatible with the loopback bypass.
+
+### Tests
+
+- 636 PASS / 0 failed (+45).
 
 ## [0.1.0-alpha.7-patch.6] — 2026-05-08
 
 ### Fixed
-- **Lease leadership pas libérée à l'arrêt propre** : `gradatum-worker` recevait SIGTERM,
-  loggait "arrêt propre", mais ne supprimait PAS sa row dans la table `worker_leadership`.
-  Conséquence : tout stop+start rapide via `install-gradatum-services.sh` ou `systemctl restart`
-  laissait le worker suivant en cycle retry ~60-75s (4 retries de 15s) avant takeover
-  post-expiration TTL.
+
+- **Worker leadership lease not released on clean shutdown**: `gradatum-worker` received
+  SIGTERM and logged a clean shutdown but did not delete its row in the `worker_leadership`
+  table. Consequence: a rapid stop+start left the next worker retrying ~60–75 s (4 × 15 s)
+  before taking over after TTL expiry.
 
 ### Changed
-- `LeaderElection::release()` ajouté dans `leader.rs` : DELETE conditionné
-  `WHERE holder = ?` pour libérer la lease (race-safe — ne touche pas une lease prise
-  par un autre worker entretemps).
-- À l'arrêt propre (`main.rs`), `el.release().await` appelé après `renewal.abort()`.
-  Best-effort : erreur loggée mais non fatale (TTL fallback via patch.5 `Restart=always`).
-- Latence takeover stop+start : **~60-75s → <1s** (cycle complet de redéploiement).
+
+- `LeaderElection::release()` added in `leader.rs`: issues a `DELETE WHERE holder = ?`
+  (race-safe — does not touch a lease held by another worker). Called from `main.rs` after
+  `renewal.abort()` on clean shutdown (best-effort; errors are logged, not fatal).
+- Stop+start takeover latency: **~60–75 s → < 1 s**.
 
 ### Added
-- 4 tests d'intégration `crates/gradatum-worker/tests/leadership_cleanup.rs` :
-  `release_removes_own_row`, `release_is_idempotent`,
-  `release_only_self_not_other_holder`, `release_without_acquire_is_noop`.
 
-### Notes
-- Combiné avec patch.5 (`Restart=always RestartSec=15s`), garantit zéro intervention
-  manuelle post-deploy.
-- Le DELETE est best-effort : si DB locked ou pool closed à l'arrêt, lease expire
-  naturellement via TTL (fallback patch.5).
+- 4 integration tests in `leadership_cleanup.rs`: `release_removes_own_row`,
+  `release_is_idempotent`, `release_only_self_not_other_holder`,
+  `release_without_acquire_is_noop`.
 
 ## [0.1.0-alpha.7-patch.5] — 2026-05-08
 
 ### Fixed
-- **gradatum-worker reste `inactive` après stop+start rapide** : `Restart=on-failure` dans `packaging/systemd/gradatum-worker.service` ne couvrait pas l'exit 0 légitime "pas leader" (worker concurrent tenant encore la lease). Sans relance auto, le service restait `inactive (dead)` jusqu'à intervention manuelle après expiration naturelle de la lease (~60s).
-- Découvert post-deploy alpha.7-patch.4 : redéploiement via `install-gradatum-services.sh` stoppait le worker (sans cleanup lease), redémarrait immédiatement → nouveau worker voyait l'ancien holder valide → exit propre → service inactive.
+
+- **`gradatum-worker` stays `inactive` after rapid stop+start**: `Restart=on-failure` in
+  `gradatum-worker.service` did not cover a legitimate exit 0 ("not leader") when another
+  worker still held the lease. Without automatic restart, the service stayed `inactive (dead)`
+  until the lease expired naturally (~60 s) and required manual intervention.
 
 ### Changed
-- `Restart=on-failure` → `Restart=always`, `RestartSec=5s` → `RestartSec=15s` dans le unit file. Systemd relance toujours, lease leadership expire naturellement (~60s), takeover automatique au prochain cycle (4 retries max avant succès).
-- Commentaires de motivation ajoutés inline dans le unit file pour documenter la décision.
 
-### Notes
-- Ce patch est purement packaging (unit file). Le binaire `gradatum-worker` reste inchangé. Une amélioration future (patch séparé ou Phase 2.2) pourrait ajouter un cleanup lease explicit dans le worker sur SIGTERM (handler signal Rust) pour éliminer la latence de takeover.
+- `Restart=on-failure` → `Restart=always`, `RestartSec=5s` → `RestartSec=15s` in the systemd
+  unit file. Systemd now always restarts; the leadership lease expires naturally (~60 s) and
+  takeover is automatic on the next cycle.
+- Motivation comments added inline in the unit file.
 
 ## [0.1.0-alpha.7-patch.4] — 2026-05-08
 
 ### Fixed
-- **CRITIQUE — bug merge structurel patch.2** : `walk_and_merge` dans `gradatum-admin/src/init.rs` itérait sur les keys du NEW template, supprimant ainsi les sections présentes UNIQUEMENT dans le backup user (sections d'extension comme `[curator]`, `[curator.llm]`). Découvert en LIVE après deploy alpha.7-patch.3 : gradatum-worker passait en `inactive (dead)` car la section `[curator]` du server.toml LIVE était wipée par le merge. Phase A manuelle (restore depuis backup) a contourné ; patch.4 corrige le code de fond.
+
+- **Structural merge bug in `walk_and_merge`**: `gradatum-admin/src/init.rs` iterated over
+  keys from the new template and discarded sections present only in the user backup (e.g.
+  `[curator]`, `[curator.llm]`). On re-install, this wiped the live `[curator]` configuration,
+  causing `gradatum-worker` to go `inactive (dead)`.
 
 ### Changed
-- **Sémantique merge inversée** : le BACKUP devient autoritaire pour TOUT contenu user (sections custom, sections d'extension, keys customisées). Le NEW template ne fait qu'augmenter avec :
-  - Nouvelles keys/sections absentes du backup (ajoutées avec leurs valeurs défaut)
-  - Valeurs défaut pour keys que le backup ne définit pas
-- Comportement existant préservé : KEY_MIGRATIONS renames (`db_path` → `vault_index_path`) appliqués pré-walk sur une copie du backup pour cohérence (évite l'insertion de l'ancienne key dans le résultat).
-- Suppression des helpers `lookup_item_mut` et `set_item` (remplacés par `set_item_or_insert` et `remove_path` dédiés aux KEY_MIGRATIONS pré-walk).
-- Ajout compteur `user_added` dans les logs merge (sections/keys préservées comme extensions user).
+
+- **Merge semantics inverted**: the backup is now authoritative for all user content (custom
+  sections, extension sections, customized keys). The new template only augments with:
+  - New keys/sections absent from the backup (added with their default values)
+  - Default values for keys the backup does not define
+- `KEY_MIGRATIONS` renames (`db_path` → `vault_index_path`) applied pre-walk on a copy of the
+  backup to maintain consistency.
+- Helpers `lookup_item_mut` and `set_item` replaced by `set_item_or_insert` and `remove_path`.
+- Merge log now emits a `user_added` counter for sections/keys preserved from the backup.
 
 ### Added
-- 2 tests régression : `merge_preserves_backup_only_sections_curator` (reproducer exact du bug LIVE) + `merge_adds_user_only_top_level_section` (extension custom user top-level).
-- `set_item_or_insert` — helper insertion avec création du nœud intermédiaire si absent.
-- `remove_path` — helper suppression d'une key par chemin dotted.
+
+- 2 regression tests: `merge_preserves_backup_only_sections_curator` (exact reproducer) and
+  `merge_adds_user_only_top_level_section`.
+- `set_item_or_insert` — helper that creates intermediate nodes when absent.
+- `remove_path` — helper that deletes a key by dotted path.
 
 ## [0.1.0-alpha.7-patch.3] — 2026-05-08
 
 ### Added
-- **Backup atomique `bearer.toml`** — `gradatum-admin init --force` (et donc `install-gradatum-services.sh`) sauvegarde désormais `bearer.toml` en `.bak.<ISO-TS>` avant écrasement. Mitigation minimaliste cohérente avec `server.toml` (patch.2). Le merge consumer-aware n'est pas implémenté (out of scope ; `bearer.toml` LIVE = 0 customisation actuelle, risque concret nul).
-- 2 tests régression : `materialize_preset_backups_existing_bearer_toml` + `materialize_preset_no_backup_on_fresh_install`.
 
-### Notes
-- Si une customisation manuelle de `bearer.toml` est introduite à l'avenir, le `--force` re-init la perd dans le fichier actif mais elle reste récupérable via le backup. Pour préservation automatique → patch futur consumer-aware (Phase 2.2+).
+- **Atomic `bearer.toml` backup**: `gradatum-admin init --force` (and
+  `install-gradatum-services.sh`) now backs up `bearer.toml` to `.bak.<ISO-TS>` before
+  overwriting. Consistent with the `server.toml` backup behaviour from patch.2.
+- 2 regression tests: `materialize_preset_backups_existing_bearer_toml` and
+  `materialize_preset_no_backup_on_fresh_install`.
+
+### Known limitations
+
+- Manual customisations to `bearer.toml` are overwritten in the active file on `--force`
+  re-init but remain recoverable from the backup. Automatic merge support is deferred to a
+  future release.
 
 ## [0.1.0-alpha.7-patch.2] — 2026-05-08
 
 ### Added
-- **Merge structurel `server.toml`** — `gradatum-admin init --force` ne réécrit plus aveuglément. Pattern : backup atomique `.bak.<ISO-TS>` + merge dirigé par schéma du nouveau template. Préserve customisations user (`[curator.llm].base_url`, `api_key_env`, `timeout_ms`, `jwt_ttl_*`, etc.) ; ajoute nouvelles clés avec défauts ; écarte clés legacy absentes du nouveau schéma.
-- **Table `KEY_MIGRATIONS`** explicite — gère renames cross-version (alpha.7 RT11 : `storage.db_path` → `storage.vault_index_path`).
-- **3 tests régression merge** : `merge_preserves_user_curator_customizations`, `merge_drops_legacy_db_path_via_rename_migration`, `merge_keeps_new_keys_with_defaults`.
 
-### Internal
-- Dépendance workspace `toml_edit = "=0.22.27"` (préserve format + commentaires TOML via `DocumentMut`).
-- `gradatum-admin` : ajout target `[lib]` pour exposition aux tests d'intégration merge sans passer par le binaire.
-- `generate_server_toml_template` et `merge_user_config` exposées `pub` (réutilisation tests + future CLI `validate`).
+- **Schema-directed `server.toml` merge**: `gradatum-admin init --force` no longer blindly
+  overwrites. Pattern: atomic backup `.bak.<ISO-TS>` + schema-directed merge. Preserves user
+  customisations (`[curator.llm].base_url`, `api_key_env`, `timeout_ms`, `jwt_ttl_*`, etc.);
+  adds new keys with defaults; drops legacy keys absent from the new schema.
+- **Explicit `KEY_MIGRATIONS` table**: handles cross-version key renames
+  (`storage.db_path` → `storage.vault_index_path`).
+- 3 regression tests: `merge_preserves_user_curator_customizations`,
+  `merge_drops_legacy_db_path_via_rename_migration`, `merge_keeps_new_keys_with_defaults`.
+- `toml_edit = "=0.22.27"` workspace dependency (preserves TOML format and comments via
+  `DocumentMut`).
+- `gradatum-admin` gains a `[lib]` target for integration-test access without the binary.
+- `generate_server_toml_template` and `merge_user_config` exposed as `pub`.
 
 ## [0.1.0-alpha.7-patch.1] — 2026-05-08
 
 ### Fixed
-- **Régression Task 16 G2** : `gradatum-admin init` template `server.toml` utilisait encore `db_path` legacy au lieu de `vault_index_path` canonical. Tout init frais ou re-init `--force` déclenchait le WARN deprecated au boot. Fix `init.rs:232` + test régression dans `init_clean.rs`.
+
+- **`gradatum-admin init` template still used legacy `db_path`**: the generated `server.toml`
+  template referenced `db_path` instead of the canonical `vault_index_path`, triggering a
+  deprecation WARN on every fresh or forced init. Fixed in `init.rs` with a regression test
+  in `init_clean.rs`.
 
 ## [0.1.0-alpha.7] — 2026-05-08
 
 ### Changed
-- **RT11** : `[storage].db_path` renommé en `[storage].vault_index_path`. Backward-compat via `serde(alias)` — l'ancien nom continue de fonctionner avec un WARN au boot. Retrait définitif prévu alpha.7+1.
+
+- **`[storage].db_path` renamed to `[storage].vault_index_path`**: backward-compatible via
+  `serde(alias)` — the old name is still accepted but emits a WARN at boot. The alias will be
+  removed in a future release.
 
 ### Added
-- `StorageConfig::legacy_alias_used()` — détection alias deprecated.
-- `build_snippet` fonction `pub(crate)` (caveat C2 — déduplication test/prod).
-- 3 tests régression UTF-8 ZWJ emoji boundary (caveat C1 POSTMORTEM).
-- `EXPECTED_TOOL_NAMES` constante test mcp-stub (caveat C3 — count dynamique).
 
-### Notes
-- Caveat C4 (vérif UI mirrors secondary-mirror + GitHub) → action manuelle the maintainer post-deploy.
+- `StorageConfig::legacy_alias_used()` — detects use of the deprecated field name.
+- `build_snippet` exposed as `pub(crate)` (deduplication between test and production paths).
+- 3 regression tests for UTF-8 ZWJ emoji boundary handling.
+- `EXPECTED_TOOL_NAMES` constant in MCP stub tests (dynamic tool count).
 
 ## [0.1.0-alpha.6] — 2026-05-08
 
 ### Fixed
-- **RT5** : `GET /api/v1/jobs/<id>` retourne désormais le statut réel depuis `jobs_v2`. Avant : stub T3 P2.0b retournait toujours `"pending"`. Après : transition `pending` → `leased` → `done` observable. **Breaking comportemental** : id inexistant retourne `404 Not Found` (au lieu de `200 + pending`). Audit consumers requis (mcp-stub poll loop, external agent).
-- **BM25 ranking** : `POST /api/v1/vault_search` utilise désormais `bm25(notes_fts)` natif FTS5 au lieu d'un score positionnel proxy. Score normalisé `[0..1]` via `1.0 / (1.0 + bm25.abs())`.
-- **Information disclosure** (caveat V1 security review 2026-05-08) : `last_error` mappé vers codes opaques (`invalid_input` / `vault_error` / `storage_error` / `processing_error`) avant retour API. Empêche leak chemins FS, ULIDs reflétés, état interne via anyhow.
 
-### Added
-- `Queue::get(id) -> Option<JobInfo>` (trait async).
-- `SqliteQueue::get` impl avec `SELECT ... FROM jobs_v2 WHERE id = ?`.
-- `Index::get_note(tenant_id, note_id) -> Option<NoteRecord>` (trait async, P1 council résolu).
-- `Index::search_fts_scored(...) -> Vec<(NoteId, f64)>` (BM25 réel).
-- `SqliteIndex::search_fts_scored` impl avec `bm25(notes_fts)`.
-- `JobInfo` struct (lecture meta job sans claim).
-- `JobStatus::as_str` + `from_str` helpers.
-- `sanitize_job_error` mapping codes opaques.
-- `NoteRecord` déplacé dans `gradatum-core::index` (Option A — types portables L0).
-- 11 tests régression (Queue::get unit, status helpers, sanitize, E2E poll_job_real, BM25 ordering, BM25 mapping).
-
-### Internal
-- Workspace clippy `-D warnings` GREEN (résolution warnings préexistants admin/server).
-- 566/545 PASS workspace (+21 tests cumul Phase 2.1 G1).
-
-## [v0.1.0-alpha.5] — 2026-05-07 (P2.0c-bis Auth Path 2)
+- **`GET /api/v1/jobs/<id>` now returns real status**: previously always returned `"pending"`;
+  now reflects actual transitions `pending` → `leased` → `done`. **Behavioural breaking
+  change**: a non-existent id returns `404 Not Found` instead of `200 + pending`.
+- **BM25 ranking**: `POST /api/v1/vault_search` now uses native FTS5 `bm25(notes_fts)` instead
+  of a positional proxy score. Score normalised to `[0..1]` via `1.0 / (1.0 + bm25.abs())`.
+- **Information disclosure**: `last_error` is now mapped to opaque codes
+  (`invalid_input` / `vault_error` / `storage_error` / `processing_error`) before being
+  returned in the API response, preventing leakage of filesystem paths, internal ULIDs, and
+  anyhow error chains.
 
 ### Added
 
-- **Auth Path 2 — API key + /auth/exchange** (spec §2 core minimum viable)
-  - `gradatum-acl-auth::ApiKeyStore` trait + `SqliteApiKeyStore` impl argon2id cost m=19456 KiB / t=2 / p=1 (T1)
-  - Migration SQL `api_keys` table + index + integration init (T2)
-  - CLI `gradatum-admin api-key {create,list,revoke,rotate}` commands (T3)
-  - CLI `gradatum-admin token issue` Path 3 minimal scope (T4)
-  - Endpoint `POST /auth/exchange {api_key}` 401 uniform hors middleware JWT (T5)
-  - `SqliteRevocationStore` wired runtime + check on exchange (T6)
-- **D3-complet** : Claims.tenant_id mandatory + TrustContext propagation + middleware layer (T7)
-- **Tests integration** : 11 tests E2E + tenant propagation (T8)
-  - `auth_e2e_full_flow.rs` 5 tests (create key → exchange → check TTL)
-  - `auth_tenant_propagation.rs` 6 tests (TrustContext leak + middleware accept/reject)
-- `scripts/smoke-alpha-5.sh` 9 étapes acceptance + bonus RAM check (T9)
-- `ExchangeResponse` V2 §2.4 : 5 champs `token`, `ttl_secs`, `scopes`, `tenant_id`, `kid`
-- `AppState::with_acl_preset_path()` wiring depuis `cfg.acl.preset_path` (E1 fix 2026-05-07)
-
-### Changed
-
-- `ExchangeResponse.expires_in` → `ttl_secs` (cohérence spec V2)
-- `AuthConfig::default()` `revocation_db_path` + `api_keys_db_path` : absolus passim via config, au lieu de `None` auto-dérivé
-- Migration `api_keys.sql` : retiré `PRAGMA journal_mode = WAL` (sqlx::migrate exécute en transaction implicite — SQLite refuse conflit). WAL config via `SqliteConnectOptions::journal_mode(Wal)` à la connexion, AVANT `sqlx::migrate!`.
-
-### Fixed
-
-- **Recovery post-NAS-freeze 2026-05-06** : 24 binaires `target/debug/deps/` corrompus via `zstd: stdout: I/O error` (fix escalier infra : VM 200 8 vCPU + 28 GB RAM + NFS timeo=600/retrans=5) → cleanup + rebuild.
-- `AclEngine` not loading from `cfg.acl.preset_path` (E1 — auparavant hardcodé preset vide → tous vault_* 403 dès alpha.5 déploiement). Fix : `AppState::with_acl_preset_path()` reads TOML + inject.
+- `Queue::get(id) -> Option<JobInfo>` (async trait).
+- `SqliteQueue::get` impl with `SELECT ... FROM jobs_v2 WHERE id = ?`.
+- `Index::get_note(tenant_id, note_id) -> Option<NoteRecord>` (async trait).
+- `Index::search_fts_scored(...) -> Vec<(NoteId, f64)>` (real BM25).
+- `SqliteIndex::search_fts_scored` impl with `bm25(notes_fts)`.
+- `JobInfo` struct (read job metadata without claiming).
+- `JobStatus::as_str` and `from_str` helpers.
+- `sanitize_job_error` mapping to opaque codes.
+- `NoteRecord` moved to `gradatum-core::index` (portable type).
+- 11 regression tests (Queue::get unit, status helpers, sanitize, E2E poll, BM25 ordering).
 
 ### Tests
 
-- **492 PASS / 0 FAIL / 9 ignored** (vs 446 baseline alpha.4 — net +46)
-- `cargo test --workspace --no-fail-fast` vert sur main `3572183`
-- 0 regression vs alpha.4 feature set
+- 566 PASS / 0 failed (+21).
 
-### Known limitations (deferred Phase 2.1)
-
-- `JsonlFileSink` audit events auth câblés bout-en-bout — D6 retenu (writeable stubs alpha.5)
-- Rate limiting `/auth/exchange` — D7 retenu pour Phase 2.1 shared rate limit
-- Scopes granulaires — D1 retenu : flat scopes alpha.5 (`read`, `write`, `admin`)
-- API key rotation auto-scheduled
-- ACL filter list par tenant_id runtime (documented tests T8)
-- Worker dispatch + Vault.read_note stubs → alpha.6 ou rc.1
-
-### Security
-
-- argon2id: `m=19456 KiB`, `t=2`, `p=1` (crate defaults, OWASP 2023 compliant)
-- CSPRNG `OsRng` for secret generation (128 bits effective entropy per key)
-- 401 uniform on `/auth/exchange` (no key enumeration leak)
-- Constant-time argon2id verify (via `argon2` crate)
-- API key displayed ONCE at creation (D8 UX, no re-display)
-- Revocation store SQLite wired runtime (check on all exchange calls)
-- C-A2 MINOR note : log distinguishability AlreadyRevoked (internal only) deferred Phase 2.1
-
-### Recovery + Incident
-
-- **2026-05-06 23:32** : filesystem unavailability (NFS soft timeout) triggered build artifact corruption — 24 `target/debug/deps/` files zstd-corrupted + 2 latent code bugs surfaced (WAL pragma in migration, AuthConfig defaults absolute) → fixed in `6f76a8e` + `3572183`.
-
-### Spec
-
-- **Spec source** : `docs/superpowers/specs/2026-05-06-p2.0c-bis-auth-path-2-design.md` (V2 ACCEPTED)
-- **Conformité** : 16/16 checks (post maintainer re-audit GO 2026-05-07)
-- **Tag** : `v0.1.0-alpha.5` annotated tag-object SHA `30f87cf3` → commit `d39685d` (docs release)
-- **Commits** : `6f76a8e` (chunks 1+2+WAL), `aa5b2f6` (deps MAJ), `c8f5628` (chunk 3 T8), `3572183` (chunks 4+5+fixes), `d39685d` (docs release pointé par tag)
-
-### Post-tag fixes (Drift #5, #6, install scriptée)
-
-- **Drift #5** — `7be4cd2` : `queue_path` convention `<root>/queue.db` → `<root>/db/queue.sqlite` (align db/ folder layout)
-- **Drift #6** — `a951b52` : `gradatum-admin init --preset` embed hiérarchique+flat via `include_str!` (idempotent install script)
-- **Scripts/install** — `a951b52` : `scripts/install-gradatum-services.sh` (10 étapes) + `packaging/systemd/README.md` section "Installation via script" (SystemdUser mode) + bonus fix : `server_smoke.rs` regression TempDir creation (db/+vault/ subdirs auto-create)
-- **Phase B acceptance** — 2026-05-07 17:00 UTC :
-  - Deploy systemd (UID/GID 985 gradatum, MemoryMax server 512M, worker 1G MemorySwapMax=0)
-  - Services gradatum-server :19090 + gradatum-worker actifs (verified via `systemctl status`)
-  - Smoke acceptance `smoke-alpha-5.sh` 4 PASS / 5 WARN / 0 FAIL (auth Path 2 critères runtime validés)
-  - 492 tests PASS / 0 FAIL / 9 ignored (0 regression vs alpha.4 baseline)
-
----
-
-## [v0.1.0-alpha.4] — ~2026-05-15 (P2.0c Runtime Wiring) — tag not yet released
-
-**Note** : Phase 2.0c alpha.4 planned but deferred post-freeze recovery. Alpha.5 Path 2 auth skipped ahead Phase 2.0c-bis (2026-05-07) as independent sub-phase per Phase 2.0 §2 spec option.
-
----
-
-## [v0.1.0-alpha.3] — 2026-05-05 (P2.0b Write+Curator)
+## [0.1.0-alpha.5] — 2026-05-07
 
 ### Added
 
-- `gradatum-queue` SqliteQueue + Queue trait + UPDATE...RETURNING atomic lease — T1 (`2ef6a54`)
-- `gradatum-worker` leader election SQLite CAS + dispatcher loop + SIGTERM + GC stale leases — T2 (`4c668fc`)
-- 3 MCP write handlers (`vault_write` / `vault_classify` / `vault_downgrade`) async 202 + jobs poll endpoint — T3 (`35d82c2`)
-- `gradatum-curator` cascade 5 fonctions (novelty SHA-256+MinHash 128 / routing regex Bayesian 10 sections / tags TF-IDF top-5 / wikilinks Jaro-Winkler 0.88 / dedup cosine 0.95) — T4
-- 5 LLM backends protocole-génériques (`HeuristicBackend` / `OpenAiCompatBackend` / `OllamaCompatBackend` / `AnthropicCompatBackend` (prompt caching ephemeral) / `GeminiCompatBackend`) — T5-T9 (`aa4a59f`)
-- `CircuitBreaker<B>` wrapper backoff exp 30→60→120→300s + HalfOpen success_threshold=2 + 7 tests — T5-T9
-- Audit log JSONL (`HttpAuditEvent` + `JsonlFileSink` rotation daily mode 0640 + content_hash JCS RFC 8785) — T10 (`b93fa4a`+`57450e2`)
-- Bench curator F1 (`gradatum-bench` binary `curator_f1` + LLM_ENDPOINT/LLM_MODEL configurables env) — T11 (`f580b6f`→`8d38d45`→`9d9d0a8`→`9701f82`)
-- OpenDAL feature gate per-backend opt-in (`fs` default + `s3`/`gcs`/`azure`/`all-cloud`) — T12 (`6a8e93f`)
-- Systemd packaging (`gradatum-server.service` MemoryMax=512M / `gradatum-worker.service` MemoryMax=1G + **MemorySwapMax=0** caveat swap saturation / `sysusers.d/gradatum.conf` UID 990) — T13 (`1be7998`)
-- TOML config curator (`[curator] backend = "heuristic"` default + `[curator.llm]` opt-in) + classifier-v1 prompt embedded via `include_str!` — T14 (`a90645f`)
+- **Auth via API key and `/auth/exchange`**:
+  - `gradatum-acl-auth::ApiKeyStore` trait and `SqliteApiKeyStore` impl; argon2id hashing
+    `m=19456 KiB / t=2 / p=1`
+  - Migration SQL: `api_keys` table, index, and integrated init
+  - CLI commands: `gradatum-admin api-key {create,list,revoke,rotate}` and
+    `gradatum-admin token issue`
+  - Endpoint `POST /auth/exchange {api_key}` with uniform 401 outside the JWT middleware
+  - `SqliteRevocationStore` wired at runtime; checked on every exchange call
+- **Mandatory `Claims.tenant_id`** with `TrustContext` propagation through the middleware
+  layer
+- **11 integration tests** (E2E auth flow + tenant propagation):
+  - `auth_e2e_full_flow.rs`: 5 tests (create key → exchange → TTL check)
+  - `auth_tenant_propagation.rs`: 6 tests (TrustContext leak + middleware accept/reject)
+- `scripts/smoke-alpha-5.sh`: 9-step acceptance smoke + RAM check
+- `ExchangeResponse` V2: 5 fields — `token`, `ttl_secs`, `scopes`, `tenant_id`, `kid`
+- `AppState::with_acl_preset_path()` wired from `cfg.acl.preset_path`
+
+### Changed
+
+- `ExchangeResponse.expires_in` → `ttl_secs`
+- `AuthConfig::default()` `revocation_db_path` and `api_keys_db_path`: absolute paths via
+  config instead of auto-derived `None`
+- Migration `api_keys.sql`: removed `PRAGMA journal_mode = WAL` (sqlx::migrate runs inside
+  an implicit transaction — SQLite rejects the pragma there). WAL now configured via
+  `SqliteConnectOptions::journal_mode(Wal)` at connection time, before migrations.
+- `queue_path` convention: `<root>/queue.db` → `<root>/db/queue.sqlite` (aligns with the
+  `db/` folder layout)
+- `gradatum-admin init --preset`: embeds presets via `include_str!` (idempotent on
+  re-install); install script `scripts/install-gradatum-services.sh` added
 
 ### Fixed
 
-- `gradatum-curator::routing` regex `\b SECTION \b` cassé sur préfixes `[SECTION]` — fix : 2 couches `PREFIX_PATTERNS` + `KEYWORD_PATTERNS` + 6 tests — T11 fix `9d9d0a8`
-- `gradatum-bench::curator_f1` body Markdown brut polluait LLM léger — fix : `clean_body_for_llm()` strip headings/wikilinks/code/frontmatter — T11 fix `9d9d0a8`
+- **NFS build-artifact corruption**: 24 `target/debug/deps/` files corrupted by
+  `zstd: stdout: I/O error` after a filesystem availability incident. Cleaned and rebuilt;
+  two latent code bugs surfaced and fixed (WAL pragma in migration, absolute
+  `AuthConfig` defaults).
+- `AclEngine` not loading from `cfg.acl.preset_path` — previously hardcoded to an empty
+  preset, causing all vault operations to return 403.
 
-### Bench results — exit P2.0b ✅ ALL PASS
+### Tests
 
-Dataset gradatum-natif `gradatum-balanced-v1-final.jsonl` (147 notes / 10 sections gradatum, construit Phase Z 2026-05-05).
+- 492 PASS / 0 FAIL / 9 ignored.
+
+### Known limitations
+
+- `JsonlFileSink` audit events are wired with writeable stubs only — full end-to-end audit
+  deferred.
+- Rate limiting on `/auth/exchange` deferred.
+- Granular scopes deferred: flat scopes only (`read`, `write`, `admin`).
+- API key auto-rotation deferred.
+- ACL filter by `tenant_id` at runtime deferred.
+- Worker dispatch and `Vault.read_note` stubs deferred.
+
+### Security
+
+- argon2id: `m=19456 KiB`, `t=2`, `p=1` (OWASP 2023 compliant)
+- `OsRng` for secret generation (128 bits effective entropy per key)
+- Uniform 401 on `/auth/exchange` (no key enumeration)
+- Constant-time argon2id verify (via `argon2` crate)
+- API key displayed only once at creation, no re-display
+- Revocation store wired at runtime; checked on every exchange call
+
+---
+
+## [0.1.0-alpha.4] — skipped
+
+This version number was reserved but skipped; development proceeded directly to
+v0.1.0-alpha.5.
+
+---
+
+## [0.1.0-alpha.3] — 2026-05-05
+
+### Added
+
+- **`gradatum-queue`**: `SqliteQueue` + `Queue` trait; `UPDATE...RETURNING` atomic lease claim.
+- **`gradatum-worker`**: leader election via SQLite CAS, dispatcher loop, SIGTERM drain, GC of
+  stale leases.
+- **3 MCP write handlers** (`vault_write` / `vault_classify` / `vault_downgrade`) with async
+  202 response + a job-status poll endpoint.
+- **`gradatum-curator`** cascade pipeline — 5 functions:
+  - Novelty detection (SHA-256 + MinHash 128)
+  - Section routing (regex + Bayesian, 10 sections)
+  - Tags (TF-IDF, top 5)
+  - Wikilink extraction (Jaro-Winkler 0.88 threshold)
+  - Deduplication (cosine 0.95 threshold)
+- **5 LLM backends** (protocol-generic):
+  `HeuristicBackend` / `OpenAiCompatBackend` / `OllamaCompatBackend` /
+  `AnthropicCompatBackend` (ephemeral prompt caching) / `GeminiCompatBackend`
+- **`CircuitBreaker<B>`** wrapper: exponential backoff 30→60→120→300 s, `HalfOpen`
+  `success_threshold=2`; 7 tests.
+- **JSONL audit log**: `HttpAuditEvent` + `JsonlFileSink` with daily rotation, mode 0640,
+  content hash (JCS RFC 8785).
+- **`gradatum-bench` binary `curator_f1`**: benchmarks curator F1 against a dataset; supports
+  `LLM_ENDPOINT` / `LLM_MODEL` env vars.
+- **OpenDAL feature gates**: `fs` default + `s3` / `gcs` / `azure` / `all-cloud` opt-in.
+- **Systemd packaging**: `gradatum-server.service` (`MemoryMax=512M`) +
+  `gradatum-worker.service` (`MemoryMax=1G`, `MemorySwapMax=0`) +
+  `sysusers.d/gradatum.conf` (UID 990).
+- **TOML curator config**: `[curator] backend = "heuristic"` default + `[curator.llm]`
+  opt-in; classifier prompt embedded via `include_str!`.
+
+### Fixed
+
+- `gradatum-curator::routing` regex `\b SECTION \b` broken on `[SECTION]` prefixes — fixed
+  with two-layer `PREFIX_PATTERNS` + `KEYWORD_PATTERNS`; 6 tests added.
+- `gradatum-bench::curator_f1` raw Markdown body degraded lightweight LLM accuracy — fixed
+  with `clean_body_for_llm()` that strips headings, wikilinks, code blocks, and frontmatter.
+
+### Bench results — ALL PASS
+
+Dataset: `gradatum-balanced-v1-final.jsonl` (147 notes / 10 sections).
 
 | Backend | F1 weighted | Threshold | Verdict |
 |---|---|---|---|
-| **heuristic** (offline default) | **0.7871** | ≥ 0.65 | ✅ PASS |
-| **Qwen3-4B-Instruct-2507 Q4_K_M** (LLM tier production) | **0.7938** | ≥ 0.75 | ✅ PASS |
-| Qwen3-0.6B-Extract (an external agent service, prompt extract non optimisé classification) | 0.4443 | indicatif | (note) |
+| **heuristic** (offline default) | **0.7871** | ≥ 0.65 | PASS |
+| **Qwen3-4B-Instruct-2507 Q4_K_M** (recommended LLM tier) | **0.7938** | ≥ 0.75 | PASS |
+| Qwen3-0.6B-Extract (indicative, unoptimised prompt) | 0.4443 | — | note |
 
-Sections fortes heuristic : decisions 0.983 / debug 0.938 / retrospectives 0.844 / reasoning 0.791 / lessons-learned 1.000 / experiments 1.000 / feedback 1.000.
+Strong sections (heuristic): decisions 0.983 / lessons-learned 1.000 / experiments 1.000 /
+feedback 1.000.
 
-**Recommandation production LLM tier** :
-- Tier minimum recommandé : `Qwen3-4B-Instruct-2507 Q4_K_M` (~2.5 GB binaire, ~4 GB VRAM, F1 0.7938 mesuré)
-- Tier "qualité" : `claude-haiku-4-5` cloud, `gemini-1.5-pro`, `Qwen3.6-27B Thinking` local
-- Tier minimal install : `heuristic` uniquement (zero LLM, F1 0.7871)
-
-Le LLM tier reste **option config TOML opérateur** — par défaut `[curator] backend = "heuristic"` (zero LLM, offline first-class).
+The LLM tier is an operator TOML option — default is `[curator] backend = "heuristic"`
+(zero LLM, offline-first). Minimum recommended LLM tier: `Qwen3-4B-Instruct-2507 Q4_K_M`
+(~2.5 GB binary, ~4 GB VRAM, F1 0.7938 measured).
 
 ### Drop-in compatibility (legacy vault v1.6.2)
 
-- L1 wire/protocol : ✅ MCP tool names + REST endpoints `/api/v1/vault_*` (10 read + 3 write)
-- L2 DTO/shape : ✅ champs JSON identiques + `tenant_id` optionnel additif
-- L3 auth/ACL : ✅ bearer JWT Ed25519 audience-scoped + ACL hierarchical deny-wins
-- L4 datas accessibles : ❌ stubs vides — full content parity deferred to Phase 2.1 with `migrate-from-v0`
-- L5+ search/curator semantics : may diverge intentionally (gradatum is a release, not a port)
-
-### Design references
-
-- design spec P2.0 — 2026-05-04 (+ addendum 2026-05-05 amendement R-A3)
-- lessons-learned record `[LESSONS][gradatum] T11 bench — routing.rs regex \b cassé sur préfixes [SECTION] + Qwen body Markdown brut régresse — 2026-05-05`
-- reasoning record `[REASONING][gradatum] Phase Z dataset gradatum-natif — pattern 4 phases — 2026-05-05`
-- experiments record `[EXPERIMENTS][gradatum] Qwen3-4B-Instruct-2507 Q4_K_M F1w=0.7938 PASS T11 P2.0b — confirmé 2026-05-05`
+- Wire/protocol: MCP tool names + REST endpoints `/api/v1/vault_*` (10 read + 3 write) — compatible
+- DTO/shape: identical JSON fields + optional additive `tenant_id` — compatible
+- Auth/ACL: same Ed25519 bearer JWT format, audience-scoped, deny-wins ACL — compatible
+- Data content: empty stubs — full parity deferred to a future release
+- Search/curator semantics: may diverge intentionally (gradatum is a new release, not a port)
 
 ---
 
-## [v0.1.0-alpha.2] — 2026-05-05 (P2.0a Foundation + Read API)
+## [0.1.0-alpha.2] — 2026-05-05
 
 ### Added
 
-- `gradatum-server` HTTP/MCP façade (Axum + figment + JSON tracing + SIGTERM 30s drain) — T1 (`5131ce2`)
-- `ServerConfig::validate_bind_tls()` C3 fail-closed (5 cases) — T2 (`f2eedb8`)
-- `gradatum-core::TrustContext` enum mandatory C10 — T3 (`4d10584`)
-- `gradatum-auth::RevocationStore` trait + InMemory + SQLite + boot guard C2 — T4 (`1c6529c`)
-- JWT Ed25519 with scope-based TTL (R-A1: 1h human / 24h service) — T5 (`08a02fd`)
-- `gradatum-acl-policy::AclEngine` deny-wins B2/B3 (12 gold cases) — T6 (`dbb0958`)
-- `gradatum-admin init` CLI (Q3 auto-gen Ed25519 keys + bearer + bearer.toml + server.toml R-A1 defaults) — T7 (`2a7ae07`)
-- 10 MCP read endpoints (drop-in API parity legacy vault v1.6.2 — R-A2) — T8 (`d2d7779`)
-- `gradatum-mcp-stub` stdio→HTTP bridge + real JWT middleware — T9 (`e84030a`)
-- `/health` endpoint D1 (10 fields) — T10 (`cd083ae`)
-- `/metrics:19091` sidechannel + cardinality cap C7 — T11 (`5989e19`)
-- Shape parity tests (10 methods + smoke) — T12 (`5ca50f0`)
-- Cross-platform support: Linux primary + Windows secondary tier via [RFC-0002](docs/RFC/RFC-0002-cross-platform-support.md) — Sprint X-1
+- **`gradatum-server`**: HTTP/MCP facade (Axum + figment + JSON tracing + 30 s SIGTERM drain)
+- **`ServerConfig::validate_bind_tls()`**: fail-closed TLS configuration validation (5 cases)
+- **`gradatum-core::TrustContext`**: mandatory enum propagated through all API handlers
+- **`gradatum-auth::RevocationStore`** trait + `InMemory` + SQLite implementations + boot guard
+- **JWT Ed25519** with scope-based TTL (1 h human / 24 h service)
+- **`gradatum-acl-policy::AclEngine`**: deny-wins ACL (12 gold cases)
+- **`gradatum-admin init`** CLI: auto-generates Ed25519 keys, bearer token, `bearer.toml`,
+  and `server.toml` with defaults
+- **10 MCP read endpoints**: drop-in API parity with legacy vault v1.6.2
+- **`gradatum-mcp-stub`**: stdio → HTTP bridge + real JWT middleware
+- **`/health`** endpoint (10 fields)
+- **`/metrics:19091`** sidechannel with cardinality cap
+- Shape parity tests (10 methods + smoke)
+- Cross-platform support: Linux primary, Windows secondary tier
+  ([RFC-0002](docs/RFC/RFC-0002-cross-platform-support.md))
 
 ### Drop-in compatibility (legacy vault v1.6.2)
 
-- L1 wire/protocol : ✅ MCP tool names + REST endpoints `/api/v1/vault_*` identiques
-- L2 DTO/shape : ✅ champs JSON identiques + `tenant_id` optionnel additif (default `main`)
-- L3 auth/ACL : ✅ même bearer JWT format Ed25519 audience-scoped
-- L4 datas accessibles : ❌ stubs T8 vides — full content parity deferred to Phase 2.1 with `migrate-from-v0`
-- L5+ search/curator semantics : may diverge intentionally (gradatum is a release, not a port)
-
-### Design references
-
-- design spec P2.0 — 2026-05-04 (+ addendum 2026-05-05 amendement R-A3)
-- reasoning record `[REASONING][gradatum] Search analytics — 4 options + préco D Phase 3 + subset A Phase 2.1 — 2026-05-05` (RFC-0004 deferred Phase 3)
+- Wire/protocol: MCP tool names + REST endpoints `/api/v1/vault_*` — compatible
+- DTO/shape: identical JSON fields + optional additive `tenant_id` (default `main`) — compatible
+- Auth/ACL: same Ed25519 bearer JWT format, audience-scoped — compatible
+- Data content: empty stubs — full parity deferred to a future release
+- Search/curator semantics: may diverge intentionally (gradatum is a new release, not a port)
 
 ---
 
-## [0.1.0-alpha] - 2026-05-04
+## [0.1.0-alpha] — 2026-05-04
+
+Initial alpha release. Establishes the workspace foundation and all Layer 0/1/2 crates.
 
 ### Added
 
-- **Phase 1 complete** — 14 livrables T01-T14 + L0-AUDIT.
-- `gradatum-core` (L0) : types canoniques (Note + Frontmatter + NoteId ULID + ContentHash JCS RFC 8785 + NoteVersion + IntegritySignature + AuthorRef + Tag + Section + NoteStatus state machine 6 etats + ExtraFields lazy), traits (Index + AclPolicy + ACLFilter + Overridable Patch/Output + OverridePayload), AuditEvent typed enum + ExtraFields, schema_registry embedded `include_dir!` (4 schemas TOML), GradatumError taxonomy + VaultOnNfs (C11), VaultConfig runtime TOML (6 sub-sections : embed/curator/index/drift/audit/vault).
-- `gradatum-markdown` (L1) : parser/writer Note <-> String round-trip + wikilink extractor regex.
-- `gradatum-cache` (L1) : EffectiveNoteCache moka LRU avec checksum validation on hit (D-perf-2 / B22) — 0 stale risk concurrent.
-- `gradatum-queue` (L1) : SQLite jobs avec UPDATE...RETURNING atomic claim + lease 5min + 4 PRAGMA C12 (WAL + synchronous=NORMAL + busy_timeout=5000 + foreign_keys=ON).
-- `gradatum-chat` (L1) : trait Chat + 3 impls (Heuristic offline + HttpChat reqwest OpenAI-compat + Noop) + CircuitBreakerChat<C> decorator (3 consec failures -> 5min cooldown).
-- `gradatum-embed` (L1) : trait Embedder + 3 impls (FastEmbedCpu fastembed bge-small-en-v1.5 384d feature-gated + HttpEmbedder reqwest + Noop) + FallbackEmbedder<P, F> decorator.
-- `gradatum-index` (L1) : SqliteIndex impl Index trait (Q5DAG core trait), FTS5 unicode61, schema complet (notes + audit_trail + note_index + note_overrides generique B20 + file_checksums + history scaffold), drift Phase A 3 niveaux (size strict -> prefix-4KB -> full sha256).
-- `gradatum-storage` (L2) : OpenDAL Storage trait + FileStorage backend + statfs NFS reject (caveat C11 BLOQUANT).
-- `gradatum-vault` (L2) : registry + lifecycle (write_note compose md + persist + upsert index) + NoteMetadataOverride impl Overridable+OverridePayload + drift orchestration (delegue scan_phase_a) + effective_note cache.
-- `gradatum-curator` (L2) : workflow heuristic gating + LLM review low-conf via Chat trait + 3 fallback strategies (PendingReviewFallback default / Reject strict / AdmitPendingReview soft) — D-perf-3 / B23.
-- `v1-parity-tests` : 22 tests d'integration baseline D5 (vault_crud + curator_workflow + drift_e2e + cache_concurrency + index_search + audit_trail + markdown_roundtrip + persistence_reopen).
-- `gradatum-bench` : 9 benches criterion actifs + 1 feature-gated + 2 scripts standalone (B1-B10/B2a/B2b/B5/B8a/B8b). B1 P0 mesure 5.23us @ 10KB JCS hash.
-- Workspace : pinned `=X.Y.Z` deps (R11 + AM3 + spec §2.12), CHANGELOG.md, CONTRIBUTING.md task workflow, deny.toml graph rule.
+- **`gradatum-core`**: canonical types (`Note`, `Frontmatter`, `NoteId` ULID,
+  `ContentHash` JCS RFC 8785, `NoteVersion`, `IntegritySignature`, `AuthorRef`, `Tag`,
+  `Section`, `NoteStatus` 6-state machine, lazy `ExtraFields`); traits (`Index`, `AclPolicy`,
+  `ACLFilter`, `Overridable`, `OverridePayload`); `AuditEvent` typed enum; embedded schema
+  registry (4 TOML schemas via `include_dir!`); `GradatumError` taxonomy; `VaultConfig`
+  runtime TOML (6 sub-sections: embed / curator / index / drift / audit / vault).
+- **`gradatum-markdown`**: parser/writer for `Note` ↔ `String` round-trip + wikilink
+  extractor regex.
+- **`gradatum-cache`**: `EffectiveNoteCache` (moka LRU) with checksum validation on hit —
+  zero stale-read risk under concurrency.
+- **`gradatum-queue`**: SQLite job queue with `UPDATE...RETURNING` atomic claim, 5-minute
+  lease, and 4 SQLite PRAGMAs (WAL, `synchronous=NORMAL`, `busy_timeout=5000`,
+  `foreign_keys=ON`).
+- **`gradatum-chat`**: `Chat` trait + 3 impls (`HeuristicBackend` offline, `HttpChat`
+  OpenAI-compat, `Noop`) + `CircuitBreakerChat<C>` decorator (3 consecutive failures →
+  5-minute cooldown).
+- **`gradatum-embed`**: `Embedder` trait + 3 impls (`FastEmbedCpu` feature-gated,
+  `HttpEmbedder`, `Noop`) + `FallbackEmbedder<P, F>` decorator.
+- **`gradatum-index`**: `SqliteIndex` implementing the `Index` trait; FTS5 unicode61;
+  complete schema (notes, audit_trail, note_index, generic note_overrides, file_checksums,
+  history scaffold); three-level drift detection (size → prefix 4 KB → full SHA-256).
+- **`gradatum-storage`**: `Storage` trait (OpenDAL) + `FileStorage` backend + NFS reject
+  via `statfs`.
+- **`gradatum-vault`**: registry + lifecycle (`write_note`: compose → persist → upsert
+  index); `NoteMetadataOverride`; drift orchestration; `effective_note` cache.
+- **`gradatum-curator`**: heuristic gating workflow + LLM review for low-confidence notes
+  via `Chat` trait; 3 fallback strategies (`PendingReviewFallback` default / `Reject` /
+  `AdmitPendingReview`).
+- **`v1-parity-tests`**: 22 integration baseline tests (vault_crud, curator_workflow,
+  drift_e2e, cache_concurrency, index_search, audit_trail, markdown_roundtrip,
+  persistence_reopen).
+- **`gradatum-bench`**: 9 active Criterion benches + 1 feature-gated + 2 standalone
+  scripts. JCS hash baseline: 5.23 µs @ 10 KB.
+- Workspace: pinned `=X.Y.Z` deps, `CHANGELOG.md`, `CONTRIBUTING.md`, `deny.toml` graph
+  rule.
 
-### Caveats Phase 1 (P1/P2 reportes v0.2.0+)
+### Known limitations
 
-- **B8** Ecart B8 (T04) : ExtraFields YAML inconnus silencieusement perdus (`serde_yaml` sans `#[serde(flatten)]`). Forward-compat partiel — fix Phase 2+ via evolution Frontmatter.
-- **T08 Concern** : FastEmbedCpu feature-gated `fastembed-cpu` (off par defaut) — bug ort-sys 2.0.0-rc.12 via private registry (build script ureq v3 vs v2). API publique complete, impl gated. Activable via `cargo --features fastembed-cpu`. Fix upstream Phase 1+ via registry update.
-- **L0 Audit** P1 fixes inline (Note::verify_integrity + ExtraFields JCS doc). 5 P2 reportes Phase 2+.
-- **T11 stubs** : `Vault::read_note` et `update_status` retournent `NoteNotFound` Phase 1. Cache miss path stub. Enrichis Phase 2+.
-- **T13** : 22 tests actifs + 3 ignored documentes. Port complet 260 tests predecesseur reporte Phase 2+ (D5 = >=30 jours real-world usage, pas test count).
-
-### References
-
-- Spec design : `docs/superpowers/specs/2026-05-03-phase1-design-gradatum-core.md` v3.2 (commit `c86554f`)
-- Annexe perf : `docs/superpowers/specs/2026-05-04-phase1-perf-bench-results.md`
-- Plan : `docs/superpowers/plans/2026-05-04-phase1-backend-plan.md`
-- Progress tracker : `docs/superpowers/PROGRESS.md`
-- Bench results : `docs/BENCH.md`
-- v1 parity inventory : `docs/superpowers/notes/v1-test-inventory.md`
+- Unknown YAML keys in `ExtraFields` are silently dropped (`serde_yaml` without
+  `#[serde(flatten)]`); deferred to a future release.
+- `FastEmbedCpu` feature-gated (`fastembed-cpu`, off by default) due to an upstream
+  `ort-sys` build script issue. Activatable via `cargo --features fastembed-cpu`.
+- `Vault::read_note` and `update_status` return `NoteNotFound` (stubs); deferred to a
+  future release.
 
 ---
 
 ## Past versions
 
-- `0.1.0-scaffold` (2026-05-01) — Phase 0 initial scaffolding.
+- `0.1.0-scaffold` (2026-05-01) — initial workspace scaffolding.
 - `0.1.0-phase0bis` (2026-05-03) — Phase 0bis re-structuring 17 -> 22 focused crates + RFC-0001 + CI enriched.

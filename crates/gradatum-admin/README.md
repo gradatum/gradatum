@@ -2,7 +2,7 @@
 
 > Operator CLI for gradatum: init, token, api-key, backfill, jobs, vault rename/forget.
 
-**Status**: Alpha (v0.4.x) — internal (not published to crates.io). API not yet stable before v1.0.
+**Status**: Alpha (v0.7.6) — internal (not published to crates.io). API not yet stable before v1.0.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -25,7 +25,7 @@ Generates: Ed25519 keypair, admin bearer token, `server.toml`, SQLite queue, ACL
 
 ### token
 
-Manage service JWT tokens (Path 3 bootstrap).
+Manage service JWT tokens.
 
 ```bash
 gradatum-admin token issue --root /var/lib/gradatum --sub mcp-stub --scopes vault_read
@@ -71,7 +71,7 @@ gradatum-admin jobs dlq    --root /var/lib/gradatum [--replay <id>] [--replay-al
 
 ### vault rename
 
-Rename a note — updates `notes.title` in the index and registers an F-39 redirect.
+Rename a note — updates `notes.title` in the index and registers a redirect.
 
 ```bash
 gradatum-admin vault rename "Old Title" "New Title" --root /var/lib/gradatum [--tenant main]
@@ -79,7 +79,7 @@ gradatum-admin vault rename "Old Title" "New Title" --root /var/lib/gradatum [--
 
 ### vault forget
 
-Semantic forget of a batch of notes (F-44). Double-confirmation workflow.
+Semantic forget of a batch of notes. Double-confirmation workflow.
 
 ```bash
 # Step 1 — preview (dry-run, default)

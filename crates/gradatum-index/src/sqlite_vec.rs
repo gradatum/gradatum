@@ -3,7 +3,7 @@
 //! ## Design
 //!
 //! Ce module expose :
-//! - [`search_ann_inner`] — requête SQL ANN sur `note_embeddings_ann` (vec0) avec decay F-44.
+//! - [`search_ann_inner`] — ANN SQL query on `note_embeddings_ann` (vec0) with time-based decay.
 //! - [`search_ann_bench_inner`] — variante simplifiée pour binaires bench (sans decay).
 //! - [`upsert_ann`] — insert/replace dans `note_embeddings_ann` (mode dégradé safe).
 //! - [`backfill_ann_from_conn`] — backfill programmatique depuis `note_embeddings`.
@@ -50,22 +50,21 @@ use tokio::sync::Mutex;
 use gradatum_core::error::GradatumError;
 use gradatum_core::identity::NoteId;
 
-/// Nombre maximal de candidats ANN transmis à vec0 (cap DoS).
+/// Maximum number of ANN candidates passed to vec0 (DoS cap).
 ///
-/// Borné pour éviter une requête vec0 avec k=∞ sur un vault de grande taille.
+/// Bounded to prevent a vec0 query with k=∞ on a large vault.
 const MAX_ANN_K: usize = 1024;
 
-/// Dimension de vecteur attendue pour le modèle bge-m3.
+/// Expected vector dimension for the bge-m3 model.
 ///
-/// Utilisée dans [`backfill_ann_from_conn`] pour filtrer les embeddings
-/// incompatibles (dim ≠ 1024 = modèle différent, skip silencieux).
+/// Used in [`backfill_ann_from_conn`] to skip incompatible embeddings
+/// (dim ≠ 1024 means a different model — silently skipped).
 const BGE_M3_DIM: usize = 1024;
 
-/// Sérialise un vecteur `f32` en BLOB little-endian.
+/// Serialises an `f32` slice to a little-endian BLOB.
 ///
-/// Format natif de `note_embeddings.vector`. sqlite-vec accepte les vecteurs
-/// en BLOB f32 LE ou en JSON. On utilise le BLOB pour éviter la sérialisation
-/// JSON O(dim).
+/// Native format for `note_embeddings.vector`. sqlite-vec accepts vectors as
+/// f32-LE BLOB or JSON; the BLOB form is used to avoid O(dim) JSON serialisation.
 pub(crate) fn f32_slice_to_blob(v: &[f32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(v.len() * 4);
     for &x in v {
@@ -74,32 +73,32 @@ pub(crate) fn f32_slice_to_blob(v: &[f32]) -> Vec<u8> {
     buf
 }
 
-/// Recherche ANN dans `note_embeddings_ann` via vec0.
+/// ANN search in `note_embeddings_ann` via the vec0 virtual table.
 ///
-/// ## Paramètres
+/// ## Parameters
 ///
-/// - `conn` : connexion partagée (extension sqlite-vec doit être chargée).
-/// - `vault_id` : filtre PARTITION KEY vault.
-/// - `embedder_id` : filtre PARTITION KEY modèle.
-/// - `query_emb` : vecteur requête (dim=1024 pour bge-m3).
-/// - `limit` : nombre de résultats finaux souhaités.
-/// - `ef_search` : facteur d'exploration (oversampling = `limit × ef_search`).
-/// - `locus` : filtre préfixe optionnel sur `notes.locus`.
+/// - `conn`: shared connection (the sqlite-vec extension must be loaded).
+/// - `vault_id`: vault PARTITION KEY filter.
+/// - `embedder_id`: model PARTITION KEY filter.
+/// - `query_emb`: query vector (dim=1024 for bge-m3).
+/// - `limit`: number of final results desired.
+/// - `ef_search`: exploration factor (oversampling = `limit × ef_search`).
+/// - `locus`: optional prefix filter on `notes.locus`.
 ///
-/// ## Retour
+/// ## Returns
 ///
-/// `Vec<(NoteId, f32)>` trié par score décroissant (cosine post-decay F-44).
+/// `Vec<(NoteId, f32)>` sorted by descending score (cosine after time-based decay).
 ///
-/// ## Comportement en mode dégradé
+/// ## Degraded mode
 ///
-/// Si l'extension sqlite-vec n'est pas chargée, la requête échoue avec
-/// "no such module: vec0". Cette erreur est propagée comme `GradatumError::Storage`
-/// afin que l'appelant puisse basculer sur le chemin brute-force (`search_semantic_inner`).
+/// If the sqlite-vec extension is not loaded, the query fails with
+/// "no such module: vec0". This error is propagated as `GradatumError::Storage`
+/// so the caller can fall back to the brute-force path (`search_semantic_inner`).
 ///
-/// ## Decay F-44
+/// ## Time-based Decay
 ///
-/// Appliqué identiquement au chemin brute-force : `cosine *= 0.5^elapsed_days`
-/// pour les notes `forgotten=1`.
+/// Applied identically to the brute-force path: `cosine *= 0.5^elapsed_days`
+/// for notes with `forgotten=1`.
 ///
 /// # Errors
 ///
@@ -252,15 +251,15 @@ pub(crate) async fn search_ann_inner(
     Ok(scored)
 }
 
-/// Requête ANN pour binaires bench — variante simplifiée de [`search_ann_inner`].
+/// ANN query for bench binaries — simplified variant of [`search_ann_inner`].
 ///
-/// Retourne les `note_id` bruts (String) ordonnés par distance croissante
-/// (plus similaire en premier). Pas de decay F-44 (bench recall uniquement).
+/// Returns raw `note_id` strings ordered by ascending distance
+/// (most similar first). No time-based decay applied (bench recall only).
 ///
 /// ## Usage
 ///
-/// Exposée via [`SqliteIndex::search_ann_bench`] pour les binaires bench
-/// qui ne peuvent pas accéder à `conn` directement (champ privé).
+/// Exposed via [`SqliteIndex::search_ann_bench`] for bench binaries
+/// that cannot access `conn` directly (private field).
 ///
 /// # Errors
 ///

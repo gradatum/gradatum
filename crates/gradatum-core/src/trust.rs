@@ -98,6 +98,18 @@ impl TrustContext {
             _ => None,
         }
     }
+
+    /// Returns the caller's subject identifier (JWT `sub` / api-key `owner`).
+    ///
+    /// Returns `None` for variants without a subject (`Unauthenticated`, `Mtls`, `Studio`).
+    /// Used by write-restrictive ACL guards (e.g. the `identity` section) to
+    /// derive the caller identity server-side without trusting any client-supplied parameter.
+    pub fn subject(&self) -> Option<&str> {
+        match self {
+            TrustContext::BearerToken { sub, .. } => Some(sub.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Trait used by the middleware to extract [`TrustContext`] from HTTP request parts.

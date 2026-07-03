@@ -2,7 +2,7 @@
 
 > Rust SDK client for the gradatum-server HTTP API.
 
-**Status**: Alpha (v0.4.x) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -17,7 +17,7 @@ is planned for a future release.
 
 ```toml
 [dependencies]
-gradatum-sdk-rs = "0.4.3"
+gradatum-sdk-rs = "0.7.6"
 ```
 
 No public types are implemented yet. Use the `gradatum-mcp-stub` binary or direct HTTP

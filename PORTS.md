@@ -25,7 +25,7 @@ Gradatum follows the **`19090 + offset`** pattern to:
 | `gradatum-gateway` (LLM gateway, optional) | **19093** | 3 | OpenAI-compatible + Anthropic mappers. **Caveat:** collides with Alertmanager default `9093` only if operator decided to use the same numeric port elsewhere. The `19090+` prefix avoids that collision. |
 | `gradatum-vault` HTTP (read-only API, optional) | 19094 | 4 | Reserved for vault-only deployments without `gradatum-server`. |
 | Reserved | 19095 | 5 | — |
-| `gradatum-studio` (admin UI, future) | 19096 | 6 | Studio is post-v0.1; port reserved now. |
+| `gradatum-studio` (admin UI) | 19096 | 6 | Port reserved for a future standalone Studio process. In v0.7.6, Studio is served by `gradatum-server` at `/ui/*` (port 19090, no separate process). |
 | Reserved | 19097–19099 | 7–9 | Future use. |
 | `gradatum-worker` healthcheck | 19100 | 10 | Worker has no public listener; this port exposes `/health` only. |
 

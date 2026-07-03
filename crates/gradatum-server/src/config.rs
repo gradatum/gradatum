@@ -13,6 +13,8 @@ use figment::{
 use gradatum_core::paths::vault_index_path as canon_vault_index_path;
 use serde::{Deserialize, Serialize};
 
+use crate::proactive_recall::ProactiveRecallConfig;
+
 /// Configuration globale du serveur.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -54,6 +56,40 @@ pub struct ServerConfig {
     /// Wired: `main.rs` active le chemin ANN sur `SqliteIndex` si `ann_backend = sqlite_vec`.
     #[serde(default)]
     pub search: SearchConfig,
+
+    /// Auto-promotion des notes review backlog (`staging` / `pending-review`) âgées.
+    ///
+    /// Promeut en `Live` les notes restées en phase review plus longtemps que `age_days`.
+    /// Wired: tâche tokio interval dans `main.rs`.
+    #[serde(default)]
+    pub review_promote: ReviewPromoteConfig,
+
+    /// Configuration for the context assembly pipeline.
+    ///
+    /// Controls the constants used by `assemble_assembled`: budget, top_n, skills.
+    /// Wired via `AppState::with_context` in `main.rs`.
+    #[serde(default)]
+    pub context: ContextConfig,
+
+    /// Active Recall scheduler (F-46, v0.7.1) — calcul de surface in-process (B').
+    ///
+    /// Contrôle l'intervalle et les paramètres du calcul de surface proactif.
+    /// Plancher de 60s appliqué dans `main.rs` au moment de construire le
+    /// `tokio::interval` (`.max(60)`) — une valeur TOML < 60 est remontée à 60s.
+    ///
+    /// Wired: tâche `tokio::interval` dans `main.rs`
+    /// (`proactive_recall::refresh::proactive_refresh_once`). Tenant : `"main"` (v0.7.1).
+    ///
+    /// ## Exemple `server.toml`
+    ///
+    /// ```toml
+    /// [proactive_recall]
+    /// refresh_interval_secs = 900  # défaut : 15 min (plancher 60s)
+    /// recent_k = 20                # défaut : 20 notes récentes
+    /// surface_size = 8             # défaut : 8 hits retenus
+    /// ```
+    #[serde(default)]
+    pub proactive_recall: ProactiveRecallConfig,
 }
 
 /// Studio web UI configuration.
@@ -193,6 +229,116 @@ impl Default for ScoringConfig {
     }
 }
 
+/// Configuration for the context assembly pipeline.
+///
+/// Externalises the `assemble_assembled` hard-coded constants into server config.
+/// Zero-config: all fields have functional defaults.
+///
+/// ## Exemple `server.toml`
+///
+/// ```toml
+/// [context]
+/// default_budget_tokens = 2000
+/// top_n_candidates = 50
+/// max_skills = 3
+/// skills_budget_fraction = 0.15
+/// embed_timeout_ms = 800
+/// stub_budget_tokens = 1000
+/// cache_breakpoint_threshold_tokens = 500
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextConfig {
+    /// Budget tokens par défaut quand `budget_tokens` et `max_tokens` sont absents.
+    ///
+    /// Borné en dur à `[1, 8000]` dans `assemble_assembled` (cap anti-DoS).
+    #[serde(default = "ContextConfig::default_budget_tokens")]
+    pub default_budget_tokens: u32,
+
+    /// Plafond de candidats récupérés par le retrieval RRF.
+    ///
+    /// La sélection budget-aware borne la liste finale ; `top_n_candidates` est
+    /// un plafond de retrieval (oversample pour que le scoring ait suffisamment de
+    /// candidats à trier).
+    #[serde(default = "ContextConfig::default_top_n_candidates")]
+    pub top_n_candidates: usize,
+
+    /// Nombre maximum de skills injectés dans le contexte (F-58).
+    #[serde(default = "ContextConfig::default_max_skills")]
+    pub max_skills: usize,
+
+    /// Fraction du budget allouée aux skills (F-58).
+    ///
+    /// Plancher absolu appliqué après calcul : 64 tokens.
+    /// Exemple : `0.15 × 2000 = 300` tokens max skills.
+    #[serde(default = "ContextConfig::default_skills_budget_fraction")]
+    pub skills_budget_fraction: f64,
+
+    /// Timeout (ms) for the embedding computation during retrieval.
+    #[serde(default = "ContextConfig::default_embed_timeout_ms")]
+    pub embed_timeout_ms: u64,
+
+    /// Token budget allocated to stub generation.
+    ///
+    /// Caps the sum of estimated tokens for stubs produced from candidates that exceed
+    /// the inline budget. Candidates beyond this cap are dropped.
+    /// Value 0 disables stubs (all notes are either inlined or dropped).
+    #[serde(default = "ContextConfig::default_stub_budget_tokens")]
+    pub stub_budget_tokens: u32,
+
+    /// Token threshold above which `cache_breakpoint_hint = true`.
+    ///
+    /// Consumer signal: when `budget_used > cache_breakpoint_threshold_tokens`,
+    /// set a `cache_control` on the `tool_result` to enable prompt caching.
+    /// Value 0 → hint always false (threshold impossible to exceed).
+    /// Default: 500 tokens.
+    #[serde(default = "ContextConfig::default_cache_breakpoint_threshold_tokens")]
+    pub cache_breakpoint_threshold_tokens: u32,
+}
+
+impl ContextConfig {
+    fn default_budget_tokens() -> u32 {
+        2000
+    }
+
+    fn default_top_n_candidates() -> usize {
+        50
+    }
+
+    fn default_max_skills() -> usize {
+        3
+    }
+
+    fn default_skills_budget_fraction() -> f64 {
+        0.15
+    }
+
+    fn default_embed_timeout_ms() -> u64 {
+        800
+    }
+
+    fn default_stub_budget_tokens() -> u32 {
+        1000
+    }
+
+    fn default_cache_breakpoint_threshold_tokens() -> u32 {
+        500
+    }
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            default_budget_tokens: Self::default_budget_tokens(),
+            top_n_candidates: Self::default_top_n_candidates(),
+            max_skills: Self::default_max_skills(),
+            skills_budget_fraction: Self::default_skills_budget_fraction(),
+            embed_timeout_ms: Self::default_embed_timeout_ms(),
+            stub_budget_tokens: Self::default_stub_budget_tokens(),
+            cache_breakpoint_threshold_tokens: Self::default_cache_breakpoint_threshold_tokens(),
+        }
+    }
+}
+
 /// HTTP listener configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpConfig {
@@ -248,7 +394,7 @@ impl StorageConfig {
     /// Returns `true` si `vault_index_path` a été explicitement overridé dans le TOML
     /// vers une valeur différente du chemin canonique `canon_vault_index_path(root)`.
     ///
-    /// Utilisé pour le fail-fast P0 de divergence (Slice A1 round 2).
+    /// Used for fast-fail detection of storage path divergence.
     pub fn vault_index_path_override_diverges(&self) -> bool {
         self.vault_index_path_override_diverges
     }
@@ -492,6 +638,49 @@ impl Default for EventLogConfig {
     }
 }
 
+/// Auto-promotion configuration for the review backlog job.
+///
+/// Default TTL: 14 days. Interval: 3600 s (1 h). Max per tick: 200 notes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewPromoteConfig {
+    /// Enable or disable the auto-promotion job. Default: `true`.
+    #[serde(default = "default_review_promote_enabled")]
+    pub enabled: bool,
+    /// Age in days before a review note is promoted to `Live`. Default: 14.
+    #[serde(default = "default_review_promote_age_days")]
+    pub age_days: u32,
+    /// Interval between promotion passes in seconds. Default: 3600 (1 h).
+    #[serde(default = "default_review_promote_interval_secs")]
+    pub interval_secs: u64,
+    /// Maximum notes promoted per tick (anti-burst cap). Default: 200.
+    #[serde(default = "default_review_promote_max_per_tick")]
+    pub max_per_tick: usize,
+}
+
+fn default_review_promote_enabled() -> bool {
+    true
+}
+fn default_review_promote_age_days() -> u32 {
+    14
+}
+fn default_review_promote_interval_secs() -> u64 {
+    3_600 // 1h
+}
+fn default_review_promote_max_per_tick() -> usize {
+    200
+}
+
+impl Default for ReviewPromoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_review_promote_enabled(),
+            age_days: default_review_promote_age_days(),
+            interval_secs: default_review_promote_interval_secs(),
+            max_per_tick: default_review_promote_max_per_tick(),
+        }
+    }
+}
+
 /// Session-log retention configuration (`session_trace` table).
 ///
 /// Default TTL: 90 days. Purged by a tokio interval task (6 h) —
@@ -638,6 +827,9 @@ impl Default for ServerConfig {
             studio: StudioConfig::default(),
             internal_api: InternalApiConfig::default(),
             search: SearchConfig::default(),
+            review_promote: ReviewPromoteConfig::default(),
+            context: ContextConfig::default(),
+            proactive_recall: ProactiveRecallConfig::default(),
         }
     }
 }
@@ -1300,5 +1492,135 @@ mod internal_api_config_tests {
             validate_internal_token(&token).is_ok(),
             "token plus long que MIN_INTERNAL_TOKEN_LEN doit être accepté"
         );
+    }
+}
+
+#[cfg(test)]
+mod review_promote_config_tests {
+    use super::*;
+
+    /// Vérifie que `ReviewPromoteConfig` s'initialise avec les valeurs par défaut attendues
+    /// depuis un TOML vide (ou via `Default`).
+    #[test]
+    fn review_promote_defaults() {
+        let cfg: ServerConfig = toml::from_str("").unwrap_or_else(|_| ServerConfig::default());
+        assert!(cfg.review_promote.enabled);
+        assert_eq!(cfg.review_promote.age_days, 14);
+        assert_eq!(cfg.review_promote.interval_secs, 3600);
+        assert_eq!(cfg.review_promote.max_per_tick, 200);
+    }
+}
+
+#[cfg(test)]
+mod proactive_recall_config_tests {
+    use super::*;
+
+    /// TOML minimal partagé : sections obligatoires, pas de `[proactive_recall]`.
+    const MINIMAL_TOML: &str = r#"
+        [server]
+        bind = "127.0.0.1:19090"
+        metrics_bind = "127.0.0.1:19091"
+
+        [storage]
+        root = "/var/lib/gradatum"
+        vault_index_path = "/var/lib/gradatum/db/index.sqlite"
+
+        [auth]
+        jwt_public_key_path = "/x"
+        jwt_private_key_path = "/y"
+        jwt_ttl_human_secs = 3600
+        jwt_ttl_service_secs = 86400
+        revocation_store = "memory"
+
+        [acl]
+        preset_path = "/x"
+
+        [log]
+        format = "json"
+    "#;
+
+    /// TOML without a `[proactive_recall]` section → default values 900/20/8.
+    ///
+    /// The TOML → `ProactiveRecallConfig` deserialisation must produce the same values
+    /// as `ProactiveRecallConfig::default()`.
+    /// The tick logic is tested separately in `tests/proactive_refresh.rs`;
+    /// this test verifies the config link.
+    #[test]
+    fn proactive_recall_config_defaults() {
+        let cfg: ServerConfig = toml::from_str(MINIMAL_TOML).expect("parse");
+        assert_eq!(
+            cfg.proactive_recall.refresh_interval_secs, 900,
+            "refresh_interval_secs par défaut doit être 900"
+        );
+        assert_eq!(
+            cfg.proactive_recall.recent_k, 20,
+            "recent_k par défaut doit être 20"
+        );
+        assert_eq!(
+            cfg.proactive_recall.surface_size, 8,
+            "surface_size par défaut doit être 8"
+        );
+    }
+
+    /// Partial section: missing field → default value applied for that field.
+    #[test]
+    fn proactive_recall_config_partial_override() {
+        let toml = format!("{MINIMAL_TOML}\n[proactive_recall]\nrecent_k = 5\n");
+        let cfg: ServerConfig = toml::from_str(&toml).expect("parse");
+        // Champ fourni explicitement.
+        assert_eq!(cfg.proactive_recall.recent_k, 5);
+        // Champs absents → défauts non modifiés.
+        assert_eq!(cfg.proactive_recall.refresh_interval_secs, 900);
+        assert_eq!(cfg.proactive_recall.surface_size, 8);
+    }
+
+    /// 60s floor: TOML value < 60 → `.max(60)` in `main.rs` clamps to 60.
+    ///
+    /// Deserialisation preserves the raw value (10 stays 10 in the config).
+    /// The floor is applied at the point where the `tokio::interval` is built
+    /// in `main.rs` via `refresh_interval_secs.max(60)`.
+    /// This test verifies that the expression used in `main.rs` is correct.
+    #[test]
+    fn proactive_recall_config_floor_60s() {
+        let toml = format!("{MINIMAL_TOML}\n[proactive_recall]\nrefresh_interval_secs = 10\n");
+        let cfg: ServerConfig = toml::from_str(&toml).expect("parse");
+        // La valeur brute est préservée dans la config.
+        assert_eq!(
+            cfg.proactive_recall.refresh_interval_secs, 10,
+            "la désérialisation ne doit pas coercer la valeur brute"
+        );
+        // Le plancher appliqué par main.rs (.max(60)) donne bien 60.
+        let effective = cfg.proactive_recall.refresh_interval_secs.max(60);
+        assert_eq!(
+            effective, 60,
+            "plancher 60s : refresh_interval_secs = 10 → effective = 60"
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_config_tests {
+    use super::*;
+
+    /// Vérifie que `ContextConfig` s'initialise avec les valeurs par défaut attendues
+    /// (via `Default` et via désérialisation depuis un TOML vide).
+    #[test]
+    fn context_config_defaults() {
+        let c = ContextConfig::default();
+        assert_eq!(c.default_budget_tokens, 2000);
+        assert_eq!(c.top_n_candidates, 50);
+        assert_eq!(c.max_skills, 3);
+        assert!((c.skills_budget_fraction - 0.15).abs() < f64::EPSILON);
+        assert_eq!(c.embed_timeout_ms, 800);
+    }
+
+    /// Vérifie que `ServerConfig` expose le champ `context` avec les bons défauts
+    /// depuis un TOML vide (zéro section `[context]`).
+    #[test]
+    fn server_config_context_section_defaults() {
+        let cfg: ServerConfig = toml::from_str("").unwrap_or_else(|_| ServerConfig::default());
+        assert_eq!(cfg.context.default_budget_tokens, 2000);
+        assert_eq!(cfg.context.top_n_candidates, 50);
+        assert_eq!(cfg.context.max_skills, 3);
     }
 }

@@ -55,12 +55,12 @@ impl EngineMetrics {
         let mut registry = Registry::default();
         registry.register(
             "engine_requests",
-            "Requêtes engine traitées par route et code HTTP",
+            "Engine requests handled by route and HTTP status",
             requests.clone(),
         );
         registry.register(
             "engine_request_latency_ms",
-            "Latence des requêtes engine en millisecondes",
+            "Engine request latency in milliseconds",
             latency.clone(),
         );
 
@@ -93,7 +93,7 @@ impl EngineMetrics {
                 .lock()
                 .expect("EngineMetrics: lock poison — ne devrait pas arriver"),
         )
-        .expect("encode métriques Prometheus");
+        .expect("failed to encode Prometheus metrics");
         buf
     }
 }

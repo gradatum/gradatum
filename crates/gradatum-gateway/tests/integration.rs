@@ -68,6 +68,7 @@ fn test_config_with_provider(provider_endpoint: &str) -> Config {
         gateway: std::collections::HashMap::new(),
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
+        messages: Default::default(),
     }
 }
 
@@ -131,6 +132,7 @@ fn test_config_vision_capable(provider_endpoint: &str) -> Config {
         gateway: std::collections::HashMap::new(),
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
+        messages: Default::default(),
     }
 }
 
@@ -179,6 +181,7 @@ fn test_config_vision_with_fallback(primary_endpoint: &str, fallback_endpoint: &
         gateway: std::collections::HashMap::new(),
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
+        messages: Default::default(),
     }
 }
 

@@ -244,6 +244,26 @@ export interface AuthExchangeResponse {
   token: string;
 }
 
+// --- GET /api/v1/system/scheduled (T6 — v0.7.5 Slice 1) ---
+// Contrat Backend gelé dans le plan 2026-06-29-v0.7.5-slice1-scheduled-task-health.md
+// last_error : déjà sanitizé côté serveur — afficher tel quel
+// last_outcome : 'ok' | 'error' | null (null = jamais exécuté ou inconnu)
+
+export interface ScheduledTask {
+  name: string;
+  last_run_ms: number | null;
+  last_outcome: 'ok' | 'error' | null;
+  last_duration_ms: number | null;
+  last_error: string | null;
+  run_count: number;
+  errors_24h: number;
+  interval_secs: number;
+}
+
+export interface ScheduledResponse {
+  tasks: ScheduledTask[];
+}
+
 // --- vault_read (POST /api/v1/vault_read, shape réelle vérifiée LIVE 2026-06-11) ---
 //
 // Contrat réel : POST body { path: "<ULID>" } — PAS GET /{id}
@@ -295,4 +315,51 @@ export interface NoteDetail {
   backlinks?: Array<{ ulid: string; title: string | null }>;
   history?: Array<{ sha: string; created_at: string; author: string }>;
   agent_runs?: Array<{ job_id: string; agent: string; created_at: string }>;
+}
+
+// ── Metrics timeseries (v0.7.5 Slice 2b — consumes Slice 2a endpoints) ──────
+export interface CatalogEntry {
+  key: string;
+  group: string;       // "usage" | "context" | "server" | "write"
+  kind: string;        // "counter" | "gauge" | "histogram_sum" | "histogram_count"
+  unit: string;
+  instrumented: boolean;
+}
+export interface CatalogResponse { series: CatalogEntry[]; }
+
+export interface TimeseriesPoint { ts_ms: number; value: number; }
+export interface TimeseriesSeries { key: string; points: TimeseriesPoint[]; }
+export interface TimeseriesResponse {
+  from_ms: number;
+  to_ms: number;
+  bucket_secs: number;
+  series: TimeseriesSeries[];
+}
+
+// ── session_trace (v0.7.5 Slice 3 — contrat gelé GET /api/v1/system/traces) ──
+// Source : plan 2026-06-29-v0.7.5-slice3-activity-session-trace.md
+export interface TraceEntry {
+  id: number;
+  session_id: string;
+  agent_id: string;
+  ts_ms: number;
+  action_type: string;
+  target: string | null;
+  intent: string | null;
+  outcome: string | null;
+  ref: string | null;
+  created_at: number;
+}
+
+export interface TracesResponse {
+  traces: TraceEntry[];
+  next_cursor: string | null;
+}
+
+export interface TraceFilters {
+  action_type?: string;
+  agent_id?: string;
+  session_id?: string;
+  fromMs?: number;
+  toMs?: number;
 }

@@ -29,7 +29,7 @@ use gradatum_core::identity::NoteId;
 use gradatum_core::scope::VaultId;
 use gradatum_dto::{
     EmbeddingOkResponse, PersistCuratedRequest, PersistDistillRequest, PersistEmbeddingRequest,
-    PersistForgetRequest, PersistOkResponse,
+    PersistForgetRequest, PersistOkResponse, VaultWriteRequest,
 };
 use gradatum_index::SqliteIndex;
 use gradatum_queue::{NewJob, Queue, SqliteQueue};
@@ -367,42 +367,24 @@ pub async fn test_dispatcher_with_index() -> DispatcherFixture {
 
 /// Encode un payload `VaultWriteRequest` minimal (titre, body, section_hint).
 ///
+/// Utilise le VRAI `gradatum_dto::VaultWriteRequest` (pas de miroir local) — tout
+/// nouveau champ dans le DTO est automatiquement pris en compte ici, évitant la
+/// dérive bincode positionnel qui a causé la régression occurred_at.
+///
 /// `tenant_id="main"` codé en dur — cohérent avec le vault `VaultId::new("main")`.
 fn encode_write_payload(title: &str, body: &str, section_hint: Option<&str>) -> Vec<u8> {
-    // Miroir de `gradatum_dto::VaultWriteRequest` — ordre des champs INVARIANT (bincode positionnel).
-    // Pos 6 = tenant_id, pos 7 = expected_sha256, pos 8 = note_id.
-    // Ne pas modifier l'ordre sans aligner dispatch.rs + gradatum-dto.
-    #[derive(serde::Serialize, serde::Deserialize, Debug)]
-    struct WriteReq {
-        title: String,
-        body: String,
-        #[serde(default)]
-        author: Option<String>,
-        #[serde(default)]
-        tags: Vec<String>,
-        #[serde(default)]
-        section_hint: Option<String>,
-        #[serde(default = "default_main")]
-        tenant_id: String,
-        #[serde(default)]
-        expected_sha256: Option<String>,
-        #[serde(default)]
-        note_id: Option<String>,
-    }
-    fn default_main() -> String {
-        "main".into()
-    }
-    let req = WriteReq {
-        title: title.into(),
-        body: body.into(),
+    let req = VaultWriteRequest {
+        title: title.to_string(),
+        body: body.to_string(),
         author: None,
         tags: vec![],
         section_hint: section_hint.map(|s| s.to_string()),
-        tenant_id: "main".into(),
+        tenant_id: "main".to_string(),
         expected_sha256: None,
         note_id: None,
+        occurred_at: None,
     };
-    bincode::serde::encode_to_vec(&req, bincode_std()).expect("encode WriteReq bincode")
+    bincode::serde::encode_to_vec(&req, bincode_std()).expect("encode VaultWriteRequest bincode")
 }
 
 /// Enqueue un job `curate` pour titre + body donnés.

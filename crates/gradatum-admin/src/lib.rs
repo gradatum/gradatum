@@ -17,10 +17,14 @@ pub mod changelog_parse;
 /// Sub-command `code ingest` — index-only ingestion via tree-sitter (Rust).
 pub mod code_cmd;
 pub mod downgrade_from_vault_trash;
+/// Backfill features.ts → vault project-map feature cards (T5).
+pub mod feature_backfill;
 pub mod init;
 pub mod jobs_cmd;
 /// Rendu cartes project-map valides depuis entrées CHANGELOG (stage2).
 pub mod project_map_card;
+/// Export JSON des cartes-feature project-map (`export-features --json`).
+pub mod project_map_export;
 /// Sub-command `project-map render` — generates `TODO.md` from the wikilink graph.
 pub mod project_map_render;
 /// Vue de synthèse read-only d'un projet (scope) depuis l'index SQLite.

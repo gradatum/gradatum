@@ -1,4 +1,4 @@
-//! Tests d'intégration — serveur MCP natif in-process (B2-Phase2 v0.6.0).
+//! Tests d'intégration — serveur MCP natif in-process (B2-Phase2 v0.6.0, mode stateless v0.6.5+).
 //!
 //! # Objectifs
 //!
@@ -22,6 +22,18 @@
 //!    (`evil.example.com`) est rejeté par rmcp AVANT que la requête n'atteigne
 //!    l'`auth_middleware` ou le handler MCP.
 //!
+//! # Mode STATELESS (v0.6.5+)
+//!
+//! Depuis `build_mcp_service` avec `.with_stateful_mode(false)` :
+//! - rmcp n'émet plus le header `Mcp-Session-Id` dans aucune réponse.
+//! - Chaque POST est autonome (OneshotTransport par requête) — pas de handshake
+//!   `initialize` requis avant `tools/list` ou `tools/call`.
+//! - GET et DELETE ne sont plus supportés (405 Method Not Allowed).
+//!
+//! Conséquence pour les tests : les séquences `initialize → session_id → request`
+//! sont remplacées par des POST directs sans session. L'invariant R1 est préservé
+//! via le `TrustContext` injecté par `auth_middleware` dans chaque requête.
+//!
 //! # Architecture du serveur de test
 //!
 //! Chaque test lance un serveur Axum sur un port éphémère (`127.0.0.1:0`) avec :
@@ -31,17 +43,13 @@
 //! - Un [`AppState`](gradatum_server::state::AppState) de test (clé Ed25519 éphémère,
 //!   index SQLite in-memory, ACL vide = default-deny).
 //!
-//! # Format des requêtes MCP (Streamable HTTP)
+//! # Format des requêtes MCP (Streamable HTTP, mode stateless)
 //!
-//! Le protocole MCP Streamable HTTP exige :
 //! - `Content-Type: application/json`
 //! - `Accept: application/json, text/event-stream`
-//! - Body : JSON-RPC 2.0 avec `"method": "initialize"` pour la première requête
-//!   (sans `Mcp-Session-Id`), puis `"method": "tools/list"` ou `"method": "tools/call"`
-//!   avec le header `Mcp-Session-Id` retourné par `initialize`.
-//!
-//! La réponse à `initialize` est un flux SSE contenant la réponse JSON-RPC.
-//! Les requêtes suivantes (avec session-id) retournent également un SSE.
+//! - Body : JSON-RPC 2.0. En stateless, `tools/list` et `tools/call` peuvent être
+//!   envoyés directement sans `initialize` préalable ni `Mcp-Session-Id`.
+//! - Réponse : flux SSE (`data: <json>\n\n`) ou JSON direct selon configuration.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -51,9 +59,9 @@ use gradatum_auth::jwt::TokenScope;
 use gradatum_server::{api_v1, middleware::auth_middleware, state::AppState};
 use reqwest::StatusCode;
 
-// ── Liste canonique des 21 outils (parité avec gradatum-mcp-stub) ─────────────
+// ── Liste canonique des 23 outils (parité avec gradatum-mcp-stub) ─────────────
 
-/// Noms canoniques des 21 outils MCP gradatum.
+/// Noms canoniques des 23 outils MCP gradatum.
 ///
 /// Cette liste est la référence unique pour le test d'équivalence (R3).
 /// Elle doit être maintenue en sync avec :
@@ -87,6 +95,9 @@ const CANONICAL_TOOL_NAMES: &[&str] = &[
     "vault_lessons_recall",
     // code scope F-61 — 1
     "code_scope",
+    // proactive recall F-46 — 2
+    "vault_proactive_recall",
+    "vault_proactive_recall_feedback",
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -159,6 +170,81 @@ async fn start_mcp_test_server() -> (SocketAddr, String) {
     (addr, token)
 }
 
+/// Démarre un serveur Axum de test avec ACL permissive pour `"mcp-native-tester"` + store proactive_recall in-memory.
+///
+/// Différence vs `start_mcp_test_server()` :
+/// - ACL configurée avec un preset qui autorise `"mcp-native-tester"` à lire/écrire partout.
+/// - Store `proactive_recall` in-memory injecté → les sessions sont persistées en RAM.
+///
+/// Utilisée par les tests F-46 qui doivent atteindre la logique métier au-delà de l'ACL.
+async fn start_permissive_test_server() -> (SocketAddr, String) {
+    use axum::{Router, middleware};
+    use gradatum_acl_policy::AclEngine;
+    use gradatum_auth::jwt::JwtService;
+    use gradatum_server::api_v1::mcp::build_mcp_service;
+    use gradatum_server::proactive_recall_store::ProactiveRecallStore;
+
+    // Preset ACL : "mcp-native-tester" peut lire et écrire dans tous les loci.
+    // Les champs TOML sont `read_patterns` et `write_patterns` (ConsumerEntry).
+    const PERMISSIVE_PRESET: &str = r#"
+[[consumer]]
+identity = "mcp-native-tester"
+read_patterns = ["**"]
+write_patterns = ["**"]
+"#;
+
+    let jwt = JwtService::new_ephemeral();
+    let acl = AclEngine::from_preset_str(PERMISSIVE_PRESET)
+        .expect("preset ACL permissif valide — invariant de test");
+    let recall_store = ProactiveRecallStore::open_in_memory()
+        .await
+        .expect("ProactiveRecallStore in-memory valide — invariant de test");
+    let state = AppState::with_jwt_and_acl(jwt, acl).with_proactive_recall(recall_store);
+
+    let token = state
+        .jwt
+        .sign(
+            "mcp-native-tester",
+            &["read".to_string(), "write".to_string()],
+            TokenScope::Service,
+            "main",
+        )
+        .expect("sign JWT de test — clé éphémère AppState permissif");
+
+    let (mcp_service, _cancel) = build_mcp_service(state.clone());
+
+    let mcp_router = Router::new().route_service("/mcp", mcp_service).layer(
+        tower_http::limit::RequestBodyLimitLayer::new(gradatum_server::api_v1::mcp::MCP_BODY_LIMIT),
+    );
+
+    let authed = Router::new()
+        .nest("/api/v1", api_v1::router())
+        .merge(mcp_router)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    let app = Router::new().merge(authed).with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind port éphémère — doit réussir sur localhost");
+    let addr = listener
+        .local_addr()
+        .expect("obtenir l'adresse locale — listener actif");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serveur de test permissif arrêté proprement");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (addr, token)
+}
+
 /// Client reqwest sans retry, timeout 5s, sans suivi de redirections.
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -168,29 +254,14 @@ fn http_client() -> reqwest::Client {
         .expect("construction client HTTP — pas de TLS custom")
 }
 
-/// Corps JSON-RPC MCP `initialize` (première requête obligatoire).
-///
-/// Envoyer `initialize` d'abord est requis par le protocole Streamable HTTP :
-/// rmcp retourne un `Mcp-Session-Id` dans la réponse qui doit être utilisé
-/// pour les appels suivants (`tools/list`, `tools/call`, etc.).
-fn initialize_body() -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": { "name": "mcp-native-test", "version": "0.0.1" }
-        }
-    })
-}
-
 /// Corps JSON-RPC MCP `tools/list`.
+///
+/// En mode stateless, cet appel peut être envoyé directement sans initialize préalable
+/// ni `Mcp-Session-Id`. rmcp dispatche chaque POST de manière autonome (OneshotTransport).
 fn list_tools_body() -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
-        "id": 2,
+        "id": 1,
         "method": "tools/list"
     })
 }
@@ -199,7 +270,7 @@ fn list_tools_body() -> serde_json::Value {
 fn vault_search_call_body() -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
-        "id": 3,
+        "id": 2,
         "method": "tools/call",
         "params": {
             "name": "vault_search",
@@ -210,14 +281,15 @@ fn vault_search_call_body() -> serde_json::Value {
 
 /// Envoie une requête MCP POST (Streamable HTTP) avec les headers requis.
 ///
-/// Retourne la réponse HTTP brute. Le body SSE peut contenir plusieurs événements ;
-/// pour les tests, on lit le premier événement de données.
+/// En mode stateless, `session_id` est ignoré (le paramètre est conservé pour la
+/// lisibilité des appels mais n'est jamais envoyé — rmcp stateless n'en tient pas compte).
+///
+/// Retourne la réponse HTTP brute.
 async fn post_mcp(
     client: &reqwest::Client,
     url: &str,
     body: &serde_json::Value,
     bearer: Option<&str>,
-    session_id: Option<&str>,
 ) -> reqwest::Response {
     let mut req = client
         .post(url)
@@ -228,9 +300,6 @@ async fn post_mcp(
 
     if let Some(token) = bearer {
         req = req.header("Authorization", format!("Bearer {token}"));
-    }
-    if let Some(sid) = session_id {
-        req = req.header("Mcp-Session-Id", sid);
     }
 
     req.send().await.expect("requête MCP envoyée")
@@ -254,6 +323,70 @@ fn parse_sse_json(text: &str) -> serde_json::Value {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+/// **STATELESS — Test pivot : POST direct sans initialize ni Mcp-Session-Id → 23 outils.**
+///
+/// Encode la correction du bug de décrochage MCP (session in-memory perdue après
+/// redémarrage serveur). En mode stateless, chaque POST `tools/list` est autonome :
+/// aucun handshake `initialize` préalable n'est requis.
+///
+/// Invariant : avec un Bearer valide, `tools/list` en POST direct retourne les 23 outils
+/// sans aucun `Mcp-Session-Id` dans la requête ni dans la réponse.
+#[tokio::test]
+async fn stateless_tools_list_without_initialize_returns_23_tools() {
+    let (addr, valid_token) = start_mcp_test_server().await;
+    let client = http_client();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
+
+    // POST direct tools/list SANS initialize préalable, SANS Mcp-Session-Id.
+    let resp = post_mcp(
+        &client,
+        &mcp_url,
+        &list_tools_body(),
+        Some(valid_token.as_str()),
+    )
+    .await;
+
+    // Vérifier qu'aucun Mcp-Session-Id n'est émis (invariant stateless).
+    assert!(
+        resp.headers().get("Mcp-Session-Id").is_none(),
+        "mode stateless ne doit PAS émettre Mcp-Session-Id"
+    );
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "POST direct tools/list sans initialize doit retourner 200"
+    );
+
+    let body_text = resp.text().await.expect("body tools/list stateless");
+    let json = parse_sse_json(&body_text);
+
+    assert!(
+        json.get("error").is_none(),
+        "tools/list stateless ne doit pas retourner d'erreur, got: {json}"
+    );
+
+    let tools = json["result"]["tools"]
+        .as_array()
+        .expect("result.tools doit être un tableau");
+
+    assert_eq!(
+        tools.len(),
+        23,
+        "POST direct tools/list doit retourner exactement 23 outils, got: {}",
+        tools.len()
+    );
+
+    // Vérifier la parité des noms avec CANONICAL_TOOL_NAMES.
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for expected in CANONICAL_TOOL_NAMES {
+        assert!(
+            tool_names.contains(expected),
+            "outil '{expected}' manquant. Reçus: {tool_names:?}"
+        );
+    }
+}
+
 /// **R1 — Test pivot : SANS Bearer → TrustContext::Unauthenticated → erreur auth MCP.**
 ///
 /// Prouve que :
@@ -262,43 +395,20 @@ fn parse_sse_json(text: &str) -> serde_json::Value {
 /// 3. `call_tool` lit le `TrustContext` depuis les extensions et refuse les appels
 ///    non authentifiés avec une erreur MCP INVALID_REQUEST.
 ///
-/// Séquence :
-/// 1. POST `/mcp` avec `initialize` sans Bearer → session créée (MCP accepte l'initialize
-///    sans auth — le TrustContext est Unauthenticated, mais initialize ne vérifie pas l'auth).
-/// 2. POST `/mcp` avec `tools/call` sur le session_id obtenu, SANS Bearer → la requête
-///    atteint `call_tool` avec `TrustContext::Unauthenticated` → erreur MCP "non authentifié".
+/// En mode stateless, chaque POST est autonome — on envoie `tools/call` directement.
 #[tokio::test]
 async fn r1_sans_bearer_trustcontext_unauthenticated_call_tool_refuses() {
     let (addr, _valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
 
-    // Étape 1 : initialize sans Bearer → obtenir le session_id.
-    // L'initialize est accepté (rmcp gère l'init avant les vérifs métier).
-    let init_resp = post_mcp(&client, &mcp_url, &initialize_body(), None, None).await;
-    // rmcp retourne 200 avec SSE pour l'initialize.
-    assert_eq!(
-        init_resp.status(),
-        StatusCode::OK,
-        "initialize doit retourner 200 même sans Bearer"
-    );
-    let session_id = init_resp
-        .headers()
-        .get("Mcp-Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-        .expect("Mcp-Session-Id doit être présent dans la réponse initialize");
-    // Consommer le body SSE pour libérer la connexion.
-    let _init_body = init_resp.text().await.expect("body initialize");
-
-    // Étape 2 : tools/call vault_search SANS Bearer sur le session établi.
+    // POST tools/call SANS Bearer — directement, sans initialize préalable.
     // auth_middleware injecte Unauthenticated → Parts injectées → call_tool reçoit Unauthenticated.
     let call_resp = post_mcp(
         &client,
         &mcp_url,
         &vault_search_call_body(),
         None, // PAS de Bearer
-        Some(session_id.as_str()),
     )
     .await;
 
@@ -330,42 +440,21 @@ async fn r1_sans_bearer_trustcontext_unauthenticated_call_tool_refuses() {
 /// 2. Les `Parts` HTTP (avec le `TrustContext`) traversent `StreamableHttpService`.
 /// 3. `call_tool` reçoit un contexte authentifié — pas d'erreur "non authentifié".
 ///    (L'ACL peut ensuite refuser l'accès vault — c'est une erreur différente, pas auth.)
+///
+/// En mode stateless, le POST est autonome — pas d'initialize requis.
 #[tokio::test]
 async fn r1_avec_bearer_valide_trustcontext_authentifie_traverse_call_tool() {
     let (addr, valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
 
-    // Étape 1 : initialize AVEC Bearer valide.
-    let init_resp = post_mcp(
-        &client,
-        &mcp_url,
-        &initialize_body(),
-        Some(valid_token.as_str()),
-        None,
-    )
-    .await;
-    assert_eq!(
-        init_resp.status(),
-        StatusCode::OK,
-        "initialize avec Bearer valide doit retourner 200"
-    );
-    let session_id = init_resp
-        .headers()
-        .get("Mcp-Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-        .expect("Mcp-Session-Id doit être présent");
-    let _init_body = init_resp.text().await.expect("body initialize");
-
-    // Étape 2 : tools/call vault_search AVEC Bearer valide.
+    // POST tools/call AVEC Bearer valide — directement, sans initialize.
     // auth_middleware injecte BearerToken → TrustContext authentifié → call_tool ne refuse pas auth.
     let call_resp = post_mcp(
         &client,
         &mcp_url,
         &vault_search_call_body(),
         Some(valid_token.as_str()),
-        Some(session_id.as_str()),
     )
     .await;
 
@@ -395,46 +484,23 @@ async fn r1_avec_bearer_valide_trustcontext_authentifie_traverse_call_tool() {
 /// **R3 — Équivalence list_tools golden runtime.**
 ///
 /// Construit un vrai serveur MCP (avec `build_mcp_service`), envoie `tools/list`
-/// via HTTP et vérifie :
-/// (a) 21 outils retournés.
+/// en POST direct (mode stateless) et vérifie :
+/// (a) 23 outils retournés.
 /// (b) Les noms correspondent exactement à `CANONICAL_TOOL_NAMES` (== stub).
 /// (c) Chaque outil a un `inputSchema` (objet JSON, éventuellement vide pour
 ///     les outils sans paramètres).
 #[tokio::test]
-async fn r3_list_tools_golden_runtime_21_outils_parité_stub() {
+async fn r3_list_tools_golden_runtime_23_outils_parité_stub() {
     let (addr, valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
 
-    // Étape 1 : initialize pour obtenir le session_id.
-    let init_resp = post_mcp(
-        &client,
-        &mcp_url,
-        &initialize_body(),
-        Some(valid_token.as_str()),
-        None,
-    )
-    .await;
-    assert_eq!(
-        init_resp.status(),
-        StatusCode::OK,
-        "initialize doit réussir"
-    );
-    let session_id = init_resp
-        .headers()
-        .get("Mcp-Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-        .expect("Mcp-Session-Id doit être présent");
-    let _init_body = init_resp.text().await.expect("body initialize");
-
-    // Étape 2 : tools/list.
+    // POST direct tools/list — mode stateless, pas d'initialize requis.
     let list_resp = post_mcp(
         &client,
         &mcp_url,
         &list_tools_body(),
         Some(valid_token.as_str()),
-        Some(session_id.as_str()),
     )
     .await;
     assert_eq!(
@@ -456,11 +522,11 @@ async fn r3_list_tools_golden_runtime_21_outils_parité_stub() {
         .as_array()
         .expect("result.tools doit être un tableau");
 
-    // (a) 21 outils.
+    // (a) 23 outils.
     assert_eq!(
         tools.len(),
-        21,
-        "list_tools doit retourner exactement 21 outils, got: {}",
+        23,
+        "list_tools doit retourner exactement 23 outils, got: {}",
         tools.len()
     );
 
@@ -500,8 +566,8 @@ async fn r3_list_tools_golden_runtime_21_outils_parité_stub() {
 /// whitelist `["localhost", "127.0.0.1", "::1"]`. C'est la protection contre les
 /// attaques DNS-rebinding (spec MCP Streamable HTTP 2025-06-18).
 ///
-/// Note : `reqwest` envoie le `Host` header basé sur l'URL. Pour simuler un Host
-/// non autorisé, on utilise `reqwest` avec un override manuel du header `Host`.
+/// Ce comportement est indépendant du mode stateful/stateless : la vérification
+/// du header `Host` est effectuée avant le dispatch de la requête.
 #[tokio::test]
 async fn r2_host_non_autorise_rejete_403() {
     let (addr, _token) = start_mcp_test_server().await;
@@ -514,7 +580,7 @@ async fn r2_host_non_autorise_rejete_403() {
         .header("Host", "evil.example.com")
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
-        .json(&initialize_body())
+        .json(&list_tools_body())
         .send()
         .await
         .expect("requête avec Host non autorisé");
@@ -526,9 +592,9 @@ async fn r2_host_non_autorise_rejete_403() {
     );
 }
 
-/// **R3-snapshot — Golden inputSchema des 21 outils MCP (DT-MCP-SCHEMA-1 + durcissement R3).**
+/// **R3-snapshot — Golden inputSchema des 23 outils MCP (DT-MCP-SCHEMA-1 + durcissement R3).**
 ///
-/// Fige la sérialisation COMPLÈTE des 21 `inputSchema` via `insta::assert_json_snapshot!`.
+/// Fige la sérialisation COMPLÈTE des 23 `inputSchema` via `insta::assert_json_snapshot!`.
 ///
 /// Cette garde résout la faiblesse de R3 existant (`inputSchema.is_object()` faible :
 /// un Map vide `{}` passait au vert et aurait laissé passer la régression `34e70eb`).
@@ -539,40 +605,17 @@ async fn r2_host_non_autorise_rejete_403() {
 ///
 /// La map est triée par nom d'outil (`BTreeMap`) pour déterminisme entre runs.
 #[tokio::test]
-async fn r3_snapshot_input_schema_21_outils_golden() {
+async fn r3_snapshot_input_schema_23_outils_golden() {
     let (addr, valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
 
-    // Étape 1 : initialize pour obtenir le session_id.
-    let init_resp = post_mcp(
-        &client,
-        &mcp_url,
-        &initialize_body(),
-        Some(valid_token.as_str()),
-        None,
-    )
-    .await;
-    assert_eq!(
-        init_resp.status(),
-        StatusCode::OK,
-        "initialize doit réussir"
-    );
-    let session_id = init_resp
-        .headers()
-        .get("Mcp-Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-        .expect("Mcp-Session-Id doit être présent");
-    let _init_body = init_resp.text().await.expect("body initialize");
-
-    // Étape 2 : tools/list.
+    // POST direct tools/list — mode stateless.
     let list_resp = post_mcp(
         &client,
         &mcp_url,
         &list_tools_body(),
         Some(valid_token.as_str()),
-        Some(session_id.as_str()),
     )
     .await;
     assert_eq!(
@@ -589,8 +632,8 @@ async fn r3_snapshot_input_schema_21_outils_golden() {
 
     assert_eq!(
         tools.len(),
-        21,
-        "snapshot golden attend exactement 21 outils"
+        23,
+        "snapshot golden attend exactement 23 outils"
     );
 
     // Construire la map nom->inputSchema triée par nom (BTreeMap = déterminisme).
@@ -606,14 +649,14 @@ async fn r3_snapshot_input_schema_21_outils_golden() {
         })
         .collect();
 
-    // Snapshot golden - fige les 21 inputSchema octet-pour-octet.
+    // Snapshot golden - fige les 23 inputSchema octet-pour-octet.
     // Pour regénérer : INSTA_UPDATE=always cargo nextest run -p gradatum-server r3_snapshot
     insta::assert_json_snapshot!("mcp_tools_input_schema_golden", schema_map);
 }
 
 // ── F-01 — Authentification de `list_tools` (durcissement /mcp) ────────────────
 
-/// **F-01 — `tools/list` SANS Bearer → erreur "non authentifié" (miroir de R1).**
+/// **F-01 — `tools/list` SANS Bearer → erreur "non authentifié".**
 ///
 /// Avant le fix, `list_tools` ignorait le `RequestContext` et divulguait le catalogue
 /// des 21 outils (noms + schémas JSON complets) à tout client LAN non authentifié.
@@ -621,39 +664,19 @@ async fn r3_snapshot_input_schema_21_outils_golden() {
 /// Après le fix, `list_tools` applique la même garde que `call_tool` :
 /// `TrustContext::Unauthenticated` → `ErrorData(INVALID_REQUEST, "non authentifié")`.
 ///
-/// Séquence (identique à R1, mais sur `tools/list` au lieu de `tools/call`) :
-/// 1. `initialize` SANS Bearer → session_id (l'init reste libre — non-goal F-01).
-/// 2. `tools/list` SANS Bearer sur ce session → `call_tool`-like garde → erreur auth.
-///
-/// Critère de réussite mesurable F-01 (spec C3).
+/// En mode stateless, le POST direct sans Bearer doit retourner l'erreur auth.
 #[tokio::test]
 async fn f01_list_tools_sans_bearer_refuse_non_authentifie() {
     let (addr, _valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
 
-    // Étape 1 : initialize sans Bearer → obtenir le session_id.
-    let init_resp = post_mcp(&client, &mcp_url, &initialize_body(), None, None).await;
-    assert_eq!(
-        init_resp.status(),
-        StatusCode::OK,
-        "initialize doit retourner 200 même sans Bearer (non-goal F-01)"
-    );
-    let session_id = init_resp
-        .headers()
-        .get("Mcp-Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-        .expect("Mcp-Session-Id doit être présent dans la réponse initialize");
-    let _init_body = init_resp.text().await.expect("body initialize");
-
-    // Étape 2 : tools/list SANS Bearer sur le session établi.
+    // POST direct tools/list SANS Bearer.
     let list_resp = post_mcp(
         &client,
         &mcp_url,
         &list_tools_body(),
         None, // PAS de Bearer
-        Some(session_id.as_str()),
     )
     .await;
 
@@ -683,46 +706,21 @@ async fn f01_list_tools_sans_bearer_refuse_non_authentifie() {
     );
 }
 
-/// **F-01 — `tools/list` AVEC Bearer valide → 21 outils (non-régression client).**
+/// **F-01 — `tools/list` AVEC Bearer valide → 23 outils (non-régression client).**
 ///
 /// Le client légitime (Claude Code) envoie l'api-key Bearer sur chaque requête.
-/// Le gating F-01 ne casse donc PAS la découverte authentifiée : 21 outils renvoyés.
-///
-/// (R3 existant couvre déjà ce chemin avec Bearer, mais ce test miroir explicite la
-/// paire négatif/positif F-01 dans le même fichier — symétrie avec R1.)
+/// Le gating F-01 ne casse donc PAS la découverte authentifiée : 23 outils renvoyés.
 #[tokio::test]
-async fn f01_list_tools_avec_bearer_retourne_21_outils() {
+async fn f01_list_tools_avec_bearer_retourne_23_outils() {
     let (addr, valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
-
-    let init_resp = post_mcp(
-        &client,
-        &mcp_url,
-        &initialize_body(),
-        Some(valid_token.as_str()),
-        None,
-    )
-    .await;
-    assert_eq!(
-        init_resp.status(),
-        StatusCode::OK,
-        "initialize doit réussir"
-    );
-    let session_id = init_resp
-        .headers()
-        .get("Mcp-Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-        .expect("Mcp-Session-Id doit être présent");
-    let _init_body = init_resp.text().await.expect("body initialize");
 
     let list_resp = post_mcp(
         &client,
         &mcp_url,
         &list_tools_body(),
         Some(valid_token.as_str()),
-        Some(session_id.as_str()),
     )
     .await;
     assert_eq!(
@@ -743,8 +741,8 @@ async fn f01_list_tools_avec_bearer_retourne_21_outils() {
         .expect("result.tools doit être un tableau");
     assert_eq!(
         tools.len(),
-        21,
-        "tools/list authentifié doit retourner exactement 21 outils, got: {}",
+        23,
+        "tools/list authentifié doit retourner exactement 23 outils, got: {}",
         tools.len()
     );
 }
@@ -761,6 +759,7 @@ async fn f01_list_tools_avec_bearer_retourne_21_outils() {
 /// consomme le corps.
 ///
 /// Un 413 ici est un HTTP nu (pas une erreur JSON-RPC encadrée) — comportement attendu (P2-1).
+/// La limite est vérifiée AVANT toute logique MCP — pas d'initialize requis.
 #[tokio::test]
 async fn f02_body_au_dessus_limite_rejete_413() {
     let (addr, valid_token) = start_mcp_test_server().await;
@@ -772,7 +771,7 @@ async fn f02_body_au_dessus_limite_rejete_413() {
     let oversized_payload = "x".repeat(600 * 1024); // 600 KiB > 512 KiB
     let body = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": 4,
+        "id": 3,
         "method": "tools/call",
         "params": {
             "name": "vault_search",
@@ -780,9 +779,7 @@ async fn f02_body_au_dessus_limite_rejete_413() {
         }
     });
 
-    // Pas besoin d'initialize : la limite de body est appliquée par le layer HTTP
-    // en amont de toute logique MCP (init/session). On envoie directement.
-    let resp = post_mcp(&client, &mcp_url, &body, Some(valid_token.as_str()), None).await;
+    let resp = post_mcp(&client, &mcp_url, &body, Some(valid_token.as_str())).await;
 
     assert_eq!(
         resp.status(),
@@ -794,14 +791,14 @@ async fn f02_body_au_dessus_limite_rejete_413() {
 /// **F-02 — POST `/mcp` avec body normal → PAS de 413 (limite non sur-restrictive).**
 ///
 /// Garantit que la limite de 512 KiB ne rejette pas un payload légitime de taille
-/// normale (ici un `initialize` minimal). La réponse est un 200 SSE rmcp.
+/// normale (ici un `tools/list` minimal). La réponse est un 200 SSE rmcp.
 #[tokio::test]
 async fn f02_body_normal_pas_de_413() {
     let (addr, _valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
 
-    let resp = post_mcp(&client, &mcp_url, &initialize_body(), None, None).await;
+    let resp = post_mcp(&client, &mcp_url, &list_tools_body(), None).await;
 
     assert_ne!(
         resp.status(),
@@ -811,6 +808,362 @@ async fn f02_body_normal_pas_de_413() {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "initialize avec body normal doit retourner 200"
+        "tools/list avec body normal doit retourner 200"
     );
+}
+
+// ── F-46 — Proactive Recall endpoints (e2e HTTP) ─────────────────────────────
+
+/// **F-46 — POST `/api/v1/proactive_recall` mode proactive → 200 surface vide.**
+///
+/// Le serveur de test démarre avec SQLite in-memory et aucune donnée.
+/// En mode proactive (sans `context`), le store est absent (`None`) →
+/// la surface est vide (`items: []`). Ce n'est pas une erreur — 200 attendu.
+///
+/// Prouve que l'endpoint est câblé et que le handler traite correctement
+/// l'absence de store proactif.
+#[tokio::test]
+async fn f46_proactive_recall_mode_proactive_surface_vide_retourne_200() {
+    let (addr, valid_token) = start_permissive_test_server().await;
+    let client = http_client();
+    let api_url = format!("http://127.0.0.1:{}/api/v1/proactive_recall", addr.port());
+
+    let resp = client
+        .post(&api_url)
+        .header("Authorization", format!("Bearer {valid_token}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST /api/v1/proactive_recall");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "proactive_recall mode proactive (surface vide) doit retourner 200"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("body JSON proactive_recall");
+
+    // recall_id présent (ULID généré par le serveur).
+    assert!(
+        body["recall_id"].as_str().is_some(),
+        "recall_id doit être présent dans la réponse, got: {body}"
+    );
+    // mode = "proactive" (context absent).
+    assert_eq!(
+        body["mode"].as_str(),
+        Some("proactive"),
+        "mode doit être 'proactive' quand context absent"
+    );
+    // items vides (corpus vide, store absent).
+    let items = body["items"]
+        .as_array()
+        .expect("items doit être un tableau");
+    assert!(
+        items.is_empty(),
+        "items doit être vide (corpus vide), got: {items:?}"
+    );
+}
+
+/// **F-46 — POST `/api/v1/proactive_recall` mode contextual → 200 items vides.**
+///
+/// En mode contextuel (avec `context`), le retrieval RRF s'exécute sur un corpus
+/// vide → `items: []`. Ce n'est pas une erreur — 200 attendu.
+///
+/// Prouve que l'endpoint gère le mode contextuel et que le dispatch `context` → RRF
+/// est câblé correctement.
+#[tokio::test]
+async fn f46_proactive_recall_mode_contextuel_corpus_vide_retourne_200() {
+    let (addr, valid_token) = start_permissive_test_server().await;
+    let client = http_client();
+    let api_url = format!("http://127.0.0.1:{}/api/v1/proactive_recall", addr.port());
+
+    let resp = client
+        .post(&api_url)
+        .header("Authorization", format!("Bearer {valid_token}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "context": "test contextuel recall" }))
+        .send()
+        .await
+        .expect("POST /api/v1/proactive_recall contextual");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "proactive_recall mode contextual (corpus vide) doit retourner 200"
+    );
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("body JSON proactive_recall contextual");
+
+    assert_eq!(
+        body["mode"].as_str(),
+        Some("contextual"),
+        "mode doit être 'contextual' quand context présent"
+    );
+    let items = body["items"]
+        .as_array()
+        .expect("items doit être un tableau");
+    assert!(
+        items.is_empty(),
+        "items doit être vide (corpus vide), got: {items:?}"
+    );
+}
+
+/// **F-46 — POST `/api/v1/proactive_recall/feedback` recall_id inconnu → 400.**
+///
+/// Un `recall_id` qui n'a jamais été créé est inexistant dans le store.
+/// L'orchestrateur retourne `GradatumError::InvalidInput` → handler mappe en 400.
+///
+/// Prouve que l'endpoint feedback est câblé et que la validation `recall_id`
+/// fonctionne correctement.
+#[tokio::test]
+async fn f46_proactive_recall_feedback_recall_id_inconnu_retourne_400() {
+    let (addr, valid_token) = start_permissive_test_server().await;
+    let client = http_client();
+    let feedback_url = format!(
+        "http://127.0.0.1:{}/api/v1/proactive_recall/feedback",
+        addr.port()
+    );
+
+    let resp = client
+        .post(&feedback_url)
+        .header("Authorization", format!("Bearer {valid_token}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "recall_id": "01JXYZ_INCONNU_000000000000",
+            "accepted_ulids": []
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/proactive_recall/feedback");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "feedback avec recall_id inconnu doit retourner 400"
+    );
+}
+
+/// **F-46 — POST `/api/v1/proactive_recall/feedback` session validée → 200.**
+///
+/// Flux complet : (1) POST /proactive_recall → recall_id.
+///               (2) POST /proactive_recall/feedback avec le recall_id → 200.
+///
+/// Prouve que la corrélation session → feedback fonctionne end-to-end.
+#[tokio::test]
+async fn f46_proactive_recall_feedback_session_validee_retourne_200() {
+    let (addr, valid_token) = start_permissive_test_server().await;
+    let client = http_client();
+    let recall_url = format!("http://127.0.0.1:{}/api/v1/proactive_recall", addr.port());
+    let feedback_url = format!(
+        "http://127.0.0.1:{}/api/v1/proactive_recall/feedback",
+        addr.port()
+    );
+
+    // Étape 1 : obtenir un recall_id valide depuis le mode proactive.
+    let recall_resp = client
+        .post(&recall_url)
+        .header("Authorization", format!("Bearer {valid_token}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST /api/v1/proactive_recall étape 1");
+
+    assert_eq!(
+        recall_resp.status(),
+        StatusCode::OK,
+        "étape 1 : proactive_recall doit retourner 200"
+    );
+
+    let recall_body: serde_json::Value = recall_resp.json().await.expect("body proactive_recall");
+    let recall_id = recall_body["recall_id"]
+        .as_str()
+        .expect("recall_id présent dans la réponse")
+        .to_owned();
+
+    // Étape 2 : feedback avec accepted_ulids vide (valide : [] ⊆ surfaced).
+    let feedback_resp = client
+        .post(&feedback_url)
+        .header("Authorization", format!("Bearer {valid_token}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "recall_id": recall_id,
+            "accepted_ulids": []
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/proactive_recall/feedback étape 2");
+
+    assert_eq!(
+        feedback_resp.status(),
+        StatusCode::OK,
+        "étape 2 : feedback avec recall_id valide et accepted_ulids [] doit retourner 200"
+    );
+}
+
+/// **F-46 — POST `/api/v1/proactive_recall` SANS Bearer → 401.**
+///
+/// Même garde d'authentification que tous les autres endpoints `/api/v1`.
+#[tokio::test]
+async fn f46_proactive_recall_sans_bearer_retourne_401() {
+    let (addr, _token) = start_mcp_test_server().await;
+    let client = http_client();
+    let api_url = format!("http://127.0.0.1:{}/api/v1/proactive_recall", addr.port());
+
+    let resp = client
+        .post(&api_url)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST /api/v1/proactive_recall sans Bearer");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "proactive_recall sans Bearer doit retourner 401"
+    );
+}
+
+// ── Task 12 — vault_context e2e HTTP (F-29 reference_mode + F-30 compact) ────
+
+/// **T12-e2e-1 — `POST /api/v1/vault_context` mode=compact SANS session_id → 400.**
+///
+/// Prouve que l'endpoint `/api/v1/vault_context` valide l'absence de `session_id`
+/// en mode compact et retourne 400 BAD_REQUEST (GradatumError::InvalidInput).
+///
+/// Invariant : `assemble_compact` exige un session_id — le routage HTTP +
+/// handler mappent correctement l'InvalidInput en 400.
+#[tokio::test]
+async fn vault_context_e2e_compact_sans_session_id_retourne_400() {
+    let (addr, valid_token) = start_permissive_test_server().await;
+    let client = http_client();
+    let url = format!("http://127.0.0.1:{}/api/v1/vault_context", addr.port());
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {valid_token}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "query": "test compact sans session",
+            "mode": "compact"
+            // session_id absent intentionnellement
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/vault_context mode=compact sans session_id");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "T12-e2e-1 : mode=compact sans session_id doit retourner 400 BAD_REQUEST"
+    );
+}
+
+/// **T12-e2e-2 — `POST /api/v1/vault_context` mode=compact AVEC session_id valide → 200.**
+///
+/// Prouve que l'endpoint `/api/v1/vault_context` accepte un session_id ULID valide
+/// en mode compact et retourne 200 (vue foldée — corpus vide → dégradation gracieuse P2-4).
+///
+/// Dégradation P2-4 : `session_trace=None` (absent du serveur de test) → compact retourne
+/// une vue assembled vide sans crasher (HashMap::new() comme sent_map).
+#[tokio::test]
+async fn vault_context_e2e_compact_avec_session_id_retourne_200() {
+    let (addr, valid_token) = start_permissive_test_server().await;
+    let client = http_client();
+    let url = format!("http://127.0.0.1:{}/api/v1/vault_context", addr.port());
+
+    // ULID Crockford base32 valide — 26 chars ASCII alphanumériques.
+    // Hardcodé pour éviter de dépendre de la crate ulid dans ce test.
+    let session_id = "01JXTASK12E2ECOMPACT000001";
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {valid_token}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "query": "test compact session valide",
+            "mode": "compact",
+            "session_id": session_id,
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/vault_context mode=compact avec session_id valide");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "T12-e2e-2 : mode=compact avec session_id ULID valide doit retourner 200 \
+         (dégradation gracieuse P2-4 — session_trace absent)"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("body JSON vault_context compact");
+    // `assembled_text` présent dans toute réponse vault_context réussie.
+    assert!(
+        body.get("assembled_text").is_some(),
+        "T12-e2e-2 : assembled_text doit être présent dans la réponse compact, got: {body}"
+    );
+}
+
+/// **T12-e2e-3 — `POST /api/v1/vault_context` reference_mode=true → 200 + champs F-29 présents.**
+///
+/// Prouve que l'endpoint `/api/v1/vault_context` avec `reference_mode=true` :
+/// 1. Retourne 200 (champ reconnu, aucun crash).
+/// 2. Expose les champs `references` (tableau — vide si corpus vide) et
+///    `counts` (objet avec les 3 sous-champs `inline`, `stub`, `dropped`).
+///
+/// Les invariants de contenu (`references` non vide) sont couverts par les tests unitaires
+/// `context_reference_mode_on_emits_references` et `select_split_inline_then_stub_then_drop`
+/// dans `context_assembly.rs` (tower oneshot + corpus seedé).
+#[tokio::test]
+async fn vault_context_e2e_reference_mode_champs_presents() {
+    let (addr, valid_token) = start_permissive_test_server().await;
+    let client = http_client();
+    let url = format!("http://127.0.0.1:{}/api/v1/vault_context", addr.port());
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {valid_token}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "query": "test reference_mode",
+            "reference_mode": true,
+            "budget_tokens": 1,
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/vault_context reference_mode=true");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "T12-e2e-3 : reference_mode=true doit retourner 200"
+    );
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("body JSON vault_context reference_mode");
+
+    // `references` toujours présent (même vide si corpus vide).
+    assert!(
+        body.get("references").and_then(|v| v.as_array()).is_some(),
+        "T12-e2e-3 : references doit être présent et être un tableau, got: {body}"
+    );
+
+    // `counts` avec les 3 sous-champs invariants F-29.
+    let counts = body
+        .get("counts")
+        .expect("T12-e2e-3 : counts doit être présent dans la réponse");
+    for field in ["inline", "stub", "dropped"] {
+        assert!(
+            counts.get(field).is_some(),
+            "T12-e2e-3 : counts.{field} doit être présent, got counts: {counts}"
+        );
+    }
 }

@@ -6,10 +6,20 @@
 //!
 //! ## Contract
 //!
+//! "Note present/absent" here means **the `.md` file is readable on disk** (what
+//! `read_note` checks) — NOT index presence. A *phantom* note (index entry present
+//! but `.md` absent) is therefore seen as "absent" by this layer and resurrected.
+//!
 //! - `expected_sha256 = None` → unconditional write (backward-compatible behaviour).
-//! - `expected_sha256 = Some(h)` AND note absent → write (note is new).
-//! - `expected_sha256 = Some(h)` AND note present AND `h == current` → write.
-//! - `expected_sha256 = Some(h)` AND note present AND `h != current` → Conflict.
+//! - `expected_sha256 = Some(h)` AND `.md` absent (new OR phantom) → write
+//!   (self-heal: the `.md` is (re)created). For a *phantom* the optimistic lock is
+//!   structurally unverifiable (no current content to hash); the
+//!   `vault_write { note_id = phantom, expected_sha256 = Some }` case is rejected
+//!   **upstream** by the server overwrite guard (409) before any job is enqueued, so
+//!   it never reaches this function. Any other enqueue path that bypasses that guard
+//!   would write unconditionally here — known residual, see the server guard SSOT.
+//! - `expected_sha256 = Some(h)` AND `.md` present AND `h == current` → write.
+//! - `expected_sha256 = Some(h)` AND `.md` present AND `h != current` → Conflict.
 //!
 //! ## Async flow
 //!
@@ -57,7 +67,9 @@ impl Vault {
     ///
     /// ## Errors
     ///
-    /// - `VaultError::Core(NoteNotFound)` cannot occur here (handled by read-before-write).
+    /// - `VaultError::Core(NoteNotFound)` is **handled internally**, never surfaced as
+    ///   `Err`: when `read_note` reports it (new or phantom note), it is caught (see the
+    ///   match arm below) and treated as "no current version" → the write proceeds.
     /// - `VaultError::Storage` / `VaultError::Markdown`: I/O errors.
     /// - `VaultError::Conflict` is never returned as `Err` — it is a `WriteResult` variant.
     pub async fn write_if_match(
@@ -76,7 +88,10 @@ impl Vault {
             // requis uniquement si multi-worker devient nécessaire (v0.5+, F-41 phase 2).
             //
             // Lire la version existante pour comparer les hashes.
-            // NoteNotFound → note nouvelle → pas de conflit possible → écriture directe.
+            // NoteNotFound → `.md` absent (note neuve OU fantôme) → pas de contenu
+            // courant à comparer → écriture directe (self-heal pour le fantôme).
+            // Le cas fantôme + expected_sha256 = Some est filtré en amont (garde serveur
+            // 409) — voir la truth-table du module.
             match self.read_note(id).await {
                 Ok(existing) => {
                     let current = existing.content_hash.0;
@@ -250,6 +265,48 @@ mod tests {
         assert!(
             matches!(result, WriteResult::Written { .. }),
             "note nouvelle avec expected doit retourner Written"
+        );
+    }
+
+    /// Note fantôme (index présent, `.md` absent) + expected_sha256 = None → self-heal :
+    /// le `.md` est (re)créé et redevient relisible. Fige le cas 2 de la décision hybride.
+    #[tokio::test]
+    async fn write_if_match_resurrects_phantom_with_none() {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::create(dir.path(), VaultId::new("main"))
+            .await
+            .unwrap();
+        let id = NoteId::new();
+        // Fabrique un fantôme : entrée d'index SANS fichier `.md` sur disque.
+        vault
+            .index()
+            .seed_note_with_fts(&id.0.to_string(), "decisions", "# t\nfantome")
+            .await
+            .unwrap();
+        // Précondition : la note est bien un fantôme (index présent, `.md` absent).
+        assert!(
+            matches!(
+                vault.read_note(id).await,
+                Err(VaultError::Core(
+                    gradatum_core::error::GradatumError::NoteNotFound(_)
+                ))
+            ),
+            "précondition : la note doit être un fantôme (NoteNotFound)"
+        );
+        // Self-heal : write_if_match(None) ressuscite le `.md`.
+        let result = vault
+            .write_if_match(minimal_fm(), "ressuscite".into(), id, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, WriteResult::Written { .. }),
+            "fantôme + None doit ressusciter (Written)"
+        );
+        // Le `.md` est désormais relisible avec le nouveau contenu.
+        let note = vault.read_note(id).await.unwrap();
+        assert_eq!(
+            note.body.markdown, "ressuscite",
+            "self-heal : le `.md` recréé porte le nouveau contenu"
         );
     }
 }

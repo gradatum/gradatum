@@ -52,7 +52,7 @@ const BADGE_STYLES: Record<string, BadgeStyle> = {
     color: '#44423c',
     background: '#eeede9',
     border: '#c8c5bf',
-    text: 'DEPRECATED',
+    text: 'DOWNGRADED',
   },
   garbage: {
     color: '#b42318',
@@ -86,7 +86,7 @@ const STATUS_TEXT: Record<string, string> = {
   'pending-review':'REVIEW',
   draft:           'DRAFT',
   deprecated:      'DEPRECATED',
-  downgraded:      'DEPRECATED',
+  downgraded:      'DOWNGRADED',
   garbage:         'GARBAGE',
 };
 

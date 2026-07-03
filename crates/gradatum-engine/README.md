@@ -2,7 +2,7 @@
 
 > Rust supervisor for llama-server inference processes — transparent OpenAI-compatible reverse proxy with restart-on-failure.
 
-**Status**: Alpha (v0.4.x) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -11,8 +11,6 @@ Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone fo
 and transparent HTTP proxy. It does not load models itself — it spawns an external
 `llama-server` binary and forwards requests to it, preserving the full OpenAI-compatible
 interface including streaming, vision (mmproj), sampling parameters, and slot IDs.
-
-Architecture in v0.3.x:
 
 1. **Spawn** — launches `llama-server` via `tokio::process::Command` (never via shell).
 2. **Wait-ready** — polls `GET /health` on the child process until it returns 200.
@@ -23,8 +21,19 @@ Architecture in v0.3.x:
    gracefully on SIGTERM.
 
 Supports multi-model deployments (one engine instance per model, each on its own port).
-Bind address is fail-closed: only binds to configured LAN addresses, never open to all
-interfaces by default.
+Binds only the explicitly configured address; it does not default to `0.0.0.0`.
+
+### Operational hardening (v0.7.6)
+
+- **`extra_args` allow-list** — extra `llama-server` flags are validated against a fixed
+  allow-list (`ALLOWED_EXTRA_FLAGS`); unknown flags are rejected at boot. Flags owned by
+  dedicated configuration fields are also rejected — in particular `--n-gpu-layers` (and
+  its aliases), which must be set through the `gpu_layers` config field instead.
+- **Loopback-only `/metrics` listener** — Prometheus metrics are served on a dedicated
+  port always bound to `127.0.0.1` (default `port + 1`, configurable via `metrics_port`),
+  never on the LAN. When running multiple engine instances on contiguous ports, set
+  `metrics_port` explicitly to avoid the `port + 1` default colliding with a neighbouring
+  instance.
 
 ## Usage
 
@@ -36,14 +45,14 @@ gradatum-engine --config /etc/gradatum/engine-curator.toml
 
 When `gradatum_url` is set, each served request emits a metadata-only event to the
 gradatum server (`POST /api/v1/event-log`) — best-effort, never blocking inference.
-Events carry **no prompt or response content** (privacy policy, P2-2).
+Events carry **no prompt or response content**.
 
 ```toml
 [engine]
 model_path  = "/opt/gradatum/models/qwen3-4b.gguf"
 model_kind  = "chat"
 port        = 11435
-# --- event-log (F-19) ---
+# --- event-log ---
 gradatum_url = "http://127.0.0.1:19090"   # loopback only — enables the HTTP event sink
 agent_id     = "engine-curator"            # semantic emitter id (engine-curator|embed|vision|deep)
 ```
@@ -57,7 +66,9 @@ agent_id     = "engine-curator"            # semantic emitter id (engine-curator
 
 | Feature | Description |
 |---|---|
-| `serve` (default) | Compile the Axum HTTP server and llama-server supervisor |
+| `serve` (opt-in) | Compile the Axum HTTP server and llama-server supervisor |
+
+Without the `serve` feature: stub crate (only `VERSION` is exposed).
 
 ## Anti-cycle invariant
 

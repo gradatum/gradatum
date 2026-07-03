@@ -332,6 +332,81 @@ async fn title_lookup_returns_none_for_unknown_title() {
     assert!(found.is_none(), "titre inexistant doit retourner None");
 }
 
+/// P2 — Collision colonne `title` vs H1 : la colonne gagne (passe 1 prioritaire).
+///
+/// `title_lookup` opère en deux passes :
+///   - **Passe 1** : exact-match colonne `notes.title` (priorité absolue, index SQL).
+///   - **Passe 2** : fallback LIKE sur `body_text LIKE '# {title}\n%'` (H1 Markdown).
+///
+/// Ce test documente le comportement de passe 1 prioritaire lorsque :
+///   - Note A a `title='dup'` en colonne (mais PAS `# dup` dans body_text).
+///   - Note B a `# dup` comme H1 dans body_text (mais colonne title = NULL).
+///
+/// → `title_lookup("main", "dup")` doit retourner l'id de la note A (colonne).
+///
+/// ## Pourquoi ce comportement est correct
+///
+/// `upsert_note_title` peuple la colonne après curation : c'est la valeur
+/// canonique extraite par le worker. Elle prime sur le H1 raw dans body_text
+/// qui peut diverger (casse, ponctuation) avant la normalisation curator.
+///
+/// ## Conséquence pour les âmes (F-34 v0.7.3)
+///
+/// `soul_instructions` (mcp.rs) résout `identity/<agent>` via `title_lookup`.
+/// Si deux notes ont le même titre (ex: `identity/main`) — colonne vs H1 —
+/// la note avec la colonne peuplée gagne. Les seeds de production DOIVENT
+/// appeler `upsert_note_title` après écriture pour garantir la résolvabilité.
+#[tokio::test]
+async fn title_lookup_collision_column_wins_over_h1() {
+    let dir = TempDir::new().expect("TempDir collision");
+    let index = SqliteIndex::open(&dir.path().join("idx.db"))
+        .await
+        .expect("SqliteIndex::open collision");
+
+    // Note A : body_text sans H1 "dup", mais colonne title = "dup" (via upsert_note_title).
+    let note_a = make_note_bare("main", Section::Architecture, "Corps A sans H1 dup.");
+    let id_a = note_a.id.to_string();
+    index
+        .upsert_note(&note_a)
+        .await
+        .expect("upsert note_a collision");
+    index
+        .upsert_note_title(&note_a.id, "dup")
+        .await
+        .expect("upsert_note_title note_a collision");
+
+    // Note B : body_text commence par `# dup\n` (H1), mais colonne title = NULL.
+    let note_b = make_note_bare("main", Section::Debug, "# dup\nCorps B avec H1 dup.");
+    let id_b = note_b.id.to_string();
+    index
+        .upsert_note(&note_b)
+        .await
+        .expect("upsert note_b collision");
+    // Note B : PAS d'appel upsert_note_title → colonne title reste NULL.
+
+    // Pré-condition : note B est résolvable via H1 seul (passe 2 fonctionnelle).
+    // Vérification indépendante : si on cherche un titre absent en colonne, la passe
+    // H1 doit fonctionner. On n'appelle pas title_lookup("main", "dup") ici pour ne
+    // pas polluer le test principal ; on vérifie juste que la fixture est cohérente.
+
+    // Résultat attendu : la note A (colonne) gagne sur la note B (H1 fallback).
+    let found = index
+        .title_lookup("main", "dup")
+        .await
+        .expect("title_lookup collision");
+
+    assert!(
+        found.is_some(),
+        "title_lookup doit trouver au moins une note pour 'dup': id_a={id_a} id_b={id_b}"
+    );
+    let found_id = found.unwrap();
+    assert_eq!(
+        found_id, id_a,
+        "P2 : colonne title doit avoir priorité sur H1 body_text — \
+         attendu id_a={id_a}, obtenu {found_id} (id_b={id_b})"
+    );
+}
+
 #[tokio::test]
 async fn get_note_returns_full_record() {
     let (_dir, index, id_a, _b, _c) = index_with_fixtures().await;

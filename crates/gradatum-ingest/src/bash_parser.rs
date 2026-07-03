@@ -1,59 +1,59 @@
-//! Parser tree-sitter pour les fichiers Bash (feature `code-bash`).
+//! Tree-sitter parser for Bash files (feature `code-bash`).
 //!
-//! ## Entités extraites
+//! ## Extracted entities
 //!
-//! - Fonctions (`function_definition`) → `DerivedSymbol` avec `kind = "fn"`.
-//!   Les deux formes Bash sont identiques dans l'AST tree-sitter-bash 0.25.1 :
-//!   `foo() { ... }` et `function bar { ... }` produisent toutes les deux un nœud
-//!   `function_definition` avec un champ nommé `name` de type `word`.
-//! - Assignments top-level (`variable_assignment`) → `kind = "const"` (best-effort :
-//!   Bash n'a pas de notion de constante, mais c'est le kind le plus proche).
+//! - Functions (`function_definition`) → `DerivedSymbol` with `kind = "fn"`.
+//!   Both Bash forms are identical in the tree-sitter-bash 0.25.1 AST:
+//!   `foo() { ... }` and `function bar { ... }` both produce a
+//!   `function_definition` node with a named field `name` of type `word`.
+//! - Top-level assignments (`variable_assignment`) → `kind = "const"` (best-effort:
+//!   Bash has no constant concept, but this is the closest available kind).
 //!
-//! ## Visibilité
+//! ## Visibility
 //!
-//! Bash n'a aucun modificateur syntaxique de visibilité. Tout est `"pub"`.
+//! Bash has no syntactic visibility modifier. Everything is `"pub"`.
 //!
 //! ## Signature
 //!
-//! Bash ne déclare pas de paramètres typés — ils sont positionnels (`$1`, `$2`...).
-//! `signature = None` par design (accuracy > coverage : une signature hallucinée serait trompeuse).
+//! Bash does not declare typed parameters — they are positional (`$1`, `$2`...).
+//! `signature = None` by design (accuracy > coverage: a fabricated signature would be misleading).
 //!
 //! ## Doc-comments
 //!
-//! Les nœuds `comment` (lignes `#`) qui précèdent immédiatement une `function_definition`
-//! en tant que siblings du nœud parent sont extraits comme doc-comment.
-//! Limité à 5 lignes, cohérent avec les autres parsers.
+//! `comment` nodes (lines starting with `#`) that immediately precede a `function_definition`
+//! as siblings of the parent node are extracted as the doc-comment.
+//! Capped at 5 lines, consistent with the other parsers.
 //!
 //! ## Deps (call graph)
 //!
-//! `deps = vec![]` — extraction des callees (nœuds `command_name` sous `command`) différée.
-//! La structure AST permettrait l'extraction, mais accuracy > coverage guide à ne pas
-//! hallucer des dépendances incertaines (alias Bash, fonctions de shell builtin, etc.).
+//! `deps = vec![]` — extraction of callees (`command_name` nodes under `command`) is deferred.
+//! The AST structure would allow extraction, but accuracy > coverage means uncertain
+//! dependencies (Bash aliases, shell builtins, etc.) are intentionally omitted.
 //!
-//! ## Non-extraits (accuracy > coverage)
+//! ## Not extracted (accuracy > coverage)
 //!
-//! - Assignments dans des sous-blocs (dans une fonction) : uniquement le niveau `program` racine.
-//! - Fonctions définies dynamiquement (via eval, export -f) : invisibles à tree-sitter.
-//! - Fonctions importées via `source` ou `.` : ignorées.
+//! - Assignments inside sub-blocks (inside a function): only the root `program` level.
+//! - Dynamically defined functions (via `eval`, `export -f`): invisible to tree-sitter.
+//! - Functions imported via `source` or `.`: ignored.
 
 use tree_sitter::Node;
 
 use crate::DerivedSymbol;
 
-/// Retourne le texte UTF-8 d'un nœud tree-sitter.
+/// Returns the UTF-8 text of a tree-sitter node.
 ///
-/// ## Invariant de sécurité
+/// ## Safety invariant
 ///
-/// `source` doit être le MÊME buffer passé à `parser.parse(content, None)`.
-/// Les offsets byte de l'AST sont garantis dans ce slice.
-/// `.unwrap_or("")` est défensif mais ne se déclenche normalement jamais.
+/// `source` must be the SAME buffer passed to `parser.parse(content, None)`.
+/// The AST byte offsets are guaranteed to lie within this slice.
+/// `.unwrap_or("")` is defensive but should never trigger.
 fn node_text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
-/// Calcule le span 1-based inclusif `(start_line, end_line)` d'un nœud.
+/// Computes the 1-based inclusive span `(start_line, end_line)` of a node.
 ///
-/// Mirror de la même fonction dans `python_parser.rs` et `rust_parser.rs`.
+/// Mirrors the same function in `python_parser.rs` and `rust_parser.rs`.
 fn extract_node_span(node: Node<'_>) -> Option<(u32, u32)> {
     let start_line = (node.start_position().row as u32).saturating_add(1);
     let end_line = if node.end_position().column == 0 && node.end_position().row > 0 {
@@ -68,11 +68,11 @@ fn extract_node_span(node: Node<'_>) -> Option<(u32, u32)> {
     Some((start_line, end_line))
 }
 
-/// Extrait les lignes de commentaire précédant immédiatement un nœud cible.
+/// Extracts comment lines that immediately precede the target node.
 ///
-/// Parcourt les siblings précédents du nœud dans son parent immédiat.
-/// Ne collecte que les `comment` contigus (s'arrête dès qu'un sibling non-comment
-/// est rencontré en remontant). Limité à 5 lignes.
+/// Walks the node's previous siblings in its immediate parent.
+/// Collects only contiguous `comment` nodes (stops as soon as a non-comment
+/// sibling is encountered when going backwards). Capped at 5 lines.
 fn extract_preceding_comments(node: Node<'_>, source: &[u8]) -> Option<String> {
     // Collecter les siblings précédents dans l'ordre inverse.
     let parent = node.parent()?;
@@ -119,12 +119,12 @@ fn extract_preceding_comments(node: Node<'_>, source: &[u8]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// Extrait une `function_definition` Bash.
+/// Extracts a Bash `function_definition`.
 ///
-/// Dans l'AST tree-sitter-bash 0.25.1, `function_definition` a un champ nommé `name`
-/// de type `word` (nom de la fonction) et un champ `body` de type `compound_statement`.
-/// Les deux formes syntaxiques (`foo(){}` et `function foo {}`) produisent le même nœud
-/// dans l'AST — pas besoin de les distinguer.
+/// In the tree-sitter-bash 0.25.1 AST, `function_definition` has a named field `name`
+/// of type `word` (the function name) and a field `body` of type `compound_statement`.
+/// Both syntactic forms (`foo(){}` and `function foo {}`) produce the same AST node —
+/// no disambiguation is needed.
 fn extract_function(node: Node<'_>, source: &[u8], source_path: &str) -> Option<DerivedSymbol> {
     // Champ nommé `name` (type `word`) — le nom de la fonction.
     let name_node = node.child_by_field_name("name")?;
@@ -154,14 +154,14 @@ fn extract_function(node: Node<'_>, source: &[u8], source_path: &str) -> Option<
     })
 }
 
-/// Extrait un `variable_assignment` top-level.
+/// Extracts a top-level `variable_assignment`.
 ///
-/// Dans l'AST tree-sitter-bash 0.25.1, `variable_assignment` a :
-/// - Un champ nommé `name` de type `variable_name`.
-/// - Un champ nommé `value` (optionnel).
+/// In the tree-sitter-bash 0.25.1 AST, `variable_assignment` has:
+/// - A named field `name` of type `variable_name`.
+/// - An optional named field `value`.
 ///
-/// Kind = "const" (best-effort — Bash n'a pas de constante syntaxique,
-/// mais les assignments top-level correspondent à des variables de configuration).
+/// Kind = `"const"` (best-effort — Bash has no syntactic constant concept,
+/// but top-level assignments typically represent configuration variables).
 fn extract_variable_assignment(
     node: Node<'_>,
     source: &[u8],
@@ -189,9 +189,9 @@ fn extract_variable_assignment(
     })
 }
 
-/// Extrait les items top-level d'un programme Bash.
+/// Extracts top-level items from a Bash program.
 ///
-/// Parcourt les enfants directs du nœud `program` (racine de l'AST Bash).
+/// Iterates over the direct children of the `program` node (root of the Bash AST).
 fn extract_program_items(
     program_node: Node<'_>,
     source: &[u8],
@@ -217,10 +217,10 @@ fn extract_program_items(
     }
 }
 
-/// Implémentation [`crate::language_parser::LanguageParser`] pour Bash (tree-sitter-bash).
+/// [`crate::language_parser::LanguageParser`] implementation for Bash (tree-sitter-bash).
 ///
-/// Encapsule la connaissance de la grammaire Bash : node-kinds, extraction de symboles.
-/// Pas de champ `include_private` : Bash n'a aucun modificateur de visibilité syntaxique.
+/// Encapsulates Bash grammar knowledge: node kinds and symbol extraction.
+/// No `include_private` field: Bash has no syntactic visibility modifier.
 pub(crate) struct BashParser;
 
 impl crate::language_parser::LanguageParser for BashParser {

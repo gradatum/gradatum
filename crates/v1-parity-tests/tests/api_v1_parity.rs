@@ -396,9 +396,13 @@ async fn shape_vault_trace() {
     );
 }
 
-/// Shape parity : vault_context — `{ context: "", estimated_tokens: 0, sources: [] }`.
+/// Shape parity : vault_context — contrat v0.7.0 Context Assembly.
 ///
-/// Shape : `context` (string), `estimated_tokens` (number), `sources` (array).
+/// Shape : `assembled_text` (string), `budget_used` (number), `included` (array),
+/// `diagnostics` (object). Renommage acté v0.7.0 (opérateur GO 2026-06-26) :
+/// ex-`{ context, estimated_tokens, sources }` → contrat enrichi. Aucun consommateur
+/// programmatique des anciens champs (skills=0, scripts=0, agents=grant seul,
+/// studio/worker ne consomment pas) — rupture sûre, pas d'alias déprécié.
 #[tokio::test]
 async fn shape_vault_context() {
     let (addr, bearer) = spawn_test_server().await;
@@ -420,28 +424,36 @@ async fn shape_vault_context() {
         .await
         .expect("vault_context : body JSON parseable");
     assert!(
-        body.get("context").is_some(),
-        "vault_context : champ 'context' absent — DTO VaultContextResponse"
+        body.get("assembled_text").is_some(),
+        "vault_context : champ 'assembled_text' absent — DTO VaultContextResponse v0.7.0"
     );
     assert!(
-        body["context"].is_string(),
-        "vault_context : 'context' doit être une string"
+        body["assembled_text"].is_string(),
+        "vault_context : 'assembled_text' doit être une string"
     );
     assert!(
-        body.get("estimated_tokens").is_some(),
-        "vault_context : champ 'estimated_tokens' absent — DTO VaultContextResponse"
+        body.get("budget_used").is_some(),
+        "vault_context : champ 'budget_used' absent — DTO VaultContextResponse v0.7.0"
     );
     assert!(
-        body["estimated_tokens"].is_number(),
-        "vault_context : 'estimated_tokens' doit être un number"
+        body["budget_used"].is_number(),
+        "vault_context : 'budget_used' doit être un number"
     );
     assert!(
-        body.get("sources").is_some(),
-        "vault_context : champ 'sources' absent — DTO VaultContextResponse"
+        body.get("included").is_some(),
+        "vault_context : champ 'included' absent — DTO VaultContextResponse v0.7.0"
     );
     assert!(
-        body["sources"].is_array(),
-        "vault_context : 'sources' doit être un array"
+        body["included"].is_array(),
+        "vault_context : 'included' doit être un array"
+    );
+    assert!(
+        body.get("diagnostics").is_some(),
+        "vault_context : champ 'diagnostics' absent — DTO VaultContextResponse v0.7.0"
+    );
+    assert!(
+        body["diagnostics"].is_object(),
+        "vault_context : 'diagnostics' doit être un object"
     );
 }
 

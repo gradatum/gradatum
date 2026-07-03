@@ -57,6 +57,62 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[".rs", ".py", ".sh", ".bash", ".ts",
 /// (macros complexes, build-generated, etc.) sans laisser passer un bug systémique.
 pub const CODE_MAP_REBUILD_MAX_FAILURES: u32 = 3;
 
+/// Nombre maximal de tentatives de rebuild autorisées après détection d'un marqueur
+/// `.ingest-incomplete-<vault>`.
+///
+/// ## Problème
+///
+/// Si `run_ingest` crashe systématiquement (panic dans l'index, corruption DB, OOM),
+/// le marqueur est re-posé à chaque tentative. Le prochain `run_update` détecte le
+/// marqueur et re-tente un rebuild, qui crashe à nouveau → boucle infinie coûteuse.
+///
+/// ## Solution
+///
+/// Le contenu du marqueur encode le compteur de tentatives (ASCII décimal, ex: `"2"`).
+///
+/// - À la détection : lire le compteur. Si `>= CODE_MAP_REBUILD_MAX_RETRY` →
+///   retourner `Err` (abandon). L'opérateur doit supprimer le marqueur manuellement.
+/// - Avant le rebuild : incrémenter et réécrire le compteur.
+/// - Après un run réussi : le marqueur est supprimé → compteur reset implicitement.
+///
+/// Justification N=3 : cohérent avec `CODE_MAP_REBUILD_MAX_FAILURES` (même philosophie
+/// de tolérance). Permet jusqu'à 3 tentatives transitoires (SIGKILL accidentel, reboot)
+/// avant d'alerter sur une boucle pathologique.
+pub const CODE_MAP_REBUILD_MAX_RETRY: u32 = 3;
+
+/// Lit le compteur de tentatives rebuild depuis le contenu du fichier marqueur.
+///
+/// Le fichier marqueur contient un entier décimal ASCII (ex: `"2"`).
+/// Retourne `0` si le fichier est absent, vide, ou non-parseable (conservative fallback).
+///
+/// # Errors (silencieusement ignorées)
+///
+/// Les erreurs de lecture ou de parse sont silencieusement traitées comme `0` :
+/// un compteur non-lisible ne doit pas bloquer l'ingest — le pire cas est une
+/// tentative supplémentaire, pas un blocage définitif.
+pub fn read_marker_attempts(path: &Path) -> u32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Écrit le compteur de tentatives rebuild dans le fichier marqueur.
+///
+/// Le contenu est un entier décimal ASCII (ex: `"2"`).
+///
+/// # Errors
+///
+/// Retourne une erreur si l'écriture filesystem échoue.
+pub fn write_marker_attempts(path: &Path, count: u32) -> Result<()> {
+    std::fs::write(path, count.to_string().as_bytes()).with_context(|| {
+        format!(
+            "write_marker_attempts : écriture compteur dans {}",
+            path.display()
+        )
+    })
+}
+
 /// Report returned by an ingest run.
 #[derive(Debug, Default)]
 pub struct IngestReport {
@@ -210,10 +266,51 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
     let need_rebuild = args.rebuild || marker_path.exists();
     if need_rebuild {
         if marker_path.exists() {
+            // ── Garde-fou anti-boucle rebuild ────────────────────────────────────
+            //
+            // Si `run_ingest` crashe systématiquement (OOM, panic DB, corruption),
+            // le marqueur est re-posé à chaque tentative → boucle infinie coûteuse.
+            //
+            // Mécanisme : le contenu du marqueur encode le nombre de tentatives
+            // précédentes (ASCII décimal). Si >= CODE_MAP_REBUILD_MAX_RETRY,
+            // on abandonne et on demande une intervention manuelle.
+            let attempts = read_marker_attempts(&marker_path);
+            if attempts >= CODE_MAP_REBUILD_MAX_RETRY {
+                tracing::error!(
+                    vault_id = %args.vault_id,
+                    marker = %marker_path.display(),
+                    attempts,
+                    max = CODE_MAP_REBUILD_MAX_RETRY,
+                    "garde-fou anti-boucle : {} tentatives de rebuild échouées — \
+                     abandon. Intervention manuelle requise : supprimer le marqueur \
+                     ou réparer l'index.",
+                    attempts
+                );
+                anyhow::bail!(
+                    "trop de tentatives de rebuild échouées ({attempts} >= \
+                     {CODE_MAP_REBUILD_MAX_RETRY}) pour le vault '{}' — \
+                     marqueur : {}. Supprimer le marqueur manuellement pour débloquer.",
+                    args.vault_id,
+                    marker_path.display()
+                );
+            }
+
+            // Incrémenter et réécrire le compteur AVANT le rebuild (le run peut crasher).
+            write_marker_attempts(&marker_path, attempts + 1).with_context(|| {
+                format!(
+                    "write_marker_attempts avant rebuild : {}",
+                    marker_path.display()
+                )
+            })?;
+
             tracing::warn!(
                 vault_id = %args.vault_id,
                 marker = %marker_path.display(),
-                "marqueur run incomplet détecté — run précédent interrompu. Forçage rebuild."
+                attempt = attempts + 1,
+                max = CODE_MAP_REBUILD_MAX_RETRY,
+                "marqueur run incomplet détecté — run précédent interrompu. \
+                 Tentative rebuild {}/{CODE_MAP_REBUILD_MAX_RETRY}.",
+                attempts + 1
             );
         }
 
@@ -227,14 +324,18 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
         // Required order: marker_write → delete_vault → (rest of run) → marker_remove.
         // The marker is absent in the non-rebuild case (no drop); it is placed again
         // below before the first write of Phase 1 to cover the non-rebuild case too.
-        // In rebuild mode this placement is redundant but idempotent
-        // (`O_CREAT|O_TRUNC` on an existing file is a net no-op).
-        std::fs::write(&marker_path, b"").with_context(|| {
-            format!(
-                "pose marqueur avant drop rebuild : {}",
-                marker_path.display()
-            )
-        })?;
+        // In rebuild mode this placement is redundant but idempotent :
+        // `write_marker_attempts` a déjà mis à jour le contenu (compteur).
+        // Pour le cas rebuild explicite (args.rebuild=true, marker absent) :
+        // on pose le marqueur avec compteur 0 initial.
+        if !marker_path.exists() {
+            write_marker_attempts(&marker_path, 0).with_context(|| {
+                format!(
+                    "pose marqueur avant drop rebuild : {}",
+                    marker_path.display()
+                )
+            })?;
+        }
 
         let deleted = index
             .delete_vault_from_index(&args.vault_id)
@@ -286,12 +387,17 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
     // Place (or re-place) the marker before Phase 1.
     //
     // Non-rebuild mode: first placement (covers the first write of Phase 1).
-    // Rebuild mode: idempotent re-placement (`O_CREAT|O_TRUNC`). The marker was already
-    // placed before `delete_vault_from_index` (see above); it is re-placed here
-    // to consolidate the visible placement point and ensure it is present before
-    // any Phase 1 write, even if the rebuild block evolves in the future.
-    std::fs::write(&marker_path, b"")
-        .with_context(|| format!("pose marqueur ingest incomplet : {}", marker_path.display()))?;
+    //   Le marqueur est posé avec compteur 0 si absent (premier run normal).
+    //   Si présent (rebuild forcé depuis ce bloc), le compteur est conservé
+    //   (write_marker_attempts l'a déjà mis à jour dans le bloc rebuild ci-dessus).
+    //
+    // Rebuild mode: le marqueur a déjà été écrit avec le compteur incrémenté.
+    //   On ne réécrit PAS avec `b""` pour ne pas effacer le compteur.
+    if !marker_path.exists() {
+        write_marker_attempts(&marker_path, 0).with_context(|| {
+            format!("pose marqueur ingest incomplet : {}", marker_path.display())
+        })?;
+    }
 
     // ── Phase 1: process git files ───────────────────────────────────────────
 
@@ -1271,6 +1377,104 @@ mod tests {
             SUPPORTED_EXTENSIONS.len(),
             6,
             "SUPPORTED_EXTENSIONS doit avoir exactement 6 entrées"
+        );
+    }
+
+    // ── Tests garde-fou anti-boucle rebuild ──────────────────────────────────
+
+    /// La constante `CODE_MAP_REBUILD_MAX_RETRY` vaut 3 (valeur contractuelle).
+    ///
+    /// Cohérente avec `CODE_MAP_REBUILD_MAX_FAILURES`. Modifier ce test si
+    /// la valeur est intentionnellement changée.
+    #[test]
+    fn rebuild_max_retry_constant_is_three() {
+        assert_eq!(
+            CODE_MAP_REBUILD_MAX_RETRY, 3,
+            "CODE_MAP_REBUILD_MAX_RETRY doit valoir 3"
+        );
+    }
+
+    /// `read_marker_attempts` retourne 0 sur un fichier absent.
+    #[test]
+    fn read_marker_attempts_returns_zero_on_missing_file() {
+        let tmp = tempfile::NamedTempFile::new().expect("NamedTempFile");
+        // Supprimer le fichier pour simuler l'absence.
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        assert!(!path.exists(), "précondition : fichier absent");
+        assert_eq!(
+            read_marker_attempts(&path),
+            0,
+            "fichier absent → compteur 0"
+        );
+    }
+
+    /// `read_marker_attempts` retourne 0 sur un fichier vide (marqueur legacy `b""`).
+    #[test]
+    fn read_marker_attempts_returns_zero_on_empty_file() {
+        let tmp = tempfile::NamedTempFile::new().expect("NamedTempFile");
+        // Fichier vide = marqueur posé par l'ancienne implémentation.
+        std::fs::write(tmp.path(), b"").expect("écriture fichier vide");
+        assert_eq!(
+            read_marker_attempts(tmp.path()),
+            0,
+            "fichier vide → compteur 0 (marqueur legacy)"
+        );
+    }
+
+    /// `write_marker_attempts` + `read_marker_attempts` : round-trip.
+    ///
+    /// Écrire N puis relire doit retourner N.
+    #[test]
+    fn write_and_read_marker_attempts_round_trip() {
+        let tmp = tempfile::NamedTempFile::new().expect("NamedTempFile");
+        for n in [0u32, 1, 2, CODE_MAP_REBUILD_MAX_RETRY, 10] {
+            write_marker_attempts(tmp.path(), n)
+                .expect("write_marker_attempts ne doit pas échouer");
+            assert_eq!(
+                read_marker_attempts(tmp.path()),
+                n,
+                "round-trip : écriture {n} → lecture {n}"
+            );
+        }
+    }
+
+    /// `read_marker_attempts` + `write_marker_attempts` : le compteur au seuil
+    /// est lu correctement, et les valeurs autour du seuil sont distinctes.
+    ///
+    /// Vérifie la frontière `< MAX_RETRY` (autorisé) vs `>= MAX_RETRY` (bloqué)
+    /// en utilisant le round-trip I/O plutôt que des assertions sur constantes.
+    #[test]
+    fn marker_attempts_threshold_boundary_via_io() {
+        let tmp = tempfile::NamedTempFile::new().expect("NamedTempFile");
+
+        // Valeur juste sous le seuil → doit être < MAX_RETRY.
+        let below = CODE_MAP_REBUILD_MAX_RETRY - 1;
+        write_marker_attempts(tmp.path(), below).expect("write below");
+        let read_below = read_marker_attempts(tmp.path());
+        assert_eq!(read_below, below, "round-trip below seuil");
+        assert!(
+            read_below < CODE_MAP_REBUILD_MAX_RETRY,
+            "below seuil : {read_below} doit être < {CODE_MAP_REBUILD_MAX_RETRY}"
+        );
+
+        // Valeur exactement au seuil → doit déclencher le guard (>= MAX_RETRY).
+        write_marker_attempts(tmp.path(), CODE_MAP_REBUILD_MAX_RETRY).expect("write at seuil");
+        let read_at = read_marker_attempts(tmp.path());
+        assert_eq!(read_at, CODE_MAP_REBUILD_MAX_RETRY, "round-trip at seuil");
+        assert!(
+            read_at >= CODE_MAP_REBUILD_MAX_RETRY,
+            "at seuil : {read_at} doit déclencher le guard (>= {CODE_MAP_REBUILD_MAX_RETRY})"
+        );
+
+        // Valeur au-dessus du seuil → doit aussi déclencher le guard.
+        let above = CODE_MAP_REBUILD_MAX_RETRY + 1;
+        write_marker_attempts(tmp.path(), above).expect("write above");
+        let read_above = read_marker_attempts(tmp.path());
+        assert_eq!(read_above, above, "round-trip above seuil");
+        assert!(
+            read_above >= CODE_MAP_REBUILD_MAX_RETRY,
+            "above seuil : {read_above} doit déclencher le guard (>= {CODE_MAP_REBUILD_MAX_RETRY})"
         );
     }
 }

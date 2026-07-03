@@ -4,9 +4,11 @@
 //!
 //! Behavior:
 //! - `bearer_token` is `None` in `AppState` → no authentication, open/test mode.
-//! - `bearer_token` is `Some(token)` → requires `Authorization: Bearer <token>` on all
-//!   endpoints except `/health` and loopback connections (when `trust_localhost = true`).
+//! - `bearer_token` is `Some(token)` → requires `Authorization: Bearer <token>`
+//!   (OpenAI convention) OR `x-api-key: <token>` (Anthropic convention)
+//!   on all endpoints except `/health` and loopback connections (when `trust_localhost = true`).
 //! - `/health` is ALWAYS public regardless of configuration.
+//! - `anthropic-version` header is tolerated (ignored, not validated).
 //! - Loopback bypass relies on `ConnectInfo<SocketAddr>.ip().is_loopback()` — the real
 //!   TCP address supplied by the kernel. HTTP headers (`X-Forwarded-For`, `X-Real-IP`) are
 //!   intentionally ignored for this decision and cannot grant the bypass.
@@ -72,13 +74,21 @@ pub async fn bearer_auth(
         // ConnectInfo absent (mocked transport, no real socket) → deny by default.
     }
 
-    // Extract the token from the Authorization header.
+    // Extract the token from either Authorization: Bearer <token>
+    // or x-api-key: <token> (Anthropic convention).
+    // Both are equivalent — same token, constant-time comparison.
     let provided = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|s| s.to_owned());
+        .map(|s| s.to_owned())
+        .or_else(|| {
+            req.headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_owned())
+        });
 
     match provided {
         // Constant-time comparison — guards against timing oracles.
@@ -125,6 +135,7 @@ mod tests {
             aliases: HashMap::new(),
             gateway: HashMap::new(),
             vault_aware: Default::default(),
+            messages: Default::default(),
         };
 
         let mut state = AppState::for_test(config);
@@ -164,6 +175,7 @@ mod tests {
             aliases: HashMap::new(),
             gateway: HashMap::new(),
             vault_aware: Default::default(),
+            messages: Default::default(),
         };
 
         let mut state = AppState::for_test(config);
@@ -358,6 +370,7 @@ mod tests {
                 aliases: HashMap::new(),
                 gateway: HashMap::new(),
                 vault_aware: Default::default(),
+                messages: Default::default(),
             };
             AppState::for_test(config)
         };

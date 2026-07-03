@@ -1,45 +1,45 @@
-//! Abstraction générique de parser de langage (feature `code-rust`).
+//! Generic language-parser abstraction (feature `code-rust`).
 //!
-//! Ce module expose le trait [`LanguageParser`] et la fonction pipeline
-//! [`parse_with_language_parser`] qui orchestre le pipeline tree-sitter commun :
-//! création du Parser, `set_language`, `parse`, gestion d'erreurs.
+//! This module exposes the [`LanguageParser`] trait and the pipeline function
+//! [`parse_with_language_parser`], which orchestrates the common tree-sitter pipeline:
+//! creating the `Parser`, calling `set_language`, `parse`, and handling errors.
 //!
-//! Les détails propres à chaque langage (grammaire, extraction de symboles) sont
-//! délégués aux implémentations du trait.
+//! Language-specific details (grammar, symbol extraction) are delegated to
+//! implementations of the trait.
 //!
-//! ## Extensibilité
+//! ## Extensibility
 //!
-//! Pour ajouter le support d'un nouveau langage (TypeScript, Python, Bash…) :
-//! 1. Créer un fichier `<lang>_parser.rs` dans ce crate.
-//! 2. Y définir un struct `<Lang>Parser { … }` qui implémente `LanguageParser`.
-//! 3. Exposer une fonction `parse_<lang>_file` dans `lib.rs` qui instancie le struct
-//!    et appelle `parse_with_language_parser`.
+//! To add support for a new language (TypeScript, Python, Bash, ...):
+//! 1. Create a `<lang>_parser.rs` file in this crate.
+//! 2. Define a struct `<Lang>Parser { … }` that implements `LanguageParser`.
+//! 3. Expose a `parse_<lang>_file` function in `lib.rs` that instantiates the struct
+//!    and calls `parse_with_language_parser`.
 //!
-//! Le pipeline commun (ce module) n'a pas à changer.
+//! The common pipeline (this module) does not need to change.
 
 use crate::{DerivedSymbol, IngestError};
 
-/// Abstraction d'un parser pour un langage source vers des symboles dérivés.
+/// Abstraction of a source-language parser producing derived symbols.
 ///
-/// Un impl de ce trait encapsule la connaissance spécifique au langage :
-/// - la grammaire tree-sitter à utiliser,
-/// - la logique d'extraction de symboles depuis l'AST.
+/// An impl of this trait encapsulates language-specific knowledge:
+/// - the tree-sitter grammar to use,
+/// - the symbol extraction logic from the AST.
 ///
-/// Le pipeline commun (création du Parser, set_language, parse, gestion d'erreurs)
-/// est externalisé dans [`parse_with_language_parser`].
+/// The common pipeline (creating the `Parser`, `set_language`, `parse`, error handling)
+/// is factored out in [`parse_with_language_parser`].
 ///
 /// # Errors
-/// Voir [`IngestError`].
+/// See [`IngestError`].
 pub(crate) trait LanguageParser {
-    /// Retourne la grammaire tree-sitter pour ce langage.
+    /// Returns the tree-sitter grammar for this language.
     fn ts_language(&self) -> tree_sitter::Language;
 
-    /// Extrait les symboles depuis un AST tree-sitter parsé.
+    /// Extracts symbols from a parsed tree-sitter AST.
     ///
-    /// # Paramètres
-    /// - `tree` : l'AST produit par `tree_sitter::Parser::parse`.
-    /// - `source` : les bytes sources (identiques à ceux passés au parser).
-    /// - `source_path` : chemin relatif du fichier (pour les erreurs et les DerivedSymbol).
+    /// # Parameters
+    /// - `tree`: the AST produced by `tree_sitter::Parser::parse`.
+    /// - `source`: the source bytes (identical to those passed to the parser).
+    /// - `source_path`: relative file path (used in errors and `DerivedSymbol` fields).
     fn extract_symbols(
         &self,
         tree: &tree_sitter::Tree,
@@ -48,12 +48,12 @@ pub(crate) trait LanguageParser {
     ) -> Vec<DerivedSymbol>;
 }
 
-/// Orchestre le pipeline commun : crée un Parser tree-sitter, set_language,
-/// parse les bytes sources, puis délègue l'extraction au [`LanguageParser`] fourni.
+/// Runs the common pipeline: creates a tree-sitter `Parser`, calls `set_language`,
+/// parses the source bytes, then delegates extraction to the provided [`LanguageParser`].
 ///
 /// # Errors
-/// - [`IngestError::ParseError`] si `set_language` échoue.
-/// - Retourne `Ok(Vec::new())` si `parser.parse` retourne `None` (fichier ignoré silencieusement).
+/// - [`IngestError::ParseError`] if `set_language` fails.
+/// - Returns `Ok(Vec::new())` if `parser.parse` returns `None` (file silently ignored).
 pub(crate) fn parse_with_language_parser(
     parser_impl: &dyn LanguageParser,
     source_path: &str,

@@ -345,25 +345,34 @@ impl SqliteIndex {
         Ok(Lineage { parents, children })
     }
 
-    /// Looks up a note by its Markdown title (first line `# {title}`).
+    /// Looks up a note by title — `title` column exact-match first, H1 fallback second.
     ///
     /// Returns the ULID of the first matching note, or `None`.
     ///
-    /// ## Implementation
+    /// ## Two-pass resolution (since v0.7.3)
     ///
-    /// The search uses `body_text LIKE '# ' || ?1 || char(10) || '%' ESCAPE '\\'`
-    /// to match the first Markdown H1 line. Limited to 1 result (first by `created DESC`).
+    /// 1. **Column exact-match**: queries `title = ?2` (no LIKE — no escaping needed).
+    ///    The column is populated by `upsert_note_title` on every `persist_curated`.
+    ///    If a note is found it is returned immediately.
     ///
-    /// SQLite LIKE wildcards `%`, `_`, and `\` in the title are escaped before
-    /// interpolation — the LIKE predicate is exact.
+    /// 2. **H1 fallback**: if no note matches via the column, falls back to
+    ///    `body_text LIKE '# {title}\n%'` (backward-compatible corpus-wide).
+    ///
+    /// ## Collision policy
+    ///
+    /// If note A has `title='dup'` (column) and note B has the H1 `# dup` without a
+    /// column entry, **the column wins**: note A is returned (pass 1 succeeds before pass 2).
     ///
     /// ## `status = 'live'` filter
     ///
-    /// Notes with `status != 'live'` (downgraded, etc.) are **excluded** from title
+    /// Notes with `status != 'live'` (downgraded, deprecated, etc.) are **excluded** from title
     /// resolution — an archived note is not addressable by title.
+    ///    This filter applies to **both passes**.
     ///
-    /// The `title` column is sparsely populated in existing vaults; the query uses
-    /// `body_text LIKE` for corpus-wide backward compatibility.
+    /// ## LIKE escaping (pass 2 only)
+    ///
+    /// SQLite LIKE wildcards `%`, `_`, and `\` in the title are escaped before
+    /// interpolation — pass 1 exact-match does not use LIKE.
     ///
     /// # Errors
     ///
@@ -375,6 +384,31 @@ impl SqliteIndex {
     ) -> Result<Option<String>, GradatumError> {
         let conn = self.conn.lock().await;
 
+        // ── Passe 1 : exact-match colonne `title` (priorité absolue) ──────────────
+        //
+        // Ne pas utiliser LIKE — l'exact-match sur colonne indexée n'a pas besoin d'escape.
+        // Exclut sentinelles + notes non-live (même garde que passe 2).
+        match conn.query_row(
+            "SELECT id FROM notes
+             WHERE vault_id = ?1 AND title = ?2
+               AND id NOT LIKE '__sentinel__%'
+               AND status = 'live'
+             ORDER BY created DESC
+             LIMIT 1",
+            rusqlite::params![vault_id, title],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(id) => return Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {} // → passe 2
+            Err(e) => {
+                return Err(GradatumError::Storage(format!(
+                    "title_lookup (colonne) : {e}"
+                )));
+            }
+        }
+
+        // ── Passe 2 : fallback LIKE H1 (backward-compat corpus) ───────────────────
+        //
         // C1 alpha.15 : escape les wildcards SQLite avant interpolation.
         // Sans escape, un titre contenant `%` ou `_` produirait des faux positifs LIKE.
         let escaped = escape_like_pattern(title);
@@ -398,7 +432,7 @@ impl SqliteIndex {
         ) {
             Ok(id) => Ok(Some(id)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(GradatumError::Storage(format!("title_lookup : {e}"))),
+            Err(e) => Err(GradatumError::Storage(format!("title_lookup (H1) : {e}"))),
         }
     }
 

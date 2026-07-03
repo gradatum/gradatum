@@ -12,17 +12,26 @@ mod api_v1;
 mod audit_jsonl;
 mod auth_routes;
 mod config;
+mod context;
+mod curated_metrics;
 mod event_log_store;
 mod health;
 mod internal;
 mod jwt_key_boot;
+mod mcp_usage;
 mod metrics;
 mod middleware;
+mod proactive_recall;
+mod proactive_recall_store;
+mod proactive_surface_store;
 mod read_usage_store;
+mod review_promote;
+mod scheduled_tasks;
 mod session_trace_store;
 mod state;
 mod stubs;
 mod studio;
+mod telemetry_flush;
 /// Enregistrement de l'extension sqlite-vec (unsafe confiné ici, hors `gradatum-index`).
 mod vec_ext;
 
@@ -236,7 +245,12 @@ async fn main() -> anyhow::Result<()> {
         .with_scoring(gradatum_search::TrustDecayConfig {
             enabled: cfg.scoring.trust_decay_enabled,
             half_life_days: cfg.scoring.half_life_days.clone(),
-        });
+        })
+        // F-35 Task 11 — câblage context config (budget, top_n, skills, embed_timeout).
+        .with_context(cfg.context.clone())
+        // v0.7.5 F-85 T5 — intervalles des tâches récurrentes disponibles dans
+        // `GET /api/v1/system/scheduled` via task_interval_secs SSOT.
+        .with_server_config(cfg.clone());
 
     // ANN-5 backfill au boot : remplir la table vec0 depuis les embeddings existants.
     //
@@ -397,6 +411,30 @@ async fn main() -> anyhow::Result<()> {
         "SessionTraceStore (session-log Tier 1) câblé sur index.db"
     );
 
+    // Surface proactive pré-calculée (F-46, Active Recall v0.7.1) — câblage ProactiveSurfaceStore
+    // sur la même DB que SqliteIndex. La migration 0022 (table proactive_surface) est
+    // exécutée par `with_search_path`. Connexion WAL dédiée (safe multi-connexion).
+    let state = state
+        .with_proactive_surface_path(&search_path)
+        .await
+        .context("ProactiveSurfaceStore init failed")?;
+    tracing::info!(
+        path = %search_path.display(),
+        "ProactiveSurfaceStore (surface proactive F-46) câblé sur index.db"
+    );
+
+    // Sessions + feedback proactif (F-46, Active Recall v0.7.1) — câblage ProactiveRecallStore
+    // sur la même DB que SqliteIndex. La migration 0023 (tables proactive_recall_sessions +
+    // proactive_recall_feedback) est exécutée par `with_search_path`. Connexion WAL dédiée.
+    let state = state
+        .with_proactive_recall_path(&search_path)
+        .await
+        .context("ProactiveRecallStore init failed")?;
+    tracing::info!(
+        path = %search_path.display(),
+        "ProactiveRecallStore (sessions+feedback recall proactif F-46) câblé sur index.db"
+    );
+
     // Télémétrie usage read-paths (v0.5.3 #4) — ReadUsageCounterStore sur index.db.
     // La migration 0019 (table read_usage_counters) est exécutée par `with_search_path`.
     let state = state
@@ -408,30 +446,85 @@ async fn main() -> anyhow::Result<()> {
         "ReadUsageCounterStore (télémétrie read-paths) câblé sur index.db"
     );
 
-    // Tâche flush 60s : swap+reset des AtomicU64 → UPSERT dans read_usage_counters.
+    // Télémétrie usage — seed Prometheus au boot depuis la DB (P1-3 reviewer).
+    //
+    // INVARIANT P1-3 : seed_metrics_from_db DOIT être complété (await) AVANT le
+    // tokio::spawn de la boucle flush ci-dessous. Sinon un premier flush pourrait
+    // écrire en DB une donnée que le seed relit → double-count.
+    {
+        let read_usage_store_seed = state
+            .read_usage
+            .as_ref()
+            .expect("ReadUsageCounterStore câblé — invariant post with_read_usage_path");
+        if let Err(e) =
+            crate::telemetry_flush::seed_metrics_from_db(read_usage_store_seed, &state.metrics)
+                .await
+        {
+            tracing::warn!(
+                error = %e,
+                "seed_metrics_from_db échoué au boot — familles Prometheus non seedées (non fatal)"
+            );
+        }
+    }
+
+    // Seed des 7 tâches récurrentes au boot (v0.7.5 F-85).
+    //
+    // INSERT OR IGNORE → idempotent : un redémarrage ne remet pas run_count à zéro.
+    // Les tâches non encore tickées apparaissent avec last_run_ms=None dans l'endpoint.
+    // Doit être effectué AVANT les spawns pour garantir les entrées visibles dès le démarrage.
+    {
+        use crate::scheduled_tasks::ALL_SCHEDULED_TASKS;
+
+        for task_name in ALL_SCHEDULED_TASKS {
+            if let Err(e) = state.search.seed_scheduled_task(task_name).await {
+                tracing::warn!(
+                    error = %e,
+                    task = task_name,
+                    "seed_scheduled_task échoué au boot (non fatal)"
+                );
+            }
+        }
+        tracing::info!(
+            count = ALL_SCHEDULED_TASKS.len(),
+            "tâches récurrentes seedées au boot"
+        );
+    }
+
+    // Tâche flush 60s : swap+reset des AtomicU64 (read-path + MCP) → UPSERT dans
+    // read_usage_counters + fan-out Prometheus via route_metric.
     //
     // Design : AtomicU64 Relaxed dans AppState (coût hot-path ~0, aucun I/O handler),
     // flush toutes les 60s (granularité horaire, perte max = 1 fenêtre de 60s si crash).
     // Erreur flush → log WARN + reset quand même (ne bloque pas le server).
-    // Self-contained — ne touche QUE read_usage_counters.
+    // Self-contained — ne touche QUE read_usage_counters + familles Prometheus.
+    //
+    // P1-3 reviewer : seed_metrics_from_db est déjà complété ci-dessus AVANT ce spawn.
     {
-        use std::sync::atomic::Ordering;
         use std::time::{SystemTime, UNIX_EPOCH};
         use tokio::time::{Duration, MissedTickBehavior, interval};
 
         let accumulators = state.read_usage_accumulators.clone();
+        let mcp_counters = state.mcp_tool_counters.clone();
         let read_usage_store = state
             .read_usage
             .clone()
             .expect("ReadUsageCounterStore câblé — invariant post with_read_usage_path");
+        let metrics = state.metrics.clone();
+        let search_flush = state.search.clone();
+        let interval_secs_flush = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_TELEMETRY_FLUSH,
+            &cfg,
+        );
 
         tokio::spawn(async move {
+            use gradatum_core::scheduled_health::TaskOutcome;
+
             // Plancher à 60s : `interval(0)` panique.
-            let mut ticker = interval(Duration::from_secs(60));
+            let mut ticker = interval(Duration::from_secs(interval_secs_flush));
             // Skip : at-most-one-missed-tick après un freeze/resume (maintenance).
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             // Premier tick consommé immédiatement (comportement tokio::interval) —
-            // la première purge réelle arrive à t=60s.
+            // la première purge réelle arrive à t=interval_secs.
             ticker.tick().await;
 
             loop {
@@ -444,61 +537,107 @@ async fn main() -> anyhow::Result<()> {
                 // window_h = heure courante (floor division epoch_ms / 3_600_000).
                 let window_h = now_ms / 3_600_000;
 
-                // Swap+reset : récupérer les hits accumulés et remettre à zéro atomiquement.
-                // Ordering::Relaxed : cohérence suffisante — aucun ordering cross-thread requis
-                // (seule la valeur du compteur compte, pas d'autres effets mémoire à synchroniser).
-                let entries: Vec<crate::read_usage_store::UsageFlushEntry> = [
-                    (
-                        crate::read_usage_store::ENDPOINT_VAULT_SEARCH,
-                        &accumulators.vault_search,
-                    ),
-                    (
-                        crate::read_usage_store::ENDPOINT_VAULT_READ,
-                        &accumulators.vault_read,
-                    ),
-                    (
-                        crate::read_usage_store::ENDPOINT_CODE_SCOPE,
-                        &accumulators.code_scope,
-                    ),
-                    (
-                        crate::read_usage_store::ENDPOINT_VAULT_TIMELINE,
-                        &accumulators.vault_timeline,
-                    ),
-                    (
-                        crate::read_usage_store::ENDPOINT_LESSONS_RECALL,
-                        &accumulators.lessons_recall,
-                    ),
-                ]
-                .iter()
-                .map(|(endpoint, counter)| {
-                    let hit_count = counter.swap(0, Ordering::Relaxed);
-                    crate::read_usage_store::UsageFlushEntry {
-                        endpoint,
-                        window_h,
-                        hit_count,
-                    }
-                })
-                .collect();
-
-                match read_usage_store.flush_batch(entries).await {
-                    Ok(n) => {
-                        if n > 0 {
-                            tracing::info!(
-                                written = n,
-                                window_h = window_h,
-                                "read_usage flush : compteurs persistés"
-                            );
-                        }
-                    }
+                let start = std::time::Instant::now();
+                let flush_result = crate::telemetry_flush::flush_once(
+                    &accumulators,
+                    &mcp_counters,
+                    &read_usage_store,
+                    &metrics,
+                    window_h,
+                )
+                .await;
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let (outcome, err_msg) = match &flush_result {
+                    Ok(()) => (TaskOutcome::Ok, None),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "read_usage flush échoué — hits perdus pour cette fenêtre (non fatal)"
+                            "telemetry-flush : flush_batch échoué — hits perdus pour cette fenêtre"
                         );
-                        // Note : les AtomicU64 ont déjà été swappés à 0 (reset fait avant le flush).
-                        // Les hits de cette fenêtre sont perdus si le flush échoue — acceptable
-                        // pour de la télémétrie (non-critique, granularité horaire).
+                        (TaskOutcome::Error, Some(e.to_string()))
                     }
+                };
+                if let Err(e) = search_flush
+                    .record_task_run(
+                        crate::scheduled_tasks::TASK_TELEMETRY_FLUSH,
+                        outcome,
+                        duration_ms,
+                        err_msg.as_deref(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "record_task_run télémétrie-flush échoué (non fatal)");
+                }
+            }
+        });
+    }
+
+    // Tâche d'échantillonnage timeseries (v0.7.5 Slice 2a) : capture la photo curée
+    // du registry Prometheus toutes les 60s → metric_sample + purge paresseuse 14j.
+    // Instrumentée via record_task_run → visible dans /api/v1/system/scheduled.
+    // Self-contained, infaillible (warn-only).
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::time::{Duration, MissedTickBehavior, interval};
+
+        let metrics = state.metrics.clone();
+        let search_ms = state.search.clone();
+        let interval_secs = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_METRIC_SAMPLE,
+            &cfg,
+        );
+        const RETENTION_MS: i64 = 14 * 86_400_000; // 14 jours
+
+        tokio::spawn(async move {
+            use gradatum_core::scheduled_health::TaskOutcome;
+
+            let mut ticker = interval(Duration::from_secs(interval_secs));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            ticker.tick().await; // premier tick consommé immédiatement
+
+            loop {
+                ticker.tick().await;
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+
+                let start = std::time::Instant::now();
+                let samples = crate::curated_metrics::collect_curated_samples(&metrics);
+                let result: Result<(), String> = async {
+                    search_ms
+                        .insert_metric_samples(now_ms, &samples)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    search_ms
+                        .purge_metric_samples(now_ms - RETENTION_MS)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                }
+                .await;
+                let duration_ms = start.elapsed().as_millis() as i64;
+
+                let (outcome, err_msg) = match &result {
+                    Ok(()) => (TaskOutcome::Ok, None),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "metric-sample : échantillonnage échoué");
+                        (TaskOutcome::Error, Some(e.clone()))
+                    }
+                };
+                if let Err(e) = search_ms
+                    .record_task_run(
+                        crate::scheduled_tasks::TASK_METRIC_SAMPLE,
+                        outcome,
+                        duration_ms,
+                        err_msg.as_deref(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "record_task_run metric-sample échoué (non fatal)");
                 }
             }
         });
@@ -516,15 +655,19 @@ async fn main() -> anyhow::Result<()> {
             .clone()
             .expect("EventLogStore câblé — invariant post with_event_log_path");
         let metrics = state.metrics.clone();
+        let search_elog = state.search.clone();
+        let interval_secs_elog = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_PURGE_EVENT_LOG,
+            &cfg,
+        );
 
         tokio::spawn(async move {
+            use gradatum_core::scheduled_health::TaskOutcome;
             use std::time::{SystemTime, UNIX_EPOCH};
             use tokio::time::{Duration, MissedTickBehavior, interval};
 
-            // P1 R1 : `interval(Duration::from_secs(0))` panique — plancher à 60s.
-            // La config documente que `purge_interval_secs` doit être ≥ 60.
-            let interval_secs = retention_cfg.purge_interval_secs.max(60);
-            let mut ticker = interval(Duration::from_secs(interval_secs));
+            // P1 R1 : SSOT interval via task_interval_secs (plancher 60s garanti).
+            let mut ticker = interval(Duration::from_secs(interval_secs_elog));
 
             // P2 R2 : Skip évite N purges en rafale après un freeze/resume (ex : SIGSTOP,
             // freeze VM, débogueur). La sémantique "at-most-one-missed-tick" est correcte
@@ -546,10 +689,12 @@ async fn main() -> anyhow::Result<()> {
                 let retention_ms = (retention_cfg.retention_days as i64) * 86_400_000;
                 let cutoff_ms = now_ms - retention_ms;
 
-                match event_log_store
+                let start = std::time::Instant::now();
+                let purge_result = event_log_store
                     .purge(cutoff_ms, retention_cfg.max_rows)
-                    .await
-                {
+                    .await;
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let (outcome, err_msg) = match purge_result {
                     Ok(purged) => {
                         tracing::info!(
                             purged = purged,
@@ -557,10 +702,25 @@ async fn main() -> anyhow::Result<()> {
                             max_rows = retention_cfg.max_rows,
                             "event_log rétention : purge terminée"
                         );
+                        (TaskOutcome::Ok, None)
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "event_log purge échouée — non fatal");
+                        let msg = e.to_string();
+                        (TaskOutcome::Error, Some(msg))
                     }
+                };
+                if let Err(e) = search_elog
+                    .record_task_run(
+                        crate::scheduled_tasks::TASK_PURGE_EVENT_LOG,
+                        outcome,
+                        duration_ms,
+                        err_msg.as_deref(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "record_task_run purge-event-log échoué (non fatal)");
                 }
 
                 // Mise à jour gauge Prometheus.
@@ -586,14 +746,19 @@ async fn main() -> anyhow::Result<()> {
             .session_trace
             .clone()
             .expect("SessionTraceStore câblé — invariant post with_session_trace_path");
+        let search_strace = state.search.clone();
+        let interval_secs_strace = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_PURGE_SESSION_TRACE,
+            &cfg,
+        );
 
         tokio::spawn(async move {
+            use gradatum_core::scheduled_health::TaskOutcome;
             use std::time::{SystemTime, UNIX_EPOCH};
             use tokio::time::{Duration, MissedTickBehavior, interval};
 
-            // Plancher à 60s : `interval(Duration::from_secs(0))` panique.
-            let interval_secs = retention_cfg.purge_interval_secs.max(60);
-            let mut ticker = interval(Duration::from_secs(interval_secs));
+            // SSOT interval via task_interval_secs (plancher 60s garanti).
+            let mut ticker = interval(Duration::from_secs(interval_secs_strace));
             // Skip : at-most-one-missed-tick après un freeze/resume (maintenance).
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             // Premier tick consommé immédiatement (comportement tokio::interval) — la
@@ -610,10 +775,12 @@ async fn main() -> anyhow::Result<()> {
                 let retention_ms = (retention_cfg.retention_days as i64) * 86_400_000;
                 let cutoff_ms = now_ms - retention_ms;
 
-                match session_trace_store
+                let start = std::time::Instant::now();
+                let purge_result = session_trace_store
                     .purge(cutoff_ms, retention_cfg.max_rows)
-                    .await
-                {
+                    .await;
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let (outcome, err_msg) = match purge_result {
                     Ok(purged) => {
                         tracing::info!(
                             purged = purged,
@@ -621,10 +788,25 @@ async fn main() -> anyhow::Result<()> {
                             max_rows = retention_cfg.max_rows,
                             "session_trace rétention : purge terminée"
                         );
+                        (TaskOutcome::Ok, None)
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "session_trace purge échouée — non fatal");
+                        let msg = e.to_string();
+                        (TaskOutcome::Error, Some(msg))
                     }
+                };
+                if let Err(e) = search_strace
+                    .record_task_run(
+                        crate::scheduled_tasks::TASK_PURGE_SESSION_TRACE,
+                        outcome,
+                        duration_ms,
+                        err_msg.as_deref(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "record_task_run purge-session-trace échoué (non fatal)");
                 }
             }
         });
@@ -641,13 +823,19 @@ async fn main() -> anyhow::Result<()> {
             .read_usage
             .clone()
             .expect("ReadUsageCounterStore câblé — invariant post with_read_usage_path");
+        let search_rusage = state.search.clone();
+        let interval_secs_rusage = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_PURGE_READ_USAGE,
+            &cfg,
+        );
 
         tokio::spawn(async move {
+            use gradatum_core::scheduled_health::TaskOutcome;
             use std::time::{SystemTime, UNIX_EPOCH};
             use tokio::time::{Duration, MissedTickBehavior, interval};
 
-            let interval_secs = retention_cfg.purge_interval_secs.max(60);
-            let mut ticker = interval(Duration::from_secs(interval_secs));
+            // SSOT interval via task_interval_secs (plancher 60s garanti).
+            let mut ticker = interval(Duration::from_secs(interval_secs_rusage));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             ticker.tick().await;
 
@@ -663,7 +851,10 @@ async fn main() -> anyhow::Result<()> {
                 let retention_ms = (retention_cfg.retention_days as i64) * 86_400_000;
                 let cutoff_window_h = (now_ms - retention_ms) / 3_600_000;
 
-                match read_usage_store.purge_before(cutoff_window_h).await {
+                let start = std::time::Instant::now();
+                let purge_result = read_usage_store.purge_before(cutoff_window_h).await;
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let (outcome, err_msg) = match purge_result {
                     Ok(purged) => {
                         if purged > 0 {
                             tracing::info!(
@@ -673,10 +864,231 @@ async fn main() -> anyhow::Result<()> {
                                 "read_usage_counters rétention : purge terminée"
                             );
                         }
+                        (TaskOutcome::Ok, None)
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "read_usage_counters purge échouée — non fatal");
+                        let msg = e.to_string();
+                        (TaskOutcome::Error, Some(msg))
                     }
+                };
+                if let Err(e) = search_rusage
+                    .record_task_run(
+                        crate::scheduled_tasks::TASK_PURGE_READ_USAGE,
+                        outcome,
+                        duration_ms,
+                        err_msg.as_deref(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "record_task_run purge-read-usage échoué (non fatal)");
+                }
+            }
+        });
+    }
+
+    // Review auto-promote — promeut staging/pending-review âgés > N jours.
+    // Miroir structurel de la tâche event_log (non-fatal, self-contained, MissedTickBehavior::Skip).
+    {
+        let promote_cfg = cfg.review_promote.clone();
+        let index = state.search.clone();
+        let vault = state.vault.clone();
+        let metrics = state.metrics.clone();
+        let interval_secs_promote = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_REVIEW_PROMOTE,
+            &cfg,
+        );
+
+        tokio::spawn(async move {
+            use gradatum_core::scheduled_health::TaskOutcome;
+            use std::time::{SystemTime, UNIX_EPOCH};
+            use tokio::time::{Duration, MissedTickBehavior, interval};
+
+            // SSOT interval via task_interval_secs (plancher 60s garanti).
+            let mut ticker = interval(Duration::from_secs(interval_secs_promote));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Premier tick consommé immédiatement — première vraie promotion à t=interval_secs.
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+
+                let start = std::time::Instant::now();
+                let stats = crate::review_promote::promote_once(
+                    &index,
+                    &vault,
+                    &metrics,
+                    &promote_cfg,
+                    now_ms,
+                )
+                .await;
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let (outcome, err_msg) = if stats.errors > 0 {
+                    (
+                        TaskOutcome::Error,
+                        Some(format!("{} erreur(s) de promotion", stats.errors)),
+                    )
+                } else {
+                    (TaskOutcome::Ok, None)
+                };
+                if let Err(e) = index
+                    .record_task_run(
+                        crate::scheduled_tasks::TASK_REVIEW_PROMOTE,
+                        outcome,
+                        duration_ms,
+                        err_msg.as_deref(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "record_task_run review-promote échoué (non fatal)");
+                }
+            }
+        });
+    }
+
+    // Active Recall — tâche interval in-process (F-46, v0.7.1, B').
+    //
+    // Gabarit miroir de `review_promote` (non-fatal, self-contained, MissedTickBehavior::Skip).
+    // Calcule la surface proactive du tenant "main" à chaque tick via `proactive_refresh_once`.
+    // Erreur loggée + skip — n'interrompt jamais la boucle.
+    {
+        let pr_cfg = cfg.proactive_recall.clone();
+        let pr_state = state.clone();
+        let interval_secs_pr = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_PROACTIVE_REFRESH,
+            &cfg,
+        );
+
+        tokio::spawn(async move {
+            use gradatum_core::scheduled_health::TaskOutcome;
+            use std::time::{SystemTime, UNIX_EPOCH};
+            use tokio::time::{Duration, MissedTickBehavior, interval};
+
+            // SSOT interval via task_interval_secs (plancher 60s garanti).
+            let mut ticker = interval(Duration::from_secs(interval_secs_pr));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Premier tick consommé immédiatement (comportement tokio::interval) —
+            // le premier refresh réel arrive à t=interval_secs.
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+
+                let start = std::time::Instant::now();
+                let refresh_result =
+                    crate::proactive_recall::refresh::proactive_refresh_once(&pr_state, &pr_cfg)
+                        .await;
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let (outcome, err_msg) = match &refresh_result {
+                    Ok(_) => (TaskOutcome::Ok, None),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "proactive_recall: refresh échoué — skip tick (non fatal)"
+                        );
+                        (TaskOutcome::Error, Some(e.to_string()))
+                    }
+                };
+                if let Err(e) = pr_state
+                    .search
+                    .record_task_run(
+                        crate::scheduled_tasks::TASK_PROACTIVE_REFRESH,
+                        outcome,
+                        duration_ms,
+                        err_msg.as_deref(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "record_task_run proactive-refresh échoué (non fatal)");
+                }
+            }
+        });
+    }
+
+    // Active Recall — tâche de rétention (purge sessions + feedback par âge + cap).
+    //
+    // Rend VRAI le commentaire de la migration 0023 ("Rétention automatique via
+    // ProactiveRecallStore::purge") : sans ce câblage, les tables proactive_recall_*
+    // croissent sans borne sur index.db. Gabarit miroir de session_trace (non-fatal,
+    // self-contained, MissedTickBehavior::Skip). Réutilise cfg.session_trace (même
+    // TTL + cap max_rows + intervalle de purge) — comme read_usage_counters ci-dessus.
+    // Store optionnel (None possible en config dégradée) → on ne spawne rien (skip propre).
+    // La tâche est tout de même seedée au boot (entrée avec last_run_ms=None dans l'endpoint).
+    if let Some(proactive_recall_store) = state.proactive_recall.clone() {
+        let retention_cfg = cfg.session_trace.clone();
+        let search_arcpurge = state.search.clone();
+        let interval_secs_arcpurge = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_ACTIVE_RECALL_PURGE,
+            &cfg,
+        );
+
+        tokio::spawn(async move {
+            use gradatum_core::scheduled_health::TaskOutcome;
+            use std::time::{SystemTime, UNIX_EPOCH};
+            use tokio::time::{Duration, MissedTickBehavior, interval};
+
+            // SSOT interval via task_interval_secs (plancher 60s garanti).
+            let mut ticker = interval(Duration::from_secs(interval_secs_arcpurge));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Premier tick consommé immédiatement — première purge réelle à t=interval_secs.
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let retention_ms = (retention_cfg.retention_days as i64) * 86_400_000;
+                let cutoff_ms = now_ms - retention_ms;
+                // `session_trace.max_rows` est i64 ; `purge` attend usize. Conversion
+                // sûre : une valeur négative/hors-borne → usize::MAX (cap désactivé).
+                let max_rows = usize::try_from(retention_cfg.max_rows).unwrap_or(usize::MAX);
+
+                let start = std::time::Instant::now();
+                let purge_result = proactive_recall_store.purge(cutoff_ms, max_rows).await;
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let (outcome, err_msg) = match purge_result {
+                    Ok(purged) => {
+                        tracing::info!(
+                            purged = purged,
+                            retention_days = retention_cfg.retention_days,
+                            max_rows = retention_cfg.max_rows,
+                            "proactive_recall rétention : purge terminée"
+                        );
+                        (TaskOutcome::Ok, None)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proactive_recall purge échouée — non fatal");
+                        let msg = e.to_string();
+                        (TaskOutcome::Error, Some(msg))
+                    }
+                };
+                if let Err(e) = search_arcpurge
+                    .record_task_run(
+                        crate::scheduled_tasks::TASK_ACTIVE_RECALL_PURGE,
+                        outcome,
+                        duration_ms,
+                        err_msg.as_deref(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "record_task_run active-recall-purge échoué (non fatal)");
                 }
             }
         });

@@ -51,13 +51,14 @@ use gradatum_core::audit::http::HttpAuditEvent;
 use gradatum_core::error::GradatumError;
 use gradatum_core::identity::NoteId;
 use gradatum_core::scope::{LocusId, VaultId};
+use gradatum_core::section::Section;
 use gradatum_core::temporal_query::{TimelineCursor, TimelineFilter};
 use gradatum_core::trust::TrustContext;
 use gradatum_dto::{
-    LessonHit, LessonsRecallRequest, LessonsRecallResponse, NoteStatusPatch, VaultClassifyRequest,
-    VaultClassifyResponse, VaultDiffRequest, VaultDiffResponse, VaultDowngradeRequest,
-    VaultDowngradeResponse, VaultHistoryGetRequest, VaultHistoryGetResponse, VaultHistoryRequest,
-    VaultHistoryResponse, VaultRestoreRequest, VaultRestoreResponse,
+    LessonHit, LessonsRecallRequest, LessonsRecallResponse, NoteStatusPatch, RankMode,
+    VaultClassifyRequest, VaultClassifyResponse, VaultDiffRequest, VaultDiffResponse,
+    VaultDowngradeRequest, VaultDowngradeResponse, VaultHistoryGetRequest, VaultHistoryGetResponse,
+    VaultHistoryRequest, VaultHistoryResponse, VaultRestoreRequest, VaultRestoreResponse,
 };
 use gradatum_embed::EmbedBackend;
 use gradatum_index::extract_h1_title;
@@ -82,20 +83,21 @@ use crate::api_v1::handlers::{
 use crate::api_v1::tenant_guard::effective_tenant;
 use crate::api_v1::timeline::{TimelineItem, VaultTimelineResponse};
 use crate::api_v1::write::{
-    actor_from_trust, build_curate_job_record, emit_auth_failure_audit, emit_write_rejection_audit,
-    parse_sha256_hex,
+    actor_from_trust, build_curate_job_record, emit_auth_failure_audit, emit_drift_audit,
+    emit_read_rejection_audit, emit_write_rejection_audit, parse_sha256_hex,
 };
+use crate::context::retrieval::retrieve_candidates;
 use crate::state::AppState;
 
 // ── Helpers internes ─────────────────────────────────────────────────────────
 
 /// Builds the ACL locus for a tenant: `{tenant_id}/main` (default section).
-fn locus_for_tenant(tenant_id: &str) -> String {
+pub(crate) fn locus_for_tenant(tenant_id: &str) -> String {
     format!("{}/main", tenant_id)
 }
 
 /// Builds the ACL locus for a specific section.
-fn locus_for_section(tenant_id: &str, section: Option<&str>) -> String {
+pub(crate) fn locus_for_section(tenant_id: &str, section: Option<&str>) -> String {
     match section {
         Some(s) => format!("{}/{}", tenant_id, s),
         None => format!("{}/main", tenant_id),
@@ -180,6 +182,11 @@ pub async fn vault_search_impl(
     let status_filter = validate_search_status(req.status.as_deref())
         .map_err(|()| GradatumError::InvalidInput("status invalide".into()))?;
 
+    // Validation temporal bounds (F-65).
+    if matches!((req.from_ms, req.to_ms), (Some(f), Some(t)) if f > t) {
+        return Err(GradatumError::InvalidInput("from_ms > to_ms".into()));
+    }
+
     let read_vault_id = req.vault_id.as_deref().unwrap_or(&tenant).to_owned();
     let query = req.query.trim();
     if query.is_empty() {
@@ -205,6 +212,8 @@ pub async fn vault_search_impl(
             req.section.as_deref(),
             req.locus.as_deref(),
             status_filter.as_deref(),
+            req.from_ms, // F-65 temporal lower bound
+            req.to_ms,   // F-65 temporal upper bound
         )
         .await?;
 
@@ -277,6 +286,52 @@ pub async fn vault_search_impl(
         semantic_hits = filter_semantic_by_status(semantic_hits, wanted_status, status_result);
     }
 
+    // Filtre temporel + batch anchor_ms sur chemin sémantique (F-65).
+    // Appel batch même sans bornes pour peupler sem_anchor_map (enrichit anchor_ms dans les hits).
+    let sem_anchor_map: std::collections::HashMap<String, i64> = if semantic_hits.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let sem_ids: Vec<String> = semantic_hits.iter().map(|(id, _)| id.to_string()).collect();
+        let bounds_active = req.from_ms.is_some() || req.to_ms.is_some();
+        let anchor_result = state
+            .search
+            .get_anchor_ms_batch(&read_vault_id, &sem_ids)
+            .await
+            .unwrap_or_else(|e| {
+                if bounds_active {
+                    tracing::warn!(
+                        err = %e,
+                        count = sem_ids.len(),
+                        from_ms = ?req.from_ms,
+                        to_ms = ?req.to_ms,
+                        "vault_search_impl: get_anchor_ms_batch failed avec bornes actives — \
+                         ALL semantic hits dropés (temporal bound unverifiable)"
+                    );
+                } else {
+                    tracing::warn!(
+                        err = %e,
+                        count = sem_ids.len(),
+                        "vault_search_impl: get_anchor_ms_batch failed — \
+                         anchor_ms absent des hits sémantiques (pas de bornes actives)"
+                    );
+                }
+                std::collections::HashMap::new()
+            });
+        // Filtrage temporel sur chemin sémantique si bornes actives.
+        if bounds_active {
+            semantic_hits.retain(|(id, _)| {
+                match anchor_result.get(&id.to_string()) {
+                    // Note sans entrée temporal_index → exclure si borne active (symétrique FTS).
+                    None => false,
+                    Some(&ms) => {
+                        req.from_ms.is_none_or(|f| ms >= f) && req.to_ms.is_none_or(|t| ms <= t)
+                    }
+                }
+            });
+        }
+        anchor_result
+    };
+
     // Fusion RRF.
     let bm25_for_rrf: Vec<(String, f64)> = bm25_hits
         .iter()
@@ -293,13 +348,22 @@ pub async fn vault_search_impl(
     let rrf_buffer = (limit * 4).clamp(20, 200);
     let mut fused = rrf_fuse(&bm25_for_rrf, &sem_for_rrf, 60.0, rrf_buffer);
 
-    // Enrichir section + snippet + title + status depuis la map BM25.
+    // Enrichir section + snippet + title + status + anchor_ms depuis la map BM25.
+    // F-17 : pour les hits semantic-only (absents de bm25_map), enrichir anchor_ms depuis
+    // sem_anchor_map ICI — avant la boucle composite — afin que `recency_factor` reçoive
+    // l'ancre canonique (occurred_at/event-date/valid_from) et non `created_ms`.
+    // Sans ce pré-enrichissement, anchor_ms resterait None au moment du scoring, et
+    // `hit.anchor_ms.unwrap_or(created_ms)` tomberait systématiquement sur created_ms.
     for hit in &mut fused {
         if let Some(bh) = bm25_map.get(&hit.note_id) {
             hit.section = bh.section.clone();
             hit.snippet = Some(bh.snippet.clone());
             hit.title = bh.title.clone().filter(|s| !s.trim().is_empty());
             hit.status = bh.status.clone();
+            hit.anchor_ms = bh.anchor_ms; // F-65 temporal
+        } else if hit.anchor_ms.is_none() {
+            // Hit semantic-only : peupler anchor_ms depuis sem_anchor_map avant le scoring. (F-17)
+            hit.anchor_ms = sem_anchor_map.get(&hit.note_id).copied();
         }
     }
 
@@ -332,7 +396,16 @@ pub async fn vault_search_impl(
             }
         };
 
-        let recency = recency_factor(created_ms, now_ms);
+        // F-17 : recency sur l'ancre canonique (temporal_index.anchor_ms =
+        // occurred_at / event-date / valid_from, via F-65) plutôt que sur created_ms.
+        // Pour les notes statiques (anchor_src=Created, anchor_ms==created_ms), le résultat
+        // est bit-identique à l'ancien comportement (backward-compat garantie).
+        // Pour les notes Event (anchor_ms != created_ms), le recency reflète la date
+        // d'événement réelle, pas la date d'ingestion.
+        // Fallback defensif sur created_ms si anchor_ms absent (ne devrait pas arriver pour
+        // les notes avec entrée temporal_index, mais protège contre les cas orphelins).
+        let anchor_for_recency = hit.anchor_ms.unwrap_or(created_ms);
+        let recency = recency_factor(anchor_for_recency, now_ms);
         let pagerank = pagerank_factor(in_degree);
 
         let trust_params = if state.scoring.enabled {
@@ -494,10 +567,31 @@ pub async fn vault_search_impl(
             })
     };
 
+    // Guard P1-B FAIL-CLOSED (audit security-reviewer v0.7.3, durci 2026-06-28).
+    //
+    // Parité avec vault_read_impl (~L671) : la read-restriction identity existait déjà
+    // pour la lecture directe, mais PAS pour le chemin search (fuite titre + snippet).
+    //
+    // Callers autorisés à voir les âmes :
+    //   - TrustContext::Studio { .. } — admin UI (observabilité totale).
+    //   - subject() == SOUL_PRIVILEGED_WRITER — propriétaire SSI (main-agent).
+    // Tout autre caller → exclusion des notes soul.
+    //
+    // FAIL-CLOSED : le filtre opère sur `hit.section` AVANT le fallback section→"main".
+    //   - hit.section == "identity" → âme explicite → exclure.
+    //   - hit.section.is_empty()   → section indéterminée (ex. soft-fail get_titles_sections
+    //     qui retourne HashMap::new() pour un hit sémantique) → exclure par précaution
+    //     (confidentialité > complétude search).
+    // En fonctionnement nominal, hit.section est toujours peuplé → 0 impact sur recall.
+    //
+    // L'exclusion est simple (pas de matching par-agent) : un agent reçoit son âme
+    // par injection MCP initialize, pas par search — le search est une surface RAG générique.
+    let identity_privileged = is_identity_privileged(trust);
+
     // Construire la réponse.
     let items: Vec<SearchHit> = final_hits
         .into_iter()
-        .map(|(mut hit, score)| {
+        .filter_map(|(mut hit, score)| {
             if (hit.title.is_none() || hit.section.is_empty())
                 && let Some((fetched_title, fetched_section)) = title_section_map.get(&hit.note_id)
             {
@@ -508,10 +602,19 @@ pub async fn vault_search_impl(
                     hit.section = fetched_section.clone();
                 }
             }
+            // Guard FAIL-CLOSED : vérifier AVANT le fallback section→"main".
+            // Si section=="identity" ou section=="" (indéterminée) et caller non-privilégié → exclure.
+            if identity_section_hidden(identity_privileged, &hit.section) {
+                return None;
+            }
             if hit.status.is_empty()
                 && let Some(fetched_status) = status_map.get(&hit.note_id)
             {
                 hit.status = fetched_status.clone();
+            }
+            // F-65 : enrich anchor_ms for semantic-only hits from the batch map.
+            if hit.anchor_ms.is_none() && hit.is_semantic_only {
+                hit.anchor_ms = sem_anchor_map.get(&hit.note_id).copied();
             }
             let section = if hit.section.is_empty() {
                 "main".to_string()
@@ -520,7 +623,7 @@ pub async fn vault_search_impl(
             };
             let scores = score_breakdowns.remove(&hit.note_id);
             #[allow(deprecated)]
-            SearchHit {
+            Some(SearchHit {
                 path: format!("{}/{}", section, hit.note_id),
                 score,
                 title: hit.title,
@@ -528,7 +631,8 @@ pub async fn vault_search_impl(
                 trust: 0.5,
                 status: hit.status,
                 scores,
-            }
+                anchor_ms: hit.anchor_ms, // F-65 temporal
+            })
         })
         .collect();
 
@@ -574,7 +678,11 @@ pub async fn vault_search_impl(
 /// # Erreurs
 ///
 /// - `GradatumError::Unauthorized` si non authentifié.
-/// - `GradatumError::Forbidden` si ACL deny.
+/// - `GradatumError::Forbidden` si ACL deny, ou si la note lue est en section
+///   `identity` et que l'appelant n'est ni le propriétaire de l'âme, ni l'owner
+///   privilégié `main-agent`, ni une session Studio (read-restrictive A2/C6,
+///   (since v0.7.3). The guard applies after resolving the note's actual section —
+///   addressing by bare ULID does not bypass it.
 /// - `GradatumError::NoteNotFound` si note absente ou titre non résolu.
 /// - `GradatumError::Storage` sur erreur index.
 pub async fn vault_read_impl(
@@ -655,13 +763,65 @@ pub async fn vault_read_impl(
             };
             let title: Option<String> = title.or_else(|| extract_h1_title(&body));
 
+            // Read-restrictive ACL on section `identity` (F-34 v0.7.3, A2/C6) — the
+            // symmetric counterpart of the write-restrictive guard in `vault_write_impl`.
+            // An agent's soul is private: only its owner (or the privileged owner
+            // `main-agent`, SSI) may read it; Studio (admin UI) may read any soul for
+            // observability. The check runs AFTER resolution, on the note's REAL section
+            // (`note.frontmatter.section`), so addressing by raw ULID (where
+            // `req.section` is `None`) cannot bypass it.
+            if note.frontmatter.section == Section::Identity {
+                // Studio sessions are the admin trust tier — full observability.
+                let is_studio_admin = matches!(trust, TrustContext::Studio { .. });
+                if !is_studio_admin {
+                    // `subject()` returns the JWT `sub` — never derived from a client
+                    // parameter. `target_agent` is extracted server-side from the note's
+                    // own title (`identity/<agent>`), never from request input.
+                    let caller_sub = trust.subject().unwrap_or("");
+                    let target_agent = title
+                        .as_deref()
+                        .and_then(|t| t.strip_prefix("identity/"))
+                        .unwrap_or("");
+                    let allowed = caller_sub == SOUL_PRIVILEGED_WRITER
+                        || (!target_agent.is_empty() && caller_sub == target_agent);
+                    if !allowed {
+                        emit_read_rejection_audit(
+                            state,
+                            trust,
+                            &tenant,
+                            &locus,
+                            "identity_read_denied_foreign_agent",
+                            Some(resolved_path.clone()),
+                        )
+                        .await;
+                        return Err(GradatumError::Forbidden(
+                            "identity: lecture restreinte au propriétaire de l'âme".into(),
+                        ));
+                    }
+                }
+            }
+
+            // Statut autoritatif depuis la colonne DB (notes.status), pas le frontmatter :
+            // vault_downgrade met à jour la colonne + replaced_by mais JAMAIS le frontmatter
+            // YAML, qui reste donc périmé (ex. "live" sur une note réellement "downgraded").
+            // Fallback sur frontmatter.status si get_statuses échoue (dégradation gracieuse).
+            let note_id_str = note.id.to_string();
+            let db_status = state
+                .search
+                .get_statuses(&tenant, std::slice::from_ref(&note_id_str))
+                .await
+                .ok()
+                .and_then(|mut m| m.remove(&note_id_str));
+            let authoritative_status =
+                db_status.unwrap_or_else(|| note.frontmatter.status.to_string());
+
             Ok(VaultReadResponse {
-                path: note.id.to_string(),
+                path: note_id_str,
                 title,
                 content: body,
                 metadata: Some(serde_json::json!({
                     "section": note.frontmatter.section.to_string(),
-                    "status": note.frontmatter.status.to_string(),
+                    "status": authoritative_status,
                     "author": note.frontmatter.author.as_ref().map(|a| a.id.as_str()),
                     "tags": note.frontmatter.tags.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
                     "vault_id": note.frontmatter.vault_id.as_str(),
@@ -684,6 +844,10 @@ pub async fn vault_read_impl(
                 .unwrap_or_else(|_| NoteId::new());
             Err(GradatumError::NoteNotFound(note_id))
         }
+        // Note « fantôme » (présente dans l'index SQLite mais `.md` absent du disque) :
+        // depuis D2, `lifecycle::read_note` remonte un `NoteNotFound` TYPÉ — capté par
+        // le bras `Err(GradatumError::NoteNotFound(_))` ci-dessus (→ 404). Plus aucun
+        // string-match fragile sur le message d'erreur n'est nécessaire ici.
         Err(e) => Err(e),
     }
 }
@@ -720,6 +884,14 @@ pub async fn vault_list_impl(
         )
         .await?;
 
+    // Guard identity (parité `vault_search`/`vault_context`) : un appelant non
+    // privilégié ne doit pas découvrir l'existence/ULID/mtime des âmes d'agents via le
+    // listing (vecteur d'énumération). Exclusion simple sur la section RÉELLE de chaque
+    // record (fan-out RAG, pas de matching par-agent). No-op pour Studio / main-agent.
+    let identity_privileged = is_identity_privileged(trust);
+
+    // `next_cursor` est calculé sur le nombre BRUT de records ramenés (avant filtre) pour
+    // que la pagination continue d'avancer même si une page entière est masquée.
     let next_cursor = if records.len() == limit {
         records.last().map(|r| r.id.clone())
     } else {
@@ -728,6 +900,7 @@ pub async fn vault_list_impl(
 
     let entries: Vec<VaultEntry> = records
         .into_iter()
+        .filter(|r| !identity_section_hidden(identity_privileged, &r.section))
         .map(|r| {
             let modified_at = {
                 let ms = r.updated.unwrap_or(r.created);
@@ -779,6 +952,61 @@ pub async fn vault_status_impl(
         last_indexed_at: None,
         health: "healthy".to_string(),
     })
+}
+
+/// Filtre les nœuds/arêtes de graphe pointant vers une âme (`section = identity`) d'un
+/// **autre** agent, pour un appelant **non privilégié** — parité [`identity_section_hidden`]
+/// avec les surfaces RAG (`vault_search`, `vault_list`, `vault_context`).
+///
+/// Sans ce filtre, `vault_graph`/`vault_links` révélaient l'existence + l'ULID d'une âme
+/// cross-agent via un nœud ou une arête wikilink, alors que `vault_read`/`vault_search`
+/// la masquent déjà (F-1, énumération résiduelle).
+///
+/// **No-op strict** pour les appelants privilégiés (Studio / `main-agent` / owner) : la
+/// résolution des sections est court-circuitée (zéro appel index). Pour les non-privilégiés,
+/// une **seule** requête batch `get_titles_sections` résout la section de tous les nœuds —
+/// volume borné (`neighbors` cape à `depth ≤ 3`, `backlinks` = liens entrants directs).
+/// Seuls les nœuds de section **exactement** `identity` (ou indéterminée — fail-closed, cf.
+/// [`identity_section_hidden`]) sont retirés ; tout nœud d'une autre section, ou absent de
+/// l'index (lien pendant), est **préservé** (le graphe normal n'est pas cassé).
+///
+/// # Erreurs
+///
+/// Propage [`GradatumError::Storage`] si la résolution des sections échoue — fail-closed :
+/// on refuse la requête plutôt que de renvoyer un graphe non filtré (risque de fuite).
+async fn filter_identity_nodes(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant: &str,
+    nodes: &mut Vec<String>,
+    edges: &mut Vec<GraphEdge>,
+) -> Result<(), GradatumError> {
+    let identity_privileged = is_identity_privileged(trust);
+    // Privilégié → observabilité totale : aucun filtre, aucun appel index.
+    if identity_privileged || nodes.is_empty() {
+        return Ok(());
+    }
+
+    // Section RÉELLE de chaque nœud résolue server-side (jamais depuis l'input).
+    let sections = state
+        .search
+        .get_titles_sections(tenant, nodes.as_slice())
+        .await?;
+    let hidden: std::collections::HashSet<String> = nodes
+        .iter()
+        .filter(|id| {
+            sections
+                .get(*id)
+                .is_some_and(|(_, section)| identity_section_hidden(identity_privileged, section))
+        })
+        .cloned()
+        .collect();
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    edges.retain(|e| !hidden.contains(&e.from) && !hidden.contains(&e.to));
+    nodes.retain(|id| !hidden.contains(id));
+    Ok(())
 }
 
 /// Logique métier de `POST /api/v1/vault_graph`.
@@ -840,6 +1068,9 @@ pub async fn vault_graph_impl(
         nodes.dedup();
     }
 
+    // F-1 : masquer les âmes cross-agent aux non-privilégiés (parité vault_search/list).
+    filter_identity_nodes(state, trust, &tenant, &mut nodes, &mut edges).await?;
+
     Ok(VaultGraphResponse { nodes, edges })
 }
 
@@ -891,6 +1122,10 @@ pub async fn vault_links_impl(
 
     nodes.sort();
     nodes.dedup();
+
+    // F-1 : masquer les âmes cross-agent aux non-privilégiés (parité vault_search/list).
+    filter_identity_nodes(state, trust, &tenant, &mut nodes, &mut edges).await?;
+
     Ok(VaultLinksResponse { nodes, edges })
 }
 
@@ -932,7 +1167,9 @@ pub async fn vault_trace_impl(
                 let fts_limit = limit.min(5);
                 match state
                     .search
-                    .search_fts_with_snippet(&vault_id, &fts_q, fts_limit, false, None, None, None)
+                    .search_fts_with_snippet(
+                        &vault_id, &fts_q, fts_limit, false, None, None, None, None, None,
+                    )
                     .await
                 {
                     Ok(hits) => hits.into_iter().map(|h| h.note_id.to_string()).collect(),
@@ -945,6 +1182,19 @@ pub async fn vault_trace_impl(
 
     if resolved_seeds.is_empty() {
         return Ok(VaultTraceResponse { entries: vec![] });
+    }
+
+    // F-1 : guard identité par-agent sur le/les seed(s) — parité `vault_read_impl` /
+    // `vault_history_impl`. Un seed peut être une âme cross-agent (résolue par
+    // `title_lookup` sur `query="identity/<agent>"`, par ULID nu, ou par FTS). Sans ce
+    // guard, un non-privilégié confirmait l'existence + le lignage complet d'une âme
+    // étrangère. Section RÉELLE résolue server-side ; refus 403 fail-closed (parité stricte,
+    // sentinelle `identity` sur erreur d'index). No-op pour seed non-`identity` et appelant
+    // privilégié. Volume borné (≤ 5 seeds : 1 ULID/titre, ou `fts_limit = limit.min(5)`).
+    for seed_id in &resolved_seeds {
+        let (title, section) = resolve_title_section_failclosed(state, &tenant, seed_id).await;
+        enforce_identity_read_guard(state, trust, &tenant, &section, title.as_deref(), seed_id)
+            .await?;
     }
 
     let mut join_set = tokio::task::JoinSet::new();
@@ -988,7 +1238,19 @@ pub async fn vault_trace_impl(
 
 /// Logique métier de `POST /api/v1/vault_context`.
 ///
-/// ACL Read + construction contexte LLM avec budget tokens.
+/// ACL Read + dispatch vers le module [`crate::context`] qui orchestre l'assemblage.
+///
+/// # Sécurité
+///
+/// - Authentification vérifiée avant tout accès aux données.
+/// - Tenant validé via [`effective_tenant`] (cross-tenant interdit).
+/// - ACL Read sur le locus section évalué avant dispatch.
+///
+/// # Délégation
+///
+/// La logique d'assemblage (résolution candidats, accumulation, rendu) vit dans
+/// [`crate::context::assemble_context`] — `vault_context_impl` ne conserve que
+/// les gardes de sécurité / ACL.
 pub async fn vault_context_impl(
     state: &AppState,
     trust: &TrustContext,
@@ -1005,92 +1267,12 @@ pub async fn vault_context_impl(
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
 
-    let max_tokens = req.max_tokens.unwrap_or(2000).clamp(1, 8000) as usize;
-
-    let top_note_ids: Vec<String> = if ulid::Ulid::from_string(&req.query).is_ok() {
-        let backlinks = state
-            .search
-            .backlinks(&tenant, &req.query)
-            .await
-            .unwrap_or_default();
-        let mut ids = vec![req.query.clone()];
-        ids.extend(backlinks);
-        ids
-    } else {
-        let fts_q = build_fts_query(&req.query);
-        if fts_q.trim_matches(['"', ' ']).is_empty() {
-            return Ok(VaultContextResponse {
-                context: String::new(),
-                estimated_tokens: 0,
-                sources: vec![],
-            });
-        }
-        let vault_id = VaultId::new(&tenant);
-        match state
-            .search
-            .search_fts_with_snippet(
-                &vault_id,
-                &fts_q,
-                10,
-                false,
-                req.section.as_deref(),
-                None,
-                None,
-            )
-            .await
-        {
-            Ok(hits) => hits.into_iter().map(|h| h.note_id.to_string()).collect(),
-            Err(e) => return Err(e),
-        }
-    };
-
-    let mut context_parts: Vec<String> = Vec::new();
-    let mut sources: Vec<String> = Vec::new();
-    let mut used_tokens: usize = 0;
-
-    for note_id in &top_note_ids {
-        if used_tokens >= max_tokens {
-            break;
-        }
-        match state.search.get_note(&tenant, note_id).await {
-            Ok(Some(record)) => {
-                let note_chars = record.body_text.chars().count();
-                let note_tokens = note_chars.div_ceil(3).max(1);
-                let remaining = max_tokens.saturating_sub(used_tokens);
-                let body_part = if note_tokens > remaining {
-                    let char_limit = remaining.saturating_mul(3);
-                    let end = record
-                        .body_text
-                        .char_indices()
-                        .nth(char_limit)
-                        .map(|(i, _)| i)
-                        .unwrap_or(record.body_text.len());
-                    record.body_text[..end].to_string()
-                } else {
-                    record.body_text.clone()
-                };
-                let consumed = body_part.chars().count().div_ceil(3).max(1);
-                context_parts.push(body_part);
-                sources.push(note_id.clone());
-                used_tokens = used_tokens.saturating_add(consumed);
-            }
-            Ok(None) => {
-                tracing::debug!(note_id = %note_id, "vault_context_impl: note absente, ignorée");
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, note_id = %note_id, "vault_context_impl: get_note failed");
-            }
-        }
-    }
-
-    let context = context_parts.join("\n\n---\n\n");
-    let estimated_tokens = (context.chars().count() / 3) as u32;
-
-    Ok(VaultContextResponse {
-        context,
-        estimated_tokens,
-        sources,
-    })
+    // Guard identity F-34 (parité `vault_search_impl`, audit security-reviewer v0.7.3) :
+    // le contexte assemblé est une surface RAG générique — les âmes d'agents ne doivent
+    // pas devenir candidates (fuite de corps dans `assembled_text`) sauf caller privilégié.
+    // Le privilège est résolu ICI (accès à `trust`) puis propagé aux assembleurs.
+    let identity_privileged = is_identity_privileged(trust);
+    crate::context::assemble_context(state, &tenant, &req, identity_privileged).await
 }
 
 /// Logique métier de `GET /api/v1/vault_authors`.
@@ -1219,6 +1401,16 @@ pub async fn vault_timeline_impl(
 
     let rows = state.search.timeline(&vault, &filter).await?;
 
+    // ── Guard identité — DÉJÀ ASSURÉ AU NIVEAU SQL (pas de filtre serveur redondant) ──
+    // La requête `SqliteIndex::timeline` (sqlite.rs) exclut `n.section NOT IN
+    // (Section::PROTECTED_FORGET)`. `Section::PROTECTED_FORGET` inclut `Identity` → aucune
+    // note `identity/<agent>` n'entre jamais dans `rows`, pour AUCUN appelant (garde plus
+    // forte que le filtre par-privilège de `vault_list` : blackout total, source unique
+    // `Section::PROTECTED_FORGET`, testée par `timeline_excludes_protected_sections`).
+    // Un filtre serveur `identity_section_hidden` ici serait une 2ᵉ source de vérité + une
+    // requête `get_titles_sections` superflue par appel → non ajouté (dev-code-economy).
+    // Régression verrouillée côté serveur par `vault_timeline_excludes_identity_*`.
+
     let next_cursor = if rows.len() == limit {
         rows.last().map(|r| {
             TimelineCursor {
@@ -1246,6 +1438,215 @@ pub async fn vault_timeline_impl(
 }
 
 // ── §3 WRITE HANDLER ─────────────────────────────────────────────────────────
+
+/// Privileged writer allowed to write any agent's soul note (`identity/*`).
+/// The api-key owner mapped to this subject bypasses the per-agent write restriction.
+pub(crate) const SOUL_PRIVILEGED_WRITER: &str = "main-agent";
+
+/// Nom canonique de la section réservée aux âmes d'agents (`identity/*`).
+///
+/// Source de vérité partagée par toutes les surfaces RAG génériques (search,
+/// context, proactive-recall) for the identity exclusion guard.
+pub(crate) const IDENTITY_SECTION: &str = "identity";
+
+/// Vrai si l'appelant est autorisé à voir les notes de section `identity`
+/// (âmes d'agents) sur les **surfaces RAG génériques** (search, context, proactive).
+///
+/// Parité avec le guard `vault_search_impl` (audit security-reviewer v0.7.3) :
+/// l'exclusion est *simple*, sans matching par-agent — une surface RAG générique
+/// ne cible pas un agent unique, contrairement à `vault_read_impl` (adressage
+/// nominal `identity/<agent>`). Callers privilégiés :
+///   - session Studio (admin UI, observabilité totale) ;
+///   - owner SSI [`SOUL_PRIVILEGED_WRITER`] (`main-agent`).
+///
+/// Ce prédicat NE remplace PAS le guard read-restrictive par-agent de
+/// `vault_read_impl` — il couvre uniquement les surfaces où aucun agent-cible
+/// n'est adressable (fan-out RRF).
+#[must_use]
+pub(crate) fn is_identity_privileged(trust: &TrustContext) -> bool {
+    matches!(trust, TrustContext::Studio { .. }) || trust.subject() == Some(SOUL_PRIVILEGED_WRITER)
+}
+
+/// Vrai si une note de section `section` doit être **masquée** à cet appelant sur
+/// a generic RAG surface (FAIL-CLOSED identity guard).
+///
+/// FAIL-CLOSED : la section vide (indéterminée — ex. soft-fail `get_titles_sections`)
+/// est masquée par précaution (confidentialité > complétude), strictement aligné
+/// sur le guard `vault_search_impl`. En fonctionnement nominal la section est
+/// toujours peuplée → 0 impact sur les sections non-`identity`.
+#[must_use]
+pub(crate) fn identity_section_hidden(identity_privileged: bool, section: &str) -> bool {
+    !identity_privileged && (section == IDENTITY_SECTION || section.is_empty())
+}
+
+/// Applique le guard read-restrictive **par-agent** de la section `identity` sur une
+/// note déjà résolue — frère jumeau du guard inline de [`vault_read_impl`].
+///
+/// Utilisé par les surfaces qui exposent le corps/section/timeline d'une note ciblée
+/// par ULID **sans** passer par [`vault_read_impl`] : l'historique CoW
+/// (`vault_history`, `vault_history_get`). L'âme d'un agent est privée : seuls son
+/// propriétaire, l'owner privilégié [`SOUL_PRIVILEGED_WRITER`] (`main-agent`) ou une
+/// session Studio (observabilité admin) peuvent la lire.
+///
+/// `section` est la section **RÉELLE** de la note, résolue server-side (jamais depuis
+/// l'input). `note_title` sert à dériver le `target_agent` du titre `identity/<agent>`
+/// (server-side également). En cas de refus, un audit `vault_read_rejected` est émis.
+///
+/// **Parité stricte avec [`vault_read_impl`]** : le guard ne se déclenche QUE lorsque la
+/// section résolue vaut exactement `identity` — **no-op strict** pour toute autre section
+/// (y compris vide/indéterminée). C'est une surface d'accès *ciblée par ULID* (comme
+/// `vault_read`), pas un fan-out RAG : la doctrine FAIL-CLOSED-sur-section-vide de
+/// [`identity_section_hidden`] ne s'y applique donc pas. Un appelant qui veut fail-closed
+/// sur une résolution *en erreur* passe une sentinelle `section = "identity"`.
+///
+/// # Erreurs
+///
+/// - [`GradatumError::Forbidden`] si l'appelant non privilégié n'est pas le
+///   propriétaire de l'âme ciblée.
+async fn enforce_identity_read_guard(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant: &str,
+    section: &str,
+    note_title: Option<&str>,
+    note_id: &str,
+) -> Result<(), GradatumError> {
+    // No-op strict hors identity (parité exacte vault_read_impl).
+    if section != IDENTITY_SECTION {
+        return Ok(());
+    }
+    // Session Studio = palier de confiance admin — observabilité totale.
+    if matches!(trust, TrustContext::Studio { .. }) {
+        return Ok(());
+    }
+    // `subject()` = `sub` du JWT (jamais dérivé d'un paramètre client). `target_agent`
+    // est extrait server-side du titre `identity/<agent>`, jamais de l'input requête.
+    let caller_sub = trust.subject().unwrap_or("");
+    let target_agent = note_title
+        .and_then(|t| t.strip_prefix("identity/"))
+        .unwrap_or("");
+    let allowed = caller_sub == SOUL_PRIVILEGED_WRITER
+        || (!target_agent.is_empty() && caller_sub == target_agent);
+    if allowed {
+        return Ok(());
+    }
+    let locus = format!("{tenant}/main");
+    emit_read_rejection_audit(
+        state,
+        trust,
+        tenant,
+        &locus,
+        "identity_read_denied_foreign_agent",
+        Some(note_id.to_string()),
+    )
+    .await;
+    Err(GradatumError::Forbidden(
+        "identity: lecture restreinte au propriétaire de l'âme".into(),
+    ))
+}
+
+/// Résout `(title, section)` **réels** d'une note par ULID depuis l'index, avec la
+/// **calibration fail-closed identity** partagée par tous les guards ciblés-par-ULID
+/// (`vault_history`, `vault_diff`, `vault_restore`, `vault_downgrade`, `patch_note`,
+/// `move_note_locus`).
+///
+/// `title`/`section` sont TOUJOURS résolus server-side (colonne `notes.title` = titre H1
+/// `identity/<agent>`, colonne `notes.section`), jamais dérivés d'un paramètre client.
+///
+/// Calibration (identique à l'inline historique de `vault_history_impl`) :
+/// - note présente          → `(title, section)` réels ;
+/// - note absente (map vide) → `(None, "")` → **no-op** des guards (préserve le
+///   comportement nominal aval : 404 / réponse vide) ;
+/// - erreur d'index         → `(None, "identity")` **sentinelle** → FAIL-CLOSED
+///   (le guard refuse au non-privilégié, laisse passer le privilégié).
+async fn resolve_title_section_failclosed(
+    state: &AppState,
+    tenant: &str,
+    note_id: &str,
+) -> (Option<String>, String) {
+    let ids = [note_id.to_owned()];
+    match state.search.get_titles_sections(tenant, &ids).await {
+        Ok(mut map) => map.remove(note_id).unwrap_or((None, String::new())),
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                note_id = %note_id,
+                "resolve_title_section_failclosed: get_titles_sections échoué — FAIL-CLOSED identity guard"
+            );
+            (None, IDENTITY_SECTION.to_string())
+        }
+    }
+}
+
+/// Applique le guard **write-restrictive par-agent** de la section `identity` sur une
+/// note déjà résolue — frère jumeau WRITE du guard inline de [`vault_write_impl`] (C6).
+///
+/// Utilisé par les surfaces de **mutation** qui ciblent une note par ULID **sans** passer
+/// par [`vault_write_impl`] : restauration CoW (`vault_restore`), déclassement
+/// (`vault_downgrade`), patch de statut (`patch_note`), relocalisation physique
+/// (`move_note_locus`). Sans ce guard, un appelant non privilégié disposant de l'ACL Write
+/// (`write_patterns=["**"]`) pourrait restaurer, déclasser, muter le statut ou déplacer le
+/// `.md` de l'âme d'un **autre** agent — atteinte d'intégrité de l'identité souveraine.
+///
+/// **Privilège identique** au guard read [`enforce_identity_read_guard`] et au guard write
+/// inline de [`vault_write_impl`] : Studio (admin) || [`SOUL_PRIVILEGED_WRITER`] (`main-agent`)
+/// || `caller == target_agent`. `section`/`note_title` sont résolus **server-side**
+/// (jamais depuis l'input). En cas de refus, un audit `vault_write_rejected`
+/// (`identity_write_denied_foreign_agent`) est émis, symétrique au guard write inline.
+///
+/// **No-op strict** hors `identity` (parité exacte `vault_write_impl`) — zéro impact sur
+/// les mutations de sections non-`identity`. Un appelant qui veut fail-closed sur une
+/// résolution *en erreur* passe une sentinelle `section = "identity"` (cf.
+/// [`resolve_title_section_failclosed`]).
+///
+/// # Erreurs
+///
+/// - [`GradatumError::Forbidden`] si l'appelant non privilégié n'est pas le propriétaire
+///   de l'âme ciblée.
+async fn enforce_identity_write_guard(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant: &str,
+    section: &str,
+    note_title: Option<&str>,
+    note_id: &str,
+) -> Result<(), GradatumError> {
+    // No-op strict hors identity (parité exacte vault_write_impl).
+    if section != IDENTITY_SECTION {
+        return Ok(());
+    }
+    // Session Studio = palier de confiance admin — mutation totale autorisée.
+    if matches!(trust, TrustContext::Studio { .. }) {
+        return Ok(());
+    }
+    // `subject()` = `sub` du JWT (jamais dérivé d'un paramètre client). `target_agent`
+    // est extrait server-side du titre `identity/<agent>`, jamais de l'input requête.
+    let caller_sub = trust.subject().unwrap_or("");
+    let target_agent = note_title
+        .and_then(|t| t.strip_prefix("identity/"))
+        .unwrap_or("");
+    let allowed = caller_sub == SOUL_PRIVILEGED_WRITER
+        || (!target_agent.is_empty() && caller_sub == target_agent);
+    if allowed {
+        return Ok(());
+    }
+    let locus = format!("{tenant}/main");
+    // Pas de `X-Request-ID` sur ces surfaces de mutation ciblées-par-ULID : ULID frais
+    // (parité `emit_read_rejection_audit`).
+    emit_write_rejection_audit(
+        state,
+        trust,
+        tenant,
+        &locus,
+        &Ulid::new().to_string(),
+        "identity_write_denied_foreign_agent",
+        Some(note_id.to_string()),
+    )
+    .await;
+    Err(GradatumError::Forbidden(
+        "identity: écriture restreinte au propriétaire de l'âme".into(),
+    ))
+}
 
 /// Logique métier de `POST /api/v1/vault_write`.
 ///
@@ -1279,6 +1680,31 @@ pub async fn vault_write_impl(
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
 
+    // ── F-36 write_check drift (v0.7.3, warn-only ABSOLU) ──────────────────────
+    // Détecte les incohérences catégorie-titre / section_hint déclarée.
+    // JAMAIS bloquant : zéro chemin d'erreur ajouté, zéro impact write.
+    // Cardinalité bornée : TABLE = 13 règles fixes → pas d'explosion label.
+    if let Some(w) = gradatum_core::write_check::check_category_section(
+        &req.title,
+        req.section_hint.as_deref(),
+        &req.tags,
+    ) {
+        tracing::warn!(
+            rule = w.rule,
+            category = %w.category,
+            expected = w.expected_section,
+            actual = ?w.actual_section,
+            title = ?req.title,
+            "write_check: catégorie titre incohérente avec section_hint/tags déclarés — vérifier section_hint et tags (NOMENCLATURE §10a, warn-only F-36)"
+        );
+        state
+            .metrics
+            .write_check
+            .get_or_create(&crate::metrics::DriftRuleLabel { rule: w.rule })
+            .inc();
+        emit_drift_audit(state, trust, &tenant, request_id, &w).await;
+    }
+
     // ── Validateur de schéma project-map (Task 5, spec §5/§16 B3) ──────────────
     // Forçage de catégorie : sur section_hint="project-map" UNIQUEMENT, le body
     // doit porter les liens typés obligatoires (1 project + 1 status + 1 kind,
@@ -1301,6 +1727,90 @@ pub async fn vault_write_impl(
             return Err(GradatumError::InvalidInput(format!(
                 "project-map schema: {schema_err}"
             )));
+        }
+    }
+
+    // ── Validation section `identity` (F-34 v0.7.3, A1/C2/C6) ──────────────────
+    // Forçage de schéma : sur section_hint="identity" UNIQUEMENT, le body doit
+    // respecter le format soul INVARIANTS/GATES/NARRATIVE avec INV-CANARY (C4).
+    // Bypass curator LLM (A1), comme project-map.
+    // Write-restrictive ACL (C6) : un agent ne peut écrire que sa propre âme —
+    // `target_agent` extrait du titre côté serveur (jamais paramètre client).
+    // Toute déviation → 403 + audit `"identity_write_denied_foreign_agent"`.
+
+    // (P1 sécu) Un titre "identity/..." sans section_hint="identity" est une anomalie :
+    // tentative de contourner la write-restrictive check identity, ou erreur client. Rejeter.
+    if req.title.starts_with("identity/") && req.section_hint.as_deref() != Some("identity") {
+        emit_write_rejection_audit(
+            state,
+            trust,
+            &tenant,
+            &locus,
+            request_id,
+            "rejected_400_identity_title_without_hint",
+            None,
+        )
+        .await;
+        return Err(GradatumError::InvalidInput(
+            "identity: section_hint=\"identity\" requis quand le titre commence par identity/"
+                .into(),
+        ));
+    }
+
+    if req.section_hint.as_deref() == Some("identity") {
+        // (a) ACL write-restrictive d'abord (fail-fast droits avant traitement du body).
+        //     Le target agent-id est extrait du titre côté serveur (jamais paramètre
+        //     client). L'owner privilégié `SOUL_PRIVILEGED_WRITER` (api-key SSI) est
+        //     autorisé à écrire n'importe quelle âme (SSI — Self-Sovereign Identity).
+        let target_agent = match req.title.strip_prefix("identity/") {
+            Some(a) if !a.is_empty() => a,
+            _ => {
+                emit_write_rejection_audit(
+                    state,
+                    trust,
+                    &tenant,
+                    &locus,
+                    request_id,
+                    "rejected_400_identity_bad_title",
+                    None,
+                )
+                .await;
+                return Err(GradatumError::InvalidInput(
+                    "identity: le titre doit être identity/<agent-id> (non vide)".into(),
+                ));
+            }
+        };
+        // `trust.subject()` renvoie `sub` du JWT — jamais dérivé d'un paramètre client.
+        let caller_sub = trust.subject().unwrap_or("");
+        let is_privileged = caller_sub == SOUL_PRIVILEGED_WRITER;
+        if !is_privileged && target_agent != caller_sub {
+            emit_write_rejection_audit(
+                state,
+                trust,
+                &tenant,
+                &locus,
+                request_id,
+                "identity_write_denied_foreign_agent",
+                Some(target_agent.to_string()),
+            )
+            .await;
+            return Err(GradatumError::Forbidden(
+                "identity: un agent ne peut écrire que sa propre âme".into(),
+            ));
+        }
+        // (b) Schema soul après ACL (body traité uniquement si droits OK).
+        if let Err(e) = gradatum_core::soul::validate_soul(&req.body) {
+            emit_write_rejection_audit(
+                state,
+                trust,
+                &tenant,
+                &locus,
+                request_id,
+                "rejected_400_identity_schema",
+                None,
+            )
+            .await;
+            return Err(GradatumError::InvalidInput(format!("identity schema: {e}")));
         }
     }
 
@@ -1345,31 +1855,78 @@ pub async fn vault_write_impl(
         ));
     }
 
-    // Garde overwrite : note_id valide + note EXISTANTE sans expected_sha256 → Conflict.
-    if req.note_id.is_some() && req.expected_sha256.is_none() {
-        match state
-            .vault
-            .read_note_by_id(&note_id_prealloc.to_string())
-            .await
-        {
+    // Garde overwrite (note_id fourni) — distingue 3 états de la cible :
+    //   • vivante : `.md` présent (index présent) ;
+    //   • fantôme : index présent mais `.md` absent (ULID mort, ressuscitable) ;
+    //   • neuve   : jamais indexée, `.md` absent.
+    //
+    // | état    | expected_sha256 = None            | expected_sha256 = Some                |
+    // |---------|-----------------------------------|---------------------------------------|
+    // | vivante | 409 (overwrite sans garde)        | passe → optimistic-lock worker        |
+    // | fantôme | passe → self-heal (résurrection)  | 409 (sha invérifiable, `.md` absent)  |
+    // | neuve   | passe                             | passe → écriture neuve                 |
+    //
+    // Le cas fantôme + `expected_sha256 = Some` ne peut PAS être honoré (aucun `.md`
+    // à hasher contre `sha`) : on refuse en 409 plutôt que d'ignorer silencieusement
+    // la garde optimiste côté worker — qui traiterait le fantôme comme une note neuve
+    // et l'écraserait inconditionnellement (bypass de l'optimistic-lock).
+    if req.note_id.is_some() {
+        let note_id_str = note_id_prealloc.to_string();
+        match state.vault.read_note_by_id(&note_id_str).await {
             Ok(_) => {
-                emit_write_rejection_audit(
-                    state,
-                    trust,
-                    &tenant,
-                    &locus,
-                    request_id,
-                    "rejected_409_overwrite_no_sha",
-                    Some(note_id_prealloc.to_string()),
-                )
-                .await;
-                return Err(GradatumError::Conflict(
-                    "overwrite sans expected_sha256".into(),
-                ));
+                // `.md` présent : note vivante. Sans expected_sha256 → overwrite refusé.
+                if req.expected_sha256.is_none() {
+                    emit_write_rejection_audit(
+                        state,
+                        trust,
+                        &tenant,
+                        &locus,
+                        request_id,
+                        "rejected_409_overwrite_no_sha",
+                        Some(note_id_str),
+                    )
+                    .await;
+                    return Err(GradatumError::Conflict(
+                        "overwrite sans expected_sha256".into(),
+                    ));
+                }
+                // expected_sha256 = Some → optimistic-lock délégué au worker (write_if_match).
             }
-            Err(gradatum_core::error::GradatumError::NoteNotFound(_)) => {}
+            Err(gradatum_core::error::GradatumError::NoteNotFound(_)) => {
+                // `.md` absent : fantôme (indexé) ou note neuve (non indexée).
+                // Seul fantôme + sha = Some est refusé ; sinon (None, ou note neuve) on
+                // laisse passer (self-heal / création). L'appel index-level n'est payé
+                // que dans ce cas étroit (`.md` absent ET sha fourni).
+                if req.expected_sha256.is_some() && state.vault.note_indexed(&note_id_str).await? {
+                    emit_write_rejection_audit(
+                        state,
+                        trust,
+                        &tenant,
+                        &locus,
+                        request_id,
+                        "rejected_409_phantom_expected_sha",
+                        Some(note_id_str),
+                    )
+                    .await;
+                    return Err(GradatumError::Conflict(
+                        "note fantôme (.md absent) : expected_sha256 invérifiable".into(),
+                    ));
+                }
+            }
             Err(e) => return Err(e),
         }
+    }
+
+    // ── Validation occurred_at (F-74) ─────────────────────────────────────────
+    // Fail-fast serveur : si occurred_at est présent et non parseable, on rejette
+    // immédiatement avec 400 AVANT d'enqueue le job.
+    // Parseur SSOT partagé avec le worker : parse_temporal_str_as_ms (gradatum-core).
+    // Cohérence serveur↔worker garantie par la même fonction — un format accepté ici
+    // sera forcément parsé correctement côté worker (aucun false-negative silencieux).
+    if let Some(occ) = &req.occurred_at
+        && gradatum_core::parse_temporal_str_as_ms(occ).is_none()
+    {
+        return Err(GradatumError::InvalidInput("occurred_at invalide".into()));
     }
 
     let record = build_curate_job_record(&req, note_id_prealloc, &tenant);
@@ -1482,9 +2039,23 @@ pub async fn vault_classify_impl(
     let note = state.vault.read_note_by_id(&req.note_id).await?;
     let current_section = note.frontmatter.section.to_string();
 
+    // Guard identité par-agent (parité `vault_read_impl`) : `vault_classify` lit le CORPS
+    // complet de la note server-side et expose `current_section`. Un non-propriétaire ne doit
+    // pas pouvoir sonder / reclassifier l'âme d'un AUTRE agent. Section = section RÉELLE de la
+    // note ; `target_agent` dérivé du H1 `identity/<agent>`. No-op strict hors `identity`.
+    let h1_title = gradatum_curator::extract_h1_title(&note.body.markdown);
+    enforce_identity_read_guard(
+        state,
+        trust,
+        &tenant,
+        &current_section,
+        h1_title.as_deref(),
+        &req.note_id,
+    )
+    .await?;
+
     // Construction du CuratorNote — pattern identique au worker classify.
-    let title_for_curator = gradatum_curator::extract_h1_title(&note.body.markdown)
-        .unwrap_or_else(|| current_section.clone());
+    let title_for_curator = h1_title.unwrap_or_else(|| current_section.clone());
     let tags_hint: Vec<String> = note
         .frontmatter
         .tags
@@ -1559,6 +2130,24 @@ pub async fn vault_history_impl(
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
 
+    // Guard identité par-agent (parité `vault_read_impl`) : ne pas divulguer l'existence
+    // ni la timeline des versions d'une âme cross-agent. Section RÉELLE + titre résolus
+    // server-side depuis l'index (`get_titles_sections`), jamais depuis l'input.
+    //   - note présente, section=identity → guard par-âme ;
+    //   - note présente, autre section    → no-op (200 normal) ;
+    //   - note absente de l'index (map vide) → section "" → no-op (préserve le 200 vide) ;
+    //   - erreur d'index → sentinelle `identity` → FAIL-CLOSED (non-priv 403, priv OK).
+    let (title, section) = resolve_title_section_failclosed(state, tenant, &req.note_id).await;
+    enforce_identity_read_guard(
+        state,
+        trust,
+        tenant,
+        &section,
+        title.as_deref(),
+        &req.note_id,
+    )
+    .await?;
+
     let versions = state.vault.history_versions(&req.note_id).await?;
     let count = versions.len();
     Ok(VaultHistoryResponse { versions, count })
@@ -1583,11 +2172,28 @@ pub async fn vault_history_get_impl(
     }
 
     let snapshot = state.vault.history_get(&req.note_id, req.ts_ms).await?;
+
+    // Guard identité par-agent (parité `vault_read_impl`) : l'historique CoW exposait
+    // le corps complet d'une âme cross-agent sans aucune restriction. Section RÉELLE et
+    // titre (`identity/<agent>`) résolus depuis le snapshot lui-même — self-contained,
+    // sans appel index supplémentaire ni chemin d'échec.
+    let section = snapshot.frontmatter.section.to_string();
+    let title = extract_h1_title(&snapshot.body.markdown);
+    enforce_identity_read_guard(
+        state,
+        trust,
+        tenant,
+        &section,
+        title.as_deref(),
+        &req.note_id,
+    )
+    .await?;
+
     Ok(VaultHistoryGetResponse {
         note_id: req.note_id,
         ts_ms: req.ts_ms,
         body: snapshot.body.markdown,
-        section: snapshot.frontmatter.section.to_string(),
+        section,
     })
 }
 
@@ -1609,6 +2215,22 @@ pub async fn vault_restore_impl(
     if state.acl.evaluate(trust, AclOp::Write, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny write".into()));
     }
+
+    // Guard write-restrictive par-agent (parité `vault_write_impl` C6) : `history_restore`
+    // écrase le corps courant d'une note par une version antérieure, court-circuitant la
+    // garde write inline de `vault_write_impl`. Sans ce guard, un non-privilégié avec ACL
+    // Write pourrait restaurer/écraser l'âme d'un AUTRE agent. Section + titre résolus
+    // server-side ; FAIL-CLOSED sur erreur d'index ; no-op hors section `identity`.
+    let (title, section) = resolve_title_section_failclosed(state, tenant, &req.note_id).await;
+    enforce_identity_write_guard(
+        state,
+        trust,
+        tenant,
+        &section,
+        title.as_deref(),
+        &req.note_id,
+    )
+    .await?;
 
     let content_hash = state.vault.history_restore(&req.note_id, req.ts_ms).await?;
     Ok(VaultRestoreResponse {
@@ -1642,6 +2264,22 @@ pub async fn vault_diff_impl(
             "sélecteur invalide (attendu 'current' ou timestamp ms)".into(),
         ));
     }
+
+    // Guard identité par-agent (parité `vault_history_get_impl`) : `history_diff` renvoie
+    // les lignes de diff du CORPS d'une note entre 2 versions → exfiltration du corps d'âme
+    // cross-agent identique à `vault_history_get`. Section + titre (`identity/<agent>`)
+    // résolus server-side depuis l'index, jamais depuis l'input. FAIL-CLOSED sur erreur
+    // d'index (sentinelle `identity`) ; no-op si note absente ou section non-`identity`.
+    let (title, section) = resolve_title_section_failclosed(state, tenant, &req.note_id).await;
+    enforce_identity_read_guard(
+        state,
+        trust,
+        tenant,
+        &section,
+        title.as_deref(),
+        &req.note_id,
+    )
+    .await?;
 
     let lines = state
         .vault
@@ -1690,7 +2328,140 @@ pub async fn lessons_recall_impl(
 
     let limit = params.limit.unwrap_or(5).clamp(1, 20) as usize;
     let vault_id = VaultId::new(LESSONS_TENANT);
+
+    // ── F-68 semantic opt-in ──────────────────────────────────────────────────
+    //
+    // Rétro-compat BLOQUANTE : `semantic` absent / `false` → chemin BM25 ci-dessous
+    // INCHANGÉ. Le hook LIVE `lesson-recall.sh`, les agents et le MCP qui n'envoient
+    // pas ce champ continuent à recevoir le résultat BM25 sans modification.
+    //
+    // `semantic = true` :
+    //  1. retrieve_candidates (RRF BM25 + sémantique, section filtrée).
+    //  2. Hydrate les ULIDs retournés → LessonHitRaw (titre, tags, anchor_ms, snippet).
+    //  3. Filtres Rust : `codified` absent + tag == class.
+    //  4. Apply rank si RecencyBoosted.
+    //  5. Return early.
+    //
+    // Fallback silencieux → chemin BM25 : `embed_fallback = true` (Noop, timeout, erreur).
+    if params.semantic.unwrap_or(false) {
+        let query = params
+            .query
+            .as_deref()
+            .filter(|q| !q.trim().is_empty())
+            .unwrap_or(class)
+            .to_string();
+
+        let embed_timeout_ms = state.context.embed_timeout_ms;
+        let retrieval_result = retrieve_candidates(
+            state,
+            &vault_id,
+            &query,
+            Some(&[LESSONS_SECTION]),
+            // Sur-fetch : retrieve_candidates renvoie les top_n candidats, certains
+            // seront filtrés (codified + class), donc on demande le double pour avoir
+            // au moins `limit` résultats nets.
+            (limit * 2).max(limit),
+            embed_timeout_ms,
+        )
+        .await;
+
+        match retrieval_result {
+            Ok(outcome) if !outcome.embed_fallback => {
+                // Embed a réussi — les candidats sont pertinents sémantiquement.
+                let ulid_refs: Vec<&str> = outcome
+                    .candidates
+                    .iter()
+                    .map(|c| c.note_id.as_str())
+                    .collect();
+                let hydrated = state
+                    .search
+                    .hydrate_lessons_by_ulids(&vault_id, &ulid_refs)
+                    .await?;
+
+                // Filtres post-hydratation : codified exclu + classe correcte.
+                let filtered: Vec<_> = hydrated
+                    .into_iter()
+                    .filter(|h| !h.tags.iter().any(|t| t == "codified"))
+                    .filter(|h| h.tags.iter().any(|t| t.as_str() == class))
+                    .take(limit)
+                    .collect();
+
+                // Recency boost opt-in (même logique que le chemin BM25 ci-dessous).
+                let raw_hits_sem = if matches!(params.rank, Some(RankMode::RecencyBoosted)) {
+                    let now_ms = Utc::now().timestamp_millis();
+                    const K: f64 = 60.0;
+                    let mut scored: Vec<(_, f64)> = filtered
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, h)| {
+                            let rank_proxy = 1.0 / (K + i as f64);
+                            let combined = rank_proxy * recency_factor(h.anchor_ms, now_ms);
+                            (h, combined)
+                        })
+                        .collect();
+                    scored
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    scored.into_iter().map(|(h, _)| h).collect::<Vec<_>>()
+                } else {
+                    filtered
+                };
+
+                let items: Vec<LessonHit> = raw_hits_sem
+                    .into_iter()
+                    .map(|h| LessonHit {
+                        ulid: h.note_id.0.to_string(),
+                        title: h.title.unwrap_or_default(),
+                        snippet: h.snippet,
+                        tags: h.tags,
+                        anchor_ms: h.anchor_ms,
+                    })
+                    .collect();
+                return Ok(LessonsRecallResponse { items });
+            }
+            // embed_fallback = true (Noop, timeout, erreur) OU Err SQL → fallback BM25.
+            _ => {
+                tracing::debug!(
+                    class = class,
+                    query = query.as_str(),
+                    "lessons_recall: embed KO ou fallback — chemin BM25"
+                );
+            }
+        }
+    }
+
+    // ── Chemin BM25 (défaut) ──────────────────────────────────────────────────
     let raw_hits = state.search.recall_lessons(&vault_id, class, limit).await?;
+
+    // Recency boost (opt-in) — rétro-compat BLOQUANTE : None / Relevance = BM25 inchangé.
+    //
+    // Stratégie : RRF-style rank-proxy (`1 / (K + rank_index)`, K = 60 standard)
+    // multiplié par `recency_factor(anchor_ms, now_ms)`.  Le score BM25 brut n'est pas
+    // exposé dans `LessonHitRaw` — le proxy de rang encode l'ordre BM25 sans modification
+    // de la couche index.  Pour des scores BM25 identiques (corpus égaux), la différence
+    // de recency détermine seule l'ordre final.
+    //
+    // `sort_by` est stable (Rust 1.x) : les ex-aequo de score combiné conservent l'ordre
+    // BM25 d'origine (invariant additionnel documenté).
+    let raw_hits = if matches!(params.rank, Some(RankMode::RecencyBoosted)) {
+        let now_ms = Utc::now().timestamp_millis();
+        // K = 60 : constante RRF standard, évite un score infini pour le rang 0.
+        const K: f64 = 60.0;
+        let mut scored: Vec<(_, f64)> = raw_hits
+            .into_iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let rank_proxy = 1.0 / (K + i as f64);
+                let combined = rank_proxy * recency_factor(h.anchor_ms, now_ms);
+                (h, combined)
+            })
+            .collect();
+        // desc : b cmp a (partial_cmp — f64 ne peut pas être NaN ici : exp() > 0 + division > 0)
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().map(|(h, _)| h).collect()
+    } else {
+        // None (absent) ou Relevance → ordre BM25 de recall_lessons, inchangé.
+        raw_hits
+    };
 
     let items: Vec<LessonHit> = raw_hits
         .into_iter()
@@ -1749,6 +2520,21 @@ pub async fn vault_downgrade_impl(
     if state.acl.evaluate(trust, AclOp::Write, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny write".into()));
     }
+
+    // Guard write-restrictive par-agent (parité `vault_write_impl` C6) : `downgrade_note`
+    // mute le statut d'une note ciblée par ULID sans passer par `vault_write_impl`. Sans ce
+    // guard, un non-privilégié avec ACL Write pourrait déclasser l'âme d'un AUTRE agent.
+    // Section + titre résolus server-side ; FAIL-CLOSED sur erreur ; no-op hors `identity`.
+    let (title, section) = resolve_title_section_failclosed(state, tenant, &req.note_id).await;
+    enforce_identity_write_guard(
+        state,
+        trust,
+        tenant,
+        &section,
+        title.as_deref(),
+        &req.note_id,
+    )
+    .await?;
 
     // Parse des ULID — erreurs déjà typées via GradatumError::Validation.
     let note_id = ulid::Ulid::from_string(&req.note_id)
@@ -1819,6 +2605,22 @@ pub async fn patch_note_impl(
     if state.acl.evaluate(trust, AclOp::Write, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny write".into()));
     }
+
+    // Guard write-restrictive par-agent (parité `vault_write_impl` C6) : `patch_note` mute le
+    // statut / `replaced_by` d'une note ciblée par ULID sans passer par `vault_write_impl`.
+    // Sans ce guard, un non-privilégié avec ACL Write pourrait altérer le statut de l'âme
+    // d'un AUTRE agent. Section + titre résolus server-side ; FAIL-CLOSED ; no-op hors identity.
+    let note_id_str = note_id.to_string();
+    let (title, section) = resolve_title_section_failclosed(state, tenant, &note_id_str).await;
+    enforce_identity_write_guard(
+        state,
+        trust,
+        tenant,
+        &section,
+        title.as_deref(),
+        &note_id_str,
+    )
+    .await?;
 
     // Logique métier extraite de patch_note (inchangée — contrat métier identique).
     if let Some(ref status_str) = body.status {
@@ -1904,6 +2706,14 @@ pub async fn move_note_locus_impl(
     if state.acl.evaluate(trust, AclOp::Write, &acl_locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny write".into()));
     }
+
+    // Guard write-restrictive par-agent (parité `vault_write_impl` C6) : `move_locus`
+    // relocalise physiquement le `.md` d'une note ciblée par ULID sans passer par
+    // `vault_write_impl`. Sans ce guard, un non-privilégié avec ACL Write pourrait déplacer
+    // (et donc casser la résolution soul-inject de) l'âme d'un AUTRE agent. Section + titre
+    // résolus server-side ; FAIL-CLOSED sur erreur d'index ; no-op hors section `identity`.
+    let (title, section) = resolve_title_section_failclosed(state, tenant, id).await;
+    enforce_identity_write_guard(state, trust, tenant, &section, title.as_deref(), id).await?;
 
     state.vault.move_locus(id, &locus).await?;
     Ok(())

@@ -59,7 +59,17 @@ async fn locus_filter_fts_restricts_by_prefix() {
 
     // Filtre locus = "council/" → seule la note council
     let results = idx
-        .search_fts_with_snippet(&vault, "scoping", 10, false, None, Some("council/"), None)
+        .search_fts_with_snippet(
+            &vault,
+            "scoping",
+            10,
+            false,
+            None,
+            Some("council/"),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("search FTS avec locus council/");
 
@@ -107,7 +117,17 @@ async fn locus_none_returns_all_notes() {
 
     // Pas de filtre locus → les deux notes
     let results = idx
-        .search_fts_with_snippet(&vault, "nonregression", 10, false, None, None, None)
+        .search_fts_with_snippet(
+            &vault,
+            "nonregression",
+            10,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("search FTS sans locus");
 
@@ -146,7 +166,7 @@ async fn locus_percent_literal_no_match() {
     // Filtre locus = "%" — sans échappement serait un joker universel.
     // Avec escape_like : traité littéralement → ne matche QUE les locus commençant par "%".
     let results = idx
-        .search_fts_with_snippet(&vault, "test", 10, false, None, Some("%"), None)
+        .search_fts_with_snippet(&vault, "test", 10, false, None, Some("%"), None, None, None)
         .await
         .expect("search avec locus=%");
 
@@ -193,7 +213,17 @@ async fn locus_underscore_literal() {
 
     // Filtre "a_b" → avec échappement, matche UNIQUEMENT le locus "a_b/..." (underscore littéral).
     let results = idx
-        .search_fts_with_snippet(&vault, "underscore", 10, false, None, Some("a_b"), None)
+        .search_fts_with_snippet(
+            &vault,
+            "underscore",
+            10,
+            false,
+            None,
+            Some("a_b"),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("search avec locus a_b");
 
@@ -249,6 +279,8 @@ async fn locus_backslash_literal() {
             None,
             Some("path\\special"),
             None,
+            None,
+            None,
         )
         .await
         .expect("search avec locus backslash");
@@ -299,7 +331,7 @@ async fn vault_id_scoping_fts() {
     // Requête sur vault "secondary" → uniquement la note secondary
     let vault_sec = VaultId::new("secondary");
     let results = idx
-        .search_fts_with_snippet(&vault_sec, "vault", 10, false, None, None, None)
+        .search_fts_with_snippet(&vault_sec, "vault", 10, false, None, None, None, None, None)
         .await
         .expect("search vault secondary");
 

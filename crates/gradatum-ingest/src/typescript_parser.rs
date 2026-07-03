@@ -1,58 +1,58 @@
-//! Parser tree-sitter pour les fichiers TypeScript (feature `code-typescript`).
+//! Tree-sitter parser for TypeScript files (feature `code-typescript`).
 //!
-//! ## Entités extraites
+//! ## Extracted entities
 //!
-//! - Fonctions (`function_declaration`) → `DerivedSymbol` avec `kind = "fn"`
-//! - Classes (`class_declaration`) → `DerivedSymbol` avec `kind = "class"`
-//! - Interfaces (`interface_declaration`) → `DerivedSymbol` avec `kind = "type"`
-//! - Méthodes dans les classes (`method_definition`) → `kind = "method"`,
+//! - Functions (`function_declaration`) → `DerivedSymbol` with `kind = "fn"`
+//! - Classes (`class_declaration`) → `DerivedSymbol` with `kind = "class"`
+//! - Interfaces (`interface_declaration`) → `DerivedSymbol` with `kind = "type"`
+//! - Class methods (`method_definition`) → `kind = "method"`,
 //!   `qualified_name = "ClassName::methodName"`
-//! - Arrow functions top-level (`const f = () => {}`) → `kind = "fn"`
+//! - Top-level arrow functions (`const f = () => {}`) → `kind = "fn"`
 //!
-//! ## Visibilité
+//! ## Visibility
 //!
-//! - Présence d'un `export_statement` parent → `"pub"`
-//! - Absence → `"priv"` (module-local, non exporté)
-//! - Dans une classe, modificateurs `public`/`private`/`protected` respectés.
-//!   Défaut absent → `"pub"` (TypeScript default visibility = public).
+//! - Presence of a parent `export_statement` → `"pub"`
+//! - Absence → `"priv"` (module-local, not exported)
+//! - Inside a class, `public`/`private`/`protected` modifiers are respected.
+//!   Missing modifier → `"pub"` (TypeScript default visibility = public).
 //!
-//! ## Docstrings JSDoc
+//! ## JSDoc docstrings
 //!
-//! Les blocs `/** ... */` (nœuds `comment` précédant l'item, texte commençant par `/**`)
-//! sont extraits comme doc-comment. Limité à 5 lignes.
+//! `/** ... */` blocks (comment nodes preceding the item, text starting with `/**`)
+//! are extracted as the doc-comment. Capped at 5 lines.
 //!
 //! ## Signature
 //!
-//! Texte brut du nœud `formal_parameters`, tronqué à 120 bytes (char-safe).
-//! `None` pour les classes et interfaces.
+//! Raw text of the `formal_parameters` node, truncated to 120 bytes (char-safe).
+//! `None` for classes and interfaces.
 //!
-//! ## Variante TSX
+//! ## TSX variant
 //!
-//! Non couverte : `LANGUAGE_TYPESCRIPT` ne parse pas JSX.
-//! Utiliser `LANGUAGE_TSX` (non exposé par cette fonction) pour `.tsx`.
-//! Comportement documenté, pas un bug.
+//! Not covered: `LANGUAGE_TYPESCRIPT` does not parse JSX.
+//! Use `LANGUAGE_TSX` (see [`crate::parse_tsx_file`]) for `.tsx` files.
+//! This is intentional behavior, not a bug.
 //!
 //! ## Deps
 //!
-//! `deps = vec![]` pour cette implémentation (accuracy > coverage).
+//! `deps = vec![]` for this implementation (accuracy > coverage).
 
 use tree_sitter::Node;
 
 use crate::DerivedSymbol;
 
-/// Retourne le texte UTF-8 d'un nœud tree-sitter.
+/// Returns the UTF-8 text of a tree-sitter node.
 ///
-/// ## Invariant de sécurité
+/// ## Safety invariant
 ///
-/// `source` doit être le MÊME buffer passé à `parser.parse(content, None)`.
-/// `.unwrap_or("")` est défensif mais ne se déclenche normalement jamais.
+/// `source` must be the SAME buffer passed to `parser.parse(content, None)`.
+/// `.unwrap_or("")` is defensive but should never trigger.
 fn node_text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
-/// Calcule le span 1-based inclusif `(start_line, end_line)` d'un nœud.
+/// Computes the 1-based inclusive span `(start_line, end_line)` of a node.
 ///
-/// Mirror de la même fonction dans `python_parser.rs` et `bash_parser.rs`.
+/// Mirrors the same function in `python_parser.rs` and `bash_parser.rs`.
 fn extract_node_span(node: Node<'_>) -> Option<(u32, u32)> {
     let start_line = (node.start_position().row as u32).saturating_add(1);
     let end_line = if node.end_position().column == 0 && node.end_position().row > 0 {
@@ -67,9 +67,9 @@ fn extract_node_span(node: Node<'_>) -> Option<(u32, u32)> {
     Some((start_line, end_line))
 }
 
-/// Tronque un texte à 120 bytes de manière char-safe.
+/// Truncates text to 120 bytes in a char-safe manner.
 ///
-/// Mirror du pattern utilisé dans `rust_parser.rs` et `python_parser.rs`.
+/// Mirrors the pattern used in `rust_parser.rs` and `python_parser.rs`.
 fn truncate_120(s: &str) -> String {
     if s.len() <= 120 {
         s.to_string()
@@ -83,21 +83,21 @@ fn truncate_120(s: &str) -> String {
     }
 }
 
-/// Extrait le commentaire JSDoc (`/** ... */`) précédant immédiatement un nœud.
+/// Extracts the JSDoc comment (`/** ... */`) that immediately precedes a node.
 ///
-/// Parcourt les siblings précédents du nœud dans son parent. Ne collecte que
-/// les `comment` contigus. Limité à 5 lignes.
+/// Walks the node's previous siblings in its parent. Collects only contiguous
+/// `comment` nodes. Capped at 5 lines.
 ///
-/// ## Cas export_statement
+/// ## `export_statement` case
 ///
-/// Quand un item est déclaré via `export_statement`, le comment JSDoc est un sibling
-/// de l'`export_statement`, PAS de la déclaration inner. Dans ce cas, on remonte
-/// au niveau de l'`export_statement` pour chercher les siblings.
+/// When an item is declared via `export_statement`, the JSDoc comment is a sibling
+/// of the `export_statement`, NOT of the inner declaration. In that case the function
+/// ascends to the `export_statement` level to search for siblings.
 ///
-/// Exemple d'AST :
+/// Example AST:
 /// ```text
 /// (program
-///   (comment "/** Handler. */")   ← sibling de export_statement
+///   (comment "/** Handler. */")   ← sibling of export_statement
 ///   (export_statement
 ///     declaration: (function_declaration ...)))
 /// ```
@@ -178,9 +178,9 @@ fn extract_jsdoc(node: Node<'_>, source: &[u8]) -> Option<String> {
     Some(lines.iter().take(5).cloned().collect::<Vec<_>>().join("\n"))
 }
 
-/// Extrait la signature depuis le nœud `formal_parameters`.
+/// Extracts the signature from the `formal_parameters` node.
 ///
-/// Texte brut tronqué à 120 bytes (char-safe). `None` si le nœud n'est pas trouvé.
+/// Raw text truncated to 120 bytes (char-safe). `None` if the node is not found.
 fn extract_formal_parameters(node: Node<'_>, source: &[u8]) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -192,12 +192,12 @@ fn extract_formal_parameters(node: Node<'_>, source: &[u8]) -> Option<String> {
     None
 }
 
-/// Détermine la visibilité d'une méthode depuis ses modificateurs TypeScript.
+/// Determines the visibility of a method from its TypeScript accessibility modifiers.
 ///
-/// Cherche les nœuds `accessibility_modifier` enfants du `method_definition`.
+/// Searches for `accessibility_modifier` child nodes of `method_definition`.
 /// - `public` → `"pub"`
 /// - `private` → `"priv"`
-/// - `protected` → `"priv"` (inaccessible depuis l'extérieur)
+/// - `protected` → `"priv"` (inaccessible from outside)
 /// - Absent → `"pub"` (TypeScript default = public)
 fn method_visibility(node: Node<'_>, source: &[u8]) -> &'static str {
     let mut cursor = node.walk();
@@ -215,13 +215,13 @@ fn method_visibility(node: Node<'_>, source: &[u8]) -> &'static str {
     "pub"
 }
 
-/// Contexte de parsing : visibilité export de l'item courant.
+/// Parsing context: export visibility of the current item.
 struct ParseContext {
-    /// Si `true`, l'item courant est sous un `export_statement`.
+    /// `true` when the current item is under an `export_statement`.
     is_exported: bool,
 }
 
-/// Extrait les items d'un `class_body` (méthodes).
+/// Extracts items from a `class_body` (methods).
 fn extract_class_methods(
     class_name: &str,
     class_body: Node<'_>,
@@ -264,7 +264,7 @@ fn extract_class_methods(
     }
 }
 
-/// Extrait un `class_declaration` ou `interface_declaration`.
+/// Extracts a `class_declaration` or `interface_declaration`.
 fn extract_class_or_interface(
     node: Node<'_>,
     source: &[u8],
@@ -314,7 +314,7 @@ fn extract_class_or_interface(
     }
 }
 
-/// Extrait une `function_declaration`.
+/// Extracts a `function_declaration`.
 fn extract_function_declaration(
     node: Node<'_>,
     source: &[u8],
@@ -350,12 +350,12 @@ fn extract_function_declaration(
     });
 }
 
-/// Extrait une `lexical_declaration` top-level contenant une `arrow_function`.
+/// Extracts a top-level `lexical_declaration` containing an `arrow_function`.
 ///
-/// Patterns reconnus :
-/// - `const f = () => {}` : `lexical_declaration` → `variable_declarator` → `arrow_function`
+/// Recognized patterns:
+/// - `const f = () => {}`: `lexical_declaration` → `variable_declarator` → `arrow_function`
 ///
-/// Le nom est extrait du `variable_declarator` (champ `name` de type `identifier`).
+/// The name is extracted from the `variable_declarator` (field `name` of type `identifier`).
 fn extract_arrow_function(
     node: Node<'_>,
     source: &[u8],
@@ -423,7 +423,7 @@ fn extract_arrow_function(
     }
 }
 
-/// Dispatch d'un item top-level ou sous un `export_statement`.
+/// Dispatches a top-level item or one nested under an `export_statement`.
 fn dispatch_item(
     node: Node<'_>,
     source: &[u8],
@@ -446,7 +446,7 @@ fn dispatch_item(
     }
 }
 
-/// Extrait les items top-level d'un programme TypeScript.
+/// Extracts top-level items from a TypeScript program.
 fn extract_program_items(
     program_node: Node<'_>,
     source: &[u8],
@@ -470,33 +470,33 @@ fn extract_program_items(
     }
 }
 
-/// Implémentation [`crate::language_parser::LanguageParser`] pour TypeScript.
+/// [`crate::language_parser::LanguageParser`] implementation for TypeScript.
 ///
-/// Encapsule la connaissance de la grammaire TypeScript : node-kinds, extraction
-/// de symboles, convention de visibilité `export`.
+/// Encapsulates TypeScript grammar knowledge: node kinds, symbol extraction,
+/// and the `export`-based visibility convention.
 ///
-/// ## Variante TSX
+/// ## TSX variant
 ///
-/// Quand `jsx = true`, utilise `LANGUAGE_TSX` (grammaire JSX/React fournie par la même
-/// crate `tree-sitter-typescript 0.23.2`) à la place de `LANGUAGE_TYPESCRIPT`.
+/// When `jsx = true`, uses `LANGUAGE_TSX` (the JSX/React grammar from the same
+/// `tree-sitter-typescript 0.23.2` crate) instead of `LANGUAGE_TYPESCRIPT`.
 ///
-/// Les node-kinds `function_declaration`, `class_declaration`, `interface_declaration`,
-/// `method_definition`, `lexical_declaration` / `arrow_function` sont identiques entre
-/// les deux grammaires — seul l'ajout de nœuds JSX diffère. L'extraction de symboles
-/// (`extract_symbols`) est donc identique quel que soit `jsx`.
+/// The node kinds `function_declaration`, `class_declaration`, `interface_declaration`,
+/// `method_definition`, `lexical_declaration` / `arrow_function` are identical in both
+/// grammars — only the addition of JSX nodes differs. The symbol extraction
+/// (`extract_symbols`) is therefore identical regardless of `jsx`.
 ///
-/// Constructeurs :
-/// - `TypeScriptParser::ts(include_private)` — grammaire `.ts` (LANGUAGE_TYPESCRIPT)
-/// - `TypeScriptParser::tsx(include_private)` — grammaire `.tsx` (LANGUAGE_TSX / JSX)
+/// Constructors:
+/// - `TypeScriptParser::ts(include_private)` — `.ts` grammar (LANGUAGE_TYPESCRIPT)
+/// - `TypeScriptParser::tsx(include_private)` — `.tsx` grammar (LANGUAGE_TSX / JSX)
 pub(crate) struct TypeScriptParser {
-    /// Si `true`, inclure les items non-exportés (`priv`) dans les symboles extraits.
+    /// When `true`, non-exported (`priv`) items are included in the output.
     pub(crate) include_private: bool,
-    /// Si `true`, utiliser `LANGUAGE_TSX` (JSX/React) au lieu de `LANGUAGE_TYPESCRIPT`.
+    /// When `true`, uses `LANGUAGE_TSX` (JSX/React) instead of `LANGUAGE_TYPESCRIPT`.
     pub(crate) jsx: bool,
 }
 
 impl TypeScriptParser {
-    /// Construit un parser pour fichiers `.ts` (grammaire `LANGUAGE_TYPESCRIPT`).
+    /// Builds a parser for `.ts` files (grammar `LANGUAGE_TYPESCRIPT`).
     pub(crate) fn ts(include_private: bool) -> Self {
         Self {
             include_private,
@@ -504,7 +504,7 @@ impl TypeScriptParser {
         }
     }
 
-    /// Construit un parser pour fichiers `.tsx` (grammaire `LANGUAGE_TSX`, comprend JSX).
+    /// Builds a parser for `.tsx` files (grammar `LANGUAGE_TSX`, includes JSX).
     pub(crate) fn tsx(include_private: bool) -> Self {
         Self {
             include_private,

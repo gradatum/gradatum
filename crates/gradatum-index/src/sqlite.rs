@@ -36,7 +36,9 @@ use gradatum_core::index::{FileChecksumEntry, FileKind, NoteRecord, TemporalEntr
 use gradatum_core::index_store::{
     CodeScopeEntryRaw, CodeSelector, LessonHitRaw, ReviewQueueRow, SearchHitRaw,
 };
+use gradatum_core::metric_sample::MetricSamplePoint;
 use gradatum_core::note::Note;
+use gradatum_core::scheduled_health::{ScheduledTaskHealth, TaskOutcome};
 use gradatum_core::scope::{OverrideScope, VaultId};
 use gradatum_core::section::{section_to_c_kind, section_to_doc_kind};
 use gradatum_core::status::NoteStatus;
@@ -1325,10 +1327,10 @@ impl SqliteIndex {
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if the SQLite query fails.
-    // 8 args: orthogonal search filters (downgraded/section/locus/status).
+    // 10 args: orthogonal search filters (downgraded/section/locus/status/from_ms/to_ms).
     #[expect(
         clippy::too_many_arguments,
-        reason = "filtres de recherche orthogonaux (F-37 notes fix) — struct d'options sans gain"
+        reason = "filtres de recherche orthogonaux (F-37+F-65) — struct d'options sans gain"
     )]
     pub async fn search_fts_with_snippet(
         &self,
@@ -1339,6 +1341,8 @@ impl SqliteIndex {
         section: Option<&str>,
         locus: Option<&str>,
         status: Option<&str>,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
     ) -> Result<Vec<SearchHitRaw>, GradatumError> {
         let conn = self.conn.lock().await;
 
@@ -1349,12 +1353,20 @@ impl SqliteIndex {
         // paramètre (NULL si None). Le prédicat `(?N IS NULL OR n.status = ?N)` matche
         // toutes les notes quand status est absent → arité fixe par branche, pas de
         // multiplication des branches section×locus×status.
-        let (downgraded_clause, section_clause, locus_clause, status_clause, _status_param_idx) =
+        // F-65 : from_ms/to_ms bindés APRÈS status, indices status+1 et status+2.
+        let (downgraded_clause, section_clause, locus_clause, status_clause, status_param_idx) =
             Self::build_fts_where_parts(4, include_downgraded, section, locus);
+        let from_ms_idx = status_param_idx + 1;
+        let to_ms_idx = status_param_idx + 2;
 
         // FTS5 snippet() : col=0 (body_text), marqueurs »/«, ellipsis ..., max 32 tokens
         // C1 (audit P1) : n.forgotten + n.forgotten_at ajoutés pour appliquer le decay
         // F-44 identique à search_fts_scored et search_fts_scored_filtered.
+        // F-65 : LEFT JOIN temporal_index — anchor_ms présent si entrée existante.
+        // Bornes from_ms/to_ms toujours bindées en fin de params (NULL si absentes)
+        // → arité fixe par branche, pas de multiplication section×locus×temporal.
+        // LEFT JOIN (pas INNER JOIN) : les notes sans entrée temporal_index passent
+        // les clauses IS NULL-guarded et sont incluses quand aucune borne n'est active.
         let sql = format!(
             "SELECT n.id,
                     bm25(notes_fts) AS score,
@@ -1363,15 +1375,19 @@ impl SqliteIndex {
                     n.section,
                     n.title,
                     n.forgotten,
-                    n.forgotten_at
+                    n.forgotten_at,
+                    t.anchor_ms
              FROM notes_fts
              JOIN notes n ON notes_fts.rowid = n.rowid
+             LEFT JOIN temporal_index t ON t.note_id = n.id
              WHERE notes_fts MATCH ?1
                AND n.vault_id = ?2
                {downgraded_clause}
                {section_clause}
                {locus_clause}
                {status_clause}
+               AND (?{from_ms_idx} IS NULL OR t.anchor_ms >= ?{from_ms_idx})
+               AND (?{to_ms_idx}   IS NULL OR t.anchor_ms <= ?{to_ms_idx})
              ORDER BY score ASC
              LIMIT ?3"
         );
@@ -1380,7 +1396,8 @@ impl SqliteIndex {
 
         // Quatre branches — params dynamiques rusqlite.
         // Pattern E0597 : stmt dans le même bloc que le collect.
-        // C1 : 8 colonnes maintenant (ajout forgotten, forgotten_at).
+        // C1 : 8 colonnes (ajout forgotten, forgotten_at).
+        // F-65 : 9 colonnes (ajout t.anchor_ms). from_ms/to_ms bindés en fin de params.
         type RawRow = (
             String,
             f64,
@@ -1390,6 +1407,7 @@ impl SqliteIndex {
             Option<String>,
             i64,
             Option<i64>,
+            Option<i64>, // t.anchor_ms (F-65)
         );
         let raw_rows: Vec<RawRow> = match (section, locus) {
             (Some(sec), Some(loc)) => {
@@ -1405,7 +1423,9 @@ impl SqliteIndex {
                         limit as i64,
                         sec,
                         locus_escaped,
-                        status
+                        status,
+                        from_ms,
+                        to_ms
                     ],
                     |row| {
                         Ok((
@@ -1417,6 +1437,7 @@ impl SqliteIndex {
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, i64>(6)?,
                             row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, Option<i64>>(8)?,
                         ))
                     },
                 )
@@ -1438,7 +1459,15 @@ impl SqliteIndex {
                 })?;
 
                 stmt.query_map(
-                    rusqlite::params![query, vault_id.as_str(), limit as i64, sec, status],
+                    rusqlite::params![
+                        query,
+                        vault_id.as_str(),
+                        limit as i64,
+                        sec,
+                        status,
+                        from_ms,
+                        to_ms
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -1449,6 +1478,7 @@ impl SqliteIndex {
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, i64>(6)?,
                             row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, Option<i64>>(8)?,
                         ))
                     },
                 )
@@ -1470,7 +1500,9 @@ impl SqliteIndex {
                         vault_id.as_str(),
                         limit as i64,
                         locus_escaped,
-                        status
+                        status,
+                        from_ms,
+                        to_ms
                     ],
                     |row| {
                         Ok((
@@ -1482,6 +1514,7 @@ impl SqliteIndex {
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, i64>(6)?,
                             row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, Option<i64>>(8)?,
                         ))
                     },
                 )
@@ -1499,7 +1532,14 @@ impl SqliteIndex {
                 })?;
 
                 stmt.query_map(
-                    rusqlite::params![query, vault_id.as_str(), limit as i64, status],
+                    rusqlite::params![
+                        query,
+                        vault_id.as_str(),
+                        limit as i64,
+                        status,
+                        from_ms,
+                        to_ms
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -1510,6 +1550,7 @@ impl SqliteIndex {
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, i64>(6)?,
                             row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, Option<i64>>(8)?,
                         ))
                     },
                 )
@@ -1533,8 +1574,17 @@ impl SqliteIndex {
         // Comportement decay : `elapsed_days = 0.0` → facteur 0.5^0 = 1.0 (neutre).
         // Choix conservateur : ne pas pénaliser une note sur un état corrompu.
         let mut results = Vec::with_capacity(raw_rows.len());
-        for (id_str, bm25_raw, status, snippet, section_str, title, forgotten, forgotten_at_ms) in
-            raw_rows
+        for (
+            id_str,
+            bm25_raw,
+            status,
+            snippet,
+            section_str,
+            title,
+            forgotten,
+            forgotten_at_ms,
+            raw_anchor_ms,
+        ) in raw_rows
         {
             let ulid = ulid::Ulid::from_string(&id_str).map_err(|e| {
                 GradatumError::Storage(format!("ULID parse search_fts_with_snippet: {e}"))
@@ -1561,6 +1611,7 @@ impl SqliteIndex {
                 snippet,
                 section: section_str,
                 title,
+                anchor_ms: raw_anchor_ms, // F-65 : from LEFT JOIN temporal_index
             });
         }
         // C1 : re-tri après application du decay (ORDER BY SQL portait sur bm25 brut).
@@ -1800,6 +1851,119 @@ impl SqliteIndex {
         Ok(results)
     }
 
+    /// Hydrate raw lesson data for a list of note ULIDs.
+    ///
+    /// Fetches the title, tags, creation timestamp and body excerpt for each note whose
+    /// ULID is in `ulids`, restricted to `section = 'lessons-learned'` and excluding
+    /// downgraded, forgotten and sentinel notes.
+    ///
+    /// Callers filter `codified` and class match on the returned [`LessonHitRaw`] slice.
+    ///
+    /// ## Implementation notes
+    ///
+    /// `rusqlite` does not support array-typed bind parameters, so the IN-clause
+    /// placeholders (`?1, ?2, …`) are built dynamically. The vault_id is appended as
+    /// the last positional parameter (`?{n+1}`).
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the SQLite query fails or a ULID cannot be parsed.
+    pub async fn hydrate_lessons_by_ulids(
+        &self,
+        vault_id: &VaultId,
+        ulids: &[&str],
+    ) -> Result<Vec<LessonHitRaw>, GradatumError> {
+        if ulids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build dynamic IN-clause : "?1, ?2, ..., ?N"
+        let placeholders = (1..=ulids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let vault_param = ulids.len() + 1;
+        let sql = format!(
+            "SELECT n.id, n.title, n.tags, n.created, n.body_text \
+             FROM notes n \
+             WHERE n.id IN ({placeholders}) \
+               AND n.vault_id = ?{vault_param} \
+               AND n.section = 'lessons-learned' \
+               AND n.status != 'downgraded' \
+               AND n.forgotten = 0 \
+               AND n.id NOT LIKE '__sentinel__%'"
+        );
+
+        // Collect owned Strings BEFORE locking — they are `Send` and may traverse the await.
+        let ulid_strings: Vec<String> = ulids.iter().map(|&u| u.to_string()).collect();
+        let vault_str = vault_id.as_str().to_string();
+
+        // Acquire the lock BEFORE building `Box<dyn ToSql>` params — `dyn ToSql` is not
+        // `Send`, so it must NOT exist at any `.await` point. All code below is synchronous.
+        let conn = self.conn.lock().await;
+
+        // Build Vec<Box<dyn ToSql>> then borrow as Vec<&dyn ToSql> — standard rusqlite
+        // pattern for dynamic parameter lists. Constructed after the lock (no more awaits).
+        let params_owned: Vec<Box<dyn rusqlite::ToSql>> = ulid_strings
+            .iter()
+            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>)
+            .chain(std::iter::once(
+                Box::new(vault_str) as Box<dyn rusqlite::ToSql>
+            ))
+            .collect();
+        let params_ref: Vec<&dyn rusqlite::ToSql> =
+            params_owned.iter().map(|p| p.as_ref()).collect();
+
+        // Pattern E0597 : collect dans la même portée que `stmt`.
+        type HydRow = (String, Option<String>, Option<String>, i64, Option<String>);
+        let raw: Vec<HydRow> = {
+            let mut stmt = conn.prepare(&sql).map_err(|e| {
+                GradatumError::Storage(format!("prepare hydrate_lessons_by_ulids: {e}"))
+            })?;
+            stmt.query_map(params_ref.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map_err(|e| GradatumError::Storage(format!("query hydrate_lessons_by_ulids: {e}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| GradatumError::Storage(format!("collect hydrate_lessons_by_ulids: {e}")))?
+        };
+
+        let mut results = Vec::with_capacity(raw.len());
+        for (id_str, title, tags_raw, created_ms, body_text) in raw {
+            let tags: Vec<String> = tags_raw
+                .as_deref()
+                .unwrap_or("")
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            // Snippet synthétique : extrait des 200 premiers caractères du body (pas de
+            // snippet FTS5 disponible ici — on ne passe pas par FTS MATCH).
+            let snippet: String = body_text
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect();
+            let ulid = ulid::Ulid::from_string(&id_str).map_err(|e| {
+                GradatumError::Storage(format!("ULID parse hydrate_lessons_by_ulids: {e}"))
+            })?;
+            results.push(LessonHitRaw {
+                note_id: NoteId(ulid),
+                title,
+                snippet,
+                tags,
+                anchor_ms: created_ms,
+            });
+        }
+        Ok(results)
+    }
+
     /// Lists notes in a vault with ULID cursor pagination.
     ///
     /// `cursor`: last ULID received — returns notes whose ULID > cursor (lexicographic order).
@@ -1934,6 +2098,178 @@ impl SqliteIndex {
         };
 
         Ok((records, total as u64))
+    }
+
+    /// Liste paginée des notes filtrées par STATUT (métadonnées), incluant `downgraded`.
+    ///
+    /// Contrairement à [`Self::list_notes`], n'exclut PAS `status = 'downgraded'` :
+    /// c'est l'objet de cette méthode (browse archived/downgraded — fix drill-down studio).
+    ///
+    /// - `statuses` : ensemble de statuts à inclure (`IN (...)`). Vide → retourne `(vec![], 0)`.
+    /// - `section` : filtre optionnel sur la section.
+    /// - `cursor` : dernier ULID reçu (exclusif). `None` ou `""` = début de liste.
+    /// - `limit` : cappé à `[1, 200]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    pub async fn list_notes_by_status(
+        &self,
+        vault_id: &str,
+        statuses: &[&str],
+        section: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        use rusqlite::types::Value as SqlVal;
+
+        if statuses.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let conn = self.conn.lock().await;
+        let limit_clamped = limit.clamp(1, 200) as i64;
+        let cursor_val = cursor.unwrap_or("");
+
+        // Placeholders IN (?, ?, ...) — construit à la volée (nombre variable de statuts).
+        let placeholders = std::iter::repeat_n("?", statuses.len())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // ── COUNT ────────────────────────────────────────────────────────────
+        let mut count_sql = format!(
+            "SELECT COUNT(*) FROM notes \
+             WHERE vault_id = ? AND id NOT LIKE '__sentinel__%' AND status IN ({placeholders})"
+        );
+        if section.is_some() {
+            count_sql.push_str(" AND section = ?");
+        }
+
+        let mut count_binds: Vec<SqlVal> = Vec::with_capacity(statuses.len() + 2);
+        count_binds.push(SqlVal::Text(vault_id.to_string()));
+        for s in statuses {
+            count_binds.push(SqlVal::Text((*s).to_string()));
+        }
+        if let Some(sec) = section {
+            count_binds.push(SqlVal::Text(sec.to_string()));
+        }
+
+        let total: i64 = conn
+            .query_row(
+                &count_sql,
+                rusqlite::params_from_iter(count_binds.iter()),
+                |row| row.get(0),
+            )
+            .map_err(|e| GradatumError::Storage(format!("list_notes_by_status count: {e}")))?;
+
+        // ── SELECT paginé ────────────────────────────────────────────────────
+        let mut sel_sql = format!(
+            "SELECT id, vault_id, section, status, body_text, \
+                    COALESCE(author_display_name, author_id) AS author, \
+                    tags, content_hash, created, updated, title, locus \
+             FROM notes \
+             WHERE vault_id = ? AND id NOT LIKE '__sentinel__%' AND status IN ({placeholders})"
+        );
+        if section.is_some() {
+            sel_sql.push_str(" AND section = ?");
+        }
+        // Keyset cursor exclusif : `(? = '' OR id > ?)` — deux liaisons pour le même cursor_val.
+        sel_sql.push_str(" AND (? = '' OR id > ?) ORDER BY id ASC LIMIT ?");
+
+        let mut sel_binds: Vec<SqlVal> = Vec::with_capacity(statuses.len() + 5);
+        sel_binds.push(SqlVal::Text(vault_id.to_string()));
+        for s in statuses {
+            sel_binds.push(SqlVal::Text((*s).to_string()));
+        }
+        if let Some(sec) = section {
+            sel_binds.push(SqlVal::Text(sec.to_string()));
+        }
+        sel_binds.push(SqlVal::Text(cursor_val.to_string()));
+        sel_binds.push(SqlVal::Text(cursor_val.to_string()));
+        sel_binds.push(SqlVal::Integer(limit_clamped));
+
+        let mut stmt = conn
+            .prepare(&sel_sql)
+            .map_err(|e| GradatumError::Storage(format!("list_notes_by_status prepare: {e}")))?;
+
+        let records: Vec<NoteRecord> = stmt
+            .query_map(rusqlite::params_from_iter(sel_binds.iter()), |row| {
+                Ok(NoteRecord {
+                    id: row.get(0)?,
+                    vault_id: row.get(1)?,
+                    section: row.get(2)?,
+                    status: row.get(3)?,
+                    body_text: row.get(4)?,
+                    author: row.get(5)?,
+                    tags_raw: row.get(6)?,
+                    content_hash: row.get::<_, Vec<u8>>(7)?,
+                    created: row.get(8)?,
+                    updated: row.get(9)?,
+                    title: row.get(10)?,
+                    locus: row.get(11)?,
+                })
+            })
+            .map_err(|e| GradatumError::Storage(format!("query list_notes_by_status: {e}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| GradatumError::Storage(format!("collect list_notes_by_status: {e}")))?;
+
+        Ok((records, total as u64))
+    }
+
+    /// Lists the `k` most recently active notes in a vault.
+    ///
+    /// **"Recently active"** = `ORDER BY COALESCE(updated, created) DESC`.
+    /// A note updated recently but with an older ULID creation timestamp ranks above
+    /// a newer note never edited — proactive recall surfaces notes the user *engaged with*,
+    /// not only the most recently *created* ones.
+    ///
+    /// Excludes sentinels (`id NOT LIKE '__sentinel__%'`) and downgraded notes
+    /// (`status != 'downgraded'`). `k` is clamped to `[1, 200]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    pub async fn list_recent_notes(
+        &self,
+        vault_id: &str,
+        k: usize,
+    ) -> Result<Vec<NoteRecord>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let limit = k.clamp(1, 200) as i64;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, vault_id, section, status, body_text,
+                        COALESCE(author_display_name, author_id) AS author,
+                        tags, content_hash, created, updated, title, locus
+                 FROM notes
+                 WHERE vault_id = ?1
+                   AND id NOT LIKE '__sentinel__%'
+                   AND status != 'downgraded'
+                 ORDER BY COALESCE(updated, created) DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| GradatumError::Storage(format!("list_recent_notes prepare: {e}")))?;
+
+        stmt.query_map(rusqlite::params![vault_id, limit], |row| {
+            Ok(NoteRecord {
+                id: row.get(0)?,
+                vault_id: row.get(1)?,
+                section: row.get(2)?,
+                status: row.get(3)?,
+                body_text: row.get(4)?,
+                author: row.get(5)?,
+                tags_raw: row.get(6)?,
+                content_hash: row.get::<_, Vec<u8>>(7)?,
+                created: row.get(8)?,
+                updated: row.get(9)?,
+                title: row.get(10)?,
+                locus: row.get(11)?,
+            })
+        })
+        .map_err(|e| GradatumError::Storage(format!("query list_recent_notes: {e}")))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| GradatumError::Storage(format!("collect list_recent_notes: {e}")))
     }
 
     /// Inserts a minimal note directly into the database — reserved for integration tests.
@@ -2881,6 +3217,58 @@ impl SqliteIndex {
             )
             .map_err(|e| GradatumError::Storage(format!("count_review_queue: {e}")))?;
         Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Returns notes promotable from the review backlog.
+    ///
+    /// Promotable = `status ∈ {staging, pending-review}` AND
+    /// `COALESCE(status_changed, created) < cutoff_ms`, excluding sentinels.
+    ///
+    /// Results are sorted oldest-first (ascending COALESCE timestamp) and capped
+    /// to `limit` rows. Used by the review auto-promote background job.
+    ///
+    /// # Errors
+    /// `GradatumError::Storage` if the SQLite query fails.
+    pub async fn find_promotable(
+        &self,
+        cutoff_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, NoteStatus)>, GradatumError> {
+        let conn = self.conn.lock().await;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, status FROM notes
+                 WHERE status IN ('staging', 'pending-review')
+                   AND COALESCE(status_changed, created) < ?1
+                   AND id NOT LIKE '__sentinel__%'
+                 ORDER BY COALESCE(status_changed, created) ASC
+                 LIMIT ?2",
+            )
+            .map_err(|e| GradatumError::Storage(format!("prepare find_promotable: {e}")))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![cutoff_ms, limit as i64], |row| {
+                let id: String = row.get(0)?;
+                let status_str: String = row.get(1)?;
+                Ok((id, status_str))
+            })
+            .map_err(|e| GradatumError::Storage(format!("query find_promotable: {e}")))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, status_str) =
+                r.map_err(|e| GradatumError::Storage(format!("row find_promotable: {e}")))?;
+            // Map status string → NoteStatus via serde kebab-case (same pattern as get_note_status).
+            let quoted = format!("\"{}\"", status_str);
+            let status: NoteStatus = serde_json::from_str(&quoted).map_err(|e| {
+                GradatumError::Storage(format!(
+                    "find_promotable: parse NoteStatus '{status_str}': {e}"
+                ))
+            })?;
+            out.push((id, status));
+        }
+        Ok(out)
     }
 
     /// Lists `status=Garbage` notes older than the given cutoff (purge lifecycle).
@@ -4527,6 +4915,370 @@ impl SqliteIndex {
         Ok(deleted > 0)
     }
 
+    // ── Santé des tâches récurrentes (v0.7.5 F-85) ──────────────────────────
+
+    /// Enregistre un tick d'une tâche récurrente dans `scheduled_task_health`.
+    ///
+    /// Upsert PK `task_name` avec `run_count + 1`. Si `outcome == Error`, append
+    /// 1 ligne dans `scheduled_task_error` + purge paresseuse (DELETE WHERE
+    /// `occurred_ms < now_ms - 7j`).
+    ///
+    /// ## Infaillibilité appelant
+    ///
+    /// L'appelant doit logger en `warn` et continuer — ne jamais propager l'erreur
+    /// dans une tâche tokio background (l'instrumentation ne doit pas faire paniquer).
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si le write SQLite échoue.
+    pub async fn record_task_run(
+        &self,
+        task_name: &str,
+        outcome: TaskOutcome,
+        duration_ms: i64,
+        error: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), GradatumError> {
+        let outcome_str = match outcome {
+            TaskOutcome::Ok => "ok",
+            TaskOutcome::Error => "error",
+        };
+        let last_error = match outcome {
+            TaskOutcome::Ok => None,
+            TaskOutcome::Error => error,
+        };
+
+        let conn = self.conn.lock().await;
+
+        // Upsert scheduled_task_health — run_count incrémenté de 1.
+        conn.execute(
+            "INSERT INTO scheduled_task_health \
+             (task_name, last_run_ms, last_outcome, last_duration_ms, last_error, run_count, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6) \
+             ON CONFLICT(task_name) DO UPDATE SET \
+               last_run_ms      = excluded.last_run_ms, \
+               last_outcome     = excluded.last_outcome, \
+               last_duration_ms = excluded.last_duration_ms, \
+               last_error       = excluded.last_error, \
+               run_count        = run_count + 1, \
+               updated_at       = excluded.updated_at",
+            rusqlite::params![
+                task_name,
+                now_ms,
+                outcome_str,
+                duration_ms,
+                last_error,
+                now_ms,
+            ],
+        )
+        .map_err(|e| GradatumError::Storage(format!("record_task_run upsert : {e}")))?;
+
+        if matches!(outcome, TaskOutcome::Error) {
+            // Append erreur.
+            let error_msg = error.unwrap_or("erreur sans message");
+            conn.execute(
+                "INSERT INTO scheduled_task_error (task_name, occurred_ms, error_msg) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![task_name, now_ms, error_msg],
+            )
+            .map_err(|e| GradatumError::Storage(format!("record_task_run insert_error : {e}")))?;
+
+            // Purge paresseuse : supprimer les entrées > 7j.
+            let cutoff_ms = now_ms - 7 * 86_400_000_i64;
+            conn.execute(
+                "DELETE FROM scheduled_task_error WHERE occurred_ms < ?1",
+                rusqlite::params![cutoff_ms],
+            )
+            .map_err(|e| GradatumError::Storage(format!("record_task_run purge_errors : {e}")))?;
+        }
+
+        Ok(())
+    }
+
+    /// Initialise la ligne d'une tâche dans `scheduled_task_health` (seed boot).
+    ///
+    /// `INSERT OR IGNORE` — n'écrase pas un enregistrement existant.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si le write SQLite échoue.
+    pub async fn seed_scheduled_task(&self, task_name: &str) -> Result<(), GradatumError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO scheduled_task_health \
+             (task_name, last_run_ms, last_outcome, last_duration_ms, last_error, run_count, updated_at) \
+             VALUES (?1, NULL, NULL, NULL, NULL, 0, 0)",
+            rusqlite::params![task_name],
+        )
+        .map_err(|e| GradatumError::Storage(format!("seed_scheduled_task : {e}")))?;
+        Ok(())
+    }
+
+    /// Liste la santé de toutes les tâches récurrentes seedées.
+    ///
+    /// `errors_24h` = COUNT(scheduled_task_error WHERE task_name = ? AND
+    /// occurred_ms > now_ms - 86_400_000).
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la lecture SQLite échoue.
+    pub async fn list_scheduled_health(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<ScheduledTaskHealth>, GradatumError> {
+        let window_24h = now_ms - 86_400_000_i64;
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT \
+                   h.task_name, h.last_run_ms, h.last_outcome, \
+                   h.last_duration_ms, h.last_error, h.run_count, \
+                   COALESCE(( \
+                     SELECT COUNT(*) FROM scheduled_task_error e \
+                     WHERE e.task_name = h.task_name \
+                       AND e.occurred_ms > ?1 \
+                   ), 0) AS errors_24h \
+                 FROM scheduled_task_health h \
+                 ORDER BY h.task_name ASC",
+            )
+            .map_err(|e| GradatumError::Storage(format!("list_scheduled_health prepare : {e}")))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![window_24h], |row| {
+                Ok(ScheduledTaskHealth {
+                    task_name: row.get(0)?,
+                    last_run_ms: row.get(1)?,
+                    last_outcome: row.get(2)?,
+                    last_duration_ms: row.get(3)?,
+                    last_error: row.get(4)?,
+                    run_count: row.get(5)?,
+                    errors_24h: row.get(6)?,
+                })
+            })
+            .map_err(|e| GradatumError::Storage(format!("list_scheduled_health query_map : {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| GradatumError::Storage(format!("list_scheduled_health collect : {e}")))?;
+
+        Ok(rows)
+    }
+
+    /// Compte les lignes présentes dans `scheduled_task_error` pour un nom de tâche.
+    ///
+    /// `COUNT(*)` sans filtre temporel = total brut dans la table (après purge paresseuse).
+    /// Réservée aux tests d'intégration pour prouver la suppression physique des lignes
+    /// anciennes — ne pas utiliser en production.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la requête SQLite échoue.
+    #[doc(hidden)]
+    pub async fn count_task_errors_for(&self, task_name: &str) -> Result<i64, GradatumError> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scheduled_task_error WHERE task_name = ?1",
+                rusqlite::params![task_name],
+                |row| row.get(0),
+            )
+            .map_err(|e| GradatumError::Storage(format!("count_task_errors_for : {e}")))?;
+        Ok(count)
+    }
+
+    // ── Timeseries de métriques curées (v0.7.5 Slice 2a F-85) ───────────────
+
+    /// Insère un lot de samples métriques horodatés `ts_ms` (un tick d'échantillonnage).
+    ///
+    /// `INSERT OR IGNORE` : la PK `(series, ts_ms)` rend l'écriture idempotente si un
+    /// tick est rejoué (jamais d'écrasement de valeur — leçon C-1 data-integrity).
+    /// Retourne le nombre de lignes effectivement insérées.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la transaction SQLite échoue.
+    pub async fn insert_metric_samples(
+        &self,
+        ts_ms: i64,
+        samples: &[(String, f64)],
+    ) -> Result<usize, GradatumError> {
+        if samples.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| GradatumError::Storage(format!("insert_metric_samples tx : {e}")))?;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR IGNORE INTO metric_sample (series, ts_ms, value) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| {
+                    GradatumError::Storage(format!("insert_metric_samples prepare : {e}"))
+                })?;
+            for (series, value) in samples {
+                written += stmt
+                    .execute(rusqlite::params![series, ts_ms, value])
+                    .map_err(|e| {
+                        GradatumError::Storage(format!("insert_metric_samples exec : {e}"))
+                    })?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| GradatumError::Storage(format!("insert_metric_samples commit : {e}")))?;
+        Ok(written)
+    }
+
+    /// Requête timeseries downsamplée : moyenne par bucket de `bucket_ms` ms.
+    ///
+    /// Bornes **inclusives** (`ts_ms >= from_ms AND ts_ms <= to_ms`). Le `ts_ms`
+    /// d'un point downsamplé = `MIN(ts_ms)` du bucket. Trié `(series, ts_ms)`.
+    /// `bucket_ms` doit être ≥ 60_000 (calculé par l'appelant).
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la requête SQLite échoue.
+    pub async fn query_metric_timeseries(
+        &self,
+        series: &[String],
+        from_ms: i64,
+        to_ms: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<MetricSamplePoint>, GradatumError> {
+        if series.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", series.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT series, MIN(ts_ms) AS bucket_ts, AVG(value) AS avg_val \
+             FROM metric_sample \
+             WHERE series IN ({placeholders}) AND ts_ms >= ? AND ts_ms <= ? \
+             GROUP BY series, ts_ms / ? \
+             ORDER BY series ASC, bucket_ts ASC"
+        );
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(&sql).map_err(|e| {
+            GradatumError::Storage(format!("query_metric_timeseries prepare : {e}"))
+        })?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(series.len() + 3);
+        for s in series {
+            params.push(s);
+        }
+        params.push(&from_ms);
+        params.push(&to_ms);
+        params.push(&bucket_ms);
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(MetricSamplePoint {
+                    series: row.get(0)?,
+                    ts_ms: row.get(1)?,
+                    value: row.get(2)?,
+                })
+            })
+            .map_err(|e| GradatumError::Storage(format!("query_metric_timeseries query : {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                GradatumError::Storage(format!("query_metric_timeseries collect : {e}"))
+            })?;
+        Ok(rows)
+    }
+
+    /// Purge les samples antérieurs à `cutoff_ms`. Retourne le nombre de lignes supprimées.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la suppression SQLite échoue.
+    pub async fn purge_metric_samples(&self, cutoff_ms: i64) -> Result<usize, GradatumError> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "DELETE FROM metric_sample WHERE ts_ms < ?1",
+                rusqlite::params![cutoff_ms],
+            )
+            .map_err(|e| GradatumError::Storage(format!("purge_metric_samples : {e}")))?;
+        Ok(n)
+    }
+
+    /// Liste les clés de série distinctes présentes dans `metric_sample` (pour le catalog).
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la requête SQLite échoue.
+    pub async fn list_distinct_metric_series(&self) -> Result<Vec<String>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT series FROM metric_sample ORDER BY series ASC")
+            .map_err(|e| {
+                GradatumError::Storage(format!("list_distinct_metric_series prepare : {e}"))
+            })?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| {
+                GradatumError::Storage(format!("list_distinct_metric_series query : {e}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                GradatumError::Storage(format!("list_distinct_metric_series collect : {e}"))
+            })?;
+        Ok(rows)
+    }
+
+    /// Batch-reads `anchor_ms` from `temporal_index` for a list of note IDs (F-65).
+    ///
+    /// Used by the semantic search path to enrich `RrfHit.anchor_ms` and apply
+    /// temporal bounds (`from_ms`/`to_ms`) without touching `VectorStore::search_semantic`.
+    ///
+    /// ## Behaviour
+    ///
+    /// - Empty `ids` → returns `Ok(HashMap::new())` immediately (no SQL round-trip).
+    /// - Notes absent from `temporal_index` are simply absent from the returned map.
+    /// - Placeholders are built dynamically: `WHERE note_id IN (?, ?, …)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    pub async fn get_anchor_ms_batch(
+        &self,
+        vault_id: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>, GradatumError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.conn.lock().await;
+        // Build `?, ?, …` placeholders dynamically — rusqlite does not support array binding.
+        let placeholders: String = ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2)) // ?1 = vault_id, ?2..=?N = ids
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT note_id, anchor_ms FROM temporal_index \
+             WHERE vault_id = ?1 AND note_id IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| GradatumError::Storage(format!("get_anchor_ms_batch prepare: {e}")))?;
+        // Build params: vault_id first, then each id.
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
+        params.push(Box::new(vault_id.to_string()));
+        for id in ids {
+            params.push(Box::new(id.clone()));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let map = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| GradatumError::Storage(format!("get_anchor_ms_batch query: {e}")))?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+            .map_err(|e| GradatumError::Storage(format!("get_anchor_ms_batch collect: {e}")))?;
+        Ok(map)
+    }
+
     /// Backfills `temporal_index` for all notes that have no entry.
     ///
     /// Uses `INSERT OR IGNORE` in bulk — idempotent, does not modify existing entries
@@ -6091,6 +6843,177 @@ mod title_tests {
             );
         }
     }
+
+    // ── Tests migration 0025 — identity title backfill (v0.7.3 Slice A item 1) ───
+
+    /// Valide le SQL de backfill de la migration 0025 sur données pré-existantes.
+    ///
+    /// La migration 0025 backfille `notes.title` pour les notes `section='identity'`
+    /// dont la colonne `title` est NULL ou vide — dérivation depuis le H1.
+    ///
+    /// # Cas testés
+    ///
+    /// - A) note identity, title=NULL, body `# identity/main\n...` → title='identity/main'.
+    /// - B) note identity, title déjà peuplé → non écrasé (idempotence).
+    /// - C) note identity, body `# identity/main\r\nSuite` (CRLF) → title sans `\r` (P2-4 council).
+    /// - D) note non-identity, title=NULL, body `# identity/main\n...` → non affectée.
+    ///
+    /// Le SQL est ré-appliqué manuellement sur une DB déjà ouverte (idempotent :
+    /// WHERE title IS NULL OR title = '').
+    #[tokio::test]
+    async fn migration_0025_backfills_identity_title() {
+        let idx = SqliteIndex::open_in_memory()
+            .await
+            .expect("open_in_memory — migration_0025");
+
+        // Cas A : section=identity, title=NULL, body LF-only → backfill attendu.
+        let id_a = ulid::Ulid::new().to_string();
+        idx.seed_note(
+            &id_a,
+            "identity",
+            "# identity/main\n## INVARIANTS\nINV-CANARY | REQUIRED | x",
+        )
+        .await
+        .expect("seed note A");
+
+        // Cas B : section=identity, title déjà peuplé → NON écrasé.
+        let id_b = ulid::Ulid::new().to_string();
+        idx.seed_note(
+            &id_b,
+            "identity",
+            "# identity/backend\n## INVARIANTS\nINV-CANARY | REQUIRED | y",
+        )
+        .await
+        .expect("seed note B");
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute(
+                "UPDATE notes SET title = 'identity/backend' WHERE id = ?1",
+                rusqlite::params![id_b],
+            )
+            .expect("pre-set title B");
+        }
+
+        // Cas C : section=identity, body avec CRLF → title sans \r (rtrim edge CRLF).
+        let id_c = ulid::Ulid::new().to_string();
+        idx.seed_note(
+            &id_c,
+            "identity",
+            "# identity/tester\r\n## INVARIANTS\nINV-CANARY | REQUIRED | z",
+        )
+        .await
+        .expect("seed note C");
+
+        // Cas D : section ≠ identity, body identity-like → NON affectée.
+        let id_d = ulid::Ulid::new().to_string();
+        idx.seed_note(
+            &id_d,
+            "reference",
+            "# identity/main\nbody référence — ne doit pas être backfillé",
+        )
+        .await
+        .expect("seed note D");
+
+        // Ré-appliquer le SQL de la migration 0025 (idempotent sur DB post-migration).
+        // Sur les notes seeds ci-dessus (title=NULL sauf B), le backfill s'applique.
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute_batch(include_str!(
+                "../migrations/0025_identity_title_backfill.sql"
+            ))
+            .expect("ré-application SQL migration 0025");
+        }
+
+        // Vérification cas A : H1 identity extrait correctement.
+        {
+            let conn = idx.conn.lock().await;
+            let title_a: Option<String> = conn
+                .query_row(
+                    "SELECT title FROM notes WHERE id = ?1",
+                    rusqlite::params![id_a],
+                    |row| row.get(0),
+                )
+                .expect("query cas A");
+            assert_eq!(
+                title_a.as_deref(),
+                Some("identity/main"),
+                "cas A : migration 0025 doit backfiller title='identity/main' pour note LF"
+            );
+        }
+
+        // Vérification cas B : title existant non écrasé (idempotence).
+        {
+            let conn = idx.conn.lock().await;
+            let title_b: Option<String> = conn
+                .query_row(
+                    "SELECT title FROM notes WHERE id = ?1",
+                    rusqlite::params![id_b],
+                    |row| row.get(0),
+                )
+                .expect("query cas B");
+            assert_eq!(
+                title_b.as_deref(),
+                Some("identity/backend"),
+                "cas B : migration 0025 ne doit pas écraser un title existant"
+            );
+        }
+
+        // Vérification cas C : CRLF → title sans \r.
+        {
+            let conn = idx.conn.lock().await;
+            let title_c: Option<String> = conn
+                .query_row(
+                    "SELECT title FROM notes WHERE id = ?1",
+                    rusqlite::params![id_c],
+                    |row| row.get(0),
+                )
+                .expect("query cas C");
+            assert_eq!(
+                title_c.as_deref(),
+                Some("identity/tester"),
+                "cas C : body CRLF → title sans \\r (rtrim char(13) edge)"
+            );
+        }
+
+        // Vérification cas D : section ≠ identity → title reste NULL.
+        {
+            let conn = idx.conn.lock().await;
+            let title_d: Option<String> = conn
+                .query_row(
+                    "SELECT title FROM notes WHERE id = ?1",
+                    rusqlite::params![id_d],
+                    |row| row.get(0),
+                )
+                .expect("query cas D");
+            assert!(
+                title_d.is_none(),
+                "cas D : note non-identity ne doit pas être backfillée, obtenu={title_d:?}"
+            );
+        }
+    }
+
+    /// Migration 0025 est enregistrée dans `_schema_migrations`.
+    ///
+    /// Prouve que la migration est câblée dans `MIGRATIONS[]` — sinon elle n'est
+    /// pas appliquée au démarrage (lesson-migration-file-not-wired-silent-noapply).
+    #[tokio::test]
+    async fn migration_0025_is_tracked_in_schema_migrations() {
+        let idx = SqliteIndex::open_in_memory()
+            .await
+            .expect("open_in_memory — migration_0025 tracking");
+        let conn = idx.conn.lock().await;
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = '0025_identity_title_backfill')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        assert!(
+            exists,
+            "0025_identity_title_backfill doit être enregistrée dans _schema_migrations"
+        );
+    }
 }
 
 // ── Tests B1 : section filter vault_search ─────────────────────────────────────
@@ -6209,7 +7132,7 @@ mod snippet_fts_tests {
 
         let vault = VaultId::new("main");
         let results = idx
-            .search_fts_with_snippet(&vault, "hardening", 5, false, None, None, None)
+            .search_fts_with_snippet(&vault, "hardening", 5, false, None, None, None, None, None)
             .await
             .unwrap();
 
@@ -6245,7 +7168,17 @@ mod snippet_fts_tests {
 
         let vault = VaultId::new("main");
         let results = idx
-            .search_fts_with_snippet(&vault, "architecture", 5, false, None, None, None)
+            .search_fts_with_snippet(
+                &vault,
+                "architecture",
+                5,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -6365,6 +7298,177 @@ mod vault_list_tests {
     }
 }
 
+// ── Tests list_notes_by_status (F-85 bug drill-down "Deprecated vide") ────────
+//
+// Couvre : notes downgraded incluses (contrairement à list_notes), filtre section,
+// multi-statuts, pagination keyset ULID ASC, garde statuts vides.
+// Helper `seed_raw` : INSERT direct avec statut string arbitraire (évite le
+// `NoteStatus` enum qui ne contient pas la variante `Downgraded`).
+
+#[cfg(test)]
+mod vault_list_by_status_tests {
+    use super::*;
+
+    /// Helper de test : insère une note avec un statut SQL brut (y compris "downgraded").
+    ///
+    /// `seed_note_with_status` prend `NoteStatus` enum sans variante `Downgraded` —
+    /// ce helper contourne la contrainte via INSERT direct sur `pub(crate) conn`.
+    async fn seed_raw(
+        idx: &SqliteIndex,
+        id: &str,
+        section: &str,
+        body: &str,
+        status: &str,
+    ) -> Result<(), GradatumError> {
+        let conn = idx.conn.lock().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO notes \
+             (id, vault_id, section, status, schema_version, created, content_hash, body_text) \
+             VALUES (?1, 'main', ?2, ?3, 1, ?4, X'00', ?5)",
+            rusqlite::params![id, section, status, now, body],
+        )
+        .map_err(|e| GradatumError::Storage(format!("seed_raw: {e}")))?;
+        Ok(())
+    }
+
+    /// by-status — inclut les notes downgraded (que list_notes exclut via `status != 'downgraded'`).
+    #[tokio::test]
+    async fn list_notes_by_status_includes_downgraded() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_raw(
+            &idx,
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "decisions",
+            "live note",
+            "live",
+        )
+        .await
+        .unwrap();
+        seed_raw(
+            &idx,
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+            "decisions",
+            "down note",
+            "downgraded",
+        )
+        .await
+        .unwrap();
+        seed_raw(
+            &idx,
+            "01CCCCCCCCCCCCCCCCCCCCCCCC",
+            "reference",
+            "down note 2",
+            "downgraded",
+        )
+        .await
+        .unwrap();
+
+        let (records, total) = idx
+            .list_notes_by_status("main", &["downgraded"], None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "2 notes downgraded");
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.status == "downgraded"));
+    }
+
+    /// by-status — filtre section + multi-statuts (union du bucket Deprecated).
+    #[tokio::test]
+    async fn list_notes_by_status_section_and_multi() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_raw(
+            &idx,
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "decisions",
+            "a",
+            "downgraded",
+        )
+        .await
+        .unwrap();
+        seed_raw(
+            &idx,
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+            "decisions",
+            "b",
+            "deprecated",
+        )
+        .await
+        .unwrap();
+        seed_raw(
+            &idx,
+            "01CCCCCCCCCCCCCCCCCCCCCCCC",
+            "reference",
+            "c",
+            "downgraded",
+        )
+        .await
+        .unwrap();
+
+        let (records, total) = idx
+            .list_notes_by_status(
+                "main",
+                &["deprecated", "downgraded"],
+                Some("decisions"),
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "2 notes en decisions (downgraded+deprecated)");
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.section == "decisions"));
+    }
+
+    /// by-status — pagination keyset ULID ASC.
+    #[tokio::test]
+    async fn list_notes_by_status_paginates() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        for id in [
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+            "01CCCCCCCCCCCCCCCCCCCCCCCC",
+        ] {
+            seed_raw(&idx, id, "decisions", "body", "downgraded")
+                .await
+                .unwrap();
+        }
+        let (page1, total) = idx
+            .list_notes_by_status("main", &["downgraded"], None, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(page1.len(), 2);
+        let cursor = page1.last().map(|r| r.id.clone());
+        let (page2, _) = idx
+            .list_notes_by_status("main", &["downgraded"], None, 2, cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 1, "3 - 2 = 1 après cursor");
+    }
+
+    /// by-status — statuts vide → résultat vide (garde early-return).
+    #[tokio::test]
+    async fn list_notes_by_status_empty_statuses() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_raw(
+            &idx,
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "decisions",
+            "a",
+            "downgraded",
+        )
+        .await
+        .unwrap();
+        let (records, total) = idx
+            .list_notes_by_status("main", &[], None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+        assert!(records.is_empty());
+    }
+}
+
 // ── Tests F-42 c-prime : colonnes c_kind + doc_kind dans upsert_note ──────────
 //
 // Vérifie que upsert_note dérive et persiste c_kind / doc_kind à partir de section.
@@ -6417,9 +7521,9 @@ mod cognitive_kind_index_tests {
         }
     }
 
-    /// F-42 — upsert_note section="debug" → c_kind="episodic" doc_kind="Event".
+    /// `upsert_note` with section `"debug"` writes `c_kind="episodic"` and `doc_kind="Event"`.
     ///
-    /// Section d'incident daté : c_kind episodic (événement unique) + doc_kind Event.
+    /// Dated-incident section: c_kind episodic (unique event) + doc_kind Event.
     #[tokio::test]
     async fn upsert_note_debug_writes_c_kind_episodic_doc_kind_event() {
         let idx = SqliteIndex::open_in_memory()
@@ -6453,9 +7557,9 @@ mod cognitive_kind_index_tests {
         );
     }
 
-    /// F-42 — upsert_note section="architecture" → c_kind="semantic" doc_kind="Static".
+    /// `upsert_note` with section `"architecture"` writes `c_kind="semantic"` and `doc_kind="Static"`.
     ///
-    /// Section de connaissance stable : c_kind semantic + doc_kind Static.
+    /// Stable-knowledge section: c_kind semantic + doc_kind Static.
     #[tokio::test]
     async fn upsert_note_architecture_writes_c_kind_semantic_doc_kind_static() {
         let idx = SqliteIndex::open_in_memory()
@@ -6525,7 +7629,7 @@ mod cognitive_kind_index_tests {
         );
     }
 
-    /// F-42 — migration 0008 crée bien les colonnes c_kind et doc_kind dans notes.
+    /// Migration 0008 creates the `c_kind` and `doc_kind` columns in the `notes` table.
     #[tokio::test]
     async fn migration_0008_adds_c_kind_doc_kind_columns() {
         let idx = SqliteIndex::open_in_memory()
@@ -6549,9 +7653,9 @@ mod cognitive_kind_index_tests {
         );
     }
 
-    /// F-42 — upsert_note est idempotent sur c_kind/doc_kind (ON CONFLICT DO UPDATE).
+    /// `upsert_note` is idempotent on `c_kind`/`doc_kind` (ON CONFLICT DO UPDATE).
     ///
-    /// Un deuxième upsert sur la même note doit conserver les valeurs correctes.
+    /// A second upsert on the same note must preserve the correct values.
     #[tokio::test]
     async fn upsert_note_c_kind_idempotent() {
         let idx = SqliteIndex::open_in_memory()
@@ -7535,7 +8639,7 @@ mod temporal_index_tests {
             .expect("write_temporal_entry seed");
     }
 
-    /// Marque une note `forgotten=1` (réutilise le chemin F-44 SQL direct).
+    /// Sets `forgotten=1` on a note via a direct SQL UPDATE.
     async fn mark_forgotten(idx: &SqliteIndex, note_id: &str) {
         let conn = idx.conn.lock().await;
         conn.execute(
@@ -8078,6 +9182,168 @@ mod temporal_index_tests {
             "P2-2 : note née après t exclue même avec include_expired=true"
         );
     }
+
+    // ── Tests get_anchor_ms_batch (F-65) ─────────────────────────────────────
+
+    /// get_anchor_ms_batch : ids vide → map vide sans requête SQL.
+    ///
+    /// Short-circuit garanti par implémentation — aucun appel DB.
+    #[tokio::test]
+    async fn get_anchor_ms_batch_empty_ids_returns_empty_map() {
+        let idx = SqliteIndex::open_in_memory()
+            .await
+            .expect("open_in_memory — invariant test");
+        let map = idx
+            .get_anchor_ms_batch("main", &[])
+            .await
+            .expect("get_anchor_ms_batch ne doit pas échouer sur ids vide");
+        assert!(map.is_empty(), "ids vide → map vide. map={map:?}");
+    }
+
+    /// get_anchor_ms_batch : ids présents dans temporal_index → anchor_ms correct retourné.
+    ///
+    /// Vérifie que les deux notes sont dans la map avec les valeurs attendues.
+    #[tokio::test]
+    async fn get_anchor_ms_batch_returns_correct_anchor_ms_for_known_ids() {
+        let idx = SqliteIndex::open_in_memory()
+            .await
+            .expect("open_in_memory — invariant test");
+        // ULIDs 26 chars, Crockford base32 (pas I/L/O/U).
+        const ID_A: &str = "01HQ00000000000000BATCH001";
+        const ID_B: &str = "01HQ00000000000000BATCH002";
+        seed_note_with_temporal(&idx, ID_A, 1_500_000, "Event", "live").await;
+        seed_note_with_temporal(&idx, ID_B, 2_500_000, "Static", "live").await;
+
+        let ids = vec![ID_A.to_string(), ID_B.to_string()];
+        let map = idx
+            .get_anchor_ms_batch("main", &ids)
+            .await
+            .expect("get_anchor_ms_batch doit réussir sur ids connus");
+
+        assert_eq!(map.len(), 2, "map doit contenir les 2 entrées. map={map:?}");
+        assert_eq!(
+            map.get(ID_A).copied(),
+            Some(1_500_000),
+            "anchor_ms de la note A doit valoir 1_500_000"
+        );
+        assert_eq!(
+            map.get(ID_B).copied(),
+            Some(2_500_000),
+            "anchor_ms de la note B doit valoir 2_500_000"
+        );
+    }
+
+    /// get_anchor_ms_batch : id absent de temporal_index → absent de la map.
+    ///
+    /// Vérifie le comportement quand :
+    /// - la note existe dans `notes` mais PAS dans `temporal_index` → absente de la map ;
+    /// - l'id est complètement inexistant → absent de la map.
+    #[tokio::test]
+    async fn get_anchor_ms_batch_absent_id_not_in_map() {
+        let idx = SqliteIndex::open_in_memory()
+            .await
+            .expect("open_in_memory — invariant test");
+        const ID_WITH_TEMPORAL: &str = "01HQ00000000000000BATCH003";
+        const ID_NO_TEMPORAL: &str = "01HQ00000000000000BATCH004";
+        const ID_NONEXISTENT: &str = "01HQ000000000000000ABSENT5";
+
+        // Note avec entrée temporal_index.
+        seed_note_with_temporal(&idx, ID_WITH_TEMPORAL, 3_000_000, "Event", "live").await;
+        // Note dans notes+notes_fts mais SANS entrée temporal_index.
+        seed_note_temporal(&idx, ID_NO_TEMPORAL, "main").await;
+
+        let ids = vec![
+            ID_WITH_TEMPORAL.to_string(),
+            ID_NO_TEMPORAL.to_string(),
+            ID_NONEXISTENT.to_string(),
+        ];
+        let map = idx
+            .get_anchor_ms_batch("main", &ids)
+            .await
+            .expect("get_anchor_ms_batch doit réussir");
+
+        assert_eq!(
+            map.len(),
+            1,
+            "seule la note avec temporal_index doit être dans la map. map={map:?}"
+        );
+        assert!(
+            map.contains_key(ID_WITH_TEMPORAL),
+            "note avec temporal_index doit être présente"
+        );
+        assert!(
+            !map.contains_key(ID_NO_TEMPORAL),
+            "note sans temporal_index doit être absente de la map"
+        );
+        assert!(
+            !map.contains_key(ID_NONEXISTENT),
+            "id inexistant doit être absent de la map"
+        );
+    }
+
+    /// get_anchor_ms_batch : scoping vault_id — une note d'un autre vault n'est pas retournée.
+    ///
+    /// Garantit que la clause `WHERE vault_id = ?1` est effective : deux notes ont le même
+    /// `note_id` prefix dans des vaults distincts ; seule la note du vault requêté apparaît.
+    #[tokio::test]
+    async fn get_anchor_ms_batch_vault_scoping() {
+        let idx = SqliteIndex::open_in_memory()
+            .await
+            .expect("open_in_memory — invariant test");
+        const ID_MAIN: &str = "01HQ00000000000000BATCH005";
+        const ID_OTHER: &str = "01HQ00000000000000BATCH006";
+
+        // Note dans vault "main" avec temporal entry (via helper existant).
+        seed_note_with_temporal(&idx, ID_MAIN, 5_000_000, "Event", "live").await;
+
+        // Note dans vault "other" — insertion directe car seed_note_with_temporal
+        // code en dur vault_id='main'.
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute(
+                "INSERT INTO notes (id, vault_id, section, status, schema_version, created, \
+                 content_hash, body_text, doc_kind, title) \
+                 VALUES (?1, 'other', 'decisions', 'live', 1, 6000000, \
+                         X'0000000000000000000000000000000000000000000000000000000000000001', \
+                         'body other vault', 'Event', 'Titre other vault')",
+                rusqlite::params![ID_OTHER],
+            )
+            .expect("insert note vault=other (notes)");
+        }
+        // Entrée temporal_index pour la note "other".
+        let entry_other = TemporalEntry {
+            note_id: ID_OTHER.to_string(),
+            vault_id: "other".to_string(),
+            anchor_ms: 6_000_000,
+            anchor_src: AnchorSrc::Created,
+            doc_kind: "Event".to_string(),
+            valid_until_ms: None,
+        };
+        idx.write_temporal_entry(&entry_other)
+            .await
+            .expect("write_temporal_entry vault=other");
+
+        // Requête avec vault_id="main" — ne doit retourner que la note de "main".
+        let ids = vec![ID_MAIN.to_string(), ID_OTHER.to_string()];
+        let map = idx
+            .get_anchor_ms_batch("main", &ids)
+            .await
+            .expect("get_anchor_ms_batch doit réussir");
+
+        assert_eq!(
+            map.len(),
+            1,
+            "seule la note du vault 'main' doit être retournée. map={map:?}"
+        );
+        assert!(
+            map.contains_key(ID_MAIN),
+            "note du vault 'main' doit être présente"
+        );
+        assert!(
+            !map.contains_key(ID_OTHER),
+            "note d'un autre vault ('other') doit être exclue par scoping vault_id"
+        );
+    }
 }
 
 // ── Tests F-60 : recall_lessons ───────────────────────────────────────────────
@@ -8532,7 +9798,7 @@ mod recall_lessons_tests {
 
     /// P0-3a : write_note_derived_batch avec vault_id="main" doit retourner Err.
     ///
-    /// TDD : ce test doit ÉCHOUER avant l'ajout de la garde (la méthode accepte "main" sans erreur).
+    /// Asserts that `write_note_derived_batch` rejects `vault_id="main"` with an error.
     #[tokio::test]
     async fn p0_3_write_note_derived_batch_main_vault_rejected() {
         let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
@@ -8579,7 +9845,7 @@ mod recall_lessons_tests {
 
     /// P0-3d : delete_vault_from_index avec vault_id="main" doit retourner Err.
     ///
-    /// TDD : ce test doit ÉCHOUER avant l'ajout de la garde (la méthode détruirait le vault main).
+    /// Asserts that `delete_vault_from_index` rejects `vault_id="main"` with an error.
     #[tokio::test]
     async fn p0_3_delete_vault_from_index_main_vault_rejected() {
         let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
@@ -8620,7 +9886,7 @@ mod recall_lessons_tests {
     ///   → si étape 3 utilise INSERT brut (sans OR REPLACE), le même rowid est ré-inséré dans FTS
     ///   → doublon FTS (body_text v1 + body_text v2 coexistent pour le même rowid)
     ///
-    /// TDD : ce test doit ÉCHOUER avant le fix (INSERT brut vs INSERT OR REPLACE).
+    /// Asserts that re-ingesting a modified file does not create FTS5 duplicates (INSERT OR REPLACE required).
     #[tokio::test]
     async fn p0_1_fts5_no_duplicate_on_reingest_modified_file() {
         let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
@@ -8702,14 +9968,13 @@ mod recall_lessons_tests {
 
     // ── P0-2 : vault_id corrompu dans la propagation des suppressions ──────────
 
-    /// P0-2 : les notes d'un fichier SUPPRIMÉ doivent être effacées lors du re-ingest.
+    /// Notes from a DELETED file must be removed on re-ingest.
     ///
-    /// Ce test vérifie le comportement de `write_note_derived_batch` avec notes=[]
-    /// (utilisé par run_ingest pour propager une suppression git).
-    /// TDD : ce test doit ÉCHOUER avant le fix de code_cmd.rs (vault_id mal passé).
+    /// Verifies that `write_note_derived_batch` with `notes=[]` clears existing notes
+    /// for the given source path (used by the ingest pipeline to propagate git deletions).
     ///
-    /// NOTE : ce test vérifie directement sqlite.rs (isolation de la méthode).
-    /// Le test d'intégration run_ingest est dans gradatum-admin/tests/code_ingest.rs.
+    /// NOTE: this test targets `sqlite.rs` directly (method isolation).
+    /// The integration test for `run_ingest` lives in `gradatum-admin/tests/code_ingest.rs`.
     #[tokio::test]
     async fn p0_2_write_note_derived_batch_empty_deletes_notes() {
         let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
@@ -9485,5 +10750,324 @@ mod apply_cap_tests {
     #[test]
     fn apply_cap_uncapped_zero() {
         assert_eq!(SqliteIndex::apply_cap(0), (0, false));
+    }
+}
+
+// ── Tests find_promotable (review auto-promote job) ──────────────────────────
+
+#[cfg(test)]
+mod find_promotable_tests {
+    use super::*;
+    use gradatum_core::status::NoteStatus;
+
+    /// Insère une note directement en SQL avec `created` et `status_changed` explicites.
+    /// Permet de simuler des notes âgées ou récentes sans dépendre d'un helper de haut niveau.
+    async fn insert_note_for_promote(
+        idx: &SqliteIndex,
+        id: &str,
+        status: &str,
+        status_changed: Option<i64>,
+        created: i64,
+    ) {
+        let conn = idx.conn.lock().await;
+        conn.execute(
+            "INSERT INTO notes (id, vault_id, section, status, schema_version, created, status_changed, content_hash, body_text)
+             VALUES (?1, 'main', 'reference', ?2, 1, ?3, ?4, X'00', '')",
+            rusqlite::params![id, status, created, status_changed],
+        )
+        .unwrap();
+    }
+
+    /// T1 : notes âgées (staging + pending-review) retournées ; récente et live exclues.
+    #[tokio::test]
+    async fn find_promotable_returns_only_aged_non_live() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        let now = 1_700_000_100_000_i64; // ms fictif « maintenant »
+        let old = now - 20 * 86_400_000; // 20 jours avant → éligible si cutoff = 14j
+
+        let cutoff = now - 14 * 86_400_000; // 14 jours avant
+
+        // Note âgée staging → éligible.
+        insert_note_for_promote(&idx, "01AAAAAAAAAAAAAAAAAAAAAAAA", "staging", None, old).await;
+        // Note âgée pending-review → éligible.
+        insert_note_for_promote(
+            &idx,
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+            "pending-review",
+            None,
+            old,
+        )
+        .await;
+        // Note récente staging → non éligible.
+        insert_note_for_promote(&idx, "01CCCCCCCCCCCCCCCCCCCCCCCC", "staging", None, now).await;
+        // Note live âgée → exclue (status ≠ review).
+        insert_note_for_promote(&idx, "01DDDDDDDDDDDDDDDDDDDDDDDD", "live", None, old).await;
+
+        let results = idx
+            .find_promotable(cutoff, 100)
+            .await
+            .expect("find_promotable ne doit pas échouer");
+
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+
+        assert_eq!(
+            results.len(),
+            2,
+            "2 notes éligibles attendues, got {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&"01AAAAAAAAAAAAAAAAAAAAAAAA"),
+            "staging âgée manquante"
+        );
+        assert!(
+            ids.contains(&"01BBBBBBBBBBBBBBBBBBBBBBBB"),
+            "pending-review âgée manquante"
+        );
+        // Vérifie les statuts retournés.
+        for (id, status) in &results {
+            match id.as_str() {
+                "01AAAAAAAAAAAAAAAAAAAAAAAA" => {
+                    assert_eq!(*status, NoteStatus::Staging);
+                }
+                "01BBBBBBBBBBBBBBBBBBBBBBBB" => {
+                    assert_eq!(*status, NoteStatus::PendingReview);
+                }
+                other => panic!("id inattendu : {other}"),
+            }
+        }
+    }
+
+    /// T2 : `status_changed=NULL`, `created` vieux → la note doit être retournée
+    /// (COALESCE utilise `created`).
+    #[tokio::test]
+    async fn find_promotable_uses_created_when_status_changed_null() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        let now = 1_700_000_100_000_i64;
+        let old = now - 20 * 86_400_000;
+        let cutoff = now - 14 * 86_400_000;
+
+        // status_changed=NULL, created=old → COALESCE → created → éligible.
+        insert_note_for_promote(
+            &idx,
+            "01EEEEEEEEEEEEEEEEEEEEEEEE",
+            "staging",
+            None, // NULL status_changed
+            old,
+        )
+        .await;
+
+        let results = idx
+            .find_promotable(cutoff, 100)
+            .await
+            .expect("find_promotable");
+
+        assert_eq!(
+            results.len(),
+            1,
+            "note éligible via created (status_changed NULL) attendue"
+        );
+        assert_eq!(results[0].0, "01EEEEEEEEEEEEEEEEEEEEEEEE");
+    }
+
+    /// T3 : note sentinel (`id LIKE '__sentinel__%'`) exclue même si âgée et staging.
+    #[tokio::test]
+    async fn find_promotable_sentinel_excluded() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        let now = 1_700_000_100_000_i64;
+        let old = now - 20 * 86_400_000;
+        let cutoff = now - 14 * 86_400_000;
+
+        // Sentinel âgé staging → doit être exclu.
+        insert_note_for_promote(&idx, "__sentinel__test", "staging", None, old).await;
+
+        let results = idx
+            .find_promotable(cutoff, 100)
+            .await
+            .expect("find_promotable");
+
+        assert!(
+            results.is_empty(),
+            "le sentinel ne doit jamais être retourné par find_promotable"
+        );
+    }
+
+    /// T4 : 5 notes éligibles, limit=2 → 2 retournées (les plus vieilles en premier).
+    #[tokio::test]
+    async fn find_promotable_cap() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        let now = 1_700_000_100_000_i64;
+        let cutoff = now - 14 * 86_400_000;
+
+        // Insérer 5 notes éligibles avec des `created` croissants.
+        for i in 0..5_u64 {
+            // Toutes âgées (created = cutoff - 1 jour - i*heure)
+            let created = cutoff - 86_400_000 - (i as i64) * 3_600_000;
+            let id = format!("01{:024}", i);
+            insert_note_for_promote(&idx, &id, "staging", None, created).await;
+        }
+
+        let results = idx
+            .find_promotable(cutoff, 2)
+            .await
+            .expect("find_promotable avec limit=2");
+
+        assert_eq!(
+            results.len(),
+            2,
+            "la cap limit=2 doit être respectée, got {}",
+            results.len()
+        );
+
+        // Les 2 retournées doivent être les plus vieilles (oldest-first).
+        // created décroissant avec i → i=4 est la plus vieille.
+        // Ordre ASC par COALESCE : i=4 d'abord, i=3 ensuite.
+        assert_eq!(results[0].0, "01000000000000000000000004");
+        assert_eq!(results[1].0, "01000000000000000000000003");
+    }
+}
+
+// ── Tests list_recent_notes ───────────────────────────────────────────────────
+
+#[cfg(test)]
+mod list_recent_notes_tests {
+    use super::*;
+
+    /// Insère une note avec `created` et `updated` explicites — helper de test local.
+    ///
+    /// Permet de simuler des notes anciennes mises à jour récemment (pour tester le COALESCE)
+    /// sans dépendre d'un helper de plus haut niveau.
+    async fn insert_note_with_timestamps(
+        idx: &SqliteIndex,
+        id: &str,
+        created_ms: i64,
+        updated_ms: Option<i64>,
+    ) {
+        let conn = idx.conn.lock().await;
+        conn.execute(
+            "INSERT INTO notes (id, vault_id, section, status, schema_version, created, updated, content_hash, body_text)
+             VALUES (?1, 'main', 'decisions', 'live', 1, ?2, ?3, X'00', ?1)",
+            rusqlite::params![id, created_ms, updated_ms],
+        )
+        .unwrap();
+    }
+
+    /// T1 : les K notes les plus récentes sont retournées triées par COALESCE(updated, created) DESC.
+    ///
+    /// Note C (created=50, updated=300) doit précéder B (created=200) et A (created=100)
+    /// car son COALESCE = 300, le plus élevé.
+    #[tokio::test]
+    async fn returns_k_most_recent_by_coalesce_desc() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        // Note A : COALESCE = 100
+        insert_note_with_timestamps(&idx, "01AAAAAAAAAAAAAAAAAAAAAAA0", 100, None).await;
+        // Note B : COALESCE = 200
+        insert_note_with_timestamps(&idx, "01AAAAAAAAAAAAAAAAAAAAAAB0", 200, None).await;
+        // Note C : COALESCE = 300 (created=50, mais updated=300 → récente)
+        insert_note_with_timestamps(&idx, "01AAAAAAAAAAAAAAAAAAAAAAC0", 50, Some(300)).await;
+
+        let records = idx
+            .list_recent_notes("main", 3)
+            .await
+            .expect("list_recent_notes");
+
+        let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "01AAAAAAAAAAAAAAAAAAAAAAC0", // COALESCE = 300
+                "01AAAAAAAAAAAAAAAAAAAAAAB0", // COALESCE = 200
+                "01AAAAAAAAAAAAAAAAAAAAAAA0", // COALESCE = 100
+            ],
+            "ordre attendu : C (coalesce=300) > B (200) > A (100)"
+        );
+    }
+
+    /// T2 : une note avec `updated` récent mais `created` ancien remonte en tête (COALESCE prouvé).
+    ///
+    /// Sans COALESCE (ORDER BY created DESC), ANCIEN (created=1000) précéderait RECENT (created=500).
+    /// Avec COALESCE(updated, created), RECENT (updated=2000) doit être en premier.
+    #[tokio::test]
+    async fn updated_recent_but_created_old_ranks_first() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        // Note ANCIEN : created=1000, pas d'updated → COALESCE = 1000
+        insert_note_with_timestamps(&idx, "01ANCIENAAAAAAAAAAAAAAAAAAA", 1000, None).await;
+        // Note RECENT : created=500 (plus ancien), updated=2000 → COALESCE = 2000
+        insert_note_with_timestamps(&idx, "01RECENTAAAAAAAAAAAAAAAAAAA", 500, Some(2000)).await;
+
+        let records = idx
+            .list_recent_notes("main", 2)
+            .await
+            .expect("list_recent_notes");
+
+        assert_eq!(records.len(), 2, "les 2 notes doivent être retournées");
+        assert_eq!(
+            records[0].id, "01RECENTAAAAAAAAAAAAAAAAAAA",
+            "la note avec updated=2000 doit passer devant malgré created=500 < 1000"
+        );
+        assert_eq!(records[1].id, "01ANCIENAAAAAAAAAAAAAAAAAAA");
+    }
+
+    /// T3 : les sentinelles sont exclues du résultat.
+    #[tokio::test]
+    async fn excludes_sentinels() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        // La sentinelle est créée automatiquement par open_in_memory ; on en insère
+        // une supplémentaire avec un timestamp très récent pour s'assurer qu'elle ne remonte pas.
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute(
+                "INSERT OR IGNORE INTO notes (id, vault_id, section, status, schema_version, created, content_hash, body_text)
+                 VALUES ('__sentinel__extra', 'main', 'decisions', 'live', 1, 9999999, X'00', '')",
+                [],
+            )
+            .unwrap();
+        }
+        insert_note_with_timestamps(&idx, "01NORMALAAAAAAAAAAAAAAAAAAAA", 100, None).await;
+
+        let records = idx
+            .list_recent_notes("main", 10)
+            .await
+            .expect("list_recent_notes");
+
+        assert!(
+            records.iter().all(|r| !r.id.starts_with("__sentinel__")),
+            "aucune sentinelle ne doit figurer dans le résultat"
+        );
+        assert_eq!(
+            records.len(),
+            1,
+            "seule la note normale doit être retournée"
+        );
+    }
+
+    /// T4 : la limite K est respectée — 5 notes seedées, k=2 → 2 retournées.
+    #[tokio::test]
+    async fn respects_limit_k() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        for i in 0..5_i64 {
+            let id = format!("01LIMIT{:020}", i);
+            insert_note_with_timestamps(&idx, &id, i * 1000, None).await;
+        }
+
+        let records = idx
+            .list_recent_notes("main", 2)
+            .await
+            .expect("list_recent_notes avec k=2");
+
+        assert_eq!(
+            records.len(),
+            2,
+            "la limite k=2 doit être respectée, got {}",
+            records.len()
+        );
     }
 }

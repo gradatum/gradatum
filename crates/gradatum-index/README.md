@@ -2,7 +2,7 @@
 
 > SQLite + FTS5 index layer — implements `DocumentStore`, `IndexStore`, and `VectorStore` traits with three-level drift detection.
 
-**Status**: Alpha (v0.4.x) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: 0.7.6 — public, Apache-2.0. API not yet stable before v1.0.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -16,19 +16,37 @@ Key features:
 
 - **FTS5 full-text search** with BM25 ranking over note bodies and metadata.
 - **Cosine vector similarity** computed directly in SQLite (no external vector database).
-- **Four mandatory PRAGMAs** on open: `WAL`, `synchronous=NORMAL`, `busy_timeout=5000`,
-  `foreign_keys=ON`.
+- **Four mandatory PRAGMAs** on every connection open: `WAL`, `synchronous=NORMAL`,
+  `busy_timeout=5000`, `foreign_keys=ON`.
 - **Schema migrations** — applied automatically from embedded SQL migration files.
 - **Three-level drift detection** via `drift::scan_phase_a`:
   - Level 1: file size check (fast, no read).
   - Level 2: first 4 KB prefix hash.
   - Level 3: full SHA-256 (only when Level 2 mismatches).
+- **Temporal index** (`temporal_index` table, migration 0013) — per-note `anchor_ms` and
+  `doc_kind`. Used by `vault_search` temporal range filter (`from_ms` / `to_ms`) and by the
+  `recency_factor` composite scoring signal. `anchor_ms` is populated from an explicit
+  `occurred_at` write field (when provided) or derived from `created_at` as fallback.
+- **Scheduled task health** (`scheduled_task_health` + `scheduled_task_error` tables,
+  migration 0026) — observability for recurring in-process tasks:
+  - `record_task_run(task_name, outcome, duration_ms, error)` — upserts the health snapshot
+    (increments `run_count`), appends to the error log on failure, triggers a lazy 7-day
+    purge. Never panics.
+  - `seed_scheduled_task(task_name)` — idempotent boot-time registration.
+  - `list_scheduled_health()` — returns all registered tasks with `errors_24h` count.
+- **Curated metrics timeseries** (`metric_sample` table, migration 0027) — persistent timeseries
+  store for Prometheus-scraped curated metrics:
+  - Table: `metric_sample (series TEXT, ts_ms INTEGER, value REAL, PRIMARY KEY (series, ts_ms)) WITHOUT ROWID` + `INDEX idx_metric_sample_ts ON metric_sample(ts_ms)`.
+  - `insert_metric_samples(ts_ms, samples: &[(String, f64)])` — batch INSERT OR IGNORE (PK prevents tick collisions).
+  - `query_metric_timeseries(series, from_ms, to_ms, bucket_ms)` — range query with server-side downsample: `AVG(value) GROUP BY (ts_ms / bucket_ms)` when `bucket_ms > 60_000`; raw points (no AVG) when `bucket_ms == 60_000`. Returns `Vec<MetricSamplePoint>` from `gradatum-core`.
+  - `purge_metric_samples(cutoff_ms)` — `DELETE WHERE ts_ms < cutoff_ms` (lazy 14-day retention).
+  - `list_distinct_metric_series()` — distinct `series` values present in the table.
 
 ## Usage
 
 ```toml
 [dependencies]
-gradatum-index = "0.4.0"
+gradatum-index = "0.7.6"
 ```
 
 ```rust
@@ -38,6 +56,12 @@ let index = SqliteIndex::open(Path::new("/var/lib/gradatum/index.db")).await?;
 // or for tests:
 let index = SqliteIndex::open_in_memory().await?;
 ```
+
+## Feature Flags
+
+| Feature | Default | Description |
+|---|---|---|
+| `sqlite-vec-ann` | no | Enables ANN (approximate nearest neighbor) search via the `sqlite-vec` `vec0` virtual table. Runtime registration of the extension (`sqlite3_auto_extension`) is the responsibility of the binary crate. |
 
 ## License
 

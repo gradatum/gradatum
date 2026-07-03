@@ -11,7 +11,10 @@
 //! ## Idempotence
 //!
 //! Avant chaque write, `client.marker_exists(marker)` est appelé. Si la note
-//! existe déjà (marqueur trouvé dans `vault_search`), la carte est sautée.
+//! existe déjà, la carte est sautée. La détection est en 4 étapes : (1) fast-path
+//! snippet/title BM25, (2) fallback `vault_read` sur les hits retournés, (3)
+//! fallback déterministe `vault_list` + `vault_read` exhaustif si `vault_search`
+//! retourne exactement 50 hits (éjection ranking possible — section ≥ 50 cartes).
 //!
 //! ## Mockable client
 //!
@@ -27,6 +30,29 @@ use async_trait::async_trait;
 
 use crate::changelog_parse::parse_changelog;
 use crate::project_map_card::{VaultWriteCard, render_card};
+
+/// Vrai si `marker` apparaît dans `haystack` avec une frontière droite valide.
+///
+/// Anti-collision sous-chaîne : la seule ambiguïté réelle entre marqueurs est
+/// l'extension numérique (`pm-feature-source:F-4` ⊂ `...F-42`,
+/// `changelog/0.5.2/added/0` ⊂ `.../01`). Une occurrence ne compte que si le
+/// caractère qui suit n'est PAS un chiffre ASCII (ou s'il n'y a pas de caractère
+/// suivant). Case-sensitive, littéral exact (markers machine-générés — P2 reviewer).
+fn marker_matches(haystack: &str, marker: &str) -> bool {
+    if marker.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(marker) {
+        let abs = start + pos;
+        let after = haystack[abs + marker.len()..].chars().next();
+        if !matches!(after, Some(c) if c.is_ascii_digit()) {
+            return true;
+        }
+        start = abs + marker.len();
+    }
+    false
+}
 
 /// Timeout par défaut pour les appels HTTP vers le serveur gradatum (cap DoS — ADN 5).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -118,6 +144,111 @@ impl HttpVaultClient {
             http,
         })
     }
+
+    /// Énumère TOUS les paths d'une section via `POST /api/v1/vault_list` avec
+    /// pagination complète (suit `next_cursor` jusqu'à épuisement).
+    ///
+    /// Garantit 0 faux-négatif quelle que soit la taille de la section : la borne
+    /// limit=1000 par page est transparente — la boucle suit les pages jusqu'à
+    /// `next_cursor == null`.
+    ///
+    /// Used as a deterministic fallback in `marker_exists` when `vault_search`
+    /// did not return the target card (BM25 ranking may eject low-scoring matches
+    /// from the top-N results).
+    ///
+    /// # Errors
+    ///
+    /// Erreur si un appel HTTP échoue ou si le parsing de la réponse est invalide.
+    async fn vault_list_section_paths(&self, section: &str) -> Result<Vec<String>> {
+        let url = format!("{}/api/v1/vault_list", self.base_url);
+        let mut all_paths: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut page = 0u32;
+
+        loop {
+            page += 1;
+            let mut body = serde_json::json!({
+                "section": section,
+                // limit=1000 = maximum accepté par vault_list (VaultListRequest.limit max).
+                "limit": 1000
+            });
+            if let Some(ref c) = cursor {
+                body["cursor"] = serde_json::Value::String(c.clone());
+            }
+
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.jwt)
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| {
+                    format!("vault_list page={page} (POST /api/v1/vault_list) section={section}")
+                })?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                bail!("vault_list page={page} échoué : HTTP {status} — section={section}");
+            }
+
+            let payload: serde_json::Value = resp.json().await.with_context(|| {
+                format!("parsing réponse vault_list page={page} section={section}")
+            })?;
+
+            // Champ entries = VaultListResponse.entries (dto.rs:180).
+            let entries = payload["entries"].as_array().cloned().unwrap_or_default();
+            all_paths.extend(
+                entries
+                    .into_iter()
+                    .filter_map(|e| e["path"].as_str().map(str::to_string)),
+            );
+
+            // Pagination : suivre next_cursor jusqu'à null.
+            match payload["next_cursor"].as_str() {
+                Some(c) if !c.is_empty() => cursor = Some(c.to_string()),
+                _ => break,
+            }
+        }
+
+        Ok(all_paths)
+    }
+
+    /// Lit le body markdown complet d'une note (`content`) via `POST /api/v1/vault_read`.
+    ///
+    /// # Errors
+    ///
+    /// Erreur si l'appel HTTP échoue, si le statut n'est pas 2xx, ou si le champ
+    /// `content` est absent de la réponse.
+    async fn vault_read_content(&self, path: &str) -> Result<String> {
+        let url = format!("{}/api/v1/vault_read", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.jwt)
+            // VaultReadRequest a deny_unknown_fields : envoyer UNIQUEMENT `path`.
+            // tenant_id défaut "main" côté serveur, section optionnel.
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await
+            .with_context(|| format!("vault_read (POST /api/v1/vault_read) path={path}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            bail!("vault_read échoué : HTTP {status} — path={path}");
+        }
+
+        let payload: serde_json::Value = resp
+            .json()
+            .await
+            .with_context(|| format!("parsing réponse vault_read path={path}"))?;
+
+        // Champ markdown = `content` (VaultReadResponse.content, dto.rs:154).
+        payload["content"]
+            .as_str()
+            .map(str::to_string)
+            .with_context(|| format!("champ 'content' absent de la réponse vault_read path={path}"))
+    }
 }
 
 #[async_trait]
@@ -131,7 +262,14 @@ impl VaultWriteClient for HttpVaultClient {
             .json(&serde_json::json!({
                 "query": marker,
                 "section": "project-map",
-                "limit": 1
+                // limit:50 (max serveur) pour maximiser la couverture BM25 avant
+                // de recourir au fallback vault_list.
+                "limit": 50,
+                // include_corpus_count:true → corpus_match_count dans la réponse.
+                // Permet de détecter si des cartes ont été éjectées du top-50 BM25
+                // (corpus_match_count > items.len()) sans se coupler à une constante
+                // limite côté client (P1-C2 reviewer 2026-06-23).
+                "include_corpus_count": true
             }))
             .send()
             .await
@@ -144,8 +282,72 @@ impl VaultWriteClient for HttpVaultClient {
 
         let payload: serde_json::Value =
             resp.json().await.context("parsing réponse vault_search")?;
-        let count = payload["results"].as_array().map(|a| a.len()).unwrap_or(0);
-        Ok(count > 0)
+
+        // Correction bug P1 : le champ API réel est `items`, pas `results`.
+        // Référence : VaultSearchResponse.items (gradatum-server/src/api_v1/dto.rs:117).
+        let items = payload["items"].as_array().cloned().unwrap_or_default();
+
+        // Step 2. Fast-path : snippet ou title contient le marqueur (match BORNÉ).
+        //         `marker_matches` évite les collisions sous-chaîne (F-4 ⊂ F-42).
+        let fast = items.iter().any(|hit| {
+            let snippet = hit["snippet"].as_str().unwrap_or("");
+            let title = hit["title"].as_str().unwrap_or("");
+            marker_matches(snippet, marker) || marker_matches(title, marker)
+        });
+        if fast {
+            return Ok(true);
+        }
+
+        // Step 3. Fallback vault_read sur les hits vault_search : le snippet FTS5
+        //         peut tronquer le marqueur. Lire le body complet des candidats,
+        //         short-circuit au 1er match. Read-error → propage (fail-loud).
+        //         Hit sans `path` = réponse vault_search malformée → bail.
+        let mut searched_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for hit in &items {
+            let path = hit["path"]
+                .as_str()
+                .context("hit vault_search sans champ 'path' (réponse malformée)")?;
+            searched_paths.insert(path.to_string());
+            let body = self.vault_read_content(path).await?;
+            if marker_matches(&body, marker) {
+                return Ok(true);
+            }
+        }
+
+        // Step 4. Fallback déterministe vault_list + pagination complète.
+        //
+        //         Activation : si corpus_match_count > items.len(), des cartes
+        //         correspondent aux tokens FTS5 du marqueur mais ont été éjectées
+        //         du top-N BM25 → la cible peut se trouver parmi elles. Sans
+        //         corpus_match_count (serveur antérieur) → fallback conservatif sur
+        //         items.len() >= VAULT_SEARCH_LIMIT (comportement v1).
+        //
+        //         Récupérer TOUS les paths via vault_list (pagination complète, boucle
+        //         next_cursor) — garantit 0 faux-négatif quelle que soit la taille de
+        //         la section. Lire les paths non encore vus en step 3.
+        //         Read-error → propage (fail-loud).
+        const VAULT_SEARCH_LIMIT: usize = 50; // max du serveur — fallback conservatif
+        let corpus_count = payload["corpus_match_count"].as_u64().unwrap_or(0);
+        let items_seen = items.len() as u64;
+        let needs_full_scan = (corpus_count > 0 && corpus_count > items_seen)
+            || items_seen >= VAULT_SEARCH_LIMIT as u64;
+        if needs_full_scan {
+            let all_paths = self.vault_list_section_paths("project-map").await?;
+            for path in &all_paths {
+                if searched_paths.contains(path) {
+                    // Déjà lu en step 3 sans match → skip.
+                    continue;
+                }
+                let body = self.vault_read_content(path).await?;
+                if marker_matches(&body, marker) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Step 5. Vault_search + vault_list exhaustif (si déclenché) : marqueur absent.
+        Ok(false)
     }
 
     async fn vault_write(&self, card: &VaultWriteCard) -> Result<String> {

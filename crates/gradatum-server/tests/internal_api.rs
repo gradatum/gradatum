@@ -585,3 +585,60 @@ async fn internal_api_invalid_ulid_is_400() {
     let resp = env.router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ── Test persist/distill tags (F-43 Task 3) ──────────────────────────────────
+
+/// POST persist/distill with `tags: ["quality-low"]` on a NEW note → re-read → frontmatter
+/// contains tag `quality-low`.
+///
+/// Verifies that `PersistDistillRequest.tags` is forwarded to `parse_tags` and stored in
+/// the note frontmatter on creation (first call, note absent from vault).
+#[tokio::test]
+async fn persist_distill_tags() {
+    let env = build_internal_env().await;
+    let router = env.router;
+    let note_id = Ulid::new().to_string();
+
+    // POST /internal/v1/persist/distill — new note with tags: ["quality-low"]
+    let req = make_request(
+        "POST",
+        "/internal/v1/persist/distill",
+        json!({
+            "note_id": note_id,
+            "tenant_id": "main",
+            "section": "reference",
+            "title": "Distilled synthesis",
+            "body": "# Synthesis\n\nContent.",
+            "trust": 0.5,
+            "expected_sha256": null,
+            "mark_processed": false,
+            "derived_into": null,
+            "derived_from": [],
+            "tags": ["quality-low"]
+        }),
+        TEST_TOKEN,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "persist/distill with tags must return 200"
+    );
+
+    // Re-read the note via GET /internal/v1/note/:ulid and verify the tag is present.
+    let req = make_get(&format!("/internal/v1/note/{note_id}"), TEST_TOKEN);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "GET note after distill must return 200"
+    );
+
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let note: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tags = note["tags"].as_array().expect("tags must be an array");
+    assert!(
+        tags.iter().any(|t| t.as_str() == Some("quality-low")),
+        "frontmatter must contain tag 'quality-low', got: {tags:?}"
+    );
+}

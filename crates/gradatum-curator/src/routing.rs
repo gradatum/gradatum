@@ -23,7 +23,7 @@
 //!
 //! [`SECTIONS`] contains only the 11 **auto-classifiable** sections (those the
 //! heuristic can produce). It is intentionally distinct from [`is_valid_hint_section`],
-//! which delegates to [`gradatum_core::section::Section::ALL`] (12 sections).
+//! which delegates to [`gradatum_core::section::Section::ALL`] (13 sections).
 //!
 //! This separation preserves the **hint-only invariant** for `project-map`: the
 //! heuristic can never produce `project-map`, but an explicit `section_hint` can.
@@ -37,13 +37,13 @@ use serde::{Deserialize, Serialize};
 /// The 11 auto-classifiable gradatum sections (stable priority order).
 ///
 /// This list covers only sections that the heuristic and LLM can **produce**
-/// from note content. It is intentionally a subset of the 12 canonical sections:
+/// from note content. It is intentionally a subset of the 13 canonical sections:
 /// `"project-map"` is absent because it is **hint-only** — it can only be
 /// assigned via an explicit `section_hint`, never by content classification.
 ///
 /// For hint validation (accepting or rejecting a `section_hint`), use
 /// [`is_valid_hint_section`] instead, which derives its answer from
-/// [`gradatum_core::section::Section::ALL`] (all 12 sections).
+/// [`gradatum_core::section::Section::ALL`] (all 13 sections).
 pub const SECTIONS: &[&str] = &[
     "decisions",
     "council",
@@ -62,7 +62,7 @@ pub const SECTIONS: &[&str] = &[
 /// `section_hint`.
 ///
 /// Derives the answer from [`gradatum_core::section::Section::ALL`] — the single
-/// source of truth for the 12 canonical sections — so this function stays correct
+/// source of truth for the 13 canonical sections — so this function stays correct
 /// automatically when new sections are added to [`gradatum_core::section::Section::ALL`].
 ///
 /// This function is **distinct from [`SECTIONS`]**: `SECTIONS` only lists the 11
@@ -394,7 +394,7 @@ mod tests {
 
     // ── Tests is_valid_hint_section (invariant hint-only project-map) ────────────
 
-    /// `is_valid_hint_section` accepte les 12 sections canoniques, y compris "project-map".
+    /// `is_valid_hint_section` accepte les 13 sections canoniques, y compris "project-map" et "identity".
     #[test]
     fn is_valid_hint_accepts_all_12_canonical_sections() {
         let all_canonical = [

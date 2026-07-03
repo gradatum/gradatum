@@ -64,6 +64,11 @@ pub struct RrfHit {
     /// semantic-only hits). Exposed as-is in the `SearchHit.status` response field.
     /// Empty string if unresolved (semantic-only hit without batch enrichment).
     pub status: String,
+    /// Temporal anchor (`temporal_index.anchor_ms`), Unix epoch milliseconds.
+    ///
+    /// Populated by the handler from BM25 results (`SearchHitRaw.anchor_ms`) or from
+    /// the semantic batch lookup (`get_anchor_ms_batch`). `None` when absent.
+    pub anchor_ms: Option<i64>,
 }
 
 /// Applies RRF fusion over BM25 and semantic results.
@@ -170,6 +175,7 @@ pub fn rrf_fuse(
                 bm25_rank: bm25_rank_val,
                 sem_rank: sem_rank_val,
                 status: String::new(), // rempli par le handler après fusion (F-37 notes fix)
+                anchor_ms: None,       // rempli par le handler (F-65 temporal)
             }
         })
         .collect()

@@ -591,6 +591,8 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
             .get_note_created_and_indegree(vault_id, note_id)
             .await
     }
+    // 10 non-self args: trait method signature — #[allow] not #[expect], clippy omits lint on trait impls.
+    #[allow(clippy::too_many_arguments)]
     async fn search_fts_with_snippet(
         &self,
         vault_id: &VaultId,
@@ -600,6 +602,8 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
         section: Option<&str>,
         locus: Option<&str>,
         status: Option<&str>,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
     ) -> Result<Vec<SearchHitRaw>, GradatumError> {
         self.inner
             .search_fts_with_snippet(
@@ -610,6 +614,8 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
                 section,
                 locus,
                 status,
+                from_ms,
+                to_ms,
             )
             .await
     }
@@ -631,6 +637,13 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
     }
     async fn count_review_queue(&self, vault_id: &VaultId) -> Result<u64, GradatumError> {
         self.inner.count_review_queue(vault_id).await
+    }
+    async fn find_promotable(
+        &self,
+        cutoff_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, NoteStatus)>, GradatumError> {
+        self.inner.find_promotable(cutoff_ms, limit).await
     }
     async fn title_lookup(
         &self,
@@ -679,6 +692,13 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
         self.inner
             .list_notes(vault_id, section, limit, cursor)
             .await
+    }
+    async fn list_recent_notes(
+        &self,
+        vault_id: &str,
+        k: usize,
+    ) -> Result<Vec<NoteRecord>, GradatumError> {
+        self.inner.list_recent_notes(vault_id, k).await
     }
     async fn total_body_size_bytes(&self, vault_id: &str) -> Result<u64, GradatumError> {
         self.inner.total_body_size_bytes(vault_id).await

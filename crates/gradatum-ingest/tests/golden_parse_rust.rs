@@ -1047,3 +1047,102 @@ fn free_function_caller_unchanged() {
         caller.deps
     );
 }
+
+// ── P2-1 : method_call_expression — documentation des limites + cas résolvable ─
+//
+// Contexte : `code_scope_reverse_deps_batch` cherche par `qualified_name` exact
+// (`Type::method`). Pour `method_call_expression`, seul le terminal est stocké
+// (`"method"`), ce qui ne matche pas `"Type::method"` dans reverse-deps.
+//
+// Le type du receiver n'est pas résolvable syntaxiquement sans analyse sémantique :
+// - `self.method()` : receiver = `self` keyword → type = Type de l'impl courant (inconnu)
+// - `instance.method()` : receiver = identifier → type inconnu
+// - `self.field.method()` : receiver = field_expression → type inconnu
+// Ces cas requièrent une résolution de type complète (dette connue, hors scope).
+//
+// Cas résolvable syntaxiquement sans analyse sémantique :
+// `scoped_identifier` dans le receiver d'un `method_call_expression` est très rare
+// en Rust idiomatique (nécessite `<Type as Trait>::method(self)` via call_expression).
+//
+// Ce fix (P2-1 code-only) documente honnêtement les limites et renforce l'extraction
+// des méthodes via `method_call_expression` : le terminal est toujours émis, et les
+// cas avec receiver `self` n'inventent PAS de qualified_name.
+
+/// Snippet : appels de méthode via `method_call_expression`.
+///
+/// - `self.parse()` : receiver `self` → seul le terminal `"parse"` stocké.
+/// - `input.split("x")` : méthode stdlib → filtrée (STDLIB_NOISE_METHODS).
+const SNIPPET_METHOD_CALL_LIMITS: &str = r#"
+pub struct Parser {
+    input: String,
+}
+
+pub fn process(s: &str) -> usize {
+    s.len()
+}
+
+impl Parser {
+    pub fn run(&self) -> usize {
+        let x = process("x");
+        self.parse() + x
+    }
+
+    pub fn parse(&self) -> usize {
+        process(&self.input)
+    }
+}
+"#;
+
+/// `method_call_terminal_is_emitted` :
+/// `self.parse()` → deps de `Parser::run` doit contenir `"parse"` (terminal).
+///
+/// Vérifie que le terminal est bien extrait pour les `method_call_expression`.
+#[test]
+fn method_call_terminal_is_emitted() {
+    let symbols = parse_rust_file("src/method_limits.rs", SNIPPET_METHOD_CALL_LIMITS, true)
+        .expect("parse ok");
+
+    // Toutes les méthodes extraites pour debug.
+    let all_methods: Vec<(&str, &str)> = symbols
+        .iter()
+        .map(|s| (s.kind.as_str(), s.qualified_name.as_str()))
+        .collect();
+
+    let run = symbols
+        .iter()
+        .find(|s| s.kind == "method" && s.qualified_name == "Parser::run")
+        .unwrap_or_else(|| {
+            panic!(
+                "Parser::run doit être extrait en mode all=true. Symboles trouvés : {all_methods:?}"
+            )
+        });
+
+    assert!(
+        run.deps.contains(&"parse".to_string()),
+        "Parser::run doit contenir le terminal 'parse' (self.parse()). deps={:?}",
+        run.deps
+    );
+}
+
+/// `method_call_self_receiver_no_invented_qualified` :
+/// `self.parse()` → ne doit PAS produire `"Parser::parse"` (type de `self` non résolvable).
+///
+/// Invariant : on n'invente pas de qualified_name quand le type n'est pas résolvable.
+/// Un faux-positif `"Parser::parse"` dans reverse-deps serait pire qu'une absence.
+#[test]
+fn method_call_self_receiver_no_invented_qualified() {
+    let symbols = parse_rust_file("src/method_limits.rs", SNIPPET_METHOD_CALL_LIMITS, true)
+        .expect("parse ok");
+
+    let run = symbols
+        .iter()
+        .find(|s| s.kind == "method" && s.qualified_name == "Parser::run")
+        .expect("Parser::run doit être extrait");
+
+    assert!(
+        !run.deps.contains(&"Parser::parse".to_string()),
+        "self.parse() ne doit PAS produire 'Parser::parse' (type de self inconnu \
+         syntaxiquement — faux-positif interdit). deps={:?}",
+        run.deps
+    );
+}

@@ -21,6 +21,7 @@ pub mod distill_cluster;
 pub mod internal_client;
 pub mod metrics;
 pub mod monitor;
+pub mod quality_score;
 pub mod schedules;
 pub mod wikilinks;
 

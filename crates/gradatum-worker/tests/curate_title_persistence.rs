@@ -200,7 +200,17 @@ async fn curate_persists_title_in_index() {
     // Mot clé court non ambigu pour le FTS
     let hits = fixture
         .index
-        .search_fts_with_snippet(&vault_id, "Régression Persist", 5, false, None, None, None)
+        .search_fts_with_snippet(
+            &vault_id,
+            "Régression Persist",
+            5,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("search_fts_with_snippet");
 
@@ -278,7 +288,17 @@ async fn search_fts_returns_title_after_curate() {
     // Chercher par un mot du body (pas du titre) — vérifier que `title` est présent dans le hit
     let hits = fixture
         .index
-        .search_fts_with_snippet(&vault_id, "correction bug", 5, false, None, None, None)
+        .search_fts_with_snippet(
+            &vault_id,
+            "correction bug",
+            5,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("search_fts_with_snippet");
 

@@ -26,7 +26,7 @@ gradatum-storage.workspace = true
 gradatum-index = { workspace = true, features = ["sqlite-vec-ann"] }
 gradatum-search.workspace = true
 gradatum-queue.workspace = true
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "0.6.4" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "0.7.0" }
 gradatum-cache.workspace = true
 gradatum-acl-policy.workspace = true
 gradatum-acl-auth.workspace = true

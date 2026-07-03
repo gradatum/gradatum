@@ -29,10 +29,10 @@
 //! - Partial patch via `search.patch_note_status` (direct SQL, no state machine).
 //!   Allows updating the reason or `replaced_by` without changing the status.
 //!
-//! # Auth (fix F-1 — A01 Broken Access Control)
+//! # Auth (A01 Broken Access Control)
 //!
-//! Ces endpoints requièrent désormais un bearer JWT valide + ACL Write (fix faille F-1).
-//! La logique auth+ACL est intégralement dans les `*_impl` de `logic.rs` (parité MCP).
+//! These endpoints require a valid bearer JWT + ACL Write permission.
+//! Auth and ACL logic lives entirely in the `*_impl` functions in `logic.rs` (MCP parity).
 //! Le thin wrapper HTTP extrait `TrustContext` via `Extension` et délègue à `*_impl`.
 //!
 //! # Idempotence

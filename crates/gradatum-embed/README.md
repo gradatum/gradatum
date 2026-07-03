@@ -2,12 +2,12 @@
 
 > `Embedder` trait with HTTP (OpenAI-compatible) and ONNX CPU backends, plus a fallback decorator.
 
-**Status**: Alpha (v0.4.x) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
 
-`gradatum-embed` defines the `Embedder` trait and provides three concrete backends:
+`gradatum-embed` defines the `Embedder` and `EmbedBackend` traits and provides three concrete backends:
 
 | Backend | Description |
 |---|---|
@@ -22,10 +22,10 @@ the fallback is called transparently.
 
 ```toml
 [dependencies]
-gradatum-embed = "0.4.0"
+gradatum-embed = "0.7.6"
 
 # For local ONNX CPU inference:
-gradatum-embed = { version = "0.4.0", features = ["fastembed-cpu"] }
+gradatum-embed = { version = "0.7.6", features = ["fastembed-cpu"] }
 ```
 
 ```rust
@@ -41,6 +41,7 @@ assert_eq!(vectors[0].len(), 1024); // bge-m3 dimension
 | Feature | Description |
 |---|---|
 | `fastembed-cpu` (off by default) | Enables `FastEmbedCpu` — local ONNX inference via fastembed |
+| `windows-native-tls` (off by default) | Falls back to the Windows native certificate store via `native-tls` |
 
 ## Anti-cycle invariant
 

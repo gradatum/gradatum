@@ -258,6 +258,7 @@ async fn curate_chains_embed_note_with_correct_payload() {
         tenant_id: "main".into(),
         expected_sha256: None,
         note_id: None,
+        occurred_at: None,
     };
     let payload_bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard())
         .expect("encode VaultWriteRequest bincode chained_jobs");

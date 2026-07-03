@@ -1,31 +1,31 @@
-//! Résolution des wikilinks `[[...]]` via [`InternalClient`].
+//! Resolution of `[[...]]` wikilinks via [`InternalClient`].
 //!
-//! Ce module expose [`resolve_wikilinks_via_client`], utilisée par :
-//! - [`crate::apalis_handlers::handle_curate`] (branches Admitted **et** Pending)
-//! - [`crate::dispatch::Dispatcher`] (compatibilité tests d'intégration)
+//! This module exposes [`resolve_wikilinks_via_client`], used by:
+//! - [`crate::apalis_handlers::handle_curate`] (both `Admitted` and `Pending` branches)
+//! - [`crate::dispatch::Dispatcher`] (integration-test compatibility)
 //!
-//! ## Stratégie de résolution ULID-first (B5 fix)
+//! ## ULID-first resolution strategy
 //!
-//! Les wikilinks écrits par le vault ont la forme `[[section:ULID]]` (ex. :
-//! `[[decisions:01KVBTMYNK4XXZJAKWMTB4AM9K]]`). `extract_wikilinks` retourne
-//! la target brute `"decisions:01KVBTMYNK..."`.
+//! Wikilinks written by the vault have the form `[[section:ULID]]` (e.g.
+//! `[[decisions:01KVBTMYNK4XXZJAKWMTB4AM9K]]`). `extract_wikilinks` returns
+//! the raw target `"decisions:01KVBTMYNK..."`.
 //!
-//! Pour chaque target, on essaie d'abord de parser un ULID (via
-//! `gradatum_curator::wikilinks::parse_ulid_target`). Si c'est un ULID valide,
-//! on appelle `client.id_lookup` (vérification d'existence + status live) —
-//! résolution directe sans aller chercher le H1. Si ce n'est pas un ULID, on
-//! retombe sur `client.title_lookup` (rétrocompat).
+//! For each target, the resolver first attempts to parse a ULID (via
+//! `gradatum_curator::wikilinks::parse_ulid_target`). If it is a valid ULID,
+//! `client.id_lookup` is called (existence check + live status) — direct resolution
+//! without fetching the H1 heading. If it is not a ULID, the resolver falls back to
+//! `client.title_lookup` (backwards compatibility).
 //!
-//! ## Protocole B5
+//! ## Resolved links
 //!
-//! Les liens résolus sont packés dans `PersistCuratedRequest.links` pour que
-//! le server gère `upsert_link` atomiquement au sein de `persist_curated`.
+//! Resolved links are packed into `PersistCuratedRequest.links` so that
+//! the server handles `upsert_link` atomically inside `persist_curated`.
 //!
-//! ## Sémantique non-fatale
+//! ## Non-fatal semantics
 //!
-//! Tout échec (`id_lookup`/`title_lookup` down, note cible absente, panic de task)
-//! est loggé sans propagation. Le `Vec<LinkDto>` retourné peut contenir
-//! moins de liens que les wikilinks extraits.
+//! Any failure (`id_lookup`/`title_lookup` unavailable, missing target note, task panic)
+//! is logged without propagation. The returned `Vec<LinkDto>` may contain
+//! fewer links than the extracted wikilinks.
 
 use std::sync::Arc;
 
@@ -35,34 +35,34 @@ use gradatum_dto::LinkDto;
 
 use crate::internal_client::InternalClient;
 
-/// Concurrence maximale de résolutions `title_lookup` simultanées.
+/// Maximum number of simultaneous `title_lookup` resolutions in flight.
 ///
-/// Cap déterministe pour éviter un fan-out illimité sur des notes avec
-/// de nombreux wikilinks — protège le serveur `/internal` d'une surcharge.
+/// Deterministic cap to prevent unbounded fan-out on notes with many wikilinks,
+/// protecting the `/internal` server from overload.
 const WIKILINK_RESOLVE_MAX_IN_FLIGHT: usize = 8;
 
-/// Extrait les wikilinks `[[...]]` du `body`, les résout via `client.title_lookup`
-/// et retourne `Vec<LinkDto>` pour inclusion dans `PersistCuratedRequest.links`.
+/// Extracts `[[...]]` wikilinks from `body`, resolves them via `client`,
+/// and returns a `Vec<LinkDto>` for inclusion in `PersistCuratedRequest.links`.
 ///
-/// Le serveur gère `upsert_link` atomiquement dans `persist_curated`.
+/// The server handles `upsert_link` atomically inside `persist_curated`.
 ///
 /// # Non-fatal
 ///
-/// Tout échec d'extraction ou de `title_lookup` est loggé sans propagation.
-/// Le `Vec` retourné peut contenir moins de liens que les wikilinks extraits.
+/// Any extraction or lookup failure is logged without propagation.
+/// The returned `Vec` may contain fewer links than the wikilinks extracted.
 ///
-/// # Comportement si la note cible est absente
+/// # Missing target note
 ///
-/// `title_lookup` retourne `Ok(None)` — loggé en `debug`, lien ignoré.
+/// `title_lookup` returns `Ok(None)` — logged at `debug` level, link skipped.
 ///
-/// # Parallélisme
+/// # Concurrency
 ///
-/// Les résolutions sont lancées en parallèle via `tokio::task::JoinSet`.
+/// Resolutions are launched in parallel via `tokio::task::JoinSet`.
 /// Concurrency is capped via a `Semaphore` (currently 8 simultaneous requests)
 /// to protect the `/internal` server against large fan-outs.
 ///
-/// Les sémantiques de résultat et l'ordre de collecte sont identiques à la version
-/// non-bornée (JoinSet non ordonné dans les deux cas).
+/// Result semantics and collection order are identical to the unbounded version
+/// (JoinSet is unordered in both cases).
 pub async fn resolve_wikilinks_via_client(
     client: &Arc<dyn InternalClient>,
     tenant_id: &str,
@@ -193,13 +193,13 @@ mod tests {
     // Les autres méthodes utilisent unreachable! car ce test n'appelle que title_lookup.
 
     struct MockClient {
-        /// Nombre maximum de requêtes simultanées observées.
+        /// Maximum number of simultaneous in-flight requests observed.
         peak_in_flight: Arc<AtomicUsize>,
-        /// Compteur courant de requêtes en vol.
+        /// Current number of in-flight requests.
         current_in_flight: Arc<AtomicUsize>,
-        /// Nombre d'appels `id_lookup` (vérifie que les nœuds réservés ne lookent pas).
+        /// Number of `id_lookup` calls (verifies reserved nodes are not looked up).
         id_lookup_calls: Arc<AtomicUsize>,
-        /// Nombre d'appels `title_lookup` (vérifie l'absence de lookup réseau réservé).
+        /// Number of `title_lookup` calls (verifies no reserved-node network lookups).
         title_lookup_calls: Arc<AtomicUsize>,
     }
 
@@ -335,8 +335,8 @@ mod tests {
         }
     }
 
-    /// Vérifie que la concurrence en vol ne dépasse jamais WIKILINK_RESOLVE_MAX_IN_FLIGHT,
-    /// même avec beaucoup plus de wikilinks que la limite.
+    /// Verifies that in-flight concurrency never exceeds `WIKILINK_RESOLVE_MAX_IN_FLIGHT`,
+    /// even with far more wikilinks than the cap.
     #[tokio::test]
     async fn many_links_resolve_correctly_within_concurrency_cap() {
         let n_links = 30_usize; // > WIKILINK_RESOLVE_MAX_IN_FLIGHT (8)
@@ -422,8 +422,8 @@ mod tests {
         );
     }
 
-    /// Une casse de statut invalide n'est PAS un nœud réservé : elle retombe sur
-    /// le flux titre (title_lookup), pas une arête synthétique silencieuse.
+    /// An invalid status casing is NOT a reserved node: it falls back to the title
+    /// lookup path (`title_lookup`), not a silent synthetic edge.
     #[tokio::test]
     async fn invalid_status_casing_falls_back_to_title_lookup() {
         let id_lookup_calls = Arc::new(AtomicUsize::new(0));

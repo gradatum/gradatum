@@ -20,7 +20,7 @@ path = "src/lib.rs"
 gradatum-core.workspace = true
 gradatum-dto.workspace = true
 # BLOCAGE CRATES.IO : gradatum-db-sqlite est publish=false. gradatum-worker non publiable.
-gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "0.6.4" }
+gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "0.7.0" }
 gradatum-embed.workspace = true
 gradatum-queue.workspace = true
 gradatum-curator.workspace = true

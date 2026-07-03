@@ -46,11 +46,10 @@ describe('StatusBadge', () => {
     expect(badge).toHaveClass('status-badge--deprecated');
   });
 
-  it('affiche DEPRECATED pour status=downgraded (legacy bucket normatif §7)', () => {
+  it('affiche DOWNGRADED pour status=downgraded', () => {
     render(<StatusBadge status="downgraded" />);
     const badge = screen.getByTestId('badge-downgraded');
-    expect(badge).toHaveTextContent('DEPRECATED');
-    // Classe identique à deprecated (legacy bucket)
+    expect(badge).toHaveTextContent('DOWNGRADED');
     expect(badge).toHaveClass('status-badge--downgraded');
   });
 

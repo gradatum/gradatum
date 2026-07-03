@@ -1,6 +1,6 @@
-//! Serveur MCP natif in-process — `gradatum-server` v0.6.0.
+//! Serveur MCP natif in-process — `gradatum-server` v0.7.1.
 //!
-//! Expose les 21 outils gradatum via le protocole MCP (Streamable HTTP),
+//! Expose les 23 outils gradatum via le protocole MCP (Streamable HTTP),
 //! réutilisant les `*_impl` de [`super::logic`] et les helpers métier existants.
 //!
 //! # Traversée TrustContext
@@ -17,14 +17,15 @@
 //!     .get::<TrustContext>()           // Parts HTTP → TrustContext Axum
 //! ```
 //!
-//! # Outils exposés (21)
+//! # Outils exposés (23)
 //!
 //! Identiques au stub `gradatum-mcp-stub` (parité contractuelle) :
 //! `vault_search`, `vault_read`, `vault_list`, `vault_status`, `vault_graph`,
 //! `vault_links`, `vault_trace`, `vault_context`, `vault_timeline`,
 //! `vault_authors`, `vault_tags`, `vault_write`, `vault_classify`,
 //! `vault_downgrade`, `vault_history`, `vault_history_get`, `vault_restore`,
-//! `vault_diff`, `vault_forget`, `vault_lessons_recall`, `code_scope`.
+//! `vault_diff`, `vault_forget`, `vault_lessons_recall`, `code_scope`,
+//! `vault_proactive_recall`, `vault_proactive_recall_feedback`.
 //!
 //! # Sécurité
 //!
@@ -40,8 +41,8 @@ use rmcp::{
     ErrorData,
     handler::server::ServerHandler,
     model::{
-        CallToolResult, Content, Implementation, ListToolsResult, ProtocolVersion,
-        ServerCapabilities, ServerInfo, Tool,
+        CallToolResult, Content, Implementation, InitializeRequestParams, ListToolsResult,
+        ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
     transport::{
@@ -56,9 +57,9 @@ use tracing::instrument;
 
 use gradatum_core::{error::GradatumError, trust::TrustContext};
 use gradatum_dto::{
-    CodeScopeRequest, LessonsRecallRequest, VaultClassifyRequest, VaultDiffRequest,
-    VaultDowngradeRequest, VaultForgetRequest, VaultHistoryGetRequest, VaultHistoryRequest,
-    VaultRestoreRequest,
+    CodeScopeRequest, LessonsRecallRequest, ProactiveRecallFeedbackRequest, ProactiveRecallRequest,
+    VaultClassifyRequest, VaultDiffRequest, VaultDowngradeRequest, VaultForgetRequest,
+    VaultHistoryGetRequest, VaultHistoryRequest, VaultRestoreRequest,
 };
 
 use crate::{
@@ -77,7 +78,7 @@ use crate::{
 
 // ── Type public du service MCP ────────────────────────────────────────────────
 
-/// Service MCP Streamable HTTP exposant les 21 outils gradatum.
+/// Service MCP Streamable HTTP exposant les 23 outils gradatum.
 ///
 /// Construit via [`build_mcp_service`] et monté sous `/mcp` dans `main.rs`.
 ///
@@ -86,7 +87,7 @@ use crate::{
 pub type GradatumMcpService =
     rmcp::transport::StreamableHttpService<GradatumMcpHandler, LocalSessionManager>;
 
-/// Limite de taille du corps des requêtes `/mcp` (anti-DoS, F-02) — 512 KiB.
+/// Maximum body size for `/mcp` requests (anti-DoS) — 512 KiB.
 ///
 /// Délibérément **supérieure** à `/api/v1/vault_write` HTTP (256 KiB) : via MCP, le
 /// payload `vault_write` est enveloppé dans du JSON-RPC (`{"jsonrpc","method":"tools/call",
@@ -107,7 +108,7 @@ pub const MCP_BODY_LIMIT: usize = 512 * 1024;
 
 // ── Handler MCP ───────────────────────────────────────────────────────────────
 
-/// Handler MCP — implémente [`ServerHandler`] pour les 21 outils gradatum.
+/// Handler MCP — implémente [`ServerHandler`] pour les 23 outils gradatum.
 ///
 /// Clone par session : `AppState` est `Arc`-backed, le clone est O(1).
 #[derive(Clone)]
@@ -145,6 +146,11 @@ impl GradatumMcpHandler {
         trust: TrustContext,
     ) -> Result<CallToolResult, ErrorData> {
         let args = args.unwrap_or(Value::Object(serde_json::Map::new()));
+
+        // P1-1 (reviewer) : call site UNIQUE, AVANT le match.
+        // La map fermée de 23 clés filtre les noms inconnus (no-op) — pas besoin
+        // de 23 sites séparés dans les arms. Cardinalité bornée garantie par McpToolCounters.
+        self.state.mcp_tool_counters.record(name);
 
         match name {
             // ── Outils read sans paramètres ───────────────────────────────────
@@ -309,11 +315,112 @@ impl GradatumMcpHandler {
                     .map_err(gradatum_error_to_mcp)?;
                 to_mcp_content(res)
             }
+            // ── F-46 Proactive recall (B' in-process) ─────────────────────────
+            "vault_proactive_recall" => {
+                let req: ProactiveRecallRequest = deserialize_args(args)?;
+                let res = crate::proactive_recall::proactive_recall(&self.state, &trust, req)
+                    .await
+                    .map_err(gradatum_error_to_mcp)?;
+                to_mcp_content(res)
+            }
+            "vault_proactive_recall_feedback" => {
+                let req: ProactiveRecallFeedbackRequest = deserialize_args(args)?;
+                crate::proactive_recall::proactive_recall_feedback(&self.state, &trust, req)
+                    .await
+                    .map_err(gradatum_error_to_mcp)?;
+                // Feedback retourne Ok(()) — on émet un objet JSON vide (pattern 204→MCP).
+                Ok(CallToolResult::success(vec![Content::text("{}")]))
+            }
             _ => Err(ErrorData::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 format!("outil inconnu : {name}"),
                 None,
             )),
+        }
+    }
+
+    /// Reads the `X-Gradatum-Agent` request header and returns a normalised, kebab-case agent id.
+    ///
+    /// Falls back to `"main"` when the header is absent, non-ASCII, empty, oversized
+    /// (> 64 chars) or contains characters outside `[a-z0-9-]` (ADN 1 — no panic on bad input).
+    ///
+    /// This is a **defence-in-depth** check: the real authorisation gate is inside
+    /// [`soul_instructions`], which validates the caller's JWT `sub` against the target agent.
+    fn requested_agent(ctx: &RequestContext<rmcp::RoleServer>) -> String {
+        let raw = ctx
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.headers.get("x-gradatum-agent"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_lowercase());
+        match raw {
+            Some(v)
+                if !v.is_empty()
+                    && v.len() <= 64
+                    && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') =>
+            {
+                v
+            }
+            _ => "main".to_string(),
+        }
+    }
+
+    /// Loads the soul body for `agent` from vault section `identity/<agent>`, if authorised.
+    ///
+    /// Returns `None` on **any** failure (unauthenticated, ACL-denied, missing note, vault KO)
+    /// so that [`initialize`] degrades gracefully to bootstrap-only without breaking the MCP
+    /// handshake (ADN 1 — never panics, never returns an error to the caller).
+    ///
+    /// The returned body is injected byte-stable into `InitializeResult.instructions` (C8):
+    /// no dynamic field is added — the vault content is returned as-is.
+    ///
+    /// # ACL rules
+    ///
+    /// - Caller `"main-agent"` (privileged owner, api-key exchanged) may read any soul.
+    /// - Any other caller may only read their **own** soul (`sub == agent`).
+    pub(crate) async fn soul_instructions(
+        &self,
+        agent: &str,
+        trust: &TrustContext,
+    ) -> Option<String> {
+        if !trust.is_authenticated() {
+            return None;
+        }
+        let caller_sub = trust.subject().unwrap_or("");
+        let authorized = caller_sub == logic::SOUL_PRIVILEGED_WRITER || caller_sub == agent;
+        if !authorized {
+            tracing::debug!(
+                caller = %caller_sub,
+                agent  = %agent,
+                "mcp::initialize: soul non autorisée — sub ne correspond pas à l'agent cible"
+            );
+            return None;
+        }
+        let req = VaultReadRequest {
+            path: format!("identity/{agent}"),
+            section: Some("identity".to_string()),
+            tenant_id: "main".to_string(),
+        };
+        match logic::vault_read_impl(&self.state, trust, req).await {
+            Ok(resp) if !resp.content.is_empty() => {
+                tracing::debug!(agent = %agent, "mcp::initialize: soul chargée");
+                Some(resp.content)
+            }
+            Ok(_) => {
+                tracing::debug!(
+                    agent = %agent,
+                    "mcp::initialize: note soul vide — dégradé bootstrap"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!(
+                    agent = %agent,
+                    error = %e,
+                    "mcp::initialize: vault_read soul KO — dégradé bootstrap"
+                );
+                None
+            }
         }
     }
 }
@@ -330,13 +437,50 @@ impl ServerHandler for GradatumMcpHandler {
             .with_protocol_version(ProtocolVersion::default())
     }
 
-    #[instrument(skip(self, ctx), fields(tool_count = 21))]
+    /// Overrides the default MCP `initialize` handshake to inject the soul (F-34 v0.7.3).
+    ///
+    /// Reads `identity/<agent>` from vault section `identity` and sets
+    /// `InitializeResult.instructions` to the body byte-stable (C8).
+    ///
+    /// # Degraded mode
+    ///
+    /// Any failure (unauthenticated, unauthorised, missing note, vault KO) produces
+    /// `instructions = None` — the agent runs on CLAUDE.md bootstrap alone.
+    /// The MCP handshake is **never broken** regardless of vault availability (ADN 1).
+    #[instrument(skip(self, context), fields(agent))]
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<ServerInfo, ErrorData> {
+        // 1. Construire l'info de base (statique, toujours valide).
+        let mut info = self.get_info();
+
+        // 2. Résoudre l'agent depuis le header `X-Gradatum-Agent` (défaut "main").
+        let agent = Self::requested_agent(&context);
+        tracing::Span::current().record("agent", agent.as_str());
+
+        // 3. Charger l'âme — auth + ACL vérifiés en interne ; toute erreur → None.
+        let trust = Self::trust_from_ctx(&context);
+        if let Some(soul_body) = self.soul_instructions(&agent, &trust).await {
+            info = info.with_instructions(soul_body);
+        }
+
+        // 4. Préserver la danse peer_info du défaut rmcp (miroir de l'impl par défaut).
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request);
+        }
+
+        Ok(info)
+    }
+
+    #[instrument(skip(self, ctx), fields(tool_count = 23))]
     async fn list_tools(
         &self,
         _params: Option<rmcp::model::PaginatedRequestParams>,
         ctx: RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        // F-01 : `list_tools` divulguerait sinon le catalogue des 21 outils (noms +
+        // F-01 : `list_tools` divulguerait sinon le catalogue des 23 outils (noms +
         // schémas JSON) à tout client LAN non authentifié. Même garde que `call_tool`.
         let trust = Self::trust_from_ctx(&ctx);
         if !trust.is_authenticated() {
@@ -392,6 +536,14 @@ impl ServerHandler for GradatumMcpHandler {
                 ),
                 tool_def::<LessonsRecallRequest>("vault_lessons_recall", "Rappel de leçons BM25"),
                 tool_def::<CodeScopeRequest>("code_scope", "Scope sélectif de code source"),
+                tool_def::<ProactiveRecallRequest>(
+                    "vault_proactive_recall",
+                    "Rappel proactif de mémoire (F-46)",
+                ),
+                tool_def::<ProactiveRecallFeedbackRequest>(
+                    "vault_proactive_recall_feedback",
+                    "Feedback rappel proactif (F-46)",
+                ),
             ],
             next_cursor: None,
         })
@@ -527,8 +679,23 @@ fn gradatum_error_to_mcp(err: GradatumError) -> ErrorData {
 /// Construit le [`GradatumMcpService`] (Streamable HTTP) pour montage sous `/mcp`.
 ///
 /// Retourne `(service, cancel_token)` — le token doit être annulé lors du shutdown
-/// pour permettre l'arrêt propre des sessions rmcp internes (évite les tâches orphelines
-/// qui empêcheraient le processus de se terminer après SIGTERM).
+/// pour permettre l'arrêt propre des connexions rmcp en cours (évite les tâches
+/// orphelines qui empêcheraient le processus de se terminer après SIGTERM).
+///
+/// # Mode STATELESS
+///
+/// Le service est configuré en mode stateless (`.with_stateful_mode(false)`) :
+/// - Chaque POST `/mcp` est traité de manière autonome (pas de session persistante).
+/// - Aucun header `Mcp-Session-Id` n'est émis ni attendu.
+/// - Les verbes GET et DELETE ne sont pas supportés (405 Method Not Allowed).
+/// - Le [`LocalSessionManager`] reste configuré mais devient inerte — il n'est
+///   jamais sollicité par rmcp en mode stateless (zéro changement de type, pas
+///   de piège générique).
+///
+/// Ce mode élimine le décrochage des 23 outils MCP côté Claude Code : les sessions
+/// in-memory étaient perdues à chaque redémarrage du serveur, forçant une
+/// reconnexion manuelle (`/mcp → Reconnect`). En stateless, chaque POST est
+/// indépendant — aucune session n'est maintenue, aucune n'est perdue.
 ///
 /// # Protection DNS-rebinding (R2)
 ///
@@ -547,7 +714,10 @@ pub fn build_mcp_service(state: AppState) -> (GradatumMcpService, CancellationTo
     // Si /mcp est un jour exposé derrière Traefik, ajouter le host Traefik ici.
     let config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(["localhost", "127.0.0.1", "::1"])
-        .with_cancellation_token(cancel.clone());
+        .with_cancellation_token(cancel.clone())
+        // Mode stateless : chaque POST est autonome, pas de session in-memory.
+        // LocalSessionManager reste inerte (zéro changement de type requis).
+        .with_stateful_mode(false);
     let factory = move || {
         let handler = GradatumMcpHandler {
             state: state.clone(),
@@ -571,12 +741,12 @@ mod tests {
     /// Marqué ignore car nécessite AppState de test complet.
     /// Ce test peut être exécuté en isolation via `--ignored` une fois l'infra test disponible.
     #[test]
-    fn list_tools_count_is_21() {
-        // Vérification statique : le vecteur `list_tools` dans le code retourne 21 outils.
+    fn list_tools_count_is_23() {
+        // Vérification statique : le vecteur `list_tools` dans le code retourne 23 outils.
         // Test de compilation uniquement — pas d'AppState requis.
         // La vérification runtime est couverte par list_tools_names_match_stub_runtime.
-        const EXPECTED: usize = 21;
-        // Les 21 noms d'outils attendus.
+        const EXPECTED: usize = 23;
+        // Les 23 noms d'outils attendus.
         let expected_names = [
             "vault_search",
             "vault_read",
@@ -599,6 +769,8 @@ mod tests {
             "vault_forget",
             "vault_lessons_recall",
             "code_scope",
+            "vault_proactive_recall",
+            "vault_proactive_recall_feedback",
         ];
         assert_eq!(expected_names.len(), EXPECTED);
     }
@@ -669,5 +841,320 @@ mod tests {
                 "inputSchema.properties doit être vide (outil sans paramètres) pour '{name}'"
             );
         }
+    }
+
+    // ── Tests télémétrie MCP (Task 2) ──────────────────────────────────────────
+
+    /// Construit un `TrustContext` authentifié minimal pour les tests.
+    ///
+    /// Tenant = "main", scope = ["read"] — suffisant pour passer `is_authenticated()`.
+    /// L'ACL du state de test (preset vide = deny-all) bloque les handlers métier,
+    /// mais les incréments de compteurs ont lieu AVANT les vérifications ACL.
+    fn make_trust() -> TrustContext {
+        TrustContext::BearerToken {
+            kid: "test-kid".to_string(),
+            aud: "gradatum".to_string(),
+            sub: "test-agent".to_string(),
+            scopes: vec!["read".to_string(), "write".to_string()],
+            tenant_id: "main".to_string(),
+        }
+    }
+
+    /// `dispatch_tool` d'un outil connu incrémente le compteur MCP correspondant.
+    ///
+    /// Ici `vault_status` : l'outil peut échouer (ACL deny sur state de test),
+    /// mais le compteur `mcp:vault_status` est incrémenté avant le `match name`.
+    #[tokio::test]
+    async fn dispatch_records_known_tool() {
+        use crate::state::AppState;
+        let state = AppState::new();
+        let handler = GradatumMcpHandler {
+            state: state.clone(),
+        };
+        let trust = make_trust();
+        // vault_status peut échouer (ACL deny) — on s'en fiche, seul le compteur compte.
+        let _ = handler.dispatch_tool("vault_status", None, trust).await;
+        let entries = state.mcp_tool_counters.swap_all_for_test();
+        let count = entries
+            .iter()
+            .find(|(k, _)| *k == "mcp:vault_status")
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        assert_eq!(count, 1, "mcp:vault_status doit être incrémenté une fois");
+    }
+
+    /// Test normatif P1-4a (reviewer) : double-count assumé sur les read-paths MCP.
+    ///
+    /// Un appel `vault_search` via MCP incrémente À LA FOIS :
+    /// - `mcp_tool_counters["vault_search"]` (compteur MCP, via call site unique en tête de dispatch)
+    /// - `read_usage_accumulators.vault_search` (accumulateur read-path, via `vault_search_impl`)
+    ///
+    /// This double-count is INTENTIONAL: the two counters track distinct semantics.
+    #[tokio::test]
+    async fn mcp_read_path_call_increments_both_families() {
+        use std::sync::atomic::Ordering;
+
+        use crate::state::AppState;
+        let state = AppState::new();
+        let handler = GradatumMcpHandler {
+            state: state.clone(),
+        };
+        let trust = make_trust();
+        let args = serde_json::json!({"query": "test"});
+        // vault_search_impl peut échouer (ACL deny) — les incréments ont eu lieu.
+        let _ = handler
+            .dispatch_tool("vault_search", Some(args), trust)
+            .await;
+
+        // Accumulateur read-path existant (vault_search_impl).
+        let rp_count = state
+            .read_usage_accumulators
+            .vault_search
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            rp_count, 1,
+            "read_usage_accumulators.vault_search doit être 1"
+        );
+
+        // Compteur MCP nouveau (dispatch_tool head).
+        let entries = state.mcp_tool_counters.swap_all_for_test();
+        let mcp_count = entries
+            .iter()
+            .find(|(k, _)| *k == "mcp:vault_search")
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        assert_eq!(mcp_count, 1, "mcp:vault_search doit être 1");
+    }
+
+    /// Un nom d'outil inconnu n'incrémente aucun compteur MCP (anti-cardinalité).
+    ///
+    /// Test P1-4b complémentaire : preuve que la map fermée bloque les noms orphelins.
+    #[tokio::test]
+    async fn dispatch_unknown_tool_increments_no_mcp_counter() {
+        use crate::state::AppState;
+        let state = AppState::new();
+        let handler = GradatumMcpHandler {
+            state: state.clone(),
+        };
+        let trust = make_trust();
+        // Outil inexistant → erreur METHOD_NOT_FOUND, aucun compteur.
+        let result = handler.dispatch_tool("outil_inexistant", None, trust).await;
+        assert!(result.is_err(), "outil inconnu doit retourner une erreur");
+        let entries = state.mcp_tool_counters.swap_all_for_test();
+        assert!(
+            entries.iter().all(|(_, n)| *n == 0),
+            "aucun compteur ne doit être incrémenté pour un outil inconnu"
+        );
+    }
+
+    // ── Tests soul_instructions (Task 6′, F-34) ────────────────────────────────
+    //
+    // Stratégie : tester `soul_instructions` directement (fn pure testable séparée
+    // de `initialize`) pour éviter de construire un `RequestContext<RoleServer>` complet
+    // (handshake MCP trop lourd en test unitaire). Ce choix est documenté dans le
+    // livrable conformément au plan `2026-06-27-v0.7.3-identity-f50-deport.md`.
+    //
+    // Cas positif (note présente → instructions = Some(body)) : couvert par le smoke
+    // LIVE après `soul-seed.sh` — nécessite un vault réel avec note seedée.
+
+    /// Non authentifié → `soul_instructions` retourne `None`.
+    ///
+    /// Vérifie le guard d'authentification avant toute ACL ou lecture vault.
+    #[tokio::test]
+    async fn soul_instructions_unauthenticated_returns_none() {
+        use crate::state::AppState;
+        let handler = GradatumMcpHandler {
+            state: AppState::new(),
+        };
+        let trust = TrustContext::Unauthenticated;
+        let result = handler.soul_instructions("main", &trust).await;
+        assert!(
+            result.is_none(),
+            "non authentifié → soul_instructions doit retourner None"
+        );
+    }
+
+    /// Sub=`frontend` tente de lire l'âme de `main` → `None` (non autorisé, C6).
+    ///
+    /// `caller_sub != "main-agent"` ET `caller_sub != agent` → dégradé bootstrap.
+    #[tokio::test]
+    async fn soul_instructions_unauthorized_sub_returns_none() {
+        use crate::state::AppState;
+        let handler = GradatumMcpHandler {
+            state: AppState::new(),
+        };
+        let trust = TrustContext::BearerToken {
+            kid: "test-kid".to_string(),
+            aud: "gradatum".to_string(),
+            sub: "frontend".to_string(),
+            scopes: vec!["read".to_string()],
+            tenant_id: "main".to_string(),
+        };
+        // frontend ne peut lire que identity/frontend, pas identity/main.
+        let result = handler.soul_instructions("main", &trust).await;
+        assert!(
+            result.is_none(),
+            "sub=frontend lisant soul=main doit retourner None (non autorisé)"
+        );
+    }
+
+    /// `main-agent` autorisé mais note absente → `None` (dégradé bootstrap, ADN 1).
+    ///
+    /// Prouve qu'une erreur vault KO ne casse pas le handshake MCP.
+    #[tokio::test]
+    async fn soul_instructions_authorized_note_absent_returns_none() {
+        use crate::state::AppState;
+        let handler = GradatumMcpHandler {
+            state: AppState::new(),
+        };
+        let trust = TrustContext::BearerToken {
+            kid: "test-kid".to_string(),
+            aud: "gradatum".to_string(),
+            sub: "main-agent".to_string(),
+            scopes: vec!["read".to_string()],
+            tenant_id: "main".to_string(),
+        };
+        // main-agent autorisé mais vault vide → KO → None.
+        let result = handler.soul_instructions("main", &trust).await;
+        assert!(
+            result.is_none(),
+            "note absente doit retourner None (dégradé bootstrap, jamais panic)"
+        );
+    }
+
+    /// Agent lisant sa propre âme (`sub == agent`) est autorisé, mais note absente → `None`.
+    ///
+    /// Prouve le code path "own soul authorised" sans le short-circuit "main-agent".
+    #[tokio::test]
+    async fn soul_instructions_own_agent_authorised_note_absent_returns_none() {
+        use crate::state::AppState;
+        let handler = GradatumMcpHandler {
+            state: AppState::new(),
+        };
+        let trust = TrustContext::BearerToken {
+            kid: "test-kid".to_string(),
+            aud: "gradatum".to_string(),
+            sub: "backend".to_string(),
+            scopes: vec!["read".to_string()],
+            tenant_id: "main".to_string(),
+        };
+        // backend lit identity/backend (sub == agent), autorisé, mais note absente → None.
+        let result = handler.soul_instructions("backend", &trust).await;
+        assert!(
+            result.is_none(),
+            "own-agent soul absente doit retourner None (dégradé bootstrap)"
+        );
+    }
+
+    /// Soul présente avec H1 canonique → `soul_instructions` retourne `Some(body)` non vide.
+    ///
+    /// Couvre le cas positif différé au smoke LIVE (livrable Tasks 1-4 v0.7.3) :
+    /// prouve le chemin complet `soul_instructions` → `vault_read_impl` → `title_lookup`
+    /// (match `body_text LIKE '# identity/main\n%'`) → lecture vault → `Some(body)`.
+    ///
+    /// Condition nécessaire : le body doit commencer par `# identity/<agent>`.
+    /// Sans ce H1, `title_lookup` retourne `Ok(None)` → `soul_instructions` retourne `None`
+    /// silencieusement (dégradé bootstrap) — l'injection MCP est désactivée sans erreur visible.
+    ///
+    /// Ce test automatise la preuve qui nécessitait auparavant un smoke LIVE après seed manuel.
+    #[tokio::test]
+    async fn soul_instructions_with_h1_present_returns_some() {
+        use chrono::Utc;
+        use gradatum_acl_policy::AclEngine;
+        use gradatum_auth::jwt::JwtService;
+        use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
+        use gradatum_core::scope::VaultId;
+        use gradatum_core::section::Section;
+        use gradatum_core::status::NoteStatus;
+        use gradatum_vault::{Registry, Vault};
+        use tempfile::TempDir;
+
+        // ACL permissive : main-agent lit tout — seule la garde soul (sub/agent) discrimine.
+        const ACL: &str = r#"
+[[consumer]]
+identity = "main-agent"
+read_patterns  = ["**"]
+write_patterns = ["**"]
+"#;
+        // Corps soul valide avec H1 canonique en tête.
+        // `validate_soul` l'accepte : `extract_section` cherche `## SECTION` (niveau 2),
+        // la ligne `# identity/main` (niveau 1) est ignorée par le parser soul.
+        const SOUL_BODY: &str = "\
+## INVARIANTS
+INV-CANARY | REQUIRED | response.prefix matches ^\\(TODAY\\):
+INV-LANG | REQUIRED | response.language == fr
+
+## GATES
+GATE-PIPELINE | multi_step OR service_live -> invoke gov-pipeline-agents
+
+## NARRATIVE
+Tu es le Général en Chef. Ton: direct, FR.
+";
+
+        let tmp = TempDir::new().expect("TempDir — soul_instructions_with_h1_present_returns_some");
+        let vault_path = tmp.path().join("vault");
+        let vault = Arc::new(
+            Vault::create(&vault_path, VaultId::new("main"))
+                .await
+                .expect("Vault::create — soul_instructions_with_h1_present_returns_some"),
+        );
+
+        let acl = AclEngine::from_preset_str(ACL)
+            .expect("ACL permissive — soul_instructions_with_h1_present_returns_some");
+        let mut state = AppState::with_jwt_and_acl(JwtService::new_ephemeral(), acl)
+            .with_vault_arc(vault.clone() as Arc<dyn Registry>);
+        // Partager l'index interne du vault pour que title_lookup voie les notes écrites.
+        state.search = vault.index().clone();
+
+        // Seed la note avec H1 canonique : body commence par `# identity/main`.
+        let title = "identity/main";
+        let frontmatter = Frontmatter {
+            schema_version: 1,
+            vault_id: VaultId::new("main"),
+            locus: None,
+            section: Section::Identity,
+            status: NoteStatus::Live,
+            status_reason: None,
+            status_changed: None,
+            tags: Default::default(),
+            author: None,
+            created: Utc::now(),
+            updated: None,
+            extra: ExtraFields::empty(),
+            provenance: None,
+            forgotten: None,
+            forgotten_at: None,
+            forgotten_by: None,
+        };
+        let body_with_h1 = format!("# {title}\n{SOUL_BODY}");
+        let note = vault.write_note(frontmatter, body_with_h1).await.expect(
+            "vault.write_note seed soul avec H1 — soul_instructions_with_h1_present_returns_some",
+        );
+        // upsert_note_title aligne la colonne `title` avec le chemin identity/<agent>.
+        state
+            .search
+            .upsert_note_title(&note.id, title)
+            .await
+            .expect("upsert_note_title — soul_instructions_with_h1_present_returns_some");
+
+        let handler = GradatumMcpHandler { state };
+        let trust = TrustContext::BearerToken {
+            kid: "test-kid".to_string(),
+            aud: "gradatum".to_string(),
+            sub: "main-agent".to_string(),
+            scopes: vec!["read".to_string()],
+            tenant_id: "main".to_string(),
+        };
+
+        let result = handler.soul_instructions("main", &trust).await;
+        assert!(
+            result.is_some(),
+            "soul présente avec H1 doit retourner Some(body) (path résolu via title_lookup)"
+        );
+        let body = result.unwrap();
+        assert!(
+            !body.is_empty(),
+            "soul_instructions doit retourner un body non vide quand la note existe: body={body:?}"
+        );
     }
 }

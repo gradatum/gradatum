@@ -37,9 +37,9 @@ pub use rrf::{RrfHit, rrf_fuse};
 
 /// Re-exports multi-factor scoring functions and trust decay utilities.
 pub use scoring::{
-    DEFAULT_TRUST_HALF_LIVES, GAMMA_TRUST, TrustDecayConfig, composite_score,
-    composite_score_with_trust, default_half_lives, pagerank_factor, recency_factor,
-    trust_decay_factor,
+    DEFAULT_TRUST_HALF_LIVES, GAMMA_TRUST, ResolvedWeights, ScoringWeightsWire, TrustDecayConfig,
+    composite_score, composite_score_weighted, composite_score_with_trust, default_half_lives,
+    pagerank_factor, recency_factor, resolve_weights, trust_decay_factor,
 };
 
 /// Re-exports the `Reranker` trait and `NoopReranker`.

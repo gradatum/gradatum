@@ -78,6 +78,7 @@ fn curate_spec_backward_compat_v020_full_roundtrip() {
         tags: vec!["smoke".to_string(), "compat".to_string()],
         section_hint: Some("experiments".to_string()),
         expected_sha256: None,
+        occurred_at: None,
     };
 
     let json = serde_json::to_string(&spec).expect("CurateSpec doit être sérialisable v0.2.0");

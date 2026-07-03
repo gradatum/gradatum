@@ -337,34 +337,54 @@ impl Vault {
         let path_no_locus = format!("{}/{}.md", vault_id, id_str);
         let path_with_section = format!("{}/{}/{}.md", vault_id, record.section, id_str);
 
+        // Mapping d'erreur de lecture du `.md` (D2 — typage de l'absence à la source).
+        //
+        // Note présente dans l'index SQLite mais `.md` absent du disque = note
+        // « fantôme » (héritée de l'import legacy vault). Le storage remonte alors
+        // `StorageError::NotFound` → on propage un `NoteNotFound` TYPÉ (et non un
+        // `Storage(String)`), pour que TOUS les appelants (`vault_read`,
+        // `vault_classify`, `reads`, RMW) répondent `404` et non `500`.
+        // Les AUTRES `StorageError` (IO réelle, OpenDAL, chemin invalide) conservent
+        // le format string : ne jamais masquer une vraie panne disque en `404`.
+        let map_read_err = move |path: &str, e: gradatum_storage::StorageError| -> VaultError {
+            match e {
+                gradatum_storage::StorageError::NotFound(_) => {
+                    VaultError::Core(GradatumError::NoteNotFound(id))
+                }
+                other => VaultError::Storage(format!("read .md {path}: {other}")),
+            }
+        };
+
         // Premier chemin existant l'emporte. `path_with_locus` n'est tenté que s'il
         // est présent dans l'index ET diffère de la section (évite un exists() inutile).
-        let md_bytes =
-            if let Some(ref locus_path) = path_with_locus {
-                if self.storage.exists(locus_path).await.unwrap_or(false) {
-                    self.storage
-                        .read(locus_path)
-                        .await
-                        .map_err(|e| VaultError::Storage(format!("read .md {locus_path}: {e}")))?
-                } else if self.storage.exists(&path_no_locus).await.unwrap_or(false) {
-                    self.storage.read(&path_no_locus).await.map_err(|e| {
-                        VaultError::Storage(format!("read .md {path_no_locus}: {e}"))
-                    })?
-                } else {
-                    self.storage.read(&path_with_section).await.map_err(|e| {
-                        VaultError::Storage(format!("read .md {path_with_section}: {e}"))
-                    })?
-                }
+        let md_bytes = if let Some(ref locus_path) = path_with_locus {
+            if self.storage.exists(locus_path).await.unwrap_or(false) {
+                self.storage
+                    .read(locus_path)
+                    .await
+                    .map_err(|e| map_read_err(locus_path, e))?
             } else if self.storage.exists(&path_no_locus).await.unwrap_or(false) {
                 self.storage
                     .read(&path_no_locus)
                     .await
-                    .map_err(|e| VaultError::Storage(format!("read .md {path_no_locus}: {e}")))?
+                    .map_err(|e| map_read_err(&path_no_locus, e))?
             } else {
-                self.storage.read(&path_with_section).await.map_err(|e| {
-                    VaultError::Storage(format!("read .md {path_with_section}: {e}"))
-                })?
-            };
+                self.storage
+                    .read(&path_with_section)
+                    .await
+                    .map_err(|e| map_read_err(&path_with_section, e))?
+            }
+        } else if self.storage.exists(&path_no_locus).await.unwrap_or(false) {
+            self.storage
+                .read(&path_no_locus)
+                .await
+                .map_err(|e| map_read_err(&path_no_locus, e))?
+        } else {
+            self.storage
+                .read(&path_with_section)
+                .await
+                .map_err(|e| map_read_err(&path_with_section, e))?
+        };
 
         let md_str = String::from_utf8(md_bytes)
             .map_err(|e| VaultError::Storage(format!("UTF-8 decode .md {id_str}: {e}")))?;

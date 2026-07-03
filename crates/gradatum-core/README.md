@@ -2,13 +2,13 @@
 
 > Shared primitives: traits, canonical types, and typed errors. The L0 foundation every other gradatum crate depends on.
 
-**Status**: Alpha (v0.4.x) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
 
 `gradatum-core` is the dependency floor of the gradatum workspace. It defines the canonical
-types (`NoteId`, `ContentHash`, `NoteVersion`), the 11 canonical vault sections (`Section`
+types (`NoteId`, `ContentHash`, `NoteVersion`), the 13 canonical vault sections (`Section`
 enum), the three storage traits (`DocumentStore`, `IndexStore`, `VectorStore`), and the
 top-level `GradatumError` enum (typed with `thiserror`, no `Box<dyn Error>`).
 
@@ -19,7 +19,7 @@ workspace dependencies.
 
 ```toml
 [dependencies]
-gradatum-core = "0.4.3"
+gradatum-core = "0.7.6"
 ```
 
 ```rust
@@ -36,7 +36,7 @@ use gradatum_core::section::Section;
 | `error` | `GradatumError` — typed error enum (thiserror, no `Box<dyn Error>`) |
 | `note` | `Note`, `NoteBody`, `EffectiveNote` |
 | `identity` | `NoteId` (ULID newtype), `ContentHash`, `NoteVersion` |
-| `section` | `Section` — 11 canonical sections (kebab-case, serde) |
+| `section` | `Section` — 13 canonical sections (kebab-case, serde) |
 | `tag` | `Tag` — normalized kebab-case note tag |
 | `author` | `AuthorId` — note authorship |
 | `status` | `NoteStatus` — note lifecycle state machine |
@@ -45,10 +45,29 @@ use gradatum_core::section::Section;
 | `document_store` | `DocumentStore` trait — raw Markdown persistence |
 | `index_store` | `IndexStore` trait — SQLite full-text + vector index |
 | `vector_store` | `VectorStore` trait — embedding storage |
+| `metric_sample` | `MetricSamplePoint { series: String, ts_ms: i64, value: f64 }` — timeseries point returned by `IndexStore` metric methods |
 | `config` | `VaultConfig` — root configuration deserialization |
 | `frontmatter` | `Frontmatter` — YAML frontmatter canonical type |
 | `acl` | ACL filter types and visibility markers |
 | `audit` | `AuditEntry` — immutable append-only audit trail |
+| `job` | `Job` enum, `JobSpec`, `JobRecord`, `JobStatus`, `ValidateSpec`, `QueueStore` trait, and all job-pipeline types |
+| `temporal_query` | `TimelineFilter`, `TimelineCursor`, `TimelineRow`, `parse_temporal_str_as_ms` — time-range queries over the index |
+| `provenance` | Provenance metadata and trust-scoring fields attached to notes |
+| `project_map` | Typed wikilink schema validator for project-map notes |
+| `soul` | Agent soul / persona schema types |
+| `paths` | Canonical path helpers (`vault_index_path`, `vault_dir_index_path`, `queue_db_path`) |
+
+### `IndexStore` metric methods
+
+Four methods added to the `IndexStore` trait for the curated metrics timeseries pipeline.
+Default implementations are no-ops (`Ok(0)` / `Ok(vec![])`) so mock backends compile without change.
+
+| Method | Signature (simplified) | Purpose |
+|---|---|---|
+| `insert_metric_samples` | `(ts_ms: i64, samples: &[(String, f64)]) -> Result<usize>` | Batch-insert one tick of curated samples |
+| `query_metric_timeseries` | `(series: &[String], from_ms: i64, to_ms: i64, bucket_ms: i64) -> Result<Vec<MetricSamplePoint>>` | Range query with server-side downsample |
+| `purge_metric_samples` | `(cutoff_ms: i64) -> Result<usize>` | Delete samples older than cutoff |
+| `list_distinct_metric_series` | `() -> Result<Vec<String>>` | Catalog of series present in the table |
 
 ## License
 

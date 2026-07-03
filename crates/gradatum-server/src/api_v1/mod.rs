@@ -2,6 +2,12 @@
 //!
 //! Built via [`router`] and nested under `/api/v1` by `crate::router::build_router`.
 //!
+//! # Project-map route
+//!
+//! | Method | Path | ACL | Handler |
+//! |--------|------|-----|---------|
+//! | GET | `/project-map/export-features` | Read | [`project_map::export_features`] |
+//!
 //! # Read routes
 //!
 //! | Method | Path | Handler |
@@ -46,6 +52,13 @@
 //! |--------|------|-----|---------|
 //! | GET | `/lessons/recall` | Read | [`lessons::lessons_recall`] |
 //!
+//! # Proactive recall routes (POST)
+//!
+//! | Method | Path | ACL | Handler |
+//! |--------|------|-----|---------|
+//! | POST | `/proactive_recall`          | Read | [`proactive_recall_handlers::proactive_recall`] |
+//! | POST | `/proactive_recall/feedback` | Read | [`proactive_recall_handlers::proactive_recall_feedback`] |
+//!
 //! # Legacy job poll route
 //!
 //! | Method | Path | Handler |
@@ -79,8 +92,11 @@ pub mod lessons;
 pub mod logic;
 pub mod mcp;
 pub mod notes;
+pub mod proactive_recall_handlers;
+pub mod project_map;
 pub mod review;
 pub mod session_log;
+pub mod system;
 pub(crate) mod tenant_guard;
 pub mod timeline;
 pub mod write;
@@ -155,6 +171,24 @@ pub fn router() -> Router<AppState> {
         .route("/vault/unforgot/{ulid}", post(forget::vault_unforgot))
         // ── F-60 Lesson Recall (v0.4.4) — GET fixe, BM25-only, aucun LLM ─────
         .route("/lessons/recall", get(lessons::lessons_recall))
+        // ── F-46 Proactive Recall (v0.7.1) — POST fixe, in-process B' ─────────
+        //
+        // Règle fixed-before-parametric : `/proactive_recall/feedback` (plus spécifique)
+        // est définie AVANT `/proactive_recall` (plus général), conformément à la règle
+        // fixed-before-parametric — même si ici les deux sont fixes (pas de param), l'ordre
+        // assure que feedback n'est jamais shadowed.
+        //
+        // Body limit 4 KiB : payload nominal < 1 KB (context texte + sections optionnels).
+        .route(
+            "/proactive_recall/feedback",
+            post(proactive_recall_handlers::proactive_recall_feedback)
+                .layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/proactive_recall",
+            post(proactive_recall_handlers::proactive_recall)
+                .layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         // ── F-61 Code Scope (v0.5.2 Phase C) — POST fixe, BM25-only, endpoint dédié ─
         //
         // Body limit 4 KiB : payload nominal <1 KB (vault + selector + budget).
@@ -165,8 +199,41 @@ pub fn router() -> Router<AppState> {
         )
         // ── F-37 S1.2 Review queue (v0.4.6) — GET fixe, auth Read ────────────
         .route("/review", get(review::list_review))
+        // ── T4 project-map export (v0.6.4) — GET fixe, auth Read ─────────────
+        //
+        // Export JSON des cartes-feature project-map — utilisé par le gate CI
+        // gradatum-www pour vérifier la cohérence avec le miroir-site.
+        // Règle fixed-before-parametric : route entièrement fixe.
+        .route(
+            "/project-map/export-features",
+            get(project_map::export_features),
+        )
         // ── F-37 S1.3 Dashboard (v0.4.6) — GET fixe, auth Read ───────────────
         .route("/dashboard", get(dashboard::dashboard))
+        // ── F-85 v0.7.5 T5 — santé tâches récurrentes, auth Read ─────────────
+        //
+        // Règle fixed-before-parametric : `/system/scheduled` est fixe, définie avant
+        // tout sous-chemin paramétrique. Auth mirror `/dashboard` (TrustContext + Read).
+        .route("/system/scheduled", get(system::get_scheduled))
+        // ── F-85 v0.7.5 Slice 2a — métriques timeseries, auth Read ──────────
+        //
+        // Deux routes fixes (catalog + timeseries) définies après /system/scheduled.
+        // Auth miroir exact de get_scheduled (TrustContext + Read main/dashboard).
+        .route("/system/metrics/catalog", get(system::get_metrics_catalog))
+        .route(
+            "/system/metrics/timeseries",
+            get(system::get_metrics_timeseries),
+        )
+        // ── F-85 v0.7.5 Slice 3 — lecture traces session_trace, auth Read ─────
+        //
+        // Route fixe, après les routes system/metrics/* (toutes fixes).
+        // Auth miroir exact de get_scheduled + get_metrics_* (TrustContext + Read).
+        .route("/system/traces", get(system::get_traces))
+        // ── F-85 bug fix — listing notes par statut (inclut downgraded) ───────
+        //
+        // Route fixe (préfixe `/notes/` au lieu de `/system/`) — après /system/traces.
+        // ACL Read miroir exact de get_traces (TrustContext + Read main/dashboard).
+        .route("/notes/by-status", get(system::get_notes_by_status))
         // Route event-log ingestion (B1 tranche v0.3.0) — append-only, gateway sink.
         //
         // F3 : body limité à 2MB avant parsing JSON (protection anti-DOS).

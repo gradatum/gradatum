@@ -9,7 +9,7 @@ repository.workspace = true
 description = "SQLite queue store: SqliteQueueStore — Apalis-backed async job queue for gradatum"
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "0.6.4" }
+gradatum-core = { path = "../gradatum-core", version = "0.7.0" }
 
 async-trait   = { workspace = true }
 chrono        = { workspace = true }

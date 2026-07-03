@@ -20,7 +20,7 @@ path = "src/main.rs"
 gradatum-core.workspace = true
 gradatum-curator.workspace = true
 # BLOCAGE CRATES.IO : gradatum-db-sqlite est publish=false. gradatum-admin non publiable.
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "0.6.4" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "0.7.0" }
 gradatum-queue.workspace = true
 gradatum-vault.workspace = true
 gradatum-storage.workspace = true
@@ -29,7 +29,7 @@ gradatum-index.workspace = true
 # gradatum-admin est le binaire d'ingest multi-langage : toutes les grammaires
 # tree-sitter sont activées ici. Elles restent isolées dans gradatum-ingest
 # (les autres crates, ex. gradatum-server, n'en dépendent pas).
-gradatum-ingest = { path = "../gradatum-ingest", version = "0.6.4", features = [
+gradatum-ingest = { path = "../gradatum-ingest", version = "0.7.0", features = [
     "code-rust",
     "code-python",
     "code-bash",
@@ -63,3 +63,5 @@ reqwest.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 rusqlite = { workspace = true }
+wiremock = { workspace = true }
+tokio = { workspace = true }

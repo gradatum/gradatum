@@ -271,7 +271,8 @@ pub fn materialize_preset(root: &Path, preset: &str, projects: Option<&str>) -> 
 ///
 /// - `[storage].vault_index_path` — chemin canonique de l'index SQLite FTS5 ;
 ///   **respecté par le server et le worker** via `gradatum-core::paths::vault_index_path`
-///   (SSOT Slice A1). Alias déprécié `db_path` toujours accepté en lecture pour rétrocompat.
+///   (canonical path, respected by both the server and the worker via `gradatum-core::paths::vault_index_path`).
+///   Deprecated alias `db_path` is still accepted for reading (backward compatibility).
 /// - `jwt_ttl_human_secs = 3600`  (1 hour)
 /// - `jwt_ttl_service_secs = 86400` (24 hours)
 /// - `revocation_store = "sqlite"`

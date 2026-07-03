@@ -232,7 +232,7 @@ async fn proxy_request(
                     route = %subpath,
                     status = status,
                     latency_ms = ms,
-                    "upstream 5xx — RequestServed non émis (event-log)"
+                    "upstream 5xx — RequestServed not emitted (event-log)"
                 );
             }
 
@@ -266,7 +266,7 @@ mod transparent_handler {
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
-    /// Stub child llama-server : capture le body, renvoie une réponse fixe.
+    /// Child stub: captures the request body and returns a fixed response.
     async fn start_child_stub(
         delay_secs: u64,
         resp_body: &'static str,
@@ -483,7 +483,7 @@ mod transparent_handler {
 
     // ── P2 item 3 : status_code réel + pas de RequestServed sur 5xx ──────────
 
-    /// Stub child qui renvoie un code HTTP configurable.
+    /// Child stub that returns a configurable HTTP status code.
     async fn start_child_stub_with_status(status_code: u16) -> u16 {
         use axum::response::IntoResponse;
         let app = axum::Router::new().route(
@@ -505,7 +505,7 @@ mod transparent_handler {
         port
     }
 
-    /// Helper : construit un AppState avec InMemorySink récupérable.
+    /// Builds an `AppState` with a recoverable `InMemorySink`.
     async fn make_app_with_sink(
         child_port: u16,
     ) -> (Router, Arc<gradatum_core::event_sink::InMemorySink>) {
@@ -529,7 +529,7 @@ mod transparent_handler {
         (EngineServer::router(state), sink)
     }
 
-    /// P2 item 3 : RequestServed émis sur 200 avec le status réel (pas hardcodé).
+    /// `RequestServed` is emitted on 200 with the real status (not hard-coded).
     #[tokio::test]
     async fn request_served_emitted_with_real_status_200() {
         let port = start_child_stub_with_status(200).await;
@@ -562,7 +562,7 @@ mod transparent_handler {
         );
     }
 
-    /// P2 item 3 : RequestServed émis sur 4xx avec le status réel.
+    /// `RequestServed` is emitted on 4xx with the real status.
     #[tokio::test]
     async fn request_served_emitted_with_real_status_4xx() {
         let port = start_child_stub_with_status(422).await;
@@ -595,7 +595,7 @@ mod transparent_handler {
         );
     }
 
-    /// P2 item 3 : PAS de RequestServed sur 5xx upstream.
+    /// No `RequestServed` event is emitted on upstream 5xx.
     #[tokio::test]
     async fn request_served_not_emitted_on_5xx() {
         let port = start_child_stub_with_status(503).await;

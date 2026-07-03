@@ -50,67 +50,66 @@ use gradatum_core::identity::NoteId;
 use gradatum_index::{CodeSymbolMeta, DerivedNote};
 use sha2::{Digest, Sha256};
 
-/// Séparateur de composants de clé pour `NoteId::derived_from`.
-/// ASCII Unit Separator — n'apparaît jamais dans un identifiant Rust ni un chemin de fichier.
+/// Key component separator for `NoteId::derived_from`.
+/// ASCII Unit Separator — never appears in a Rust identifier or a file path.
 const KEY_SEP: u8 = 0x1f;
 
-/// Symbole de code extrait par tree-sitter (Rust, Python, Bash ou TypeScript selon la feature).
+/// A code symbol extracted by tree-sitter (Rust, Python, Bash, or TypeScript depending on the active feature).
 ///
-/// Représente une entité de code (fonction, type, trait, impl, const, module, méthode, etc.).
-/// Produit par les parsers `parse_rust_file`, `parse_python_file`, `parse_bash_file` ou
-/// `parse_typescript_file` selon la feature activée, et consommé par `build_derived_notes`.
+/// Represents a code entity (function, type, trait, impl, const, module, method, etc.).
+/// Produced by `parse_rust_file`, `parse_python_file`, `parse_bash_file`, or
+/// `parse_typescript_file` (depending on the active feature) and consumed by `build_derived_notes`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DerivedSymbol {
-    /// Nom qualifié (ex. `"MyStruct::my_method"`, `"parse_file"`, `"MyEnum"`).
+    /// Qualified name (e.g. `"MyStruct::my_method"`, `"parse_file"`, `"MyEnum"`).
     pub qualified_name: String,
-    /// Kind de l'entité (ex. `"fn"`, `"struct"`, `"enum"`, `"trait"`, `"impl"`,
+    /// Entity kind (e.g. `"fn"`, `"struct"`, `"enum"`, `"trait"`, `"impl"`,
     /// `"const"`, `"mod"`, `"method"`).
     pub kind: String,
-    /// Signature textuelle (params + retour, ≤ 1 ligne). Absente si non extractible.
+    /// Textual signature (params + return type, ≤ 1 line). `None` if not extractable.
     pub signature: Option<String>,
-    /// Doc-comment extrait (premières lignes). Absent si non présent dans la source.
+    /// Extracted doc-comment (first lines). `None` if not present in the source.
     pub doc_comment: Option<String>,
-    /// Dépendances intra-repo sortantes (best-effort, flaggées incertaines si besoin).
-    /// Accuracy > coverage : en cas de doute, la dep est omise plutôt que hallucinée.
+    /// Outgoing intra-repo dependencies (best-effort; omitted rather than fabricated when uncertain).
     pub deps: Vec<String>,
-    /// Chemin du fichier source (relatif au repo).
+    /// Source file path (relative to the repository root).
     pub source_path: String,
-    /// Visibilité de l'item : `"pub"` (item public) ou `"priv"` (item privé).
-    /// Pour les blocs `impl` : toujours `"pub"` (les impl n'ont pas de visibilité propre).
+    /// Item visibility: `"pub"` (public item) or `"priv"` (private item).
+    /// For `impl` blocks: always `"pub"` (impl blocks have no visibility of their own).
     pub visibility: String,
-    /// Span du nœud tree-sitter (1-based inclusif) : `(start_line, end_line)`.
+    /// Tree-sitter node span (1-based inclusive): `(start_line, end_line)`.
     ///
-    /// Capture le nœud de l'item seul (pas les attributs `#[...]` ni les doc-comments —
-    /// ceux-ci sont déjà dans `doc_comment`). `None` si non extractible (accuracy>coverage).
+    /// Covers the item node only (not preceding `#[...]` attributes or doc-comments —
+    /// those are already in `doc_comment`). `None` if not extractable (accuracy > coverage).
     ///
-    /// Utilisé par `code_scope include_body` pour servir le corps exact sans re-parse.
-    /// Invariant B2 (caveats council) : exclure la ligne vide terminale si `end_position().row`
-    /// pointe une ligne vide (newline final) — seul le corps réel est servi.
+    /// Used by `code_scope include_body` to serve the exact body without re-parsing.
+    /// The trailing blank line is excluded when `end_position().row` points at a blank line
+    /// (final newline) — only the real body is served.
     pub span: Option<(u32, u32)>,
-    /// Indicateur que ce symbole est ambigu (overload / macro opaque à tree-sitter).
-    /// Un symbole ambigu est omis lors de la construction des notes.
+    /// Whether this symbol is ambiguous (overload or macro opaque to tree-sitter).
+    /// Ambiguous symbols are omitted when building notes.
     pub ambiguous: bool,
 }
 
-/// Erreur du pipeline ingest.
+/// Error type for the ingest pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
-    /// Erreur de lecture ou de parse du fichier source.
-    #[error("parse error pour {path}: {reason}")]
+    /// A source file could not be read or parsed.
+    #[error("parse error for {path}: {reason}")]
     ParseError {
-        /// Chemin du fichier source.
+        /// Source file path.
         path: String,
-        /// Raison de l'échec.
+        /// Reason for the failure.
         reason: String,
     },
-    /// Erreur interne inattendue.
+    /// Unexpected internal error.
     #[error("ingest internal error: {0}")]
     Internal(String),
 }
 
-/// Module pipeline générique multi-langage.
+/// Generic multi-language parser pipeline.
 ///
-/// Activé si au moins une feature de parser de langage est activée.
+/// Enabled when at least one language-parser feature is active.
 #[cfg(any(
     feature = "code-rust",
     feature = "code-python",
@@ -119,56 +118,56 @@ pub enum IngestError {
 ))]
 mod language_parser;
 
-/// Module tree-sitter Rust (feature `code-rust`).
+/// Tree-sitter Rust parser module (feature `code-rust`).
 #[cfg(feature = "code-rust")]
 mod rust_parser;
 
-/// Module tree-sitter Python (feature `code-python`).
+/// Tree-sitter Python parser module (feature `code-python`).
 #[cfg(feature = "code-python")]
 mod python_parser;
 
-/// Module tree-sitter Bash (feature `code-bash`).
+/// Tree-sitter Bash parser module (feature `code-bash`).
 #[cfg(feature = "code-bash")]
 mod bash_parser;
 
-/// Module tree-sitter TypeScript (feature `code-typescript`).
+/// Tree-sitter TypeScript parser module (feature `code-typescript`).
 #[cfg(feature = "code-typescript")]
 mod typescript_parser;
 
-/// Parse un fichier Rust et retourne la liste des symboles extraits.
+/// Parses a Rust file and returns the list of extracted symbols.
 ///
-/// ## Visibilité
+/// ## Visibility
 ///
-/// Le paramètre `include_private` contrôle le filtre de visibilité :
-/// - `false` (défaut) : seuls les items `pub` ou `pub(crate)` sont extraits.
-///   Les modules sont toujours extraits quel que soit ce paramètre (ils structurent l'espace
-///   de noms). Comportement historique préservé.
-/// - `true` : tous les items sont extraits, y compris les items privés.
+/// The `include_private` parameter controls the visibility filter:
+/// - `false` (default): only `pub` or `pub(crate)` items are extracted.
+///   Modules are always extracted regardless of this parameter (they structure the namespace).
+///   Historical behavior preserved.
+/// - `true`: all items are extracted, including private ones.
 ///
 /// ## Accuracy > coverage
 ///
-/// En cas de doute (symbole non parsable, source corrompue) → le symbole est omis plutôt
-/// que retourné avec une signature potentiellement fausse. Un fichier entièrement non-parsable
-/// retourne `Ok(Vec::new())` (pas d'erreur — le fichier est ignoré silencieusement).
+/// When in doubt (symbol not parseable, corrupted source) → the symbol is omitted rather
+/// than returned with a potentially incorrect signature. A file that cannot be parsed at all
+/// returns `Ok(Vec::new())` (no error — the file is silently ignored).
 ///
-/// ## Macros procédurales
+/// ## Procedural macros
 ///
-/// `#[derive]` et macros procédurales sont invisibles à tree-sitter → omises.
-/// Comportement documenté, pas un bug.
+/// `#[derive]` and procedural macros are invisible to tree-sitter → omitted.
+/// Documented behavior, not a bug.
 ///
-/// ## Duplicates ambigus
+/// ## Ambiguous duplicates
 ///
-/// Même `(path, kind, qualified_name)` : overloads ou macros opaques → le symbole est
-/// marqué `ambiguous=true` et filtré par `build_derived_notes`.
+/// Same `(path, kind, qualified_name)`: overloads or opaque macros → the symbol is
+/// marked `ambiguous=true` and filtered out by `build_derived_notes`.
 ///
 /// ## Feature `code-rust`
 ///
-/// Cette fonction n'est disponible que si la feature `code-rust` est activée.
-/// Sans la feature, construire des `DerivedSymbol` manuellement via la struct publique.
+/// This function is only available when the `code-rust` feature is enabled.
+/// Without the feature, construct `DerivedSymbol` instances manually via the public struct.
 ///
-/// ## Effets de bord
+/// ## Side effects
 ///
-/// Aucun. Fonction pure (lecture seule, pas d'I/O réseau, pas de DB).
+/// None. Pure function (read-only, no network I/O, no DB).
 #[cfg(feature = "code-rust")]
 pub fn parse_rust_file(
     source_path: &str,
@@ -184,39 +183,39 @@ pub fn parse_rust_file(
     language_parser::parse_with_language_parser(&parser, source_path, content)
 }
 
-/// Parse un fichier Python et retourne la liste des symboles extraits.
+/// Parses a Python file and returns the list of extracted symbols.
 ///
-/// ## Visibilité
+/// ## Visibility
 ///
-/// Le paramètre `include_private` contrôle le filtre de visibilité :
-/// - `false` (défaut) : seuls les items publics sont extraits (pas de `_`-prefix).
-///   Les items dunder (`__init__`, `__str__`) sont toujours publics (API protocole Python).
-/// - `true` : tous les items sont extraits, y compris les items `_`-préfixés.
+/// The `include_private` parameter controls the visibility filter:
+/// - `false` (default): only public items are extracted (no `_`-prefix).
+///   Dunder items (`__init__`, `__str__`) are always public (Python protocol API).
+/// - `true`: all items are extracted, including `_`-prefixed ones.
 ///
 /// ## Accuracy > coverage
 ///
-/// En cas de doute (symbole non parsable, source corrompue) → le symbole est omis plutôt
-/// que retourné avec une extraction potentiellement fausse. Un fichier entièrement
-/// non-parsable retourne `Ok(Vec::new())` (fichier ignoré silencieusement).
+/// When in doubt (symbol not parseable, corrupted source) → the symbol is omitted rather
+/// than returned with a potentially incorrect extraction. A file that cannot be parsed at all
+/// returns `Ok(Vec::new())` (file silently ignored).
 ///
-/// ## Entités extraites
+/// ## Extracted entities
 ///
-/// - Fonctions top-level → `kind = "fn"`
-/// - Classes top-level → `kind = "class"`
-/// - Méthodes dans les classes → `kind = "method"`, `qualified_name = "Classe::méthode"`
+/// - Top-level functions → `kind = "fn"`
+/// - Top-level classes → `kind = "class"`
+/// - Methods inside classes → `kind = "method"`, `qualified_name = "ClassName::method_name"`
 ///
-/// ## Non-extraits (par design)
+/// ## Not extracted (by design)
 ///
-/// - Assignments module-level (`CONSTANT = 42`) : aucun kind adapté
-/// - Deps (call graph) : `deps = vec![]` pour l'incrément 1
+/// - Module-level assignments (`CONSTANT = 42`): no suitable kind
+/// - Deps (call graph): `deps = vec![]` — call graph extraction not yet implemented
 ///
 /// ## Feature `code-python`
 ///
-/// Cette fonction n'est disponible que si la feature `code-python` est activée.
+/// This function is only available when the `code-python` feature is enabled.
 ///
-/// ## Effets de bord
+/// ## Side effects
 ///
-/// Aucun. Fonction pure (lecture seule, pas d'I/O réseau, pas de DB).
+/// None. Pure function (read-only, no network I/O, no DB).
 #[cfg(feature = "code-python")]
 pub fn parse_python_file(
     source_path: &str,
@@ -227,34 +226,34 @@ pub fn parse_python_file(
     language_parser::parse_with_language_parser(&parser, source_path, content)
 }
 
-/// Parse un fichier Bash et retourne la liste des symboles extraits.
+/// Parses a Bash file and returns the list of extracted symbols.
 ///
-/// ## Entités extraites
+/// ## Extracted entities
 ///
-/// - Fonctions top-level (`function_definition`) → `kind = "fn"`
-/// - Assignments top-level (`variable_assignment`) → `kind = "const"` (best-effort)
+/// - Top-level functions (`function_definition`) → `kind = "fn"`
+/// - Top-level assignments (`variable_assignment`) → `kind = "const"` (best-effort)
 ///
-/// ## Visibilité
+/// ## Visibility
 ///
-/// Bash n'a aucun modificateur de visibilité syntaxique — tous les symboles sont `"pub"`.
-/// Ce parser ne prend pas de paramètre `include_private` (pas de concept applicable).
+/// Bash has no syntactic visibility modifier — all symbols are `"pub"`.
+/// This parser takes no `include_private` parameter (the concept does not apply).
 ///
 /// ## Signature
 ///
-/// `signature = None` par design : Bash ne déclare pas de paramètres typés.
-/// Les paramètres positionnels (`$1`, `$2`) ne sont pas déclarés syntaxiquement.
+/// `signature = None` by design: Bash does not declare typed parameters.
+/// Positional parameters (`$1`, `$2`) are not syntactically declared.
 ///
 /// ## Deps
 ///
-/// `deps = vec![]` — extraction des callees différée (accuracy > coverage).
+/// `deps = vec![]` — callee extraction is deferred (accuracy > coverage).
 ///
 /// ## Feature `code-bash`
 ///
-/// Cette fonction n'est disponible que si la feature `code-bash` est activée.
+/// This function is only available when the `code-bash` feature is enabled.
 ///
-/// ## Effets de bord
+/// ## Side effects
 ///
-/// Aucun. Fonction pure (lecture seule, pas d'I/O réseau, pas de DB).
+/// None. Pure function (read-only, no network I/O, no DB).
 #[cfg(feature = "code-bash")]
 pub fn parse_bash_file(
     source_path: &str,
@@ -264,36 +263,36 @@ pub fn parse_bash_file(
     language_parser::parse_with_language_parser(&parser, source_path, content)
 }
 
-/// Parse un fichier TypeScript et retourne la liste des symboles extraits.
+/// Parses a TypeScript file and returns the list of extracted symbols.
 ///
-/// ## Entités extraites
+/// ## Extracted entities
 ///
-/// - Fonctions (`function_declaration`) → `kind = "fn"`
+/// - Functions (`function_declaration`) → `kind = "fn"`
 /// - Classes (`class_declaration`) → `kind = "class"`
 /// - Interfaces (`interface_declaration`) → `kind = "type"`
-/// - Méthodes dans les classes (`method_definition`) → `kind = "method"`,
+/// - Class methods (`method_definition`) → `kind = "method"`,
 ///   `qualified_name = "ClassName::methodName"`
-/// - Arrow functions top-level (`const f = () => {}`) → `kind = "fn"`
+/// - Top-level arrow functions (`const f = () => {}`) → `kind = "fn"`
 ///
-/// ## Visibilité
+/// ## Visibility
 ///
-/// - Présence d'un `export_statement` parent → `"pub"`
+/// - Presence of a parent `export_statement` → `"pub"`
 /// - Absence → `"priv"` (module-local)
-/// - Dans une classe, modificateurs `public`/`private`/`protected` respectés.
-///   Défaut absent → `"pub"` (TypeScript default visibility = public).
+/// - Inside a class, `public`/`private`/`protected` modifiers are respected.
+///   Missing modifier → `"pub"` (TypeScript default visibility = public).
 ///
-/// ## Variante `.tsx`
+/// ## `.tsx` variant
 ///
-/// Utiliser [`parse_tsx_file`] pour les fichiers `.tsx` (grammaire JSX `LANGUAGE_TSX`).
-/// Cette fonction utilise `LANGUAGE_TYPESCRIPT` — les fragments JSX ne sont pas parsés.
+/// Use [`parse_tsx_file`] for `.tsx` files (JSX grammar `LANGUAGE_TSX`).
+/// This function uses `LANGUAGE_TYPESCRIPT` — JSX fragments are not parsed.
 ///
 /// ## Feature `code-typescript`
 ///
-/// Cette fonction n'est disponible que si la feature `code-typescript` est activée.
+/// This function is only available when the `code-typescript` feature is enabled.
 ///
-/// ## Effets de bord
+/// ## Side effects
 ///
-/// Aucun. Fonction pure (lecture seule, pas d'I/O réseau, pas de DB).
+/// None. Pure function (read-only, no network I/O, no DB).
 #[cfg(feature = "code-typescript")]
 pub fn parse_typescript_file(
     source_path: &str,
@@ -304,39 +303,39 @@ pub fn parse_typescript_file(
     language_parser::parse_with_language_parser(&parser, source_path, content)
 }
 
-/// Parse un fichier TypeScript JSX (`.tsx`) et retourne la liste des symboles extraits.
+/// Parses a TypeScript JSX (`.tsx`) file and returns the list of extracted symbols.
 ///
-/// Utilise la grammaire `LANGUAGE_TSX` de `tree-sitter-typescript 0.23.2`, qui comprend
-/// les nœuds JSX/React (`jsx_element`, `jsx_opening_element`, etc.) en plus du TS.
+/// Uses the `LANGUAGE_TSX` grammar from `tree-sitter-typescript 0.23.2`, which includes
+/// JSX/React nodes (`jsx_element`, `jsx_opening_element`, etc.) in addition to TypeScript.
 ///
-/// ## Entités extraites
+/// ## Extracted entities
 ///
-/// Identique à [`parse_typescript_file`] (même extraction de symboles) :
-/// - Fonctions / composants React (`function_declaration`) → `kind = "fn"`
+/// Identical to [`parse_typescript_file`] (same symbol extraction):
+/// - Functions / React components (`function_declaration`) → `kind = "fn"`
 /// - Classes (`class_declaration`) → `kind = "class"`
 /// - Interfaces (`interface_declaration`) → `kind = "type"`
-/// - Méthodes dans les classes (`method_definition`) → `kind = "method"`
-/// - Arrow functions top-level (`const f = () => {}`) → `kind = "fn"`
+/// - Class methods (`method_definition`) → `kind = "method"`
+/// - Top-level arrow functions (`const f = () => {}`) → `kind = "fn"`
 ///
-/// Les nœuds JSX (éléments `<div>`, `<Button>`, etc.) sont parsés correctement
-/// mais **ne génèrent pas de symboles** — seules les déclarations TS sont extraites.
+/// JSX nodes (elements `<div>`, `<Button>`, etc.) are parsed correctly
+/// but **do not produce symbols** — only TypeScript declarations are extracted.
 ///
-/// ## Visibilité
+/// ## Visibility
 ///
-/// - `export` → `"pub"` ; absence → `"priv"`.
+/// - `export` → `"pub"`; absent → `"priv"`.
 ///
 /// ## Feature `code-typescript`
 ///
-/// Cette fonction n'est disponible que si la feature `code-typescript` est activée.
+/// This function is only available when the `code-typescript` feature is enabled.
 ///
-/// ## Effets de bord
+/// ## Side effects
 ///
-/// Aucun. Fonction pure (lecture seule, pas d'I/O réseau, pas de DB).
+/// None. Pure function (read-only, no network I/O, no DB).
 ///
 /// # Errors
 ///
-/// Retourne [`IngestError::ParseError`] si la grammaire `LANGUAGE_TSX` est ABI-incompatible
-/// avec le core tree-sitter (détecté au premier appel, non silencieux).
+/// Returns [`IngestError::ParseError`] if the `LANGUAGE_TSX` grammar is ABI-incompatible
+/// with the tree-sitter core (detected on the first call, not silenced).
 #[cfg(feature = "code-typescript")]
 pub fn parse_tsx_file(
     source_path: &str,
@@ -347,33 +346,33 @@ pub fn parse_tsx_file(
     language_parser::parse_with_language_parser(&parser, source_path, content)
 }
 
-/// Construit les `DerivedNote` depuis les symboles extraits.
+/// Builds `DerivedNote` instances from the extracted symbols.
 ///
-/// ## Clé déterministe
+/// ## Deterministic key
 ///
 /// `note_id = NoteId::derived_from(vault_id ‖ '\x1f' ‖ source_path ‖ '\x1f' ‖ kind ‖ '\x1f' ‖ qualified_name)`
 ///
-/// Garantit idempotence : rebuild identique quelle que soit l'ordre d'insertion.
+/// Guarantees idempotence: identical rebuild regardless of insertion order.
 ///
-/// ## Filtrage
+/// ## Filtering
 ///
-/// - Symboles `ambiguous=true` → omis (accuracy > coverage, §3.2 spec).
-/// - Duplicates `(kind, qualified_name)` après filtrage → le premier est conservé.
+/// - Symbols with `ambiguous=true` → omitted (accuracy > coverage).
+/// - Duplicate `(kind, qualified_name)` pairs after filtering → the first one is kept.
 ///
-/// ## Body_text
+/// ## Body text
 ///
-/// Construit comme : `kind qualified_name\n[signature]\n[doc_comment]\ndeps: ...`
-/// Cap strict ≤ 60 lignes.
+/// Constructed as: `kind qualified_name\n[signature]\n[doc_comment]\ndeps: ...`
+/// Hard cap at ≤ 60 lines.
 ///
 /// ## Tags
 ///
-/// `"code <lang> <kind> <module_name>"` où `lang` est déduit de l'extension du fichier source
-/// (`rs`→`rust`, `py`→`python`, `sh`/`bash`→`bash`, `ts`/`tsx`→`typescript`, sinon `unknown`).
-/// `module_name` = composant avant le `::`, ou `"root"` si absent.
+/// `"code <lang> <kind> <module_name>"` where `lang` is inferred from the source file extension
+/// (`rs`→`rust`, `py`→`python`, `sh`/`bash`→`bash`, `ts`/`tsx`→`typescript`, otherwise `unknown`).
+/// `module_name` = the component before `::`, or `"root"` if absent.
 ///
-/// ## Effets de bord
+/// ## Side effects
 ///
-/// Aucun. Fonction pure.
+/// None. Pure function.
 pub fn build_derived_notes(vault_id: &str, symbols: Vec<DerivedSymbol>) -> Vec<DerivedNote> {
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut result = Vec::new();
@@ -489,9 +488,9 @@ pub fn build_derived_notes(vault_id: &str, symbols: Vec<DerivedSymbol>) -> Vec<D
     result
 }
 
-/// Déduit le langage de programmation depuis l'extension d'un chemin de fichier source.
+/// Infers the programming language from a source file path extension.
 ///
-/// Utilisé par `build_derived_notes` pour tagger les notes code avec le bon langage.
+/// Used by `build_derived_notes` to tag code notes with the correct language.
 fn lang_from_path(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
         "rs" => "rust",
@@ -502,9 +501,9 @@ fn lang_from_path(path: &str) -> &'static str {
     }
 }
 
-/// Calcule le hash SHA-256 hex d'un contenu de fichier.
+/// Computes the hex-encoded SHA-256 hash of a file's byte content.
 ///
-/// Utilisé comme `content_hash_source` pour l'idempotence (skip si inchangé).
+/// Used as `content_hash_source` for idempotency (skip if unchanged).
 pub fn content_hash_source(bytes: &[u8]) -> String {
     let hash: [u8; 32] = Sha256::digest(bytes).into();
     hash.iter().map(|b| format!("{b:02x}")).collect()

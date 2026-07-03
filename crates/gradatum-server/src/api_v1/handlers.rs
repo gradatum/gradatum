@@ -197,6 +197,51 @@ pub(crate) fn filter_semantic_by_section(
     }
 }
 
+/// Filters semantic hits to a set of sections (multi-section generalisation of
+/// [`filter_semantic_by_section`]).
+///
+/// `sec_result` is the return value of `IndexStore::get_titles_sections` for the
+/// IDs of the semantic hits. Semantics:
+///
+/// - `Ok(map)`: only hits whose section (read from `map`) is in `wanted_sections`
+///   are kept. A hit absent from the map (unknown section) is **excluded** —
+///   same conservative policy as [`filter_semantic_by_section`].
+/// - `Err(_)`: **BM25-only degradation** — returns an empty vector.
+///   A section leak would be worse than losing semantic signal.
+///
+/// Pure (no I/O, no state) — directly unit-testable.
+///
+/// # Note on single-element sets
+///
+/// When `wanted_sections` has exactly one element this behaves identically to
+/// [`filter_semantic_by_section`] with that element. The caller may use either
+/// function; this one is preferred when the set is dynamically sized.
+pub(crate) fn filter_semantic_by_sections(
+    semantic_hits: Vec<(gradatum_core::identity::NoteId, f32)>,
+    wanted_sections: &[&str],
+    sec_result: Result<std::collections::HashMap<String, (Option<String>, String)>, GradatumError>,
+) -> Vec<(gradatum_core::identity::NoteId, f32)> {
+    match sec_result {
+        Ok(sec_map) => semantic_hits
+            .into_iter()
+            .filter(|(id, _)| {
+                sec_map
+                    .get(&id.to_string())
+                    .map(|(_, sec)| wanted_sections.contains(&sec.as_str()))
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                "retrieve_candidates: get_titles_sections (filtre multi-sections sémantique) \
+                 échoué — dégradation BM25-only (hits sémantiques écartés ce tour)"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Filters semantic hits by status (symmetric to `filter_semantic_by_section`).
 ///
 /// `status_result` is the return value of `IndexStore::get_statuses` (raw SQL status)

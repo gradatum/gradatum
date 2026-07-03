@@ -75,6 +75,27 @@ pub struct VaultSearchRequest {
     /// Opt-in (default `false`): zero overhead when absent — no COUNT is executed.
     #[serde(default)]
     pub include_corpus_count: bool,
+    /// Earliest temporal anchor (inclusive), Unix epoch milliseconds.
+    ///
+    /// If provided, restricts results to notes whose `temporal_index.anchor_ms >= from_ms`.
+    /// Applied as an AND filter after all other filters (ACL, section, locus, status).
+    /// Notes without a `temporal_index` entry are excluded when this bound is set.
+    ///
+    /// Absent or `null`: no lower bound (unchanged behavior).
+    #[serde(default)]
+    pub from_ms: Option<i64>,
+    /// Latest temporal anchor (inclusive), Unix epoch milliseconds.
+    ///
+    /// If provided, restricts results to notes whose `temporal_index.anchor_ms <= to_ms`.
+    /// Applied as an AND filter after all other filters (ACL, section, locus, status).
+    /// Notes without a `temporal_index` entry are excluded when this bound is set.
+    ///
+    /// Absent or `null`: no upper bound (unchanged behavior).
+    ///
+    /// Validation: `from_ms` and `to_ms` may be provided independently; if both are
+    /// present, `from_ms` must be ≤ `to_ms` (otherwise `400 Bad Request`).
+    #[serde(default)]
+    pub to_ms: Option<i64>,
 }
 
 /// Escapes SQLite LIKE metacharacters (`%`, `_`, `\`) in a value

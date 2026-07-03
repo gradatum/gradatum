@@ -141,8 +141,20 @@ pub async fn list_review(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // Guard identité (parité stricte `vault_list_impl` / `get_notes_by_status`) :
+    // la file de revue est une surface de listing TRANSVERSE (toutes sections, filtre
+    // `status IN ('pending-review','staging')` côté SQL — aucune exclusion `identity`).
+    // Une âme d'agent qui atteindrait l'un de ces statuts verrait son titre
+    // (`identity/<agent>`) + section exfiltrés vers tout appelant disposant de l'ACL
+    // `main/review`. Fail-closed : on masque les entrées `identity` pour un appelant non
+    // privilégié AVANT de construire les items. No-op pour Studio / main-agent / owner.
+    // `next_cursor` (calculé plus haut) et `total` restent sur le compte BRUT — la
+    // pagination continue d'avancer même si une page entière est masquée.
+    let identity_privileged = crate::api_v1::logic::is_identity_privileged(&trust);
+
     let items: Vec<ReviewItem> = rows
         .into_iter()
+        .filter(|r| !crate::api_v1::logic::identity_section_hidden(identity_privileged, &r.section))
         .map(|r| ReviewItem {
             ulid: r.note_id.0.to_string(),
             title: r.title,

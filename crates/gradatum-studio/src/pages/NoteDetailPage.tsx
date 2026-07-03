@@ -121,16 +121,16 @@ export function NoteDetailPage() {
     }
   };
 
-  const forceDeprecated = async () => {
+  const downgradeNote = async () => {
     if (!note) return;
     setActionLoading(true);
-    const res = await apiFetch(`/api/v1/notes/${note.ulid}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ status: 'deprecated' }),
+    const res = await apiFetch('/api/v1/vault_downgrade', {
+      method: 'POST',
+      body: JSON.stringify({ note_id: note.ulid, reason: 'Manual downgrade via studio' }),
     });
     setActionLoading(false);
     if (res.ok) {
-      setToast('Marked as deprecated');
+      setToast('Note downgraded');
       fetchNote();
     } else {
       setToast(`Error: HTTP ${res.status}`);
@@ -285,15 +285,15 @@ export function NoteDetailPage() {
                   </button>
                 </div>
 
-                {/* Force deprecated */}
-                {note.status !== 'deprecated' && note.status !== 'garbage' && (
+                {/* Downgrade (soft-downgrade F-39, retire du FTS) */}
+                {note.status !== 'downgraded' && note.status !== 'garbage' && (
                   <button
-                    onClick={forceDeprecated}
+                    onClick={downgradeNote}
                     disabled={actionLoading}
-                    className="force-deprecated-btn"
-                    data-testid="force-deprecated"
+                    className="downgrade-btn"
+                    data-testid="downgrade-note"
                   >
-                    Force deprecated
+                    Downgrade
                   </button>
                 )}
               </div>

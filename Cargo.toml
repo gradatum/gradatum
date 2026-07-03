@@ -56,7 +56,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.4"
+version = "0.7.6"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Gradatum Contributors"]
@@ -87,7 +87,8 @@ bincode     = { version = "=2.0.1", features = ["serde"] }
 
 # Errors
 thiserror   = "=2.0.18"
-anyhow      = "=1.0.102"
+# anyhow 1.0.103 : fix RUSTSEC-2026-0190 (unsound Error::downcast_mut sous Error::context).
+anyhow      = "=1.0.103"
 
 # Time + IDs
 chrono      = { version = "=0.4.44", features = ["serde"] }
@@ -218,29 +219,29 @@ criterion   = "=0.5.1"
 
 # Cross-crate — version= obligatoire pour cargo publish (crates.io refuse les path-only)
 # gradatum-warden conserve sa version propre 0.0.1 (hors workspace.package.version)
-gradatum = { path = "crates/gradatum", version = "0.6.4" }
-gradatum-dto = { path = "crates/gradatum-dto", version = "0.6.4" }
-gradatum-warden = { path = "crates/gradatum-warden", version = "0.6.4" }
+gradatum = { path = "crates/gradatum", version = "0.7.0" }
+gradatum-dto = { path = "crates/gradatum-dto", version = "0.7.0" }
+gradatum-warden = { path = "crates/gradatum-warden", version = "0.7.0" }
 schemars = { version = "=1.0.4", features = ["derive"] }
-gradatum-acl-auth = { path = "crates/gradatum-acl-auth", version = "0.6.4" }
-gradatum-acl-policy = { path = "crates/gradatum-acl-policy", version = "0.6.4" }
-gradatum-auth = { path = "crates/gradatum-auth", version = "0.6.4" }
-gradatum-cache = { path = "crates/gradatum-cache", version = "0.6.4" }
-gradatum-chat = { path = "crates/gradatum-chat", version = "0.6.4" }
-gradatum-core = { path = "crates/gradatum-core", version = "0.6.4" }
-gradatum-curator = { path = "crates/gradatum-curator", version = "0.6.4" }
-gradatum-embed = { path = "crates/gradatum-embed", version = "0.6.4" }
-gradatum-engine = { path = "crates/gradatum-engine", version = "0.6.4" }
-gradatum-index = { path = "crates/gradatum-index", version = "0.6.4" }
-gradatum-markdown = { path = "crates/gradatum-markdown", version = "0.6.4" }
-gradatum-queue = { path = "crates/gradatum-queue", version = "0.6.4" }
-gradatum-search = { path = "crates/gradatum-search", version = "0.6.4" }
-gradatum-sdk-rs = { path = "crates/gradatum-sdk-rs", version = "0.6.4" }
-gradatum-storage = { path = "crates/gradatum-storage", version = "0.6.4" }
-gradatum-vault = { path = "crates/gradatum-vault", version = "0.6.4" }
-gradatum-worker = { path = "crates/gradatum-worker", version = "0.6.4" }
-gradatum-db-sqlite = { path = "crates/gradatum-db-sqlite", version = "0.6.4" }
-gradatum-gateway = { path = "crates/gradatum-gateway", version = "0.6.4" }
+gradatum-acl-auth = { path = "crates/gradatum-acl-auth", version = "0.7.0" }
+gradatum-acl-policy = { path = "crates/gradatum-acl-policy", version = "0.7.0" }
+gradatum-auth = { path = "crates/gradatum-auth", version = "0.7.0" }
+gradatum-cache = { path = "crates/gradatum-cache", version = "0.7.0" }
+gradatum-chat = { path = "crates/gradatum-chat", version = "0.7.0" }
+gradatum-core = { path = "crates/gradatum-core", version = "0.7.0" }
+gradatum-curator = { path = "crates/gradatum-curator", version = "0.7.0" }
+gradatum-embed = { path = "crates/gradatum-embed", version = "0.7.0" }
+gradatum-engine = { path = "crates/gradatum-engine", version = "0.7.0" }
+gradatum-index = { path = "crates/gradatum-index", version = "0.7.0" }
+gradatum-markdown = { path = "crates/gradatum-markdown", version = "0.7.0" }
+gradatum-queue = { path = "crates/gradatum-queue", version = "0.7.0" }
+gradatum-search = { path = "crates/gradatum-search", version = "0.7.0" }
+gradatum-sdk-rs = { path = "crates/gradatum-sdk-rs", version = "0.7.0" }
+gradatum-storage = { path = "crates/gradatum-storage", version = "0.7.0" }
+gradatum-vault = { path = "crates/gradatum-vault", version = "0.7.0" }
+gradatum-worker = { path = "crates/gradatum-worker", version = "0.7.0" }
+gradatum-db-sqlite = { path = "crates/gradatum-db-sqlite", version = "0.7.0" }
+gradatum-gateway = { path = "crates/gradatum-gateway", version = "0.7.0" }
 
 [profile.release]
 opt-level = 3

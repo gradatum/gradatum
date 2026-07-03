@@ -27,6 +27,8 @@ const NAV_MAIN: NavItem[] = [
   { label: 'Search', path: '/search' },
   { label: 'Review', path: '/review' },
   { label: 'Jobs', path: '/jobs' },
+  { label: 'Système', path: '/system' },
+  { label: 'Activité', path: '/activity' },
 ];
 
 export function Sidebar({

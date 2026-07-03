@@ -2,7 +2,7 @@
 
 > MCP stdio adapter — forwards MCP tool calls to the gradatum-server HTTP API.
 
-**Status**: Alpha (v0.4.x) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -41,14 +41,17 @@ Configure in your MCP host:
 | `GRADATUM_API_KEY_FILE` | — | Path to a chmod-600 file containing `ak_xxx` (preferred) |
 | `GRADATUM_BEARER_TOKEN` | — | Static JWT (fallback if `GRADATUM_API_KEY_FILE` is absent) |
 
-## MCP Tools Exposed (18 tools)
+## MCP Tools Exposed (23 tools)
 
 | Category | Tools |
 |---|---|
-| Read (10) | `vault_search`, `vault_read`, `vault_list`, `vault_status`, `vault_graph`, `vault_links`, `vault_trace`, `vault_context`, `vault_authors`, `vault_tags` |
+| Read (11) | `vault_search`, `vault_read`, `vault_list`, `vault_status`, `vault_graph`, `vault_links`, `vault_trace`, `vault_context`, `vault_timeline`, `vault_authors`, `vault_tags` |
 | Write (3) | `vault_write`, `vault_classify`, `vault_downgrade` |
-| History F-40 (4) | `vault_history`, `vault_history_get`, `vault_restore`, `vault_diff` |
-| Forget F-44 (1) | `vault_forget` |
+| History (4) | `vault_history`, `vault_history_get`, `vault_restore`, `vault_diff` |
+| Forget (1) | `vault_forget` |
+| Lessons Recall (1) | `vault_lessons_recall` |
+| Code Scope (1) | `code_scope` |
+| Proactive Recall (2) | `vault_proactive_recall`, `vault_proactive_recall_feedback` |
 
 ## License
 

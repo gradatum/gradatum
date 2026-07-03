@@ -446,6 +446,7 @@ async fn test_22_worker_run_once_processes_curate_job() {
         tenant_id: "main".into(),
         expected_sha256: None,
         note_id: None,
+        occurred_at: None,
     };
     let payload = bincode::serde::encode_to_vec(&req, bincode::config::standard())
         .expect("encode VaultWriteRequest bincode test 22");

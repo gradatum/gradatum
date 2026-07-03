@@ -25,6 +25,7 @@
 //! gradatum-admin code ingest <repo_path> --vault code-<projet> --root /var/lib/gradatum
 //! ```
 
+use anyhow::Context as _;
 use gradatum_admin::{
     BackfillArgs, BackfillNoteLinksArgs, BackfillTitlesArgs, DowngradeFromTrashArgs,
     VaultRenameArgs, api_key_cmd, code_cmd, init, jobs_cmd, token, vault_forget_cmd, vault_rename,
@@ -233,6 +234,50 @@ enum ProjectMapCmd {
         /// Vault / tenant to read (default: `"main"`).
         #[arg(long, default_value = "main")]
         vault: String,
+    },
+    /// Exporte les cartes-feature project-map en JSON trié par F-XX.
+    ///
+    /// Projection : `[{"feature":"F-37","release":"released","version":"v0.5.2","title":"…"}]`.
+    /// Par défaut (miroir-site) : exclut `release:dropped` et `version:*/backlog`.
+    /// Avec `--include-dropped` : expose toutes les cartes-feature pour audit.
+    /// Lecture directe SQLite (rusqlite, sans appel HTTP).
+    #[command(name = "export-features")]
+    ExportFeatures {
+        /// Gradatum root directory.
+        #[arg(long, default_value = "/var/lib/gradatum")]
+        root: std::path::PathBuf,
+        /// Vault / tenant à lire (défaut : `"main"`).
+        #[arg(long, default_value = "main")]
+        vault: String,
+        /// Inclure aussi les cartes `release:dropped` et `version:*/backlog`.
+        ///
+        /// Défaut : miroir-site strict (dropped et backlog exclus).
+        #[arg(long, default_value_t = false)]
+        include_dropped: bool,
+    },
+    /// Backfille 41 cartes-feature project-map depuis `features.ts` (T5, idempotent).
+    ///
+    /// Parse `features.ts`, génère une carte-feature par entrée (6 wikilinks typés
+    /// §10e : `[[feature:F-XX]] [[project:gradatum]] [[status:…]] [[kind:FEATURE]]
+    /// [[release:…]] [[version:gradatum/x.y.z]]`), et poste vers `vault_write`.
+    /// Idempotent : marqueur `pm-feature-source:F-XX` vérifié avant chaque write.
+    ///
+    /// Défaut : dry-run (preview sans POST). `--apply` déclenche l'écriture réelle.
+    /// **GATE STÉPHANE** : ne jamais lancer `--apply` sans GO explicite.
+    #[command(name = "backfill-features")]
+    BackfillFeatures {
+        /// Chemin vers `features.ts` (défaut : relatif au CWD, à ajuster selon le layout local).
+        #[arg(long, default_value = "./features.ts")]
+        features_path: std::path::PathBuf,
+        /// Écrire les cartes dans le vault (défaut : false = dry-run). Requiert --api-key.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// URL de base du serveur gradatum.
+        #[arg(long, default_value = "http://127.0.0.1:19090")]
+        server_url: String,
+        /// Clé API pour l'authentification (vide = dry-run uniquement).
+        #[arg(long, default_value = "")]
+        api_key: String,
     },
 }
 
@@ -583,6 +628,77 @@ async fn main() -> anyhow::Result<()> {
                 println!("  DONE             : {}", scope.done_count);
                 if !scope.versions.is_empty() {
                     println!("  versions         : {}", scope.versions.join(", "));
+                }
+                Ok(())
+            }
+            ProjectMapCmd::ExportFeatures {
+                root,
+                vault,
+                include_dropped,
+            } => {
+                use gradatum_admin::project_map_export::{ExportOptions, export_features};
+                let opts = ExportOptions { include_dropped };
+                let features = export_features(&root, &vault, opts).await?;
+                // Sérialisation JSON sur stdout (opérateur redirige ou pipe vers CI).
+                let json = serde_json::to_string_pretty(&features)
+                    .context("sérialisation JSON export-features")?;
+                println!("{json}");
+                Ok(())
+            }
+            ProjectMapCmd::BackfillFeatures {
+                features_path,
+                apply,
+                server_url,
+                api_key,
+            } => {
+                use gradatum_admin::feature_backfill::{
+                    BackfillFeaturesArgs, build_http_client, run_backfill_features,
+                };
+
+                let args = BackfillFeaturesArgs::new(
+                    features_path,
+                    apply,
+                    server_url.clone(),
+                    api_key.clone(),
+                );
+
+                // DRY-RUN : client fictif (marker_exists=false, vault_write jamais appelé).
+                // Construit le client HTTP de façon paresseuse (seulement en mode apply)
+                // pour ne pas exiger de serveur LIVE ni de JWT en dry-run.
+                struct DryRunClient;
+                #[async_trait::async_trait]
+                impl gradatum_admin::changelog_backfill::VaultWriteClient for DryRunClient {
+                    async fn marker_exists(&self, _marker: &str) -> anyhow::Result<bool> {
+                        Ok(false)
+                    }
+                    async fn vault_write(
+                        &self,
+                        _card: &gradatum_admin::project_map_card::VaultWriteCard,
+                    ) -> anyhow::Result<String> {
+                        Ok(String::new())
+                    }
+                }
+
+                let report = if !apply {
+                    run_backfill_features(&args, &DryRunClient).await?
+                } else {
+                    if api_key.is_empty() {
+                        anyhow::bail!("--apply requires a non-empty --api-key");
+                    }
+                    let client = build_http_client(&args).await?;
+                    run_backfill_features(&args, &client).await?
+                };
+
+                if !apply {
+                    println!(
+                        "backfill-features [DRY-RUN]: parsed={} would_create={}",
+                        report.parsed, report.would_create,
+                    );
+                } else {
+                    println!(
+                        "backfill-features: parsed={} created={} skipped={}",
+                        report.parsed, report.created, report.skipped,
+                    );
                 }
                 Ok(())
             }

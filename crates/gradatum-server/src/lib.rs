@@ -20,11 +20,17 @@ pub mod auth_routes;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
+pub mod context;
+#[doc(hidden)]
+pub mod curated_metrics;
+#[doc(hidden)]
 pub mod event_log_store;
 #[doc(hidden)]
 pub mod health;
 #[doc(hidden)]
 pub mod internal;
+#[doc(hidden)]
+pub mod mcp_usage;
 #[doc(hidden)]
 pub mod metrics;
 #[doc(hidden)]
@@ -32,7 +38,17 @@ pub mod metrics_proxy;
 #[doc(hidden)]
 pub mod middleware;
 #[doc(hidden)]
+pub mod proactive_recall;
+#[doc(hidden)]
+pub mod proactive_recall_store;
+#[doc(hidden)]
+pub mod proactive_surface_store;
+#[doc(hidden)]
 pub mod read_usage_store;
+#[doc(hidden)]
+pub mod review_promote;
+#[doc(hidden)]
+pub mod scheduled_tasks;
 #[doc(hidden)]
 pub mod session_trace_store;
 #[doc(hidden)]
@@ -41,6 +57,8 @@ pub mod state;
 pub mod stubs;
 #[doc(hidden)]
 pub mod studio;
+#[doc(hidden)]
+pub mod telemetry_flush;
 
 /// Builds a minimal Axum router for rate-limit E2E tests.
 ///

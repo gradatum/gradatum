@@ -25,7 +25,7 @@ All three archives are covered by a single `SHA256SUMS` file. Each archive ships
 **Download and verify (example for the server archive):**
 
 ```bash
-VERSION=v0.5.2
+VERSION=v0.7.6
 ARCH=x86_64-unknown-linux-gnu
 
 curl -fLO "https://github.com/gradatum/gradatum/releases/download/${VERSION}/gradatum-server-${VERSION}-${ARCH}.tar.gz"
@@ -46,7 +46,7 @@ Repeat the same steps for `gradatum-llm` and `gradatum-mcp` as needed. Install t
 
 ### 0.2 Build from source
 
-**Prerequisites:** Rust stable (MSRV 1.85), `gcc` or `clang`, `libsqlite3-dev`.
+**Prerequisites:** Rust stable (MSRV 1.88), `gcc` or `clang`, `libsqlite3-dev`.
 
 ```bash
 git clone https://github.com/gradatum/gradatum.git
@@ -616,9 +616,9 @@ new port, and stop the old instance.
 | Symptom | Likely cause | Action |
 |---|---|---|
 | `EngineError::ModelLoad: llama_server_bin canonicalize failed` | Binary not found at configured path | Install `llama-server` to `/usr/local/bin/` |
-| `EngineError::ModelLoad: ... hors préfixe autorisé` | Binary path outside allowed prefix | Place binary in `/usr/local/bin/` or `/opt/gradatum/bin/` |
-| `EngineError::ModelLoad: model_path: ... hors /opt/gradatum/models/` | Model file outside allowed prefix | Move GGUF to `/opt/gradatum/models/` |
-| `EngineError::BadRequest: extra_args: flag '...' non autorisé` | Flag not in allow-list | Remove the flag or check Section 5 |
+| `EngineError::ModelLoad: ... is outside the allowed prefix` | Binary path outside allowed prefix | Place binary in `/usr/local/bin/` or `/opt/gradatum/bin/` |
+| `EngineError::ModelLoad: model_path: path must be under /opt/gradatum/models/` | Model file outside allowed prefix | Move GGUF to `/opt/gradatum/models/` |
+| `EngineError::BadRequest: extra_args: flag '...' is not allowed` | Flag not in allow-list | Remove the flag or check Section 5 |
 | `/health` returns `503` immediately | Child startup failed or timed out | Check `journalctl -u gradatum-engine-chat` for child stderr |
 | `/health` returns `503` after running fine | Restart budget exhausted (flapping child) | Check model compatibility with your `llama-server` version |
 | GPU not used despite `gpu_layers > 0` | Missing GPU runtime or env vars not injected | Verify the GPU runtime is installed; env vars prefixed `VK_*`/`CUDA_*` etc. are auto-injected |

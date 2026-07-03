@@ -28,9 +28,12 @@ use gradatum_core::identity::NoteId;
 use gradatum_core::scope::VaultId;
 use gradatum_core::section::Section;
 use gradatum_core::status::NoteStatus;
+use std::time::Duration;
+
 use gradatum_core::{
-    DistillSource, GradatumJob, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority,
-    JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, TriggerSource,
+    DistillSource, GradatumJob, Job, JobClass, JobFilter, JobLifecycle, JobLineage, JobMode,
+    JobPriority, JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, QueueError,
+    QueueEvent, QueueStore, TriggerSource, job_kind_str,
 };
 use gradatum_embed::{EmbedBackend, EmbedError, Embedder};
 use gradatum_index::SqliteIndex;
@@ -64,6 +67,159 @@ impl Embedder for StubEmbedder {
     }
     fn backend_kind(&self) -> EmbedBackend {
         EmbedBackend::Noop
+    }
+}
+
+// ── QueueStore mocks ──────────────────────────────────────────────────────────
+
+/// No-op QueueStore — silently accepts all enqueues (used in dry-run and error tests where
+/// the queue path is never reached or the enqueued content is irrelevant).
+struct NoopQueueStore;
+
+#[async_trait]
+impl QueueStore for NoopQueueStore {
+    async fn enqueue(&self, _job: JobRecord) -> Result<Ulid, QueueError> {
+        Ok(Ulid::new())
+    }
+    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError> {
+        Ok(None)
+    }
+    async fn get(&self, _id: Ulid) -> Result<Option<JobRecord>, QueueError> {
+        Ok(None)
+    }
+    async fn complete(
+        &self,
+        _id: Ulid,
+        _result: gradatum_core::JobResult,
+    ) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn fail(&self, _id: Ulid, _err: &str, _attempt: u32) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn cancel(&self, _id: Ulid) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn fail_dlq(&self, _id: Ulid, _err: &str) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn find_awaiting(&self, _job_id: Ulid) -> Result<Vec<JobRecord>, QueueError> {
+        Ok(vec![])
+    }
+    async fn set_pending(&self, _id: Ulid) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn recover_stale_leases(&self, _ttl: Duration) -> Result<Vec<Ulid>, QueueError> {
+        Ok(vec![])
+    }
+    async fn cancel_expired_deadlines(
+        &self,
+        _now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<Ulid>, QueueError> {
+        Ok(vec![])
+    }
+    async fn promote_retries(&self, _now: chrono::DateTime<Utc>) -> Result<Vec<Ulid>, QueueError> {
+        Ok(vec![])
+    }
+    async fn schedule_retry(
+        &self,
+        _id: Ulid,
+        _at: chrono::DateTime<Utc>,
+    ) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn list(&self, _filter: JobFilter) -> Result<Vec<JobRecord>, QueueError> {
+        Ok(vec![])
+    }
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<QueueEvent> {
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        drop(tx);
+        rx
+    }
+}
+
+/// Capturing QueueStore — records every enqueued `JobRecord` for assertion in real-mode tests.
+struct CapturingQueueStore {
+    jobs: std::sync::Mutex<Vec<JobRecord>>,
+}
+
+impl CapturingQueueStore {
+    fn new() -> Self {
+        Self {
+            jobs: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Returns a snapshot of all enqueued jobs.
+    fn enqueued(&self) -> Vec<JobRecord> {
+        self.jobs.lock().expect("CapturingQueueStore lock").clone()
+    }
+}
+
+#[async_trait]
+impl QueueStore for CapturingQueueStore {
+    async fn enqueue(&self, job: JobRecord) -> Result<Ulid, QueueError> {
+        let id = job.id;
+        self.jobs
+            .lock()
+            .expect("CapturingQueueStore lock")
+            .push(job);
+        Ok(id)
+    }
+    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError> {
+        Ok(None)
+    }
+    async fn get(&self, _id: Ulid) -> Result<Option<JobRecord>, QueueError> {
+        Ok(None)
+    }
+    async fn complete(
+        &self,
+        _id: Ulid,
+        _result: gradatum_core::JobResult,
+    ) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn fail(&self, _id: Ulid, _err: &str, _attempt: u32) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn cancel(&self, _id: Ulid) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn fail_dlq(&self, _id: Ulid, _err: &str) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn find_awaiting(&self, _job_id: Ulid) -> Result<Vec<JobRecord>, QueueError> {
+        Ok(vec![])
+    }
+    async fn set_pending(&self, _id: Ulid) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn recover_stale_leases(&self, _ttl: Duration) -> Result<Vec<Ulid>, QueueError> {
+        Ok(vec![])
+    }
+    async fn cancel_expired_deadlines(
+        &self,
+        _now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<Ulid>, QueueError> {
+        Ok(vec![])
+    }
+    async fn promote_retries(&self, _now: chrono::DateTime<Utc>) -> Result<Vec<Ulid>, QueueError> {
+        Ok(vec![])
+    }
+    async fn schedule_retry(
+        &self,
+        _id: Ulid,
+        _at: chrono::DateTime<Utc>,
+    ) -> Result<(), QueueError> {
+        Ok(())
+    }
+    async fn list(&self, _filter: JobFilter) -> Result<Vec<JobRecord>, QueueError> {
+        Ok(vec![])
+    }
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<QueueEvent> {
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        drop(tx);
+        rx
     }
 }
 
@@ -208,6 +364,7 @@ async fn dry_run_lists_clusters_without_mutation() {
     let b = write_note_with_embedding(&fx, "B", "contenu b", vec![0.99, 0.01, 0.0]).await;
 
     let job = make_distill_job(JobScope::Notes(vec![a.0, b.0]), JobMode::DryRun);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let out = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -216,6 +373,7 @@ async fn dry_run_lists_clusters_without_mutation() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await
     .expect("dry-run ne doit pas échouer");
@@ -239,14 +397,15 @@ async fn dry_run_lists_clusters_without_mutation() {
     );
 }
 
-/// Mode réel : crée une note de synthèse PendingReview avec provenance "distilled",
-/// derived-from, trust dynamique persisté ; marque les sources processed=true.
+/// Mode réel : enqueues one `Job::Validate` per cluster (no direct persist in handle_distill).
+/// Persistence (note write + source marking) is delegated to handle_validate.
 #[tokio::test]
 async fn real_mode_creates_pending_review_synthesis() {
     let fx = make_fixture().await;
     let a = write_note_with_embedding(&fx, "A", "contenu a", vec![1.0, 0.0, 0.0]).await;
     let b = write_note_with_embedding(&fx, "B", "contenu b", vec![0.99, 0.01, 0.0]).await;
 
+    let queue = Arc::new(CapturingQueueStore::new());
     let job = make_distill_job(JobScope::Notes(vec![a.0, b.0]), JobMode::Batch);
     let out = handle_distill(
         job,
@@ -256,67 +415,78 @@ async fn real_mode_creates_pending_review_synthesis() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(Arc::clone(&queue) as Arc<dyn QueueStore + Send + Sync>),
     )
     .await
     .expect("mode réel ne doit pas échouer");
 
-    assert_eq!(out.notes_created.len(), 1, "un cluster → une synthèse");
-    let synth_id = NoteId(out.notes_created[0]);
-    let synth = fx.vault.read_note(synth_id).await.expect("read synthèse");
-
-    // PendingReview + provenance distilled.
-    assert_eq!(synth.frontmatter.status, NoteStatus::PendingReview);
-    assert_eq!(synth.frontmatter.provenance.as_deref(), Some("distilled"));
-
-    // derived-from contient les deux sources.
-    let derived = synth
-        .frontmatter
-        .extra
-        .get("derived-from")
-        .and_then(|v| v.as_array())
-        .expect("derived-from présent");
-    let derived_set: std::collections::HashSet<String> = derived
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect();
-    assert!(derived_set.contains(&a.to_string()));
-    assert!(derived_set.contains(&b.to_string()));
-
-    // Trust dynamique : sources agent-log (0.50) → mean 0.50 × confidence 0.75 = 0.375.
-    let trust = fx
-        .index
-        .get_trust(&synth_id)
-        .await
-        .expect("get_trust")
-        .expect("trust non NULL");
-    assert!(
-        (trust - 0.375).abs() < 1e-3,
-        "trust dynamique attendu ≈ 0.375 (0.50 × 0.75), obtenu {trust}"
+    // One cluster → one Job::Validate enqueued (synth_id pre-allocated).
+    assert_eq!(
+        out.notes_created.len(),
+        1,
+        "un cluster → une synthèse enqueued"
     );
 
-    // Sources marquées processed=true + derived-into.
+    // Persistence is delegated: no direct write to vault from handle_distill.
+    // The synthesis note does NOT exist in the vault yet.
+    let synth_id = NoteId(out.notes_created[0]);
+    assert!(
+        fx.vault.read_note(synth_id).await.is_err(),
+        "handle_distill ne doit PAS écrire directement dans le vault (persistence déléguée à handle_validate)"
+    );
+
+    // Exactly one Job::Validate was enqueued with the correct source ULIDs.
+    let enqueued = queue.enqueued();
+    assert_eq!(
+        enqueued.len(),
+        1,
+        "exactly one Job::Validate enqueued per cluster"
+    );
+    let kind = job_kind_str(&enqueued[0].spec.kind);
+    assert_eq!(
+        kind, "Validate",
+        "enqueued job kind must be Validate, got {kind}"
+    );
+
+    // The ValidateSpec carries both source IDs.
+    let Job::Validate(ref spec) = enqueued[0].spec.kind else {
+        panic!("expected Job::Validate, got {:?}", kind);
+    };
+    let src_set: std::collections::HashSet<Ulid> = spec.source_ids.iter().copied().collect();
+    assert!(
+        src_set.contains(&a.0),
+        "source A must be in ValidateSpec.source_ids"
+    );
+    assert!(
+        src_set.contains(&b.0),
+        "source B must be in ValidateSpec.source_ids"
+    );
+    assert_eq!(
+        spec.note_id, synth_id.0,
+        "ValidateSpec.note_id must match out.notes_created[0]"
+    );
+
+    // Sources must NOT be marked processed by handle_distill (marking moved to handle_validate).
     for src in [a, b] {
         let note = fx.vault.read_note(src).await.expect("read source");
-        assert_eq!(
-            note.frontmatter
-                .extra
-                .get("processed")
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "source {src} doit être processed"
-        );
-        assert_eq!(
-            note.frontmatter
-                .extra
-                .get("derived-into")
-                .and_then(|v| v.as_str()),
-            Some(synth_id.to_string().as_str())
+        assert!(
+            note.frontmatter.extra.get("processed").is_none(),
+            "source {src} must NOT be marked processed by handle_distill"
         );
     }
+
+    // result_note_md reports enqueuing, not direct persistence.
+    assert!(
+        out.result_note_md.contains("enqueued for validation"),
+        "result_note_md must mention enqueue: {}",
+        out.result_note_md
+    );
 }
 
 /// Idempotence : une note déjà processed n'est jamais re-clusterisée.
-/// Un second run sur le même scope ne produit aucune nouvelle synthèse.
+/// Un second run sur le même scope ne produit aucun nouvel enqueue.
+/// Since handle_distill no longer marks sources itself (moved to handle_validate),
+/// we simulate the validate worker by marking sources processed manually between runs.
 #[tokio::test]
 async fn processed_notes_never_reclustered() {
     let fx = make_fixture().await;
@@ -325,8 +495,9 @@ async fn processed_notes_never_reclustered() {
     let scope = JobScope::Notes(vec![a.0, b.0]);
 
     let synth = Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>;
+    let queue1 = Arc::new(CapturingQueueStore::new());
 
-    // Premier run : crée la synthèse + marque les sources.
+    // Run 1: enqueues one Job::Validate.
     let out1 = handle_distill(
         make_distill_job(scope.clone(), JobMode::Batch),
         Data::new(Arc::new(TestInternalClient::new(
@@ -335,12 +506,32 @@ async fn processed_notes_never_reclustered() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::clone(&synth)),
+        Data::new(Arc::clone(&queue1) as Arc<dyn QueueStore + Send + Sync>),
     )
     .await
     .expect("run 1");
-    assert_eq!(out1.notes_created.len(), 1);
+    assert_eq!(out1.notes_created.len(), 1, "run 1: one synthesis enqueued");
+    assert_eq!(
+        queue1.enqueued().len(),
+        1,
+        "run 1: one Job::Validate enqueued"
+    );
 
-    // Second run : sources processed → exclues → aucune nouvelle synthèse.
+    // Simulate handle_validate marking sources as processed=true.
+    for src in [a, b] {
+        let note = fx.vault.read_note(src).await.expect("read source");
+        let mut fm = note.frontmatter.clone();
+        fm.extra
+            .insert("processed".to_string(), toml::Value::Boolean(true));
+        fx.vault
+            .write_note_with_id(fm, note.body.markdown.clone(), src)
+            .await
+            .expect("mark processed");
+    }
+
+    let queue2 = Arc::new(CapturingQueueStore::new());
+
+    // Run 2: sources now processed → excluded → zero enqueues.
     let out2 = handle_distill(
         make_distill_job(scope.clone(), JobMode::Batch),
         Data::new(Arc::new(TestInternalClient::new(
@@ -349,6 +540,7 @@ async fn processed_notes_never_reclustered() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::clone(&synth)),
+        Data::new(Arc::clone(&queue2) as Arc<dyn QueueStore + Send + Sync>),
     )
     .await
     .expect("run 2");
@@ -356,6 +548,10 @@ async fn processed_notes_never_reclustered() {
         out2.notes_created.is_empty(),
         "run 2 idempotent : aucune nouvelle synthèse, obtenu {:?}",
         out2.notes_created
+    );
+    assert!(
+        queue2.enqueued().is_empty(),
+        "run 2: no Job::Validate enqueued"
     );
 }
 
@@ -368,6 +564,7 @@ async fn synthesizer_failure_propagates_as_business_error() {
     let b = write_note_with_embedding(&fx, "B", "contenu b", vec![0.99, 0.01, 0.0]).await;
 
     let job = make_distill_job(JobScope::Notes(vec![a.0, b.0]), JobMode::Batch);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let res = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -376,6 +573,7 @@ async fn synthesizer_failure_propagates_as_business_error() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(FailingSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await;
 
@@ -394,6 +592,7 @@ async fn synthesizer_failure_propagates_as_business_error() {
 async fn vaultwide_refused_in_real_mode() {
     let fx = make_fixture().await;
     let job = make_distill_job(JobScope::VaultWide, JobMode::Batch);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let res = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -402,6 +601,7 @@ async fn vaultwide_refused_in_real_mode() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await;
     assert!(res.is_err(), "VaultWide en mode réel doit être refusé");
@@ -413,6 +613,7 @@ async fn vaultwide_allowed_in_dry_run() {
     let fx = make_fixture().await;
     let _a = write_note_with_embedding(&fx, "A", "contenu a", vec![1.0, 0.0, 0.0]).await;
     let job = make_distill_job(JobScope::VaultWide, JobMode::DryRun);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let out = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -421,6 +622,7 @@ async fn vaultwide_allowed_in_dry_run() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await
     .expect("VaultWide dry-run autorisé");
@@ -460,6 +662,7 @@ async fn notes_without_embedding_skipped() {
 
     // Dry-run : seule la note A (avec embedding) est candidate → 1 cluster singleton.
     let job = make_distill_job(JobScope::Notes(vec![a.0, id_no_emb.0]), JobMode::DryRun);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let out = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -468,6 +671,7 @@ async fn notes_without_embedding_skipped() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await
     .expect("note sans embedding ignorée sans erreur");
@@ -561,6 +765,7 @@ async fn forgotten_notes_skipped_in_distill() {
 
     // Scope Notes explicite incluant la note forgotten → elle doit être ignorée.
     let job = make_distill_job(JobScope::Notes(vec![live.0, forgotten.0]), JobMode::DryRun);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let out = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -569,6 +774,7 @@ async fn forgotten_notes_skipped_in_distill() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await
     .expect("dry-run");
@@ -588,6 +794,7 @@ async fn garbage_notes_skipped_in_distill() {
         write_note_then_mutate(&fx, "Corbeille", vec![0.99, 0.01, 0.0], false, true).await;
 
     let job = make_distill_job(JobScope::Notes(vec![live.0, garbage.0]), JobMode::DryRun);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let out = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -596,6 +803,7 @@ async fn garbage_notes_skipped_in_distill() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await
     .expect("dry-run");
@@ -636,6 +844,7 @@ async fn batch_limit_applied_after_processed_filter() {
         ..DistillSource::default()
     };
     let job = make_distill_job_with_spec(spec, JobMode::DryRun);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let out = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -644,6 +853,7 @@ async fn batch_limit_applied_after_processed_filter() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await
     .expect("dry-run");
@@ -663,6 +873,7 @@ async fn empty_locus_rejected_in_real_mode() {
         ..DistillSource::default()
     };
     let job = make_distill_job_with_spec(spec, JobMode::Batch);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let res = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -671,6 +882,7 @@ async fn empty_locus_rejected_in_real_mode() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await;
     assert!(
@@ -694,6 +906,7 @@ async fn out_of_range_threshold_clamped() {
         ..DistillSource::default()
     };
     let job = make_distill_job_with_spec(spec, JobMode::DryRun);
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(NoopQueueStore);
     let out = handle_distill(
         job,
         Data::new(Arc::new(TestInternalClient::new(
@@ -702,6 +915,7 @@ async fn out_of_range_threshold_clamped() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(queue),
     )
     .await
     .expect("seuil clampé → pas de panique");
@@ -713,13 +927,15 @@ async fn out_of_range_threshold_clamped() {
     );
 }
 
-/// P2-2 : le résumé du job inclut `mark_failures: N`.
+/// P2-2 (adapted): the job summary reports enqueue count (persistence delegated to handle_validate).
+/// Previously tested `mark_failures: 0`; with F-43, source marking moved to handle_validate.
 #[tokio::test]
-async fn job_output_reports_mark_failures() {
+async fn job_output_reports_enqueue_count() {
     let fx = make_fixture().await;
     let a = write_note_with_embedding(&fx, "A", "c", vec![1.0, 0.0, 0.0]).await;
     let b = write_note_with_embedding(&fx, "B", "c", vec![0.99, 0.01, 0.0]).await;
 
+    let queue = Arc::new(CapturingQueueStore::new());
     let job = make_distill_job(JobScope::Notes(vec![a.0, b.0]), JobMode::Batch);
     let out = handle_distill(
         job,
@@ -729,13 +945,15 @@ async fn job_output_reports_mark_failures() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(Arc::clone(&queue) as Arc<dyn QueueStore + Send + Sync>),
     )
     .await
     .expect("mode réel");
-    // Cas nominal : aucun échec de marquage.
+    // Nominal: one cluster → one Job::Validate enqueued.
     assert!(
-        out.result_note_md.contains("mark_failures: 0"),
-        "le résumé doit exposer mark_failures : {}",
+        out.result_note_md.contains("enqueued for validation"),
+        "result_note_md must report enqueue: {}",
         out.result_note_md
     );
+    assert_eq!(queue.enqueued().len(), 1, "one Job::Validate enqueued");
 }

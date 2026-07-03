@@ -27,7 +27,7 @@
 
 #[cfg(not(feature = "serve"))]
 fn main() {
-    eprintln!("gradatum-engine: compilé sans la feature 'serve'. Rien à faire.");
+    eprintln!("gradatum-engine: compiled without the 'serve' feature. Nothing to do.");
     std::process::exit(1);
 }
 
@@ -68,22 +68,22 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Load config ---
     let config = EngineConfig::load_local(config_path)
-        .map_err(|e| anyhow::anyhow!("EngineConfig::load_local échoué : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("EngineConfig::load_local failed: {e}"))?;
 
     // --- Validate config (model_path canonicalization + prefix) ---
     config
         .validate()
-        .map_err(|e| anyhow::anyhow!("config invalide : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
     // --- Match runtime ---
     if config.runtime == RuntimeKind::Onnx {
-        anyhow::bail!("runtime 'onnx' non implémenté. Utiliser runtime='llamaserver' (défaut).");
+        anyhow::bail!("runtime 'onnx' is not implemented. Use runtime='llamaserver' (default).");
     }
 
     // --- Validate child port ---
     if config.child_port <= 1024 {
         anyhow::bail!(
-            "child_port {} invalide — doit être > 1024 (SP-P0-4)",
+            "child_port {} is invalid — must be > 1024 (SP-P0-4)",
             config.child_port
         );
     }
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
                     // Best-effort fallback — no crash on JWT failure
                     tracing::warn!(
                         error = %e,
-                        "échange api-key→JWT échoué. Fallback NoopEventSink (event-log non alimenté)."
+                        "api-key→JWT exchange failed. Falling back to NoopEventSink (event-log disabled)."
                     );
                     Arc::new(NoopEventSink)
                 }
@@ -121,9 +121,9 @@ async fn main() -> anyhow::Result<()> {
             // gradatum_url absent → NoopEventSink in production (no event-log POST).
             // In test/CI (feature test-utils): InMemorySink allows inspection.
             tracing::info!(
-                "gradatum_url absent — event-log désactivé (NoopEventSink en prod ; \
-                InMemorySink uniquement si feature test-utils activée). \
-                Configurer gradatum_url pour activer l'envoi des events."
+                "gradatum_url not set — event-log disabled (NoopEventSink in prod; \
+                InMemorySink only if feature test-utils is enabled). \
+                Set gradatum_url to enable event posting."
             );
             #[cfg(any(test, feature = "test-utils"))]
             {
@@ -144,13 +144,13 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Build the supervisor ---
     let supervisor = LlamaServerSupervisor::new(config.clone())
-        .map_err(|e| anyhow::anyhow!("LlamaServerSupervisor::new échoué : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("LlamaServerSupervisor::new failed: {e}"))?;
 
     // --- Spawn llama-server ---
     supervisor
         .spawn_child()
         .await
-        .map_err(|e| anyhow::anyhow!("spawn llama-server échoué : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to spawn llama-server: {e}"))?;
 
     // --- Wait ready ---
     // Capture the initial ready Instant to seed last_ready_at in supervise_loop
@@ -161,11 +161,11 @@ async fn main() -> anyhow::Result<()> {
             // wait_ready returns StartupTimeout without calling set_unhealthy — do it here
             // so the gateway falls back to its fallback cleanly.
             tracing::error!(
-                "llama-server n'a pas démarré dans le timeout — moteur unhealthy. \
-                 Le fallback gateway prend le relais."
+                "llama-server did not start within the timeout — engine unhealthy. \
+                 The fallback gateway takes over."
             );
             health.set_unhealthy();
-            None // pas de seed : supervise_loop ne démarre pas sur un enfant mort
+            None // no seed: supervise_loop does not start on a dead child
         } else {
             Some(std::time::Instant::now())
         }
@@ -207,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
     let metrics_router = EngineServer::metrics_router(metrics);
     tracing::info!(
         metrics_addr = %metrics_addr,
-        "gradatum-engine /metrics listener loopback démarré"
+        "gradatum-engine /metrics listener started on loopback"
     );
     tokio::spawn(async move {
         if let Err(e) = axum::serve(metrics_listener, metrics_router).await {
@@ -226,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
         model = %state.model_name,
         child_port = config.child_port,
         metrics_port = config.resolved_metrics_port(),
-        "gradatum-engine démarré (superviseur llama-server PIVOT v2)"
+        "gradatum-engine started (llama-server supervisor PIVOT v2)"
     );
 
     let router = EngineServer::router(state);
@@ -264,14 +264,14 @@ async fn exchange_api_key_for_jwt(
         .bearer_auth(api_key.as_str())
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("échange api-key→JWT échoué ({url}): {e}"))?;
+        .map_err(|e| anyhow::anyhow!("api-key→JWT exchange failed ({url}): {e}"))?;
     if !resp.status().is_success() {
-        anyhow::bail!("échange api-key→JWT → HTTP {} ({url})", resp.status());
+        anyhow::bail!("api-key→JWT exchange → HTTP {} ({url})", resp.status());
     }
     let body: serde_json::Value = resp.json().await?;
     let token = body["token"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("réponse exchange sans champ 'token'"))?;
+        .ok_or_else(|| anyhow::anyhow!("exchange response missing 'token' field"))?;
     Ok(zeroize::Zeroizing::new(token.to_string()))
 }
 
@@ -299,10 +299,10 @@ fn validate_loopback_url(url: &str) -> anyhow::Result<()> {
     use std::net::IpAddr;
 
     let parsed = url::Url::parse(url)
-        .map_err(|e| anyhow::anyhow!("gradatum_url invalide (parsing URL) : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("gradatum_url invalid (URL parsing): {e}"))?;
     let host = parsed
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("gradatum_url sans host : {url}"))?;
+        .ok_or_else(|| anyhow::anyhow!("gradatum_url has no host: {url}"))?;
 
     // Try to parse the host as a literal IP address.
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -310,7 +310,7 @@ fn validate_loopback_url(url: &str) -> anyhow::Result<()> {
         if ip.is_loopback() {
             return Ok(());
         }
-        anyhow::bail!("gradatum_url doit pointer vers loopback (127.0.0.1/::1), IP={ip} : {url}");
+        anyhow::bail!("gradatum_url must point to loopback (127.0.0.1/::1), IP={ip}: {url}");
     }
 
     // Hostname — synchronous DNS resolution (fail-closed if resolution fails).
@@ -328,13 +328,13 @@ fn validate_loopback_url(url: &str) -> anyhow::Result<()> {
         })
         .map_err(|e| {
             anyhow::anyhow!(
-                "gradatum_url hostname='{host}' ne se résout pas — fail-closed (P2-4 anti-SSRF) : {e}"
+                "gradatum_url hostname='{host}' does not resolve — fail-closed (P2-4 anti-SSRF): {e}"
             )
         })?;
 
     if addrs.is_empty() {
         anyhow::bail!(
-            "gradatum_url hostname='{host}' résout en 0 adresse — fail-closed (P2-4 anti-SSRF)"
+            "gradatum_url hostname='{host}' resolves to 0 addresses — fail-closed (P2-4 anti-SSRF)"
         );
     }
 
@@ -342,7 +342,8 @@ fn validate_loopback_url(url: &str) -> anyhow::Result<()> {
     for addr in &addrs {
         if !addr.ip().is_loopback() {
             anyhow::bail!(
-                "gradatum_url hostname='{host}' résout vers IP non-loopback={} —                  rejeté (P2-4 anti-SSRF). Utiliser l'IP littérale 127.0.0.1 ou ::1.",
+                "gradatum_url hostname='{host}' resolves to non-loopback IP={} — \
+                 rejected (P2-4 anti-SSRF). Use the literal IP 127.0.0.1 or ::1.",
                 addr.ip()
             );
         }
@@ -394,12 +395,10 @@ mod bin_tests {
         // (fail-closed est correct — pas de bypass SSRF).
         if let Err(e) = result {
             let msg = e.to_string();
-            // L'erreur doit être une erreur de résolution ou de validation — pas un panic.
+            // The error must be a resolution or validation error — not a panic.
             assert!(
-                msg.contains("résout")
-                    || msg.contains("résout pas")
-                    || msg.contains("non-loopback"),
-                "erreur attendue = résolution ou validation — reçu: {msg}"
+                msg.contains("resolve") || msg.contains("non-loopback"),
+                "expected resolution or validation error — received: {msg}"
             );
         }
         // Pas d'assert!(result.is_ok()) — fail-closed acceptable si DNS restreint.

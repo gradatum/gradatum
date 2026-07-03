@@ -200,6 +200,7 @@ fn make_curate_job(title: &str, body: &str, section_hint: Option<&str>) -> Grada
                     section_hint: section_hint.map(|s| s.to_string()),
                     author: None,
                     expected_sha256: None,
+                    occurred_at: None,
                 }),
                 class,
                 mode: JobMode::Batch,

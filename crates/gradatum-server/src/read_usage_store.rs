@@ -112,6 +112,50 @@ impl ReadUsageCounterStore {
         })
     }
 
+    /// Ouvre ou crée une connexion sur `path`, en créant la table si absente.
+    ///
+    /// Contrairement à `open()` (qui exige que le fichier et la table existent déjà via la
+    /// migration 0019 de `SqliteIndex`), cette méthode est autonome : elle crée le fichier
+    /// SQLite si absent et applique le DDL directement.
+    ///
+    /// Usage : tests d'intégration qui ont besoin d'un store isolé sans `SqliteIndex`.
+    ///
+    /// # Errors
+    ///
+    /// Retourne `ReadUsageError::Sqlite` si le fichier est inaccessible ou si le DDL échoue.
+    // Utilisé par les tests d'intégration via la lib crate (non callable depuis le binaire).
+    #[allow(dead_code)]
+    pub async fn open_or_create(path: &Path) -> Result<Self, ReadUsageError> {
+        let path = path.to_path_buf();
+        let conn = tokio::task::spawn_blocking(move || {
+            let conn = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            conn.pragma_update(None, "busy_timeout", 5000i32)?;
+            conn.pragma_update(None, "foreign_keys", true)?;
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS read_usage_counters (
+                    endpoint   TEXT    NOT NULL,
+                    window_h   INTEGER NOT NULL,
+                    hit_count  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (endpoint, window_h)
+                ) WITHOUT ROWID;",
+            )?;
+            Ok::<Connection, rusqlite::Error>(conn)
+        })
+        .await
+        .map_err(|_| ReadUsageError::Blocking)??;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
     /// Ouvre une connexion en mémoire pour les tests unitaires.
     ///
     /// Crée la table `read_usage_counters` directement (sans migration runner).
@@ -216,6 +260,46 @@ impl ReadUsageCounterStore {
         .map_err(|_| ReadUsageError::Blocking)??;
 
         Ok(deleted)
+    }
+
+    /// Retourne la somme des `hit_count` groupée par `endpoint`, toutes fenêtres confondues.
+    ///
+    /// `SELECT endpoint, SUM(hit_count) FROM read_usage_counters GROUP BY endpoint`
+    ///
+    /// Used at startup to seed Prometheus metric families and in tests
+    /// to verify multi-window aggregation.
+    ///
+    /// # Errors
+    ///
+    /// `ReadUsageError::Sqlite` sur erreur SQLite.
+    /// `ReadUsageError::Blocking` si le thread de blocage échoue.
+    // Câblé dans Task 6 (seed_metrics_from_db au boot, main.rs).
+    #[allow(dead_code)]
+    pub async fn sum_by_endpoint(&self) -> Result<Vec<(String, u64)>, ReadUsageError> {
+        let conn = Arc::clone(&self.conn);
+        let rows = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(
+                "SELECT endpoint, SUM(hit_count) as total
+                 FROM read_usage_counters
+                 GROUP BY endpoint",
+            )?;
+            let rows: Vec<(String, u64)> = stmt
+                .query_map([], |row| {
+                    let endpoint: String = row.get(0)?;
+                    // SUM(hit_count) peut théoriquement dépasser i64::MAX, mais en pratique
+                    // dans une fenêtre de rétention 90j avec des compteurs horaires, c'est
+                    // impossible. On sature à u64::MAX pour sécurité.
+                    let total: i64 = row.get(1)?;
+                    Ok((endpoint, total.max(0) as u64))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<Vec<(String, u64)>, rusqlite::Error>(rows)
+        })
+        .await
+        .map_err(|_| ReadUsageError::Blocking)??;
+
+        Ok(rows)
     }
 
     /// Retourne le hit_count total pour un endpoint et une fenêtre donnés.
@@ -521,5 +605,59 @@ mod tests {
             1,
             "ligne préservée"
         );
+    }
+
+    // ── Test Task 4 : sum_by_endpoint groupe les fenêtres multiples ──────────────
+
+    /// Helper : retrouver la somme pour un endpoint dans le résultat de `sum_by_endpoint`.
+    fn find_sum(sums: &[(String, u64)], endpoint: &str) -> u64 {
+        sums.iter()
+            .find(|(k, _)| k == endpoint)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+
+    /// `sum_by_endpoint` groupe les hits de plusieurs fenêtres horaires par endpoint.
+    ///
+    /// Vérifie que `SUM(hit_count) GROUP BY endpoint` agrège correctement plusieurs
+    /// lignes avec des `window_h` différents.
+    #[tokio::test]
+    async fn sum_by_endpoint_groups_across_windows() {
+        let store = ReadUsageCounterStore::open_in_memory()
+            .await
+            .expect("open in-memory");
+
+        // Deux fenêtres pour vault_search (total = 5), une pour mcp:vault_list (total = 2).
+        store
+            .flush_batch(vec![
+                UsageFlushEntry {
+                    endpoint: "/api/v1/vault_search",
+                    window_h: 100,
+                    hit_count: 4,
+                },
+                UsageFlushEntry {
+                    endpoint: "mcp:vault_list",
+                    window_h: 100,
+                    hit_count: 2,
+                },
+            ])
+            .await
+            .expect("flush 1");
+        store
+            .flush_batch(vec![UsageFlushEntry {
+                endpoint: "/api/v1/vault_search",
+                window_h: 101,
+                hit_count: 1,
+            }])
+            .await
+            .expect("flush 2");
+
+        let sums = store.sum_by_endpoint().await.expect("sum_by_endpoint");
+        assert_eq!(
+            find_sum(&sums, "/api/v1/vault_search"),
+            5,
+            "vault_search : 4 + 1 = 5"
+        );
+        assert_eq!(find_sum(&sums, "mcp:vault_list"), 2, "mcp:vault_list = 2");
     }
 }

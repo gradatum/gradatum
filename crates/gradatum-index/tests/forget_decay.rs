@@ -68,7 +68,7 @@ async fn fts_with_snippet_forgotten_degraded() {
         .expect("seed_mark_forgotten_at");
 
     let results = idx
-        .search_fts_with_snippet(&vault, "decay", 10, false, None, None, None)
+        .search_fts_with_snippet(&vault, "decay", 10, false, None, None, None, None, None)
         .await
         .expect("search_fts_with_snippet");
 

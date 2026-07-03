@@ -11,6 +11,7 @@ import { useNavigate } from 'react-router-dom';
 import { Layout } from '../components/Layout';
 import type { DashboardResponse } from '../types/api';
 import { apiFetch } from '../hooks/useAuth';
+import { useScheduledHealth, taskBadge } from '../hooks/useScheduledHealth';
 
 // D3.3 : onUnauthorized retiré — intercepteur centralisé dans apiFetch (useAuth)
 
@@ -48,7 +49,7 @@ const STATUS_LABELS: Record<string, string> = {
   'pending-review': 'Review',
   draft: 'Draft',
   deprecated: 'Deprecated',
-  downgraded: 'Deprecated',
+  downgraded: 'Downgraded',
   garbage: 'Garbage',
 };
 
@@ -57,6 +58,9 @@ export function DashboardPage() {
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // T7 — widget santé tâches planifiées (non bloquant)
+  const { tasks: scheduledTasks, loading: scheduledLoading } = useScheduledHealth();
 
   useEffect(() => {
     let cancelled = false;
@@ -78,7 +82,7 @@ export function DashboardPage() {
   }, []);
 
   // Stats cards : 5 statuts principaux dans l'ordre
-  const STAT_STATUSES = ['live', 'pending-review', 'staging', 'draft', 'deprecated'];
+  const STAT_STATUSES = ['live', 'pending-review', 'staging', 'draft', 'downgraded'];
 
   const alerts: Array<{ dot: string; title: string; sub: string; action: string; path: string }> = [];
   if (data) {
@@ -121,6 +125,17 @@ export function DashboardPage() {
   const runningJobs = data?.jobs_by_status['Running'] ?? 0;
   const failedJobs = data?.jobs_by_status['Failed'] ?? 0;
 
+  // T7 — calculs widget tâches planifiées
+  const scheduledNowMs = Date.now();
+  const scheduledTotal = scheduledTasks.length;
+  const scheduledErrorCount = scheduledTasks.filter(t => t.errors_24h > 0).length;
+  const scheduledLateCount = scheduledTasks.filter(t => taskBadge(t, scheduledNowMs) === 'en retard').length;
+
+  // T8 — statut global pour le dot indicateur du widget
+  const scheduledGlobalStatus: 'ok' | 'warn' | 'error' =
+    scheduledErrorCount > 0 ? 'error' :
+    scheduledLateCount > 0 ? 'warn' : 'ok';
+
   // Couleur du statut last_job — ensemble fini
   const lastJobStatusColor = (status: string) => {
     if (status === 'Done') return 'var(--color-ok)';
@@ -145,10 +160,7 @@ export function DashboardPage() {
           {/* Stats cards */}
           <div className="dashboard-stats-grid">
             {STAT_STATUSES.map(statusKey => {
-              let count = data.notes_by_status[statusKey] ?? 0;
-              if (statusKey === 'deprecated') {
-                count += data.notes_by_status['downgraded'] ?? 0;
-              }
+              const count = data.notes_by_status[statusKey] ?? 0;
               const dotColor = STATUS_DOTS[statusKey] ?? '#8a857c';
               return (
                 <button
@@ -267,6 +279,61 @@ export function DashboardPage() {
                   data-testid="open-review-link"
                 >
                   Open review queue →
+                </button>
+              </div>
+
+              {/* T7 — Tâches planifiées (widget compact) */}
+              <div className="card worker-card" data-testid="scheduled-health-widget">
+                {/* T8 — dot statut global : lecture rapide de la santé du scheduler */}
+                <div className="card-title-row">
+                  <span className="card-title">Tâches planifiées</span>
+                  {!scheduledLoading && (
+                    <span
+                      className={`scheduled-status-dot scheduled-status-dot--${scheduledGlobalStatus}`}
+                      aria-hidden="true"
+                      title={
+                        scheduledGlobalStatus === 'error' ? 'Erreurs détectées' :
+                        scheduledGlobalStatus === 'warn'  ? 'Tâches en retard' :
+                        'Nominal'
+                      }
+                    />
+                  )}
+                </div>
+                {scheduledLoading ? (
+                  <div className="loading-text" style={{ fontSize: '12px', padding: 0 }}>…</div>
+                ) : (
+                  <div className="worker-grid">
+                    <span className="worker-label">Total</span>
+                    <span className="worker-value tabular" data-testid="scheduled-total-count">
+                      {scheduledTotal}
+                    </span>
+                    <span className="worker-label">Erreurs 24h</span>
+                    <span className="worker-value tabular">
+                      <span
+                        data-testid="scheduled-error-count"
+                        style={scheduledErrorCount > 0 ? { color: 'var(--color-danger)', fontWeight: 600 } : {}}
+                      >
+                        {scheduledErrorCount}
+                      </span>
+                    </span>
+                    <span className="worker-label">En retard</span>
+                    <span className="worker-value tabular">
+                      <span
+                        data-testid="scheduled-late-count"
+                        style={scheduledLateCount > 0 ? { color: 'var(--color-warn)' } : {}}
+                      >
+                        {scheduledLateCount}
+                      </span>
+                    </span>
+                  </div>
+                )}
+                <button
+                  onClick={() => navigate('/system')}
+                  className="link-accent"
+                  style={{ fontSize: '12.5px' }}
+                  data-testid="system-link"
+                >
+                  Voir tâches →
                 </button>
               </div>
             </div>

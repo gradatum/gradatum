@@ -108,6 +108,12 @@ pub struct SearchHit {
     /// `include_scores: true`. Omitted otherwise (fully backward-compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scores: Option<ScoreBreakdown>,
+    /// Temporal anchor (`temporal_index.anchor_ms`), Unix epoch milliseconds.
+    ///
+    /// Present when the note has a `temporal_index` entry; `null` otherwise.
+    /// Allows clients to display the document date without re-reading the note.
+    /// Additive field (F-65) — existing clients that ignore unknown fields are unaffected.
+    pub anchor_ms: Option<i64>,
 }
 
 /// Response for `vault_search`.
@@ -254,15 +260,111 @@ pub struct VaultTraceResponse {
 
 // ── vault_context ─────────────────────────────────────────────────────────────
 
-/// Response for `vault_context`.
+/// Source note incluse dans la réponse `vault_context`.
+#[derive(Debug, Serialize)]
+pub struct IncludedNote {
+    /// ULID de la note source.
+    pub ulid: String,
+    /// Titre Markdown H1 (ULID de repli si le titre est absent).
+    pub title: String,
+    /// Section de la note (ex. `"decisions"`, `"reference"`).
+    pub section: String,
+    /// Date de création ISO 8601 UTC (ex. `"2026-06-26T12:00:00+00:00"`).
+    pub date: String,
+    /// Score de pertinence (0.0 en mode Raw ; score composite en mode Assembled).
+    pub score: f64,
+}
+
+/// Diagnostics d'assemblage retournés dans chaque réponse `vault_context`.
+#[derive(Debug, Serialize)]
+pub struct ContextDiagnostics {
+    /// Nombre de candidats évalués avant la sélection budgétaire.
+    pub candidates_considered: u32,
+    /// Nombre de notes effectivement incluses dans le contexte produit.
+    pub included_count: u32,
+    /// `true` si l'embed a échoué / timeout et que le RRF s'est dégradé en BM25-only.
+    pub embed_fallback: bool,
+    /// Nombre de skills injectés dans le contexte (F-58, `inject_skills=true`).
+    pub skills_injected: u32,
+}
+
+/// Stub d'une note référencée — miroir sérialisable de [`crate::context::reference::Stub`].
+///
+/// Retourné dans [`VaultContextResponse::references`] quand `reference_mode=true`.
+/// Champs en **ordre fixe** (cache-stable, contrainte §5 spec v0.7.2).
+/// Score and date excluded: canonical byte-stable stub (cache stability constraint).
+#[derive(Debug, Serialize)]
+pub struct StubDto {
+    /// ULID de la note (identifiant pour déréférencement via `vault_read`).
+    pub ulid: String,
+    /// Titre de la note.
+    pub title: String,
+    /// Section thématique (ex. `"decisions"`, `"reference"`).
+    pub section: String,
+    /// Extrait figé du corps (tronqué char-safe, sans newline).
+    pub snippet: String,
+}
+
+/// Distribution counters for inline/stub/dropped notes in a context assembly.
+///
+/// Invariant : `inline + stub + dropped == diagnostics.candidates_considered`.
+///
+/// - `inline` : notes dont le corps complet figure dans `assembled_text`.
+/// - `stub` : notes condensées en stubs déréférençables dans `references`.
+/// - `dropped` : notes ignorées (hors budget inline + stub).
+#[derive(Debug, Serialize)]
+pub struct ContextCounts {
+    /// Notes retenues inline (corps complet dans `assembled_text`).
+    pub inline: usize,
+    /// Notes retournées en stubs déréférençables (`references`).
+    pub stub: usize,
+    /// Notes droppées (hors budget inline + stub).
+    pub dropped: usize,
+}
+
+/// Response for `vault_context` (v0.7.0+).
+///
+/// Remplace l'ancienne forme `{ context, estimated_tokens, sources }` (v0.6.x).
+/// Le mode Raw produit `assembled_text` = exactement l'ancien `context` (parité
+/// bit-pour-bit : jointure `"\n\n---\n\n"`, troncature char-safe, budget `chars/3`).
+///
+/// ## Additional fields (since v0.7.2)
+///
+/// `references` and `counts` are **always present** (never `null`).
+/// When `reference_mode=false` (default): `references = []`, `counts.stub = 0` —
+/// fully backward-compatible behavior.
 #[derive(Debug, Serialize)]
 pub struct VaultContextResponse {
-    /// Context formatted for injection into an LLM prompt.
-    pub context: String,
-    /// Estimated token count for the context.
-    pub estimated_tokens: u32,
-    /// Source notes used to build the context (note paths).
-    pub sources: Vec<String>,
+    /// Texte assemblé prêt pour injection dans un prompt LLM.
+    pub assembled_text: String,
+    /// Notes sources incluses dans le contexte.
+    pub included: Vec<IncludedNote>,
+    /// Budget tokens consommé par le contexte assemblé.
+    ///
+    /// - Mode **Assembled** : `HeuristicEstimator::estimate(&assembled_text)` mesuré après
+    ///   rendu final complet (scaffolding Markdown, métadonnées, header skills éventuel inclus).
+    ///   Représente le vrai coût d'injection — plus précis que la somme des seuls corps (P2-b).
+    /// - Mode **Raw** : `assembled_text.chars().count() / 3` (division entière, parité legacy).
+    pub budget_used: u32,
+    /// Diagnostics d'assemblage.
+    pub diagnostics: ContextDiagnostics,
+    /// Notes en stubs déréférençables (F-29).
+    ///
+    /// Empty (`[]`) when `reference_mode=false` (default) — fully backward-compatible.
+    /// Chaque stub contient `ulid`/`title`/`section`/`snippet` (byte-stable, sans score).
+    pub references: Vec<StubDto>,
+    /// Répartition inline/stub/dropped pour cette requête (F-29).
+    ///
+    /// Invariant : `counts.inline + counts.stub + counts.dropped == diagnostics.candidates_considered`.
+    pub counts: ContextCounts,
+
+    /// Prompt cache signal.
+    ///
+    /// `true` si `budget_used > cache_breakpoint_threshold_tokens` (config `[context]`).
+    /// Le consommateur peut utiliser ce signal pour poser un `cache_control` sur le
+    /// `tool_result` et optimiser le prompt cache LCP.
+    /// `false` si `budget_used == 0` (assemblage vide) ou si le seuil n'est pas atteint.
+    pub cache_breakpoint_hint: bool,
 }
 
 // ── vault_authors ─────────────────────────────────────────────────────────────
@@ -351,4 +453,82 @@ pub struct JobStatusResponse {
     pub attempts: i32,
     /// Last error message, absent if none.
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `StubDto` se sérialise avec les 4 champs en ordre fixe (cache-stable).
+    #[test]
+    fn stub_dto_serializes_four_fields() {
+        let stub = StubDto {
+            ulid: "01JXABCDE12345678901234567".to_string(),
+            title: "Ma note".to_string(),
+            section: "decisions".to_string(),
+            snippet: "Un extrait concis".to_string(),
+        };
+        let json = serde_json::to_value(&stub).unwrap();
+        assert_eq!(json["ulid"], "01JXABCDE12345678901234567");
+        assert_eq!(json["title"], "Ma note");
+        assert_eq!(json["section"], "decisions");
+        assert_eq!(json["snippet"], "Un extrait concis");
+        // Pas de champ `score` ni `date` (cache-stable, contrainte F-29).
+        assert!(
+            json.get("score").is_none(),
+            "score ne doit pas être dans StubDto"
+        );
+        assert!(
+            json.get("date").is_none(),
+            "date ne doit pas être dans StubDto"
+        );
+    }
+
+    /// `ContextCounts` se sérialise avec les 3 compteurs.
+    #[test]
+    fn context_counts_serializes_three_fields() {
+        let counts = ContextCounts {
+            inline: 3,
+            stub: 5,
+            dropped: 2,
+        };
+        let json = serde_json::to_value(&counts).unwrap();
+        assert_eq!(json["inline"], 3);
+        assert_eq!(json["stub"], 5);
+        assert_eq!(json["dropped"], 2);
+    }
+
+    /// `VaultContextResponse` sérialise `references`, `counts` et `cache_breakpoint_hint`.
+    #[test]
+    fn vault_context_response_serializes_references_and_counts() {
+        let resp = VaultContextResponse {
+            assembled_text: "texte".to_string(),
+            included: vec![],
+            budget_used: 42,
+            diagnostics: ContextDiagnostics {
+                candidates_considered: 10,
+                included_count: 3,
+                embed_fallback: false,
+                skills_injected: 0,
+            },
+            references: vec![StubDto {
+                ulid: "01JXTEST".to_string(),
+                title: "T".to_string(),
+                section: "s".to_string(),
+                snippet: "snip".to_string(),
+            }],
+            counts: ContextCounts {
+                inline: 3,
+                stub: 1,
+                dropped: 6,
+            },
+            cache_breakpoint_hint: true,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["references"].as_array().unwrap().len(), 1);
+        assert_eq!(json["counts"]["inline"], 3);
+        assert_eq!(json["counts"]["stub"], 1);
+        assert_eq!(json["counts"]["dropped"], 6);
+        assert_eq!(json["cache_breakpoint_hint"], serde_json::json!(true));
+    }
 }

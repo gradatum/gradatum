@@ -131,10 +131,9 @@ pub async fn handle_cleanup_dlq(
 /// 1. [`QueueStore::recover_stale_leases`] — returns expired Running jobs to Pending
 /// 2. [`QueueStore::cancel_expired_deadlines`] — cancels jobs past their deadline
 /// 3. [`QueueStore::promote_retries`] — moves Failed jobs to Pending (or DLQ at max retries)
-/// 4. [`QueueStore::promote_stranded_waiting_jobs`] — DAG recovery filet de rattrapage
-///    (DT-DAG-1) : rattrape les jobs `Waiting` bloqués dont toutes les dépendances sont
-///    `Done` mais dont la cascade post-commit a echoue (crash worker ou erreur storage).
-///    No-op si aucun job stranded n'existe.
+/// 4. [`QueueStore::promote_stranded_waiting_jobs`] — DAG recovery: promotes stranded
+///    `Waiting` jobs whose all dependencies are `Done` but whose post-commit cascade failed
+///    (worker crash or storage error). No-op when no stranded jobs exist.
 /// 5. [`idempotency_cleanup`] — purges idempotency entries older than 24 hours (TTL)
 ///
 /// The `pool` is required to clean the `gradatum_idempotency` table (migration 008).
@@ -219,7 +218,7 @@ mod tests {
     use tokio::sync::broadcast::Receiver;
     use ulid::Ulid;
 
-    /// Store mock pour tester sweep_once.
+    /// Mock store for testing `sweep_once`.
     struct MockStore {
         stale_calls: Mutex<u32>,
         deadline_calls: Mutex<u32>,

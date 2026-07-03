@@ -153,6 +153,7 @@ fn make_engine_spike_config(
         gateway: HashMap::new(),
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
+        messages: Default::default(),
     }
 }
 

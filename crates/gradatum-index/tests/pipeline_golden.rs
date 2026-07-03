@@ -76,7 +76,7 @@ async fn golden_bm25_order_is_stable() {
     // FTS5 BM25 : score ASC → index 0 = meilleur match (plus proche de 0).
     // Avec 3× répétition dans ALPHA vs 1× dans BETA, BM25 favorise ALPHA.
     let hits = idx
-        .search_fts_with_snippet(&vault, "gradatum", 10, false, None, None, None)
+        .search_fts_with_snippet(&vault, "gradatum", 10, false, None, None, None, None, None)
         .await
         .unwrap();
 

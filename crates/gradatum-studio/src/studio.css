@@ -981,7 +981,7 @@
   outline: none;
 }
 
-.force-deprecated-btn {
+.downgrade-btn {
   font-size: 12.5px;
   font-weight: 600;
   color: var(--color-danger);
@@ -996,7 +996,7 @@
   transition: border-color 120ms;
 }
 
-.force-deprecated-btn:hover {
+.downgrade-btn:hover {
   border-color: var(--color-danger);
 }
 
@@ -1563,6 +1563,93 @@
   overflow-y: auto;
 }
 
+/* ── Système — tâches planifiées ─────────────────────────────────────────── */
+
+/* Erreurs 24h en rouge si > 0 (SystemPage + DashboardPage widget) */
+.errors-danger {
+  color: var(--color-danger);
+  font-weight: 600;
+}
+
+/* Grille SystemPage : 4 colonnes (Tâche / Méta / Err.24h / Statut) */
+.system-task-header {
+  display: grid;
+  grid-template-columns: 160px 1fr 70px 100px;
+  padding: 10px 16px;
+  background: var(--color-code-bg);
+  border-bottom: 1px solid #f3f2ee;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.system-task-row-inner {
+  display: grid;
+  grid-template-columns: 160px 1fr 70px 100px;
+  padding: 12px 16px;
+  align-items: center;
+}
+
+.system-task-errors-col {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* Accordéon last_error — <details> natif HTML */
+.task-error-accordion {
+  margin: 0 16px 12px;
+}
+
+.task-error-summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 0 4px;
+  list-style: none;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+/* Masquer le marker natif sur tous les navigateurs */
+.task-error-summary::-webkit-details-marker { display: none; }
+.task-error-summary::marker               { display: none; }
+
+/* Triangle rotatif — animé via CSS, désactivé par prefers-reduced-motion global */
+.task-error-summary::before {
+  content: '▶';
+  font-size: 8px;
+  color: var(--color-text-faint);
+  flex-shrink: 0;
+  transition: transform 180ms ease-out;
+}
+
+details[open] > .task-error-summary::before {
+  transform: rotate(90deg);
+}
+
+/* Dashboard widget — titre + dot statut en ligne */
+.card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scheduled-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.scheduled-status-dot--ok    { background: var(--color-ok); }
+.scheduled-status-dot--warn  { background: var(--color-warn); }
+.scheduled-status-dot--error { background: var(--color-danger); }
+
 .jobs-pagination {
   display: flex;
   align-items: center;
@@ -1640,6 +1727,174 @@
   border: 1px solid var(--color-border-soft);
   color: var(--color-text-3);
 }
+
+/* ── MetricsSection (v0.7.5 Slice 2b) ───────────────────────────────────────── */
+
+.metrics-section {
+  margin-top: 2rem;
+}
+
+.metrics-section h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0 0 0.75rem 0;
+}
+
+.metrics-controls {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.metrics-controls button {
+  padding: 0.25rem 0.75rem;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8125rem;
+  color: var(--color-text-3);
+  line-height: 1.4;
+}
+
+.metrics-controls button:hover {
+  background: var(--color-nav-hover);
+}
+
+.metrics-controls button.active {
+  background: var(--color-accent);
+  color: #fff;
+  border-color: var(--color-accent);
+}
+
+.metrics-controls label {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  cursor: pointer;
+}
+
+.metrics-section details {
+  margin-bottom: 1rem;
+}
+
+.metrics-section details > summary {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--color-text-2);
+  cursor: pointer;
+  padding: 0.375rem 0;
+  user-select: none;
+  text-transform: capitalize;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1rem;
+  margin-top: 0.5rem;
+}
+
+.metric-chart-empty {
+  color: var(--color-text-muted);
+  font-size: 0.8125rem;
+  padding: 1rem;
+  border: 1px dashed var(--color-border-soft);
+  border-radius: 6px;
+  background: var(--color-bg);
+}
+
+.metric-chart-empty.error {
+  color: var(--color-danger);
+  border-color: var(--color-danger-bd);
+  background: var(--color-danger-bg);
+}
+
+/* ── page Activité — table session_trace (v0.7.5 Slice 3) ──────────────────── */
+
+.activity-filter-bar {
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.activity-filter-bar input[type="text"] {
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-input, 4px);
+  font-size: 0.8125rem;
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  min-width: 120px;
+}
+
+.activity-filter-bar select {
+  height: 30px;
+  padding: 0 6px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-input, 4px);
+  font-size: 0.8125rem;
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+
+.activity-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.activity-table th {
+  text-align: left;
+  padding: 8px 12px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.activity-row {
+  cursor: pointer;
+  border-bottom: 1px solid #f3f2ee;
+}
+
+.activity-row:hover {
+  background: var(--color-bg-soft, #fafaf8);
+}
+
+.activity-row td {
+  padding: 10px 12px;
+  vertical-align: middle;
+}
+
+.trace-expand-panel {
+  padding: 10px 16px 14px !important;
+  background: var(--color-bg);
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--color-text-2);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.trace-expand-panel > div {
+  margin-bottom: 4px;
+}
+
+.activity-load-more {
+  margin-top: 12px;
+  display: flex;
+  justify-content: center;
+}
+
+/* ── why-toggle (fin fichier) ─────────────────────────────────────────────────── */
 
 .why-toggle-wrapper {
   margin-top: 8px;

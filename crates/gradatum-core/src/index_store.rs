@@ -14,6 +14,8 @@ use ulid::Ulid;
 use crate::error::GradatumError;
 use crate::identity::NoteId;
 use crate::index::{FileChecksumEntry, NoteRecord, TemporalEntry};
+use crate::metric_sample::MetricSamplePoint;
+use crate::scheduled_health::{ScheduledTaskHealth, TaskOutcome};
 use crate::scope::{OverrideScope, VaultId};
 use crate::status::NoteStatus;
 
@@ -40,6 +42,13 @@ pub struct SearchHitRaw {
     pub section: String,
     /// Markdown H1 title (extracted after curate via migration 0005, may be absent).
     pub title: Option<String>,
+    /// Temporal anchor (`temporal_index.anchor_ms`), Unix epoch milliseconds.
+    ///
+    /// `Some(ms)` when the note has a `temporal_index` entry (populated via LEFT JOIN
+    /// in `search_fts_with_snippet`). `None` when absent — notes without an entry are
+    /// still returned unless a temporal bound (`from_ms`/`to_ms`) is active, in which
+    /// case the SQL WHERE clause excludes them.
+    pub anchor_ms: Option<i64>,
 }
 
 /// Raw lesson result returned by [`IndexStore::recall_lessons`].
@@ -277,12 +286,12 @@ pub trait IndexStore: Send + Sync {
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if the SQLite query fails.
-    // 8 args: orthogonal search filters (downgraded/section/locus/status) on a single
-    // FTS path. An options struct would obscure the wire contract with no readability gain
-    // (each filter is an independent `Option`). Cap accepted here.
+    // 10 args: orthogonal search filters (downgraded/section/locus/status/from_ms/to_ms)
+    // on a single FTS path. An options struct would obscure the wire contract with no
+    // readability gain (each filter is an independent `Option`). Cap accepted here.
     #[expect(
         clippy::too_many_arguments,
-        reason = "filtres de recherche orthogonaux (F-37 notes fix) — struct d'options sans gain"
+        reason = "filtres de recherche orthogonaux (F-37+F-65) — struct d'options sans gain"
     )]
     async fn search_fts_with_snippet(
         &self,
@@ -293,6 +302,8 @@ pub trait IndexStore: Send + Sync {
         section: Option<&str>,
         locus: Option<&str>,
         status: Option<&str>,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
     ) -> Result<Vec<SearchHitRaw>, GradatumError>;
 
     /// Recalls lessons by class — BM25-only, section `lessons-learned`.
@@ -324,6 +335,34 @@ pub trait IndexStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<LessonHitRaw>, GradatumError>;
 
+    /// Hydrate raw lesson data for a list of ULIDs.
+    ///
+    /// Returns notes in `section = 'lessons-learned'` matching the provided ULID list,
+    /// excluding downgraded, forgotten, and sentinel notes.
+    /// Callers apply their own filters (codified tag, class match) on the returned data.
+    ///
+    /// ## Default implementation
+    ///
+    /// Returns an empty vec — safe for all mock implementations (fanout-safe).
+    /// Override in `SqliteIndex` via the `index_store_impl` module (gradatum-index).
+    ///
+    /// ## Parameters
+    ///
+    /// - `vault_id`: vault identifier (e.g. `VaultId::new("main")`).
+    /// - `ulids`: list of note ULIDs to hydrate; empty slice → returns `Ok(vec![])` immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    async fn hydrate_lessons_by_ulids(
+        &self,
+        vault_id: &VaultId,
+        ulids: &[&str],
+    ) -> Result<Vec<LessonHitRaw>, GradatumError> {
+        let _ = (vault_id, ulids);
+        Ok(vec![])
+    }
+
     /// Review queue — notes with `status ∈ {pending-review, staging}`.
     ///
     /// Returns at most `limit` rows, paginated by lexicographic ULID cursor
@@ -351,6 +390,22 @@ pub trait IndexStore: Send + Sync {
     /// # Errors
     /// `GradatumError::Storage` if the SQLite query fails.
     async fn count_review_queue(&self, vault_id: &VaultId) -> Result<u64, GradatumError>;
+
+    /// Notes promotable from review statuses — staging or pending-review older than cutoff.
+    ///
+    /// Returns notes where `status ∈ {staging, pending-review}` AND
+    /// `COALESCE(status_changed, created) < cutoff_ms`, excluding sentinels.
+    /// Sorted oldest-first. Capped to `limit`.
+    ///
+    /// Used by the review auto-promote background job.
+    ///
+    /// # Errors
+    /// `GradatumError::Storage` if the SQLite query fails.
+    async fn find_promotable(
+        &self,
+        cutoff_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, NoteStatus)>, GradatumError>;
 
     /// Looks up a note by its Markdown title (first `# {title}` line).
     ///
@@ -468,6 +523,53 @@ pub trait IndexStore: Send + Sync {
         cursor: Option<&str>,
     ) -> Result<(Vec<NoteRecord>, u64), GradatumError>;
 
+    /// Liste les notes par STATUT (métadonnées, inclut `downgraded`).
+    ///
+    /// Contrairement à [`Self::list_notes`], n'exclut PAS les notes `downgraded` —
+    /// c'est l'objet de cette méthode (browse archived/downgraded, fix drill-down studio).
+    ///
+    /// - `statuses` : ensemble de statuts à inclure. Vide → `Ok((vec![], 0))`.
+    /// - `section` : filtre optionnel sur la section.
+    /// - `cursor` : dernier ULID reçu (exclusif). `None` ou `""` = début.
+    /// - `limit` : cappé à `[1, 200]` par l'implémentation.
+    ///
+    /// Implémentation par défaut : retourne `Ok((vec![], 0))` — uniquement l'index SQLite
+    /// réel fournit des résultats. Les mocks de test héritent du défaut sans modification.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    async fn list_notes_by_status(
+        &self,
+        _vault_id: &str,
+        _statuses: &[&str],
+        _section: Option<&str>,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        Ok((Vec::new(), 0))
+    }
+
+    /// Lists the `k` most recently active notes in a vault.
+    ///
+    /// **"Recently active"** is defined as `ORDER BY COALESCE(updated, created) DESC`:
+    /// a note that was updated recently but has an older ULID creation timestamp will rank
+    /// above a newer note that has never been edited. This aligns with the Active Recall
+    /// goal of surfacing notes the user has recently engaged with, not merely the most
+    /// recently *created* ones.
+    ///
+    /// Excludes sentinel notes (`id NOT LIKE '__sentinel__%'`) and downgraded notes
+    /// (`status != 'downgraded'`). `k` is clamped to `[1, 200]` by the implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the query fails.
+    async fn list_recent_notes(
+        &self,
+        vault_id: &str,
+        k: usize,
+    ) -> Result<Vec<NoteRecord>, GradatumError>;
+
     /// Sum of `LENGTH(body_text)` for non-sentinel notes in a vault.
     ///
     /// Returns 0 if no notes exist. Used for `vault_status.total_size_bytes`.
@@ -533,6 +635,42 @@ pub trait IndexStore: Send + Sync {
         _vault_id: &str,
         _ids: &[String],
     ) -> Result<std::collections::HashMap<String, String>, GradatumError> {
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// Batch-reads `anchor_ms` from `temporal_index` for a list of note IDs (F-65).
+    ///
+    /// Returns `HashMap<note_id, anchor_ms>` for notes present in `temporal_index`.
+    /// Notes absent from the index are simply not in the returned map.
+    ///
+    /// Used by the semantic path to enrich `RrfHit.anchor_ms` and apply optional
+    /// temporal bounds (`from_ms`/`to_ms`) without modifying `VectorStore::search_semantic`.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns an empty map — safe for all mock implementations and backends
+    /// that do not maintain a `temporal_index`. `SqliteIndex` overrides.
+    ///
+    /// # Warning — fail-closed on semantic temporal filtering
+    ///
+    /// When a backend does **not** override this method, the returned map is always empty.
+    /// If a temporal bound (`from_ms`/`to_ms`) is active in `vault_search_impl`, the caller
+    /// retains only hits whose `note_id` appears in the map (the `None => false` branch).
+    /// A backend that returns an empty map here will therefore **silently drop ALL semantic
+    /// hits** whenever bounds are active — making the sémantique branch fail-closed.
+    ///
+    /// Any backend that populates `note_embeddings` and exposes semantic search MUST override
+    /// this method to maintain parity between the FTS and semantic temporal filtering paths
+    /// (FTS∪ANN temporal filter parity).
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    async fn get_anchor_ms_batch(
+        &self,
+        _vault_id: &str,
+        _ids: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>, GradatumError> {
         Ok(std::collections::HashMap::new())
     }
 
@@ -982,7 +1120,6 @@ pub trait IndexStore: Send + Sync {
     /// # Errors
     ///
     /// `GradatumError::Storage` on SQLite error.
-    #[allow(clippy::too_many_arguments)]
     async fn count_fts_matches(
         &self,
         _vault_id: &VaultId,
@@ -1086,5 +1223,125 @@ pub trait IndexStore: Send + Sync {
     async fn backfill_ann_index(&self) -> Result<u64, GradatumError> {
         // Default : no-op — BruteForce path et mocks de test.
         Ok(0)
+    }
+
+    // ── Santé des tâches récurrentes (v0.7.5 F-85) ──────────────────────────
+
+    /// Enregistre un tick d'une tâche récurrente dans `scheduled_task_health`.
+    ///
+    /// Sémantique :
+    /// - Upsert `scheduled_task_health` (PK `task_name`) : `run_count + 1`,
+    ///   `last_run_ms`, `last_outcome`, `last_duration_ms`, `last_error`, `updated_at`.
+    /// - Si `outcome == Error` : append 1 ligne dans `scheduled_task_error`
+    ///   + purge paresseuse (`DELETE WHERE occurred_ms < now - 7j`).
+    ///
+    /// ## Infaillibilité
+    ///
+    /// L'appelant ne doit PAS propager une erreur de cette méthode dans une tâche tokio —
+    /// logguer en `warn` et continuer. La tâche ne doit jamais paniquer à cause de
+    /// l'instrumentation.
+    ///
+    /// ## Implémentation default
+    ///
+    /// No-op `Ok(())` — backends sans table `scheduled_task_health` (mocks, tests).
+    /// `SqliteIndex` override avec le vrai upsert.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si le write SQLite échoue.
+    async fn record_task_run(
+        &self,
+        _task_name: &str,
+        _outcome: TaskOutcome,
+        _duration_ms: i64,
+        _error: Option<&str>,
+        _now_ms: i64,
+    ) -> Result<(), GradatumError> {
+        Ok(())
+    }
+
+    /// Initialise la ligne d'une tâche dans `scheduled_task_health` (seed boot).
+    ///
+    /// `INSERT OR IGNORE` — n'écrase pas un enregistrement existant.
+    /// Appelé au boot du serveur pour garantir que toutes les tâches connues
+    /// apparaissent dans l'endpoint avec `last_run_ms = null` dès le démarrage.
+    ///
+    /// ## Implémentation default
+    ///
+    /// No-op `Ok(())` — mocks et backends sans la table.
+    /// `SqliteIndex` override avec le vrai `INSERT OR IGNORE`.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si le write SQLite échoue.
+    async fn seed_scheduled_task(&self, _task_name: &str) -> Result<(), GradatumError> {
+        Ok(())
+    }
+
+    /// Liste la santé de toutes les tâches récurrentes seedées.
+    ///
+    /// `errors_24h` est calculé comme `COUNT(occurred_ms > now_ms - 86_400_000)`
+    /// depuis `scheduled_task_error`.
+    ///
+    /// ## Implémentation default
+    ///
+    /// Retourne `Ok(vec![])` — backends sans la table (mocks, tests).
+    /// `SqliteIndex` override avec la vraie requête.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la lecture SQLite échoue.
+    async fn list_scheduled_health(
+        &self,
+        _now_ms: i64,
+    ) -> Result<Vec<ScheduledTaskHealth>, GradatumError> {
+        Ok(vec![])
+    }
+
+    /// Insère un lot de samples métriques (timeseries). Default no-op `Ok(0)` (mocks).
+    /// `SqliteIndex` override avec le vrai INSERT OR IGNORE.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si l'écriture SQLite échoue.
+    async fn insert_metric_samples(
+        &self,
+        _ts_ms: i64,
+        _samples: &[(String, f64)],
+    ) -> Result<usize, GradatumError> {
+        Ok(0)
+    }
+
+    /// Requête timeseries downsamplée (moyenne par bucket). Default `Ok(vec![])` (mocks).
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la lecture SQLite échoue.
+    async fn query_metric_timeseries(
+        &self,
+        _series: &[String],
+        _from_ms: i64,
+        _to_ms: i64,
+        _bucket_ms: i64,
+    ) -> Result<Vec<MetricSamplePoint>, GradatumError> {
+        Ok(vec![])
+    }
+
+    /// Purge les samples antérieurs à `cutoff_ms`. Default no-op `Ok(0)` (mocks).
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la suppression SQLite échoue.
+    async fn purge_metric_samples(&self, _cutoff_ms: i64) -> Result<usize, GradatumError> {
+        Ok(0)
+    }
+
+    /// Liste les séries distinctes présentes (catalog). Default `Ok(vec![])` (mocks).
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` si la lecture SQLite échoue.
+    async fn list_distinct_metric_series(&self) -> Result<Vec<String>, GradatumError> {
+        Ok(vec![])
     }
 }

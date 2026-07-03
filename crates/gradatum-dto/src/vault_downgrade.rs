@@ -4,7 +4,9 @@ use crate::default_main;
 
 /// Request body for `vault_downgrade` — downgrades a note.
 ///
-/// Serialized via `bincode::serde::encode_to_vec` for the queue payload.
+/// The **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.
+/// The bincode serialization (`bincode::serde::encode_to_vec`) is used only by the
+/// legacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.
 ///
 /// POST `/api/v1/vault_downgrade`. Idempotent: downgrading an already-downgraded
 /// note returns 200 with the current status.

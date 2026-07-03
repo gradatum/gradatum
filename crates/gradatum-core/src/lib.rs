@@ -47,6 +47,7 @@ pub mod index_store;
 /// [`JobScope`], [`JobPriority`], [`QueueStore`], [`QueueEvent`], [`DryRunAware`]
 /// and all associated types of the job pipeline.
 pub mod job;
+pub mod metric_sample;
 pub mod note;
 pub mod overrides;
 /// SSOT helpers pour les chemins canoniques du layout Gradatum.
@@ -56,15 +57,18 @@ pub mod overrides;
 pub mod paths;
 pub mod project_map;
 pub mod provenance;
+pub mod scheduled_health;
 pub mod schema_registry;
 pub mod scope;
 pub mod secrets;
 pub mod section;
+pub mod soul;
 pub mod status;
 pub mod tag;
 pub mod temporal_query;
 pub mod trust;
 pub mod vector_store;
+pub mod write_check;
 
 pub use job::{
     // Source structs nouveaux variants v59
@@ -135,6 +139,8 @@ pub use job::{
     RetryBackoff,
     TriggerCondition,
     TriggerSource,
+    // Memory validation F-43
+    ValidateSpec,
     // VaultScope alias
     VaultScope,
     job_kind_str,
@@ -142,7 +148,7 @@ pub use job::{
 
 pub use document_store::DocumentStore;
 pub use index_store::{AuthorRow, IndexStore, Lineage, ReviewQueueRow, SearchHitRaw};
-pub use temporal_query::{TimelineCursor, TimelineFilter, TimelineRow};
+pub use temporal_query::{TimelineCursor, TimelineFilter, TimelineRow, parse_temporal_str_as_ms};
 pub use vector_store::VectorStore;
 
 /// Crate version (from `workspace.package.version`).

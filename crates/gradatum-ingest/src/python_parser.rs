@@ -1,56 +1,55 @@
-//! Parser tree-sitter pour les fichiers Python (feature `code-python`).
+//! Tree-sitter parser for Python files (feature `code-python`).
 //!
-//! ## Entités extraites
+//! ## Extracted entities
 //!
-//! - Fonctions top-level (`function_definition`) → `DerivedSymbol` avec `kind = "fn"`
-//! - Classes top-level (`class_definition`) → `DerivedSymbol` avec `kind = "class"`
-//! - Méthodes (fonctions dans un bloc `block` enfant d'une classe) → `kind = "method"`,
+//! - Top-level functions (`function_definition`) → `DerivedSymbol` with `kind = "fn"`
+//! - Top-level classes (`class_definition`) → `DerivedSymbol` with `kind = "class"`
+//! - Methods (functions inside the `block` child of a class) → `kind = "method"`,
 //!   `qualified_name = "ClassName::method_name"`
 //!
-//! ## Visibilité Python
+//! ## Python visibility
 //!
-//! Python n'a pas de modificateur de visibilité syntaxique. Convention :
-//! - Nom commençant par `_` (mais pas `__dunder__`) → `"priv"`
-//! - Noms dunder (`__init__`, `__str__`, etc.) → `"pub"` (API publique du protocole)
-//! - Tout autre nom → `"pub"`
+//! Python has no syntactic visibility modifier. Convention:
+//! - Name starting with `_` (but not `__dunder__`) → `"priv"`
+//! - Dunder names (`__init__`, `__str__`, etc.) → `"pub"` (public protocol API)
+//! - Any other name → `"pub"`
 //!
-//! ## Non-extraits (accuracy > coverage)
+//! ## Not extracted (accuracy > coverage)
 //!
-//! - Assignments module-level (`CONSTANT = 42`) : aucun kind adapté dans `DerivedSymbol`
-//!   (force-fitter en "const" serait trompeur en Python — skip documenté)
-//! - Fonctions/classes dans des blocs conditionnels (`if __name__ == "__main__":`)
-//! - Decorated definitions : décorateurs lus mais l'entité inner est extraite normalement
-//! - Deps (call graph) : `deps: vec![]` — TODO F-61 inc2 (extraction call_expression Python)
+//! - Module-level assignments (`CONSTANT = 42`): no suitable kind in `DerivedSymbol`
+//!   (force-fitting as `"const"` would be misleading in Python — intentionally skipped)
+//! - Functions/classes inside conditional blocks (`if __name__ == "__main__":`)
+//! - Decorated definitions: decorators are read, but the inner entity is extracted normally
+//! - Deps (call graph): `deps: vec![]` — call graph extraction not yet implemented
 //!
 //! ## Docstrings
 //!
-//! Le premier `expression_statement` contenant une `string` dans le `block` d'une
-//! fonction ou classe est traité comme docstring (PEP 257).
-//! La docstring module-level (premier statement du module) est ignorée (non associée
-//! à un symbole extractible).
+//! The first `expression_statement` containing a `string` inside the `block` of a
+//! function or class is treated as the docstring (PEP 257).
+//! The module-level docstring (first statement of the module) is ignored (not associated
+//! with an extractable symbol).
 
 use tree_sitter::Node;
 
 use crate::DerivedSymbol;
 
-/// Retourne le texte UTF-8 d'un nœud tree-sitter.
+/// Returns the UTF-8 text of a tree-sitter node.
 ///
-/// ## Invariant de sécurité
+/// ## Safety invariant
 ///
-/// `source` doit être le MÊME buffer passé à `parser.parse(content, None)`.
-/// Les offsets byte de l'AST sont garantis dans ce slice — `utf8_text` ne peut
-/// pas indexer hors-bornes. `.unwrap_or("")` est défensif mais ne se déclenche
-/// normalement jamais.
+/// `source` must be the SAME buffer passed to `parser.parse(content, None)`.
+/// The AST byte offsets are guaranteed to lie within this slice — `utf8_text` cannot
+/// index out of bounds. `.unwrap_or("")` is defensive but should never trigger.
 fn node_text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
-/// Détermine la visibilité d'un symbole Python selon la convention `_`-prefix.
+/// Determines the visibility of a Python symbol according to the `_`-prefix convention.
 ///
-/// Règles :
-/// - `__dunder__` (double underscore des deux côtés) → `"pub"` (protocole Python public)
-/// - `_single_prefix` → `"priv"` (convention privé)
-/// - Tout autre nom → `"pub"`
+/// Rules:
+/// - `__dunder__` (double underscores on both sides) → `"pub"` (public Python protocol)
+/// - `_single_prefix` → `"priv"` (private by convention)
+/// - Any other name → `"pub"`
 fn python_visibility(name: &str) -> &'static str {
     if name.starts_with("__") && name.ends_with("__") {
         // Dunder methods (__init__, __str__, etc.) = API publique du protocole Python.
@@ -62,12 +61,12 @@ fn python_visibility(name: &str) -> &'static str {
     }
 }
 
-/// Calcule le span 1-based inclusif `(start_line, end_line)` d'un nœud.
+/// Computes the 1-based inclusive span `(start_line, end_line)` of a node.
 ///
-/// Mirror de la même fonction dans `rust_parser.rs` (caveats council B2/B3) :
-/// - Lines 1-based : `row + 1` (tree-sitter = 0-based).
-/// - Si `end_position().column == 0` et `row > 0` → exclure la ligne vide terminale.
-/// - Span dégénéré (`start > end`) → `None`.
+/// Mirrors the same function in `rust_parser.rs`:
+/// - Lines are 1-based: `row + 1` (tree-sitter is 0-based).
+/// - If `end_position().column == 0` and `row > 0` → exclude the trailing blank line.
+/// - Degenerate span (`start > end`) → `None`.
 fn extract_node_span(node: Node<'_>) -> Option<(u32, u32)> {
     let start_line = (node.start_position().row as u32).saturating_add(1);
     let end_line = if node.end_position().column == 0 && node.end_position().row > 0 {
@@ -82,10 +81,10 @@ fn extract_node_span(node: Node<'_>) -> Option<(u32, u32)> {
     Some((start_line, end_line))
 }
 
-/// Extrait la docstring d'un bloc Python (première `expression_statement` contenant une `string`).
+/// Extracts the docstring from a Python block (first `expression_statement` containing a `string`).
 ///
-/// Selon PEP 257, la docstring est le premier statement du body si c'est un littéral string.
-/// La fonction limite à 5 lignes (cohérent avec rust_parser.rs).
+/// Per PEP 257, the docstring is the first statement of the body if it is a string literal.
+/// Output is capped at 5 lines (consistent with rust_parser.rs).
 fn extract_docstring(block_node: Node<'_>, source: &[u8]) -> Option<String> {
     let mut cursor = block_node.walk();
     // La docstring doit être le PREMIER statement du bloc.
@@ -133,10 +132,10 @@ fn extract_docstring(block_node: Node<'_>, source: &[u8]) -> Option<String> {
     None
 }
 
-/// Extrait la signature textuelle d'une fonction Python (paramètres + retour).
+/// Extracts the textual signature of a Python function (parameters + return type).
 ///
-/// Extrait le texte brut du nœud `parameters`, avec troncature char-safe à 120 bytes.
-/// Si un type de retour est présent (après `->`) il est ajouté.
+/// Extracts the raw text of the `parameters` node with a char-safe truncation at 120 bytes.
+/// If a return type annotation is present (after `->`) it is appended.
 fn extract_fn_signature(node: Node<'_>, source: &[u8]) -> Option<String> {
     let mut params_text: Option<String> = None;
     let mut return_type: Option<String> = None;
@@ -178,12 +177,12 @@ fn extract_fn_signature(node: Node<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
-/// Extrait une fonction top-level ou une méthode.
+/// Extracts a top-level function or a method.
 ///
-/// # Paramètres
+/// # Parameters
 ///
-/// - `class_name` : `Some("ClassName")` si cette fonction est une méthode d'une classe.
-/// - `visibility_filter` : si `true`, exclure les items privés (`_`-prefix).
+/// - `class_name`: `Some("ClassName")` if this function is a method of a class.
+/// - `include_private`: when `false`, items with a `_`-prefix are excluded.
 fn extract_function(
     node: Node<'_>,
     source: &[u8],
@@ -248,7 +247,7 @@ fn extract_function(
     })
 }
 
-/// Extrait les méthodes d'une classe (fonctions dans le bloc body).
+/// Extracts the methods of a class (functions inside the body block).
 fn extract_class_methods(
     class_name: &str,
     block_node: Node<'_>,
@@ -290,7 +289,7 @@ fn extract_class_methods(
     }
 }
 
-/// Extrait une classe top-level et ses méthodes.
+/// Extracts a top-level class and its methods.
 fn extract_class(
     node: Node<'_>,
     source: &[u8],
@@ -354,9 +353,9 @@ fn extract_class(
     }
 }
 
-/// Extrait les items top-level d'un module Python.
+/// Extracts top-level items from a Python module.
 ///
-/// Parcourt les enfants directs du nœud `module` et dispatche selon le kind.
+/// Iterates over the direct children of the `module` node and dispatches by kind.
 fn extract_module_items(
     module_node: Node<'_>,
     source: &[u8],
@@ -403,12 +402,12 @@ fn extract_module_items(
     }
 }
 
-/// Implémentation [`crate::language_parser::LanguageParser`] pour Python (tree-sitter-python).
+/// [`crate::language_parser::LanguageParser`] implementation for Python (tree-sitter-python).
 ///
-/// Encapsule la connaissance de la grammaire Python : node-kinds, extraction de symboles,
-/// convention de visibilité `_`-prefix.
+/// Encapsulates Python grammar knowledge: node kinds, symbol extraction,
+/// and the `_`-prefix visibility convention.
 pub(crate) struct PythonParser {
-    /// Si `true`, inclure les items privés (`_`-prefix) dans les symboles extraits.
+    /// When `true`, private items (names starting with `_`) are included in the output.
     pub(crate) include_private: bool,
 }
 

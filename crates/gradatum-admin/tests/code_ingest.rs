@@ -18,7 +18,10 @@
 //!
 //! Ces tests ne dépendent pas de l'accès réseau ni du service gradatum LIVE.
 
-use gradatum_admin::code_cmd::{CODE_MAP_REBUILD_MAX_FAILURES, CodeIngestArgs, run_ingest};
+use gradatum_admin::code_cmd::{
+    CODE_MAP_REBUILD_MAX_FAILURES, CODE_MAP_REBUILD_MAX_RETRY, CodeIngestArgs, run_ingest,
+    write_marker_attempts,
+};
 use gradatum_index::{Freshness, SqliteIndex};
 use gradatum_ingest::content_hash_source;
 use tempfile::TempDir;
@@ -861,6 +864,124 @@ async fn a3_incomplete_marker_triggers_rebuild_and_cleanup() {
     assert_eq!(
         report2.files_skipped, report2.files_total,
         "a3: 2e run = idempotence (tous les fichiers skippés)"
+    );
+}
+
+// ── Garde-fou anti-boucle rebuild — tests d'intégration ──────────────────────
+
+/// Vérifie que si le marqueur contient un compteur >= `CODE_MAP_REBUILD_MAX_RETRY`,
+/// `run_ingest` retourne une `Err` (pas de rebuild) et loggue une erreur.
+///
+/// ## Invariant (garde-fou anti-boucle)
+///
+/// Un marqueur saturerait la boucle `run_update → run_ingest` en cas de crash
+/// systématique de `run_ingest`. Le garde-fou s'arrête après N tentatives et
+/// demande une intervention manuelle (suppression du marqueur).
+///
+/// ## Stratégie
+///
+/// On écrit manuellement le compteur == `CODE_MAP_REBUILD_MAX_RETRY` dans le marqueur,
+/// puis on appelle `run_ingest`. On vérifie que :
+/// 1. `run_ingest` retourne `Err` (pas de succès silencieux).
+/// 2. Le message d'erreur mentionne le vault_id.
+/// 3. Le marqueur est toujours présent (non supprimé par un run avorté).
+#[tokio::test]
+async fn a4_marker_at_max_retry_returns_error() {
+    let repo_tmp = setup_git_repo(RUST_SNIPPET);
+    let (index_path, _index_tmp) = setup_index().await;
+
+    let vault_id = "code-a4-retry-guard".to_string();
+
+    // Calculer le chemin du marqueur (même logique que run_ingest).
+    let safe_vault = vault_id.replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
+    let marker_path = index_path
+        .parent()
+        .expect("index_path doit avoir un parent")
+        .join(format!(".ingest-incomplete-{safe_vault}"));
+
+    // Poser le marqueur avec compteur == MAX_RETRY (seuil de blocage).
+    write_marker_attempts(&marker_path, CODE_MAP_REBUILD_MAX_RETRY)
+        .expect("écriture marqueur avec compteur saturé");
+    assert!(
+        marker_path.exists(),
+        "précondition : marqueur doit exister avant run_ingest"
+    );
+
+    // run_ingest doit retourner Err (garde-fou activé).
+    let result = run_ingest(CodeIngestArgs {
+        repo_path: repo_tmp.path().to_path_buf(),
+        vault_id: vault_id.clone(),
+        index_path: index_path.clone(),
+        rebuild: false,
+        ..Default::default()
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a4: run_ingest doit retourner Err quand le compteur du marqueur atteint MAX_RETRY. \
+         Résultat obtenu : Ok({:?})",
+        result.ok()
+    );
+
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains(&vault_id) || err_msg.contains("tentatives"),
+        "a4: le message d'erreur doit mentionner le vault_id ou 'tentatives'. \
+         Message : {err_msg}"
+    );
+
+    // Le marqueur doit toujours être présent (run avorté, pas de cleanup).
+    assert!(
+        marker_path.exists(),
+        "a4: le marqueur doit rester présent après un run avorté par le garde-fou"
+    );
+}
+
+/// Vérifie qu'un marqueur avec compteur = MAX_RETRY - 1 (sous le seuil) laisse
+/// passer le run et incrémente le compteur.
+///
+/// Teste la frontière exacte : à N-1 tentatives, le rebuild est autorisé.
+/// À N tentatives, il est bloqué (cf. `a4_marker_at_max_retry_returns_error`).
+#[tokio::test]
+async fn a5_marker_below_max_retry_allows_rebuild_and_increments() {
+    let repo_tmp = setup_git_repo(RUST_SNIPPET);
+    let (index_path, _index_tmp) = setup_index().await;
+
+    let vault_id = "code-a5-retry-below".to_string();
+
+    let safe_vault = vault_id.replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
+    let marker_path = index_path
+        .parent()
+        .expect("index_path doit avoir un parent")
+        .join(format!(".ingest-incomplete-{safe_vault}"));
+
+    // Poser le marqueur avec compteur = MAX_RETRY - 1 (juste sous le seuil).
+    let below = CODE_MAP_REBUILD_MAX_RETRY - 1;
+    write_marker_attempts(&marker_path, below).expect("écriture marqueur sous le seuil");
+
+    // run_ingest doit réussir (rebuild autorisé sous le seuil).
+    let report = run_ingest(CodeIngestArgs {
+        repo_path: repo_tmp.path().to_path_buf(),
+        vault_id: vault_id.clone(),
+        index_path: index_path.clone(),
+        rebuild: false,
+        ..Default::default()
+    })
+    .await
+    .expect("a5: run_ingest doit réussir sous le seuil MAX_RETRY");
+
+    // Le run réussi supprime le marqueur (compteur reset implicite).
+    assert!(
+        !marker_path.exists(),
+        "a5: le marqueur doit être supprimé après un run complet réussi"
+    );
+
+    // Des notes doivent avoir été insérées.
+    assert!(
+        report.notes_inserted > 0,
+        "a5: des notes doivent être insérées (rebuild autorisé, notes_inserted={})",
+        report.notes_inserted
     );
 }
 

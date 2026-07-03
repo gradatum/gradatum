@@ -583,18 +583,19 @@ impl ServerHandler for StubHandler {
             .with_protocol_version(ProtocolVersion::default())
     }
 
-    /// Lists the 21 exposed MCP tools (11 read + 3 write + 4 history + 1 forget + 1 lesson recall + 1 code scope — matches the REST server API).
+    /// Lists the 23 exposed MCP tools (11 read + 3 write + 4 history + 1 forget + 1 lesson recall + 1 code scope + 2 proactive recall — matches the REST server API).
     fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
         use gradatum_dto::{
-            CodeScopeRequest, LessonsRecallRequest, VaultClassifyRequest, VaultContextRequest,
-            VaultDiffRequest, VaultDowngradeRequest, VaultForgetRequest, VaultGraphRequest,
-            VaultHistoryGetRequest, VaultHistoryRequest, VaultLinksRequest, VaultListRequest,
-            VaultReadRequest, VaultRestoreRequest, VaultSearchRequest, VaultTimelineRequest,
-            VaultTraceRequest, VaultWriteRequest,
+            CodeScopeRequest, LessonsRecallRequest, ProactiveRecallFeedbackRequest,
+            ProactiveRecallRequest, VaultClassifyRequest, VaultContextRequest, VaultDiffRequest,
+            VaultDowngradeRequest, VaultForgetRequest, VaultGraphRequest, VaultHistoryGetRequest,
+            VaultHistoryRequest, VaultLinksRequest, VaultListRequest, VaultReadRequest,
+            VaultRestoreRequest, VaultSearchRequest, VaultTimelineRequest, VaultTraceRequest,
+            VaultWriteRequest,
         };
 
         let tools = vec![
@@ -706,6 +707,31 @@ impl ServerHandler for StubHandler {
                  deps, stale}], truncated, total_matched}. Une entrée stale=true est PÉRIMÉE \
                  (fichier modifié depuis l'ingest) — NE PAS l'utiliser comme vérité.",
             ),
+            // ── Proactive Recall tools F-46 (2) — POST, surface in-process B' ───
+            tool_def::<ProactiveRecallRequest>(
+                "vault_proactive_recall",
+                "Rappel proactif de mémoire (F-46, Active Recall). \
+                 Deux modes selon la présence de 'context' : \
+                 (1) context absent → mode 'proactive' : lit la surface pré-calculée \
+                 (calcul en arrière-plan toutes les 15 min). Surface absente → items vides. \
+                 (2) context présent → mode 'contextual' : retrieval RRF à la demande \
+                 sur les sections fournies ou toutes les sections. \
+                 Champs : tenant_id (opt, défaut 'main'), context (opt), sections (opt), \
+                 limit (opt, défaut 10, max 20). \
+                 Retourne {recall_id, mode, items:[{ulid, title, section, snippet, score}]}. \
+                 recall_id sert de corrélateur pour vault_proactive_recall_feedback.",
+            ),
+            tool_def::<ProactiveRecallFeedbackRequest>(
+                "vault_proactive_recall_feedback",
+                "Feedback d'acceptation pour une session de rappel proactif (F-46). \
+                 Corrèle les notes effectivement utilisées avec la surface présentée. \
+                 Idempotent : 2× le même feedback = 1 enregistrement. \
+                 Validation : accepted_ulids ⊆ surfaced (sur-ensemble → 400). \
+                 Champs : recall_id (req — retourné par vault_proactive_recall), \
+                 accepted_ulids (req — liste ULIDs acceptés, peut être vide), \
+                 tenant_id (opt, défaut 'main'). \
+                 Retourne 200 sur succès.",
+            ),
         ];
         std::future::ready(Ok(ListToolsResult {
             tools,
@@ -759,6 +785,11 @@ impl ServerHandler for StubHandler {
                 }
                 // Code Scope F-61 — POST endpoint dédié code-map
                 "code_scope" => self.forward_post("code_scope", body).await?,
+                // Proactive Recall F-46 — POST, surface in-process B'
+                "vault_proactive_recall" => self.forward_post("proactive_recall", body).await?,
+                "vault_proactive_recall_feedback" => {
+                    self.forward_post("proactive_recall/feedback", body).await?
+                }
                 unknown => {
                     return Err(ErrorData::invalid_params(
                         format!("outil inconnu : {unknown}"),
@@ -774,13 +805,21 @@ impl ServerHandler for StubHandler {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Builds the GET endpoint `lessons/recall?class=&limit=` from MCP arguments.
+/// Builds the GET endpoint `lessons/recall?class=&limit=&rank=&semantic=&query=` from MCP arguments.
 ///
 /// Validates `class` against the controlled vocabulary [`gradatum_dto::LESSON_CLASSES`]
 /// BEFORE constructing the URL: (1) returns a clear client error if the class is invalid;
 /// (2) guarantees that `class` contains only URL-safe characters (alphanumeric and hyphen)
 /// — no percent-encoding needed, no injection possible.
 /// `limit`, when present, must be a positive integer.
+/// `rank`, when present, must be a string (`"relevance"` or `"recency-boosted"`).
+/// `semantic`, when present, must be a boolean.
+/// `query`, when present, must be a string — percent-encoded before insertion.
+///
+/// ## Rétro-compat
+///
+/// `rank`, `semantic`, `query` sont des champs opt-in : leur absence ne change pas
+/// le comportement du serveur (BM25 order inchangé, hook LIVE `lesson-recall.sh` préservé).
 fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, ErrorData> {
     let class = body
         .get("class")
@@ -802,6 +841,8 @@ fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, Err
     }
 
     let mut endpoint = format!("lessons/recall?class={class}");
+
+    // `limit` — entier positif optionnel.
     if let Some(limit_val) = body.get("limit") {
         // limit absent/null → endpoint sans param (le serveur applique son défaut).
         if !limit_val.is_null() {
@@ -814,7 +855,79 @@ fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, Err
             endpoint.push_str(&format!("&limit={limit}"));
         }
     }
+
+    // `rank` — mode de tri opt-in (vocabulaire contrôlé : "relevance" | "recency-boosted").
+    // Absent/null → BM25 order inchangé (rétro-compat absolue, hook LIVE en dépend).
+    if let Some(rank_val) = body.get("rank")
+        && !rank_val.is_null()
+    {
+        let rank = rank_val.as_str().ok_or_else(|| {
+            ErrorData::invalid_params("vault_lessons_recall : 'rank' doit être une string", None)
+        })?;
+        // Valeurs admises identiques à RankMode (serde rename_all kebab-case).
+        // Le serveur valide et retourne 400 sur valeur inconnue — percent-encodé
+        // pour empêcher toute injection dans la query string (parité avec `query`).
+        endpoint.push_str("&rank=");
+        endpoint.push_str(&percent_encode_value(rank));
+    }
+
+    // `semantic` — opt-in retrieval hybride (bool).
+    // Absent/false → chemin BM25 inchangé (rétro-compat absolue).
+    if let Some(sem_val) = body.get("semantic")
+        && !sem_val.is_null()
+    {
+        let semantic = sem_val.as_bool().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "vault_lessons_recall : 'semantic' doit être un booléen",
+                None,
+            )
+        })?;
+        endpoint.push_str(if semantic {
+            "&semantic=true"
+        } else {
+            "&semantic=false"
+        });
+    }
+
+    // `query` — texte libre pour la recherche sémantique (opt-in, semantic=true).
+    // Absent → le serveur utilise `class` comme requête par défaut. Percent-encodé.
+    if let Some(query_val) = body.get("query")
+        && !query_val.is_null()
+    {
+        let query = query_val.as_str().ok_or_else(|| {
+            ErrorData::invalid_params("vault_lessons_recall : 'query' doit être une string", None)
+        })?;
+        endpoint.push_str("&query=");
+        endpoint.push_str(&percent_encode_value(query));
+    }
+
     Ok(endpoint)
+}
+
+/// URL-encode une valeur de query string selon RFC 3986 percent-encoding.
+///
+/// Encode tout octet non classé « unreserved » (ALPHA / DIGIT / `-` / `.` / `_` / `~`).
+/// Les caractères UTF-8 multi-octet sont encodés octet par octet (`é` → `%C3%A9`).
+///
+/// ## Sécurité
+///
+/// Garantit qu'aucun caractère de contrôle URL (`&`, `=`, `+`, `?`, `#`, `%`, `/`, …)
+/// ne peut perturber la query string construite dans [`build_lessons_recall_endpoint`].
+fn percent_encode_value(s: &str) -> String {
+    let mut encoded = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b => {
+                use std::fmt::Write as _;
+                // Invariant : write! sur String est infaillible — pas de retour d'erreur.
+                let _ = write!(encoded, "%{b:02X}");
+            }
+        }
+    }
+    encoded
 }
 
 /// Construit un [`Tool`] MCP avec schéma JSON dérivé du type `T`.
@@ -972,10 +1085,10 @@ mod tests {
 
     #[test]
     fn list_tools_count_matches_expected() {
-        // Liste canonique des 20 tools (11 read + 3 write + 4 history F-40 + 1 forget
-        // F-44 + 1 lesson recall F-60). Cette constante est la source de vérité pour
-        // le compte : si on ajoute un tool en production sans MAJ cette liste, le test
-        // échoue explicitement avec le nom de la constante dans le message d'erreur.
+        // Liste canonique des 23 tools (11 read + 3 write + 4 history F-40 + 1 forget
+        // F-44 + 1 lesson recall F-60 + 1 code scope F-61 + 2 proactive recall F-46).
+        // Cette constante est la source de vérité pour le compte : si on ajoute un tool
+        // en production sans MAJ cette liste, le test échoue explicitement.
         const EXPECTED_TOOL_NAMES: &[&str] = &[
             // read
             "vault_search",
@@ -1004,12 +1117,15 @@ mod tests {
             "vault_lessons_recall",
             // code scope F-61
             "code_scope",
+            // proactive recall F-46
+            "vault_proactive_recall",
+            "vault_proactive_recall_feedback",
         ];
 
         assert_eq!(
             EXPECTED_TOOL_NAMES.len(),
-            21,
-            "liste canonique doit contenir 21 tools (11 read + 3 write + 4 history F-40 + 1 forget F-44 + 1 lesson recall F-60 + 1 code scope F-61)"
+            23,
+            "liste canonique doit contenir 23 tools (11 read + 3 write + 4 history F-40 + 1 forget F-44 + 1 lesson recall F-60 + 1 code scope F-61 + 2 proactive recall F-46)"
         );
     }
 
@@ -1057,6 +1173,101 @@ mod tests {
         let body = serde_json::json!({ "class": "migration", "limit": null });
         let ep = build_lessons_recall_endpoint(&body).expect("classe valide");
         assert_eq!(ep, "lessons/recall?class=migration");
+    }
+
+    #[test]
+    fn build_lessons_recall_endpoint_rank_recency_boosted() {
+        let body = serde_json::json!({ "class": "deploy", "rank": "recency-boosted" });
+        let ep = build_lessons_recall_endpoint(&body).expect("classe + rank valides");
+        assert_eq!(ep, "lessons/recall?class=deploy&rank=recency-boosted");
+    }
+
+    #[test]
+    fn build_lessons_recall_endpoint_rank_relevance() {
+        // rank=relevance est un no-op (BM25 order) — forwardé tel quel pour parité.
+        let body = serde_json::json!({ "class": "release", "rank": "relevance" });
+        let ep = build_lessons_recall_endpoint(&body).expect("classe + rank valides");
+        assert_eq!(ep, "lessons/recall?class=release&rank=relevance");
+    }
+
+    #[test]
+    fn build_lessons_recall_endpoint_rank_null_omitted() {
+        // rank absent/null → endpoint sans param (rétro-compat).
+        let body = serde_json::json!({ "class": "migration", "rank": null });
+        let ep = build_lessons_recall_endpoint(&body).expect("classe valide");
+        assert_eq!(ep, "lessons/recall?class=migration");
+    }
+
+    #[test]
+    fn build_lessons_recall_endpoint_semantic_true() {
+        let body = serde_json::json!({ "class": "archi", "semantic": true });
+        let ep = build_lessons_recall_endpoint(&body).expect("classe + semantic valides");
+        assert_eq!(ep, "lessons/recall?class=archi&semantic=true");
+    }
+
+    #[test]
+    fn build_lessons_recall_endpoint_semantic_false_explicit() {
+        // semantic=false explicite est forwardé — le serveur applique le chemin BM25.
+        let body = serde_json::json!({ "class": "archi", "semantic": false });
+        let ep = build_lessons_recall_endpoint(&body).expect("classe + semantic valides");
+        assert_eq!(ep, "lessons/recall?class=archi&semantic=false");
+    }
+
+    #[test]
+    fn build_lessons_recall_endpoint_query_ascii() {
+        // query ASCII simple — aucun encodage nécessaire.
+        let body = serde_json::json!({ "class": "deploy", "semantic": true, "query": "deploy CI pipeline" });
+        let ep = build_lessons_recall_endpoint(&body).expect("valide");
+        assert_eq!(
+            ep,
+            "lessons/recall?class=deploy&semantic=true&query=deploy%20CI%20pipeline"
+        );
+    }
+
+    #[test]
+    fn build_lessons_recall_endpoint_query_special_chars() {
+        // query avec caractères spéciaux — percent-encodés correctement.
+        let body = serde_json::json!({ "class": "archi", "semantic": true, "query": "a&b=c" });
+        let ep = build_lessons_recall_endpoint(&body).expect("valide");
+        // '&' → %26, '=' → %3D
+        assert_eq!(
+            ep,
+            "lessons/recall?class=archi&semantic=true&query=a%26b%3Dc"
+        );
+    }
+
+    #[test]
+    fn build_lessons_recall_endpoint_full_params() {
+        // Tous les paramètres présents simultanément.
+        let body = serde_json::json!({
+            "class": "migration",
+            "limit": 5,
+            "rank": "recency-boosted",
+            "semantic": true,
+            "query": "sqlx migration"
+        });
+        let ep = build_lessons_recall_endpoint(&body).expect("tous les params valides");
+        assert_eq!(
+            ep,
+            "lessons/recall?class=migration&limit=5&rank=recency-boosted&semantic=true&query=sqlx%20migration"
+        );
+    }
+
+    #[test]
+    fn percent_encode_value_unreserved_chars_unchanged() {
+        // Caractères unreserved RFC 3986 : ALPHA / DIGIT / '-' / '.' / '_' / '~'
+        let input = "abcXYZ019-._~";
+        assert_eq!(percent_encode_value(input), input);
+    }
+
+    #[test]
+    fn percent_encode_value_space_encoded() {
+        assert_eq!(percent_encode_value("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn percent_encode_value_ampersand_encoded() {
+        assert_eq!(percent_encode_value("a&b"), "a%26b");
     }
 
     #[test]

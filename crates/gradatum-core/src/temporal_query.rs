@@ -138,9 +138,80 @@ pub struct TimelineRow {
     pub title: Option<String>,
 }
 
+/// Parses a temporal string as a UTC epoch in milliseconds.
+///
+/// This is the **canonical parser** shared between the validation layer (server)
+/// and the resolution layer (worker). Both sides MUST use this function to ensure
+/// that a value accepted by the server (HTTP 202) is also accepted by the worker
+/// (otherwise an invalid string accepted server-side would silently fall back to
+/// `anchor_src=Created` in the worker — breaking the semantic guarantee).
+///
+/// ## Accepted formats
+///
+/// - ISO 8601 / RFC 3339 with time: `"2026-01-15T10:00:00Z"`
+/// - Date-only YYYY-MM-DD → start of day UTC: `"2026-01-15"`
+///
+/// ## Returns
+///
+/// `Some(epoch_ms)` on success, `None` if the string is malformed.
+///
+/// # Side effects
+///
+/// None. Pure function.
+#[must_use]
+pub fn parse_temporal_str_as_ms(s: &str) -> Option<i64> {
+    // Attempt RFC 3339 (with time)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_millis());
+    }
+    // Attempt date-only YYYY-MM-DD → start of day UTC
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        use chrono::TimeZone as _;
+        let dt = chrono::Utc.from_utc_datetime(
+            &d.and_hms_opt(0, 0, 0)
+                .expect("hms(0,0,0) est un horaire valide — ne peut pas échouer"),
+        );
+        return Some(dt.timestamp_millis());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Tests parse_temporal_str_as_ms (SSOT parseur) ────────────────────────
+
+    /// ISO 8601 complet (RFC 3339) → epoch ms correct.
+    #[test]
+    fn parse_temporal_str_as_ms_rfc3339_returns_ms() {
+        let ms = parse_temporal_str_as_ms("2026-01-15T00:00:00Z");
+        assert!(ms.is_some(), "RFC3339 doit être parsé");
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
+            .expect("parsing ref")
+            .timestamp_millis();
+        assert_eq!(ms.unwrap(), expected);
+    }
+
+    /// YYYY-MM-DD → début du jour UTC en ms.
+    #[test]
+    fn parse_temporal_str_as_ms_date_only_returns_start_of_day_ms() {
+        let ms = parse_temporal_str_as_ms("2026-01-15");
+        assert!(ms.is_some(), "YYYY-MM-DD doit être parsé");
+        // 2026-01-15T00:00:00Z
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
+            .expect("parsing ref")
+            .timestamp_millis();
+        assert_eq!(ms.unwrap(), expected);
+    }
+
+    /// Chaîne invalide → None (pas de panic).
+    #[test]
+    fn parse_temporal_str_as_ms_invalid_returns_none() {
+        assert_eq!(parse_temporal_str_as_ms("pas-une-date"), None);
+        assert_eq!(parse_temporal_str_as_ms(""), None);
+        assert_eq!(parse_temporal_str_as_ms("2026-13-45"), None);
+    }
 
     #[test]
     fn cursor_roundtrip() {

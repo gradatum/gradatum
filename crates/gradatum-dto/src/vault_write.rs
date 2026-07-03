@@ -4,7 +4,9 @@ use crate::default_main;
 
 /// Request body for `vault_write` — creates a note via the async queue.
 ///
-/// Serialized via `bincode::serde::encode_to_vec` for the queue payload.
+/// The **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.
+/// The bincode serialization (`bincode::serde::encode_to_vec`) is used only by the
+/// legacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VaultWriteRequest {
@@ -47,4 +49,50 @@ pub struct VaultWriteRequest {
     /// Never move this field without updating all encoders.
     #[serde(default)]
     pub note_id: Option<String>,
+    /// Temporal anchor — event date of the note (ISO 8601 UTC or YYYY-MM-DD).
+    ///
+    /// When present and parseable, the worker sets `anchor_src = occurred_at` and
+    /// `anchor_ms` to this date's epoch milliseconds, instead of the creation time.
+    ///
+    /// Absent or `null` → `anchor_src = created` (backward-compatible behaviour).
+    ///
+    /// ## Accepted formats
+    ///
+    /// - ISO 8601 / RFC 3339 with time: `"2026-01-15T10:00:00Z"`
+    /// - Date-only YYYY-MM-DD → start of day UTC: `"2026-01-15"`
+    ///
+    /// An unparseable value is rejected by the server with **400 InvalidInput**.
+    ///
+    /// Dates arbitraires (passé/futur) acceptées by-design — pas de borne sémantique.
+    #[serde(default)]
+    pub occurred_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// occurred_at présent → désérialisé en Some.
+    #[test]
+    fn vault_write_request_occurred_at_present_parses_to_some() {
+        let json = r#"{"title":"T","body":"B","occurred_at":"2026-01-15"}"#;
+        let req: VaultWriteRequest = serde_json::from_str(json).expect("parsing VaultWriteRequest");
+        assert_eq!(req.occurred_at, Some("2026-01-15".to_string()));
+    }
+
+    /// occurred_at absent → None (backward-compat).
+    #[test]
+    fn vault_write_request_occurred_at_absent_defaults_to_none() {
+        let json = r#"{"title":"T","body":"B"}"#;
+        let req: VaultWriteRequest = serde_json::from_str(json).expect("parsing VaultWriteRequest");
+        assert_eq!(req.occurred_at, None);
+    }
+
+    /// occurred_at ISO 8601 complet (RFC 3339) → Some.
+    #[test]
+    fn vault_write_request_occurred_at_iso8601_full_parses_to_some() {
+        let json = r#"{"title":"T","body":"B","occurred_at":"2026-01-15T10:00:00Z"}"#;
+        let req: VaultWriteRequest = serde_json::from_str(json).expect("parsing VaultWriteRequest");
+        assert_eq!(req.occurred_at, Some("2026-01-15T10:00:00Z".to_string()));
+    }
 }

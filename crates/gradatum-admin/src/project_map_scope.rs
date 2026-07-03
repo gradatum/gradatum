@@ -48,7 +48,9 @@ pub struct ProjectScope {
 /// Extrait les paires `(key, value)` de wikilinks `[[key:value]]` dans un body.
 ///
 /// Scan non-regex, char-safe. Retourne toutes les paires trouvées.
-fn extract_typed_links(body: &str) -> Vec<(String, String)> {
+///
+/// Exposé `pub(crate)` pour être réutilisé par `project_map_export` (DRY — ADN 3).
+pub(crate) fn extract_typed_links(body: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut rest = body;
     while let Some(start) = rest.find("[[") {

@@ -2,7 +2,7 @@
 
 > Wire DTOs for the gradatum HTTP API — single source of truth for all `Vault*Request` structs.
 
-**Status**: Alpha (v0.4.x) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -21,10 +21,10 @@ independent of internal domain evolution.
 
 ```toml
 # Without JSON Schema generation (server / SDK):
-gradatum-dto = "0.4.0"
+gradatum-dto = "0.7.6"
 
 # With JSON Schema generation (MCP stub):
-gradatum-dto = { version = "0.4.0", features = ["schemars"] }
+gradatum-dto = { version = "0.7.6", features = ["schemars"] }
 ```
 
 ```rust

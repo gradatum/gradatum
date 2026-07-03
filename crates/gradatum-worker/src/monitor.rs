@@ -48,7 +48,7 @@ use crate::internal_client::InternalClient;
 use super::apalis_backend::build_gradatum_backend;
 use super::apalis_handlers::{
     DistillSynthesizer, handle_curate, handle_distill, handle_embed, handle_forget, handle_purge,
-    handle_reindex,
+    handle_reindex, handle_validate,
 };
 use super::metrics::WorkerMetrics;
 use super::schedules::{ScheduleConfig, handle_cleanup_dlq};
@@ -136,6 +136,15 @@ pub struct WorkersConfig {
     /// (CoW). O(n²) clustering bounded by `batch_limit`. Long timeout (corpus + synthesis).
     #[serde(default = "WorkersConfig::default_distill")]
     pub distill: WorkerConfig,
+    /// Validate worker — deterministic quality gate before persistence (F-43).
+    ///
+    /// Concurrency 1: scorer + persist are sequential per synthesis.
+    /// Timeout matches distill (embedder call + persist). Retries=2: `persist_distill` is
+    /// idempotent (fixed pre-allocated note_id, unconditional write; source-marking
+    /// idempotent — sources already marked processed in handle_distill before enqueue).
+    /// Transient failures must not make the job terminal and lose the note.
+    #[serde(default = "WorkersConfig::default_validate")]
+    pub validate: WorkerConfig,
 }
 
 impl WorkersConfig {
@@ -190,9 +199,25 @@ impl WorkersConfig {
             concurrency: 1,
             // Long timeout: O(n²) clustering over batch_limit notes + synthesis per cluster.
             timeout_secs: 300,
-            // No automatic retry: a synthesis failure (gateway down) must not loop;
-            // already-written clusters are idempotent (sources marked as processed).
+            // No automatic retry: a synthesis failure (gateway down) must not loop.
+            // Idempotent on re-run: sources are marked processed in handle_distill
+            // (early marking before Job::Validate enqueue) — a re-run skips them.
             max_retries: 0,
+        }
+    }
+
+    fn default_validate() -> WorkerConfig {
+        WorkerConfig {
+            // Concurrency 1 — one scorer per synthesis (embedder call + persist, sequential).
+            concurrency: 1,
+            // Timeout matches distill: embedder call can be slow under load.
+            timeout_secs: 300,
+            // Retries=2: `persist_distill` is idempotent (fixed pre-allocated note_id,
+            // expected_sha256=None → unconditional write; source-marking idempotent
+            // — sources already marked processed in handle_distill before enqueue).
+            // A transient failure must not make the job terminal — without retries
+            // the distilled synthesis note is permanently lost.
+            max_retries: 2,
         }
     }
 }
@@ -206,6 +231,7 @@ impl Default for WorkersConfig {
             purge: Self::default_purge(),
             forget: Self::default_forget(),
             distill: Self::default_distill(),
+            validate: Self::default_validate(),
         }
     }
 }
@@ -266,6 +292,7 @@ pub fn build_monitor(
     let purge_cfg = config.workers.purge.clone();
     let forget_cfg = config.workers.forget.clone();
     let distill_cfg = config.workers.distill.clone();
+    let validate_cfg = config.workers.validate.clone();
 
     // Isolated backends per kind — each worker fetches ONLY its own jobs.
     // DLQ routing fix: build_gradatum_backend(store, kind) calls dequeue_by_kind(kind)
@@ -280,6 +307,7 @@ pub fn build_monitor(
     let (purge_backend, purge_ack) = build_gradatum_backend(Arc::clone(&store), "Purge")?;
     let (forget_backend, forget_ack) = build_gradatum_backend(Arc::clone(&store), "Forget")?;
     let (distill_backend, distill_ack) = build_gradatum_backend(Arc::clone(&store), "Distill")?;
+    let (validate_backend, validate_ack) = build_gradatum_backend(Arc::clone(&store), "Validate")?;
 
     let m_curate = metrics.clone();
     let m_embed = metrics.clone();
@@ -287,6 +315,7 @@ pub fn build_monitor(
     let m_purge = metrics.clone();
     let m_forget = metrics.clone();
     let m_distill = metrics.clone();
+    let m_validate = metrics.clone();
 
     let mut monitor = Monitor::new()
         // ── Curate worker ─────────────────────────────────────────────────────
@@ -469,6 +498,8 @@ pub fn build_monitor(
             let client_d = Arc::clone(&client);
             let embedder_d = Arc::clone(&embedder);
             let synth_d = Arc::clone(&distill_synthesizer);
+            // Queue injected into handle_distill for distill→validate chaining (F-43).
+            let store_d = Arc::clone(&store);
             move |idx| {
                 let worker_name = format!("distill-{idx}");
                 WorkerBuilder::new(&worker_name)
@@ -477,6 +508,7 @@ pub fn build_monitor(
                     .data(Arc::clone(&client_d) as Arc<dyn InternalClient>)
                     .data(Arc::clone(&embedder_d) as Arc<dyn Embedder + Send + Sync>)
                     .data(Arc::clone(&synth_d) as Arc<dyn DistillSynthesizer + Send + Sync>)
+                    .data(Arc::clone(&store_d) as Arc<dyn QueueStore + Send + Sync>)
                     .ack_with(ack.clone())
                     .enable_tracing()
                     .timeout(Duration::from_secs(cfg.timeout_secs))
@@ -494,6 +526,40 @@ pub fn build_monitor(
                         }
                     })
                     .build(handle_distill)
+            }
+        })
+        // ── Validate worker ───────────────────────────────────────────────────
+        .register({
+            let cfg = validate_cfg.clone();
+            let backend = validate_backend;
+            let ack = validate_ack;
+            let m = m_validate;
+            let client_v = Arc::clone(&client);
+            let embedder_v = Arc::clone(&embedder);
+            move |idx| {
+                let worker_name = format!("validate-{idx}");
+                WorkerBuilder::new(&worker_name)
+                    .backend(backend.clone())
+                    // Order matches the parameter order of handle_validate.
+                    .data(Arc::clone(&client_v) as Arc<dyn InternalClient>)
+                    .data(Arc::clone(&embedder_v) as Arc<dyn Embedder + Send + Sync>)
+                    .ack_with(ack.clone())
+                    .enable_tracing()
+                    .timeout(Duration::from_secs(cfg.timeout_secs))
+                    .retry(RetryPolicy::retries(cfg.max_retries))
+                    .catch_panic()
+                    .concurrency(cfg.concurrency)
+                    .on_event({
+                        let m = m.clone();
+                        move |_ctx, ev| match ev {
+                            Event::Start => m.inc_workers_active("validate"),
+                            Event::Stop => m.dec_workers_active("validate"),
+                            Event::Success => m.inc_jobs_total("validate", "done"),
+                            Event::Error(_) => m.inc_jobs_total("validate", "error"),
+                            _ => {}
+                        }
+                    })
+                    .build(handle_validate)
             }
         });
 

@@ -37,11 +37,16 @@
 
 /// Temporal recency decay factor.
 ///
-/// Returns 1.0 for a note created right now; decays exponentially with age.
+/// Returns 1.0 for a note anchored right now; decays exponentially with age.
 /// Future timestamps (clock skew) are clamped to 0 days → 1.0.
 ///
 /// # Parameters
-/// - `note_created_ms`: creation timestamp of the note in UTC epoch milliseconds.
+/// - `note_created_ms`: canonical anchor timestamp of the note in UTC epoch milliseconds.
+///   Callers pass `hit.anchor_ms.unwrap_or(created_ms)` — the anchor is the
+///   canonical event date (`occurred_at` / `event-date` / `valid_from` via
+///   `temporal_index`), falling back to the ingestion timestamp (`notes.created`)
+///   when absent. For static notes (`anchor_src = Created`), `anchor_ms == created_ms`
+///   and the result is **bit-identical** to the pre-F-17 behaviour.
 /// - `now_ms`: current timestamp in UTC epoch milliseconds.
 ///
 /// # Returns
@@ -199,6 +204,129 @@ pub fn trust_decay_factor(trust: f64, age_days: f64, half_life_days: Option<f64>
     }
 }
 
+/// Wire scoring weights (local mirror of `gradatum-dto::ScoringWeights`).
+///
+/// Wire/lib decoupling: `gradatum-search` does not depend on `gradatum-dto`.
+/// The server converts `ScoringWeights` → `ScoringWeightsWire` before calling
+/// [`resolve_weights`].
+///
+/// All fields are optional — `None` lets the pipeline use the default value.
+#[derive(Debug, Clone, Default)]
+pub struct ScoringWeightsWire {
+    /// Recency weight (default: 0.2).
+    pub recency: Option<f64>,
+    /// PageRank weight (default: 0.1).
+    pub pagerank: Option<f64>,
+    /// Trust weight (default: [`GAMMA_TRUST`]).
+    pub trust: Option<f64>,
+}
+
+/// Resolved scoring weights (defaults applied).
+///
+/// Produced by [`resolve_weights`] from an optional [`ScoringWeightsWire`].
+/// Consumed by [`composite_score_weighted`].
+///
+/// # Defaults
+///
+/// `{ recency: 0.2, pagerank: 0.1, trust: GAMMA_TRUST }` — identical to the α/β/γ
+/// coefficients of [`composite_score`] and [`composite_score_with_trust`].
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedWeights {
+    /// Recency weight (α, default 0.2).
+    pub recency: f64,
+    /// PageRank weight (β, default 0.1).
+    pub pagerank: f64,
+    /// Trust weight (γ, default [`GAMMA_TRUST`]).
+    pub trust: f64,
+}
+
+impl Default for ResolvedWeights {
+    /// Defaults: α=0.2, β=0.1, γ=[`GAMMA_TRUST`] (0.15).
+    ///
+    /// With these defaults, [`composite_score_weighted`] reproduces [`composite_score_with_trust`]
+    /// **bit-for-bit**.
+    fn default() -> Self {
+        Self {
+            recency: 0.2,
+            pagerank: 0.1,
+            trust: GAMMA_TRUST,
+        }
+    }
+}
+
+/// Resolves scoring weights by substituting defaults for any `None` fields.
+///
+/// # Parameters
+///
+/// - `w`: optional wire weights. `None` → all defaults.
+///
+/// # Returns
+///
+/// [`ResolvedWeights`] with each field set to either the wire value or the default.
+///
+/// # Examples
+///
+/// ```
+/// # use gradatum_search::scoring::{ScoringWeightsWire, resolve_weights};
+/// let w = resolve_weights(None); // all defaults
+/// assert!((w.recency - 0.2).abs() < 1e-9);
+///
+/// let wire = ScoringWeightsWire { recency: Some(0.5), ..Default::default() };
+/// let w2 = resolve_weights(Some(&wire));
+/// assert!((w2.recency - 0.5).abs() < 1e-9);
+/// assert!((w2.pagerank - 0.1).abs() < 1e-9); // default preserved
+/// ```
+#[must_use]
+pub fn resolve_weights(w: Option<&ScoringWeightsWire>) -> ResolvedWeights {
+    let d = ResolvedWeights::default();
+    match w {
+        None => d,
+        Some(x) => ResolvedWeights {
+            recency: x.recency.unwrap_or(d.recency),
+            pagerank: x.pagerank.unwrap_or(d.pagerank),
+            trust: x.trust.unwrap_or(d.trust),
+        },
+    }
+}
+
+/// Generalizes the existing multiplicative form with configurable weights.
+///
+/// Formula: `rrf × (1 + w.recency × recency) × (1 + w.pagerank × pagerank)
+///           [× (1 + w.trust × trust_decayed)]` — the trust term is applied **only**
+/// when `trust_params.is_some()` (same condition as [`composite_score_with_trust`]).
+///
+/// # Parity
+///
+/// With [`ResolvedWeights::default()`] (w.recency=0.2, w.pagerank=0.1, w.trust=GAMMA_TRUST),
+/// reproduces [`composite_score_with_trust`] **bit-for-bit** in both branches
+/// (`None` and `Some`).
+///
+/// # Parameters
+///
+/// - `rrf`: raw RRF score (`Candidate.rrf_score`).
+/// - `recency`: recency factor (`recency_factor(created_ms, now_ms)`).
+/// - `pagerank`: PageRank factor (`pagerank_factor(in_degree)`).
+/// - `trust_params`: `Some((trust, age_days, half_life))` or `None` (trust disabled).
+/// - `w`: resolved weights (produced by [`resolve_weights`]).
+///
+/// # Errors
+///
+/// Pure function — infaillible.
+#[must_use]
+pub fn composite_score_weighted(
+    rrf: f64,
+    recency: f64,
+    pagerank: f64,
+    trust_params: Option<(f64, f64, Option<f64>)>,
+    w: &ResolvedWeights,
+) -> f64 {
+    let mut s = rrf * (1.0 + w.recency * recency) * (1.0 + w.pagerank * pagerank);
+    if let Some((trust, age_days, hl)) = trust_params {
+        s *= 1.0 + w.trust * trust_decay_factor(trust, age_days, hl);
+    }
+    s
+}
+
 /// Multi-factor composite score **with** trust decay.
 ///
 /// Extends [`composite_score`] by adding the factor `(1 + γ × trust_decayed)`.
@@ -237,8 +365,8 @@ pub fn composite_score_with_trust(
 mod tests {
     use super::*;
 
-    /// D2.2 — `TrustDecayConfig::default` dérive ses demi-vies du const partagé.
-    /// Non-régression decay : `distilled = 90j`, aucune autre provenance.
+    /// `TrustDecayConfig::default` derives its half-lives from the shared const.
+    /// Non-regression: `distilled = 90d`, no other source.
     #[test]
     fn default_half_lives_match_const_source() {
         let map = default_half_lives();
@@ -520,5 +648,52 @@ mod tests {
         let cfg = TrustDecayConfig::default();
         let r = cfg.resolve(Some(0.5), None, 50.0);
         assert_eq!(r, Some((0.5_f32 as f64, 50.0, None)));
+    }
+
+    // ── T6 — ScoringWeights + composite_score_weighted ───────────────────────
+
+    // P0-2 : poids par défaut ⇒ reproduit composite_score_with_trust bit-pour-bit.
+    #[test]
+    fn weighted_defaults_match_existing_multiplicative_bit_for_bit() {
+        let (rrf, rec, pr) = (0.5_f64, 0.9_f64, 0.3_f64);
+        let trust = Some((0.8_f64, 10.0_f64, Some(90.0)));
+        let expected = composite_score_with_trust(rrf, rec, pr, trust);
+        let got = composite_score_weighted(rrf, rec, pr, trust, &ResolvedWeights::default());
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "défauts doivent reproduire l'existant : got={got} expected={expected}"
+        );
+    }
+
+    // Poids nuls ⇒ tous les facteurs (1+0·x)=1 ⇒ score == rrf pur (forme multiplicative).
+    #[test]
+    fn weighted_zero_weights_collapse_to_rrf() {
+        let got = composite_score_weighted(
+            0.5,
+            0.9,
+            0.3,
+            None,
+            &ResolvedWeights {
+                recency: 0.0,
+                pagerank: 0.0,
+                trust: 0.0,
+            },
+        );
+        assert!(
+            (got - 0.5).abs() < 1e-9,
+            "poids nuls → score = rrf = 0.5, got {got}"
+        );
+    }
+
+    // resolve_weights(None) retourne les défauts (0.2 / 0.1 / GAMMA_TRUST).
+    #[test]
+    fn resolve_weights_falls_back_to_defaults() {
+        let w = resolve_weights(None);
+        assert!((w.recency - 0.2).abs() < 1e-9, "recency défaut 0.2");
+        assert!((w.pagerank - 0.1).abs() < 1e-9, "pagerank défaut 0.1");
+        assert!(
+            (w.trust - GAMMA_TRUST).abs() < 1e-9,
+            "trust défaut GAMMA_TRUST={GAMMA_TRUST}"
+        );
     }
 }

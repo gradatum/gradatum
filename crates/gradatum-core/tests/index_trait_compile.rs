@@ -212,6 +212,8 @@ impl IndexStore for MockIndex {
         _section: Option<&str>,
         _locus: Option<&str>,
         _status: Option<&str>,
+        _from_ms: Option<i64>,
+        _to_ms: Option<i64>,
     ) -> Result<Vec<SearchHitRaw>, GradatumError> {
         Ok(vec![])
     }
@@ -236,6 +238,14 @@ impl IndexStore for MockIndex {
 
     async fn count_review_queue(&self, _vault_id: &VaultId) -> Result<u64, GradatumError> {
         Ok(0)
+    }
+
+    async fn find_promotable(
+        &self,
+        _cutoff_ms: i64,
+        _limit: usize,
+    ) -> Result<Vec<(String, gradatum_core::status::NoteStatus)>, GradatumError> {
+        Ok(vec![])
     }
 
     async fn title_lookup(
@@ -299,6 +309,14 @@ impl IndexStore for MockIndex {
         _cursor: Option<&str>,
     ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
         Ok((vec![], 0))
+    }
+
+    async fn list_recent_notes(
+        &self,
+        _vault_id: &str,
+        _k: usize,
+    ) -> Result<Vec<NoteRecord>, GradatumError> {
+        Ok(vec![])
     }
 
     async fn total_body_size_bytes(&self, _vault_id: &str) -> Result<u64, GradatumError> {

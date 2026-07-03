@@ -15,6 +15,8 @@ import { NoteDetailPage } from './pages/NoteDetailPage';
 import { SearchPage } from './pages/SearchPage';
 import { ReviewPage } from './pages/ReviewPage';
 import { JobsPage } from './pages/JobsPage';
+import { SystemPage } from './pages/SystemPage';
+import ActivityPage from './pages/ActivityPage';
 
 function AppRoutes() {
   const { isAuthenticated, login, logout, loading, error } = useAuth();
@@ -46,6 +48,8 @@ function AppRoutes() {
       <Route path="/search" element={<SearchPage />} />
       <Route path="/review" element={<ReviewPage />} />
       <Route path="/jobs" element={<JobsPage />} />
+      <Route path="/system" element={<SystemPage />} />
+      <Route path="/activity" element={<ActivityPage />} />
       <Route path="/login" element={<Navigate to="/" replace />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
