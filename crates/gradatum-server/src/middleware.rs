@@ -1,4 +1,4 @@
-//! Axum middlewares: JWT authentication and rate limiting.
+//! Axum middlewares: JWT authentication, rate limiting and HTTP metrics.
 //!
 //! ## JWT auth middleware
 //!
@@ -19,7 +19,7 @@
 //! **Path B — Bearer JWT (`eyJ...`)** (short-lived, TTL 24h, for interactive clients):
 //! 1. `Authorization: Bearer <token>` header absent → `TrustContext::Unauthenticated`.
 //! 2. Header present, `JwtService::verify(token)` succeeds →
-//!    revocation check: `state.revocation.is_revoked(&jti)` with a 200 ms timeout.
+//!    revocation check: `state.revocation.is_revoked(&jti, "main")` with a 200 ms timeout.
 //!    - Token revoked → immediate 401 (not injected into extensions).
 //!    - Store error or timeout → 401 **fail-closed** + `tracing::error!` (never panic or 500).
 //!    - Valid, non-revoked token → `TrustContext::BearerToken` injected.
@@ -68,10 +68,21 @@
 //!       otherwise: inner.call(req) → real handler body
 //!   → business handler
 //! ```
+//!
+//! ## HTTP metrics middleware
+//!
+//! [`http_metrics_middleware`] feeds the two HTTP families of the Prometheus
+//! registry (`gradatum_http_requests_total`, `gradatum_http_request_duration_seconds`).
+//! It is mounted as the **outermost** layer of the assembled router, so every route
+//! is counted — including `/health`, `/mcp`, `/ui/*`, the 404 fallback, and the
+//! rate-limiter's own 429 replies.
+//!
+//! Cardinality is bounded by construction: see [`http_metrics_middleware`].
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
+use axum::extract::MatchedPath;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -79,6 +90,7 @@ use gradatum_acl_auth::{ApiKeyError, KEY_PREFIX};
 use serde::Serialize;
 
 use crate::config::RateLimitConfig;
+use crate::metrics::{AppMetrics, HttpDurLabels, HttpReqLabels};
 use crate::state::AppState;
 use gradatum_warden::{WardenConfig, WardenLayer};
 
@@ -105,9 +117,79 @@ pub fn build_warden_layer(cfg: &RateLimitConfig) -> Option<WardenLayer> {
         ip_deny: vec![],
     };
     Some(WardenLayer::new(warden_cfg).expect(
-        "config warden invalide — per_minute et burst doivent être > 0, \
-         garantis par RateLimitConfig::default() (60, 10)",
+        "invalid warden config — per_minute and burst must be > 0, \
+         guaranteed by RateLimitConfig::default() (60, 10)",
     ))
+}
+
+// ─── Métriques HTTP ──────────────────────────────────────────────────────────
+
+/// `path` label value used when axum exposes no route pattern for the request.
+///
+/// Two cases fall into this bucket:
+/// - the request matched no route (404 fallback) — the concrete URI is deliberately
+///   **not** used as a label, otherwise any scanner could create unbounded series;
+/// - the route is mounted with `Router::nest_service` (studio `/ui/*`), for which axum
+///   inserts a private `MatchedNestedPath` instead of [`MatchedPath`](axum::extract::MatchedPath) — the pattern is
+///   not reachable from a middleware.
+pub const OTHER_ROUTE: &str = "other";
+
+/// Axum middleware feeding the HTTP counter and duration histogram.
+///
+/// Mounted via `axum::middleware::from_fn_with_state(state.metrics.clone(), _)` as the
+/// outermost layer of the fully assembled router (see `build_router` in `main.rs`).
+///
+/// # Observed series
+///
+/// - `gradatum_http_requests_total{method, path, status}` — incremented once per request.
+/// - `gradatum_http_request_duration_seconds{method, path}` — wall-clock duration of
+///   `next.run(request)`, i.e. everything downstream of this layer (auth, rate limiting,
+///   handler, response serialisation).
+///
+/// # Cardinality
+///
+/// `path` is the **route pattern** obtained from the
+/// [`MatchedPath`](axum::extract::MatchedPath) extension
+/// (`/api/v1/vault/unforgot/{ulid}`), never the concrete URI — no series is ever created
+/// per ULID. `Router::layer` runs *after* routing in axum 0.8, so the extension is
+/// available here; `Router::nest` flattens nested routes into the outer table, so the
+/// pattern already carries the `/api/v1` prefix. Requests without a pattern fall into
+/// [`OTHER_ROUTE`]. The label domain is therefore bounded by the route table, and no
+/// admission cap is needed (unlike the tenant label, which is user-supplied).
+pub async fn http_metrics_middleware(
+    axum::extract::State(metrics): axum::extract::State<AppMetrics>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    // Les labels sont capturés AVANT `next.run` : la requête est consommée par le handler,
+    // et un handler peut réécrire l'URI. Le motif de route, lui, est déjà figé par le routage.
+    let method = request.method().as_str().to_owned();
+    let path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or(OTHER_ROUTE, MatchedPath::as_str)
+        .to_owned();
+
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let elapsed_secs = started.elapsed().as_secs_f64();
+    let status = response.status().as_u16();
+
+    metrics
+        .http_requests
+        .get_or_create(&HttpReqLabels {
+            method: method.clone(),
+            path: path.clone(),
+            status,
+        })
+        .inc();
+    // Labels déplacés (pas clonés) : le compteur ci-dessus est le seul à en avoir besoin après.
+    metrics
+        .http_duration
+        .get_or_create(&HttpDurLabels { method, path })
+        .observe(elapsed_secs);
+
+    response
 }
 
 // ─── Auth JWT ────────────────────────────────────────────────────────────────
@@ -154,7 +236,7 @@ fn forbidden(msg: &'static str) -> Response {
 ///
 /// 1. `extract_trust` parses the header and verifies the JWT signature (sync).
 /// 2. If the token is valid (`BearerToken`), the jti is extracted and
-///    `state.revocation.is_revoked(&jti)` is called with a 200 ms timeout
+///    `state.revocation.is_revoked(&jti, "main")` is called with a 200 ms timeout
 ///    (fail-closed: store error or timeout → 401).
 /// 3. The resulting `TrustContext` is injected into the request extensions.
 ///
@@ -173,12 +255,18 @@ pub async fn auth_middleware(
         && bearer_token.starts_with(KEY_PREFIX)
     {
         let trust = verify_api_key_bearer(&state, bearer_token).await;
-        if !tenant_is_authorized(&trust) {
+        if !tenant_is_authorized(&state, &trust).await {
+            // Alignement 401/403 (C2, P2-c) : à ON le refus A8 d'un contexte NON
+            // AUTHENTIFIÉ est un 401 (credentials absents/invalides), pas un 403 —
+            // parité avec le chemin OFF où le handler aval rend 401.
+            if matches!(trust, gradatum_core::trust::TrustContext::Unauthenticated) {
+                return unauthorized("authentication required");
+            }
             tracing::warn!(
                 tenant = ?trust.tenant_id(),
-                "middleware: TrustContext api-key refusé (tenant ≠ main) — 403"
+                "middleware: TrustContext api-key denied (tenant ≠ main) — 403"
             );
-            return forbidden("tenant non supporté (mono-vault v0.4.x)");
+            return forbidden("unsupported tenant (mono-vault v0.4.x)");
         }
         request.extensions_mut().insert(trust);
         return next.run(request).await;
@@ -190,15 +278,17 @@ pub async fn auth_middleware(
     // Check de révocation uniquement pour les tokens valides (BearerToken).
     // Pour Unauthenticated : le handler métier retournera 401 — pas de check nécessaire.
     if let Some(jti) = maybe_jti {
+        // P0 #2 : la révocation est scopée au tenant porté par le token.
+        let tenant_id = trust.tenant_id().map(|t| t.as_str()).unwrap_or("main");
         match tokio::time::timeout(
             REVOCATION_CHECK_TIMEOUT,
-            state.revocation.is_revoked(jti.as_str()),
+            state.revocation.is_revoked(jti.as_str(), tenant_id),
         )
         .await
         {
             Ok(Ok(true)) => {
-                tracing::debug!(jti = %jti, "token JWT révoqué — 401");
-                return unauthorized("token révoqué");
+                tracing::debug!(jti = %jti, "JWT token revoked — 401");
+                return unauthorized("token revoked");
             }
             Ok(Ok(false)) => {
                 // Token valide et non révoqué — continuer.
@@ -208,14 +298,14 @@ pub async fn auth_middleware(
                     err = %e,
                     "revocation store error — fail-closed (401)"
                 );
-                return unauthorized("erreur de vérification du token — réessayer plus tard");
+                return unauthorized("token verification error — retry later");
             }
             Err(_timeout) => {
                 tracing::error!(
                     timeout_ms = REVOCATION_CHECK_TIMEOUT.as_millis(),
                     "revocation check timeout — fail-closed (401)"
                 );
-                return unauthorized("erreur de vérification du token — réessayer plus tard");
+                return unauthorized("token verification error — retry later");
             }
         }
     }
@@ -225,37 +315,170 @@ pub async fn auth_middleware(
     // ne doit atteindre un handler. Même si un tel JWT venait à exister (clé legacy
     // antérieure au gate Lot 1, ou compromission de clé de signature), il est refusé
     // ici, AVANT toute logique métier. Restrictive-only : zéro impact tenant "main".
-    if !tenant_is_authorized(&trust) {
+    if !tenant_is_authorized(&state, &trust).await {
+        // Alignement 401/403 (C2, P2-c) : Unauthenticated refusé à ON (A8) → 401,
+        // parité avec le chemin OFF (handler aval 401). Les autres refus restent 403.
+        if matches!(trust, gradatum_core::trust::TrustContext::Unauthenticated) {
+            return unauthorized("authentication required");
+        }
         tracing::warn!(
             tenant = ?trust.tenant_id(),
-            "middleware: TrustContext refusé (tenant ≠ main, invariant mono-vault) — 403"
+            "middleware: TrustContext denied (tenant ≠ main, mono-vault invariant) — 403"
         );
-        return forbidden("tenant non supporté (mono-vault v0.4.x)");
+        return forbidden("unsupported tenant (mono-vault v0.4.x)");
     }
 
     request.extensions_mut().insert(trust);
     next.run(request).await
 }
 
-/// Authorises a [`TrustContext`] to reach vault handlers, enforcing the mono-vault
-/// `"main"` tenant invariant.
+/// Authorises a [`TrustContext`] to reach vault handlers (C1, F-63).
 ///
-/// **Exhaustive match without `_`**: any new `TrustContext` variant must explicitly
-/// declare its authorisation (fail-safe by construction).
+/// Two paths, gated by `multi_tenant.enabled` (default `false`):
+/// - **OFF** → [`tenant_is_authorized_legacy`] (mono-vault `"main"` invariant —
+///   the grant tables are never read).
+/// - **ON** → [`tenant_is_authorized_by_grants`] (allow-list `tenant_vault_grants`
+///   consulted on every request, EX-C1-2).
+async fn tenant_is_authorized(
+    state: &AppState,
+    trust: &gradatum_core::trust::TrustContext,
+) -> bool {
+    if state.server_config.multi_tenant.enabled {
+        tenant_is_authorized_by_grants(state, trust).await
+    } else {
+        tenant_is_authorized_legacy(trust)
+    }
+}
+
+/// Legacy mono-vault authorisation (active path while `multi_tenant.enabled = false`).
 ///
 /// Rules:
 /// - `BearerToken { tenant_id, .. }`: allowed only if `tenant_id == "main"`.
 /// - `Unauthenticated`: allowed to pass through (the business handler returns 401).
 /// - `Mtls` / `Studio`: carry no tenant — must not access vault by locus tenant.
 ///   Allowed through here; their vault access refusal is handled downstream by the ACL
-///   (`tenant_id()` returns `None`). No catch-all `_`.
-fn tenant_is_authorized(trust: &gradatum_core::trust::TrustContext) -> bool {
+///   (`tenant_id()` returns `None`).
+fn tenant_is_authorized_legacy(trust: &gradatum_core::trust::TrustContext) -> bool {
     use gradatum_core::trust::TrustContext;
     match trust {
         TrustContext::BearerToken { tenant_id, .. } => tenant_id == "main",
         TrustContext::Unauthenticated => true,
         TrustContext::Mtls { .. } => true,
         TrustContext::Studio { .. } => true,
+        // TrustContext est #[non_exhaustive] (A3) : catch-all FAIL-CLOSED — une
+        // variante future n'est JAMAIS autorisée implicitement (meilleur que
+        // l'ancien match exhaustif : le refus est déclaré, pas déduit).
+        _ => false,
+    }
+}
+
+/// Allow-list authorisation (active path while `multi_tenant.enabled = true`, EX-C1-2).
+///
+/// Rules:
+/// - `BearerToken { tenant_id, .. }`: allowed iff the tenant is `active` and holds
+///   at least one grant in `tenant_vault_grants` (per-vault write access is enforced
+///   downstream by `tenant_guard::effective_write_vault`). Lookup error → deny
+///   (fail-closed, never an implicit grant).
+/// - `Unauthenticated`: **denied** — re-validated fail-closed in the lookup path (A8) ;
+///   contrairement au chemin legacy, le refus est rendu ici (403) et non délégué au
+///   handler aval.
+/// - `Mtls` / `Studio`: carry no tenant — same as legacy, allowed through here and
+///   denied downstream by the ACL for vault access.
+async fn tenant_is_authorized_by_grants(
+    state: &AppState,
+    trust: &gradatum_core::trust::TrustContext,
+) -> bool {
+    use gradatum_core::trust::TrustContext;
+    match trust {
+        TrustContext::BearerToken { tenant_id, sub, .. } => {
+            // Frontière : `tenant_grants_authorize` prend `&str` (SSOT partagée avec
+            // `/auth/exchange`). `.as_str()` = conversion transparente, byte-identical.
+            if !tenant_grants_authorize(state, tenant_id.as_str()).await {
+                return false;
+            }
+            // B7 : intersection tenant-grants ∩ agent-grants.
+            // L'agent doit détenir au moins un grant — l'absence est un refus fail-closed.
+            agent_grants_authorize(state, sub).await
+        }
+        TrustContext::Unauthenticated => false,
+        TrustContext::Mtls { .. } => true,
+        TrustContext::Studio { .. } => true,
+        // TrustContext est #[non_exhaustive] (A3) : catch-all FAIL-CLOSED.
+        _ => false,
+    }
+}
+
+/// Vrai si `tenant_id` est autorisé par l'allow-list `tenant_vault_grants` (chemin
+/// `multi_tenant.enabled = true` uniquement — EX-C1-2) : tenant `active` détenant au
+/// moins un grant. Erreur de lookup → deny (fail-closed, jamais un grant implicite).
+///
+/// SSOT partagée par le middleware ([`tenant_is_authorized_by_grants`]) et par
+/// `/auth/exchange` (C3a, F-45 : l'émission d'un JWT pour un tenant ≠ `main` est
+/// gouvernée par la MÊME allow-list que l'accès aux handlers).
+pub(crate) async fn tenant_grants_authorize(state: &AppState, tenant_id: &str) -> bool {
+    // Report assumé, pas une contrainte : AUCUN appelant n'a besoin d'un `&str`. Les
+    // deux (`tenant_is_authorized_by_grants` et `/auth/exchange`) détiennent déjà un
+    // `TenantId` — respectivement `TrustContext::BearerToken` et `ApiKey::tenant_id` —
+    // et le dégradent en `&str` pour appeler ici. Le typage de cette fonction, de
+    // `effective_tenant` et des `require_*_grant` est différé à la Task 11 (report déjà
+    // tracé dans `api_v1::tenant_guard::effective_tenant`) : toutes sont `pub(crate)`,
+    // donc hors surface publique et hors semver — les typer après le tag coûtera
+    // exactement le même travail.
+    // Coût du report, non masqué : une allocation `String` par requête authentifiée sur
+    // le chemin `multi_tenant`, l'aller-retour `TenantId` → `&str` → `TenantId`.
+    // `TenantId::new` est non validé et byte-identical : reconstruction de type, jamais
+    // une validation (elle a eu lieu en amont).
+    let tenant = gradatum_core::scope::TenantId::new(tenant_id);
+    match state.search.tenant_grants(&tenant).await {
+        Ok(grants) => !grants.is_empty(),
+        Err(e) => {
+            tracing::error!(
+                tenant = %tenant_id,
+                err = %e,
+                "tenant_grants lookup failed — fail-closed (deny)"
+            );
+            false
+        }
+    }
+}
+
+/// Vrai si `agent_id` est autorisé par l'allow-list `agent_vault_grants` (lot B7,
+/// plan v1.0.0).
+///
+/// **Transition progressive** : si l'agent n'a **aucune** ligne dans la table
+/// (il n'a pas encore été provisionné par la réconciliation), le check retourne
+/// `true` — l'agent passe sans encombre. Dès que l'agent a AU MOINS une ligne
+/// (grant explicite), le check devient contraignant : le jeu de grants définit
+/// ce que l'agent peut faire.
+///
+/// Erreur de lookup → deny (fail-closed, jamais un grant implicite).
+///
+/// Consulté après [`tenant_grants_authorize`] — l'accès effectif est l'intersection :
+/// le tenant ET l'agent doivent chacun avoir au moins un grant.
+async fn agent_grants_authorize(
+    state: &AppState,
+    agent_id: &gradatum_core::scope::AgentId,
+) -> bool {
+    match state.search.agent_grants(agent_id).await {
+        Ok(grants) => {
+            if grants.is_empty() {
+                // Transition progressive : l'agent n'a pas encore de grants
+                // configurés — on laisse passer (pas de refus silencieux).
+                return true;
+            }
+            // L'agent a des grants explicites — le check est contraignant.
+            // Un agent configuré avec un grant read-only sur un vault ne
+            // pourra pas écrire (B8, portée par section).
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                agent = %agent_id,
+                err = %e,
+                "agent_grants lookup failed — fail-closed (deny)"
+            );
+            false
+        }
     }
 }
 
@@ -302,7 +525,7 @@ async fn verify_api_key_bearer(
                 key_id = %key.id,
                 owner = %key.owner,
                 tenant = %key.tenant_id,
-                "api-key Bearer vérifiée avec succès (valeur : [REDACTED])"
+                "api-key Bearer verified successfully (value: [REDACTED])"
             );
             gradatum_core::trust::TrustContext::BearerToken {
                 kid: key.id.to_string(),
@@ -310,13 +533,14 @@ async fn verify_api_key_bearer(
                 sub: key.owner,
                 scopes: key.scopes,
                 tenant_id: key.tenant_id,
+                jti: None,
             }
         }
         Err(ApiKeyError::NotFound | ApiKeyError::AlreadyRevoked) => {
             // Tentative avec clé invalide ou révoquée — pas une erreur serveur.
             tracing::debug!(
-                "api-key Bearer invalide ou révoquée — TrustContext::Unauthenticated \
-                 (valeur : [REDACTED])"
+                "invalid or revoked Bearer api-key — TrustContext::Unauthenticated \
+                 (value: [REDACTED])"
             );
             gradatum_core::trust::TrustContext::Unauthenticated
         }
@@ -363,7 +587,7 @@ fn extract_trust(
     let raw = match header_value.to_str() {
         Ok(s) => s,
         Err(_) => {
-            tracing::debug!("Authorization header contient des octets non-UTF-8 — ignoré");
+            tracing::debug!("Authorization header contains non-UTF-8 bytes — ignored");
             return (gradatum_core::trust::TrustContext::Unauthenticated, None);
         }
     };
@@ -378,20 +602,28 @@ fn extract_trust(
             tracing::debug!(
                 sub = %claims.sub,
                 tenant = %claims.tenant_id,
-                "JWT vérifié avec succès"
+                "JWT verified successfully"
             );
             let jti = claims.jti.clone();
             let trust = gradatum_core::trust::TrustContext::BearerToken {
                 kid: state.jwt.kid().to_string(),
                 aud: claims.aud,
-                sub: claims.sub,
+                // Le claim `sub` (String, signature déjà vérifiée par `verify` —
+                // jamais un champ du corps de requête) est enveloppé dans le newtype
+                // d'identité. `serde(transparent)` → JSON du claim inchangé.
+                sub: gradatum_core::scope::AgentId::new(claims.sub),
                 scopes: claims.scopes,
-                tenant_id: claims.tenant_id,
+                // Le claim JWT (String, déjà validé par `verify`) est enveloppé dans le
+                // newtype principal. `serde(transparent)` → JSON du claim inchangé.
+                tenant_id: gradatum_core::scope::TenantId::new(claims.tenant_id),
+                // EX-C3a-2 : l'instance de token (révocable) accompagne le contexte
+                // jusqu'à l'audit trail.
+                jti: Some(jti.clone()),
             };
             (trust, Some(jti))
         }
         Err(e) => {
-            tracing::debug!(err = %e, "JWT invalide — TrustContext::Unauthenticated");
+            tracing::debug!(err = %e, "invalid JWT — TrustContext::Unauthenticated");
             (gradatum_core::trust::TrustContext::Unauthenticated, None)
         }
     }
@@ -422,7 +654,7 @@ mod tests {
         AppState::new()
     }
 
-    // ── Lot 2 : tenant_is_authorized (match exhaustif) ─────────────────────────
+    // ── Lot 2 : tenant_is_authorized_legacy (chemin flag OFF) ──────────────────
 
     #[test]
     fn tenant_authorized_bearer_main_ok() {
@@ -433,8 +665,9 @@ mod tests {
             sub: "agent".into(),
             scopes: vec!["write".into()],
             tenant_id: "main".into(),
+            jti: None,
         };
-        assert!(super::tenant_is_authorized(&trust));
+        assert!(super::tenant_is_authorized_legacy(&trust));
     }
 
     #[test]
@@ -446,15 +679,18 @@ mod tests {
             sub: "agent".into(),
             scopes: vec!["write".into()],
             tenant_id: "evil".into(),
+            jti: None,
         };
-        assert!(!super::tenant_is_authorized(&trust));
+        assert!(!super::tenant_is_authorized_legacy(&trust));
     }
 
     #[test]
     fn tenant_authorized_unauthenticated_passes_through() {
         use gradatum_core::trust::TrustContext;
         // Unauthenticated traverse — le handler répond 401 (pas un refus tenant).
-        assert!(super::tenant_is_authorized(&TrustContext::Unauthenticated));
+        assert!(super::tenant_is_authorized_legacy(
+            &TrustContext::Unauthenticated
+        ));
     }
 
     #[test]
@@ -470,8 +706,8 @@ mod tests {
             scope: StudioScope::ReadOnly,
             step_up_until: None,
         };
-        assert!(super::tenant_is_authorized(&mtls));
-        assert!(super::tenant_is_authorized(&studio));
+        assert!(super::tenant_is_authorized_legacy(&mtls));
+        assert!(super::tenant_is_authorized_legacy(&studio));
     }
 
     /// Crée un `AppState` avec un store de révocation injecté.
@@ -549,7 +785,7 @@ mod tests {
         let exp = SystemTime::now() + Duration::from_secs(86400);
         state
             .revocation
-            .revoke(&jti, exp)
+            .revoke(&jti, "main", exp)
             .await
             .expect("revoke doit réussir sur InMemoryRevocationStore");
 
@@ -565,15 +801,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RevocationStore for AlwaysErrorStore {
-        async fn is_revoked(&self, _jti: &str) -> Result<bool, RevocationError> {
+        async fn is_revoked(&self, _jti: &str, _tenant_id: &str) -> Result<bool, RevocationError> {
             Err(RevocationError::Sqlite(sqlx::Error::RowNotFound))
         }
 
-        async fn revoke(&self, _jti: &str, _exp: SystemTime) -> Result<(), RevocationError> {
+        async fn revoke(
+            &self,
+            _jti: &str,
+            _tenant_id: &str,
+            _exp: SystemTime,
+        ) -> Result<(), RevocationError> {
             Ok(())
         }
 
-        async fn gc(&self) -> Result<usize, RevocationError> {
+        async fn gc(&self, _tenant_id: &str) -> Result<usize, RevocationError> {
             Ok(0)
         }
     }
@@ -595,16 +836,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RevocationStore for SlowStore {
-        async fn is_revoked(&self, _jti: &str) -> Result<bool, RevocationError> {
+        async fn is_revoked(&self, _jti: &str, _tenant_id: &str) -> Result<bool, RevocationError> {
             tokio::time::sleep(Duration::from_millis(300)).await;
             Ok(false)
         }
 
-        async fn revoke(&self, _jti: &str, _exp: SystemTime) -> Result<(), RevocationError> {
+        async fn revoke(
+            &self,
+            _jti: &str,
+            _tenant_id: &str,
+            _exp: SystemTime,
+        ) -> Result<(), RevocationError> {
             Ok(())
         }
 
-        async fn gc(&self) -> Result<usize, RevocationError> {
+        async fn gc(&self, _tenant_id: &str) -> Result<usize, RevocationError> {
             Ok(0)
         }
     }
@@ -617,5 +863,175 @@ mod tests {
         let router = test_router(state);
         let status = send_request(router, Some(&token)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Métriques HTTP : http_metrics_middleware ──────────────────────────────
+
+    /// Routeur de test reproduisant les trois formes de routage de production :
+    /// sous-routeur monté via `nest` (comme `/api/v1`), route fixe, route paramétrique.
+    /// Le middleware sous test est le code livré — seul le routeur est un montage d'essai
+    /// (le montage réel est prouvé côté `build_router`, tests unitaires de `main.rs`).
+    fn metrics_router(metrics: crate::metrics::AppMetrics) -> Router {
+        async fn ok() -> StatusCode {
+            StatusCode::OK
+        }
+        async fn boom() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let inner = Router::new()
+            .route("/vault_read", get(ok))
+            .route("/vault/unforgot/{ulid}", get(ok))
+            .route("/boom", get(boom));
+
+        Router::new()
+            .nest("/api/v1", inner)
+            .layer(axum::middleware::from_fn_with_state(
+                metrics,
+                crate::middleware::http_metrics_middleware,
+            ))
+    }
+
+    /// Émet un GET sur `uri` à travers le routeur et retourne le statut.
+    async fn get_through(router: &Router, uri: &str) -> StatusCode {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request builder invariant");
+        router
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("le middleware métriques ne doit jamais paniquer")
+            .status()
+    }
+
+    /// Encode le registry et retourne les lignes de la famille demandée.
+    fn series_lines(metrics: &crate::metrics::AppMetrics, family: &str) -> Vec<String> {
+        let mut buf = String::new();
+        prometheus_client::encoding::text::encode(&mut buf, &metrics.registry)
+            .expect("encoding du registry ne doit pas échouer");
+        buf.lines()
+            .filter(|l| !l.starts_with('#') && l.starts_with(family))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn http_request_produces_counter_sample_with_route_pattern() {
+        let metrics = crate::metrics::AppMetrics::new();
+        let router = metrics_router(metrics.clone());
+
+        assert_eq!(
+            get_through(&router, "/api/v1/vault_read").await,
+            StatusCode::OK
+        );
+
+        let lines = series_lines(&metrics, "gradatum_http_requests_total");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#"path="/api/v1/vault_read""#)
+                    && l.contains(r#"status="200""#)
+                    && l.ends_with(" 1")),
+            "un échantillon path=/api/v1/vault_read status=200 doit exister, lignes = {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_5xx_is_a_distinct_series_from_200() {
+        let metrics = crate::metrics::AppMetrics::new();
+        let router = metrics_router(metrics.clone());
+
+        assert_eq!(
+            get_through(&router, "/api/v1/vault_read").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_through(&router, "/api/v1/boom").await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let lines = series_lines(&metrics, "gradatum_http_requests_total");
+        assert!(
+            lines.iter().any(|l| l.contains(r#"status="200""#)),
+            "le 200 doit être visible, lignes = {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#"status="500""#) && l.contains(r#"path="/api/v1/boom""#)),
+            "le 5xx doit être une série distincte, lignes = {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_duration_histogram_is_observed_without_status_label() {
+        let metrics = crate::metrics::AppMetrics::new();
+        let router = metrics_router(metrics.clone());
+
+        assert_eq!(
+            get_through(&router, "/api/v1/vault_read").await,
+            StatusCode::OK
+        );
+
+        let counts = series_lines(&metrics, "gradatum_http_request_duration_seconds_count");
+        assert!(
+            counts
+                .iter()
+                .any(|l| l.contains(r#"path="/api/v1/vault_read""#) && l.ends_with(" 1")),
+            "l'histogramme doit compter 1 observation, lignes = {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|l| !l.contains("status=")),
+            "l'histogramme ne porte pas de label status (contrat déclaré), lignes = {counts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parametric_route_never_interpolates_the_ulid_in_the_label() {
+        let metrics = crate::metrics::AppMetrics::new();
+        let router = metrics_router(metrics.clone());
+        const ULID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+        let uri = format!("/api/v1/vault/unforgot/{ULID}");
+        assert_eq!(get_through(&router, &uri).await, StatusCode::OK);
+
+        let lines = series_lines(&metrics, "gradatum_http_requests_total");
+        assert!(
+            lines.iter().all(|l| !l.contains(ULID)),
+            "aucune série ne doit contenir l'ULID concret, lignes = {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#"path="/api/v1/vault/unforgot/{ulid}""#)),
+            "le motif de route doit être le label, lignes = {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmatched_request_falls_into_the_other_bucket() {
+        let metrics = crate::metrics::AppMetrics::new();
+        let router = metrics_router(metrics.clone());
+
+        // URI hostile : si le label était l'URI concrète, un scanner créerait une série par appel.
+        let uri = "/wp-admin/../../etc/passwd?token=secret";
+        assert_eq!(get_through(&router, uri).await, StatusCode::NOT_FOUND);
+
+        let lines = series_lines(&metrics, "gradatum_http_requests_total");
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains("wp-admin") && !l.contains("secret")),
+            "l'URI concrète ne doit jamais devenir un label, lignes = {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!(r#"path="{}""#, crate::middleware::OTHER_ROUTE))),
+            "les requêtes sans motif tombent dans le bucket `other`, lignes = {lines:?}"
+        );
     }
 }

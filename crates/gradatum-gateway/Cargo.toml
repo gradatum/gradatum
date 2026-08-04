@@ -6,13 +6,17 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "LLM proxy gateway — multi-provider routing with circuit-breaker, F-08 reranker, and engine supervisor integration"
+description = "LLM proxy gateway — multi-provider routing with circuit-breaker, cross-encoder reranking, and engine supervisor integration"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
-# opt-in : active FastEmbedCpu comme backend embedding de fallback in-process.
-# Nécessite ort runtime ONNX (~300MB binary overhead).
-fastembed-cpu = ["gradatum-embed/fastembed-cpu"]
+# Pas de passe-plat `fastembed-cpu` ici : aucun code de ce crate ne construit
+# `FastEmbedCpu` (il ne consomme que `dyn Embedder`, injecté par l'appelant).
+# Le raccourci coûtait ~300 Mo de runtime ONNX sans rien câbler. Un consommateur
+# qui veut ce backend active `gradatum-embed/fastembed-cpu` directement.
 
 [dependencies]
 # Workspace crates

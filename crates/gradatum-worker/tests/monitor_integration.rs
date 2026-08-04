@@ -126,7 +126,11 @@ async fn sweep_no_stale_leases_returns_empty() {
     // Enqueue puis déqueue un job → Running avec lease_until = now+300s
     let record = make_curate_record();
     store.enqueue(record).await.expect("enqueue");
-    let _dequeued = store.dequeue().await.expect("dequeue").expect("déqueué");
+    let _dequeued = store
+        .dequeue(None)
+        .await
+        .expect("dequeue")
+        .expect("déqueué");
 
     // recover_stale_leases avec TTL=300s (5min) → lease_until=now+300 n'est pas encore expiré
     // threshold = now - 300s → lease_until > threshold → 0 IDs retournés
@@ -166,7 +170,7 @@ async fn sweep_recover_stale_leases_returns_ids() {
     sweep(&store, Duration::from_secs(0), None).await;
 
     // Le job Pending n'est pas touché par recover_stale_leases (seuls les Running sont candidats)
-    let job = store.get(id).await.expect("get").expect("job existe");
+    let job = store.get(id, None).await.expect("get").expect("job existe");
     assert_eq!(
         job.lifecycle.status,
         JobStatus::Pending,

@@ -1,0 +1,357 @@
+pub mod gradatum_chat
+pub mod gradatum_chat::anthropic_compat
+pub struct gradatum_chat::anthropic_compat::AnthropicCompatBackend
+impl gradatum_chat::anthropic_compat::AnthropicCompatBackend
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::new(secrecy::SecretString, alloc::string::String) -> Self
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::with_base_url(self, alloc::string::String) -> Self
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::with_max_tokens(self, u32) -> Self
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::anthropic_compat::AnthropicCompatBackend
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::name(&self) -> &'static str
+pub mod gradatum_chat::backend
+pub enum gradatum_chat::backend::LlmError
+pub gradatum_chat::backend::LlmError::AuthError
+pub gradatum_chat::backend::LlmError::BadRequest(alloc::string::String)
+pub gradatum_chat::backend::LlmError::ConnectionRefused
+pub gradatum_chat::backend::LlmError::DnsFailure(alloc::string::String)
+pub gradatum_chat::backend::LlmError::Parse(alloc::string::String)
+pub gradatum_chat::backend::LlmError::RateLimit
+pub gradatum_chat::backend::LlmError::ServerError
+pub gradatum_chat::backend::LlmError::ServerError::body: alloc::string::String
+pub gradatum_chat::backend::LlmError::ServerError::status: u16
+pub gradatum_chat::backend::LlmError::Timeout
+pub gradatum_chat::backend::LlmError::Transport(alloc::string::String)
+impl gradatum_chat::backend::LlmError
+pub fn gradatum_chat::backend::LlmError::counts_for_circuit(&self) -> bool
+pub struct gradatum_chat::backend::CuratorDecision
+pub gradatum_chat::backend::CuratorDecision::duplicate_hint: core::option::Option<alloc::string::String>
+pub gradatum_chat::backend::CuratorDecision::section: alloc::string::String
+pub gradatum_chat::backend::CuratorDecision::tags: alloc::vec::Vec<alloc::string::String>
+pub gradatum_chat::backend::CuratorDecision::wikilinks: alloc::vec::Vec<alloc::string::String>
+pub trait gradatum_chat::backend::LlmBackend: core::marker::Send + core::marker::Sync + 'static
+pub fn gradatum_chat::backend::LlmBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::backend::LlmBackend::is_local(&self) -> bool
+pub fn gradatum_chat::backend::LlmBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::anthropic_compat::AnthropicCompatBackend
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::gemini_compat::GeminiCompatBackend
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::heuristic_routing::HeuristicBackend
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::is_local(&self) -> bool
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::ollama_compat::OllamaCompatBackend
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::openai_compat::OpenAiCompatBackend
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::name(&self) -> &'static str
+impl<B: gradatum_chat::backend::LlmBackend> gradatum_chat::backend::LlmBackend for gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::is_local(&self) -> bool
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::name(&self) -> &'static str
+pub mod gradatum_chat::chat_trait
+pub enum gradatum_chat::chat_trait::ChatBackend
+pub gradatum_chat::chat_trait::ChatBackend::Heuristic
+pub gradatum_chat::chat_trait::ChatBackend::Http
+pub gradatum_chat::chat_trait::ChatBackend::Noop
+pub struct gradatum_chat::chat_trait::CuratorContext
+pub gradatum_chat::chat_trait::CuratorContext::similar_note_ids: alloc::vec::Vec<alloc::string::String>
+pub gradatum_chat::chat_trait::CuratorContext::vault_tags: alloc::vec::Vec<alloc::string::String>
+pub struct gradatum_chat::chat_trait::CuratorVerdict
+pub gradatum_chat::chat_trait::CuratorVerdict::backend: gradatum_chat::chat_trait::ChatBackend
+pub gradatum_chat::chat_trait::CuratorVerdict::confidence: f32
+pub gradatum_chat::chat_trait::CuratorVerdict::proposed_status: gradatum_core::status::NoteStatus
+pub gradatum_chat::chat_trait::CuratorVerdict::reason: alloc::string::String
+pub trait gradatum_chat::chat_trait::Chat: core::marker::Send + core::marker::Sync
+pub fn gradatum_chat::chat_trait::Chat::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::chat_trait::Chat::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::heuristic::Heuristic
+pub fn gradatum_chat::heuristic::Heuristic::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::heuristic::Heuristic::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::http::HttpChat
+pub fn gradatum_chat::http::HttpChat::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::http::HttpChat::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::noop::Noop
+pub fn gradatum_chat::noop::Noop::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::noop::Noop::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl<C: gradatum_chat::chat_trait::Chat> gradatum_chat::chat_trait::Chat for gradatum_chat::circuit_breaker::CircuitBreakerChat<C>
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub mod gradatum_chat::circuit_breaker
+pub struct gradatum_chat::circuit_breaker::CircuitBreakerChat<C: gradatum_chat::chat_trait::Chat>
+impl<C: gradatum_chat::chat_trait::Chat> gradatum_chat::circuit_breaker::CircuitBreakerChat<C>
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::is_open(&self) -> bool
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::new(C) -> Self
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::with_cooldown(self, core::time::Duration) -> Self
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::with_threshold(self, u32) -> Self
+impl<C: gradatum_chat::chat_trait::Chat> gradatum_chat::chat_trait::Chat for gradatum_chat::circuit_breaker::CircuitBreakerChat<C>
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub mod gradatum_chat::circuit_breaker_llm
+pub struct gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>
+impl<B: gradatum_chat::backend::LlmBackend> gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::is_half_open(&self) -> bool
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::is_open(&self) -> bool
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::new(B, alloc::sync::Arc<gradatum_chat::heuristic_routing::HeuristicBackend>, gradatum_chat::circuit_breaker_llm::CircuitConfig) -> Self
+impl<B: gradatum_chat::backend::LlmBackend> gradatum_chat::backend::LlmBackend for gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::is_local(&self) -> bool
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::name(&self) -> &'static str
+pub struct gradatum_chat::circuit_breaker_llm::CircuitConfig
+pub gradatum_chat::circuit_breaker_llm::CircuitConfig::failure_threshold: u32
+pub gradatum_chat::circuit_breaker_llm::CircuitConfig::failure_window: core::time::Duration
+pub gradatum_chat::circuit_breaker_llm::CircuitConfig::open_durations: alloc::vec::Vec<core::time::Duration>
+pub gradatum_chat::circuit_breaker_llm::CircuitConfig::success_threshold: u32
+impl core::default::Default for gradatum_chat::circuit_breaker_llm::CircuitConfig
+pub fn gradatum_chat::circuit_breaker_llm::CircuitConfig::default() -> Self
+pub mod gradatum_chat::error
+pub enum gradatum_chat::error::ChatError
+pub gradatum_chat::error::ChatError::CircuitOpen
+pub gradatum_chat::error::ChatError::Http(reqwest::error::Error)
+pub gradatum_chat::error::ChatError::InvalidResponse(alloc::string::String)
+pub gradatum_chat::error::ChatError::ParseFailure(alloc::string::String)
+pub gradatum_chat::error::ChatError::Timeout
+pub mod gradatum_chat::gemini_compat
+pub struct gradatum_chat::gemini_compat::GeminiCompatBackend
+impl gradatum_chat::gemini_compat::GeminiCompatBackend
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::new(secrecy::SecretString, alloc::string::String) -> Self
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::with_base_url(self, alloc::string::String) -> Self
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::gemini_compat::GeminiCompatBackend
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::name(&self) -> &'static str
+pub mod gradatum_chat::heuristic
+pub struct gradatum_chat::heuristic::Heuristic
+pub gradatum_chat::heuristic::Heuristic::min_body_len_for_boost: usize
+pub gradatum_chat::heuristic::Heuristic::short_body_threshold: usize
+impl gradatum_chat::heuristic::Heuristic
+pub fn gradatum_chat::heuristic::Heuristic::classify_sync(&self, &gradatum_core::note::Note) -> (f32, gradatum_core::status::NoteStatus, alloc::string::String)
+pub fn gradatum_chat::heuristic::Heuristic::new() -> Self
+impl core::default::Default for gradatum_chat::heuristic::Heuristic
+pub fn gradatum_chat::heuristic::Heuristic::default() -> Self
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::heuristic::Heuristic
+pub fn gradatum_chat::heuristic::Heuristic::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::heuristic::Heuristic::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub mod gradatum_chat::heuristic_routing
+pub struct gradatum_chat::heuristic_routing::HeuristicBackend
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::heuristic_routing::HeuristicBackend
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::is_local(&self) -> bool
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::name(&self) -> &'static str
+pub mod gradatum_chat::http
+pub struct gradatum_chat::http::HttpChat
+impl gradatum_chat::http::HttpChat
+pub fn gradatum_chat::http::HttpChat::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gradatum_chat::http::HttpChat::with_max_tokens(self, u32) -> Self
+pub fn gradatum_chat::http::HttpChat::with_timeout(self, core::time::Duration) -> Self
+impl core::default::Default for gradatum_chat::http::HttpChat
+pub fn gradatum_chat::http::HttpChat::default() -> Self
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::http::HttpChat
+pub fn gradatum_chat::http::HttpChat::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::http::HttpChat::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub mod gradatum_chat::noop
+pub struct gradatum_chat::noop::Noop
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::noop::Noop
+pub fn gradatum_chat::noop::Noop::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::noop::Noop::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub mod gradatum_chat::ollama_compat
+pub struct gradatum_chat::ollama_compat::OllamaCompatBackend
+impl gradatum_chat::ollama_compat::OllamaCompatBackend
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::new(alloc::string::String, alloc::string::String) -> Self
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::ollama_compat::OllamaCompatBackend
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::name(&self) -> &'static str
+pub mod gradatum_chat::openai_compat
+pub struct gradatum_chat::openai_compat::OpenAiCompatBackend
+impl gradatum_chat::openai_compat::OpenAiCompatBackend
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::new(alloc::string::String, alloc::string::String, secrecy::SecretString) -> Self
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::with_max_tokens(self, u32) -> Self
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::openai_compat::OpenAiCompatBackend
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::name(&self) -> &'static str
+pub enum gradatum_chat::ChatBackend
+pub gradatum_chat::ChatBackend::Heuristic
+pub gradatum_chat::ChatBackend::Http
+pub gradatum_chat::ChatBackend::Noop
+pub enum gradatum_chat::ChatError
+pub gradatum_chat::ChatError::CircuitOpen
+pub gradatum_chat::ChatError::Http(reqwest::error::Error)
+pub gradatum_chat::ChatError::InvalidResponse(alloc::string::String)
+pub gradatum_chat::ChatError::ParseFailure(alloc::string::String)
+pub gradatum_chat::ChatError::Timeout
+pub enum gradatum_chat::LlmError
+pub gradatum_chat::LlmError::AuthError
+pub gradatum_chat::LlmError::BadRequest(alloc::string::String)
+pub gradatum_chat::LlmError::ConnectionRefused
+pub gradatum_chat::LlmError::DnsFailure(alloc::string::String)
+pub gradatum_chat::LlmError::Parse(alloc::string::String)
+pub gradatum_chat::LlmError::RateLimit
+pub gradatum_chat::LlmError::ServerError
+pub gradatum_chat::LlmError::ServerError::body: alloc::string::String
+pub gradatum_chat::LlmError::ServerError::status: u16
+pub gradatum_chat::LlmError::Timeout
+pub gradatum_chat::LlmError::Transport(alloc::string::String)
+impl gradatum_chat::backend::LlmError
+pub fn gradatum_chat::backend::LlmError::counts_for_circuit(&self) -> bool
+pub struct gradatum_chat::AnthropicCompatBackend
+impl gradatum_chat::anthropic_compat::AnthropicCompatBackend
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::new(secrecy::SecretString, alloc::string::String) -> Self
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::with_base_url(self, alloc::string::String) -> Self
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::with_max_tokens(self, u32) -> Self
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::anthropic_compat::AnthropicCompatBackend
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::name(&self) -> &'static str
+pub struct gradatum_chat::CircuitBreaker<B>
+impl<B: gradatum_chat::backend::LlmBackend> gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::is_half_open(&self) -> bool
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::is_open(&self) -> bool
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::new(B, alloc::sync::Arc<gradatum_chat::heuristic_routing::HeuristicBackend>, gradatum_chat::circuit_breaker_llm::CircuitConfig) -> Self
+impl<B: gradatum_chat::backend::LlmBackend> gradatum_chat::backend::LlmBackend for gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::is_local(&self) -> bool
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::name(&self) -> &'static str
+pub struct gradatum_chat::CircuitBreakerChat<C: gradatum_chat::chat_trait::Chat>
+impl<C: gradatum_chat::chat_trait::Chat> gradatum_chat::circuit_breaker::CircuitBreakerChat<C>
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::is_open(&self) -> bool
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::new(C) -> Self
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::with_cooldown(self, core::time::Duration) -> Self
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::with_threshold(self, u32) -> Self
+impl<C: gradatum_chat::chat_trait::Chat> gradatum_chat::chat_trait::Chat for gradatum_chat::circuit_breaker::CircuitBreakerChat<C>
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub struct gradatum_chat::CircuitConfig
+pub gradatum_chat::CircuitConfig::failure_threshold: u32
+pub gradatum_chat::CircuitConfig::failure_window: core::time::Duration
+pub gradatum_chat::CircuitConfig::open_durations: alloc::vec::Vec<core::time::Duration>
+pub gradatum_chat::CircuitConfig::success_threshold: u32
+impl core::default::Default for gradatum_chat::circuit_breaker_llm::CircuitConfig
+pub fn gradatum_chat::circuit_breaker_llm::CircuitConfig::default() -> Self
+pub struct gradatum_chat::CuratorContext
+pub gradatum_chat::CuratorContext::similar_note_ids: alloc::vec::Vec<alloc::string::String>
+pub gradatum_chat::CuratorContext::vault_tags: alloc::vec::Vec<alloc::string::String>
+pub struct gradatum_chat::CuratorDecision
+pub gradatum_chat::CuratorDecision::duplicate_hint: core::option::Option<alloc::string::String>
+pub gradatum_chat::CuratorDecision::section: alloc::string::String
+pub gradatum_chat::CuratorDecision::tags: alloc::vec::Vec<alloc::string::String>
+pub gradatum_chat::CuratorDecision::wikilinks: alloc::vec::Vec<alloc::string::String>
+pub struct gradatum_chat::CuratorVerdict
+pub gradatum_chat::CuratorVerdict::backend: gradatum_chat::chat_trait::ChatBackend
+pub gradatum_chat::CuratorVerdict::confidence: f32
+pub gradatum_chat::CuratorVerdict::proposed_status: gradatum_core::status::NoteStatus
+pub gradatum_chat::CuratorVerdict::reason: alloc::string::String
+pub struct gradatum_chat::GeminiCompatBackend
+impl gradatum_chat::gemini_compat::GeminiCompatBackend
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::new(secrecy::SecretString, alloc::string::String) -> Self
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::with_base_url(self, alloc::string::String) -> Self
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::gemini_compat::GeminiCompatBackend
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::name(&self) -> &'static str
+pub struct gradatum_chat::Heuristic
+pub gradatum_chat::Heuristic::min_body_len_for_boost: usize
+pub gradatum_chat::Heuristic::short_body_threshold: usize
+impl gradatum_chat::heuristic::Heuristic
+pub fn gradatum_chat::heuristic::Heuristic::classify_sync(&self, &gradatum_core::note::Note) -> (f32, gradatum_core::status::NoteStatus, alloc::string::String)
+pub fn gradatum_chat::heuristic::Heuristic::new() -> Self
+impl core::default::Default for gradatum_chat::heuristic::Heuristic
+pub fn gradatum_chat::heuristic::Heuristic::default() -> Self
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::heuristic::Heuristic
+pub fn gradatum_chat::heuristic::Heuristic::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::heuristic::Heuristic::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub struct gradatum_chat::HeuristicBackend
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::heuristic_routing::HeuristicBackend
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::is_local(&self) -> bool
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::name(&self) -> &'static str
+pub struct gradatum_chat::HttpChat
+impl gradatum_chat::http::HttpChat
+pub fn gradatum_chat::http::HttpChat::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gradatum_chat::http::HttpChat::with_max_tokens(self, u32) -> Self
+pub fn gradatum_chat::http::HttpChat::with_timeout(self, core::time::Duration) -> Self
+impl core::default::Default for gradatum_chat::http::HttpChat
+pub fn gradatum_chat::http::HttpChat::default() -> Self
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::http::HttpChat
+pub fn gradatum_chat::http::HttpChat::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::http::HttpChat::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub struct gradatum_chat::Noop
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::noop::Noop
+pub fn gradatum_chat::noop::Noop::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::noop::Noop::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub struct gradatum_chat::OllamaCompatBackend
+impl gradatum_chat::ollama_compat::OllamaCompatBackend
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::new(alloc::string::String, alloc::string::String) -> Self
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::ollama_compat::OllamaCompatBackend
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::name(&self) -> &'static str
+pub struct gradatum_chat::OpenAiCompatBackend
+impl gradatum_chat::openai_compat::OpenAiCompatBackend
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::new(alloc::string::String, alloc::string::String, secrecy::SecretString) -> Self
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::with_max_tokens(self, u32) -> Self
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::openai_compat::OpenAiCompatBackend
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::name(&self) -> &'static str
+pub const gradatum_chat::VERSION: &str
+pub trait gradatum_chat::Chat: core::marker::Send + core::marker::Sync
+pub fn gradatum_chat::Chat::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::Chat::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::heuristic::Heuristic
+pub fn gradatum_chat::heuristic::Heuristic::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::heuristic::Heuristic::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::http::HttpChat
+pub fn gradatum_chat::http::HttpChat::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::http::HttpChat::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl gradatum_chat::chat_trait::Chat for gradatum_chat::noop::Noop
+pub fn gradatum_chat::noop::Noop::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::noop::Noop::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl<C: gradatum_chat::chat_trait::Chat> gradatum_chat::chat_trait::Chat for gradatum_chat::circuit_breaker::CircuitBreakerChat<C>
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::backend_kind(&self) -> gradatum_chat::chat_trait::ChatBackend
+pub fn gradatum_chat::circuit_breaker::CircuitBreakerChat<C>::classify_curator<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::note::Note, &'life2 gradatum_chat::chat_trait::CuratorContext) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::chat_trait::CuratorVerdict, gradatum_chat::error::ChatError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub trait gradatum_chat::LlmBackend: core::marker::Send + core::marker::Sync + 'static
+pub fn gradatum_chat::LlmBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::LlmBackend::is_local(&self) -> bool
+pub fn gradatum_chat::LlmBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::anthropic_compat::AnthropicCompatBackend
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::anthropic_compat::AnthropicCompatBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::gemini_compat::GeminiCompatBackend
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::gemini_compat::GeminiCompatBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::heuristic_routing::HeuristicBackend
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::is_local(&self) -> bool
+pub fn gradatum_chat::heuristic_routing::HeuristicBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::ollama_compat::OllamaCompatBackend
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::ollama_compat::OllamaCompatBackend::name(&self) -> &'static str
+impl gradatum_chat::backend::LlmBackend for gradatum_chat::openai_compat::OpenAiCompatBackend
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::is_local(&self) -> bool
+pub fn gradatum_chat::openai_compat::OpenAiCompatBackend::name(&self) -> &'static str
+impl<B: gradatum_chat::backend::LlmBackend> gradatum_chat::backend::LlmBackend for gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::classify<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_chat::backend::CuratorDecision, gradatum_chat::backend::LlmError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::is_local(&self) -> bool
+pub fn gradatum_chat::circuit_breaker_llm::CircuitBreaker<B>::name(&self) -> &'static str

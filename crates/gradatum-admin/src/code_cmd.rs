@@ -36,60 +36,61 @@ use gradatum_ingest::{
     parse_python_file, parse_rust_file, parse_tsx_file, parse_typescript_file,
 };
 
-/// Extensions de fichiers source supportées par le pipeline d'ingest multi-langage.
+/// Source file extensions handled by the multi-language ingest pipeline.
 ///
-/// Seules les extensions listées ici sont traitées par `run_ingest` et `run_update`.
-/// Les autres fichiers sont silencieusement ignorés (accuracy > coverage).
+/// Only the extensions listed here are processed by `run_ingest` and `run_update`; any
+/// other file is skipped silently, favouring accuracy over coverage.
 ///
-/// `.tsx` est routé vers le parser TypeScript : LANGUAGE_TYPESCRIPT ne parse pas JSX,
-/// mais le routage est préférable à l'exclusion complète — les déclarations TS pures
-/// dans un fichier `.tsx` sont extraites ; les fragments JSX sont ignorés par le parser.
-/// Comportement documenté, pas un bug.
+/// `.tsx` is routed to the dedicated TSX grammar rather than the plain TypeScript one, so
+/// React components parse correctly. `parse_file_by_extension` holds the full routing
+/// table.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[".rs", ".py", ".sh", ".bash", ".ts", ".tsx"];
 
-/// Nombre maximal d'échecs consécutifs de `parse_rust_file` avant d'ouvrir le circuit-breaker.
+/// Number of consecutive parse failures, in any supported language, after which the
+/// circuit breaker opens.
 ///
-/// Si N fichiers consécutifs font échouer le parser tree-sitter (ex: bug parser, fichiers
-/// corrompus, incompatibilité syntaxe), l'ingest s'arrête plutôt que de silencieusement
-/// ignorer la majorité du corpus.
+/// When that many files in a row fail to parse — a parser bug, corrupted files, or a
+/// syntax the grammar does not accept — the ingest stops instead of silently skipping most
+/// of the corpus.
 ///
-/// Justification N=3 : tolérance aux quelques fichiers Rust légitimement non-parsables
-/// (macros complexes, build-generated, etc.) sans laisser passer un bug systémique.
+/// Three is a deliberate compromise: it tolerates the occasional file that legitimately
+/// fails to parse, such as one built around complex macros or generated at build time,
+/// without letting a systemic failure go unnoticed.
 pub const CODE_MAP_REBUILD_MAX_FAILURES: u32 = 3;
 
-/// Nombre maximal de tentatives de rebuild autorisées après détection d'un marqueur
-/// `.ingest-incomplete-<vault>`.
+/// Maximum number of rebuild attempts allowed once an `.ingest-incomplete-<vault>` marker
+/// has been detected.
 ///
-/// ## Problème
+/// ## Problem
 ///
-/// Si `run_ingest` crashe systématiquement (panic dans l'index, corruption DB, OOM),
-/// le marqueur est re-posé à chaque tentative. Le prochain `run_update` détecte le
-/// marqueur et re-tente un rebuild, qui crashe à nouveau → boucle infinie coûteuse.
+/// If `run_ingest` fails systematically — a panic in the index, a corrupted database, an
+/// out-of-memory kill — the marker is written again on every attempt. The next
+/// `run_update` sees the marker, retries a rebuild, and fails again: an expensive infinite
+/// loop.
 ///
 /// ## Solution
 ///
-/// Le contenu du marqueur encode le compteur de tentatives (ASCII décimal, ex: `"2"`).
+/// The marker file holds the attempt counter as an ASCII decimal integer, for example
+/// `"2"`.
 ///
-/// - À la détection : lire le compteur. Si `>= CODE_MAP_REBUILD_MAX_RETRY` →
-///   retourner `Err` (abandon). L'opérateur doit supprimer le marqueur manuellement.
-/// - Avant le rebuild : incrémenter et réécrire le compteur.
-/// - Après un run réussi : le marqueur est supprimé → compteur reset implicitement.
+/// - On detection, the counter is read. Once it reaches this limit the run gives up with
+///   an error, and an operator has to remove the marker by hand.
+/// - Before each rebuild, the counter is incremented and written back.
+/// - After a successful run the marker is deleted, which resets the counter implicitly.
 ///
-/// Justification N=3 : cohérent avec `CODE_MAP_REBUILD_MAX_FAILURES` (même philosophie
-/// de tolérance). Permet jusqu'à 3 tentatives transitoires (SIGKILL accidentel, reboot)
-/// avant d'alerter sur une boucle pathologique.
+/// Three matches [`CODE_MAP_REBUILD_MAX_FAILURES`] and follows the same reasoning: it
+/// absorbs a few transient failures, such as an accidental `SIGKILL` or a reboot, before
+/// raising the alarm on a pathological loop.
 pub const CODE_MAP_REBUILD_MAX_RETRY: u32 = 3;
 
-/// Lit le compteur de tentatives rebuild depuis le contenu du fichier marqueur.
+/// Reads the rebuild attempt counter from the marker file.
 ///
-/// Le fichier marqueur contient un entier décimal ASCII (ex: `"2"`).
-/// Retourne `0` si le fichier est absent, vide, ou non-parseable (conservative fallback).
+/// The marker file holds an ASCII decimal integer, for example `"2"`. Returns `0` when the
+/// file is missing, empty or unparsable.
 ///
-/// # Errors (silencieusement ignorées)
-///
-/// Les erreurs de lecture ou de parse sont silencieusement traitées comme `0` :
-/// un compteur non-lisible ne doit pas bloquer l'ingest — le pire cas est une
-/// tentative supplémentaire, pas un blocage définitif.
+/// Read and parse errors are deliberately swallowed and reported as `0` rather than
+/// propagated: an unreadable counter must not block the ingest, and the worst case is one
+/// extra attempt rather than a permanent deadlock.
 pub fn read_marker_attempts(path: &Path) -> u32 {
     std::fs::read_to_string(path)
         .ok()
@@ -97,17 +98,17 @@ pub fn read_marker_attempts(path: &Path) -> u32 {
         .unwrap_or(0)
 }
 
-/// Écrit le compteur de tentatives rebuild dans le fichier marqueur.
+/// Writes the rebuild attempt counter into the marker file.
 ///
-/// Le contenu est un entier décimal ASCII (ex: `"2"`).
+/// The content is an ASCII decimal integer, for example `"2"`.
 ///
 /// # Errors
 ///
-/// Retourne une erreur si l'écriture filesystem échoue.
+/// The filesystem write fails.
 pub fn write_marker_attempts(path: &Path, count: u32) -> Result<()> {
     std::fs::write(path, count.to_string().as_bytes()).with_context(|| {
         format!(
-            "write_marker_attempts : écriture compteur dans {}",
+            "write_marker_attempts: writing counter to {}",
             path.display()
         )
     })
@@ -189,6 +190,38 @@ pub struct CodeIngestArgs {
     pub visibility: IngestVisibility,
 }
 
+/// Refuses to ingest into a `vault_id` that already belongs to the DATA registry
+/// (`tenants`) — mirror guard of the one carried by `SqliteIndex::provision_vault` (lot REG).
+///
+/// ## Why this guard exists
+///
+/// The two registries carry incompatible lifecycles: `tenants` drives per-vault background
+/// jobs (distill, decay, GC) while `code_vault` rows are regenerated on every refresh and
+/// have no lifecycle at all. Ingesting derived notes into a vault that the crons iterate
+/// would expose them to distill; provisioning a code vault would do the symmetric damage.
+/// The invariant is `tenants` ∩ `code_vault` = ∅, and it needs a bar on **both** sides —
+/// a `code-` prefix check alone does not cover an operator who ran
+/// `admin vault create code-gradatum` beforehand.
+///
+/// ## Errors
+///
+/// Returns an error if the registry lookup fails (fail-closed: a lookup failure never
+/// grants ingestion) or if `vault_id` is present in `tenants`.
+async fn refuse_data_vault(index: &SqliteIndex, vault_id: &str) -> Result<()> {
+    let status = index
+        .get_tenant_status(vault_id)
+        .await
+        .with_context(|| format!("get_tenant_status({vault_id})"))?;
+    if status.is_some() {
+        anyhow::bail!(
+            "vault '{vault_id}' belongs to the DATA registry (`tenants`) — code ingest \
+             is refused: derived notes would become eligible for background jobs \
+             (distill/decay). A vault belongs to exactly one registry."
+        );
+    }
+    Ok(())
+}
+
 /// Ingests a git repository into the logical vault.
 ///
 /// ## Workflow
@@ -229,7 +262,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
 
     if !args.index_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le worker doit avoir démarré au moins une fois",
+            "index.db not found: {} — the worker must have started at least once",
             args.index_path.display()
         );
     }
@@ -237,6 +270,9 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
     let index = SqliteIndex::open(&args.index_path)
         .await
         .with_context(|| format!("ouverture index.db : {}", args.index_path.display()))?;
+
+    // Lot REG — garde miroir AVANT toute écriture, marqueur d'atomicité compris.
+    refuse_data_vault(&index, &args.vault_id).await?;
 
     // ── Cross-file atomicity marker ───────────────────────────────────────────
     //
@@ -281,15 +317,15 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
                     marker = %marker_path.display(),
                     attempts,
                     max = CODE_MAP_REBUILD_MAX_RETRY,
-                    "garde-fou anti-boucle : {} tentatives de rebuild échouées — \
-                     abandon. Intervention manuelle requise : supprimer le marqueur \
-                     ou réparer l'index.",
+                    "anti-loop guard: {} failed rebuild attempts — \
+                     aborting. Manual intervention required: remove the marker \
+                     or repair the index.",
                     attempts
                 );
                 anyhow::bail!(
-                    "trop de tentatives de rebuild échouées ({attempts} >= \
-                     {CODE_MAP_REBUILD_MAX_RETRY}) pour le vault '{}' — \
-                     marqueur : {}. Supprimer le marqueur manuellement pour débloquer.",
+                    "too many failed rebuild attempts ({attempts} >= \
+                     {CODE_MAP_REBUILD_MAX_RETRY}) for vault '{}' — \
+                     marker: {}. Remove the marker manually to unblock.",
                     args.vault_id,
                     marker_path.display()
                 );
@@ -298,7 +334,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
             // Incrémenter et réécrire le compteur AVANT le rebuild (le run peut crasher).
             write_marker_attempts(&marker_path, attempts + 1).with_context(|| {
                 format!(
-                    "write_marker_attempts avant rebuild : {}",
+                    "write_marker_attempts before rebuild: {}",
                     marker_path.display()
                 )
             })?;
@@ -308,8 +344,8 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
                 marker = %marker_path.display(),
                 attempt = attempts + 1,
                 max = CODE_MAP_REBUILD_MAX_RETRY,
-                "marqueur run incomplet détecté — run précédent interrompu. \
-                 Tentative rebuild {}/{CODE_MAP_REBUILD_MAX_RETRY}.",
+                "incomplete run marker detected — previous run interrupted. \
+                 Rebuild attempt {}/{CODE_MAP_REBUILD_MAX_RETRY}.",
                 attempts + 1
             );
         }
@@ -330,10 +366,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
         // on pose le marqueur avec compteur 0 initial.
         if !marker_path.exists() {
             write_marker_attempts(&marker_path, 0).with_context(|| {
-                format!(
-                    "pose marqueur avant drop rebuild : {}",
-                    marker_path.display()
-                )
+                format!("set marker before drop rebuild: {}", marker_path.display())
             })?;
         }
 
@@ -346,7 +379,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
             deleted,
             rebuild_explicit = args.rebuild,
             rebuild_forced = marker_path.exists(),
-            "rebuild : vault droppé"
+            "rebuild: vault dropped"
         );
     }
 
@@ -427,7 +460,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
         {
             tracing::warn!(
                 path = %relative_path,
-                "git ls-files a retourné un path absolu inattendu — skip défensif"
+                "git ls-files returned an unexpected absolute path — defensive skip"
             );
             continue;
         }
@@ -436,7 +469,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
         let file_bytes = match std::fs::read(&abs_path) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(path = %relative_path, error = %e, "lecture fichier échouée — skip");
+                tracing::warn!(path = %relative_path, error = %e, "file read failed — skip");
                 continue;
             }
         };
@@ -455,7 +488,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
         let content = match std::str::from_utf8(&file_bytes) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(path = %relative_path, error = %e, "fichier non-UTF8 — skip");
+                tracing::warn!(path = %relative_path, error = %e, "non-UTF8 file — skip");
                 continue;
             }
         };
@@ -473,7 +506,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
             None => {
                 tracing::warn!(
                     path = %relative_path,
-                    "extension non routée malgré le filtre SUPPORTED_EXTENSIONS — skip défensif"
+                    "extension not routed despite the SUPPORTED_EXTENSIONS filter — defensive skip"
                 );
                 continue 'files;
             }
@@ -491,15 +524,15 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
                     path = %relative_path,
                     error = %e,
                     consecutive_failures = failures,
-                    "parse tree-sitter échoué — skip (accuracy>coverage)"
+                    "tree-sitter parse failed — skip (accuracy>coverage)"
                 );
                 // Circuit-breaker : N échecs consécutifs = arrêt de l'ingest.
                 if circuit_breaker_should_open(failures) {
                     tracing::error!(
                         vault_id = %args.vault_id,
                         n = CODE_MAP_REBUILD_MAX_FAILURES,
-                        "code-map rebuild circuit-breaker ouvert après {} échecs consécutifs \
-                         — ingest interrompu. Vérifier le parser ou les fichiers source.",
+                        "code-map rebuild circuit-breaker open after {} consecutive failures \
+                         — ingest interrupted. Check the parser or the source files.",
                         CODE_MAP_REBUILD_MAX_FAILURES
                     );
                     break 'files;
@@ -515,7 +548,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
         index
             .write_note_derived_batch(&args.vault_id, relative_path, &hash, &head_sha, notes)
             .await
-            .with_context(|| format!("write_note_derived_batch pour {relative_path}"))?;
+            .with_context(|| format!("write_note_derived_batch for {relative_path}"))?;
 
         report.files_ingested += 1;
         report.notes_inserted += note_count;
@@ -533,13 +566,13 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
             index
                 .write_note_derived_batch(&args.vault_id, indexed_path, "", "", vec![])
                 .await
-                .with_context(|| format!("delete_path_notes pour {indexed_path}"))?;
+                .with_context(|| format!("delete_path_notes for {indexed_path}"))?;
 
             // Nettoyer l'entrée code_freshness.
             index
                 .delete_code_freshness_entry(&args.vault_id, indexed_path)
                 .await
-                .with_context(|| format!("delete_code_freshness_entry pour {indexed_path}"))?;
+                .with_context(|| format!("delete_code_freshness_entry for {indexed_path}"))?;
 
             report.files_deleted += 1;
         }
@@ -556,7 +589,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
         tracing::warn!(
             marker = %marker_path.display(),
             error = %e,
-            "impossible de retirer le marqueur ingest incomplet — le prochain run fera un rebuild"
+            "cannot remove the incomplete ingest marker — the next run will rebuild"
         );
     }
 
@@ -568,7 +601,7 @@ pub async fn run_ingest(args: CodeIngestArgs) -> Result<IngestReport> {
         files_deleted = report.files_deleted,
         notes_inserted = report.notes_inserted,
         duration_ms = report.duration_ms,
-        "code ingest terminé"
+        "code ingest complete"
     );
 
     Ok(report)
@@ -635,7 +668,7 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
 
     if !args.index_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le worker doit avoir démarré au moins une fois",
+            "index.db not found: {} — the worker must have started at least once",
             args.index_path.display()
         );
     }
@@ -643,6 +676,10 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
     let index = SqliteIndex::open(&args.index_path)
         .await
         .with_context(|| format!("ouverture index.db : {}", args.index_path.display()))?;
+
+    // Lot REG — garde miroir AVANT toute écriture (le repli `run_ingest` la rejoue,
+    // c'est sans effet : la garde est idempotente et sans I/O d'écriture).
+    refuse_data_vault(&index, &args.vault_id).await?;
 
     // ── Detect incomplete-run marker ──────────────────────────────────────────
     //
@@ -661,7 +698,7 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
     if marker_path.exists() {
         tracing::warn!(
             vault_id = %args.vault_id,
-            "run_update : marqueur ingest incomplet détecté — diff partiel refusé. Rebuild complet."
+            "run_update: incomplete ingest marker detected — partial diff refused. Full rebuild."
         );
         let to_sha = git_head_sha(&args.repo_path)?;
         let ingest = run_ingest(CodeIngestArgs {
@@ -705,7 +742,7 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
             None => {
                 tracing::debug!(
                     vault_id = %args.vault_id,
-                    "code update : vault inconnu ou pré-0018 → visibilité Pub par défaut"
+                    "code update: unknown or pre-0018 vault → Pub visibility by default"
                 );
                 IngestVisibility::Pub
             }
@@ -717,7 +754,7 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
         tracing::info!(
             vault_id = %args.vault_id,
             visibility = effective_visibility.as_str(),
-            "code update : aucun sha précédent → fallback ingest complet"
+            "code update: no previous sha → full ingest fallback"
         );
         let to_sha = git_head_sha(&args.repo_path)?;
         let ingest = run_ingest(CodeIngestArgs {
@@ -781,11 +818,11 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
                 index
                     .write_note_derived_batch(&args.vault_id, path, "", "", vec![])
                     .await
-                    .with_context(|| format!("delete notes pour {path}"))?;
+                    .with_context(|| format!("delete notes for {path}"))?;
                 index
                     .delete_code_freshness_entry(&args.vault_id, path)
                     .await
-                    .with_context(|| format!("delete_code_freshness_entry pour {path}"))?;
+                    .with_context(|| format!("delete_code_freshness_entry for {path}"))?;
                 report.files_deleted += 1;
             }
             // Added/Modified → re-ingest the file (atomic transaction).
@@ -796,7 +833,7 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
                 if std::path::Path::new(path.as_str()).is_absolute() || path.starts_with('/') {
                     tracing::warn!(
                         path = %path,
-                        "git diff a retourné un path absolu inattendu — skip défensif"
+                        "git diff returned an unexpected absolute path — defensive skip"
                     );
                     continue;
                 }
@@ -806,7 +843,7 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
                     Ok(b) => b,
                     Err(e) => {
                         // File listed as Modified but unreadable (race condition) → defensive skip.
-                        tracing::warn!(path = %path, error = %e, "lecture échouée — skip");
+                        tracing::warn!(path = %path, error = %e, "read failed — skip");
                         continue;
                     }
                 };
@@ -826,12 +863,12 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
                 ) {
                     Some(Ok(s)) => s,
                     Some(Err(e)) => {
-                        tracing::warn!(path = %path, error = %e, "parse échoué — skip");
+                        tracing::warn!(path = %path, error = %e, "parse failed — skip");
                         continue;
                     }
                     None => {
                         // Incohérence interne : le filtre SUPPORTED_EXTENSIONS l'aurait dû l'exclure.
-                        tracing::warn!(path = %path, "extension non routée — skip défensif");
+                        tracing::warn!(path = %path, "extension not routed — defensive skip");
                         continue;
                     }
                 };
@@ -840,7 +877,7 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
                 index
                     .write_note_derived_batch(&args.vault_id, path, &hash, &head_sha, notes)
                     .await
-                    .with_context(|| format!("write_note_derived_batch pour {path}"))?;
+                    .with_context(|| format!("write_note_derived_batch for {path}"))?;
                 report.files_ingested += 1;
                 report.notes_inserted += note_count;
             }
@@ -858,7 +895,7 @@ pub async fn run_update(args: CodeUpdateArgs) -> Result<UpdateReport> {
         from_sha = %report.from_sha,
         to_sha = %report.to_sha,
         duration_ms = report.duration_ms,
-        "code update terminé"
+        "code update complete"
     );
 
     Ok(report)
@@ -903,11 +940,11 @@ fn git_diff_name_status(repo: &Path, from: &str, to: &str) -> Result<Vec<(DiffSt
         ])
         .current_dir(repo)
         .output()
-        .with_context(|| format!("git diff --name-status -z {range} dans {}", repo.display()))?;
+        .with_context(|| format!("git diff --name-status -z {range} in {}", repo.display()))?;
 
     if !output.status.success() {
         anyhow::bail!(
-            "git diff échoué dans {} (range {range}) : {}",
+            "git diff failed in {} (range {range}): {}",
             repo.display(),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -946,11 +983,11 @@ fn git_head_sha(repo: &Path) -> Result<String> {
         .args(["rev-parse", "HEAD"])
         .current_dir(repo)
         .output()
-        .with_context(|| format!("git rev-parse HEAD dans {}", repo.display()))?;
+        .with_context(|| format!("git rev-parse HEAD in {}", repo.display()))?;
 
     if !output.status.success() {
         anyhow::bail!(
-            "git rev-parse HEAD échoué dans {} : {}",
+            "git rev-parse HEAD failed in {}: {}",
             repo.display(),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -959,9 +996,10 @@ fn git_head_sha(repo: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Vérifie si le circuit-breaker doit s'ouvrir après `failures` échecs consécutifs.
+/// Reports whether the circuit breaker should open after `failures` consecutive failures.
 ///
-/// Logique extraite pour testabilité unitaire — sans dépendre de tree-sitter ni I/O.
+/// Extracted as its own function so the threshold logic can be unit-tested without
+/// involving tree-sitter or any I/O.
 ///
 /// # Returns
 ///
@@ -971,35 +1009,35 @@ pub(crate) fn circuit_breaker_should_open(failures: u32) -> bool {
     failures >= CODE_MAP_REBUILD_MAX_FAILURES
 }
 
-/// Dispatch l'extraction de symboles selon l'extension du fichier source.
+/// Dispatches symbol extraction according to the source file extension.
 ///
-/// Retourne `None` si l'extension n'est pas supportée → le fichier est silencieusement
-/// ignoré par l'appelant (accuracy > coverage).
+/// Returns `None` when the extension is not supported, in which case the caller skips the
+/// file silently, favouring accuracy over coverage.
 ///
-/// ## Extensions routées
+/// ## Routing table
 ///
-/// | Extension        | Parser                |
-/// |------------------|-----------------------|
-/// | `.rs`            | `parse_rust_file`     |
-/// | `.py`            | `parse_python_file`   |
-/// | `.sh`, `.bash`   | `parse_bash_file`     |
-/// | `.ts`            | `parse_typescript_file` |
-/// | `.tsx`           | `parse_tsx_file` (grammaire JSX) |
+/// | Extension        | Parser                           |
+/// |------------------|----------------------------------|
+/// | `.rs`            | `parse_rust_file`                |
+/// | `.py`            | `parse_python_file`              |
+/// | `.sh`, `.bash`   | `parse_bash_file`                |
+/// | `.ts`            | `parse_typescript_file`          |
+/// | `.tsx`           | `parse_tsx_file` (JSX grammar)   |
 ///
-/// ## Note sur `.tsx`
+/// ## Note on `.tsx`
 ///
-/// `.tsx` utilise `LANGUAGE_TSX` (grammaire JSX de `tree-sitter-typescript 0.23.2`).
-/// Les composants React et le JSX sont parsés correctement.
-/// Les déclarations TS (fonctions, classes, interfaces, arrow functions) sont extraites ;
-/// les fragments JSX purs ne génèrent pas de symboles (accuracy > coverage).
+/// `.tsx` files go through the dedicated TSX grammar, so React components and JSX parse
+/// correctly. TypeScript declarations — functions, classes, interfaces, arrow functions —
+/// are extracted; pure JSX fragments yield no symbols, which is the intended trade-off of
+/// favouring accuracy over coverage.
 ///
-/// ## Paramètre `include_private`
+/// ## The `include_private` parameter
 ///
-/// Bash n'a aucun modificateur de visibilité → le paramètre est ignoré pour `.sh`/`.bash`.
+/// Bash has no visibility modifier, so the parameter is ignored for `.sh` and `.bash`.
 ///
-/// ## Effets de bord
+/// ## Side effects
 ///
-/// Aucun. Fonction pure (délègue à des parsers purs).
+/// None: the function is pure and delegates to pure parsers.
 pub(crate) fn parse_file_by_extension(
     source_path: &str,
     content: &str,
@@ -1037,11 +1075,11 @@ fn git_ls_files(repo: &Path) -> Result<Vec<String>> {
         .args(["-c", "core.quotepath=off", "ls-files", "-z"])
         .current_dir(repo)
         .output()
-        .with_context(|| format!("git ls-files -z dans {}", repo.display()))?;
+        .with_context(|| format!("git ls-files -z in {}", repo.display()))?;
 
     if !output.status.success() {
         anyhow::bail!(
-            "git ls-files échoué dans {} : {}",
+            "git ls-files failed in {}: {}",
             repo.display(),
             String::from_utf8_lossy(&output.stderr)
         );

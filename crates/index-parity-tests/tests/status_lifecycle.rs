@@ -51,9 +51,16 @@ async fn downgrade_removes_note_from_live_listing() {
         "note Live listée avant downgrade"
     );
 
-    idx.downgrade_note(&note.id, "remplacée", None)
-        .await
-        .expect("downgrade_note");
+    idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        ),
+        &note.id,
+        "remplacée",
+        None,
+    )
+    .await
+    .expect("downgrade_note");
 
     assert!(
         !idx.list_by_status(&vault, NoteStatus::Live)
@@ -77,16 +84,24 @@ async fn downgraded_note_excluded_from_semantic() {
     idx.write_note(&doomed).await.expect("write doomed");
 
     // Même vecteur → mêmes scores, seul le statut les distingue.
-    idx.insert_note_embedding(&live.id, embedder_id, dim, &[1.0, 0.0, 0.0, 0.0])
+    idx.insert_note_embedding("main", &live.id, embedder_id, dim, &[1.0, 0.0, 0.0, 0.0])
         .await
         .expect("emb live");
-    idx.insert_note_embedding(&doomed.id, embedder_id, dim, &[1.0, 0.0, 0.0, 0.0])
+    idx.insert_note_embedding("main", &doomed.id, embedder_id, dim, &[1.0, 0.0, 0.0, 0.0])
         .await
         .expect("emb doomed");
 
     // Avant downgrade : les deux remontent.
     let before = idx
-        .search_semantic("main", embedder_id, &[1.0, 0.0, 0.0, 0.0], 10, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            embedder_id,
+            &[1.0, 0.0, 0.0, 0.0],
+            10,
+            None,
+        )
         .await
         .expect("search before");
     assert!(
@@ -94,12 +109,27 @@ async fn downgraded_note_excluded_from_semantic() {
         "doomed présente avant"
     );
 
-    idx.downgrade_note(&doomed.id, "decay test", None)
-        .await
-        .expect("downgrade");
+    idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        ),
+        &doomed.id,
+        "decay test",
+        None,
+    )
+    .await
+    .expect("downgrade");
 
     let after = idx
-        .search_semantic("main", embedder_id, &[1.0, 0.0, 0.0, 0.0], 10, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            embedder_id,
+            &[1.0, 0.0, 0.0, 0.0],
+            10,
+            None,
+        )
         .await
         .expect("search after");
     assert!(

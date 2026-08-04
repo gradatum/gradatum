@@ -16,7 +16,7 @@ use crate::identity::NoteId;
 use crate::index::{FileChecksumEntry, NoteRecord, TemporalEntry};
 use crate::metric_sample::MetricSamplePoint;
 use crate::scheduled_health::{ScheduledTaskHealth, TaskOutcome};
-use crate::scope::{OverrideScope, VaultId};
+use crate::scope::{AclCheckedVaultId, OverrideScope, TenantId, VaultId};
 use crate::status::NoteStatus;
 
 // ── Types publics migrés depuis gradatum-index ────────────────────────────────
@@ -49,6 +49,37 @@ pub struct SearchHitRaw {
     /// still returned unless a temporal bound (`from_ms`/`to_ms`) is active, in which
     /// case the SQL WHERE clause excludes them.
     pub anchor_ms: Option<i64>,
+}
+
+/// Projected note row for the retrospective audit scan ([`IndexStore::audit_scan`]).
+///
+/// Carries only what the audit detection needs (id, section, body, optional embedding).
+/// Notes in [`crate::section::Section::PROTECTED_DELETE`] are excluded at the SQL level —
+/// this row is never produced for a governance note.
+#[derive(Debug, Clone)]
+pub struct AuditScanRow {
+    /// Note ULID.
+    pub note_id: String,
+    /// Note section (never a `PROTECTED_DELETE` section).
+    pub section: String,
+    /// Stored H1 title (migration 0005), if present. Falls back to body-derived at the caller.
+    pub title: Option<String>,
+    /// Logical author id (`author_id`), if present. Audit signal: `tester` in `debug` = test note.
+    pub author_id: Option<String>,
+    /// Creation timestamp (`notes.created`, epoch ms) — relevance axis: note age.
+    pub created_ms: i64,
+    /// Trust score (`notes.trust`, `REAL`), if set (NULL → `None`). Relevance axis.
+    pub trust: Option<f64>,
+    /// Lifecycle status (`notes.status`, kebab-case). The irrelevance detector filters on
+    /// `"live"`, but the SQL scan only excludes `('downgraded','garbage')`, so `staging`
+    /// and `pending-review` rows do reach here.
+    pub status: String,
+    /// Body Markdown (source for hash / MinHash / title derivation).
+    pub body_text: String,
+    /// Body embedding, if present (degraded ANN mode tolerated → `None`).
+    pub embedding: Option<Vec<f32>>,
+    /// Embedding model id (audit compares only same-model vectors).
+    pub embedder_id: Option<String>,
 }
 
 /// Raw lesson result returned by [`IndexStore::recall_lessons`].
@@ -164,14 +195,46 @@ pub struct CodeScopeEntryRaw {
     pub span: Option<(u32, u32)>,
 }
 
+/// One ANN partition `(vault_id, embedder_id)` whose derived index is **incomplete**.
+///
+/// Produced by [`IndexStore::ann_health_gate`] at server boot: `indexed < eligible` means
+/// the vec0 table holds fewer rows than the source table `note_embeddings` legitimately
+/// requires for that partition, so part of the corpus is unreachable through the ANN path.
+///
+/// ## Deficit only, never surplus
+///
+/// A surplus (`indexed > eligible`) is deliberately **not** reported: downgrading a note
+/// only updates `notes.status`, leaving both the embedding and its ANN row in place, so a
+/// surplus is a legitimate steady state. Such a row can never surface in a result either —
+/// the ANN query re-joins `notes` and filters `status != 'downgraded'` plus sentinels.
+/// A deficit is the opposite: it is invisible at query time and silently shrinks recall.
+///
+/// ## Not `#[non_exhaustive]`
+///
+/// The four fields **are** the measurement, and the struct is built outside this crate (by
+/// `gradatum-index`), which `#[non_exhaustive]` would forbid. Extending the record would
+/// change what is measured, not add an optional detail — that is a new type, not a field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnPartitionDeficit {
+    /// Vault owning the partition (vec0 `PARTITION KEY`).
+    pub vault_id: String,
+    /// Embedder owning the partition (vec0 `PARTITION KEY`).
+    pub embedder_id: String,
+    /// Pairs `(note, embedder)` eligible for the ANN index in `note_embeddings`.
+    pub eligible: u64,
+    /// Rows actually present in `note_embeddings_ann` for that partition.
+    pub indexed: u64,
+}
+
 /// Full-text search, override, and checksum storage contract — async, thread-safe.
 ///
 /// Implemented by `gradatum-index::SqliteIndex`.
 ///
 /// ## Stability
 ///
-/// `#[stability::unstable]` — the API may change before v1.0.0.
-/// `GradatumError` will converge to a dedicated `StoreError` (see `QueueStore`) in a future release.
+/// `#[stability::unstable]` — this trait sits outside the crate's SemVer guarantee and may
+/// change in a future release. `GradatumError` will converge to a dedicated `StoreError`
+/// (see `QueueStore`).
 ///
 /// ## Contention
 ///
@@ -291,11 +354,11 @@ pub trait IndexStore: Send + Sync {
     // readability gain (each filter is an independent `Option`). Cap accepted here.
     #[expect(
         clippy::too_many_arguments,
-        reason = "filtres de recherche orthogonaux (F-37+F-65) — struct d'options sans gain"
+        reason = "orthogonal search filters (F-37+F-65) — options struct without benefit"
     )]
     async fn search_fts_with_snippet(
         &self,
-        vault_id: &VaultId,
+        vault_id: &AclCheckedVaultId,
         query: &str,
         limit: usize,
         include_downgraded: bool,
@@ -407,6 +470,133 @@ pub trait IndexStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<(String, NoteStatus)>, GradatumError>;
 
+    /// Per-vault variant of [`IndexStore::find_promotable`].
+    ///
+    /// Same predicate (aged `staging`/`pending-review` notes, sentinels excluded),
+    /// restricted to one `vault_id`. Used by the review-promote tick when
+    /// `multi_tenant.enabled = true`, where no job may ever span two vaults.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns an empty list: a backend without support promotes nothing, which is the
+    /// safe outcome. `SqliteIndex` provides the real query.
+    ///
+    /// # Errors
+    /// `GradatumError::Storage` if the SQLite query fails.
+    async fn find_promotable_in_vault(
+        &self,
+        _vault_id: &VaultId,
+        _cutoff_ms: i64,
+        _limit: usize,
+    ) -> Result<Vec<(String, NoteStatus)>, GradatumError> {
+        Ok(vec![])
+    }
+
+    /// Active vaults — `tenants.status = 'active'`, sorted by id.
+    ///
+    /// The iteration source of the periodic jobs when `multi_tenant.enabled = true`:
+    /// each tick processes the vaults **one at a time**. `suspended` and `deleted`
+    /// tenants are excluded, so their jobs are refused outright.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns an empty list — fail-closed: a backend without support iterates over no
+    /// vault at all, rather than falling back to an implicit cross-vault scan.
+    /// `SqliteIndex` provides the real query.
+    ///
+    /// # Errors
+    /// `GradatumError::Storage` if the SQLite query fails.
+    async fn list_active_vaults(&self) -> Result<Vec<VaultId>, GradatumError> {
+        Ok(vec![])
+    }
+
+    /// Provisions a vault: `INSERT OR IGNORE` of the tenant row (as `active`) plus its
+    /// `write` self-grant — transactional and idempotent, so replaying it is a no-op.
+    ///
+    /// Returns `true` if at least one row was created, `false` if the vault was already
+    /// provisioned.
+    ///
+    /// # Default implementation
+    ///
+    /// `Err(Storage)` — a backend without support must NEVER claim to have provisioned
+    /// anything: fail loud rather than silently no-op. `SqliteIndex` provides the real
+    /// transaction.
+    ///
+    /// # Errors
+    /// `GradatumError::Storage` if the write fails or the backend has no support.
+    async fn provision_vault(&self, _vault_id: &str) -> Result<bool, GradatumError> {
+        Err(GradatumError::Storage(
+            "provision_vault not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// Changes the lifecycle status of a tenant (suspend or soft-delete).
+    ///
+    /// Returns `Ok(Some(changed))` when the tenant exists — `changed = false` if it was
+    /// already in that status, so the call is idempotent — and `Ok(None)` when the
+    /// tenant is unknown.
+    ///
+    /// # Default implementation
+    ///
+    /// `Err(Storage)` — same fail-loud contract as [`IndexStore::provision_vault`].
+    ///
+    /// # Errors
+    /// `GradatumError::Storage` if the write fails or the backend has no support.
+    async fn set_tenant_status(
+        &self,
+        _vault_id: &str,
+        _status: crate::scope::TenantStatus,
+    ) -> Result<Option<bool>, GradatumError> {
+        Err(GradatumError::Storage(
+            "set_tenant_status not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// Reads the lifecycle status of a tenant.
+    ///
+    /// `Ok(None)` means the tenant is unknown (never provisioned). A row holding an
+    /// out-of-domain status value is a `Storage` error — fail-closed, so that a
+    /// corrupted value is never read back as a valid status.
+    ///
+    /// # Default implementation
+    ///
+    /// `Err(Storage)` — same fail-loud contract as [`IndexStore::provision_vault`]:
+    /// the callers (the read-target guard, the purge path) then refuse downstream.
+    ///
+    /// # Errors
+    /// `GradatumError::Storage` if the read fails or the backend has no support.
+    async fn get_tenant_status(
+        &self,
+        _vault_id: &str,
+    ) -> Result<Option<crate::scope::TenantStatus>, GradatumError> {
+        Err(GradatumError::Storage(
+            "get_tenant_status not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// Lists the ULIDs of **every** note in a vault — any status, `downgraded`
+    /// included, sentinels excluded — together with the absolute total.
+    /// This is the eligibility listing used when purging a soft-deleted vault.
+    /// `limit` is clamped to `[1, 500]`.
+    ///
+    /// # Default implementation
+    ///
+    /// `Err(Storage)` — fail loud: a backend without support must never let the caller
+    /// believe a purge was complete, which `(vec![], 0)` would suggest ("nothing left
+    /// to purge").
+    ///
+    /// # Errors
+    /// `GradatumError::Storage` if the read fails or the backend has no support.
+    async fn list_vault_note_ulids(
+        &self,
+        _vault_id: &str,
+        _limit: usize,
+    ) -> Result<(Vec<String>, u64), GradatumError> {
+        Err(GradatumError::Storage(
+            "list_vault_note_ulids not supported by this backend".to_owned(),
+        ))
+    }
+
     /// Looks up a note by its Markdown title (first `# {title}` line).
     ///
     /// Returns the ULID of the first matching note, or `None`.
@@ -421,14 +611,14 @@ pub trait IndexStore: Send + Sync {
         title: &str,
     ) -> Result<Option<String>, GradatumError>;
 
-    /// Vérifie qu'une note existe et est `live` par son identifiant (ULID string).
+    /// Checks that a note exists and is `live`, addressing it by ULID string.
     ///
-    /// Utilisé pour la résolution ULID-first des wikilinks `[[section:ULID]]` :
-    /// quand le wikilink contient directement un ULID, cette méthode confirme
-    /// l'existence sans passer par la correspondance H1 (titre Markdown).
+    /// Used for the ULID-first resolution of `[[section:ULID]]` wikilinks: when the
+    /// wikilink already carries a ULID, this method confirms existence without going
+    /// through the Markdown H1 title match.
     ///
-    /// Retourne `Some(id)` si la note existe et est `live`, `None` sinon.
-    /// Exclut les sentinelles et les notes non-live (archived, garbage, etc.).
+    /// Returns `Some(id)` when the note exists and is `live`, `None` otherwise.
+    /// Sentinels and non-live notes (archived, garbage, …) are excluded.
     ///
     /// # Errors
     ///
@@ -448,6 +638,79 @@ pub trait IndexStore: Send + Sync {
     ///
     /// Returns `GradatumError::Storage` if the SQLite query fails.
     async fn live_note_count(&self, vault_id: &str) -> Result<u64, GradatumError>;
+
+    /// Returns the allow-list grants of a tenant (multi-vault substrate).
+    ///
+    /// Only grants whose tenant row is `active` (table `tenants`, migration 0030)
+    /// are returned. Consulted by the auth middleware and the scoped write paths
+    /// when `multi_tenant.enabled = true`; the legacy single-vault path never calls it.
+    ///
+    /// Default implementation: **empty list, fail-closed** — a backend without
+    /// grant storage grants nothing (enforcement points treat "no grant" as deny).
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the query fails (callers must treat an
+    /// error as a denial, never as an implicit grant).
+    ///
+    /// `tenant_id` is typed [`TenantId`]: the principal is the same type here, on the
+    /// api-key record and on the returned [`crate::scope::VaultGrant`], so no call site
+    /// can accidentally pass a vault id where a tenant id is expected.
+    async fn tenant_grants(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<crate::scope::VaultGrant>, GradatumError> {
+        let _ = tenant_id;
+        Ok(Vec::new())
+    }
+
+    /// Allow-list grants of an agent — mirror of [`Self::tenant_grants`] at the
+    /// agent level (lot B6, plan v1.0.0).
+    ///
+    /// Returns the set of vaults an agent identity may access, with access level and
+    /// optional section scope. Consulted by the auth middleware after the tenant-level
+    /// grant check: effective access = `min(tenant_grant, agent_grant)`.
+    ///
+    /// Default implementation: **empty list, fail-closed** — a backend without
+    /// grant storage grants nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the query fails (callers must treat an
+    /// error as a denial, never as an implicit grant).
+    async fn agent_grants(
+        &self,
+        agent_id: &crate::scope::AgentId,
+    ) -> Result<Vec<crate::scope::AgentVaultGrant>, GradatumError> {
+        let _ = agent_id;
+        Ok(Vec::new())
+    }
+
+    /// Upserts a row into `agent_vault_grants` — **INSERT OR IGNORE**, idempotent by
+    /// construction (lot B7, v1.0.0 plan).
+    ///
+    /// Called at boot by the `agent_id` ↔ `agent_vault_grants` reconciliation to
+    /// ensure every active key has its grant row, and at `api-key create` time
+    /// to provision the grant alongside the key.
+    ///
+    /// A pre-existing row (same `agent_id` + `vault_id`) is **never**
+    /// overwritten — the upsert is additive, never destructive. A grant that was
+    /// granted then manually revoked is not silently restored at boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the INSERT fails.
+    async fn upsert_agent_grant(
+        &self,
+        agent_id: &crate::scope::AgentId,
+        vault_id: &crate::scope::VaultId,
+        access: crate::scope::GrantAccess,
+        section: Option<&str>,
+    ) -> Result<(), GradatumError> {
+        // Default: no-op pour les stores sans agent_vault_grants.
+        let _ = (agent_id, vault_id, access, section);
+        Ok(())
+    }
 
     /// Lists distinct authors in a vault with their note counts.
     ///
@@ -523,18 +786,52 @@ pub trait IndexStore: Send + Sync {
         cursor: Option<&str>,
     ) -> Result<(Vec<NoteRecord>, u64), GradatumError>;
 
-    /// Liste les notes par STATUT (métadonnées, inclut `downgraded`).
+    /// Atomically allocates the next **feature number** for `vault_id`.
     ///
-    /// Contrairement à [`Self::list_notes`], n'exclut PAS les notes `downgraded` —
-    /// c'est l'objet de cette méthode (browse archived/downgraded, fix drill-down studio).
+    /// Returns a number that is guaranteed unique across concurrent callers: the backing
+    /// store increments a persistent per-vault counter inside a single serialized
+    /// transaction, so two simultaneous allocations always receive two distinct numbers.
+    /// The counter never goes backwards.
     ///
-    /// - `statuses` : ensemble de statuts à inclure. Vide → `Ok((vec![], 0))`.
-    /// - `section` : filtre optionnel sur la section.
-    /// - `cursor` : dernier ULID reçu (exclusif). `None` ou `""` = début.
-    /// - `limit` : cappé à `[1, 200]` par l'implémentation.
+    /// On **every** allocation the store recomputes the current maximum from the project-map
+    /// card **bodies** (role `[[feature:F-XX]]`, via [`crate::project_map::max_feature_number`])
+    /// — the reliable source of truth, never the note tags — and takes the floor as
+    /// `max(persistent_counter, derived_max)`. This holds the sequence above any card created
+    /// out-of-band (an explicit client-side number), so allocation does not depend on the
+    /// (incomplete, inconsistent) `f-NNN` tags and cannot collide with an existing card.
     ///
-    /// Implémentation par défaut : retourne `Ok((vec![], 0))` — uniquement l'index SQLite
-    /// réel fournit des résultats. Les mocks de test héritent du défaut sans modification.
+    /// # Default
+    ///
+    /// The default implementation fails **loudly** with [`GradatumError::Storage`]: a store
+    /// that does not persist a feature counter must never silently return a doubtful number.
+    /// The production `SqliteIndex` overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradatumError::Storage`] if the counter cannot be read, seeded or written —
+    /// in which case **no number is handed out** (the transaction rolls back).
+    async fn allocate_feature_number(&self, vault_id: &VaultId) -> Result<u32, GradatumError> {
+        let _ = vault_id;
+        Err(GradatumError::Storage(
+            "allocate_feature_number is not supported by this index backend".to_string(),
+        ))
+    }
+
+    /// Lists notes **by status** (metadata only, `downgraded` notes included).
+    ///
+    /// Unlike [`Self::list_notes`], this does **not** exclude `downgraded` notes — that
+    /// is the whole point of the method: browsing archived or downgraded material, and
+    /// drilling down from the Studio UI.
+    ///
+    /// - `statuses`: the set of statuses to include. Empty → `Ok((vec![], 0))`.
+    /// - `section`: optional filter on the section.
+    /// - `cursor`: the last ULID received (exclusive). `None` or `""` starts from the top.
+    /// - `limit`: clamped to `[1, 200]` by the implementation.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok((vec![], 0))` — only the real SQLite index produces results; test
+    /// mocks inherit the default unchanged.
     ///
     /// # Errors
     ///
@@ -616,7 +913,7 @@ pub trait IndexStore: Send + Sync {
     /// Returns `GradatumError::Storage` if the SQLite query fails.
     async fn get_titles_sections(
         &self,
-        vault_id: &str,
+        vault_id: &AclCheckedVaultId,
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, (Option<String>, String)>, GradatumError>;
 
@@ -632,13 +929,13 @@ pub trait IndexStore: Send + Sync {
     /// safe degradation to BM25-status-only). `SqliteIndex` overrides.
     async fn get_statuses(
         &self,
-        _vault_id: &str,
+        _vault_id: &AclCheckedVaultId,
         _ids: &[String],
     ) -> Result<std::collections::HashMap<String, String>, GradatumError> {
         Ok(std::collections::HashMap::new())
     }
 
-    /// Batch-reads `anchor_ms` from `temporal_index` for a list of note IDs (F-65).
+    /// Batch-reads `anchor_ms` from `temporal_index` for a list of note IDs.
     ///
     /// Returns `HashMap<note_id, anchor_ms>` for notes present in `temporal_index`.
     /// Notes absent from the index are simply not in the returned map.
@@ -657,7 +954,7 @@ pub trait IndexStore: Send + Sync {
     /// If a temporal bound (`from_ms`/`to_ms`) is active in `vault_search_impl`, the caller
     /// retains only hits whose `note_id` appears in the map (the `None => false` branch).
     /// A backend that returns an empty map here will therefore **silently drop ALL semantic
-    /// hits** whenever bounds are active — making the sémantique branch fail-closed.
+    /// hits** whenever bounds are active — making the semantic branch fail-closed.
     ///
     /// Any backend that populates `note_embeddings` and exposes semantic search MUST override
     /// this method to maintain parity between the FTS and semantic temporal filtering paths
@@ -668,21 +965,24 @@ pub trait IndexStore: Send + Sync {
     /// Returns `GradatumError::Storage` if the SQLite query fails.
     async fn get_anchor_ms_batch(
         &self,
-        _vault_id: &str,
+        _vault_id: &AclCheckedVaultId,
         _ids: &[String],
     ) -> Result<std::collections::HashMap<String, i64>, GradatumError> {
         Ok(std::collections::HashMap::new())
     }
 
-    /// Reads the trust score for a note from the `notes.trust` column.
+    /// Reads the trust score for a note from the `notes.trust` column, scoped to `vault_id`.
     ///
-    /// Returns `Some(trust)` if the note exists and the column is non-NULL,
-    /// `None` if the note is absent or trust has not been set.
+    /// Returns `Some(trust)` if the note exists in `vault_id` and the column is non-NULL,
+    /// `None` if the note is absent (in that vault) or trust has not been set.
+    ///
+    /// The lookup is `(vault_id, id)` — never id-only — to avoid resolving a homonymous
+    /// note from another vault on ULID collision (composite PK since migration 0032).
     ///
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if the SQLite query fails.
-    async fn get_trust(&self, id: &NoteId) -> Result<Option<f32>, GradatumError>;
+    async fn get_trust(&self, vault_id: &str, id: &NoteId) -> Result<Option<f32>, GradatumError>;
 
     /// Reads `(trust, provenance)` for a note to support decay-trust scoring.
     ///
@@ -708,10 +1008,13 @@ pub trait IndexStore: Send + Sync {
 
     /// Inserts or updates a redirect `old_slug → ulid` in `redirect_table`.
     ///
+    /// `vault_id`: namespace of the redirect (part of the composite PK
+    /// `(vault_id, title_slug)`, migration 0035). Two vaults may carry the same
+    /// slug without clobbering each other.
     /// `renamed_at_ms`: rename timestamp in Unix epoch milliseconds.
     ///
-    /// Idempotent: `INSERT OR REPLACE` — if a redirect exists for this slug,
-    /// it is replaced by the new ULID (last rename wins).
+    /// Idempotent: `INSERT OR REPLACE` — if a redirect exists for this
+    /// `(vault_id, slug)`, it is replaced by the new ULID (last rename wins).
     ///
     /// Called by `gradatum-admin vault rename` after each rename.
     ///
@@ -720,15 +1023,17 @@ pub trait IndexStore: Send + Sync {
     /// Returns `GradatumError::Storage` if the INSERT fails.
     async fn upsert_redirect(
         &self,
+        vault_id: &str,
         slug: &str,
         ulid: &Ulid,
         renamed_at_ms: i64,
     ) -> Result<(), GradatumError>;
 
-    /// Resolves an old-title slug to its current ULID via `redirect_table`.
+    /// Resolves an old-title slug to its current ULID via `redirect_table`,
+    /// scoped to `vault_id` (composite PK `(vault_id, title_slug)`, migration 0035).
     ///
-    /// Returns `Some(ulid)` if the slug exists in the redirect table,
-    /// `None` if no redirect is registered for this slug.
+    /// Returns `Some(ulid)` if the slug exists in the redirect table for this vault,
+    /// `None` if no redirect is registered for this `(vault_id, slug)`.
     ///
     /// The slug is obtained via `title_to_slug(old_title)` (lowercase + spaces→hyphens).
     ///
@@ -738,7 +1043,11 @@ pub trait IndexStore: Send + Sync {
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if the SQLite query fails.
-    async fn resolve_redirect(&self, slug: &str) -> Result<Option<Ulid>, GradatumError>;
+    async fn resolve_redirect(
+        &self,
+        vault_id: &str,
+        slug: &str,
+    ) -> Result<Option<Ulid>, GradatumError>;
 
     // ── Semantic Forget — scope resolution ────────────────────────────────────
 
@@ -756,7 +1065,7 @@ pub trait IndexStore: Send + Sync {
     /// Returns `GradatumError::Storage` if the FTS5 query fails.
     async fn search_fts_for_forget(
         &self,
-        vault_id: &str,
+        vault_id: &VaultId,
         query: &str,
         limit: usize,
     ) -> Result<Vec<(String, String)>, GradatumError>;
@@ -803,10 +1112,11 @@ pub trait IndexStore: Send + Sync {
     /// Writes the computed trust score for a note into the `notes.trust` column.
     ///
     /// Single write point for a computed trust value outside `TRUST_SCORES` (distillation).
-    /// Idempotent: `UPDATE notes SET trust = ?2 WHERE id = ?1`.
+    /// Idempotent, scoped on `(vault_id, id)` — mirrors
+    /// [`get_trust_and_provenance`](Self::get_trust_and_provenance).
     ///
-    /// Returns the number of affected rows (`0` if the note is absent — non-fatal
-    /// for the caller: the static `provenance` value remains in place).
+    /// Returns the number of affected rows (`0` if no note matches `(vault_id, id)` —
+    /// non-fatal for the caller: the static `provenance` value remains in place).
     ///
     /// # Default implementation
     ///
@@ -816,8 +1126,13 @@ pub trait IndexStore: Send + Sync {
     /// # Errors
     ///
     /// `GradatumError::Storage` if the `UPDATE` fails.
-    #[must_use = "le nombre de lignes affectées indique si la note existait"]
-    async fn set_note_trust(&self, _id: &NoteId, _trust: f32) -> Result<usize, GradatumError> {
+    #[must_use = "the number of affected rows indicates whether the note existed"]
+    async fn set_note_trust(
+        &self,
+        _vault_id: &str,
+        _id: &NoteId,
+        _trust: f32,
+    ) -> Result<usize, GradatumError> {
         Ok(0)
     }
 
@@ -858,13 +1173,16 @@ pub trait IndexStore: Send + Sync {
     /// `GradatumError::Storage` if the query fails.
     async fn timeline(
         &self,
-        vault_id: &VaultId,
+        vault_id: &AclCheckedVaultId,
         filter: &crate::temporal_query::TimelineFilter,
     ) -> Result<Vec<crate::temporal_query::TimelineRow>, GradatumError>;
 
-    /// Deletes a redirect by target ULID from `redirect_table`.
+    /// Deletes a redirect by target ULID from `redirect_table`, scoped to `vault_id`.
     ///
     /// Used during note purge/forget to clean up redirects pointing to it.
+    /// `vault_id` scopes the `DELETE` to the note's namespace (composite PK
+    /// `(vault_id, title_slug)`, migration 0035) so a purge in one vault never
+    /// removes a homonymous redirect in another.
     /// Returns the number of deleted rows.
     ///
     /// # Default implementation
@@ -875,7 +1193,11 @@ pub trait IndexStore: Send + Sync {
     /// # Errors
     ///
     /// `GradatumError::Storage` if the `DELETE` fails.
-    async fn delete_redirect_by_ulid(&self, _ulid_str: &str) -> Result<usize, GradatumError> {
+    async fn delete_redirect_by_ulid(
+        &self,
+        _vault_id: &str,
+        _ulid_str: &str,
+    ) -> Result<usize, GradatumError> {
         Ok(0)
     }
 
@@ -1122,7 +1444,7 @@ pub trait IndexStore: Send + Sync {
     /// `GradatumError::Storage` on SQLite error.
     async fn count_fts_matches(
         &self,
-        _vault_id: &VaultId,
+        _vault_id: &AclCheckedVaultId,
         _query: &str,
         _include_downgraded: bool,
         _section: Option<&str>,
@@ -1155,37 +1477,37 @@ pub trait IndexStore: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
-    /// Mutations index atomiques pour persist/curated.
+    /// Applies the index mutations of a persist/curate step atomically.
     ///
-    /// ## Contrat d'atomicité
+    /// ## Atomicity contract
     ///
-    /// - Si une mutation échoue → TOUTES les mutations index sont rollback.
-    /// - Ne couvre PAS le vault write (markdown sur disque) — celui-ci est
-    ///   écrit avant, est idempotent (CoW + .history), et reste cohérent
-    ///   même si la tx index échoue : l'état est ré-exécutable (le worker
-    ///   re-tentera le job, retrouvera le markdown présent et re-tentera index).
+    /// - If any one mutation fails, **all** index mutations are rolled back.
+    /// - It does **not** cover the vault write (the Markdown file on disk). That write
+    ///   happens first, is idempotent (copy-on-write plus `.history`), and stays
+    ///   consistent even when the index transaction fails: the state remains replayable,
+    ///   because the worker retries the job, finds the Markdown already there and retries
+    ///   the indexing step.
     ///
-    /// ## Implémentation default
+    /// ## Default implementation
     ///
-    /// No-op `Ok(())` — suffisant pour les implémentations de test/mock.
-    /// L'implémentation concrète `SqliteIndex` override avec une vraie transaction
-    /// (`unchecked_transaction`) pour une atomicité garantie.
+    /// A no-op returning `Ok(())` — enough for test and mock implementations.
+    /// The concrete `SqliteIndex` overrides it with a real transaction
+    /// (`unchecked_transaction`) that guarantees atomicity.
     ///
-    /// ## Paramètres
+    /// ## Parameters
     ///
-    /// - `note_id`: identifiant de la note cible.
-    /// - `title`: titre H1 extrait du corps (upsert dans `notes.title`).
-    /// - `temporal`: entrée temporelle optionnelle (`temporal_index`).
-    /// - `links`: paires `(src_note_id, dst_note_id)` à insérer dans `note_links`.
-    /// - `trust`: confiance optionnelle (`notes.trust`).
-    /// - `vault_id`: tenant — utilisé pour `note_links.vault_id`
-    ///   et `temporal_index.vault_id`.
+    /// - `note_id`: identifier of the target note.
+    /// - `title`: H1 title extracted from the body (upserted into `notes.title`).
+    /// - `temporal`: optional temporal entry (`temporal_index`).
+    /// - `links`: `(src_note_id, dst_note_id)` pairs to insert into `note_links`.
+    /// - `trust`: optional trust score (`notes.trust`).
+    /// - `vault_id`: the tenant — used for `note_links.vault_id` and
+    ///   `temporal_index.vault_id`.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si l'une des mutations échoue.
-    /// L'implémentation concrète (`SqliteIndex`) garantit le rollback de
-    /// toutes les mutations du lot en cas d'échec.
+    /// `GradatumError::Storage` if any mutation fails. The concrete `SqliteIndex`
+    /// implementation guarantees that the whole batch is rolled back in that case.
     async fn persist_curated_index_atomic(
         &self,
         _note_id: &NoteId,
@@ -1200,55 +1522,130 @@ pub trait IndexStore: Send + Sync {
         Ok(())
     }
 
-    /// Remplit la table ANN `note_embeddings_ann` (vec0) à partir de `note_embeddings`.
+    /// Fills the ANN table `note_embeddings_ann` (vec0) from `note_embeddings`.
     ///
-    /// Opération idempotente — les vecteurs déjà présents sont ignorés (upsert).
-    /// Appelée une seule fois au boot du serveur, après l'enregistrement de l'extension
-    /// sqlite-vec, pour garantir qu'un corpus existant est immédiatement interrogeable
-    /// en mode ANN sans nécessiter un re-index manuel.
+    /// Idempotent: vectors already present are skipped (upsert). Called once at server
+    /// boot, right after the sqlite-vec extension is registered, so that an existing
+    /// corpus is immediately queryable in ANN mode without a manual re-index.
     ///
-    /// ## Implémentation default
+    /// ## Default implementation
     ///
-    /// No-op `Ok(0)` — pour les backends brute-force et les mocks de test.
-    /// `SqliteIndex` override en déléguant à `sqlite_vec::backfill_ann_from_conn`.
+    /// A no-op returning `Ok(0)` — for brute-force backends and test mocks.
+    /// `SqliteIndex` overrides it by delegating to `sqlite_vec::backfill_ann_from_conn`.
     ///
-    /// ## Retour
+    /// ## Returns
     ///
-    /// Nombre de vecteurs effectivement écrits dans la table ANN (0 = déjà à jour).
+    /// The number of vectors actually written to the ANN table (`0` = already up to date).
     ///
-    /// ## Erreurs
+    /// # Errors
     ///
-    /// `GradatumError::Storage` si la lecture ou l'écriture SQLite échoue.
-    /// En production, l'erreur est non-fatale (le serveur continue en dégradé brute-force).
+    /// `GradatumError::Storage` if the SQLite read or write fails. In production the
+    /// error is non-fatal: the server carries on in degraded brute-force mode.
     async fn backfill_ann_index(&self) -> Result<u64, GradatumError> {
         // Default : no-op — BruteForce path et mocks de test.
         Ok(0)
     }
 
-    // ── Santé des tâches récurrentes (v0.7.5 F-85) ──────────────────────────
-
-    /// Enregistre un tick d'une tâche récurrente dans `scheduled_task_health`.
+    /// Garbage-collects orphan ANN vectors (`note_embeddings_ann`) of the given `vault_id`
+    /// partition, whose `note_id` no longer exists in that vault's `notes`. The sweep is
+    /// **partition-scoped**: only the target vault's vectors are considered.
     ///
-    /// Sémantique :
-    /// - Upsert `scheduled_task_health` (PK `task_name`) : `run_count + 1`,
-    ///   `last_run_ms`, `last_outcome`, `last_duration_ms`, `last_error`, `updated_at`.
-    /// - Si `outcome == Error` : append 1 ligne dans `scheduled_task_error`
-    ///   + purge paresseuse (`DELETE WHERE occurred_ms < now - 7j`).
+    /// Idempotent one-shot safety net for orphans created before the atomic ANN
+    /// cascade landed. Called at server boot after [`Self::backfill_ann_index`], once per
+    /// active vault when `multi_tenant` is enabled (and once for `"main"` when it is not).
     ///
-    /// ## Infaillibilité
+    /// ## Default implementation
     ///
-    /// L'appelant ne doit PAS propager une erreur de cette méthode dans une tâche tokio —
-    /// logguer en `warn` et continuer. La tâche ne doit jamais paniquer à cause de
-    /// l'instrumentation.
+    /// A no-op returning `Ok(0)` — for brute-force backends and test mocks. `SqliteIndex`
+    /// overrides it with the real `DELETE ... WHERE vault_id = ?1 AND note_id NOT IN
+    /// (SELECT id FROM notes WHERE vault_id = ?1)`.
     ///
-    /// ## Implémentation default
+    /// ## Returns
     ///
-    /// No-op `Ok(())` — backends sans table `scheduled_task_health` (mocks, tests).
-    /// `SqliteIndex` override avec le vrai upsert.
+    /// The number of orphan vectors actually deleted in this partition (`0` = nothing to
+    /// clean up, or ANN inactive in degraded mode).
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si le write SQLite échoue.
+    /// `GradatumError::Storage` on a SQLite error other than a missing ANN table or
+    /// module. In production the boot caller treats the error as non-fatal.
+    async fn gc_orphan_ann(&self, _vault_id: &VaultId) -> Result<u64, GradatumError> {
+        // Default : no-op — BruteForce path et mocks de test.
+        Ok(0)
+    }
+
+    /// Boot health gate for the derived ANN index — **fail-closed on the ANN path**.
+    ///
+    /// Compares, per partition `(vault_id, embedder_id)`, the number of pairs eligible in
+    /// `note_embeddings` (source of truth) with the number of rows present in
+    /// `note_embeddings_ann` (derived index), and returns one [`AnnPartitionDeficit`] per
+    /// partition where rows are **missing**. Called at boot right after
+    /// [`Self::backfill_ann_index`] and the [`Self::gc_orphan_ann`] sweep.
+    ///
+    /// ## Why a gate rather than a warning
+    ///
+    /// The semantic search path falls back to brute force on `Err` only, never on
+    /// `Ok(vec![])`: an ANN partition that is empty or partially filled returns *fewer*
+    /// neighbours — or none — with no error, so recall silently collapses. Implementations
+    /// therefore **disable the ANN path** (brute force takes over, results stay exact and
+    /// complete) as soon as a deficit is found, and also when the measurement itself cannot
+    /// conclude (`Err`): a gate that did not run is not a pass. Boot is never interrupted —
+    /// a slow axis is recoverable, a mute one is not.
+    ///
+    /// ## Runs only when ANN is enabled
+    ///
+    /// Implementations MUST return `Ok(Vec::new())` without issuing any query when the ANN
+    /// path is disabled, so a brute-force deployment pays nothing and logs nothing.
+    ///
+    /// ## Cost
+    ///
+    /// Two grouped `COUNT(*)` aggregates over metadata columns — no vector is decoded.
+    ///
+    /// ## Default implementation
+    ///
+    /// A no-op returning `Ok(Vec::new())` — brute-force backends and test mocks have no
+    /// derived index to keep in sync. `SqliteIndex` overrides it.
+    ///
+    /// ## Returns
+    ///
+    /// One entry per deficient partition, ordered by `(vault_id, embedder_id)`. An empty
+    /// vector means the derived index covers the whole eligible corpus (or ANN is off).
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the measurement fails for any reason other than a missing
+    /// ANN table or extension (that case is the documented brute-force degradation, not a
+    /// deficit). The ANN path is closed before the error is returned.
+    async fn ann_health_gate(&self) -> Result<Vec<AnnPartitionDeficit>, GradatumError> {
+        // Default : no-op — BruteForce path et mocks de test (aucun index dérivé à garder
+        // en cohérence). Aucune requête émise.
+        Ok(Vec::new())
+    }
+
+    // ── Santé des tâches récurrentes (v0.7.5 F-85) ──────────────────────────
+
+    /// Records one tick of a recurring task into `scheduled_task_health`.
+    ///
+    /// Semantics:
+    /// - Upsert into `scheduled_task_health` (primary key `task_name`): `run_count + 1`,
+    ///   `last_run_ms`, `last_outcome`, `last_duration_ms`, `last_error`, `updated_at`.
+    /// - When `outcome == Error`, one row is appended to `scheduled_task_error`, together
+    ///   with a lazy purge (`DELETE WHERE occurred_ms < now - 7 days`).
+    ///
+    /// ## Must not break the caller
+    ///
+    /// Callers must **not** propagate an error from this method inside a Tokio task:
+    /// log it at `warn` level and carry on. A task must never die because of its own
+    /// instrumentation.
+    ///
+    /// ## Default implementation
+    ///
+    /// A no-op returning `Ok(())` — for mocks and backends without a
+    /// `scheduled_task_health` table. `SqliteIndex` overrides it with the real upsert.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the SQLite write fails.
     async fn record_task_run(
         &self,
         _task_name: &str,
@@ -1260,37 +1657,37 @@ pub trait IndexStore: Send + Sync {
         Ok(())
     }
 
-    /// Initialise la ligne d'une tâche dans `scheduled_task_health` (seed boot).
+    /// Seeds the row of a task in `scheduled_task_health` at boot.
     ///
-    /// `INSERT OR IGNORE` — n'écrase pas un enregistrement existant.
-    /// Appelé au boot du serveur pour garantir que toutes les tâches connues
-    /// apparaissent dans l'endpoint avec `last_run_ms = null` dès le démarrage.
+    /// Uses `INSERT OR IGNORE`, so an existing record is never overwritten. Called at
+    /// server boot so that every known task shows up in the health endpoint with
+    /// `last_run_ms = null` from the very start.
     ///
-    /// ## Implémentation default
+    /// ## Default implementation
     ///
-    /// No-op `Ok(())` — mocks et backends sans la table.
-    /// `SqliteIndex` override avec le vrai `INSERT OR IGNORE`.
+    /// A no-op returning `Ok(())` — for mocks and backends without the table.
+    /// `SqliteIndex` overrides it with the real `INSERT OR IGNORE`.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si le write SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite write fails.
     async fn seed_scheduled_task(&self, _task_name: &str) -> Result<(), GradatumError> {
         Ok(())
     }
 
-    /// Liste la santé de toutes les tâches récurrentes seedées.
+    /// Lists the health of every seeded recurring task.
     ///
-    /// `errors_24h` est calculé comme `COUNT(occurred_ms > now_ms - 86_400_000)`
-    /// depuis `scheduled_task_error`.
+    /// `errors_24h` is computed as `COUNT(occurred_ms > now_ms - 86_400_000)` over
+    /// `scheduled_task_error`.
     ///
-    /// ## Implémentation default
+    /// ## Default implementation
     ///
-    /// Retourne `Ok(vec![])` — backends sans la table (mocks, tests).
-    /// `SqliteIndex` override avec la vraie requête.
+    /// Returns `Ok(vec![])` — for mocks and backends without the table.
+    /// `SqliteIndex` overrides it with the real query.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la lecture SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite read fails.
     async fn list_scheduled_health(
         &self,
         _now_ms: i64,
@@ -1298,12 +1695,12 @@ pub trait IndexStore: Send + Sync {
         Ok(vec![])
     }
 
-    /// Insère un lot de samples métriques (timeseries). Default no-op `Ok(0)` (mocks).
-    /// `SqliteIndex` override avec le vrai INSERT OR IGNORE.
+    /// Inserts a batch of metric samples (time series). Default: no-op `Ok(0)` for mocks;
+    /// `SqliteIndex` overrides it with the real `INSERT OR IGNORE`.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si l'écriture SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite write fails.
     async fn insert_metric_samples(
         &self,
         _ts_ms: i64,
@@ -1312,11 +1709,11 @@ pub trait IndexStore: Send + Sync {
         Ok(0)
     }
 
-    /// Requête timeseries downsamplée (moyenne par bucket). Default `Ok(vec![])` (mocks).
+    /// Downsampled time-series query (mean per bucket). Default: `Ok(vec![])` for mocks.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la lecture SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite read fails.
     async fn query_metric_timeseries(
         &self,
         _series: &[String],
@@ -1327,21 +1724,39 @@ pub trait IndexStore: Send + Sync {
         Ok(vec![])
     }
 
-    /// Purge les samples antérieurs à `cutoff_ms`. Default no-op `Ok(0)` (mocks).
+    /// Purges the samples older than `cutoff_ms`. Default: no-op `Ok(0)` for mocks.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la suppression SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite delete fails.
     async fn purge_metric_samples(&self, _cutoff_ms: i64) -> Result<usize, GradatumError> {
         Ok(0)
     }
 
-    /// Liste les séries distinctes présentes (catalog). Default `Ok(vec![])` (mocks).
+    /// Lists the distinct series present (catalogue). Default: `Ok(vec![])` for mocks.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la lecture SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite read fails.
     async fn list_distinct_metric_series(&self) -> Result<Vec<String>, GradatumError> {
+        Ok(vec![])
+    }
+
+    /// Projected note scan for the retrospective audit and dedup pass.
+    ///
+    /// Returns up to `limit` notes of `vault_id`, **excluding** all
+    /// [`crate::section::Section::PROTECTED_DELETE`] sections (defense in depth: the
+    /// audit never even sees a governance note) and sentinel rows, each with its body
+    /// embedding when available. Default no-op `Ok(vec![])` for mocks.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the SQLite query fails.
+    async fn audit_scan(
+        &self,
+        _vault_id: &str,
+        _limit: usize,
+    ) -> Result<Vec<AuditScanRow>, GradatumError> {
         Ok(vec![])
     }
 }

@@ -170,19 +170,19 @@ pub fn migrate_payload(
 #[derive(Debug, Error)]
 pub enum ValidationError {
     /// Field not declared in the schema.
-    #[error("champ inconnu : {0}")]
+    #[error("unknown field: {0}")]
     UnknownField(String),
 
     /// Required field absent from the payload.
-    #[error("champ obligatoire manquant : {0}")]
+    #[error("missing required field: {0}")]
     MissingRequired(String),
 
     /// Field type incompatible with the schema.
-    #[error("type incorrect pour le champ {0} : attendu {1}")]
+    #[error("incorrect type for field {0}: expected {1}")]
     TypeMismatch(String, String),
 
     /// Maximum length exceeded.
-    #[error("longueur max dépassée pour le champ {0} : obtenu {1}")]
+    #[error("max length exceeded for field {0}: got {1}")]
     MaxLenExceeded(String, u32),
 }
 
@@ -190,10 +190,10 @@ pub enum ValidationError {
 #[derive(Debug, Error)]
 pub enum MigrationError {
     /// Schema not found in the embedded registry.
-    #[error("schéma introuvable : {0}-v{1}")]
+    #[error("schema not found: {0}-v{1}")]
     SchemaNotFound(String, u32),
 
     /// Irreversible migration step.
-    #[error("migration irréversible à l'étape {0}")]
+    #[error("irreversible migration at step {0}")]
     Irreversible(String),
 }

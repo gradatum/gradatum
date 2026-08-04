@@ -36,7 +36,7 @@ pub struct Wikilink {
 /// - Group 2 (optional): alias after `|`
 static WIKILINK_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
-        .expect("Pattern wikilink est valide et statiquement correct")
+        .expect("wikilink pattern is valid and statically correct")
 });
 
 /// Extracts all wikilinks from the `body` text.

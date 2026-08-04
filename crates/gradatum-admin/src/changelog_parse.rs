@@ -26,35 +26,35 @@
 
 use gradatum_core::project_map::KindKind;
 
-/// Longueur maximale d'un titre de carte project-map.
+/// Maximum length of a project-map card title, in characters.
 const MAX_TITLE_LEN: usize = 80;
 
-/// Une entrée extraite du CHANGELOG, prête pour la génération d'une carte project-map.
+/// One entry extracted from a CHANGELOG, ready to be rendered as a project-map card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogEntry {
-    /// Version SemVer extraite du `## [x.y.z]`.
+    /// SemVer version taken from the `## [x.y.z]` header.
     pub version: String,
-    /// Section CHANGELOG parente (`Added`, `Fixed`, …).
+    /// Parent CHANGELOG section (`Added`, `Fixed`, …).
     pub section: String,
-    /// Nature de l'unité de travail, dérivée de la section.
+    /// Nature of the work item, derived from the section name.
     pub kind: KindKind,
     /// Cleaned title, truncated to 80 characters.
     pub title: String,
-    /// Marqueur déterministe pour l'idempotence : `changelog/{ver}/{section_snake}/{idx}`.
+    /// Deterministic idempotence marker: `changelog/{version}/{section_snake}/{idx}`.
     pub source_marker: String,
-    /// Rang (0-indexé) de l'item dans la section courante.
+    /// Zero-based rank of the item within its section.
     pub idx: usize,
 }
 
-/// Retourne `true` si la section CHANGELOG est dans l'allowlist Keep-a-Changelog standard.
+/// Returns `true` when the CHANGELOG section is on the standard allow-list.
 ///
-/// Sections exclues (méta) : `Tests`, `Internal`, `Documentation`, `Behavior`,
-/// `Infrastructure`, `Design References`, etc. — elles produisent du bruit
-/// dans les cartes project-map.
+/// Meta sections such as `Tests`, `Internal`, `Documentation`, `Behavior`,
+/// `Infrastructure` or `Design References` are excluded, because they turn into noise
+/// once rendered as project-map cards.
 ///
-/// Les sections standard reconnues sont celles définies par la spec
-/// [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) plus les extensions
-/// sémantiques courantes (`Performance`, `Privacy`).
+/// The accepted sections are the ones defined by
+/// [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), plus the two common
+/// semantic extensions `Performance` and `Privacy`.
 fn is_standard_section(section: &str) -> bool {
     matches!(
         section,
@@ -69,9 +69,9 @@ fn is_standard_section(section: &str) -> bool {
     )
 }
 
-/// Convertit un nom de section CHANGELOG en [`KindKind`].
+/// Maps a CHANGELOG section name onto a [`KindKind`].
 ///
-/// Les sections inconnues produisent un `Task` avec un log d'avertissement.
+/// Unknown sections map to [`KindKind::Task`] and emit a warning log.
 fn section_to_kind(section: &str) -> KindKind {
     match section {
         "Added" => KindKind::Feature,
@@ -81,14 +81,14 @@ fn section_to_kind(section: &str) -> KindKind {
         other => {
             tracing::warn!(
                 section = other,
-                "section CHANGELOG inconnue → KindKind::Task"
+                "unknown CHANGELOG section → KindKind::Task"
             );
             KindKind::Task
         }
     }
 }
 
-/// Convertit un nom de section en snake_case minuscule pour le marqueur source.
+/// Converts a section name to lowercase snake_case, as used in the source marker.
 fn section_to_snake(section: &str) -> String {
     let mut out = String::with_capacity(section.len());
     for (i, c) in section.chars().enumerate() {
@@ -100,10 +100,11 @@ fn section_to_snake(section: &str) -> String {
     out
 }
 
-/// Compare deux versions SemVer (`x.y.z`) numériquement.
+/// Compares `x.y.z` versions numerically and reports whether `from <= ver <= to`.
 ///
-/// Retourne `Ok(())` si `from ≤ ver ≤ to`, `Err(())` sinon.
-/// Versions malformées (non parsable) sont traitées comme inférieures à tout.
+/// Each component is parsed independently; a component that is missing or unparsable
+/// counts as `0`, and any pre-release suffix such as `-rc.1` is dropped before parsing.
+/// A completely malformed version therefore behaves like `0.0.0`.
 fn semver_in_range(ver: &str, from: &str, to: &str) -> bool {
     fn parse(s: &str) -> (u64, u64, u64) {
         let parts: Vec<&str> = s.split('.').collect();
@@ -125,9 +126,9 @@ fn semver_in_range(ver: &str, from: &str, to: &str) -> bool {
     from_t <= ver_t && ver_t <= to_t
 }
 
-/// Supprime le préfixe de bullet `- ` et les marqueurs markdown bold `**...**`.
+/// Strips the `- ` bullet prefix and the Markdown bold markers `**…**`.
 ///
-/// Retourne le texte nettoyé, tronqué à [`MAX_TITLE_LEN`] caractères.
+/// Returns the cleaned text, truncated to [`MAX_TITLE_LEN`] characters.
 fn strip_and_truncate(raw: &str) -> String {
     let s = raw.trim();
     // Retire le préfixe de bullet
@@ -142,7 +143,7 @@ fn strip_and_truncate(raw: &str) -> String {
     }
 }
 
-/// Supprime les séquences `**...**` d'une chaîne.
+/// Removes `**…**` sequences from a string, keeping the text they wrap.
 fn remove_bold(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -168,24 +169,23 @@ fn remove_bold(s: &str) -> String {
     out
 }
 
-/// Parse `text` et retourne les entrées dans la plage `[from_version, to_version]` inclus.
+/// Parses `text` and returns the entries whose version falls in the inclusive range
+/// `[from_version, to_version]`.
 ///
-/// Les `####` sous-headers sont ignorés côté ventilation kind — ils appartiennent à la
-/// section `###` parente. Entrées avec titre vide après stripping sont ignorées
-/// silencieusement.
+/// A `####` sub-header is transparent: its bullets keep the kind of the enclosing `###`
+/// section. Entries whose title is empty once stripped are silently dropped.
 ///
-/// Les sections méta (hors allowlist Keep-a-Changelog standard : `Tests`, `Internal`,
-/// `Documentation`, `Behavior`, `Infrastructure`, etc.) sont filtrées par défaut
-/// (`include_meta = false`). Avec `include_meta = true`, elles sont incluses comme
-/// [`KindKind::Task`].
+/// Meta sections — anything outside the standard allow-list, such as `Tests`, `Internal`,
+/// `Documentation`, `Behavior` or `Infrastructure` — are filtered out unless
+/// `include_meta` is set, in which case they are emitted as [`KindKind::Task`].
 ///
 /// # Arguments
 ///
-/// - `text` : contenu complet du fichier CHANGELOG.md.
-/// - `from_version` : version SemVer minimale incluse (ex. `"0.4.0"`).
-/// - `to_version` : version SemVer maximale incluse (ex. `"0.5.2"`).
-/// - `include_meta` : si `true`, inclut les sections méta (Tests, Internal, …) comme
-///   cartes [`KindKind::Task`]. Par défaut `false`.
+/// - `text`: the full contents of the `CHANGELOG.md` file.
+/// - `from_version`: lowest SemVer version to include, for example `"0.4.0"`.
+/// - `to_version`: highest SemVer version to include, for example `"0.5.2"`.
+/// - `include_meta`: when `true`, meta sections are kept and emitted as
+///   [`KindKind::Task`] cards.
 pub fn parse_changelog(
     text: &str,
     from_version: &str,

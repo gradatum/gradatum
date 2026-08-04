@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Operator CLI: init, token, api-key, backfill-embeddings, backfill-titles, jobs, vault rename/forget"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 name = "gradatum_admin"
@@ -19,8 +22,10 @@ path = "src/main.rs"
 [dependencies]
 gradatum-core.workspace = true
 gradatum-curator.workspace = true
-# BLOCAGE CRATES.IO : gradatum-db-sqlite est publish=false. gradatum-admin non publiable.
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "0.7.0" }
+gradatum-dto.workspace = true
+# gradatum-db-sqlite is publishable (no `publish` key); this dependency does not block
+# publication of gradatum-admin.
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "1.0.0" }
 gradatum-queue.workspace = true
 gradatum-vault.workspace = true
 gradatum-storage.workspace = true
@@ -29,7 +34,7 @@ gradatum-index.workspace = true
 # gradatum-admin est le binaire d'ingest multi-langage : toutes les grammaires
 # tree-sitter sont activées ici. Elles restent isolées dans gradatum-ingest
 # (les autres crates, ex. gradatum-server, n'en dépendent pas).
-gradatum-ingest = { path = "../gradatum-ingest", version = "0.7.0", features = [
+gradatum-ingest = { path = "../gradatum-ingest", version = "1.0.0", features = [
     "code-rust",
     "code-python",
     "code-bash",
@@ -50,8 +55,6 @@ tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ed25519-dalek.workspace = true
-pkcs8.workspace = true
 rusqlite.workspace = true
 chrono = { workspace = true }
 hex = "=0.4.3"

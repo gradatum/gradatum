@@ -200,6 +200,7 @@ async fn semantic_forgotten_degraded() {
     .await
     .expect("seed live");
     idx.insert_note_embedding(
+        "main",
         &gradatum_core::identity::NoteId(id_live),
         "test-sem-decay",
         4,
@@ -218,6 +219,7 @@ async fn semantic_forgotten_degraded() {
     .await
     .expect("seed forgotten");
     idx.insert_note_embedding(
+        "main",
         &gradatum_core::identity::NoteId(id_forgotten_ulid),
         "test-sem-decay",
         4,
@@ -233,7 +235,15 @@ async fn semantic_forgotten_degraded() {
 
     let query_emb = vec![1.0f32, 0.0, 0.0, 0.0];
     let hits = idx
-        .search_semantic("main", "test-sem-decay", &query_emb, 10, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "test-sem-decay",
+            &query_emb,
+            10,
+            None,
+        )
         .await
         .expect("search_semantic");
 

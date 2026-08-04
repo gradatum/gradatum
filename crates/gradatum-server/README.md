@@ -2,7 +2,7 @@
 
 > HTTP/MCP server daemon (port 19090) — stateless API facade for vault reads, writes, and search.
 
-**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -18,8 +18,10 @@ Key properties:
 - Read/search path: queries `gradatum-index` and `gradatum-search` directly.
 - JWT authentication via `gradatum-auth` (Ed25519 tokens, audience-scoped).
 - Rate limiting and IP filtering via `gradatum-warden`.
-- MCP transport: Streamable HTTP (2025-03-26 spec) on `/mcp`, SSE on `/sse`.
-- Prometheus metrics on `/metrics` (loopback-only by default).
+- MCP transport: Streamable HTTP (2025-03-26 spec) on `/mcp` — the only MCP route; there is no SSE MCP transport.
+- Prometheus metrics on `/metrics`, exposed on a **separate loopback-only listener**
+  (`127.0.0.1:19091` by default). A non-loopback metrics bind is rejected at startup — this
+  is enforced, not merely a default.
 - Curated metrics timeseries: `curated_metrics` module (`collect_curated_samples`) samples ~60 curated
   Prometheus series every 60 s into `metric_sample` (via `IndexStore`), with 14-day retention and
   server-side downsampling (`compute_bucket_ms`). The `metric-sample` task is the 8th entry in
@@ -51,7 +53,7 @@ gradatum-server --config /etc/gradatum/server.toml
 | `GET` | `/api/v1/lessons/recall` | Bearer | BM25 lesson recall (optional `rank` and `semantic` params) |
 | `POST` | `/api/v1/proactive_recall` | Bearer | Pull proactive or contextual memory surface |
 | `POST` | `/api/v1/proactive_recall/feedback` | Bearer | Record which surfaced notes were accepted |
-| `GET` | `/api/v1/system/scheduled` | Bearer | Health snapshot for all 8 recurring scheduled tasks |
+| `GET` | `/api/v1/system/scheduled` | Bearer | Health snapshot for all 9 recurring scheduled tasks |
 | `GET` | `/api/v1/system/metrics/catalog` | Bearer | Static catalog of ~60 curated Prometheus series (`{ key, group, kind, unit, instrumented }`) — no DB query |
 | `GET` | `/api/v1/system/metrics/timeseries` | Bearer | Downsampled timeseries for selected curated series (`series` CSV, `from_ms`/`to_ms`, `max_points`; server-side bucket AVG via `compute_bucket_ms`) |
 | `GET` | `/api/v1/system/traces` | Bearer | Paginated read of `session_trace` records |

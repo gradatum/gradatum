@@ -1,0 +1,208 @@
+pub mod gradatum_queue
+pub mod gradatum_queue::gradatum_queue
+pub struct gradatum_queue::gradatum_queue::GradatumQueue
+impl gradatum_queue::gradatum_queue::GradatumQueue
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::new(gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore) -> Self
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::store(&self) -> alloc::sync::Arc<gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore>
+impl gradatum_core::job::QueueStore for gradatum_queue::gradatum_queue::GradatumQueue
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::cancel<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::cancel_expired_deadlines<'life0, 'async_trait>(&'life0 self, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<ulid::Ulid>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::complete<'life0, 'async_trait>(&'life0 self, ulid::Ulid, gradatum_core::job::JobResult) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::delete_dlq_jobs<'life0, 'async_trait>(&'life0 self, core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::dequeue<'life0, 'life1, 'async_trait>(&'life0 self, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::dequeue_by_kind<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, core::option::Option<&'life2 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::enqueue<'life0, 'async_trait>(&'life0 self, gradatum_core::job::JobRecord) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<ulid::Ulid, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::fail<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, &'life1 str, u32) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::fail_dlq<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::find_awaiting<'life0, 'async_trait>(&'life0 self, ulid::Ulid) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::get<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::list<'life0, 'async_trait>(&'life0 self, gradatum_core::job::JobFilter) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::promote_retries<'life0, 'async_trait>(&'life0 self, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<ulid::Ulid>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::recover_stale_leases<'life0, 'async_trait>(&'life0 self, core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<ulid::Ulid>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::schedule_retry<'life0, 'async_trait>(&'life0 self, ulid::Ulid, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::set_pending<'life0, 'async_trait>(&'life0 self, ulid::Ulid) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::subscribe(&self) -> tokio::sync::broadcast::Receiver<gradatum_core::job::QueueEvent>
+pub mod gradatum_queue::queue
+pub enum gradatum_queue::queue::JobStatus
+pub gradatum_queue::queue::JobStatus::Dead
+pub gradatum_queue::queue::JobStatus::Done
+pub gradatum_queue::queue::JobStatus::Leased
+pub gradatum_queue::queue::JobStatus::Pending
+impl gradatum_queue::queue::JobStatus
+pub fn gradatum_queue::queue::JobStatus::as_str(&self) -> &'static str
+pub fn gradatum_queue::queue::JobStatus::from_str(&str) -> core::option::Option<Self>
+pub enum gradatum_queue::queue::QueueError
+pub gradatum_queue::queue::QueueError::CorruptedStatus(alloc::string::String)
+pub gradatum_queue::queue::QueueError::NotLeased(gradatum_queue::queue::JobId)
+pub gradatum_queue::queue::QueueError::Sqlx(sqlx_core::error::Error)
+pub gradatum_queue::queue::QueueError::Time(std::time::SystemTimeError)
+pub struct gradatum_queue::queue::JobInfo
+pub gradatum_queue::queue::JobInfo::attempts: i32
+pub gradatum_queue::queue::JobInfo::id: gradatum_queue::queue::JobId
+pub gradatum_queue::queue::JobInfo::last_error: core::option::Option<alloc::string::String>
+pub gradatum_queue::queue::JobInfo::status: gradatum_queue::queue::JobStatus
+pub struct gradatum_queue::queue::LeasedJob
+pub gradatum_queue::queue::LeasedJob::attempts: i32
+pub gradatum_queue::queue::LeasedJob::id: gradatum_queue::queue::JobId
+pub gradatum_queue::queue::LeasedJob::kind: alloc::string::String
+pub gradatum_queue::queue::LeasedJob::payload: alloc::vec::Vec<u8>
+pub gradatum_queue::queue::LeasedJob::tenant_id: alloc::string::String
+pub struct gradatum_queue::queue::NewJob
+pub gradatum_queue::queue::NewJob::kind: alloc::string::String
+pub gradatum_queue::queue::NewJob::max_attempts: i32
+pub gradatum_queue::queue::NewJob::payload: alloc::vec::Vec<u8>
+pub gradatum_queue::queue::NewJob::tenant_id: alloc::string::String
+pub struct gradatum_queue::queue::SqliteQueue
+impl gradatum_queue::queue::SqliteQueue
+pub async fn gradatum_queue::queue::SqliteQueue::in_memory() -> core::result::Result<Self, gradatum_queue::queue::QueueError>
+pub async fn gradatum_queue::queue::SqliteQueue::new(&std::path::Path) -> core::result::Result<Self, gradatum_queue::queue::QueueError>
+impl gradatum_queue::queue::Queue for gradatum_queue::queue::SqliteQueue
+pub fn gradatum_queue::queue::SqliteQueue::complete<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::depth<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::enqueue<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::NewJob) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_queue::queue::JobId, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::extend_lease<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::fail<'life0, 'life1, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::get<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::JobInfo>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::lease<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str], core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::LeasedJob>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::oldest_age_secs<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub trait gradatum_queue::queue::Queue: core::marker::Send + core::marker::Sync + 'static
+pub fn gradatum_queue::queue::Queue::complete<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::Queue::depth<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::Queue::enqueue<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::NewJob) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_queue::queue::JobId, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::Queue::extend_lease<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::Queue::fail<'life0, 'life1, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::queue::Queue::get<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::JobInfo>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::Queue::lease<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str], core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::LeasedJob>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_queue::queue::Queue::oldest_age_secs<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+impl gradatum_queue::queue::Queue for gradatum_queue::queue::SqliteQueue
+pub fn gradatum_queue::queue::SqliteQueue::complete<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::depth<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::enqueue<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::NewJob) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_queue::queue::JobId, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::extend_lease<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::fail<'life0, 'life1, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::get<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::JobInfo>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::lease<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str], core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::LeasedJob>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::oldest_age_secs<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub type gradatum_queue::queue::JobId = i64
+pub mod gradatum_queue::schema
+pub const gradatum_queue::schema::CREATE_IDX_JOBS_STATUS_LEASE: &str
+pub const gradatum_queue::schema::CREATE_JOBS_TABLE: &str
+pub const gradatum_queue::schema::SCHEMA_V1: &str
+pub enum gradatum_queue::JobStatus
+pub gradatum_queue::JobStatus::Dead
+pub gradatum_queue::JobStatus::Done
+pub gradatum_queue::JobStatus::Leased
+pub gradatum_queue::JobStatus::Pending
+impl gradatum_queue::queue::JobStatus
+pub fn gradatum_queue::queue::JobStatus::as_str(&self) -> &'static str
+pub fn gradatum_queue::queue::JobStatus::from_str(&str) -> core::option::Option<Self>
+pub enum gradatum_queue::LegacyJobStatus
+pub gradatum_queue::LegacyJobStatus::Claimed
+pub gradatum_queue::LegacyJobStatus::Done
+pub gradatum_queue::LegacyJobStatus::Failed
+pub gradatum_queue::LegacyJobStatus::Pending
+impl gradatum_queue::LegacyJobStatus
+pub fn gradatum_queue::LegacyJobStatus::as_str(&self) -> &'static str
+impl rusqlite::types::from_sql::FromSql for gradatum_queue::LegacyJobStatus
+pub fn gradatum_queue::LegacyJobStatus::column_result(rusqlite::types::value_ref::ValueRef<'_>) -> rusqlite::types::from_sql::FromSqlResult<Self>
+impl rusqlite::types::to_sql::ToSql for gradatum_queue::LegacyJobStatus
+pub fn gradatum_queue::LegacyJobStatus::to_sql(&self) -> rusqlite::Result<rusqlite::types::to_sql::ToSqlOutput<'_>>
+pub enum gradatum_queue::LegacyQueueError
+pub gradatum_queue::LegacyQueueError::Io(core::io::error::Error)
+pub gradatum_queue::LegacyQueueError::Sqlite(rusqlite::error::Error)
+pub gradatum_queue::LegacyQueueError::UlidParse(ulid::base32::DecodeError)
+pub enum gradatum_queue::QueueError
+pub gradatum_queue::QueueError::CorruptedStatus(alloc::string::String)
+pub gradatum_queue::QueueError::NotLeased(gradatum_queue::queue::JobId)
+pub gradatum_queue::QueueError::Sqlx(sqlx_core::error::Error)
+pub gradatum_queue::QueueError::Time(std::time::SystemTimeError)
+pub struct gradatum_queue::GradatumQueue
+impl gradatum_queue::gradatum_queue::GradatumQueue
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::new(gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore) -> Self
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::store(&self) -> alloc::sync::Arc<gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore>
+impl gradatum_core::job::QueueStore for gradatum_queue::gradatum_queue::GradatumQueue
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::cancel<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::cancel_expired_deadlines<'life0, 'async_trait>(&'life0 self, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<ulid::Ulid>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::complete<'life0, 'async_trait>(&'life0 self, ulid::Ulid, gradatum_core::job::JobResult) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::delete_dlq_jobs<'life0, 'async_trait>(&'life0 self, core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::dequeue<'life0, 'life1, 'async_trait>(&'life0 self, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::dequeue_by_kind<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, core::option::Option<&'life2 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::enqueue<'life0, 'async_trait>(&'life0 self, gradatum_core::job::JobRecord) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<ulid::Ulid, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::fail<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, &'life1 str, u32) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::fail_dlq<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::find_awaiting<'life0, 'async_trait>(&'life0 self, ulid::Ulid) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::get<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::list<'life0, 'async_trait>(&'life0 self, gradatum_core::job::JobFilter) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::job::JobRecord>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::promote_retries<'life0, 'async_trait>(&'life0 self, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<ulid::Ulid>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::recover_stale_leases<'life0, 'async_trait>(&'life0 self, core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<ulid::Ulid>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::schedule_retry<'life0, 'async_trait>(&'life0 self, ulid::Ulid, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::set_pending<'life0, 'async_trait>(&'life0 self, ulid::Ulid) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::gradatum_queue::GradatumQueue::subscribe(&self) -> tokio::sync::broadcast::Receiver<gradatum_core::job::QueueEvent>
+pub struct gradatum_queue::Job
+pub gradatum_queue::Job::attempts: u32
+pub gradatum_queue::Job::created_at: i64
+pub gradatum_queue::Job::id: ulid::Ulid
+pub gradatum_queue::Job::kind: alloc::string::String
+pub gradatum_queue::Job::last_error: core::option::Option<alloc::string::String>
+pub gradatum_queue::Job::lease_until: core::option::Option<i64>
+pub gradatum_queue::Job::payload_json: alloc::string::String
+pub gradatum_queue::Job::status: gradatum_queue::LegacyJobStatus
+pub gradatum_queue::Job::updated_at: i64
+pub struct gradatum_queue::JobInfo
+pub gradatum_queue::JobInfo::attempts: i32
+pub gradatum_queue::JobInfo::id: gradatum_queue::queue::JobId
+pub gradatum_queue::JobInfo::last_error: core::option::Option<alloc::string::String>
+pub gradatum_queue::JobInfo::status: gradatum_queue::queue::JobStatus
+pub struct gradatum_queue::LeasedJob
+pub gradatum_queue::LeasedJob::attempts: i32
+pub gradatum_queue::LeasedJob::id: gradatum_queue::queue::JobId
+pub gradatum_queue::LeasedJob::kind: alloc::string::String
+pub gradatum_queue::LeasedJob::payload: alloc::vec::Vec<u8>
+pub gradatum_queue::LeasedJob::tenant_id: alloc::string::String
+pub struct gradatum_queue::LegacyQueue
+impl gradatum_queue::LegacyQueue
+pub async fn gradatum_queue::LegacyQueue::claim_one(&self, i64) -> core::result::Result<core::option::Option<gradatum_queue::Job>, gradatum_queue::LegacyQueueError>
+pub async fn gradatum_queue::LegacyQueue::complete(&self, ulid::Ulid) -> core::result::Result<(), gradatum_queue::LegacyQueueError>
+pub async fn gradatum_queue::LegacyQueue::enqueue(&self, &str, &str) -> core::result::Result<ulid::Ulid, gradatum_queue::LegacyQueueError>
+pub async fn gradatum_queue::LegacyQueue::fail(&self, ulid::Ulid, &str) -> core::result::Result<(), gradatum_queue::LegacyQueueError>
+pub async fn gradatum_queue::LegacyQueue::open(&std::path::Path) -> core::result::Result<Self, gradatum_queue::LegacyQueueError>
+pub async fn gradatum_queue::LegacyQueue::open_in_memory() -> core::result::Result<Self, gradatum_queue::LegacyQueueError>
+pub async fn gradatum_queue::LegacyQueue::pragma_value<T: rusqlite::types::from_sql::FromSql>(&self, &str) -> core::result::Result<T, gradatum_queue::LegacyQueueError>
+pub struct gradatum_queue::NewJob
+pub gradatum_queue::NewJob::kind: alloc::string::String
+pub gradatum_queue::NewJob::max_attempts: i32
+pub gradatum_queue::NewJob::payload: alloc::vec::Vec<u8>
+pub gradatum_queue::NewJob::tenant_id: alloc::string::String
+pub struct gradatum_queue::SqliteQueue
+impl gradatum_queue::queue::SqliteQueue
+pub async fn gradatum_queue::queue::SqliteQueue::in_memory() -> core::result::Result<Self, gradatum_queue::queue::QueueError>
+pub async fn gradatum_queue::queue::SqliteQueue::new(&std::path::Path) -> core::result::Result<Self, gradatum_queue::queue::QueueError>
+impl gradatum_queue::queue::Queue for gradatum_queue::queue::SqliteQueue
+pub fn gradatum_queue::queue::SqliteQueue::complete<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::depth<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::enqueue<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::NewJob) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_queue::queue::JobId, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::extend_lease<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::fail<'life0, 'life1, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::get<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::JobInfo>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::lease<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str], core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::LeasedJob>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::oldest_age_secs<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub const gradatum_queue::VERSION: &str
+pub trait gradatum_queue::Queue: core::marker::Send + core::marker::Sync + 'static
+pub fn gradatum_queue::Queue::complete<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::Queue::depth<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::Queue::enqueue<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::NewJob) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_queue::queue::JobId, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::Queue::extend_lease<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::Queue::fail<'life0, 'life1, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::Queue::get<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::JobInfo>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::Queue::lease<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str], core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::LeasedJob>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_queue::Queue::oldest_age_secs<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+impl gradatum_queue::queue::Queue for gradatum_queue::queue::SqliteQueue
+pub fn gradatum_queue::queue::SqliteQueue::complete<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::depth<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::enqueue<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::NewJob) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_queue::queue::JobId, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::extend_lease<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::fail<'life0, 'life1, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::get<'life0, 'async_trait>(&'life0 self, gradatum_queue::queue::JobId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::JobInfo>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::lease<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str], core::time::Duration) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<gradatum_queue::queue::LeasedJob>, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_queue::queue::SqliteQueue::oldest_age_secs<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_queue::queue::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub type gradatum_queue::JobId = i64

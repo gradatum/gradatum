@@ -10,8 +10,11 @@
 //! Si un write index échoue → WARN loggué, response 200 quand même (best-effort).
 //! Les callers du worker doivent être idempotents (retryables).
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
@@ -28,31 +31,160 @@ use gradatum_dto::{
     EmbeddingOkResponse, PersistCuratedRequest, PersistDistillRequest, PersistEmbeddingRequest,
     PersistForgetRequest, PersistOkResponse,
 };
+use gradatum_vault::WriteResult;
 use smallvec::SmallVec;
 use toml::Value as TomlValue;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+use crate::api_v1::write::parse_sha256_hex;
 use crate::state::AppState;
 
-// ── Tenant ────────────────────────────────────────────────────────────────────
-
-/// Tenant utilisé par tous les handlers persist internes.
-///
-/// ## Rationale
-///
-/// L'API interne est destinée au worker (mono-tenant aujourd'hui).
-/// Le champ `tenant_id` des DTOs est conservé pour compatibilité worker
-/// mais N'EST PAS utilisé pour router l'écriture — seule cette constante fait foi.
-///
-/// ## DT-INTERNAL-1 — dette multi-tenant
-///
-/// In a future multi-tenant revision, the tenant will be derived from the JWT claim
-/// of the internal token (`X-Gradatum-Internal`). This constant will then be removed
-/// and replaced with claim extraction.
-const INTERNAL_TENANT_ID: &str = "main";
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Résout le handle de read-back d'un handler `persist/*`, **gaté sur `multi_tenant`**
+/// (évite le split-brain read-back : le mark était scopé mais le read/write-back
+/// passait par le singleton `main`).
+///
+/// - `multi_tenant.enabled = false` (défaut LIVE) → singleton `state.vault` inchangé
+///   (byte-identical ; le worker impose `tenant_id = "main"` à OFF).
+/// - `enabled = true` → route via `state.vaults.resolve` sur le `tenant_id` du job (=
+///   namespace vault, source de confiance interne → [`VaultId::new`], parité avec le
+///   write-back `frontmatter.vault_id`). **Fail-closed** : vault inconnu → 500, jamais
+///   un repli silencieux sur `main`.
+#[allow(clippy::result_large_err)]
+fn resolve_persist_reader(
+    state: &AppState,
+    tenant_id: &str,
+) -> Result<Arc<dyn gradatum_vault::Registry>, Response> {
+    if !state.server_config.multi_tenant.enabled {
+        return Ok(Arc::clone(&state.vault));
+    }
+    state.vaults.resolve(&VaultId::new(tenant_id)).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("vault routing failed: {e}"),
+        )
+            .into_response()
+    })
+}
+
+/// Résout le vault CIBLE d'une écriture curated (C1, F-63) : dissocie le `target_vault`
+/// optionnel du principal (`tenant_id`), en maintenant l'INTERDICTION du writable cross-vault.
+///
+/// - `target` absent → `principal` (byte-identical : namespace == `tenant_id`, chemin LIVE
+///   actuel où le worker impose `tenant_id = "main"` à flag OFF).
+/// - `target == principal` → `principal`.
+/// - `target != principal` → `403` : le 2e vault writable reste fermé (capacité de champ
+///   seulement — aucune écriture cross-vault autorisée avant décision ultérieure).
+///
+/// ## Invariant partagé `INV-P1-3` (SSOT contrat, pas SSOT code — L4)
+///
+/// `INV-P1-3` : **la cible d'écriture est toujours le vault propre du principal** ;
+/// aucune écriture cross-vault n'est autorisée avant le fix ACL C2. Cette fonction est
+/// l'enforcement de `INV-P1-3` sur le **listener INTERNE loopback** (worker) : garde PURE
+/// `(principal, target)`, sans grant, sans scope, sans flag — le grant a déjà été payé en
+/// amont à la frontière publique (cf. commentaire C4-1b dans `handle_persist_curated`).
+///
+/// Le pendant sur la **frontière PUBLIQUE (JWT)** est `effective_write_vault`
+/// (module `crate::api_v1::tenant_guard`) : il enforce le MÊME `INV-P1-3`
+/// de façon **structurelle** (aucun paramètre `target` → la cible EST toujours le vault
+/// propre) et y ajoute scope + grant (surensemble légitime). Les deux sites ne PARTAGENT
+/// PAS de code : couches d'auth distinctes, types de refus distincts (`Response` ici vs
+/// `TenantGuardRefusal` là-bas), grant/scope/flag EXCLUSIVEMENT côté frontière publique.
+/// La convergence L4 est un **invariant nommé partagé**, pas un kernel commun (le kernel
+/// partagé absorbant grant/scope/flag a été REJETÉ — P0 latent : divergence de sémantique
+/// de refus entre les deux couches).
+#[allow(clippy::result_large_err)]
+fn resolve_write_namespace(principal: &str, target: Option<&VaultId>) -> Result<VaultId, Response> {
+    match target {
+        Some(t) if t.as_str() != principal => Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "write target vault '{}' != principal '{}' — writable cross-vault forbidden",
+                t.as_str(),
+                principal
+            ),
+        )
+            .into_response()),
+        _ => Ok(VaultId::new(principal)),
+    }
+}
+
+/// Exige que le vault CIBLE d'une écriture de note soit inscrit au registre de DONNÉES
+/// (`tenants`) et n'appartienne pas au registre de CODE (lot REG).
+///
+/// ## Pourquoi ici, et pas à la création de vault
+///
+/// Un vault se crée rarement ; une note s'écrit en permanence. La divergence mesurée sur
+/// le LIVE (5 notes portant `vault_id` ∈ {`default`, `test`}, absentes des DEUX registres)
+/// est née de ce chemin-là, pas d'une création de vault. Le point d'enforcement de
+/// l'invariant est donc l'écriture, et [`handle_persist_curated`] en est l'unique site de
+/// naissance d'une note curated côté production (`resolve_write_namespace` n'a pas d'autre
+/// appelant).
+///
+/// ## Ce que cette garde vérifie — et ce qu'elle ne vérifie pas
+///
+/// - Refuse un `vault_id` préfixé `code-` : une note de données n'atterrit jamais dans un
+///   vault dérivé de git.
+/// - Refuse un `vault_id` absent de `tenants` : c'est le barreau qui ferme le trou par
+///   lequel `default` et `test` sont entrés.
+///
+/// Does **not** check the status: the invariant is REGISTRY MEMBERSHIP.
+/// `TenantStatus` has three variants — `Active`, `Suspended`, `Deleted` — and
+/// all three pass here; a soft-deleted vault therefore remains writable
+/// (interaction with purge: audit REG 2026-07-29, P1-3, tracked follow-up).
+/// Do not "align" this with `require_active_target` (403) without reading that
+/// trace: the 500-vs-403 split is deliberate (retryable vs terminal).
+///
+/// Fail-closed : un lookup en échec refuse (500) — jamais une inscription implicite.
+#[allow(clippy::result_large_err)]
+async fn require_registered_data_vault(state: &AppState, vault: &str) -> Result<(), Response> {
+    if vault.starts_with(super::CODE_VAULT_PREFIX) {
+        warn!(
+            vault = %vault,
+            "persist: write refused — code vault, never the target of a data note"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "write vault '{vault}' belongs to the code registry \
+                 ('{}') — never the target of a data note",
+                super::CODE_VAULT_PREFIX
+            ),
+        )
+            .into_response());
+    }
+    match state.search.get_tenant_status(vault).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            warn!(
+                vault = %vault,
+                "persist: write refused — vault absent from the `tenants` data registry"
+            );
+            Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "write vault '{vault}' is not registered in any registry — \
+                     provision the vault before writing to it"
+                ),
+            )
+                .into_response())
+        }
+        Err(e) => {
+            warn!(
+                vault = %vault,
+                err = %e,
+                "persist: registry lookup failed — fail-closed, write refused"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("vault registry lookup failed: {e}"),
+            )
+                .into_response())
+        }
+    }
+}
 
 /// Parse un ULID string → NoteId (400 si invalide).
 #[allow(clippy::result_large_err)]
@@ -60,7 +192,7 @@ fn parse_ulid(s: &str) -> Result<NoteId, Response> {
     Ulid::from_string(s).map(NoteId).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
-            format!("ULID invalide : {s:?} — {e}"),
+            format!("invalid ULID: {s:?} — {e}"),
         )
             .into_response()
     })
@@ -73,9 +205,8 @@ fn parse_ulid(s: &str) -> Result<NoteId, Response> {
 /// devient automatiquement acceptée sans patch supplémentaire ici.
 #[allow(clippy::result_large_err)]
 fn parse_section(s: &str) -> Result<Section, Response> {
-    Section::from_canonical_str(s).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, format!("section invalide : {s:?}")).into_response()
-    })
+    Section::from_canonical_str(s)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("invalid section: {s:?}")).into_response())
 }
 
 /// Parse un statut string → NoteStatus (400 si invalide).
@@ -86,7 +217,7 @@ fn parse_status(s: &str) -> Result<NoteStatus, Response> {
         "live" => Ok(NoteStatus::Live),
         "pending-review" => Ok(NoteStatus::PendingReview),
         "archived" => Ok(NoteStatus::Deprecated),
-        _ => Err((StatusCode::BAD_REQUEST, format!("statut invalide : {s:?}")).into_response()),
+        _ => Err((StatusCode::BAD_REQUEST, format!("invalid status: {s:?}")).into_response()),
     }
 }
 
@@ -139,7 +270,7 @@ fn parse_tags(tags: &[String]) -> SmallVec<[Tag; 4]> {
             tracing::warn!(
                 original = %t,
                 normalized = ?norm.as_ref().map(|n| n.as_str()),
-                "tag normalisé"
+                "normalized tag"
             );
         }
 
@@ -196,11 +327,29 @@ pub(crate) async fn handle_persist_curated(
 
     let tags = parse_tags(&req.tags);
 
+    // C4-1b (P0 security review) : le tenant provient du job (CurateSpec.tenant_id), lui-même
+    // dérivé du tenant ACL-vérifié côté `vault_write` (effective_write_vault) et propagé par le
+    // worker sur ce listener loopback. À flag OFF le worker impose `main` (ensure_main_tenant),
+    // donc byte-identical (req.tenant_id == "main" == ex-INTERNAL_TENANT_ID). Ex-hardcode = vecteur
+    // write tiers→main (une écriture d'un tenant tiers atterrissait dans `main`).
+    // C1 (T14) : namespace = `target_vault.unwrap_or(principal)`, writable cross-vault
+    // INTERDIT (la garde refuse `target != principal`). À défaut de `target_vault` (chemin
+    // LIVE actuel) → `VaultId::new(req.tenant_id)`, byte-identical.
+    let write_vault =
+        match resolve_write_namespace(req.tenant_id.as_str(), req.target_vault.as_ref()) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+    // Lot REG — enforcement de l'invariant de registre au point de NAISSANCE de la note.
+    if let Err(resp) = require_registered_data_vault(&state, write_vault.as_str()).await {
+        return resp;
+    }
+    let checked_write =
+        gradatum_core::scope::AclCheckedVaultId::for_system_task(write_vault.clone());
+
     let frontmatter = Frontmatter {
         schema_version: 1,
-        // DT-INTERNAL-1 : tenant dérivé du token claim en v0.6.x multi-tenant (Slice 2b).
-        // req.tenant_id du body est ignoré — INTERNAL_TENANT_ID fait foi.
-        vault_id: VaultId::new(INTERNAL_TENANT_ID),
+        vault_id: write_vault,
         locus: None,
         section,
         status,
@@ -217,23 +366,75 @@ pub(crate) async fn handle_persist_curated(
         forgotten_by: None,
     };
 
-    // 1. Vault write — BLOQUANT.
-    let written = state
-        .vault
-        .write_note_with_id_internal(frontmatter, req.body.clone(), note_id)
-        .await;
-
-    let note = match written {
-        Ok(n) => n,
-        Err(GradatumError::Storage(ref msg)) if msg.contains("conflict: hash mismatch") => {
-            return (StatusCode::CONFLICT, msg.clone()).into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("vault write échoué : {e}"),
+    // 1. Vault write — BLOQUANT. Le champ `expected_sha256` discrimine DEUX modes (F-41) :
+    //   • None → CREATE : ULID préalloué neuf, écriture INCONDITIONNELLE.
+    //   • Some → RMW in-place sous lock optimiste (compare-and-swap sur le hash courant).
+    // Un `expected_sha256` périmé sur une note vivante produit un job `Conflict` et laisse
+    // la note INTACTE (WriteResult::Conflict → 409). Le cas fantôme + sha, et l'overwrite
+    // sans sha, sont déjà refusés en amont par la garde de présence publique (logic.rs 409).
+    let written_id: NoteId = if let Some(expected_hex) = req.expected_sha256.as_deref() {
+        // Mode RMW — parse hex→[u8;32] (400 si malformé ; la garde publique valide déjà le
+        // format, ce re-check garde le listener interne fail-closed contre un appelant direct).
+        let expected = match parse_sha256_hex(expected_hex) {
+            Some(h) => h,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid expected_sha256 (64 hex expected): {expected_hex:?}"),
+                )
+                    .into_response();
+            }
+        };
+        match state
+            .vault
+            .write_if_match_internal(
+                &checked_write,
+                frontmatter,
+                req.body.clone(),
+                note_id,
+                expected,
             )
-                .into_response();
+            .await
+        {
+            Ok(WriteResult::Written { .. }) => note_id,
+            Ok(WriteResult::Conflict { current_sha256 }) => {
+                // Hash attendu périmé → aucune écriture. Corps 409 JSON exploitable : le client
+                // interne (loopback) parse `current_sha256` pour le propager dans le
+                // WriteConflictDto (F-41 CAS) — un corps texte le priverait du hash gagnant.
+                let current_hex = gradatum_core::identity::ContentHash(current_sha256).hex();
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "current_sha256": current_hex })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("vault write failed: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        // Mode CREATE — écriture inconditionnelle (l'arm `conflict: hash mismatch` reste
+        // défensif : write_note_with_id_internal ne produit jamais de conflit).
+        match state
+            .vault
+            .write_note_with_id_internal(&checked_write, frontmatter, req.body.clone(), note_id)
+            .await
+        {
+            Ok(n) => n.id,
+            Err(GradatumError::Storage(ref msg)) if msg.contains("conflict: hash mismatch") => {
+                return (StatusCode::CONFLICT, msg.clone()).into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("vault write failed: {e}"),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -260,7 +461,8 @@ pub(crate) async fn handle_persist_curated(
         };
         TemporalEntry {
             note_id: req.note_id.clone(),
-            vault_id: INTERNAL_TENANT_ID.to_string(),
+            // C4-1b : scopé au tenant du job (cohérent avec frontmatter.vault_id + index).
+            vault_id: req.tenant_id.to_string(),
             anchor_ms: temporal.anchor_ms,
             anchor_src,
             doc_kind: temporal.doc_kind.clone(),
@@ -277,20 +479,34 @@ pub(crate) async fn handle_persist_curated(
     if let Err(e) = state
         .search
         .persist_curated_index_atomic(
-            &note.id,
+            &written_id,
             &req.title,
             temporal_entry.as_ref(),
             &links,
             req.trust,
-            INTERNAL_TENANT_ID,
+            req.tenant_id.as_str(),
         )
         .await
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("persist/curated : transaction index échouée (vault OK, ré-exécutable) : {e}"),
+            format!("persist/curated: index transaction failed (vault OK, re-runnable): {e}"),
         )
             .into_response();
+    }
+
+    // F-66 instrumentation: record the curator decision (path × outcome) exactly
+    // once per persisted note. The worker owns the decision; the server owns the
+    // Prometheus registry (:19091). Absent on the legacy dispatch path (`None`).
+    if let Some(decision) = &req.curator_decision {
+        state
+            .metrics
+            .curator_decisions
+            .get_or_create(&crate::metrics::CuratorDecisionLabel {
+                path: decision.path.clone(),
+                outcome: decision.outcome.clone(),
+            })
+            .inc();
     }
 
     info!(
@@ -316,9 +532,17 @@ pub(crate) async fn handle_persist_embedding(
         Err(e) => return e,
     };
 
+    // C4-1e (Slice B) EXPAND : `vault_id` optionnel du DTO, défaut "main" (payload d'un
+    // worker antérieur, sans le champ, reste byte-identical). Sert de clé de partition ANN.
+    let vault_id = req
+        .vault_id
+        .as_ref()
+        .map(gradatum_core::scope::VaultId::as_str)
+        .unwrap_or("main");
+
     match state
         .search
-        .insert_note_embedding(&note_id, &req.embedder_id, req.dim, &req.vector)
+        .insert_note_embedding(vault_id, &note_id, &req.embedder_id, req.dim, &req.vector)
         .await
     {
         Ok(()) => {
@@ -337,7 +561,7 @@ pub(crate) async fn handle_persist_embedding(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("insert_note_embedding échoué : {e}"),
+            format!("insert_note_embedding failed: {e}"),
         )
             .into_response(),
     }
@@ -363,20 +587,27 @@ pub(crate) async fn handle_persist_forget(
         Err(e) => return e,
     };
 
+    // Task 14 (W3) : read-back routé par le vault effectif (`req.tenant_id`) — ferme le
+    // split-brain (le mark_forgotten ci-dessous est scopé, le read/write-back doit l'être aussi).
+    let reader = match resolve_persist_reader(&state, req.tenant_id.as_str()) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
     // Lire la note existante pour construire le frontmatter mis à jour.
-    let existing = match state.vault.read_note_by_id(&req.note_id).await {
+    let existing = match reader.read_note_by_id(&req.note_id).await {
         Ok(n) => n,
         Err(GradatumError::NoteNotFound(_)) => {
             return (
                 StatusCode::NOT_FOUND,
-                format!("note introuvable : {}", req.note_id),
+                format!("note not found: {}", req.note_id),
             )
                 .into_response();
         }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("lecture note échouée : {e}"),
+                format!("note read failed: {e}"),
             )
                 .into_response();
         }
@@ -388,25 +619,33 @@ pub(crate) async fn handle_persist_forget(
     new_fm.forgotten_at = Some(Utc::now());
     new_fm.forgotten_by = req.forgotten_by.clone();
 
+    // C4-1b : témoin = vault de la note (préservé depuis le frontmatter existant, read main-bound).
+    let checked_forget =
+        gradatum_core::scope::AclCheckedVaultId::for_system_task(new_fm.vault_id.clone());
+
     // Vault write — BLOQUANT.
     if let Err(e) = state
         .vault
-        .write_note_with_id_internal(new_fm, req.body.clone(), note_id)
+        .write_note_with_id_internal(&checked_forget, new_fm, req.body.clone(), note_id)
         .await
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("vault forget write échoué : {e}"),
+            format!("vault forget write failed: {e}"),
         )
             .into_response();
     }
 
     // Mark_forgotten dans l'index — non bloquant.
+    //
+    // C4-1e (Slice E) : scopé sur le vault du job (`req.tenant_id`), plus jamais un
+    // hardcode `"main"`. À flag OFF `req.tenant_id == "main"` (le worker impose main),
+    // donc byte-identical. À ON, l'ex-hardcode marquait l'homonyme `main` de l'index au
+    // lieu de la note du vault secondaire visé (classe forget-cross-vault).
     if let Err(e) = state
         .search
-        // DT-INTERNAL-1 : tenant dérivé du token claim en v0.6.x multi-tenant (Slice 2b).
         .mark_forgotten(
-            INTERNAL_TENANT_ID,
+            req.tenant_id.as_str(),
             &req.note_id,
             req.forgotten_by.as_deref(),
         )
@@ -415,7 +654,7 @@ pub(crate) async fn handle_persist_forget(
         warn!(
             note_id = %req.note_id,
             error = %e,
-            "persist/forget : mark_forgotten échoué (non bloquant)"
+            "persist/forget: mark_forgotten failed (non-blocking)"
         );
     }
 
@@ -426,6 +665,200 @@ pub(crate) async fn handle_persist_forget(
     .into_response()
 }
 
+/// `POST /internal/v1/note/{ulid}/forget-resync?vault_id=<vault_id>` — répare la marque
+/// d'oubli de l'index sans toucher au frontmatter ni aux colonnes d'audit (A7-bis).
+///
+/// ## Pourquoi une route distincte de `persist/forget`
+///
+/// `persist/forget` réécrit le frontmatter et estampille `forgotten_at`/`forgotten_by` à
+/// l'instant de l'appel : le rejouer sur une note déjà oubliée détruit la piste d'audit du
+/// PREMIER oubli. Cette route ne fait que remettre `forgotten = 1` dans l'index — elle
+/// répare la désynchronisation sans rien coûter en auditabilité.
+///
+/// ## Désynchronisations réparées
+///
+/// Ce n'est pas une fenêtre de course : deux chemins de production ordinaires la
+/// produisent — `vault_unforgot` efface la marque d'index sans toucher au `.md`, et
+/// `handle_persist_forget` ci-dessus rend 200 best-effort quand son `mark_forgotten`
+/// échoue après un write vault réussi.
+///
+/// ## Réponses
+///
+/// - **204 No Content** — marque ré-affirmée (idempotent).
+/// - **400 Bad Request** — ULID malformé ou `vault_id` hors borne.
+/// - **404 Not Found** — aucune ligne d'index pour ce couple (ULID, `vault_id`).
+/// - **500 Internal Server Error** — échec SQLite.
+pub(crate) async fn handle_note_forget_resync(
+    State(state): State<AppState>,
+    Path(ulid): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    // Valider le format ULID d'abord (400 avant toute I/O).
+    if let Err(e) = parse_ulid(&ulid) {
+        return e;
+    }
+
+    // Vault cible optionnel, défaut "main" — même contrat que les routes voisines
+    // `/note/{ulid}` et `/note/{ulid}/status`.
+    let vault_id = params.get("vault_id").map(String::as_str).unwrap_or("main");
+    if let Err(r) = super::reads::validate_param_len(vault_id, 256, "vault_id") {
+        return r;
+    }
+
+    match state.search.reassert_forgotten(vault_id, &ulid).await {
+        Ok(()) => {
+            info!(
+                note_id = %ulid,
+                vault_id = %vault_id,
+                "persist/forget-resync: index mark re-asserted"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(GradatumError::NoteNotFound(_)) => {
+            (StatusCode::NOT_FOUND, format!("note not found: {ulid}")).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("reassert_forgotten failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+// ── Cascade delete partagée (F-100) ────────────────────────────────────────────
+
+/// Résultat de la cascade physique de suppression d'une note (F-100).
+///
+/// La suppression vault (`.md` + `.history`) est fatale et propagée par
+/// [`cascade_delete_note`]. Les purges index et redirect sont **retournées** ici
+/// pour que l'appelant choisisse sa politique : best-effort (handler interne de
+/// purge) ou stricte (endpoint public `vault_delete`).
+#[derive(Debug)]
+pub(crate) struct CascadeDeleteOutcome {
+    /// Erreur non fatale de la purge index SQLite, le cas échéant.
+    pub index_error: Option<GradatumError>,
+    /// Erreur non fatale de la purge des redirections wikilink, le cas échéant.
+    pub redirect_error: Option<GradatumError>,
+    /// Chemin de l'archive `.md` (relatif au vault) si disposition = archivage.
+    pub archive_path: Option<String>,
+}
+
+/// Disposition physique du `.md` + `.history` au moment de la cascade (F-100 1.6).
+///
+/// Le choke point [`cascade_delete_note`] applique la même garde PROTECTED_DELETE puis
+/// la même cascade index quelle que soit la disposition — seul le sort des fichiers
+/// change : destruction (job Purge sur garbage) vs archivage réversible (delete admin).
+#[derive(Debug, Clone)]
+pub(crate) enum VaultDisposition {
+    /// Détruit physiquement le `.md` + `.history` (job Purge / GC tier).
+    Destroy,
+    /// Déplace le `.md` + `.history` sous `.archive/` + inscrit le registre (delete admin).
+    Archive {
+        /// `sub` du token à l'origine de l'archivage (traçabilité registre).
+        archived_by: Option<String>,
+        /// Échéance de rétention (epoch ms) au-delà de laquelle le GC détruit.
+        gc_due_ms: i64,
+    },
+}
+
+/// Supprime physiquement une note en cascade : vault (`.md` + `.history`, BLOQUANT)
+/// puis index SQLite (cascade + FTS + temporal + ANN) puis redirections wikilink.
+///
+/// **Source unique** de la cascade de suppression (F-100 1.2) — partagée par le
+/// handler interne de purge [`handle_delete_note`] (best-effort) et l'endpoint
+/// public `vault_delete` (strict). Zéro duplication de cascade.
+///
+/// # Garde system-wide (F-100 P1-1)
+///
+/// La section de la note est résolue **côté serveur** ([`Section::is_protected_delete`])
+/// AVANT toute mutation. Si elle appartient à [`Section::PROTECTED_DELETE`], la cascade
+/// est refusée ([`GradatumError::Forbidden`]) sans toucher au vault ni à l'index. Comme
+/// c'est le **choke point unique** de toute suppression physique, cette garde protège
+/// à la fois l'endpoint `vault_delete` ET le job Purge (qui atteint cette cascade via
+/// l'endpoint interne). L'erreur `Forbidden` est **distincte** d'un échec technique :
+/// l'appelant Purge la reconnaît (HTTP 403) et journalise un SKIP sans faire échouer le
+/// batch. Une note protégée en `garbage` reste donc non purgée.
+///
+/// # Errors
+///
+/// - [`GradatumError::Forbidden`] si la note est dans une section protégée — aucune
+///   mutation n'est effectuée.
+/// - [`GradatumError::NoteNotFound`] si le `.md` est absent (signal d'idempotence).
+/// - [`GradatumError::Storage`] (ou autre) sur échec I/O vault — fatal, la cascade
+///   s'arrête avant de toucher l'index.
+///
+/// Les erreurs index et redirect ne sont **pas** propagées comme `Err` : elles
+/// remontent dans [`CascadeDeleteOutcome`] pour que chaque appelant décide de leur
+/// caractère fatal (best-effort vs strict).
+pub(crate) async fn cascade_delete_note(
+    state: &AppState,
+    vault_id: &str,
+    ulid: &str,
+    note_id: NoteId,
+    disposition: VaultDisposition,
+) -> Result<CascadeDeleteOutcome, GradatumError> {
+    // 0. Garde PROTECTED_DELETE system-wide — refus AVANT toute mutation.
+    //
+    // Résolution de la section côté serveur (autorité unique de la protection),
+    // indépendante de ce que l'appelant a — ou n'a pas — vérifié. Protège l'API
+    // et le Purge par le même point de passage. Une note absente de l'index
+    // (section = None) n'est pas protégeable ici : la suppression vault suivante
+    // tranchera (NoteNotFound si le `.md` est absent).
+    if let Some(section) = state.search.get_note_section(vault_id, ulid).await?
+        && Section::is_protected_delete(&section)
+    {
+        return Err(GradatumError::Forbidden(format!(
+            "protected section: '{section}' can never be hard-deleted (PROTECTED_DELETE, no bypass)"
+        )));
+    }
+    // 1. Vault (.md + .history) — BLOQUANT (propage NoteNotFound / I/O).
+    //    Destroy = destruction physique ; Archive = déplacement sous .archive/ + registre.
+    //    Variantes `_in` (C3a, P2-2) : les chemins disque sont résolus sous le vault
+    //    PROPRIÉTAIRE de la note (`vault_id`), pas sous le vault racine de l'instance —
+    //    sinon les `.md` d'un vault secondaire survivraient à la purge (résidu orphelin).
+    let archive_path = match disposition {
+        VaultDisposition::Destroy => {
+            state.vault.delete_note_by_id_in(vault_id, note_id).await?;
+            None
+        }
+        VaultDisposition::Archive {
+            archived_by,
+            gc_due_ms,
+        } => {
+            let outcome = state
+                .vault
+                .archive_note_by_id_in(vault_id, note_id, archived_by, gc_due_ms)
+                .await?;
+            Some(outcome.archive_path)
+        }
+    };
+    // 2. Index SQLite (cascade FK + FTS + temporal + ANN) — erreur retournée.
+    //
+    // CONTRAINTE D'ORDRE (crash-safety, P2-1) : le déplacement `.md`+registre (étape 1)
+    // précède OBLIGATOIREMENT la dé-indexation (étape 2). `archive_note` n'est pas atomique
+    // (read→write→delete + insert registre) ; un crash entre 1 et 2 laisse la note encore
+    // indexée pointant sur un `.md` déplacé (drift `read_note`=NoteNotFound) MAIS l'archive
+    // et sa ligne registre active existent → récupérable via `restore` (lit `archive_path`).
+    // L'ordre inverse (dé-indexer d'abord) rendrait un crash IRRÉCUPÉRABLE (note absente de
+    // l'index ET `.md` non encore archivé). Ne jamais inverser 1 et 2.
+    let index_error = state
+        .search
+        .delete_note_from_index(vault_id, ulid)
+        .await
+        .err();
+    // 3. Redirections wikilink — erreur retournée.
+    let redirect_error = state
+        .search
+        .delete_redirect_by_ulid(vault_id, ulid)
+        .await
+        .err();
+    Ok(CascadeDeleteOutcome {
+        index_error,
+        redirect_error,
+        archive_path,
+    })
+}
+
 /// `DELETE /internal/v1/note/:ulid` — suppression d'une note.
 ///
 /// ## Séquence
@@ -433,50 +866,66 @@ pub(crate) async fn handle_persist_forget(
 /// 1. Suppression vault (fichier .md) — BLOQUANT (404/500 si erreur).
 /// 2. Suppression index SQLite (`delete_note_from_index`) — WARN si erreur (non bloquant).
 ///
+/// ## Scope multi-vault (C4-1e, Slice E) — EXPAND
+///
+/// Le vault CIBLE provient d'un query param OPTIONNEL `?vault_id=` (défaut `"main"`),
+/// exactement comme `handle_note_trust` / `handle_note_embedding` (Slice B). À flag OFF
+/// le worker n'émet pas le param (ou émet `main`) → défaut `"main"` → byte-identical.
+/// À ON, l'ex-hardcode `"main"` supprimait l'homonyme `main` d'un ULID au lieu de la note
+/// du vault secondaire visé (clobber `main` + no-op cible : classe delete-cross-vault).
+/// `cascade_delete_note` est déjà scopé par ce `vault_id` (garde PROTECTED_DELETE, purge
+/// `.md`/index/redirect) — seule la SOURCE du tenant change.
+///
 /// ## Limite transactionnelle
 ///
 /// Le vault et l'index sont purgés séquentiellement (non atomique).
 pub(crate) async fn handle_delete_note(
     State(state): State<AppState>,
     Path(ulid): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let note_id = match parse_ulid(&ulid) {
         Ok(id) => id,
         Err(e) => return e,
     };
 
-    match state.vault.delete_note_by_id(note_id).await {
-        Ok(()) => {
+    // C4-1e (Slice E) EXPAND : vault cible optionnel, défaut "main" (un worker antérieur,
+    // sans le param, reste byte-identical). Le contract final (param requis) relève d'une
+    // slice ultérieure.
+    let vault_id = params.get("vault_id").map(String::as_str).unwrap_or("main");
+
+    // Job Purge (garbage) = DESTRUCTION physique (tier GC), pas archivage : une note
+    // en garbage a déjà traversé le cycle downgrade → l'archivage est réservé au delete
+    // admin on-demand (F-100 1.6, frontière « archive(=delete) < GC physique »).
+    match cascade_delete_note(&state, vault_id, &ulid, note_id, VaultDisposition::Destroy).await {
+        Ok(outcome) => {
             info!(note_id = %ulid, "DELETE note vault : OK");
-            // Purger l'index — non bloquant (best-effort).
-            // DT-INTERNAL-1 : tenant dérivé du token claim en v0.6.x multi-tenant (Slice 2b).
-            if let Err(e) = state
-                .search
-                .delete_note_from_index(INTERNAL_TENANT_ID, &ulid)
-                .await
-            {
+            // Purges index/redirect best-effort (non bloquant pour la purge interne).
+            if let Some(e) = outcome.index_error {
                 warn!(
                     note_id = %ulid,
                     error = %e,
-                    "DELETE note : delete_note_from_index échoué (non bloquant)"
+                    "DELETE note: delete_note_from_index failed (non-blocking)"
                 );
             }
-            // Purger les redirections wikilink — non bloquant (best-effort).
-            if let Err(e) = state.search.delete_redirect_by_ulid(&ulid).await {
+            if let Some(e) = outcome.redirect_error {
                 warn!(
                     note_id = %ulid,
                     error = %e,
-                    "DELETE note : delete_redirect_by_ulid échoué (non bloquant)"
+                    "DELETE note: delete_redirect_by_ulid failed (non-blocking)"
                 );
             }
             StatusCode::NO_CONTENT.into_response()
         }
         Err(GradatumError::NoteNotFound(_)) => {
-            (StatusCode::NOT_FOUND, format!("note introuvable : {ulid}")).into_response()
+            (StatusCode::NOT_FOUND, format!("note not found: {ulid}")).into_response()
         }
+        // Section protégée (garde system-wide) : 403 distinct d'un échec technique.
+        // Le Purge reconnaît ce statut et journalise un SKIP sans échouer le batch.
+        Err(GradatumError::Forbidden(msg)) => (StatusCode::FORBIDDEN, msg).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("delete_note échoué : {e}"),
+            format!("delete_note failed: {e}"),
         )
             .into_response(),
     }
@@ -500,9 +949,16 @@ pub(crate) async fn handle_persist_distill(
         Err(e) => return e,
     };
 
+    // Task 14 (W3) : read-back routé par le vault effectif (`req.tenant_id`) — le write-back
+    // (`VaultId::new(req.tenant_id)` sur le frontmatter neuf) doit lire le MÊME vault.
+    let reader = match resolve_persist_reader(&state, req.tenant_id.as_str()) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
     // Lire la note existante pour conserver le frontmatter canonique.
     // Si la note est absente (nouvelle note de synthèse), créer un frontmatter PendingReview.
-    let mut new_fm = match state.vault.read_note_by_id(&req.note_id).await {
+    let mut new_fm = match reader.read_note_by_id(&req.note_id).await {
         Ok(existing) => {
             let mut fm = existing.frontmatter.clone();
             fm.section = section;
@@ -527,7 +983,7 @@ pub(crate) async fn handle_persist_distill(
             }
             gradatum_core::frontmatter::Frontmatter {
                 schema_version: 1,
-                vault_id: gradatum_core::scope::VaultId::new(&req.tenant_id),
+                vault_id: gradatum_core::scope::VaultId::new(req.tenant_id.as_str()),
                 locus: None,
                 section,
                 status: NoteStatus::PendingReview,
@@ -551,7 +1007,7 @@ pub(crate) async fn handle_persist_distill(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("lecture note échouée : {e}"),
+                format!("note read failed: {e}"),
             )
                 .into_response();
         }
@@ -574,10 +1030,15 @@ pub(crate) async fn handle_persist_distill(
         }
     }
 
+    // C4-1b : témoin = vault de la note (frontmatter existant conservé, ou VaultId(req.tenant_id)
+    // pour une note de synthèse neuve — cf. construction de new_fm ci-dessus).
+    let checked_distill =
+        gradatum_core::scope::AclCheckedVaultId::for_system_task(new_fm.vault_id.clone());
+
     // Vault write — BLOQUANT.
     let written = state
         .vault
-        .write_note_with_id_internal(new_fm, req.body.clone(), note_id)
+        .write_note_with_id_internal(&checked_distill, new_fm, req.body.clone(), note_id)
         .await;
 
     let note = match written {
@@ -588,30 +1049,37 @@ pub(crate) async fn handle_persist_distill(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("vault distill write échoué : {e}"),
+                format!("vault distill write failed: {e}"),
             )
                 .into_response();
         }
     };
 
-    // Upsert title — non bloquant.
-    if let Err(e) = state.search.upsert_note_title(&note.id, &req.title).await {
+    // Upsert title — non bloquant. Scopé sur le vault de la note écrite (C4-1e A2).
+    if let Err(e) = state
+        .search
+        .upsert_note_title(note.frontmatter.vault_id.as_str(), &note.id, &req.title)
+        .await
+    {
         warn!(
             note_id = %req.note_id,
             error = %e,
-            "persist/distill : upsert_note_title échoué (non bloquant)"
+            "persist/distill: upsert_note_title failed (non-blocking)"
         );
     }
 
-    // Trust — non bloquant.
+    // Trust — non bloquant. Scopé sur le vault de la note écrite (C4-1e A3).
     if let Some(trust) = req.trust
-        && let Err(e) = state.search.set_note_trust(&note.id, trust).await
+        && let Err(e) = state
+            .search
+            .set_note_trust(note.frontmatter.vault_id.as_str(), &note.id, trust)
+            .await
     {
         warn!(
             note_id = %req.note_id,
             trust,
             error = %e,
-            "persist/distill : set_note_trust échoué (non bloquant)"
+            "persist/distill: set_note_trust failed (non-blocking)"
         );
     }
 
@@ -626,8 +1094,100 @@ pub(crate) async fn handle_persist_distill(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_section, parse_tags};
+    use super::{parse_section, parse_tags, resolve_write_namespace};
+    use gradatum_core::scope::VaultId;
     use gradatum_core::section::Section;
+
+    /// C1 (T14) : `target_vault` absent → namespace = principal (byte-identical).
+    #[test]
+    fn write_target_absent_falls_back_to_principal() {
+        let ns = resolve_write_namespace("main", None).expect("target absent → principal");
+        assert_eq!(ns.as_str(), "main");
+    }
+
+    /// C1 (T14) : `target_vault == principal` → accepté (namespace = principal).
+    #[test]
+    fn write_target_equal_principal_ok() {
+        let t = VaultId::new("main");
+        let ns = resolve_write_namespace("main", Some(&t)).expect("target == principal → ok");
+        assert_eq!(ns.as_str(), "main");
+    }
+
+    /// C1 (T14) : `target_vault != principal` → 403 (writable cross-vault INTERDIT).
+    #[test]
+    fn write_guard_rejects_target_neq_principal() {
+        use axum::http::StatusCode;
+        let t = VaultId::new("vault-b");
+        let resp = resolve_write_namespace("main", Some(&t))
+            .expect_err("target != principal → refus (writable cross-vault interdit)");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// L4 — `INV-P1-3` sur la couche INTERNE uniquement (`resolve_write_namespace`,
+    /// listener loopback worker) : la cible d'écriture est toujours le vault propre.
+    ///
+    /// `resolve_write_namespace` enforce `INV-P1-3` (cible d'écriture == vault propre du
+    /// principal) : la SEULE cible acceptée est le principal lui-même (absent ou égal) ;
+    /// toute cible tierce → 403 avec le message EXACT `write target vault '{}' != principal
+    /// '{}' — writable cross-vault forbidden`. Ce test balaie plusieurs principaux/cibles
+    /// ET vérifie le **corps EXACT** de la réponse 403 — surface de sécurité observable à
+    /// préserver contre un refactor futur — pour prouver que la sémantique de refus est
+    /// cohérente quel que soit le nom de vault.
+    ///
+    /// Portée : ce test prouve la couche INTERNE UNIQUEMENT. La couche PUBLIQUE
+    /// (`effective_write_vault`, module `crate::api_v1::tenant_guard`, JWT) tient le MÊME
+    /// `INV-P1-3` par **construction structurelle** (aucun paramètre `target` → la cible
+    /// EST toujours le vault propre) : le cas `target != principal` y est **inatteignable**
+    /// (impossible à construire), l'invariant y est donc tenu structurellement, PAS par ce
+    /// test. Il n'y a **pas d'équivalence mécanique** entre les deux sites : couches d'auth
+    /// distinctes, types de refus distincts (`Response` ici vs `TenantGuardRefusal`
+    /// là-bas), grant/scope/flag EXCLUSIVEMENT côté frontière publique — le kernel partagé
+    /// absorbant grant/scope/flag a été REJETÉ (P0 latent). La convergence L4 est un
+    /// **invariant nommé partagé**, pas un kernel commun.
+    #[tokio::test]
+    async fn write_namespace_inv_p1_3_internal_layer_own_vault_only() {
+        use axum::http::StatusCode;
+
+        // Cible == principal (explicite ou absente) → toujours acceptée == principal.
+        for principal in ["main", "vault-b", "tenant-42"] {
+            let own = VaultId::new(principal);
+            assert_eq!(
+                resolve_write_namespace(principal, Some(&own))
+                    .expect("target == principal → ok")
+                    .as_str(),
+                principal,
+            );
+            assert_eq!(
+                resolve_write_namespace(principal, None)
+                    .expect("target absent → principal")
+                    .as_str(),
+                principal,
+            );
+        }
+
+        // Cible tierce (≠ principal) → 403 systématique, corps EXACT préservé
+        // (SSOT du message de sécurité observable, verrouillé contre tout refactor).
+        let cases = [
+            ("main", "vault-b"),
+            ("vault-b", "main"),
+            ("tenant-42", "main"),
+        ];
+        for (principal, foreign) in cases {
+            let t = VaultId::new(foreign);
+            let resp = resolve_write_namespace(principal, Some(&t))
+                .expect_err("target != principal → refus INV-P1-3");
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("lecture du corps de la réponse 403");
+            let body = String::from_utf8(body.to_vec()).expect("corps 403 en UTF-8");
+            let expected = format!(
+                "write target vault '{foreign}' != principal '{principal}' — writable cross-vault forbidden"
+            );
+            assert_eq!(body, expected, "corps 403 EXACT INV-P1-3 (couche interne)");
+        }
+    }
 
     /// parse_section accepte la 12ᵉ section (anti-régression stage1 bug).
     #[test]
@@ -710,5 +1270,158 @@ mod tests {
     fn parse_tags_empty_input() {
         let result = parse_tags(&[]);
         assert!(result.is_empty());
+    }
+}
+
+// ── Tests garde PROTECTED_DELETE system-wide (F-100 P1-1) ─────────────────────
+//
+// Le choke point `cascade_delete_note` est le point de passage unique de toute
+// suppression physique (endpoint `vault_delete` ET job Purge). Ces tests prouvent
+// que la garde y refuse une section protégée AVANT toute mutation, indépendamment
+// de ce que l'appelant a vérifié — c'est la protection porteuse du scénario audit
+// (note council PATCH→garbage → Purge → note toujours présente).
+#[cfg(test)]
+mod guard_tests {
+    use super::{AppState, GradatumError, VaultDisposition, cascade_delete_note};
+    use gradatum_acl_policy::AclEngine;
+    use gradatum_auth::jwt::JwtService;
+    use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
+    use gradatum_core::index::Index;
+    use gradatum_core::scope::VaultId;
+    use gradatum_core::section::Section;
+    use gradatum_core::status::NoteStatus;
+    use gradatum_vault::{Registry, Vault};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// Construit un `AppState` de test avec un vrai `Vault` + index partagé.
+    async fn build_state() -> (AppState, Arc<Vault>, TempDir) {
+        let tmp = TempDir::new().expect("TempDir guard_tests");
+        let vault = Arc::new(
+            Vault::create(&tmp.path().join("vault"), VaultId::new("main"))
+                .await
+                .expect("Vault::create guard_tests"),
+        );
+        let idx = vault.index().clone();
+        let jwt = JwtService::new_ephemeral();
+        let acl = AclEngine::from_preset_str("").expect("AclEngine guard_tests");
+        let registry: Arc<dyn Registry> = vault.clone();
+        let mut state = AppState::with_jwt_and_acl(jwt, acl).with_vault_arc(registry);
+        state.search = Arc::clone(&idx) as Arc<dyn Index>;
+        (state, vault, tmp)
+    }
+
+    /// Frontmatter minimal pour une note de la section donnée, en `garbage`.
+    fn garbage_frontmatter(section: Section) -> Frontmatter {
+        let now = chrono::Utc::now();
+        Frontmatter {
+            schema_version: 1,
+            vault_id: VaultId::new("main"),
+            locus: None,
+            section,
+            status: NoteStatus::Live,
+            status_reason: None,
+            status_changed: Some(now),
+            tags: Default::default(),
+            author: None,
+            created: now,
+            updated: None,
+            extra: ExtraFields::empty(),
+            provenance: None,
+            forgotten: None,
+            forgotten_at: None,
+            forgotten_by: None,
+        }
+    }
+
+    /// Scénario audit : une note `council` en garbage atteignant la cascade est
+    /// refusée (`Forbidden`) AVANT toute mutation — index ET `.md` préservés.
+    #[tokio::test]
+    async fn cascade_refuses_protected_section_and_preserves_note() {
+        let (state, vault, _tmp) = build_state().await;
+
+        let note = vault
+            .write_note(
+                garbage_frontmatter(Section::Council),
+                "verdict council".to_string(),
+            )
+            .await
+            .expect("write_note council");
+        let id = note.id;
+        vault
+            .update_status(id, NoteStatus::Garbage, None)
+            .await
+            .expect("update_status Live→Garbage");
+
+        let res = cascade_delete_note(
+            &state,
+            "main",
+            &id.to_string(),
+            id,
+            VaultDisposition::Destroy,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(GradatumError::Forbidden(_))),
+            "une note council doit être refusée par la garde : {res:?}"
+        );
+
+        // Aucune mutation : la note reste indexée ET son `.md` est intact.
+        let section = state
+            .search
+            .get_note_section("main", &id.to_string())
+            .await
+            .expect("get_note_section");
+        assert_eq!(
+            section.as_deref(),
+            Some("council"),
+            "la note council doit rester présente dans l'index"
+        );
+        assert!(
+            vault.read_note(id).await.is_ok(),
+            "le `.md` council ne doit pas avoir été supprimé"
+        );
+    }
+
+    /// Non-régression : une section NON protégée passe la garde et est supprimée.
+    #[tokio::test]
+    async fn cascade_allows_non_protected_section() {
+        let (state, vault, _tmp) = build_state().await;
+
+        let note = vault
+            .write_note(
+                garbage_frontmatter(Section::Feedback),
+                "note feedback".to_string(),
+            )
+            .await
+            .expect("write_note feedback");
+        let id = note.id;
+        vault
+            .update_status(id, NoteStatus::Garbage, None)
+            .await
+            .expect("update_status Live→Garbage");
+
+        let res = cascade_delete_note(
+            &state,
+            "main",
+            &id.to_string(),
+            id,
+            VaultDisposition::Destroy,
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "une note feedback doit être supprimable : {res:?}"
+        );
+
+        let section = state
+            .search
+            .get_note_section("main", &id.to_string())
+            .await
+            .expect("get_note_section");
+        assert!(
+            section.is_none(),
+            "la note feedback doit avoir été purgée de l'index"
+        );
     }
 }

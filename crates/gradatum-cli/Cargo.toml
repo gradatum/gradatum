@@ -7,13 +7,13 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "End-user CLI for gradatum-server HTTP API — placeholder, not yet implemented"
+publish = false
 
 [[bin]]
 name = "gradatum-cli"
 path = "src/main.rs"
 
 [dependencies]
-gradatum-core.workspace = true
 reqwest.workspace = true
 clap.workspace = true
 serde.workspace = true

@@ -67,9 +67,12 @@ fn override_scope_serde_roundtrip_vault() {
 /// Round-trip serde JSON de `OverrideScope::Locus`.
 #[test]
 fn override_scope_serde_roundtrip_locus() {
-    use gradatum_core::scope::{LocusId, OverrideScope};
+    use gradatum_core::scope::{LocusId, OverrideScope, VaultId};
 
-    let scope = OverrideScope::Locus(LocusId::new("decisions"));
+    let scope = OverrideScope::Locus {
+        vault: VaultId::new("main"),
+        locus: LocusId::new("decisions"),
+    };
     let json = serde_json::to_string(&scope).unwrap();
     assert!(
         json.contains("\"kind\":\"locus\""),

@@ -1,0 +1,190 @@
+pub mod gradatum_embed
+pub mod gradatum_embed::embedder_trait
+pub enum gradatum_embed::embedder_trait::EmbedBackend
+pub gradatum_embed::embedder_trait::EmbedBackend::FastembedCpu
+pub gradatum_embed::embedder_trait::EmbedBackend::Http
+pub gradatum_embed::embedder_trait::EmbedBackend::Noop
+pub trait gradatum_embed::embedder_trait::Embedder: core::marker::Send + core::marker::Sync
+pub fn gradatum_embed::embedder_trait::Embedder::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::embedder_trait::Embedder::dim(&self) -> u16
+pub fn gradatum_embed::embedder_trait::Embedder::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::embedder_trait::Embedder::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::embedder_trait::Embedder::embedder_id(&self) -> &str
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::fastembed_cpu::FastEmbedCpu
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::dim(&self) -> u16
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embedder_id(&self) -> &str
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::http::HttpEmbedder
+pub fn gradatum_embed::http::HttpEmbedder::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::http::HttpEmbedder::dim(&self) -> u16
+pub fn gradatum_embed::http::HttpEmbedder::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::http::HttpEmbedder::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::http::HttpEmbedder::embedder_id(&self) -> &str
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::noop::Noop
+pub fn gradatum_embed::noop::Noop::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::noop::Noop::dim(&self) -> u16
+pub fn gradatum_embed::noop::Noop::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::noop::Noop::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::noop::Noop::embedder_id(&self) -> &str
+impl<P: gradatum_embed::embedder_trait::Embedder, F: gradatum_embed::embedder_trait::Embedder> gradatum_embed::embedder_trait::Embedder for gradatum_embed::fallback::FallbackEmbedder<P, F>
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::dim(&self) -> u16
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embedder_id(&self) -> &str
+pub mod gradatum_embed::error
+pub enum gradatum_embed::error::EmbedError
+pub gradatum_embed::error::EmbedError::CountMismatch
+pub gradatum_embed::error::EmbedError::CountMismatch::received: usize
+pub gradatum_embed::error::EmbedError::CountMismatch::sent: usize
+pub gradatum_embed::error::EmbedError::DimMismatch
+pub gradatum_embed::error::EmbedError::DimMismatch::expected: u16
+pub gradatum_embed::error::EmbedError::DimMismatch::got: u16
+pub gradatum_embed::error::EmbedError::Embed(alloc::string::String)
+pub gradatum_embed::error::EmbedError::Http(reqwest::error::Error)
+pub gradatum_embed::error::EmbedError::IndexMismatch
+pub gradatum_embed::error::EmbedError::IndexMismatch::expected: usize
+pub gradatum_embed::error::EmbedError::IndexMismatch::got: usize
+pub gradatum_embed::error::EmbedError::IndexMismatch::position: usize
+pub gradatum_embed::error::EmbedError::Init(alloc::string::String)
+pub gradatum_embed::error::EmbedError::InvalidResponse(alloc::string::String)
+impl core::convert::From<gradatum_embed::error::EmbedError> for gradatum_core::error::GradatumError
+pub fn gradatum_core::error::GradatumError::from(gradatum_embed::error::EmbedError) -> Self
+pub mod gradatum_embed::fallback
+pub struct gradatum_embed::fallback::FallbackEmbedder<P: gradatum_embed::embedder_trait::Embedder, F: gradatum_embed::embedder_trait::Embedder>
+impl<P: gradatum_embed::embedder_trait::Embedder, F: gradatum_embed::embedder_trait::Embedder> gradatum_embed::fallback::FallbackEmbedder<P, F>
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::new(P, F) -> Self
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::with_cooldown(self, core::time::Duration) -> Self
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::with_threshold(self, u32) -> Self
+impl<P: gradatum_embed::embedder_trait::Embedder, F: gradatum_embed::embedder_trait::Embedder> gradatum_embed::embedder_trait::Embedder for gradatum_embed::fallback::FallbackEmbedder<P, F>
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::dim(&self) -> u16
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embedder_id(&self) -> &str
+pub mod gradatum_embed::fastembed_cpu
+pub struct gradatum_embed::fastembed_cpu::FastEmbedCpu
+impl gradatum_embed::fastembed_cpu::FastEmbedCpu
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::try_default() -> core::result::Result<Self, gradatum_embed::error::EmbedError>
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::fastembed_cpu::FastEmbedCpu
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::dim(&self) -> u16
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embedder_id(&self) -> &str
+pub mod gradatum_embed::http
+pub struct gradatum_embed::http::HttpEmbedder
+impl gradatum_embed::http::HttpEmbedder
+pub fn gradatum_embed::http::HttpEmbedder::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, u16) -> Self
+pub fn gradatum_embed::http::HttpEmbedder::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::http::HttpEmbedder
+pub fn gradatum_embed::http::HttpEmbedder::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::http::HttpEmbedder::dim(&self) -> u16
+pub fn gradatum_embed::http::HttpEmbedder::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::http::HttpEmbedder::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::http::HttpEmbedder::embedder_id(&self) -> &str
+pub mod gradatum_embed::noop
+pub struct gradatum_embed::noop::Noop
+pub gradatum_embed::noop::Noop::dim: u16
+impl gradatum_embed::noop::Noop
+pub fn gradatum_embed::noop::Noop::new(u16) -> Self
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::noop::Noop
+pub fn gradatum_embed::noop::Noop::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::noop::Noop::dim(&self) -> u16
+pub fn gradatum_embed::noop::Noop::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::noop::Noop::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::noop::Noop::embedder_id(&self) -> &str
+pub enum gradatum_embed::EmbedBackend
+pub gradatum_embed::EmbedBackend::FastembedCpu
+pub gradatum_embed::EmbedBackend::Http
+pub gradatum_embed::EmbedBackend::Noop
+pub enum gradatum_embed::EmbedError
+pub gradatum_embed::EmbedError::CountMismatch
+pub gradatum_embed::EmbedError::CountMismatch::received: usize
+pub gradatum_embed::EmbedError::CountMismatch::sent: usize
+pub gradatum_embed::EmbedError::DimMismatch
+pub gradatum_embed::EmbedError::DimMismatch::expected: u16
+pub gradatum_embed::EmbedError::DimMismatch::got: u16
+pub gradatum_embed::EmbedError::Embed(alloc::string::String)
+pub gradatum_embed::EmbedError::Http(reqwest::error::Error)
+pub gradatum_embed::EmbedError::IndexMismatch
+pub gradatum_embed::EmbedError::IndexMismatch::expected: usize
+pub gradatum_embed::EmbedError::IndexMismatch::got: usize
+pub gradatum_embed::EmbedError::IndexMismatch::position: usize
+pub gradatum_embed::EmbedError::Init(alloc::string::String)
+pub gradatum_embed::EmbedError::InvalidResponse(alloc::string::String)
+impl core::convert::From<gradatum_embed::error::EmbedError> for gradatum_core::error::GradatumError
+pub fn gradatum_core::error::GradatumError::from(gradatum_embed::error::EmbedError) -> Self
+pub struct gradatum_embed::FallbackEmbedder<P: gradatum_embed::embedder_trait::Embedder, F: gradatum_embed::embedder_trait::Embedder>
+impl<P: gradatum_embed::embedder_trait::Embedder, F: gradatum_embed::embedder_trait::Embedder> gradatum_embed::fallback::FallbackEmbedder<P, F>
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::new(P, F) -> Self
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::with_cooldown(self, core::time::Duration) -> Self
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::with_threshold(self, u32) -> Self
+impl<P: gradatum_embed::embedder_trait::Embedder, F: gradatum_embed::embedder_trait::Embedder> gradatum_embed::embedder_trait::Embedder for gradatum_embed::fallback::FallbackEmbedder<P, F>
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::dim(&self) -> u16
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embedder_id(&self) -> &str
+pub struct gradatum_embed::FastEmbedCpu
+impl gradatum_embed::fastembed_cpu::FastEmbedCpu
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::try_default() -> core::result::Result<Self, gradatum_embed::error::EmbedError>
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::fastembed_cpu::FastEmbedCpu
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::dim(&self) -> u16
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embedder_id(&self) -> &str
+pub struct gradatum_embed::HttpEmbedder
+impl gradatum_embed::http::HttpEmbedder
+pub fn gradatum_embed::http::HttpEmbedder::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, u16) -> Self
+pub fn gradatum_embed::http::HttpEmbedder::with_timeout(self, core::time::Duration) -> Self
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::http::HttpEmbedder
+pub fn gradatum_embed::http::HttpEmbedder::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::http::HttpEmbedder::dim(&self) -> u16
+pub fn gradatum_embed::http::HttpEmbedder::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::http::HttpEmbedder::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::http::HttpEmbedder::embedder_id(&self) -> &str
+pub struct gradatum_embed::Noop
+pub gradatum_embed::Noop::dim: u16
+impl gradatum_embed::noop::Noop
+pub fn gradatum_embed::noop::Noop::new(u16) -> Self
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::noop::Noop
+pub fn gradatum_embed::noop::Noop::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::noop::Noop::dim(&self) -> u16
+pub fn gradatum_embed::noop::Noop::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::noop::Noop::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::noop::Noop::embedder_id(&self) -> &str
+pub const gradatum_embed::VERSION: &str
+pub trait gradatum_embed::Embedder: core::marker::Send + core::marker::Sync
+pub fn gradatum_embed::Embedder::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::Embedder::dim(&self) -> u16
+pub fn gradatum_embed::Embedder::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::Embedder::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::Embedder::embedder_id(&self) -> &str
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::fastembed_cpu::FastEmbedCpu
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::dim(&self) -> u16
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::fastembed_cpu::FastEmbedCpu::embedder_id(&self) -> &str
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::http::HttpEmbedder
+pub fn gradatum_embed::http::HttpEmbedder::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::http::HttpEmbedder::dim(&self) -> u16
+pub fn gradatum_embed::http::HttpEmbedder::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::http::HttpEmbedder::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::http::HttpEmbedder::embedder_id(&self) -> &str
+impl gradatum_embed::embedder_trait::Embedder for gradatum_embed::noop::Noop
+pub fn gradatum_embed::noop::Noop::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::noop::Noop::dim(&self) -> u16
+pub fn gradatum_embed::noop::Noop::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::noop::Noop::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::noop::Noop::embedder_id(&self) -> &str
+impl<P: gradatum_embed::embedder_trait::Embedder, F: gradatum_embed::embedder_trait::Embedder> gradatum_embed::embedder_trait::Embedder for gradatum_embed::fallback::FallbackEmbedder<P, F>
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::backend_kind(&self) -> gradatum_embed::embedder_trait::EmbedBackend
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::dim(&self) -> u16
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<f32>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embed_batch<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 [&'life2 str]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>, gradatum_embed::error::EmbedError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_embed::fallback::FallbackEmbedder<P, F>::embedder_id(&self) -> &str

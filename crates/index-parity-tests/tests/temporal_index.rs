@@ -9,7 +9,7 @@ mod common;
 use common::{make_index, make_note_with_id, minimal_frontmatter};
 use gradatum_core::identity::NoteId;
 use gradatum_core::index::{AnchorSrc, Index, TemporalEntry};
-use gradatum_core::scope::VaultId;
+use gradatum_core::scope::{AclCheckedVaultId, VaultId};
 use gradatum_core::temporal_query::{TimelineCursor, TimelineFilter};
 use ulid::Ulid;
 
@@ -114,7 +114,7 @@ async fn timeline_orders_filters_paginates_parity() {
     // Ordre DESC,DESC
     let all = idx
         .timeline(
-            &VaultId::new("main"),
+            &AclCheckedVaultId::for_system_task(VaultId::new("main")),
             &TimelineFilter {
                 limit: 10,
                 ..Default::default()
@@ -128,7 +128,7 @@ async fn timeline_orders_filters_paginates_parity() {
     // Filtre doc_kind
     let events = idx
         .timeline(
-            &VaultId::new("main"),
+            &AclCheckedVaultId::for_system_task(VaultId::new("main")),
             &TimelineFilter {
                 doc_kind: Some(vec!["Event".into()]),
                 limit: 10,
@@ -142,7 +142,7 @@ async fn timeline_orders_filters_paginates_parity() {
     // Pagination cursor
     let p1 = idx
         .timeline(
-            &VaultId::new("main"),
+            &AclCheckedVaultId::for_system_task(VaultId::new("main")),
             &TimelineFilter {
                 limit: 2,
                 ..Default::default()
@@ -156,7 +156,7 @@ async fn timeline_orders_filters_paginates_parity() {
     };
     let p2 = idx
         .timeline(
-            &VaultId::new("main"),
+            &AclCheckedVaultId::for_system_task(VaultId::new("main")),
             &TimelineFilter {
                 limit: 2,
                 cursor: Some(cur),
@@ -190,7 +190,7 @@ async fn timeline_parity_as_of_equal_valid_until_excluded() {
     // as_of == valid_until = 5000 → exclusif → exclue
     let rows = idx
         .timeline(
-            &VaultId::new("main"),
+            &AclCheckedVaultId::for_system_task(VaultId::new("main")),
             &TimelineFilter {
                 as_of_ms: Some(5_000),
                 ..Default::default()
@@ -219,7 +219,7 @@ async fn timeline_parity_as_of_equal_anchor_included() {
     // as_of == anchor = 2000 → inclusif → visible
     let rows = idx
         .timeline(
-            &VaultId::new("main"),
+            &AclCheckedVaultId::for_system_task(VaultId::new("main")),
             &TimelineFilter {
                 as_of_ms: Some(2_000),
                 ..Default::default()
@@ -248,7 +248,7 @@ async fn timeline_parity_as_of_include_expired_shows_expired() {
     // include_expired=false : exclue
     let rows_strict = idx
         .timeline(
-            &VaultId::new("main"),
+            &AclCheckedVaultId::for_system_task(VaultId::new("main")),
             &TimelineFilter {
                 as_of_ms: Some(3_000),
                 include_expired: false,
@@ -268,7 +268,7 @@ async fn timeline_parity_as_of_include_expired_shows_expired() {
     // include_expired=true : visible
     let rows_hist = idx
         .timeline(
-            &VaultId::new("main"),
+            &AclCheckedVaultId::for_system_task(VaultId::new("main")),
             &TimelineFilter {
                 as_of_ms: Some(3_000),
                 include_expired: true,

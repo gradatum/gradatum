@@ -69,6 +69,7 @@ fn test_config_with_provider(provider_endpoint: &str) -> Config {
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
         messages: Default::default(),
+        router: Default::default(),
     }
 }
 
@@ -133,6 +134,7 @@ fn test_config_vision_capable(provider_endpoint: &str) -> Config {
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
         messages: Default::default(),
+        router: Default::default(),
     }
 }
 
@@ -182,6 +184,7 @@ fn test_config_vision_with_fallback(primary_endpoint: &str, fallback_endpoint: &
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
         messages: Default::default(),
+        router: Default::default(),
     }
 }
 

@@ -1,20 +1,16 @@
-//! Tests d'atomicité pour `persist_curated_index_atomic`.
+//! Tests d'atomicité et de contrat pour `persist_curated_index_atomic`.
 //!
-//! ## Contrat testé
+//! ## Contrat
 //!
-//! - Si l'une des mutations index échoue (ex: violation FK `note_links`),
-//!   TOUTES les mutations du lot sont rollback.
-//! - En particulier : si `upsert_note_title` réussit mais `upsert_link` échoue
-//!   (FK sur `src_note_id`), le titre NE DOIT PAS être persisté.
+//! - Le lot (titre + temporal + links + trust) s'exécute dans une transaction unique :
+//!   sur erreur SQL réelle, tout est rollback.
+//! - C4-1d (option C) : la FK `note_links.src_note_id REFERENCES notes(id)` a été RETIRÉE
+//!   (migration 0032, incompatible avec la PK composite `(vault_id, id)`). Un lien orphelin
+//!   n'est donc plus rejeté par une FK — il est inséré, et le persist réussit. La cascade et
+//!   l'intégrité référentielle des enfants passent en gestion manuelle (cf. `delete_note_from_index`).
 //!
-//! ## Stratégie d'injection de défaillance
-//!
-//! `note_links` a une FK : `FOREIGN KEY (src_note_id) REFERENCES notes(id)`.
-//! Un `src_note_id` inexistant → `SQLITE_CONSTRAINT_FOREIGNKEY` → rollback.
-//!
-//! Le test utilise `SqliteIndex::open_in_memory()` directement (pas via HTTP).
-//! La méthode `persist_curated_index_atomic` est accessible depuis le trait
-//! `IndexStore` (impl concrète sur `SqliteIndex`).
+//! Les tests utilisent `SqliteIndex::open_in_memory()` directement (pas via HTTP).
+//! `persist_curated_index_atomic` est accessible via le trait `IndexStore` (impl `SqliteIndex`).
 
 mod common;
 use common::make_note;
@@ -24,19 +20,16 @@ use gradatum_core::section::Section;
 use gradatum_core::status::NoteStatus;
 use gradatum_index::SqliteIndex;
 
-/// Vérifie que le titre reste NULL si `upsert_link` échoue (FK violation).
+/// C4-1d (option C) : la FK `note_links.src_note_id REFERENCES notes(id)` a été RETIRÉE
+/// par la migration 0032 (incompatible avec la PK composite `(vault_id, id)`). Un lien vers
+/// un `src` inexistant n'est donc plus rejeté → il est inséré (lien orphelin) et
+/// `persist_curated_index_atomic` RÉUSSIT (plus de rollback sur ce chemin).
 ///
-/// ## Séquence
-///
-/// 1. Seed note A dans l'index (titre initial NULL).
-/// 2. Appelle `persist_curated_index_atomic` avec :
-///    - titre = "Titre à rollback"
-///    - links = [("ULID_INEXISTANT", note_a.id)] → viole FK `src_note_id`
-///    - temporal = None, trust = None
-/// 3. Vérifie que `persist_curated_index_atomic` retourne `Err(...)`.
-/// 4. Vérifie que le titre de note A est TOUJOURS NULL (rollback effectif).
+/// Documente la perte d'intégrité FK-enforced actée par l'option C (cascade → manuelle) :
+/// l'atomicité sur erreur SQL réelle reste (transaction), mais n'est plus déclenchable via un
+/// lien orphelin. L'isolation référentielle par-vault des enfants est le follow-up option A.
 #[tokio::test]
-async fn persist_curated_atomic_rollback_on_fk_violation() {
+async fn persist_curated_atomic_orphan_link_no_longer_rolls_back() {
     let idx = SqliteIndex::open_in_memory()
         .await
         .expect("open_in_memory — invariant test");
@@ -49,61 +42,62 @@ async fn persist_curated_atomic_rollback_on_fk_violation() {
 
     let note_a_id_str = note_a.id.to_string();
 
-    // Vérifier que le titre initial est bien NULL.
+    // Titre initial NULL.
     let titles_before = idx
         .get_titles_sections("main", std::slice::from_ref(&note_a_id_str))
         .await
         .expect("get_titles_sections avant — invariant test");
-    let title_before = titles_before
-        .get(&note_a_id_str)
-        .and_then(|(title, _section)| title.as_deref());
     assert!(
-        title_before.is_none(),
-        "titre initial doit être NULL avant persist_curated_index_atomic"
+        titles_before
+            .get(&note_a_id_str)
+            .and_then(|(title, _s)| title.as_deref())
+            .is_none(),
+        "titre initial doit être NULL"
     );
 
-    // ULID inexistant → violation FK `src_note_id REFERENCES notes(id)`.
+    // `src` inexistant : ex-violation FK, désormais lien orphelin inséré (option C).
     let nonexistent_src = "01JZZZZZZZZZZZZZZZZZZZZZZZ".to_string();
     let dst = note_a_id_str.clone();
 
     let result = idx
         .persist_curated_index_atomic(
             &note_a.id,
-            "Titre à rollback",
-            None, // temporal
+            "Titre orphelin",
+            None,
             &[(nonexistent_src, dst.clone())],
-            None, // trust
+            None,
             "main",
         )
         .await;
 
-    // L'appel doit échouer (FK violation).
+    // Sans FK note_links, l'appel RÉUSSIT (le lien orphelin n'échoue plus).
     assert!(
-        result.is_err(),
-        "persist_curated_index_atomic doit retourner Err quand FK violée — got Ok"
+        result.is_ok(),
+        "sans FK note_links (option C), un lien orphelin ne fait plus échouer le persist — got {result:?}"
     );
 
-    // Le titre DOIT être NULL (rollback de upsert_note_title).
+    // Le titre EST persisté (pas de rollback).
     let titles_after = idx
         .get_titles_sections("main", std::slice::from_ref(&note_a_id_str))
         .await
         .expect("get_titles_sections après — invariant test");
-    let title_after = titles_after
-        .get(&note_a_id_str)
-        .and_then(|(title, _section)| title.as_deref());
-    assert!(
-        title_after.is_none(),
-        "le titre doit être NULL après rollback (atomicité violée si Some)"
+    assert_eq!(
+        titles_after
+            .get(&note_a_id_str)
+            .and_then(|(title, _s)| title.as_deref()),
+        Some("Titre orphelin"),
+        "le titre doit être persisté (aucun rollback puisque plus de FK)"
     );
 
-    // Aucun lien ne doit exister.
+    // Le lien orphelin est présent (documente la perte d'intégrité FK-enforced, option C).
     let backlinks = idx
         .backlinks("main", &dst)
         .await
         .expect("backlinks — invariant test");
-    assert!(
-        backlinks.is_empty(),
-        "aucun backlink ne doit exister après rollback"
+    assert_eq!(
+        backlinks.len(),
+        1,
+        "le lien orphelin est inséré (FK retirée, intégrité → cascade manuelle)"
     );
 }
 

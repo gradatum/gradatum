@@ -1,4 +1,4 @@
-//! Task 10 — Harness d'évaluation : preuve stricte d'apport RRF+composite vs baseline FTS-only.
+//! Harness d'évaluation : preuve stricte d'apport RRF+composite vs baseline FTS-only.
 //!
 //! ## Objectif
 //!

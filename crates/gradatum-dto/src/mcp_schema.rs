@@ -1,26 +1,24 @@
-//! SSOT des helpers de schéma JSON pour les outils MCP gradatum.
+//! Single source of truth for the JSON Schema helpers used by the gradatum MCP tools.
 //!
-//! Ce module est activé uniquement avec la feature `schemars`. Il remplace les
-//! 4 copies dupliquées dans `gradatum-server/src/api_v1/mcp.rs` et
-//! `gradatum-mcp-stub/src/main.rs`.
+//! Enabled only with the `schemars` feature. It replaces what used to be four duplicated
+//! copies of these two helpers across the server and the MCP stub.
 //!
-//! # Rationale — régression 34e70eb
+//! # Why this module exists
 //!
-//! Lors du cutover MCP (commit `34e70eb`), `tool_def_no_params` émettait `{}` (Map vide)
-//! au lieu de `{"type":"object","properties":{}}`. Le validateur zod de Claude Code rejette
-//! un Map vide → la liste entière des 21 outils était rejetée en cascade, rendant le serveur
-//! MCP inutilisable. Ce module est la SSOT anti-34e70eb : toute correction future n'a
-//! besoin d'être faite qu'ici.
+//! A regression once made the no-parameter tool definition emit an empty map `{}` instead
+//! of `{"type":"object","properties":{}}`. Strict MCP clients reject an empty map, and the
+//! rejection cascades: the **entire** tool list is discarded and the MCP server becomes
+//! unusable. Centralising the two helpers here means such a fix only ever has to be made
+//! in one place.
 
 use serde_json::{Map, Value};
 
-/// Schéma MCP d'un outil sans paramètres.
+/// MCP schema for a tool that takes no parameters.
 ///
-/// Retourne `{"type":"object","properties":{}}`, conforme à la spec MCP.
+/// Returns `{"type":"object","properties":{}}`, as required by the MCP specification.
 ///
-/// Un Map vide `{}` est rejeté par les validateurs clients (ex : zod de Claude Code)
-/// qui exigent `type: "object"` — ce qui invalide toute la liste d'outils en cascade.
-/// Régression historique `34e70eb` (serveur émettait `{}` → 21 outils rejetés).
+/// An empty map `{}` is rejected by strict client-side validators, which require
+/// `type: "object"` — and that rejection invalidates the whole tool list in cascade.
 ///
 /// # Examples
 ///
@@ -40,20 +38,20 @@ pub fn mcp_empty_params_schema() -> Map<String, Value> {
     m
 }
 
-/// Schéma MCP dérivé du type `T` via schemars.
+/// MCP schema derived from type `T` via schemars.
 ///
-/// Retourne un `serde_json::Map` représentant le schéma JSON de `T` tel qu'attendu
-/// par les consommateurs MCP (wire contract HTTP).
+/// Returns a `serde_json::Map` holding the JSON schema of `T`, in the shape MCP consumers
+/// expect for the HTTP wire contract.
 ///
-/// # Fail-loud
+/// # Panics
 ///
-/// Panique si schemars produit un schéma racine non-objet. En pratique, `schema_for!(T)`
-/// produit **toujours** un objet JSON → cette panique est impossible. Le fail-loud est
-/// intentionnel (anti-34e70eb) : on préfère un crash à la compilation/test plutôt qu'un
-/// Map vide silencieux qui invalide la liste d'outils en prod.
+/// Panics if schemars produces a non-object root schema. In practice `schema_for!(T)`
+/// **always** produces a JSON object, so this panic is unreachable. Failing loudly is
+/// deliberate: a crash at build or test time is far preferable to silently emitting an
+/// empty map, which invalidates the whole tool list in production.
 ///
-/// **Ne jamais substituer par `unwrap_or_default()`** : un Map vide est silencieusement
-/// erroné (zod rejet en cascade) — c'est exactement ce que `34e70eb` a introduit.
+/// **Never substitute `unwrap_or_default()` here**: an empty map is wrong in a way that
+/// no caller can detect, and it takes the entire tool list down with it.
 ///
 /// # Examples
 ///
@@ -72,14 +70,13 @@ pub fn mcp_tool_schema<T: schemars::JsonSchema>() -> Map<String, Value> {
     // La sérialisation d'un RootSchema schemars ne peut pas échouer (types internes
     // sont tous sérialisables) et le résultat est toujours Value::Object.
     // Fail-loud intentionnel — jamais de dégradé silencieux (anti-34e70eb).
-    let value = serde_json::to_value(&schema).expect(
-        "schemars::schema_for!(T) produit toujours un Value JSON valide — échec impossible",
-    );
+    let value = serde_json::to_value(&schema)
+        .expect("schemars::schema_for!(T) always produces a valid JSON Value — failure impossible");
     match value {
         Value::Object(m) => m,
         other => panic!(
-            "schemars::schema_for!(T) doit retourner un objet JSON mais a retourné : {other:?} \
-             — cela indique un bug interne dans schemars ou un type T non standard"
+            "schemars::schema_for!(T) must return a JSON object but returned: {other:?} \
+             — this indicates an internal bug in schemars or a non-standard type T"
         ),
     }
 }

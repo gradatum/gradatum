@@ -100,9 +100,10 @@ async fn trust_all(
     req.extensions_mut().insert(TrustContext::BearerToken {
         kid: "test-kid".to_string(),
         aud: "gradatum".to_string(),
-        sub: "test-admin".to_string(),
+        sub: "test-admin".into(),
         scopes: vec!["read".to_string(), "write".to_string()],
-        tenant_id: "main".to_string(),
+        tenant_id: "main".into(),
+        jti: None,
     });
     next.run(req).await
 }
@@ -419,7 +420,7 @@ async fn forgotten_by_over_limit_returns_400() {
     );
     let error = json["error"].as_str().unwrap_or("");
     assert!(
-        error.contains("forgotten_by") && error.contains("borne"),
+        error.contains("forgotten_by") && error.contains("bound"),
         "le message d'erreur doit expliquer le dépassement de borne: {json}"
     );
 }
@@ -479,6 +480,76 @@ async fn locus_scope_cross_vault_returns_403() {
     );
 }
 
+/// A7-bis : `Agent { vaults: ["main", "main"] }` posté par `main` → 400, pas 202.
+///
+/// **Le trou fermé** — `cross_vault_violation` ne cherche qu'un vault ≠ tenant : un vault
+/// RÉPÉTÉ n'en est pas un, la requête passait donc la garde cross-vault, `dto_scope_to_core`
+/// produisait un `Agent` de longueur 2, et le worker la refusait terminalement
+/// (`ensure_forget_scope_vault`, branche `many`) — 202 puis DLQ. Même classe que la garde
+/// A7 de `jobs_v2`, autre porte d'entrée.
+///
+/// **Discriminance** — la répétition est le seul cas qui distingue la nouvelle garde de
+/// l'ancienne : `["main", "autre"]` rendait déjà 403 avant ce lot (et le rend toujours,
+/// cf. `agent_scope_cross_vault_still_returns_403`). Un test sur deux vaults DISTINCTS
+/// aurait un pouvoir discriminant nul.
+///
+/// Le refus est en amont : `dry_run = true` suffit à le déclencher, aucune résolution de
+/// scope n'est tentée.
+#[tokio::test]
+async fn agent_scope_repeated_vault_returns_400() {
+    let (app, _state, _idx) = build_app().await;
+
+    let body = serde_json::json!({
+        "tenant_id": "main",
+        "scope": {
+            "type": "agent",
+            "agent_id": "claude",
+            "vaults": ["main", "main"]   // aucun vault ≠ tenant → cross_vault_violation aveugle
+        },
+        "dry_run": true
+    });
+    let (status, json) = post_forget(app, body).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "un Agent scope à vault répété doit être refusé 400, pas accepté puis mis en DLQ: {json}"
+    );
+    let error = json["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("exactly one vault"),
+        "le message doit énoncer la règle « un job = un vault »: {json}"
+    );
+}
+
+/// A7-bis, garde-fou de non-régression : deux vaults DISTINCTS restent un 403.
+///
+/// La nouvelle garde de forme (400) est évaluée APRÈS `cross_vault_violation` : elle ferme
+/// le trou que celui-ci laisse sans requalifier ce qu'il attrape déjà. Ce test fige cette
+/// précédence — sans lui, déplacer la garde en amont transformerait silencieusement un refus
+/// d'autorisation documenté en refus de forme.
+#[tokio::test]
+async fn agent_scope_cross_vault_still_returns_403() {
+    let (app, _state, _idx) = build_app().await;
+
+    let body = serde_json::json!({
+        "tenant_id": "main",
+        "scope": {
+            "type": "agent",
+            "agent_id": "claude",
+            "vaults": ["main", "autre"]
+        },
+        "dry_run": true
+    });
+    let (status, json) = post_forget(app, body).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "un Agent scope citant un vault ≠ tenant reste un 403 (contrat mono-tenant v0.4.x): {json}"
+    );
+}
+
 /// Test 7 : une note peut être à la fois forgotten ET downgraded (indépendance statuts).
 ///
 /// Le statut `forgotten` (colonne `forgotten`) est orthogonal à `status` ('live' / 'downgraded').
@@ -491,9 +562,16 @@ async fn forgotten_and_downgraded_coexistence() {
     // Downgrade via l'index.
     use gradatum_core::identity::NoteId;
     let nid = NoteId(Ulid::from_string(&id).expect("ULID parse coexistence"));
-    idx.downgrade_note(&nid, "test raison coexistence", None)
-        .await
-        .expect("downgrade_note doit réussir");
+    idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        ),
+        &nid,
+        "test raison coexistence",
+        None,
+    )
+    .await
+    .expect("downgrade_note doit réussir");
 
     // Marquer forgotten.
     idx.mark_forgotten("main", &id, None)

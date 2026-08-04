@@ -100,20 +100,33 @@ impl InternalClient for CapturingClient {
         })
     }
 
-    async fn delete_note(&self, ulid: &str) -> Result<(), InternalClientError> {
+    async fn delete_note(&self, _vault_id: &str, ulid: &str) -> Result<(), InternalClientError> {
         Err(InternalClientError::NotFound {
             ulid: ulid.to_string(),
         })
     }
 
-    async fn get_note(&self, ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+    async fn get_note(
+        &self,
+        _vault_id: &str,
+        ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError> {
         Err(InternalClientError::NotFound {
             ulid: ulid.to_string(),
         })
+    }
+
+    async fn get_note_status(
+        &self,
+        _vault_id: &str,
+        _ulid: &str,
+    ) -> Result<Option<String>, InternalClientError> {
+        Ok(None)
     }
 
     async fn get_note_embedding(
         &self,
+        _vault_id: &str,
         ulid: &str,
         _embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
@@ -122,7 +135,7 @@ impl InternalClient for CapturingClient {
         })
     }
 
-    async fn get_trust(&self, ulid: &str) -> Result<f32, InternalClientError> {
+    async fn get_trust(&self, _vault_id: &str, ulid: &str) -> Result<f32, InternalClientError> {
         Err(InternalClientError::NotFound {
             ulid: ulid.to_string(),
         })
@@ -317,6 +330,7 @@ async fn well_grounded_synthesis_passes_with_base_trust() {
         make_validate_job(spec),
         Data::new(Arc::clone(&client) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&embedder) as Arc<dyn Embedder + Send + Sync>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("well-grounded synthesis must succeed");
@@ -358,6 +372,7 @@ async fn poorly_grounded_synthesis_degrades_trust_and_adds_tag() {
         make_validate_job(spec),
         Data::new(Arc::clone(&client) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&embedder) as Arc<dyn Embedder + Send + Sync>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("poorly-grounded synthesis must not fail (non-blocking gate)");

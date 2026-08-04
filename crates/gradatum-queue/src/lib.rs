@@ -25,7 +25,9 @@
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee.
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible additions
+//! only within `1.x`, breaking changes deferred to the next major. See
+//! [RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 
 #![forbid(unsafe_code)]
 #![warn(rust_2018_idioms)]
@@ -43,7 +45,7 @@ pub use gradatum_queue::GradatumQueue;
 // API P2.0b — sqlx-based (exports primaires)
 #[deprecated(
     since = "0.2.0",
-    note = "Remplacé par GradatumQueue (ARCH-D15). Sera retiré en v0.3.0."
+    note = "Replaced by GradatumQueue (ARCH-D15). Will be removed in 2.0.0."
 )]
 pub use queue::{JobId, JobInfo, JobStatus, LeasedJob, NewJob, Queue, QueueError, SqliteQueue};
 

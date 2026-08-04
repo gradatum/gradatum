@@ -1,17 +1,31 @@
-//! gradatum-studio — bundle-only crate.
+//! gradatum-studio — a "bundle-only" crate.
 //!
-//! Ce crate ne contient pas de code Rust fonctionnel. Il héberge le projet npm
-//! (React + TypeScript + Vite) dont le build produit `dist/` — servi par
-//! gradatum-server via tower-http `ServeDir` sur `/ui/*`.
+//! This crate contains no functional Rust code and exposes no public API.
+//! It hosts the npm project (React + TypeScript + Vite) whose build produces
+//! the `dist/` directory, the only real deliverable of this package.
 //!
 //! # Build
 //!
-//! Le build npm est déclenché par le job CI `studio-build` (runner web dédié,
-//! sans label de runner CI interne). Le binaire gradatum-server s'attend à trouver
-//! les assets dans le répertoire configuré par `[studio] ui_dir`.
+//! The bundle is produced by the `studio-build` continuous integration job
+//! (`npm ci` → `npm audit` → `npm run build` → `npm test`). No Cargo build
+//! script invokes npm: compiling this crate has no effect on the bundle.
+//! The `dist/` directory is checked into the repository and embedded as is
+//! into the published package.
 //!
-//! # Déploiement
+//! # Asset serving
 //!
-//! Les assets compilés sont copiés dans `/usr/share/gradatum/ui/` par le
-//! script de déploiement. Le serveur sert ces fichiers sans authentification
-//! (le bundle est public ; toutes les API calls portent le Bearer JWT).
+//! `gradatum-server` serves the contents of `dist/` under `/ui/*` through the
+//! `ServeDir` of `tower-http`, from the directory designated by the
+//! `[studio] ui_dir` configuration key. No Cargo dependency links the two
+//! crates: the coupling is a filesystem path, resolved at runtime.
+//!
+//! The bundle is served without authentication — it is a public static
+//! artifact. Authentication is carried by the API calls issued from the
+//! browser, which present a JWT as `Bearer`.
+//!
+//! # Licensing
+//!
+//! The code of this crate is under Apache-2.0. The distributed bundle
+//! incorporates fonts under OFL-1.1 and npm dependencies under MIT and ISC;
+//! the full notices live in `THIRD-PARTY-LICENSES.md`, at the root of the
+//! package.

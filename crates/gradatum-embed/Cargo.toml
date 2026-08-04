@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Trait Embedder + HTTP remote backends + embedder_id/dim invariants (local impl provided by gradatum-engine)"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # Feature flags
 # fastembed-cpu : active FastEmbedCpu (inférence locale ONNX via fastembed).

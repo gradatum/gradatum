@@ -113,7 +113,7 @@ async fn embed_local(
 
     let embeddings = embedder.embed_batch(&texts_refs).await.map_err(|e| {
         ApiError::Backend(LlmError::Custom {
-            message: format!("erreur embedder local: {}", e),
+            message: format!("local embedder error: {}", e),
         })
     })?;
 
@@ -146,7 +146,7 @@ async fn embed_local(
     tracing::debug!(
         count = count,
         model = model_alias,
-        "embeddings locaux générés"
+        "local embeddings generated"
     );
 
     Ok((StatusCode::OK, Json(response)).into_response())
@@ -174,7 +174,7 @@ async fn embed_remote(
             tracing::warn!(
                 consumer = %client_ip,
                 model = %model_alias,
-                "alias inconnu (embeddings) — requête rejetée HTTP 404"
+                "unknown alias (embeddings) — request rejected HTTP 404"
             );
             ApiError::AliasNotFound {
                 alias: model_alias.to_owned(),
@@ -229,7 +229,7 @@ async fn embed_remote(
             error_message: error_msg,
         };
         if let Err(e) = registry.log_request(entry).await {
-            tracing::warn!("erreur journalisation requête embeddings: {}", e);
+            tracing::warn!("embeddings request logging error: {}", e);
         }
     });
 
@@ -288,7 +288,7 @@ async fn embed_dispatch_with_fallback(
                 primary = %alias.provider,
                 fallback = %fb_provider,
                 error = %primary_err,
-                "primary embed provider échoué — tentative fallback"
+                "primary embed provider failed — attempting fallback"
             );
 
             let fb_model = alias.fallback_model.as_deref().unwrap_or(&alias.model);
@@ -303,7 +303,7 @@ async fn embed_dispatch_with_fallback(
                     tracing::warn!(
                         fallback = %fb_provider,
                         error = %fb_err,
-                        "fallback embed provider également échoué"
+                        "fallback embed provider also failed"
                     );
                     (Err(fb_err), fb_provider.clone(), fb_model.to_string())
                 }
@@ -332,11 +332,11 @@ async fn try_embed_provider(
     if !state.providers.circuit_breakers.should_allow(provider_name) {
         tracing::warn!(
             provider = %provider_name,
-            "circuit breaker ouvert — requête embeddings rejetée"
+            "circuit breaker open — embeddings request rejected"
         );
         return Err(ApiError::Backend(LlmError::ProviderUnavailable {
             provider: provider_name.to_string(),
-            reason: "circuit breaker ouvert".to_string(),
+            reason: "circuit breaker open".to_string(),
         }));
     }
 
@@ -403,7 +403,7 @@ async fn try_embed_provider(
             .body(Body::from(body_bytes))
             .map_err(|e| {
                 ApiError::Backend(LlmError::Custom {
-                    message: format!("erreur construction réponse passthrough: {}", e),
+                    message: format!("passthrough response construction error: {}", e),
                 })
             })?
             .into_response());
@@ -424,7 +424,7 @@ async fn try_embed_provider(
         .body(Body::from(body_bytes))
         .map_err(|e| {
             ApiError::Backend(LlmError::Custom {
-                message: format!("erreur construction réponse embeddings: {}", e),
+                message: format!("embeddings response construction error: {}", e),
             })
         })?
         .into_response())

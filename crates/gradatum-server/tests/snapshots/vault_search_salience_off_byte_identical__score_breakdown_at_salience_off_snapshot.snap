@@ -1,0 +1,15 @@
+---
+source: crates/gradatum-server/tests/vault_search_salience_off_byte_identical.rs
+expression: projected
+---
+[
+  {
+    "composite": 0.039672,
+    "in_degree": 0,
+    "pagerank_factor": 0.0,
+    "recency_factor": 1.0,
+    "rrf_score": 0.03306,
+    "salience_factor_present": false,
+    "salience_weighted_sum_present": false
+  }
+]

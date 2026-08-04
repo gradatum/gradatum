@@ -11,8 +11,8 @@
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee; the public surface may change in any
-//! `0.y` release. See the
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
+//! additions only within `1.x`, breaking changes deferred to the next major. See the
 //! [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 
 #![forbid(unsafe_code)]

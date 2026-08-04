@@ -12,6 +12,7 @@ use std::sync::{
 
 use gradatum_cache::{CacheKey, EffectiveNoteCache, EffectiveNoteCacheConfig};
 use gradatum_core::identity::{ContentHash, NoteId};
+use gradatum_core::scope::VaultId;
 
 // ────────────────────────────────────────────────────────
 // T1 : hit avec hash valide → retour de la valeur cachée
@@ -21,11 +22,11 @@ use gradatum_core::identity::{ContentHash, NoteId};
 async fn cache_hit_with_valid_checksum_returns_value() {
     let cache = EffectiveNoteCache::new(EffectiveNoteCacheConfig::default());
     let id = NoteId::new();
-    let key: CacheKey = (id, 0u64);
+    let key: CacheKey = (VaultId::new("main"), id, 0u64);
     let value = dummy_effective_note(id);
     let hash = ContentHash([0x11; 32]);
 
-    cache.insert(key, value.clone(), hash).await;
+    cache.insert(key.clone(), value.clone(), hash).await;
 
     let got = cache
         .get::<_, _, std::convert::Infallible>(key, |_id| async move { Ok(hash) })
@@ -50,12 +51,12 @@ async fn cache_hit_with_valid_checksum_returns_value() {
 async fn cache_hit_with_stale_checksum_invalidates_and_misses() {
     let cache = EffectiveNoteCache::new(EffectiveNoteCacheConfig::default());
     let id = NoteId::new();
-    let key: CacheKey = (id, 0u64);
+    let key: CacheKey = (VaultId::new("main"), id, 0u64);
     let value = dummy_effective_note(id);
     let hash_old = ContentHash([0x11; 32]);
     let hash_new = ContentHash([0x22; 32]);
 
-    cache.insert(key, value, hash_old).await;
+    cache.insert(key.clone(), value, hash_old).await;
 
     let got = cache
         .get::<_, _, std::convert::Infallible>(key, |_id| async move { Ok(hash_new) })
@@ -88,13 +89,16 @@ async fn cache_miss_returns_none_without_validator_call() {
     let validator_called_clone = validator_called.clone();
 
     let result = cache
-        .get::<_, _, std::convert::Infallible>((NoteId::new(), 0), move |_id| {
-            let v = validator_called_clone.clone();
-            async move {
-                v.store(true, Ordering::SeqCst);
-                Ok(ContentHash([0; 32]))
-            }
-        })
+        .get::<_, _, std::convert::Infallible>(
+            (VaultId::new("main"), NoteId::new(), 0),
+            move |_id| {
+                let v = validator_called_clone.clone();
+                async move {
+                    v.store(true, Ordering::SeqCst);
+                    Ok(ContentHash([0; 32]))
+                }
+            },
+        )
         .await
         .unwrap();
 
@@ -113,17 +117,17 @@ async fn cache_miss_returns_none_without_validator_call() {
 async fn validator_error_propagates() {
     let cache = EffectiveNoteCache::new(EffectiveNoteCacheConfig::default());
     let id = NoteId::new();
-    let key: CacheKey = (id, 0u64);
+    let key: CacheKey = (VaultId::new("main"), id, 0u64);
     // Insérer une entrée pour provoquer un hit.
     cache
-        .insert(key, dummy_effective_note(id), ContentHash([0; 32]))
+        .insert(key.clone(), dummy_effective_note(id), ContentHash([0; 32]))
         .await;
 
     #[derive(Debug, PartialEq)]
     struct DbError;
 
     let result = cache
-        .get::<_, _, DbError>(key, |_id| async move { Err(DbError) })
+        .get::<_, _, DbError>(key.clone(), |_id| async move { Err(DbError) })
         .await;
 
     assert_eq!(
@@ -151,9 +155,9 @@ async fn validator_error_propagates() {
 async fn explicit_invalidate_works() {
     let cache = EffectiveNoteCache::new(EffectiveNoteCacheConfig::default());
     let id = NoteId::new();
-    let key: CacheKey = (id, 0u64);
+    let key: CacheKey = (VaultId::new("main"), id, 0u64);
     cache
-        .insert(key, dummy_effective_note(id), ContentHash([0; 32]))
+        .insert(key.clone(), dummy_effective_note(id), ContentHash([0; 32]))
         .await;
 
     cache.invalidate(&key).await;

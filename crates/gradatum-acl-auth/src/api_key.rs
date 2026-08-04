@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use argon2::password_hash::SaltString;
 use argon2::password_hash::rand_core::OsRng as ArgonOsRng;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use gradatum_core::scope::{AgentId, TenantId};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use sqlx::SqlitePool;
@@ -39,29 +40,67 @@ pub const KEY_PREFIX: &str = "ak_";
 /// 224 bits of secret unexposed.
 pub const SECRET_LEN: usize = 64;
 
+/// The closed set of scopes that grant write access.
+///
+/// - `write` — the nominal write scope;
+/// - `admin` — operator keys (a superset of `write`);
+/// - `service` — internal service agents.
+///
+/// Matching is exact string equality: any other value, including near-misses such
+/// as `vault_write`, grants no write access. A key whose scopes are disjoint from
+/// this set is strictly read-only and is refused on every write path once
+/// `multi_tenant.enabled = true`.
+///
+/// This constant is the single source of truth shared by the server (which enforces
+/// it on each request) and by `gradatum-admin api-key create` (which refuses to mint
+/// a key that would silently lack the write access its scopes appear to describe).
+///
+/// Typed as a slice rather than `[&str; 3]` so that the number of write scopes is not
+/// frozen into the public signature: adding a fourth one stays a minor release.
+pub const WRITE_SCOPES: &[&str] = &["write", "admin", "service"];
+
+/// Returns `true` if `scopes` contains at least one scope from [`WRITE_SCOPES`].
+///
+/// Comparison is exact string equality — see [`WRITE_SCOPES`] for why near-misses
+/// such as `vault_write` return `false`.
+///
+/// # Examples
+///
+/// ```
+/// use gradatum_acl_auth::has_write_scope;
+///
+/// assert!(has_write_scope(&["admin".to_owned()]));
+/// assert!(!has_write_scope(&["vault_write".to_owned()]));
+/// assert!(!has_write_scope(&[]));
+/// ```
+#[must_use]
+pub fn has_write_scope(scopes: &[String]) -> bool {
+    scopes.iter().any(|s| WRITE_SCOPES.contains(&s.as_str()))
+}
+
 // ── Erreurs ────────────────────────────────────────────────────────────────────
 
 /// Errors returned by API key store operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiKeyError {
     /// No key matching the given prefix or secret was found.
-    #[error("API key non trouvée")]
+    #[error("API key not found")]
     NotFound,
 
     /// The key has already been revoked.
-    #[error("API key déjà révoquée")]
+    #[error("API key already revoked")]
     AlreadyRevoked,
 
     /// argon2id hashing failed (should not occur under normal conditions).
-    #[error("erreur de hachage argon2id : {0}")]
+    #[error("argon2id hashing error: {0}")]
     ArgonHash(String),
 
     /// Underlying SQLite error.
-    #[error("erreur SQLite : {0}")]
+    #[error("SQLite error: {0}")]
     Sql(#[from] sqlx::Error),
 
     /// Cryptographic secret generation failed.
-    #[error("erreur cryptographique : {0}")]
+    #[error("cryptographic error: {0}")]
     Crypto(String),
 
     /// Unsupported tenant at creation time.
@@ -71,7 +110,7 @@ pub enum ApiKeyError {
     /// the `/auth/exchange` endpoint anyway. This is a code-level guard
     /// (no SQL constraint) and is reversible once true multi-tenant support is
     /// implemented.
-    #[error("tenant non supporté (mono-vault) : '{0}' ≠ 'main'")]
+    #[error("unsupported tenant (mono-vault): '{0}' ≠ 'main'")]
     InvalidTenant(String),
 }
 
@@ -89,12 +128,19 @@ pub struct ApiKey {
     pub prefix: String,
     /// Encoded argon2id hash (PHC string format).
     pub hash: String,
-    /// Key owner (CLI `--owner`).
-    pub owner: String,
+    /// Key owner — the credential-borne agent identity, typed [`AgentId`].
+    ///
+    /// Rebuilt without re-validation from the SQLite `owner` column (CLI `--owner`),
+    /// whose value is already trusted: `ApiKeyStore::create` is the single write path.
+    /// This is the value the middleware copies into `TrustContext::BearerToken.sub`
+    /// after argon2id verification — never a client-supplied header.
+    pub owner: AgentId,
     /// Authorized scopes (e.g. `["admin"]`, extensible).
     pub scopes: Vec<String>,
-    /// Target tenant identifier.
-    pub tenant_id: String,
+    /// Target tenant identifier (**principal**, typed [`TenantId`]) — a principal
+    /// dimension distinct from the `VaultId` namespace. Rebuilt without re-validation
+    /// from the SQLite `tenant_id` column, whose value is already trusted.
+    pub tenant_id: TenantId,
     /// Creation timestamp (epoch seconds).
     pub created_at: i64,
     /// Last-used timestamp (epoch seconds, nullable).
@@ -130,8 +176,8 @@ pub struct ApiKeyMaterial {
 ///
 /// ## Stability
 ///
-/// `0.x` — no API stability guarantees.
-/// Concrete implementations must implement all methods.
+/// Covered by the crate's `1.x` SemVer guarantee — see the [crate-level stability
+/// section](crate#stability). Concrete implementations must implement all methods.
 ///
 /// ## argon2id cost
 ///
@@ -144,12 +190,16 @@ pub trait ApiKeyStore: Send + Sync {
     /// the result to the DB. Returns [`ApiKeyMaterial`] containing the plaintext secret
     /// (to be displayed ONCE ONLY).
     ///
+    /// `owner` is an [`AgentId`], never a bare string. Callers coming from untrusted input
+    /// (the `--owner` CLI argument) must obtain the value through [`AgentId::parse`];
+    /// server-side callers rebuilding an already-trusted value may use [`AgentId::new`].
+    ///
     /// # Errors
     /// - `ApiKeyError::ArgonHash` if argon2id hashing fails (should not occur under normal conditions)
     /// - `ApiKeyError::Sql` if the SQLite insert fails
     async fn create(
         &self,
-        owner: &str,
+        owner: &AgentId,
         scopes: Vec<String>,
         tenant_id: String,
         description: Option<String>,
@@ -172,10 +222,16 @@ pub trait ApiKeyStore: Send + Sync {
     /// - `ApiKeyError::Sql` on DB error
     async fn verify(&self, secret: &str) -> Result<ApiKey, ApiKeyError>;
 
-    /// Lists API keys (secrets excluded).
+    /// Lists API keys (secrets excluded), scoped to `tenant_filter`.
     ///
+    /// `tenant_filter`: `None` = all tenants (backward-compatible) ;
+    /// `Some(t)` = only keys for tenant `t` (multi-tenant isolation, P1 #4).
     /// If `include_revoked` is `false`, returns only active keys.
-    async fn list(&self, include_revoked: bool) -> Result<Vec<ApiKey>, ApiKeyError>;
+    async fn list(
+        &self,
+        include_revoked: bool,
+        tenant_filter: Option<&str>,
+    ) -> Result<Vec<ApiKey>, ApiKeyError>;
 
     /// Revokes an API key by its prefix.
     ///
@@ -214,6 +270,14 @@ pub trait ApiKeyStore: Send + Sync {
 #[derive(Clone)]
 pub struct SqliteApiKeyStore {
     pool: SqlitePool,
+    /// Allows creating keys for a tenant other than `"main"`.
+    ///
+    /// `false` by default, which preserves the single-vault invariant. The operator turns
+    /// it on explicitly through [`SqliteApiKeyStore::with_non_main_tenants`] (loopback
+    /// admin CLI) once the multi-tenant substrate is provisioned. JWT issuance stays
+    /// governed downstream by the `tenant_vault_grants` allow-list, at `/auth/exchange`
+    /// and in the middleware, which are fail-closed.
+    allow_non_main_tenants: bool,
 }
 
 impl SqliteApiKeyStore {
@@ -246,7 +310,7 @@ impl SqliteApiKeyStore {
             .await
             .map_err(|e| {
                 ApiKeyError::Sql(sqlx::Error::Protocol(format!(
-                    "migration api_keys échouée : {e}"
+                    "api_keys migration failed: {e}"
                 )))
             })?;
 
@@ -259,11 +323,14 @@ impl SqliteApiKeyStore {
         if count > 0 {
             warn!(
                 rows = count,
-                "api_keys table existe avec {} rows — re-init non-destructive", count
+                "api_keys table exists with {} rows — non-destructive re-init", count
             );
         }
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            allow_non_main_tenants: false,
+        })
     }
 
     /// Creates a `SqliteApiKeyStore` backed by an in-memory SQLite database (tests only).
@@ -277,10 +344,26 @@ impl SqliteApiKeyStore {
             .await
             .map_err(|e| {
                 ApiKeyError::Sql(sqlx::Error::Protocol(format!(
-                    "migration api_keys (in-memory) échouée : {e}"
+                    "api_keys migration (in-memory) failed: {e}"
                 )))
             })?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            allow_non_main_tenants: false,
+        })
+    }
+
+    /// Allows creating keys for a tenant other than `"main"`.
+    ///
+    /// An **explicit** lift of the single-vault guard, reserved for the operator through
+    /// the loopback admin CLI and its dedicated flag. Without this opt-in, `create`
+    /// rejects every non-`main` key with [`ApiKeyError::InvalidTenant`]. JWT issuance for
+    /// such keys stays governed downstream by the fail-closed `tenant_vault_grants`
+    /// allow-list: a key belonging to an unprovisioned tenant never obtains a token.
+    #[must_use]
+    pub fn with_non_main_tenants(mut self) -> Self {
+        self.allow_non_main_tenants = true;
+        self
     }
 
     /// Generates a 256-bit API key secret (32 bytes → 64 hex chars).
@@ -390,9 +473,13 @@ impl SqliteApiKeyStore {
             id: id_ulid,
             prefix,
             hash,
-            owner,
+            // La colonne SQLite `owner` est déjà de confiance (insérée par `create`,
+            // seul chemin d'écriture) → `new` sans revalidation. Byte-identical.
+            owner: AgentId::new(owner),
             scopes,
-            tenant_id,
+            // La colonne SQLite `tenant_id` est déjà de confiance (insérée par `create`,
+            // seul chemin d'écriture) → `new` sans revalidation. Byte-identical.
+            tenant_id: TenantId::new(tenant_id),
             created_at,
             last_used_at,
             revoked_at,
@@ -416,7 +503,7 @@ mod hex {
 impl ApiKeyStore for SqliteApiKeyStore {
     async fn create(
         &self,
-        owner: &str,
+        owner: &AgentId,
         scopes: Vec<String>,
         tenant_id: String,
         description: Option<String>,
@@ -424,12 +511,13 @@ impl ApiKeyStore for SqliteApiKeyStore {
         // P0 cross-tenant (Lot 6) : refus à la création de toute clé non-main tant
         // que le vault est mono-physique. Garde code-level (pas de CHECK SQL — SQLite
         // n'autorise pas ADD CONSTRAINT ; cette garde est réversible et suffisante car
-        // `create` est l'UNIQUE chemin d'insertion d'api_keys).
-        if tenant_id != "main" {
+        // `create` est l'UNIQUE chemin d'insertion d'api_keys). Levée contrôlée C3a :
+        // opt-in explicite `with_non_main_tenants` (opérateur, CLI admin) uniquement.
+        if tenant_id != "main" && !self.allow_non_main_tenants {
             tracing::warn!(
-                owner = owner,
+                owner = %owner,
                 tenant = %tenant_id,
-                "création api_key refusée : tenant ≠ main (invariant mono-vault)"
+                "api_key creation refused: tenant ≠ main (single-vault invariant)"
             );
             return Err(ApiKeyError::InvalidTenant(tenant_id));
         }
@@ -438,7 +526,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         let hash = Self::hash_secret(&secret)?;
         let id = Ulid::new().to_string();
         let scopes_json = serde_json::to_string(&scopes)
-            .map_err(|e| ApiKeyError::Crypto(format!("sérialisation scopes JSON échouée : {e}")))?;
+            .map_err(|e| ApiKeyError::Crypto(format!("scopes JSON serialization failed: {e}")))?;
         let now = Self::now_epoch();
 
         // INSERT avec gestion de collision de préfixe (retry si UNIQUE constraint fail).
@@ -450,7 +538,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         .bind(&id)
         .bind(&prefix)
         .bind(&hash)
-        .bind(owner)
+        .bind(owner.as_str())
         .bind(&scopes_json)
         .bind(&tenant_id)
         .bind(now)
@@ -461,10 +549,10 @@ impl ApiKeyStore for SqliteApiKeyStore {
         match result {
             Ok(_) => {
                 debug!(
-                    owner = owner,
+                    owner = %owner,
                     prefix = %prefix,
                     tenant = %tenant_id,
-                    "API key créée"
+                    "API key created"
                 );
                 Ok(ApiKeyMaterial { secret, prefix })
             }
@@ -475,7 +563,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
             {
                 // Collision de préfixe (P1-1 spec V2) — quasi-impossible en pratique.
                 // Retry avec un nouveau secret.
-                warn!("collision préfixe API key détectée — retry génération");
+                warn!("API key prefix collision detected — retrying generation");
                 let secret2 = Self::generate_secret();
                 let prefix2 = Self::derive_prefix(&secret2).to_string();
                 let hash2 = Self::hash_secret(&secret2)?;
@@ -487,7 +575,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
                 .bind(&id2)
                 .bind(&prefix2)
                 .bind(&hash2)
-                .bind(owner)
+                .bind(owner.as_str())
                 .bind(&scopes_json)
                 .bind(&tenant_id)
                 .bind(now)
@@ -579,19 +667,29 @@ impl ApiKeyStore for SqliteApiKeyStore {
         ))
     }
 
-    async fn list(&self, include_revoked: bool) -> Result<Vec<ApiKey>, ApiKeyError> {
+    async fn list(
+        &self,
+        include_revoked: bool,
+        tenant_filter: Option<&str>,
+    ) -> Result<Vec<ApiKey>, ApiKeyError> {
+        // P1 #4 : filtre tenant_id. `None` = tous les tenants (backward-compat) ;
+        // `Some(t)` = isole les clés API au tenant `t`.
         let rows = if include_revoked {
             sqlx::query_as::<_, (String, String, String, String, String, String, i64, Option<i64>, Option<i64>, Option<String>)>(
                 "SELECT id, prefix, hash, owner, scopes_json, tenant_id, created_at, last_used_at, revoked_at, description \
-                 FROM api_keys ORDER BY created_at DESC",
+                 FROM api_keys WHERE (? IS NULL OR tenant_id = ?) ORDER BY created_at DESC",
             )
+            .bind(tenant_filter)
+            .bind(tenant_filter)
             .fetch_all(&self.pool)
             .await?
         } else {
             sqlx::query_as::<_, (String, String, String, String, String, String, i64, Option<i64>, Option<i64>, Option<String>)>(
                 "SELECT id, prefix, hash, owner, scopes_json, tenant_id, created_at, last_used_at, revoked_at, description \
-                 FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at DESC",
+                 FROM api_keys WHERE revoked_at IS NULL AND (? IS NULL OR tenant_id = ?) ORDER BY created_at DESC",
             )
+            .bind(tenant_filter)
+            .bind(tenant_filter)
             .fetch_all(&self.pool)
             .await?
         };
@@ -657,7 +755,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
             return Err(ApiKeyError::AlreadyRevoked);
         }
 
-        debug!(prefix = prefix, "API key révoquée");
+        debug!(prefix = prefix, "API key revoked");
         Ok(())
     }
 
@@ -732,7 +830,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         debug!(
             old_prefix = prefix,
             new_prefix = %new_prefix,
-            "API key rotée"
+            "API key rotated"
         );
         Ok(ApiKeyMaterial {
             secret: new_secret,
@@ -759,7 +857,7 @@ mod tests {
         let store = make_store().await;
         let material = store
             .create(
-                "test-owner",
+                &AgentId::new("test-owner"),
                 vec!["admin".to_string()],
                 "main".to_string(),
                 Some("test key".to_string()),
@@ -780,13 +878,32 @@ mod tests {
         assert!(!key.is_revoked());
     }
 
+    /// C3a (F-45) : l'opt-in `with_non_main_tenants` lève la garde Lot 6 — la clé
+    /// est créée avec son tenant propre (l'autorisation d'émission JWT reste en aval).
+    #[tokio::test]
+    async fn create_non_main_tenant_allowed_with_optin() {
+        let store = make_store().await.with_non_main_tenants();
+        let material = store
+            .create(
+                &AgentId::new("research-agent"),
+                vec!["read".to_string()],
+                "research".to_string(),
+                None,
+            )
+            .await
+            .expect("création clé tenant='research' avec opt-in");
+        let key = store.verify(&material.secret).await.expect("verify OK");
+        assert_eq!(key.tenant_id, "research");
+        assert_eq!(key.owner, "research-agent");
+    }
+
     #[tokio::test]
     async fn create_non_main_tenant_is_refused() {
         // P0 cross-tenant (Lot 6) : impossible de créer une clé non-main en mono-vault.
         let store = make_store().await;
         let result = store
             .create(
-                "evil-owner",
+                &AgentId::new("evil-owner"),
                 vec!["admin".to_string()],
                 "evil".to_string(),
                 None,
@@ -804,7 +921,7 @@ mod tests {
         let store = make_store().await;
         let material = store
             .create(
-                "main-owner",
+                &AgentId::new("main-owner"),
                 vec!["admin".to_string()],
                 "main".to_string(),
                 None,
@@ -819,7 +936,7 @@ mod tests {
     async fn verify_wrong_secret_fails() {
         let store = make_store().await;
         let material = store
-            .create("owner", vec![], "main".to_string(), None)
+            .create(&AgentId::new("owner"), vec![], "main".to_string(), None)
             .await
             .expect("create");
 
@@ -843,7 +960,12 @@ mod tests {
     async fn create_then_revoke_then_verify_fails() {
         let store = make_store().await;
         let material = store
-            .create("owner", vec!["admin".into()], "main".to_string(), None)
+            .create(
+                &AgentId::new("owner"),
+                vec!["admin".into()],
+                "main".to_string(),
+                None,
+            )
             .await
             .expect("create");
 
@@ -871,7 +993,12 @@ mod tests {
     async fn rotate_produces_new_key_and_revokes_old() {
         let store = make_store().await;
         let original = store
-            .create("owner", vec!["admin".into()], "main".to_string(), None)
+            .create(
+                &AgentId::new("owner"),
+                vec!["admin".into()],
+                "main".to_string(),
+                None,
+            )
             .await
             .expect("create original");
 
@@ -904,7 +1031,7 @@ mod tests {
     async fn rotate_already_revoked_returns_error() {
         let store = make_store().await;
         let material = store
-            .create("owner", vec![], "main".to_string(), None)
+            .create(&AgentId::new("owner"), vec![], "main".to_string(), None)
             .await
             .expect("create");
 
@@ -931,22 +1058,85 @@ mod tests {
     async fn list_excludes_revoked_by_default() {
         let store = make_store().await;
         let k1 = store
-            .create("owner1", vec![], "main".to_string(), None)
+            .create(&AgentId::new("owner1"), vec![], "main".to_string(), None)
             .await
             .expect("k1");
         let _k2 = store
-            .create("owner2", vec![], "main".to_string(), None)
+            .create(&AgentId::new("owner2"), vec![], "main".to_string(), None)
             .await
             .expect("k2");
 
         store.revoke(&k1.prefix).await.expect("revoke k1");
 
-        let active = store.list(false).await.expect("list active");
+        let active = store.list(false, None).await.expect("list active");
         assert_eq!(active.len(), 1, "1 clé active attendue");
         assert_eq!(active[0].owner, "owner2");
 
-        let all = store.list(true).await.expect("list all");
+        let all = store.list(true, None).await.expect("list all");
         assert_eq!(all.len(), 2, "2 clés total attendues");
+    }
+
+    /// `list()` avec `tenant_filter = Some(t)` ne retourne que les clés du tenant `t` (P1 #4).
+    #[tokio::test]
+    async fn list_filters_by_tenant() {
+        let store = make_store().await.with_non_main_tenants();
+        // Créer des clés sur deux tenants différents.
+        store
+            .create(
+                &AgentId::new("owner-a"),
+                vec![],
+                "tenant-a".to_string(),
+                None,
+            )
+            .await
+            .expect("clé tenant-a");
+        store
+            .create(
+                &AgentId::new("owner-a2"),
+                vec![],
+                "tenant-a".to_string(),
+                None,
+            )
+            .await
+            .expect("clé 2 tenant-a");
+        store
+            .create(
+                &AgentId::new("owner-b"),
+                vec![],
+                "tenant-b".to_string(),
+                None,
+            )
+            .await
+            .expect("clé tenant-b");
+
+        // Sans filtre → toutes les clés sont visibles (backward-compat).
+        let all = store.list(false, None).await.expect("list all");
+        assert_eq!(all.len(), 3);
+
+        // Filtré sur tenant-a → 2 clés.
+        let ta = store
+            .list(false, Some("tenant-a"))
+            .await
+            .expect("list tenant-a");
+        assert_eq!(ta.len(), 2, "2 clés pour tenant-a attendues");
+        for k in &ta {
+            assert_eq!(k.tenant_id.as_str(), "tenant-a");
+        }
+
+        // Filtré sur tenant-b → 1 clé.
+        let tb = store
+            .list(false, Some("tenant-b"))
+            .await
+            .expect("list tenant-b");
+        assert_eq!(tb.len(), 1);
+        assert_eq!(tb[0].tenant_id.as_str(), "tenant-b");
+
+        // Tenant inconnu → 0 clé.
+        let empty = store
+            .list(false, Some("tenant-inexistant"))
+            .await
+            .expect("list tenant inconnu");
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]

@@ -275,6 +275,22 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    /// Top-k sampling — keep only the `k` most probable tokens (llama.cpp / vLLM).
+    ///
+    /// Omitted from the forwarded body when `None` (the backend applies its own
+    /// launch default, e.g. `--top-k`), so this is additive and non-breaking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Min-p sampling — drop tokens below `min_p × p(top token)` (llama.cpp / vLLM).
+    ///
+    /// Omitted from the forwarded body when `None` (backend launch default applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    /// Presence penalty — discourages repeating tokens already present.
+    ///
+    /// Omitted from the forwarded body when `None` (backend launch default applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

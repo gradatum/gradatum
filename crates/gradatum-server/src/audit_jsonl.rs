@@ -32,8 +32,6 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Mutex;
 
 /// Internal sink state: open file + current date.
-// Phase 2.1 : Inner sera utilisé quand JsonlFileSink sera câblé dans AppState.
-#[allow(dead_code)]
 struct Inner {
     /// Current file date in `YYYY-MM-DD` format.
     current_date: String,
@@ -53,8 +51,9 @@ struct Inner {
 /// Incremented on every I/O error (disk full, insufficient permissions, etc.).
 /// Accessible via [`JsonlFileSink::dropped_total`] for test fixtures
 /// and monitoring.
-// Phase 2.1 : JsonlFileSink sera câblé dans AppState (with_audit_dir).
-#[allow(dead_code)]
+///
+/// Câblé en prod via [`AppState::with_audit_dir`](crate::state::AppState::with_audit_dir)
+/// (invoqué au boot dans `main.rs`).
 pub struct JsonlFileSink {
     /// Base directory for audit files.
     base_dir: PathBuf,
@@ -67,8 +66,6 @@ pub struct JsonlFileSink {
     dropped_total: Arc<AtomicU64>,
 }
 
-// Phase 2.1 : méthodes câblées dans AppState::with_audit_dir.
-#[allow(dead_code)]
 impl JsonlFileSink {
     /// Creates a new sink that writes its files into `base_dir`.
     ///
@@ -85,6 +82,10 @@ impl JsonlFileSink {
     ///
     /// Atomic value — Relaxed load, sufficient for monitoring and tests.
     /// Accessible from test fixtures.
+    // `allow` (et non `expect`) : lu par les fixtures de test/monitoring mais sans appelant
+    // dans la cible binaire — `dead_code` ne se déclenche que côté bin, pas côté lib (API
+    // publique), donc `expect` serait non satisfait dans la cible lib.
+    #[allow(dead_code)]
     pub fn dropped_total(&self) -> u64 {
         self.dropped_total.load(Ordering::Relaxed)
     }
@@ -113,7 +114,7 @@ impl JsonlFileSink {
         // SAFETY : guard est Some après la rotation ci-dessus.
         let inner = guard
             .as_mut()
-            .expect("Inner est Some — initialisé juste au-dessus");
+            .expect("Inner is Some — initialized just above");
 
         let line = serde_json::to_string(&event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -162,7 +163,7 @@ impl AuditSink for JsonlFileSink {
         let result = self.record_inner(event).await;
         if result.is_err() {
             self.dropped_total.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("audit sink : événement non persisté — dropped_total incrémenté");
+            tracing::warn!("audit sink: event not persisted — dropped_total incremented");
         }
         result
     }

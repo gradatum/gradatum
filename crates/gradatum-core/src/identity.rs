@@ -7,11 +7,12 @@
 //! - `ContentHash`: SHA-256 of `JCS(frontmatter) ++ "\n---\n" ++ body`.
 //!   Cross-language deterministic via JCS RFC 8785. Enables drift detection.
 //! - `NoteVersion`: monotonic counter incremented on every write.
-//! - `IntegritySignature`: optional — HMAC-SHA256 or Ed25519 via `gradatum-acl-auth`.
+//! - `IntegritySignature`: declared but **never constructed** — no signing scheme is
+//!   implemented anywhere in the workspace. Always `None` in practice.
 //!
 //! ## Why JCS?
 //!
-//! `serde_yml::to_string` is non-deterministic across library versions.
+//! YAML serialization is non-deterministic across library versions and backends.
 //! `serde_json::to_string` is non-canonical (key order not guaranteed).
 //! JCS RFC 8785 is an IETF standard: sorted keys, canonical IEEE 754 floats,
 //! normative string escaping. Produces bit-identical hashes in Rust, Python, Go, and JS.
@@ -133,6 +134,7 @@ impl ContentHash {
     /// a strictly IEEE 754 serialiser would produce.
     ///
     /// **Caveat**: if a `toml::Value::Float(f64::NAN)` is inserted into `extra` programmatically
+    // scan-fr-strings: allow-jargon § — citation de la section 3.3 de la RFC TOML, pas un renvoi de spec interne
     /// (TOML does not parse `NaN` per RFC 3.3 §2.3, but it can be constructed in code),
     /// `serde_jcs` will serialise it as `null`, potentially producing a hash collision with
     /// a note that has a `null` for that field. Avoid non-finite floats in `extra`.
@@ -142,8 +144,8 @@ impl ContentHash {
         // JCS RFC 8785: sorted keys, canonical IEEE 754 floats, normative string escaping.
         // Guarantees a bit-identical hash regardless of the producer or YAML library.
         let canonical = serde_jcs::to_string(frontmatter).expect(
-            "Frontmatter est toujours sérialisable en JCS : \
-             pas de f64::NAN/INFINITY possible (TOML RFC 3.3 garantit des floats finis)",
+            "Frontmatter is always JCS-serializable: \
+             no f64::NAN/INFINITY possible (TOML RFC 3.3 guarantees finite floats)",
         );
 
         let mut hasher = Sha256::new();
@@ -193,10 +195,12 @@ impl NoteVersion {
 
 /// Optional cryptographic signature.
 ///
-/// Absent by default: drift detection via `ContentHash` is sufficient for most use cases.
-/// Vault-scoped HMAC-SHA256 or Ed25519 is available via `gradatum-acl-auth` with bearer auth.
+/// **Never constructed.** The type exists to reserve the shape of a future signature, but
+/// no code in the workspace produces one — `gradatum-acl-auth` contains no HMAC or Ed25519
+/// implementation. `Note::integrity_signature` is therefore always `None`.
 ///
-/// Separates accidental drift (`ContentHash`) from malicious tampering (`IntegritySignature`).
+/// Consequence: only accidental drift (`ContentHash`) is detectable today. Malicious
+/// tampering is **not** covered — do not treat the absence of drift as authenticity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct IntegritySignature(pub Vec<u8>);

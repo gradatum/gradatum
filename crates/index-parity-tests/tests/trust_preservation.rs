@@ -25,7 +25,7 @@ async fn set_and_get_trust_roundtrips() {
     idx.write_note(&note).await.expect("write");
 
     let affected = idx
-        .set_note_trust(&note.id, 0.87)
+        .set_note_trust("main", &note.id, 0.87)
         .await
         .expect("set_note_trust");
     assert_eq!(
@@ -36,7 +36,7 @@ async fn set_and_get_trust_roundtrips() {
     );
 
     let trust = idx
-        .get_trust(&note.id)
+        .get_trust("main", &note.id)
         .await
         .expect("get_trust")
         .expect("trust présent");
@@ -56,11 +56,17 @@ async fn dynamic_trust_preserved_on_reupsert_same_provenance() {
     idx.write_note(&note).await.expect("write initial");
 
     // La distillation pose un trust dynamique calculé.
-    idx.set_note_trust(&id, 0.96)
+    idx.set_note_trust("main", &id, 0.96)
         .await
         .expect("set_note_trust dynamique");
     assert!(
-        (idx.get_trust(&id).await.expect("get").expect("trust") - 0.96).abs() < 1e-6,
+        (idx.get_trust("main", &id)
+            .await
+            .expect("get")
+            .expect("trust")
+            - 0.96)
+            .abs()
+            < 1e-6,
         "trust dynamique posé"
     );
 
@@ -69,7 +75,7 @@ async fn dynamic_trust_preserved_on_reupsert_same_provenance() {
     idx.write_note(&note_again).await.expect("re-upsert");
 
     let after = idx
-        .get_trust(&id)
+        .get_trust("main", &id)
         .await
         .expect("get after")
         .expect("trust after");
@@ -84,7 +90,7 @@ async fn dynamic_trust_preserved_on_reupsert_same_provenance() {
 async fn set_note_trust_absent_note_affects_zero_rows() {
     let idx = make_index().await;
     let affected = idx
-        .set_note_trust(&NoteId::new(), 0.5)
+        .set_note_trust("main", &NoteId::new(), 0.5)
         .await
         .expect("set_note_trust sur note absente");
     assert_eq!(

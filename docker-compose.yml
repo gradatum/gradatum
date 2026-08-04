@@ -1,32 +1,57 @@
-version: "3.9"
+# ============================================================================
+# Déploiement Docker gradatum — validé 2026-08-03 sur VPS test (CA-1).
+#
+# Remplace l'ancien docker-compose.yml (0.1.0-alpha.4 "reference only" obsolète
+# depuis la validation multi-tenant v1.0.0).
+#
+# Leçons du déploiement test CA-1 (docker-compose.test.yml) :
+#   1. network_mode — le worker DOIT partager le network namespace du serveur
+#      (service:gradatum-server) pour joindre l'API interne en loopback
+#      (127.0.0.1:19092). Sans ça, GRADATUM_INTERNAL_URL est injoignable.
+#   2. Token via variable d'environnement — JAMAIS de secret en dur dans le
+#      fichier. Utiliser ${GRADATUM_INTERNAL_TOKEN:?...} pour forcer la
+#      fourniture au démarrage.
+#   3. Healthcheck llama override — l'image ghcr.io/ggml-org/llama.cpp:server
+#      sonde :8080 par défaut. Surcharger le healthcheck pour pointer vers le
+#      port réel (8436 embedding, 8000 chat).
+#
+# Sécurité : tous les ports sont en loopback (127.0.0.1) ou à restreindre via
+# tunnel VPN. Aucun port public non protégé. Secrets uniquement via variables
+# d'environnement ou fichiers montés, jamais en dur.
+# ============================================================================
 
-# NOTE: Docker images are not published yet. Use the pre-built binaries from GitHub Releases (see README/INSTALL).
-# The image tags below are historical and not available on ghcr.io. This docker-compose.yml is for reference only.
+name: gradatum
 
 services:
+  # ── Serveur principal ────────────────────────────────────────────────────
   gradatum-server:
-    # image: ghcr.io/gradatum/gradatum:0.1.0-alpha.4  # NOT AVAILABLE — use pre-built binaries from GitHub Releases
+    build: .
     container_name: gradatum-server
     restart: unless-stopped
     ports:
-      - "19090:19090"
+      - "127.0.0.1:19090:19090"
     volumes:
       - gradatum-config:/etc/gradatum
       - gradatum-state:/var/lib/gradatum
       - gradatum-audit:/var/log/gradatum
     environment:
-      - GRADATUM_LOG=info
       - RUST_BACKTRACE=1
+    command: ["--config", "/etc/gradatum/server.toml"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:19090/health"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 15s
 
+  # ── Worker (curation, embedding, distillation) ───────────────────────────
   gradatum-worker:
-    # image: ghcr.io/gradatum/gradatum:0.1.0-alpha.4  # NOT AVAILABLE — use pre-built binaries from GitHub Releases
+    build: .
     container_name: gradatum-worker
     restart: unless-stopped
+    # CRITIQUE : le worker appelle l'API interne gradatum en loopback
+    # (127.0.0.1:19092). Il DOIT partager le network namespace du serveur.
+    network_mode: "service:gradatum-server"
     depends_on:
       gradatum-server:
         condition: service_healthy
@@ -37,18 +62,133 @@ services:
     entrypoint: ["/usr/local/bin/gradatum-worker"]
     command: ["--config", "/etc/gradatum/server.toml"]
     environment:
-      - GRADATUM_LOG=info
+      - GRADATUM_INTERNAL_URL=http://127.0.0.1:19092
+      - GRADATUM_INTERNAL_TOKEN=${GRADATUM_INTERNAL_TOKEN:?GRADATUM_INTERNAL_TOKEN requis — fournir via .env ou export}
 
-  # Conteneur d'initialisation — exécuter une seule fois avant le démarrage nominal
+  # ── Initialisation (one-shot) ────────────────────────────────────────────
   # Usage : docker compose --profile init up gradatum-init
   gradatum-init:
-    # image: ghcr.io/gradatum/gradatum:0.1.0-alpha.4  # NOT AVAILABLE — use pre-built binaries from GitHub Releases
+    build: .
     container_name: gradatum-init
     volumes:
-      - gradatum-config:/etc/gradatum
+      - gradatum-state:/var/lib/gradatum
     entrypoint: ["/usr/local/bin/gradatum-admin"]
-    command: ["init", "--force-skip-if-exists"]
+    command: ["init", "--root", "/var/lib/gradatum", "--bind", "0.0.0.0:19090", "--non-interactive"]
     profiles: ["init"]
+
+  # ── Gateway LLM (proxy multi-provider, optionnel) ───────────────────────
+  # Le gateway est un proxy LLM avec circuit-breaker, cross-encoder reranking
+  # et intégration supervisor engine. Configuration attendue :
+  #   /etc/gradatum/gateway.toml — endpoints providers, clés API, reranking
+  #   (monter le fichier de config dans gradatum-config).
+  # Port par défaut du gateway : 19091 (à confirmer dans la config).
+  gradatum-gateway:
+    build: .
+    container_name: gradatum-gateway
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:19091:19091"
+    volumes:
+      - gradatum-config:/etc/gradatum:ro
+      - gradatum-state:/var/lib/gradatum
+    entrypoint: ["/usr/local/bin/gradatum-gateway"]
+    command: ["--config", "/etc/gradatum/gateway.toml"]
+    profiles: ["gateway"]
+
+  # ── Engine runtime (superviseur llama-server, optionnel) ─────────────────
+  # L'engine démarre et supervise un sous-processus llama-server. En contexte
+  # Docker, préférer les conteneurs llama-embed / llama-chat dédiés (profil
+  # llm ci-dessous) plutôt que d'embarquer llama-server dans l'engine.
+  #
+  # Config attendue : /etc/gradatum/engine.toml (fichier unique, format [engine]).
+  # Exemples de config à adapter : examples/configs/engine-chat.toml
+  #                               examples/configs/engine-embed.toml
+  # Documentation complète : docs/DEPLOYMENT.md §4-§5 + crates/gradatum-engine/src/config.rs
+  gradatum-engine:
+    build: .
+    container_name: gradatum-engine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:19093:19093"
+    volumes:
+      - gradatum-config:/etc/gradatum:ro
+      - gradatum-state:/var/lib/gradatum
+    entrypoint: ["/usr/local/bin/gradatum-engine"]
+    command: ["--config", "/etc/gradatum/engine.toml"]
+    profiles: ["engine"]
+
+  # ── LLM CPU local — embedding (optionnel) ────────────────────────────────
+  # CPU uniquement, pas de GPU. Sert [embed] dans la config gradatum.
+  # Modèle : BGE-M3 Q8_0 (~1.5 Go RAM). Port loopback uniquement.
+  # Usage : docker compose --profile llm up llama-embed
+  llama-embed:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: gradatum-llama-embed
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8436:8436"
+    volumes:
+      # Adapter le chemin vers le répertoire des modèles :
+      - ./models/embed:/models:ro
+    healthcheck:
+      # Surcharge obligatoire : l'image sonde :8080 par défaut
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8436/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    command:
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8436"
+      - --model
+      - /models/bge-m3-q8_0.gguf
+      - --alias
+      - bge-m3-Q8_0
+      - --embedding
+      - --ctx-size
+      - "512"
+      - --threads
+      - "2"
+      - --threads-batch
+      - "4"
+    profiles: ["llm"]
+
+  # ── LLM CPU local — chat / curator (optionnel) ───────────────────────────
+  # CPU uniquement, pas de GPU. Sert [curator.llm] dans la config gradatum.
+  # Modèle : Qwen2.5-1.5B-Instruct Q4_K_M (~1 Go RAM). Port loopback uniquement.
+  # Usage : docker compose --profile llm up llama-chat
+  llama-chat:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: gradatum-llama-chat
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Adapter le chemin vers le répertoire des modèles :
+      - ./models/chat:/models:ro
+    healthcheck:
+      # Surcharge obligatoire : l'image sonde :8080 par défaut
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    command:
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --model
+      - /models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+      - --alias
+      - Qwen2.5-1.5B-Instruct
+      - --ctx-size
+      - "4096"
+      - --threads
+      - "6"
+    profiles: ["llm"]
 
 volumes:
   gradatum-config:

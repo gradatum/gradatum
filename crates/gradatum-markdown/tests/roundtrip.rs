@@ -45,12 +45,12 @@ fn roundtrip_typical_note() {
 
 /// Round-trip avec des champs extra inconnus (forward-compat B8).
 ///
-/// ## Comportement actuel (serde_yml + toml::Value)
+/// ## Comportement actuel (backend YAML + toml::Value)
 ///
-/// `ExtraFields` utilise `BTreeMap<String, toml::Value>` mais `serde_yml` ne peut
+/// `ExtraFields` utilise `BTreeMap<String, toml::Value>` mais le backend YAML ne peut
 /// pas mapper automatiquement les champs YAML inconnus vers `toml::Value` sans
 /// `#[serde(flatten)]` sur le champ `extra` de `Frontmatter`. En conséquence :
-/// - Le parse ne plante PAS sur des champs inconnus (serde_yml les ignore silencieusement).
+/// - Le parse ne plante PAS sur des champs inconnus (le backend YAML les ignore silencieusement).
 /// - Les champs inconnus sont **perdus** lors du parse depuis YAML.
 /// - Le round-trip parse→write→parse est stable (mais les extras sont absent des deux côtés).
 ///
@@ -69,7 +69,7 @@ fn roundtrip_preserves_unknown_extra_fields() {
     let parsed =
         parse(raw).expect("parse note-with-extras.md ne doit pas échouer sur des champs inconnus");
 
-    // Note : serde_yml ignore les champs inconnus — extra reste vide.
+    // Note : le backend YAML ignore les champs inconnus — extra reste vide.
     // C'est le comportement attendu avec le design actuel de ExtraFields (toml::Value).
     // forward-compat B8 complet requiert #[serde(flatten)] dans Frontmatter — hors-scope T04.
 

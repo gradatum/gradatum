@@ -30,12 +30,12 @@ async fn insert_note_embedding_persists_vector() {
 
     let vec_in: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
 
-    idx.insert_note_embedding(&note_id, "bge-small-en-v1.5", 384, &vec_in)
+    idx.insert_note_embedding("main", &note_id, "bge-small-en-v1.5", 384, &vec_in)
         .await
         .expect("insert ok");
 
     let vec_out = idx
-        .get_note_embedding(&note_id, "bge-small-en-v1.5")
+        .get_note_embedding("main", &note_id, "bge-small-en-v1.5")
         .await
         .expect("get ok")
         .expect("vecteur doit être présent après insert");
@@ -68,16 +68,16 @@ async fn insert_note_embedding_replaces_on_conflict() {
     let vec1 = vec![0.1f32; 384];
     let vec2 = vec![0.5f32; 384];
 
-    idx.insert_note_embedding(&note_id, embedder_id, 384, &vec1)
+    idx.insert_note_embedding("main", &note_id, embedder_id, 384, &vec1)
         .await
         .expect("insert 1 ok");
 
-    idx.insert_note_embedding(&note_id, embedder_id, 384, &vec2)
+    idx.insert_note_embedding("main", &note_id, embedder_id, 384, &vec2)
         .await
         .expect("insert 2 (upsert) ok");
 
     let vec_out = idx
-        .get_note_embedding(&note_id, embedder_id)
+        .get_note_embedding("main", &note_id, embedder_id)
         .await
         .expect("get ok")
         .expect("vecteur doit être présent après upsert");
@@ -91,7 +91,7 @@ async fn insert_note_embedding_replaces_on_conflict() {
     );
     // Vérifier qu'un embedder différent retourne None (isolation entre embedders).
     let other = idx
-        .get_note_embedding(&note_id, "autre-embedder")
+        .get_note_embedding("main", &note_id, "autre-embedder")
         .await
         .expect("get ok");
     assert!(
@@ -109,7 +109,7 @@ async fn insert_note_embedding_rejects_dim_mismatch() {
     // 100 éléments mais on annonce dim=384 → doit retourner Err.
     let vec = vec![0.1f32; 100];
     let res = idx
-        .insert_note_embedding(&note_id, "bge-small-en-v1.5", 384, &vec)
+        .insert_note_embedding("main", &note_id, "bge-small-en-v1.5", 384, &vec)
         .await;
 
     assert!(
@@ -150,13 +150,13 @@ async fn insert_note_embedding_commits_in_degraded_mode() {
 
     // Appeler insert_note_embedding sans extension vec0 chargée (open_in_memory =
     // mode dégradé par construction). Doit retourner Ok(()).
-    idx.insert_note_embedding(&note_id, "test-embedder", 4, &vec_in)
+    idx.insert_note_embedding("main", &note_id, "test-embedder", 4, &vec_in)
         .await
         .expect("insert_note_embedding doit réussir en mode dégradé (no upsert_ann)");
 
     // L'embedding doit être lisible : la transaction a commité l'INSERT note_embeddings.
     let vec_out = idx
-        .get_note_embedding(&note_id, "test-embedder")
+        .get_note_embedding("main", &note_id, "test-embedder")
         .await
         .expect("get_note_embedding ok")
         .expect("le vecteur doit être persisté même sans extension ANN");

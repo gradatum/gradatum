@@ -6,7 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Managed model runtime — axum OpenAI-compat server supervising a llama-server subprocess (PIVOT v2)."
+description = "Managed model runtime — axum OpenAI-compatible server supervising a llama-server subprocess"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "gradatum-engine"
@@ -35,8 +38,14 @@ serve = [
     "dep:url",
     "dep:nix",
 ]
-# test-utils : expose test_app_with_mock + MockGen pour les tests d'intégration
-test-utils   = ["serve"]
+# test-utils : expose test_app_with_mock + MockGen pour les tests d'intégration.
+# `gradatum-core/test-utils` est OBLIGATOIRE ici : `src/server.rs` importe
+# `gradatum_core::event_sink::InMemorySink`, gaté `#[cfg(any(test, feature = "test-utils"))]`
+# côté core. Sans propagation, seule l'activation via `[dev-dependencies]` ci-dessous
+# rendait le symbole visible — donc UNIQUEMENT quand cargo compile les cibles de test de
+# CE workspace. Un consommateur externe (`cargo add gradatum-engine --features test-utils`)
+# ne compilait pas (E0432). Pas de `?` : `gradatum-core` est une dépendance non optionnelle.
+test-utils   = ["serve", "gradatum-core/test-utils"]
 
 [dependencies]
 # Cœur — toujours présent (pas de feature gate, anti-cycle : ce crate ne dépend que de gradatum-core)

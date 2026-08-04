@@ -5,21 +5,23 @@
 //!
 //! ## Contents
 //!
-//! - `SqliteIndex`: SQLite + FTS5 base, 4 mandatory PRAGMAs (C12), migration `0001_phase1.sql`.
+//! - `SqliteIndex`: SQLite + FTS5 store, four mandatory PRAGMAs, migration `0001_phase1.sql`.
 //! - `drift::scan_phase_a`: three-level helper (size → prefix-4 KB → full SHA-256).
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee. See [RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible additions only within `1.x`. See [RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 //!
 //! ## Status
 //!
-//! SQLite schema, drift detection, and mandatory PRAGMAs (C12) are fully implemented.
+//! SQLite schema, drift detection, and the mandatory PRAGMAs are fully implemented.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+/// Archive registry (`archive_index`) backing note archiving and retention GC.
+pub mod archive;
 /// `DocumentStore` implementation for `SqliteIndex`.
 pub(crate) mod document_store_impl;
 pub mod drift;
@@ -30,16 +32,16 @@ pub mod links;
 pub mod migrations;
 pub mod queries;
 pub mod sqlite;
-/// ANN search via sqlite-vec `vec0` virtual table (v0.5.3 ANN-1).
+/// Approximate nearest-neighbour search over the sqlite-vec `vec0` virtual table.
 ///
-/// Expose [`sqlite_vec::search_ann_inner`], [`sqlite_vec::upsert_ann`],
-/// et [`sqlite_vec::backfill_ann_from_conn`].
-/// Aucun `unsafe` dans ce module — l'enregistrement de l'extension
-/// (`sqlite3_auto_extension`) reste dans les bin crates.
+/// Exposes [`sqlite_vec::search_ann_inner`], [`sqlite_vec::upsert_ann`] and
+/// [`sqlite_vec::backfill_ann_from_conn`]. This module contains no `unsafe` code:
+/// registering the SQLite extension (`sqlite3_auto_extension`) stays in the binary crates.
 pub(crate) mod sqlite_vec;
 /// `VectorStore` implementation for `SqliteIndex`.
 pub(crate) mod vector_store_impl;
 
+pub use archive::{ARCHIVE_LIST_MAX, ArchiveEntry, ArchiveListFilter};
 pub use queries::{AuthorRow, Lineage, NoteRecord, extract_h1_title};
 pub use sqlite::{
     CodeSymbolMeta, DerivedNote, Freshness, IndexStatusSnapshot, SqliteIndex, fts5_quote_query,

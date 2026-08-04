@@ -377,11 +377,11 @@ impl QueueStore for SlowJobStore {
         Err(QueueError::Storage("SlowJobStore stub".into()))
     }
 
-    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError> {
+    async fn dequeue(&self, _tenant_filter: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
         Ok(None)
     }
 
-    async fn get(&self, _id: Ulid) -> Result<Option<JobRecord>, QueueError> {
+    async fn get(&self, _id: Ulid, _tenant: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
         Ok(None)
     }
 
@@ -393,7 +393,7 @@ impl QueueStore for SlowJobStore {
         Ok(())
     }
 
-    async fn cancel(&self, _id: Ulid) -> Result<(), QueueError> {
+    async fn cancel(&self, _id: Ulid, _tenant: Option<&str>) -> Result<(), QueueError> {
         Ok(())
     }
 
@@ -441,6 +441,7 @@ impl QueueStore for SlowJobStore {
     /// Retourne 1 job Pending pour que `queue_depth > 0`.
     async fn count_jobs_by_status(
         &self,
+        _tenant_filter: Option<&str>,
     ) -> Result<std::collections::HashMap<JobStatus, u64>, QueueError> {
         let mut m = std::collections::HashMap::new();
         m.insert(JobStatus::Pending, 1u64);

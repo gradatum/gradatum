@@ -224,7 +224,7 @@ async fn empty_items_returns_false() {
 /// L'impl correcte vérifie via fast-path (snippet/title) ET via fallback
 /// vault_read (body complet) que le marqueur littéral est absent.
 ///
-/// Mise à jour (Task 2) : avec le fallback vault_read, le mock doit aussi
+/// Mise à jour : avec le fallback vault_read, le mock doit aussi
 /// enregistrer `/api/v1/vault_read` — le body ne contient pas F-42 → false.
 #[tokio::test]
 async fn precision_hit_with_different_marker_returns_false() {

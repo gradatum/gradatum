@@ -99,7 +99,10 @@ async fn override_distinct_scope_kinds() {
     idx.upsert_note(&note).await.unwrap();
 
     let scope_vault = OverrideScope::Vault(VaultId::new("main"));
-    let scope_locus = OverrideScope::Locus(gradatum_core::scope::LocusId::new("locus-private"));
+    let scope_locus = OverrideScope::Locus {
+        vault: VaultId::new("main"),
+        locus: gradatum_core::scope::LocusId::new("locus-private"),
+    };
 
     idx.upsert_override_raw(note.id, &scope_vault, "metadata", 1, "source = \"vault\"\n")
         .await

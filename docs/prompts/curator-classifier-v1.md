@@ -1,8 +1,13 @@
 # Curator Classifier Prompt v1 — gradatum
 
+> **SUPERSEDED — historical reference.** The prompt shipped today is **v2**, embedded in the
+> binary at compile time (`gradatum-curator`, `CLASSIFIER_SYSTEM_PROMPT`, sourced from
+> `crates/gradatum-curator/prompts/curator-classifier-v2.txt`). v1 was never embedded in
+> Rust source. It is kept unchanged below to document the original design; do not read it as
+> a description of current behaviour.
+
 > Author: prompt engineer
 > Date: 2026-05-05
-> Bench reference: docs/bench/BASELINE-CURATOR-V1.md
 > Ratified design spec P2.0 — 2026-05-04
 
 ---
@@ -12,8 +17,8 @@
 Classify a gradatum note into exactly one of the 10 canonical sections.
 Secondary outputs: extract 2–5 tags, detect wikilinks, signal duplicate candidates.
 
-This prompt targets **P2.0b** (`gradatum-curator` crate, `classify_section()` function).
-It is not embedded in Rust source yet — this file is the standalone design reference.
+This prompt targeted **P2.0b** (`gradatum-curator` crate). It was a standalone design
+reference and was never embedded in Rust source; v2 superseded it before that step.
 
 ---
 

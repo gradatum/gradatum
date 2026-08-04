@@ -45,7 +45,7 @@ use gradatum_acl_policy::{AclDecision, AclOp};
 use gradatum_core::{
     ForgetScope, ForgetSpec, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority,
     JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, TriggerSource,
-    error::GradatumError, section::Section, trust::TrustContext,
+    error::GradatumError, scope::VaultId, section::Section, trust::TrustContext,
 };
 use gradatum_dto::{
     ExcludedNote, ForgetPreview, ForgetScopeDto, ForgottenListResponse, ForgottenNoteEntry,
@@ -54,7 +54,8 @@ use gradatum_dto::{
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::api_v1::tenant_guard::effective_tenant;
+use crate::api_v1::logic::locus_for_tenant;
+use crate::api_v1::tenant_guard::{effective_tenant, effective_write_vault};
 use crate::state::AppState;
 
 // ── Sections protégées ────────────────────────────────────────────────────────
@@ -96,7 +97,7 @@ async fn resolve_scope(
             let max_limit = limit.unwrap_or(50).min(200);
             state
                 .search
-                .search_fts_for_forget(effective_vault, query, max_limit)
+                .search_fts_for_forget(&VaultId::new(effective_vault), query, max_limit)
                 .await
                 .map_err(|e| {
                     tracing::warn!(error = %e, "vault_forget: search_fts_for_forget failed");
@@ -136,7 +137,7 @@ fn partition_candidates(candidates: Vec<(String, String)>) -> (Vec<String>, Vec<
             excluded.push(ExcludedNote {
                 ulid,
                 section: section.clone(),
-                reason: format!("section protégée : {section}"),
+                reason: format!("protected section: {section}"),
             });
         } else {
             eligible.push(ulid);
@@ -181,6 +182,47 @@ pub(crate) fn cross_vault_violation<'a>(
     }
 }
 
+/// Returns the vault count of an `Agent` scope that targets more than one vault.
+///
+/// A7-bis — même classe que la garde A7 de `jobs_v2::build_job_record_from_spec`, appliquée
+/// à l'autre porte d'entrée. Sans elle, `Agent { vaults: ["alice", "alice"] }` posté par
+/// `alice` traverse [`cross_vault_violation`] (qui ne cherche qu'un vault ≠ tenant, et n'en
+/// trouve aucun), puis `dto_scope_to_core` produit un `Agent` de longueur 2 que le worker
+/// refuse terminalement (`ensure_forget_scope_vault`, branche `many`) : 202 puis DLQ.
+///
+/// ## Pourquoi compter SANS dédoublonner
+///
+/// Le worker branche sur la longueur BRUTE du slice : dédoublonner ici sans réécrire le
+/// spec enfilé ne changerait rien au 202 → DLQ, et le réécrire reviendrait à enfiler
+/// silencieusement autre chose que ce que l'appelant a posté — un registre inacceptable
+/// pour un acte que le protocole `confirm_ulids` rend justement explicite. Le
+/// dédoublonnage a un sens là où il y a un fan-out à produire : le CLI admin
+/// (`fan_out_by_vault`) émet N jobs et dédoublonne pour ne pas en émettre deux sur la même
+/// cible. Cette route n'émet qu'UN job : elle n'a rien à dédoublonner, seulement à refuser.
+/// Une règle unique, identique sur les trois sites.
+///
+/// ## Pourquoi 400 et non 403
+///
+/// Refus de FORME, comme en A7 : il ne consulte ni trust ni tenant, vaut à `multi_tenant`
+/// OFF, et se déclenche même si le porteur couvre tous les vaults cités. Un 403 serait un
+/// faux signal de sécurité. Il est évalué APRÈS [`cross_vault_violation`] : un scope citant
+/// un vault ≠ tenant reste un 403 (contrat public existant, mono-tenant v0.4.x) — cette
+/// garde ne ferme que le trou qu'il laisse, elle ne le requalifie pas.
+pub(crate) fn multi_vault_agent_scope(scope: &ForgetScopeDto) -> Option<usize> {
+    match scope {
+        ForgetScopeDto::Agent { vaults, .. } if vaults.len() > 1 => Some(vaults.len()),
+        _ => None,
+    }
+}
+
+/// Message de refus commun aux deux portes d'entrée `vault_forget` (HTTP et MCP).
+fn multi_vault_agent_error(count: usize) -> String {
+    format!(
+        "`ForgetScope::Agent` targets {count} vaults — a job targets exactly one vault. \
+         Post one job per vault (fan-out belongs to the enqueue site). Repeated vaults count."
+    )
+}
+
 // ── Conversion DTO scope → core ───────────────────────────────────────────────
 
 /// Converts a `ForgetScopeDto` into a `ForgetScope` (core) for the job worker.
@@ -217,13 +259,40 @@ fn dto_scope_to_core(dto: &ForgetScopeDto) -> ForgetScope {
 /// - `scope`: resolution scope converted to a `ForgetScope` core value
 /// - `confirm_ulids`: confirmed ULIDs (exact match against the preview)
 /// - `forgotten_by`: optional actor name (logged in frontmatters)
+/// - `vault_id`: vault EFFECTIF résolu (JWT) — estampillé dans le job pour que le worker
+///   re-dérive le tenant (voir le bloc de commentaire ci-dessous, complétude cross-tenant).
 fn build_forget_job_record(
     scope: ForgetScope,
     confirm_ulids: Vec<String>,
     forgotten_by: Option<String>,
+    vault_id: &str,
 ) -> JobRecord {
     let now = Utc::now();
     let class = JobClass::Agent;
+    // P0 cross-tenant (complétude worker) : estampiller le vault EFFECTIF dans le job.
+    // Sans cela le job ne portait PAS le tenant : `JobScope::VaultWide` faisait retomber
+    // `resolve_job_vault` (worker) sur `"main"` — donc `persist_forget` (apalis_handlers)
+    // mutait sous le namespace `"main"` (perte du tenant / mutation cross-vault), et un
+    // `Forget::Topic{vault:None}` résolvait ses candidats dans `"main"`. Deux dérivations
+    // distinctes, corrigées ensemble :
+    //   1. `JobScope::Vault(vault_id)` → `resolve_job_vault` rend le tenant (vault de
+    //      `persist_forget` + fallback de résolution Topic côté worker).
+    //   2. `Topic{vault:None}` normalisé en `Some(vault_id)` → `forget_scope_tenant`
+    //      (colonne `tenant_id` de la file = routing per-vault à ON) rend le tenant.
+    // À OFF (mono-vault) `vault_id == "main"` : les deux estampilles restent `"main"` →
+    // byte-identical (seul le payload sérialisé du job diffère, jamais observable via l'API).
+    let scope = match scope {
+        ForgetScope::Topic {
+            query,
+            vault: None,
+            limit,
+        } => ForgetScope::Topic {
+            query,
+            vault: Some(vault_id.to_owned()),
+            limit,
+        },
+        other => other,
+    };
     let spec = ForgetSpec {
         scope,
         dry_run: false, // Mode réel — la double-garde vérifie aussi ce flag
@@ -236,7 +305,7 @@ fn build_forget_job_record(
             kind: Job::Forget(spec),
             class,
             mode: JobMode::Batch,
-            scope: JobScope::VaultWide,
+            scope: JobScope::Vault(vault_id.to_owned()),
             priority: JobPriority::Normal,
         },
         scheduling: JobScheduling {
@@ -311,7 +380,8 @@ pub struct ForgetJobResponse {
 ///
 /// - **200 OK** + JSON `ForgetPreview` — dry-run
 /// - **202 Accepted** + JSON `ForgetJobResponse` — real mode, job enqueued
-/// - **400 Bad Request** — `confirm_ulids` mismatch
+/// - **400 Bad Request** — `confirm_ulids` mismatch, bounds exceeded, or
+///   `ForgetScope::Agent` targeting more than one vault (repeated vaults count)
 /// - **401 Unauthorized** — missing or invalid bearer token
 /// - **403 Forbidden** — ACL Write required
 /// - **500 Internal Server Error** — index or enqueue failure
@@ -325,7 +395,10 @@ pub async fn vault_forget(
     }
     // P0 cross-tenant (Lot 3) : tenant/vault dérivé du JWT, refuse body divergent.
     // Le scope cross_vault_violation est désormais évalué contre le tenant du JWT.
-    let vault_id = effective_tenant(&trust, &req.tenant_id)?.to_owned();
+    // C1 (F-63, EX-C1-1/2) : + grant write exigé à flag ON.
+    let vault_id = effective_write_vault(&state, &trust, req.tenant_id.as_ref())
+        .await
+        .map_err(|r| r.status())?;
     let locus = format!("{}/main", vault_id);
     if state.acl.evaluate(&trust, AclOp::Write, &locus) != AclDecision::Allow {
         return Err(StatusCode::FORBIDDEN);
@@ -350,11 +423,27 @@ pub async fn vault_forget(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": format!(
-                    "cross-vault forget non supporté en v0.4.x : scope.vault='{}' ≠ tenant_id='{}'. Prévu en v0.5.1.",
+                    "cross-vault forget not supported in v0.4.x: scope.vault='{}' ≠ tenant_id='{}'. Planned for v0.5.1.",
                     scope_vault,
                     vault_id
                 )
             })),
+        ));
+    }
+
+    // A7-bis — un `Agent` multi-vault (répétitions comprises) n'est pas exécutable par
+    // cette route : refus 400 en amont, AVANT toute résolution de scope, plutôt qu'un 202
+    // suivi d'une mort en DLQ. Cf. `multi_vault_agent_scope` pour l'arbitrage
+    // « refuser » vs « dédoublonner » et pour le choix 400 vs 403.
+    if let Some(count) = multi_vault_agent_scope(&req.scope) {
+        tracing::warn!(
+            tenant_id = %vault_id,
+            vault_count = count,
+            "vault_forget: ForgetScope::Agent multi-vault — 400"
+        );
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": multi_vault_agent_error(count) })),
         ));
     }
 
@@ -368,13 +457,13 @@ pub async fn vault_forget(
         tracing::warn!(
             len = by.len(),
             max = MAX_FORGOTTEN_BY_LEN,
-            "vault_forget: forgotten_by dépasse la borne — 400"
+            "vault_forget: forgotten_by exceeds bound — 400"
         );
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": format!(
-                    "forgotten_by dépasse la borne : maximum {} octets, reçu {}",
+                    "forgotten_by exceeds bound: maximum {} bytes, received {}",
                     MAX_FORGOTTEN_BY_LEN,
                     by.len()
                 )
@@ -388,13 +477,13 @@ pub async fn vault_forget(
     if req.confirm_ulids.len() > 200 {
         tracing::warn!(
             count = req.confirm_ulids.len(),
-            "vault_forget: confirm_ulids dépasse la borne 200 — 400"
+            "vault_forget: confirm_ulids exceeds bound 200 — 400"
         );
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": format!(
-                    "confirm_ulids dépasse la borne : maximum 200, reçu {}",
+                    "confirm_ulids exceeds bound: maximum 200, received {}",
                     req.confirm_ulids.len()
                 )
             })),
@@ -451,6 +540,7 @@ pub async fn vault_forget(
         core_scope,
         req.confirm_ulids.clone(),
         req.forgotten_by.clone(),
+        &vault_id,
     );
     let job_ulid = state.job_store.enqueue(record).await.map_err(|e| {
         tracing::warn!(error = %e, "vault_forget: enqueue Job::Forget failed");
@@ -498,7 +588,8 @@ pub async fn vault_forget(
 /// - [`GradatumError::Forbidden`] si l'ACL Write est refusée ou si la requête cible
 ///   un vault différent du tenant JWT.
 /// - [`GradatumError::InvalidInput`] si `forgotten_by`, `confirm_ulids` ou le
-///   `confirm_ulids` mismatch sont invalides.
+///   `confirm_ulids` mismatch sont invalides, ou si le scope est un `Agent` visant
+///   plus d'un vault (répétitions comprises).
 /// - [`GradatumError::Storage`] si l'enqueue du job échoue.
 pub(crate) async fn vault_forget_mcp_impl(
     state: AppState,
@@ -509,21 +600,29 @@ pub(crate) async fn vault_forget_mcp_impl(
         return Err(GradatumError::Unauthorized);
     }
 
-    let vault_id = effective_tenant(&trust, &req.tenant_id)
-        .map_err(|_| GradatumError::Forbidden("tenant JWT diverge du body".to_owned()))?
-        .to_owned();
+    // C1 (F-63, EX-C1-1/2) : résolution write-scope — tenant JWT + grant write à flag ON.
+    let vault_id = effective_write_vault(&state, &trust, req.tenant_id.as_ref())
+        .await
+        .map_err(|r| r.into_forbidden("JWT tenant diverges from body"))?;
 
     let locus = format!("{}/main", vault_id);
     if state.acl.evaluate(&trust, AclOp::Write, &locus) != AclDecision::Allow {
-        return Err(GradatumError::Forbidden("ACL Write refusée".to_owned()));
+        return Err(GradatumError::Forbidden("ACL Write denied".to_owned()));
     }
 
     // D3 — Validation mono-tenant : scope cross-vault refusé.
     if let Some(scope_vault) = cross_vault_violation(&req.scope, &vault_id) {
         return Err(GradatumError::Forbidden(format!(
-            "cross-vault forget non supporté en v0.4.x : scope.vault='{}' ≠ tenant_id='{}'. Prévu en v0.5.1.",
+            "cross-vault forget not supported in v0.4.x: scope.vault='{}' ≠ tenant_id='{}'. Planned for v0.5.1.",
             scope_vault, vault_id
         )));
+    }
+
+    // A7-bis — `Agent` multi-vault refusé en amont (cf. `multi_vault_agent_scope`).
+    // Même règle que la porte HTTP : les deux portes ne doivent pas diverger, c'est
+    // exactement la classe de défaut que ce lot ferme.
+    if let Some(count) = multi_vault_agent_scope(&req.scope) {
+        return Err(GradatumError::InvalidInput(multi_vault_agent_error(count)));
     }
 
     // G10 — Borne forgotten_by (anti DoS).
@@ -531,7 +630,7 @@ pub(crate) async fn vault_forget_mcp_impl(
         && by.len() > MAX_FORGOTTEN_BY_LEN
     {
         return Err(GradatumError::InvalidInput(format!(
-            "forgotten_by dépasse la borne : maximum {} octets, reçu {}",
+            "forgotten_by exceeds bound: maximum {} bytes, received {}",
             MAX_FORGOTTEN_BY_LEN,
             by.len()
         )));
@@ -540,14 +639,14 @@ pub(crate) async fn vault_forget_mcp_impl(
     // C8 — Borne confirm_ulids.
     if req.confirm_ulids.len() > 200 {
         return Err(GradatumError::InvalidInput(format!(
-            "confirm_ulids dépasse la borne : maximum 200, reçu {}",
+            "confirm_ulids exceeds bound: maximum 200, received {}",
             req.confirm_ulids.len()
         )));
     }
 
     let raw_candidates = resolve_scope(&state, &req.scope, &vault_id)
         .await
-        .map_err(|_| GradatumError::Storage("résolution scope échouée".to_owned()))?;
+        .map_err(|_| GradatumError::Storage("scope resolution failed".to_owned()))?;
 
     let (eligible, excluded) = partition_candidates(raw_candidates);
     let eligible_count = eligible.len();
@@ -561,7 +660,7 @@ pub(crate) async fn vault_forget_mcp_impl(
             dry_run: true,
         };
         return serde_json::to_value(&preview)
-            .map_err(|e| GradatumError::Storage(format!("sérialisation preview : {e}")));
+            .map_err(|e| GradatumError::Storage(format!("preview serialization: {e}")));
     }
 
     // Mode réel — vérification confirm_ulids.
@@ -584,10 +683,11 @@ pub(crate) async fn vault_forget_mcp_impl(
         core_scope,
         req.confirm_ulids.clone(),
         req.forgotten_by.clone(),
+        &vault_id,
     );
     let job_ulid = state.job_store.enqueue(record).await.map_err(|e| {
         tracing::warn!(error = %e, "vault_forget_mcp_impl: enqueue Job::Forget failed");
-        GradatumError::Storage("enqueue job échoué".to_owned())
+        GradatumError::Storage("job enqueue failed".to_owned())
     })?;
 
     tracing::info!(
@@ -610,7 +710,7 @@ pub(crate) async fn vault_forget_mcp_impl(
         preview,
     };
     serde_json::to_value(&response)
-        .map_err(|e| GradatumError::Storage(format!("sérialisation réponse : {e}")))
+        .map_err(|e| GradatumError::Storage(format!("response serialization: {e}")))
 }
 
 // ── Handler GET /vault/forgotten ──────────────────────────────────────────────
@@ -645,16 +745,29 @@ pub async fn vault_forgotten_list(
     Extension(trust): Extension<TrustContext>,
     Query(params): Query<ForgottenListQuery>,
 ) -> Result<Json<ForgottenListResponse>, StatusCode> {
-    // Mono-tenant v0.4.x : tenant fixé à "main" (hardcodé).
-    // Multi-tenant prévu en v0.5.1 — ce hardcode sera remplacé par extraction
-    // depuis le JWT (TrustContext::BearerToken::tenant_id).
-    // Cohérent avec vault_status et vault_write (même pattern v0.4.x).
-    let vault_id = "main".to_string();
-
     if !trust.is_authenticated() {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let locus = format!("{}/main", vault_id);
+
+    // Résolution du vault EFFECTIF depuis le JWT, GATÉE sur `multi_tenant.enabled` —
+    // alignée sur `vault_status_impl` (logic.rs), sibling de lecture own-vault :
+    // - OFF (défaut LIVE) : `"main"` INCHANGÉ (mono-vault, principal == main → byte-identical).
+    // - ON : le vault est le tenant du principal JWT (`effective_tenant`) ; un contexte sans
+    //   tenant (Studio/Mtls) est refusé 403.
+    // Sans ce gate le vault était figé à `"main"` : un tenant ≠ main porteur d'un grant ACL
+    // couvrant `main/*` listait les `forgotten_by` (PII) des notes de main → fuite cross-tenant.
+    let vault_id: String = if state.server_config.multi_tenant.enabled {
+        let Some(principal) = trust.tenant_id() else {
+            return Err(StatusCode::FORBIDDEN);
+        };
+        effective_tenant(&trust, Some(principal))
+            .map_err(|_| StatusCode::FORBIDDEN)?
+            .to_owned()
+    } else {
+        "main".to_owned()
+    };
+
+    let locus = locus_for_tenant(&vault_id);
     if state.acl.evaluate(&trust, AclOp::Read, &locus) != AclDecision::Allow {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -706,7 +819,7 @@ pub async fn vault_forgotten_list(
     let total = match state.search.count_forgotten(&vault_id).await {
         Ok(n) => n,
         Err(e) => {
-            tracing::warn!(error = %e, "vault_forgotten_list: count_forgotten échoué — fallback taille page");
+            tracing::warn!(error = %e, "vault_forgotten_list: count_forgotten failed — fallback to page size");
             notes.len()
         }
     };
@@ -762,13 +875,34 @@ pub async fn vault_unforgot(
     Extension(trust): Extension<TrustContext>,
     Path(ulid_str): Path<String>,
 ) -> Result<Json<UnforgotResponse>, StatusCode> {
-    // Mono-tenant v0.4.x : tenant fixé à "main" (hardcodé).
-    // Multi-tenant prévu en v0.5.1 — même raisonnement que vault_forgotten_list.
-    let vault_id = "main".to_string();
-
     if !trust.is_authenticated() {
         return Err(StatusCode::UNAUTHORIZED);
     }
+
+    // P0 cross-tenant (famille P0-8) : vault dérivé du JWT, GATÉ sur `multi_tenant.enabled`,
+    // avec la MÊME protection write-path que `vault_forget` (dette C1 comblée : `vault_unforgot`
+    // était le SEUL write-path vault sans grant — il n'appliquait que `write_scope_allowed`,
+    // pas `require_write_grant`).
+    // - OFF (défaut LIVE mono-vault) : `"main"` INCHANGÉ, byte-identical. `write_scope_allowed`
+    //   valant toujours vrai à OFF, la garde standalone était un no-op → retirée (aucun
+    //   changement de comportement à OFF).
+    // - ON : `effective_write_vault` = effective_tenant (JWT) + write-scope (EX-C3a-1) +
+    //   `require_write_grant` (EX-C1-2). Le hardcode `"main"` laissait un tenant ≠ main porteur
+    //   d'un grant ACL couvrant `main/*` RESTAURER une note oubliée de `main` (tampering +
+    //   droit à l'oubli défait). Route paramétrique sans body tenant_id : le `body_tenant`
+    //   passé EST le principal JWT (cohérence triviale — `effective_tenant` compare JWT à
+    //   lui-même), la garde effective vient du write-scope + du grant.
+    let vault_id: String = if state.server_config.multi_tenant.enabled {
+        let Some(principal) = trust.tenant_id() else {
+            return Err(StatusCode::FORBIDDEN);
+        };
+        effective_write_vault(&state, &trust, Some(principal))
+            .await
+            .map_err(|r| r.status())?
+    } else {
+        "main".to_owned()
+    };
+
     let locus = format!("{}/main", vault_id);
     if state.acl.evaluate(&trust, AclOp::Write, &locus) != AclDecision::Allow {
         return Err(StatusCode::FORBIDDEN);
@@ -883,5 +1017,61 @@ mod tests {
         };
         let violation = cross_vault_violation(&scope, "main");
         assert_eq!(violation, Some("other"));
+    }
+
+    /// Complétude worker (P0 cross-tenant) : `build_forget_job_record` estampille le vault
+    /// EFFECTIF pour que le worker re-dérive le tenant depuis le job.
+    ///
+    /// RED avant fix : `JobScope::VaultWide` + `Topic{vault:None}` → `spec_tenant` == `"main"`
+    /// (donc `persist_forget` mutait sous `"main"` et le routing file l'attribuait à `"main"`).
+    #[test]
+    fn build_forget_job_record_stamps_effective_vault() {
+        let scope = ForgetScope::Topic {
+            query: "secret".to_string(),
+            vault: None,
+            limit: None,
+        };
+        let record = build_forget_job_record(scope, vec![], None, "vault-b");
+
+        // 1. JobScope porte le vault effectif → worker `resolve_job_vault` rend le tenant
+        //    (namespace de `persist_forget`), plus jamais `"main"` via `VaultWide`.
+        match &record.spec.scope {
+            JobScope::Vault(v) => assert_eq!(v, "vault-b", "JobScope doit porter le tenant"),
+            other => panic!("attendu JobScope::Vault, obtenu {other:?}"),
+        }
+        // 2. Tenant estampillé dans la file (routing per-vault ON) = vault effectif, pas 'main'.
+        assert_eq!(
+            gradatum_core::spec_tenant(&record.spec),
+            "vault-b",
+            "un Forget::Topic{{vault:None}} d'un tenant ≠ main ne doit PAS retomber sur 'main'"
+        );
+        // 3. Le scope Topic a été normalisé (vault renseigné) → worker résout ses candidats
+        //    dans le bon vault.
+        match &record.spec.kind {
+            Job::Forget(f) => match &f.scope {
+                ForgetScope::Topic { vault, .. } => {
+                    assert_eq!(vault.as_deref(), Some("vault-b"));
+                }
+                other => panic!("scope Forget inattendu : {other:?}"),
+            },
+            other => panic!("kind inattendu : {other:?}"),
+        }
+    }
+
+    /// Parité OFF (mono-vault) : un job `main` reste estampillé `"main"` (byte-identical —
+    /// `resolve_job_vault(Vault("main")) == "main"`, `spec_tenant == "main"`).
+    #[test]
+    fn build_forget_job_record_main_is_byte_identical_off() {
+        let scope = ForgetScope::Topic {
+            query: "x".to_string(),
+            vault: None,
+            limit: None,
+        };
+        let record = build_forget_job_record(scope, vec![], None, "main");
+        match &record.spec.scope {
+            JobScope::Vault(v) => assert_eq!(v, "main"),
+            other => panic!("attendu JobScope::Vault(main), obtenu {other:?}"),
+        }
+        assert_eq!(gradatum_core::spec_tenant(&record.spec), "main");
     }
 }

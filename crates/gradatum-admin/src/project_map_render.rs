@@ -11,14 +11,15 @@
 //! There is no push-on-write: the view is produced by this explicit command, not
 //! coupled to the write path.
 //!
-//! ## Algorithme (lecture du graphe `note_links`)
+//! ## Algorithm, reading the `note_links` graph
 //!
-//! 1. `backlinks("project:<p>")` → cartes du projet.
-//! 2. pour chaque carte : `trace_lineage(carte).children` → ses arêtes sortantes
-//!    typées (`status:X`, `version:p/v`).
-//! 3. ne garder que les cartes au statut ∈ {OPEN, IN_PROGRESS, BLOCKED}.
-//! 4. `get_titles_sections` (batch, anti-N+1) → titres.
-//! 5. `render_todo_markdown` → markdown groupé par version + marqueur généré.
+//! 1. `backlinks("project:<p>")` yields the cards of the project.
+//! 2. For each card, `trace_lineage(card).children` yields its outgoing typed edges,
+//!    such as `status:X` and `version:project/version`.
+//! 3. Keep only the cards whose status is `OPEN`, `IN_PROGRESS` or `BLOCKED`.
+//! 4. `get_titles_sections` fetches all titles in one batch, avoiding a query per card.
+//! 5. [`crate::project_map_render::render_todo_markdown`] groups the result by version
+//!    and prepends the generated-file marker.
 
 use std::collections::BTreeMap;
 
@@ -30,7 +31,7 @@ use gradatum_index::SqliteIndex;
 /// Header marker written at the top of every generated `TODO.md` file.
 ///
 /// Signals that the file is machine-generated and must not be edited by hand.
-pub const GENERATED_MARKER: &str = "<!-- généré project-map, ne pas éditer à la main -->";
+pub const GENERATED_MARKER: &str = "<!-- generated project-map, do not edit by hand -->";
 
 /// Work statuses that appear in the generated `TODO.md` backlog.
 ///
@@ -42,23 +43,26 @@ const OPEN_STATUSES: [StatusKind; 3] = [
     StatusKind::Blocked,
 ];
 
-/// Une unité de travail ouverte d'un projet, projetée pour le rendu `TODO.md`.
+/// One open work item of a project, projected for the `TODO.md` rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkItem {
-    /// Titre humain de la carte (H1), ou son ULID en repli.
+    /// Human-readable card title taken from its H1, falling back to its ULID.
     pub title: String,
     /// Work status. Only `OPEN`, `IN_PROGRESS`, and `BLOCKED` appear in the view.
     pub status: StatusKind,
-    /// Version cible namespacée `projet/x.y.z`, ou `None` si non attribuée.
+    /// Namespaced target version, shaped as `project/x.y.z`, or `None` when unassigned.
     pub version: Option<String>,
 }
 
-/// Extrait le work-status et la version d'une carte depuis ses arêtes sortantes.
+/// Extracts the work status and the target version of a card from its outgoing edges.
 ///
-/// `children` = `dst_note_id` bruts (`trace_lineage(carte).children`) : nœuds
-/// réservés (`status:DONE`, `version:gradatum/0.6.1`) et dépendances/annexes.
-/// On reparse via [`gradatum_core::project_map::parse_link`] (SSOT) pour isoler
-/// le statut et la version. Retourne `(status, version)` si un statut est trouvé.
+/// `children` holds the raw destination identifiers returned by `trace_lineage`, mixing
+/// reserved nodes such as `status:DONE` or `version:gradatum/0.6.1` with ordinary
+/// dependencies. Each one is re-parsed through
+/// [`gradatum_core::project_map::parse_link`] — the single parser shared across the
+/// codebase — to single out the status and the version.
+///
+/// Returns `None` when no status edge is present.
 #[must_use]
 pub fn work_status_from_children(children: &[String]) -> Option<(StatusKind, Option<String>)> {
     let mut status: Option<StatusKind> = None;
@@ -82,9 +86,9 @@ pub fn work_status_from_children(children: &[String]) -> Option<(StatusKind, Opt
 
 /// Renders the `TODO.md` of a project from its open work items (pure function).
 ///
-/// Filters to open statuses (`OPEN`/`IN_PROGRESS`/`BLOCKED`), groups by version
-/// (`None` = "Non attribué" section, rendered last), sorts deterministically, and
-/// prepends the generated-file marker. This is a **pure function** (no I/O) —
+/// Filters to open statuses (`OPEN`/`IN_PROGRESS`/`BLOCKED`), groups by version — items
+/// with no version land in an `Unassigned` section rendered last — sorts deterministically,
+/// and prepends the generated-file marker. This is a **pure function** (no I/O),
 /// testable in isolation.
 ///
 /// Sort order is deterministic: versions in ascending lexicographic order via
@@ -108,7 +112,7 @@ pub fn render_todo_markdown(project: &str, items: &[WorkItem]) -> String {
     out.push_str(&format!("# TODO — {project}\n\n"));
 
     if by_version.is_empty() {
-        out.push_str("_Aucun item ouvert._\n");
+        out.push_str("_No open item._\n");
         return out;
     }
 
@@ -126,7 +130,7 @@ pub fn render_todo_markdown(project: &str, items: &[WorkItem]) -> String {
     for (version, group) in groups {
         let heading = match version {
             Some(v) => format!("## {v}"),
-            None => "## Non attribué".to_string(),
+            None => "## Unassigned".to_string(),
         };
         out.push_str(&heading);
         out.push('\n');
@@ -151,7 +155,7 @@ pub fn render_todo_markdown(project: &str, items: &[WorkItem]) -> String {
 ///
 /// # Errors
 ///
-/// Retourne une erreur si l'index est introuvable ou si une requête graphe échoue.
+/// Returns an error if the index cannot be found or if a graph query fails.
 pub async fn render_project_map(
     root: &std::path::Path,
     vault_id: &str,
@@ -160,13 +164,13 @@ pub async fn render_project_map(
     let db_path = vault_index_path(root);
     if !db_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le server doit avoir démarré au moins une fois",
+            "index.db not found: {} — the server must have started at least once",
             db_path.display()
         );
     }
     let index = SqliteIndex::open(&db_path)
         .await
-        .context("ouverture index.db pour project-map render")?;
+        .context("opening index.db for project-map render")?;
 
     render_from_index(&index, vault_id, project).await
 }
@@ -247,7 +251,7 @@ mod tests {
         let md = render_todo_markdown("gradatum", &[]);
         assert!(md.starts_with(GENERATED_MARKER), "marqueur généré en tête");
         assert!(md.contains("# TODO — gradatum"));
-        assert!(md.contains("_Aucun item ouvert._"));
+        assert!(md.contains("_No open item._"));
     }
 
     #[test]
@@ -292,11 +296,11 @@ mod tests {
         assert!(md.contains("## gradatum/0.6.1"));
         assert!(md.contains("- [IN_PROGRESS] Feature B"));
         // Groupe non attribué en dernier.
-        assert!(md.contains("## Non attribué"));
+        assert!(md.contains("## Unassigned"));
         assert!(md.contains("- [OPEN] Tâche C"));
         // Ordre : la section versionnée précède « Non attribué ».
         let pos_ver = md.find("## gradatum/0.6.1").unwrap();
-        let pos_none = md.find("## Non attribué").unwrap();
+        let pos_none = md.find("## Unassigned").unwrap();
         assert!(pos_ver < pos_none, "versions attribuées avant non-attribué");
     }
 

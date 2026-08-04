@@ -146,7 +146,7 @@ async fn seed_target_note(fixture: &helpers::DispatcherFixture, title: &str, bod
         .expect("vault.write_note seed cible");
     fixture
         .index
-        .upsert_note_title(&note.id, title)
+        .upsert_note_title(note.frontmatter.vault_id.as_str(), &note.id, title)
         .await
         .expect("upsert_note_title seed cible");
     note.id.to_string()

@@ -50,15 +50,23 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
 };
-use gradatum_acl_policy::{AclDecision, AclOp};
 use gradatum_core::project_map::{ExportOptions, FeatureEntry, project_map_feature_entries};
+use gradatum_core::scope::VaultId;
 use gradatum_core::trust::TrustContext;
 use serde::Deserialize;
 
 use crate::state::AppState;
 
-/// Tenant unique (mono-vault v0.4.x).
-const TENANT: &str = "main";
+/// Vault namespace ciblé par ce handler (dimension NAMESPACE, distincte du
+/// principal `TenantId`).
+///
+/// Déploiement single-vault : toujours `main`. Point de résolution **typé**
+/// remplaçant l'ancien `const TENANT: &str` — en multi-vault (Groupe B) il deviendra
+/// un routage par registre.
+#[must_use]
+pub fn target_vault() -> VaultId {
+    VaultId::new("main")
+}
 
 /// Section cible pour l'export project-map.
 const SECTION: &str = "project-map";
@@ -125,16 +133,16 @@ pub async fn export_features(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // ── ACL : lecture sur la section project-map ──────────────────────────────
-    let acl_locus = format!("{TENANT}/{SECTION}");
-    if state.acl.evaluate(&trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    // ── T9 (A3-handlers) : OFF = ACL Read legacy sur `main/project-map` (byte-identical) ;
+    //    ON = vault effectif du principal JWT (ACL cible + grant read + statut actif). ──
+    let vault =
+        crate::api_v1::tenant_guard::resolve_read_vault(&state, &trust, target_vault(), SECTION)
+            .await?;
 
     // V-01 : audit-trail léger post-ACL (aucune valeur sensible dans le log).
     tracing::debug!(
         include_dropped = params.include_dropped,
-        "export_features: accès accordé"
+        "export_features: access granted"
     );
 
     // ── Récupération paginée de toutes les notes project-map ─────────────────
@@ -154,15 +162,15 @@ pub async fn export_features(
                 max_pages = MAX_PAGES,
                 collected = all_records.len(),
                 section = SECTION,
-                "export_features: MAX_PAGES atteint — section project-map anormalement volumineuse. \
-                 Export partiel retourné."
+                "export_features: MAX_PAGES reached — abnormally large project-map section. \
+                 Partial export returned."
             );
             break;
         }
 
         let (records, total) = state
             .search
-            .list_notes(TENANT, Some(SECTION), PAGE_SIZE, cursor.as_deref())
+            .list_notes(vault.as_str(), Some(SECTION), PAGE_SIZE, cursor.as_deref())
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -195,7 +203,7 @@ pub async fn export_features(
         section = SECTION,
         pages = pages_fetched,
         raw_count = all_records.len(),
-        "export_features: récupération terminée"
+        "export_features: retrieval complete"
     );
 
     // ── C2 : filtre garbage (parité CLI admin) ────────────────────────────────
@@ -219,4 +227,41 @@ pub async fn export_features(
     let entries = project_map_feature_entries(&notes, opts);
 
     Ok(Json(entries))
+}
+
+/// `POST /api/v1/project-map/create-feature`
+///
+/// Crée une carte-feature project-map dont le **numéro est choisi par le serveur**. Le corps
+/// de requête est un [`crate::api_v1::dto::CreateFeatureCardRequest`] (titre + corps SANS
+/// rôle `[[feature:…]]` + les 5 autres rôles). Réponse `200` :
+/// `{ "feature": "F-135", "number": 135, "job_id", "note_id", "poll_url" }` — l'écriture est
+/// asynchrone, confirmer via `job_status`.
+///
+/// Thin wrapper — délègue à [`crate::api_v1::logic::create_feature_card_impl`], qui porte
+/// l'ACL (Bearer JWT `Write` sur `{tenant}/main`), l'allocation atomique et l'enqueue.
+///
+/// # Errors
+///
+/// - `400 Bad Request` : corps portant déjà un `[[feature:…]]`, ou carte incomplète.
+/// - `401 Unauthorized` : requête non authentifiée.
+/// - `403 Forbidden` : ACL Write refusée / cross-tenant.
+/// - `409 Conflict` / `500 Internal Server Error` : échec allocation ou enqueue.
+pub async fn create_feature(
+    State(state): State<AppState>,
+    Extension(trust): Extension<TrustContext>,
+    axum::extract::Json(req): axum::extract::Json<crate::api_v1::dto::CreateFeatureCardRequest>,
+) -> Result<
+    (
+        StatusCode,
+        Json<crate::api_v1::dto::CreateFeatureCardResponse>,
+    ),
+    StatusCode,
+> {
+    let request_id = ulid::Ulid::new().to_string();
+    crate::api_v1::logic::create_feature_card_impl(&state, &trust, req, &request_id)
+        .await
+        // 202 Accepted : le numéro est attribué, l'écriture de la carte est asynchrone
+        // (poll via `poll_url` / `job_status`).
+        .map(|resp| (StatusCode::ACCEPTED, Json(resp)))
+        .map_err(|e| crate::api_v1::logic::err_to_status(&e))
 }

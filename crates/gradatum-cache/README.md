@@ -2,7 +2,7 @@
 
 > Moka LRU in-process cache with checksum validation on hit.
 
-**Status**: 0.7.6 — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -21,7 +21,7 @@ This approach avoids stale reads without requiring write-through coordination.
 
 ```toml
 [dependencies]
-gradatum-cache = "0.7.6"
+gradatum-cache = "1.0.0"
 ```
 
 ```rust
@@ -29,13 +29,14 @@ use gradatum_cache::{EffectiveNoteCache, EffectiveNoteCacheConfig};
 
 let cache = EffectiveNoteCache::new(EffectiveNoteCacheConfig {
     max_capacity: 1_000,
-    ttl_secs: 300,
+    time_to_live: Duration::from_secs(300),
+    time_to_idle: Duration::from_secs(60),
 });
 
-let note = cache.get(&key, |k| async move {
+let note = cache.get(key, |note_id| async move {
     // return current ContentHash from SQLite
-    db.fetch_hash(k).await
-}).await;
+    db.fetch_hash(note_id).await
+}).await?;
 ```
 
 ## License

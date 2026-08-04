@@ -1,0 +1,24 @@
+pub mod gradatum_acl_policy
+#[non_exhaustive] pub enum gradatum_acl_policy::AclDecision
+pub gradatum_acl_policy::AclDecision::Allow
+pub gradatum_acl_policy::AclDecision::DenyExplicit
+pub gradatum_acl_policy::AclDecision::DenyImplicit
+pub enum gradatum_acl_policy::AclError
+pub gradatum_acl_policy::AclError::Glob(globset::Error)
+pub gradatum_acl_policy::AclError::Toml(toml::de::error::Error)
+#[non_exhaustive] pub enum gradatum_acl_policy::AclOp
+pub gradatum_acl_policy::AclOp::Read
+pub gradatum_acl_policy::AclOp::Write
+pub struct gradatum_acl_policy::AclEngine
+impl gradatum_acl_policy::AclEngine
+pub fn gradatum_acl_policy::AclEngine::evaluate(&self, &gradatum_core::trust::TrustContext, gradatum_acl_policy::AclOp, &str) -> gradatum_acl_policy::AclDecision
+pub fn gradatum_acl_policy::AclEngine::from_preset_str(&str) -> core::result::Result<Self, gradatum_acl_policy::AclError>
+pub fn gradatum_acl_policy::AclEngine::has_identity(&self, &gradatum_core::scope::AgentId) -> bool
+pub struct gradatum_acl_policy::AclPreset
+pub gradatum_acl_policy::AclPreset::consumer: alloc::vec::Vec<gradatum_acl_policy::ConsumerEntry>
+pub struct gradatum_acl_policy::ConsumerEntry
+pub gradatum_acl_policy::ConsumerEntry::identity: alloc::string::String
+pub gradatum_acl_policy::ConsumerEntry::read_patterns: alloc::vec::Vec<alloc::string::String>
+pub gradatum_acl_policy::ConsumerEntry::sees_personal_classified: bool
+pub gradatum_acl_policy::ConsumerEntry::write_patterns: alloc::vec::Vec<alloc::string::String>
+pub const gradatum_acl_policy::VERSION: &str

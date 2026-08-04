@@ -356,7 +356,7 @@ async fn patch_note_replaced_by_persisted() {
 
     // Vérification directe en DB — replaced_by doit être persisté.
     let stored = idx
-        .get_replaced_by(&note_id)
+        .get_replaced_by("main", &note_id)
         .await
         .expect("get_replaced_by — invariant test");
     assert_eq!(
@@ -382,7 +382,7 @@ async fn patch_note_replaced_by_persisted() {
         "second PATCH replaced_by doit retourner 204"
     );
     let stored2 = idx
-        .get_replaced_by(&note_id)
+        .get_replaced_by("main", &note_id)
         .await
         .expect("get_replaced_by second — invariant test");
     assert_eq!(

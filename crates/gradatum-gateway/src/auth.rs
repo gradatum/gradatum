@@ -136,6 +136,7 @@ mod tests {
             gateway: HashMap::new(),
             vault_aware: Default::default(),
             messages: Default::default(),
+            router: Default::default(),
         };
 
         let mut state = AppState::for_test(config);
@@ -176,6 +177,7 @@ mod tests {
             gateway: HashMap::new(),
             vault_aware: Default::default(),
             messages: Default::default(),
+            router: Default::default(),
         };
 
         let mut state = AppState::for_test(config);
@@ -371,6 +373,7 @@ mod tests {
                 gateway: HashMap::new(),
                 vault_aware: Default::default(),
                 messages: Default::default(),
+                router: Default::default(),
             };
             AppState::for_test(config)
         };

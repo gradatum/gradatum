@@ -9,6 +9,11 @@ Type=simple
 User=gradatum
 Group=gradatum
 EnvironmentFile=/etc/gradatum/engine-secrets.env
+# Port-race fix (A1b, incident 2026-07-08 20:47) : ExecStopPost du run précédent
+# (`fuser -k <child_port>`) peut ne pas avoir libéré child_port avant que ce
+# ExecStart tente de bind — llama-server échoue alors au bind et exit
+# immédiatement. Attend explicitement la libération plutôt que de l'espérer.
+ExecStartPre=/opt/gradatum/bin/wait-for-port-free.sh /etc/gradatum/conf.d/70-engine-%i.toml
 ExecStart=/opt/gradatum/bin/gradatum-engine /etc/gradatum/conf.d/70-engine-%i.toml
 Restart=on-failure
 RestartSec=10s

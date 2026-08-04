@@ -2,15 +2,16 @@
 
 > MCP stdio adapter — forwards MCP tool calls to the gradatum-server HTTP API.
 
-**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
 
 `gradatum-mcp-stub` is a thin stdio process that bridges MCP hosts (Claude Code,
 Claude Desktop, Continue.dev, etc.) to a running `gradatum-server` instance. Each MCP
-tool call is serialized to JSON and forwarded as an HTTP POST to the corresponding REST
-endpoint; the response is passed back to the host.
+tool call is serialized to JSON and forwarded to the corresponding REST endpoint (POST for
+most tools; GET for `vault_status`, `vault_authors`, `vault_tags` and `vault_lessons_recall`);
+the response is passed back to the host.
 
 Supports auto-refresh authentication: when configured with an API key file, the stub
 exchanges the key for a JWT at startup and renews it transparently before expiry.
@@ -41,17 +42,24 @@ Configure in your MCP host:
 | `GRADATUM_API_KEY_FILE` | — | Path to a chmod-600 file containing `ak_xxx` (preferred) |
 | `GRADATUM_BEARER_TOKEN` | — | Static JWT (fallback if `GRADATUM_API_KEY_FILE` is absent) |
 
-## MCP Tools Exposed (23 tools)
+## MCP Tools Exposed
 
 | Category | Tools |
 |---|---|
-| Read (11) | `vault_search`, `vault_read`, `vault_list`, `vault_status`, `vault_graph`, `vault_links`, `vault_trace`, `vault_context`, `vault_timeline`, `vault_authors`, `vault_tags` |
-| Write (3) | `vault_write`, `vault_classify`, `vault_downgrade` |
-| History (4) | `vault_history`, `vault_history_get`, `vault_restore`, `vault_diff` |
-| Forget (1) | `vault_forget` |
-| Lessons Recall (1) | `vault_lessons_recall` |
-| Code Scope (1) | `code_scope` |
-| Proactive Recall (2) | `vault_proactive_recall`, `vault_proactive_recall_feedback` |
+| Read | `vault_search`, `vault_read`, `vault_list`, `vault_status`, `vault_graph`, `vault_links`, `vault_trace`, `vault_context`, `vault_timeline`, `vault_authors`, `vault_tags` |
+| Write | `vault_write`, `create_feature_card`, `vault_classify`, `vault_downgrade` |
+| History | `vault_history`, `vault_history_get`, `vault_restore`, `vault_diff` |
+| Archives | `vault_archives_list` |
+| Forget | `vault_forget` |
+| Lessons Recall | `vault_lessons_recall` |
+| Code Scope | `code_scope` |
+| Proactive Recall | `vault_proactive_recall`, `vault_proactive_recall_feedback` |
+
+The table above is a guide to the categories, not a contract. The stub proxies the
+tools it declares at `tools/list`; that response is authoritative for a given build,
+and it is not necessarily identical to the `tools/list` of the `gradatum-server` it
+forwards to. To know what a running pair actually exposes, call `tools/list` on each —
+do not rely on any count or list written here.
 
 ## License
 

@@ -46,7 +46,7 @@ impl FromSql for JobStatus {
             "done" => Ok(Self::Done),
             "failed" => Ok(Self::Failed),
             other => Err(FromSqlError::Other(
-                format!("valeur JobStatus inconnue : {other}").into(),
+                format!("unknown JobStatus value: {other}").into(),
             )),
         }
     }

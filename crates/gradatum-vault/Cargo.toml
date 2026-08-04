@@ -7,6 +7,13 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Multi-vault registry + lifecycle (create/list/swap/delete) + forward-compat"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Ne jamais empaqueter les tests d'intégration : ils ne compilent pas chez le
+# consommateur, alourdissent le package et sont un vecteur récurrent de fuite
+# (marqueurs PII/fixtures). Cf. bloquant publish v1.0.0.
+exclude = ["tests/**"]
 
 [dependencies]
 gradatum-core.workspace = true

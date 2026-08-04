@@ -76,23 +76,36 @@ impl InternalClient for NeverCalledClient {
         panic!("NeverCalledClient::persist_distill should not be called in this test")
     }
 
-    async fn delete_note(&self, _ulid: &str) -> Result<(), InternalClientError> {
+    async fn delete_note(&self, _vault_id: &str, _ulid: &str) -> Result<(), InternalClientError> {
         panic!("NeverCalledClient::delete_note should not be called in this test")
     }
 
-    async fn get_note(&self, _ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+    async fn get_note(
+        &self,
+        _vault_id: &str,
+        _ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError> {
         panic!("NeverCalledClient::get_note should not be called in this test")
+    }
+
+    async fn get_note_status(
+        &self,
+        _vault_id: &str,
+        _ulid: &str,
+    ) -> Result<Option<String>, InternalClientError> {
+        panic!("NeverCalledClient::get_note_status should not be called in this test")
     }
 
     async fn get_note_embedding(
         &self,
+        _vault_id: &str,
         _ulid: &str,
         _embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
         panic!("NeverCalledClient::get_note_embedding should not be called in this test")
     }
 
-    async fn get_trust(&self, _ulid: &str) -> Result<f32, InternalClientError> {
+    async fn get_trust(&self, _vault_id: &str, _ulid: &str) -> Result<f32, InternalClientError> {
         panic!("NeverCalledClient::get_trust should not be called in this test")
     }
 

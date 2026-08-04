@@ -120,7 +120,7 @@ fn override_author_override_applies() {
     use gradatum_core::author::AuthorRef;
 
     let base = build_minimal_frontmatter(); // author = None
-    let new_author = AuthorRef::human("steph@test.com");
+    let new_author = AuthorRef::human("test-author@example.com");
 
     let patch = FrontmatterPatch {
         author_override: Some(new_author.clone()),

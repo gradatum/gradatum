@@ -8,7 +8,8 @@
 //! - `NoteBody`: raw Markdown content.
 //! - `NoteVersion`: monotonic counter (incremented by the worker on every write).
 //! - `ContentHash`: JCS SHA-256 of (frontmatter + body) — drift detection.
-//! - `IntegritySignature`: always `None` without an auth layer. HMAC/Ed25519 available via `gradatum-acl-auth`.
+//! - `IntegritySignature`: always `None` — the type is never constructed anywhere in the
+//!   workspace, and no HMAC/Ed25519 implementation exists to produce one.
 //!
 //! ## EffectiveNote
 //!
@@ -67,9 +68,11 @@ impl Note {
     /// wants to assert a `Note` is internally consistent before reading its body
     /// or trusting its frontmatter.
     ///
-    /// Detects accidental drift (accidental edit). Tamper-proof
-    /// verification via [`IntegritySignature`] (HMAC-SHA256 / Ed25519)
-    /// is available in `gradatum-acl-auth`.
+    /// Detects accidental drift (accidental edit) **only** — it is not a defence against
+    /// tampering: an attacker who edits the body can recompute the hash. There is no
+    /// tamper-proof verification available anywhere in the workspace today:
+    /// [`IntegritySignature`] is declared but never constructed, and `gradatum-acl-auth`
+    /// contains no HMAC or Ed25519 code.
     ///
     /// # Errors
     ///

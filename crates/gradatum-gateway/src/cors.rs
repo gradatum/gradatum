@@ -46,9 +46,7 @@ pub fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
         .collect();
 
     if origins.is_empty() {
-        tracing::warn!(
-            "allowed_origins non vide mais aucune origine valide parsée — CORS désactivé"
-        );
+        tracing::warn!("allowed_origins non-empty but no valid origin parsed — CORS disabled");
         return None;
     }
 

@@ -146,7 +146,7 @@ fn sort_candidates_by_score_then_ulid(scored: &mut [(Candidate, f64)]) {
 // câblent la feature complète, reconsidérer un refactor en builder si ≥3 paramètres ajoutés.
 #[expect(
     clippy::too_many_arguments,
-    reason = "stub_budget est orthogonal aux 7 autres params existants — wrapper YAGNI pré-Tasks 3-7"
+    reason = "stub_budget is orthogonal to the 7 other existing params — YAGNI wrapper pre-Tasks 3-7"
 )]
 pub async fn select_budget_aware(
     state: &AppState,
@@ -171,13 +171,16 @@ pub async fn select_budget_aware(
     let candidate_ids: Vec<String> = candidates.iter().map(|c| c.note_id.clone()).collect();
     let anchor_ms_map = state
         .search
-        .get_anchor_ms_batch(tenant, &candidate_ids)
+        .get_anchor_ms_batch(
+            &crate::api_v1::tenant_guard::own_vault_checked(tenant),
+            &candidate_ids,
+        )
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(
                 err = %e,
                 count = candidate_ids.len(),
-                "select_budget_aware: get_anchor_ms_batch failed — fallback created_ms pour recency"
+                "select_budget_aware: get_anchor_ms_batch failed — fallback created_ms for recency"
             );
             std::collections::HashMap::new()
         });
@@ -194,7 +197,7 @@ pub async fn select_budget_aware(
                 tracing::warn!(
                     err = %e,
                     note_id = %c.note_id,
-                    "select_budget_aware: get_note_created_and_indegree failed, note ignorée"
+                    "select_budget_aware: get_note_created_and_indegree failed, note skipped"
                 );
                 continue;
             }
@@ -250,6 +253,11 @@ pub async fn select_budget_aware(
             break 'phase_inline;
         }
 
+        // Task 14 (W3, iso-audit) : `get_note` est déjà scopé PAR ARGUMENT sur le vault
+        // (`tenant`), pas le singleton — aucun split-brain read-back ici. `vault_context` est
+        // own-vault (pas de `vault_id` dans la requête ⇒ cible == vault propre de l'appelant),
+        // donc `tenant` (principal) EST le namespace vault cible — dimensions confondues mais
+        // égales. Rien à router ; désambiguïsation typée = refacto `get_note` séparé.
         match state.search.get_note(tenant, &c.note_id).await {
             Ok(Some(record)) => {
                 let tokens = estimator.estimate(&record.body_text);
@@ -282,14 +290,14 @@ pub async fn select_budget_aware(
             Ok(None) => {
                 tracing::debug!(
                     note_id = %c.note_id,
-                    "select_budget_aware: note absente (inline), ignorée"
+                    "select_budget_aware: note missing (inline), skipped"
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     err = %e,
                     note_id = %c.note_id,
-                    "select_budget_aware: get_note failed (inline), ignorée"
+                    "select_budget_aware: get_note failed (inline), skipped"
                 );
             }
         }
@@ -313,6 +321,8 @@ pub async fn select_budget_aware(
             break;
         }
 
+        // Task 14 (W3, iso-audit) : idem phase inline — `get_note` scopé par argument sur le
+        // vault own (`tenant`), pas de split-brain singleton à router.
         match state.search.get_note(tenant, &c.note_id).await {
             Ok(Some(record)) => {
                 let date = DateTime::<Utc>::from_timestamp_millis(record.created)
@@ -344,14 +354,14 @@ pub async fn select_budget_aware(
             Ok(None) => {
                 tracing::debug!(
                     note_id = %c.note_id,
-                    "select_budget_aware: note absente (stub), ignorée"
+                    "select_budget_aware: note missing (stub), skipped"
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     err = %e,
                     note_id = %c.note_id,
-                    "select_budget_aware: get_note failed (stub), ignorée"
+                    "select_budget_aware: get_note failed (stub), skipped"
                 );
             }
         }

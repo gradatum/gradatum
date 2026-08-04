@@ -71,14 +71,14 @@ impl fmt::Debug for SecretBytes {
 #[derive(Debug, thiserror::Error)]
 pub enum SecretsError {
     /// Key absent (file or env variable does not exist).
-    #[error("secret '{key}' introuvable")]
+    #[error("secret '{key}' not found")]
     NotFound {
         /// Name of the requested key.
         key: String,
     },
 
     /// I/O error while reading the secret.
-    #[error("erreur I/O lors de la lecture du secret '{key}': {source}")]
+    #[error("I/O error reading secret '{key}': {source}")]
     Io {
         /// Name of the affected key.
         key: String,
@@ -92,8 +92,8 @@ pub enum SecretsError {
     /// A secret file with group/world read/write/execute is refused
     /// to prevent secret leakage via concurrent access or shell history.
     #[error(
-        "permissions trop ouvertes sur le fichier secret '{key}' \
-        (attendu: mode ≤ 0o600, trouvé: 0o{mode:04o})"
+        "secret file '{key}' has permissions too open \
+        (expected: mode ≤ 0o600, found: 0o{mode:04o})"
     )]
     Permissions {
         /// Name of the affected key.
@@ -104,7 +104,7 @@ pub enum SecretsError {
 
     /// Unsupported operation for this provider, or invalid key
     /// (contains `/`, `..`, or is empty — path-traversal guard).
-    #[error("opération non supportée ou clé invalide pour ce SecretsProvider: {operation}")]
+    #[error("unsupported operation or invalid key for this SecretsProvider: {operation}")]
     Unsupported {
         /// Operation name or description of the problem.
         operation: String,
@@ -161,10 +161,7 @@ impl SecretsProvider for EnvSecretsProvider {
             }),
             Err(env::VarError::NotUnicode(_)) => Err(SecretsError::Io {
                 key: key.to_string(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "valeur de variable d'env non-UTF-8",
-                ),
+                source: io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 env variable value"),
             }),
         }
     }
@@ -206,21 +203,21 @@ impl FileSecretsProvider {
     pub(crate) fn validate_key(key: &str) -> Result<(), SecretsError> {
         if key.is_empty() {
             return Err(SecretsError::Unsupported {
-                operation: "clé vide — la clé ne peut pas être une chaîne vide".to_string(),
+                operation: "empty key — the key cannot be an empty string".to_string(),
             });
         }
         // Refuser tout slash : la clé doit être un nom de fichier plat, pas un chemin.
         if key.contains('/') {
             return Err(SecretsError::Unsupported {
                 operation: format!(
-                    "clé '{key}' invalide — les slashes '/' sont interdits (path traversal)"
+                    "invalid key '{key}' — slashes '/' are forbidden (path traversal)"
                 ),
             });
         }
         // Refuser les composants de remontée de répertoire.
         if key.split('/').any(|c| c == "..") || key == ".." {
             return Err(SecretsError::Unsupported {
-                operation: format!("clé '{key}' invalide — '..' est interdit (path traversal)"),
+                operation: format!("invalid key '{key}' — '..' is forbidden (path traversal)"),
             });
         }
         Ok(())

@@ -1,0 +1,2 @@
+pub mod gradatum_sdk_rs
+pub const gradatum_sdk_rs::VERSION: &str

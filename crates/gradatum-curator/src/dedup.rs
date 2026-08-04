@@ -1,7 +1,11 @@
 //! Semantic deduplication — cosine similarity ≥ 0.95 over embeddings.
 //!
-//! Applied at the end of the cascade to detect notes whose semantic content
-//! is too close to a note already present in the vault.
+//! Detects notes whose semantic content is too close to a note already present
+//! in the vault. This module is **provided but not wired into
+//! [`CuratorPipeline`]'s `process` in 1.0.0** (planned post-1.0); the pipeline
+//! currently emits the default `dedup = Unique` verdict for every note.
+//!
+//! [`CuratorPipeline`]: crate::CuratorPipeline
 //!
 //! Embeddings are provided as input (computed by `gradatum-embed` — bge-small-en-v1.5,
 //! 384 dimensions). This module does not load any model.

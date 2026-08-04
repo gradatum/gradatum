@@ -21,6 +21,20 @@
 //! `rusqlite::Connection` n'est ni `Send` ni `Sync` → enveloppé dans
 //! `Arc<tokio::sync::Mutex<Connection>>`. Les verrous sont tenus au minimum.
 //! Les opérations bloquantes s'exécutent dans `tokio::task::spawn_blocking`.
+//!
+//! ## Dimension de scope — per-PRINCIPAL (`TenantId`)
+//!
+//! `proactive_surface` stocke **un rang par principal** (PK `tenant_id`) : la surface
+//! proactive pré-calculée est une donnée **du principal** (dérivée via `effective_tenant`
+//! côté refresh/handler), PAS du namespace vault. La dimension est le **principal**
+//! ([`gradatum_core::scope::TenantId`]) → ce store n'est **pas** une surface d'isolation vault.
+//!
+//! **Typage `&str`-facing** : `upsert_surface` et `get_surface` sont toutes deux
+//! consommées par des fichiers (`proactive_recall/mod.rs` +
+//! `api_v1/proactive_recall_handlers.rs`) qui tiennent un `&str`/`String` (issu
+//! de `effective_tenant`) : les typer ici casserait leur compilation. Elles restent
+//! `&str`-facing ; l'isolation per-principal est déjà garantie par la PK `tenant_id`
+//! (test `distinct_tenants_are_isolated`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -40,7 +54,7 @@ pub enum ProactiveSurfaceError {
     #[error("proactive_surface JSON : {0}")]
     Json(#[from] serde_json::Error),
     /// Le thread bloquant a échoué (panic ou annulation) — impossible en pratique.
-    #[error("proactive_surface thread blocking échoué")]
+    #[error("proactive_surface blocking thread failed")]
     Blocking,
 }
 

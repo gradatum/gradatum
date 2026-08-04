@@ -74,9 +74,11 @@ fn insert_note(conn: &rusqlite::Connection, note_id: &str, vault_id: &str, body_
 fn insert_embedding(conn: &rusqlite::Connection, note_id: &str, embedder_id: &str) {
     // vector : 4 octets (f32 = 0.0), dim = 1
     let vector = 0f32.to_le_bytes().to_vec();
+    // C4-1e (migration 0033) : `vault_id` NOT NULL — résolu depuis la note parente
+    // (insérée au préalable via `insert_note`), cohérent avec le contrat mono-vault du test.
     conn.execute(
-        "INSERT INTO note_embeddings (note_id, embedder_id, vector, dim, model_version, computed_at)
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+        "INSERT INTO note_embeddings (note_id, embedder_id, vector, dim, model_version, computed_at, vault_id)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, (SELECT vault_id FROM notes WHERE id = ?1))",
         rusqlite::params![
             note_id,
             embedder_id,

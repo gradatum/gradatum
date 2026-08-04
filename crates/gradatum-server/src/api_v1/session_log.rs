@@ -88,18 +88,28 @@ pub async fn post_session_trace(
     // 2. C-SA1 : agent_id = JWT sub (destructuring), tenant_id = JWT — jamais du body.
     //    Seul BearerToken porte `sub`/`tenant_id` → mTLS/Studio refusés (401).
     let (agent_id, tenant_id) = match &trust {
-        TrustContext::BearerToken { sub, tenant_id, .. } => (sub.clone(), tenant_id.clone()),
+        // Frontière : `tenant_id` typé `TenantId` (Task 3) ; comparé au `req.tenant_id`
+        // (String, DTO) et passé à `insert_trace(&str)` — `.as_str().to_owned()` byte-identical.
+        TrustContext::BearerToken { sub, tenant_id, .. } => {
+            // `sub` typé `AgentId` ; `SessionTraceRow.agent_id` reste `String`
+            // (frontière DTO) — `.as_str().to_owned()` byte-identical.
+            (sub.as_str().to_owned(), tenant_id.as_str().to_owned())
+        }
         _ => return Err(StatusCode::UNAUTHORIZED),
     };
 
     // 2bis. tenant_id du body : explicitness uniquement. S'il est fourni ET diffère
     //       du tenant_id du JWT → 422 (pas de divergence silencieuse client/serveur).
     //       L'identité ACL reste TOUJOURS le tenant_id du JWT (C-SA1 inchangé).
-    if req.tenant_id != tenant_id {
+    // Lot A1 : `tenant_id` du body est optionnel. Omis (`None`) → aucune divergence
+    // possible (le tenant est celui du JWT). Fourni ET divergent → 422 (explicitness).
+    if let Some(body_tenant) = req.tenant_id.as_ref()
+        && body_tenant.as_str() != tenant_id
+    {
         tracing::warn!(
-            body_tenant = %req.tenant_id,
+            body_tenant = %body_tenant,
             jwt_tenant = %tenant_id,
-            "session_trace: tenant_id du body ≠ JWT → 422"
+            "session_trace: body tenant_id ≠ JWT → 422"
         );
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
@@ -108,6 +118,10 @@ pub async fn post_session_trace(
     let locus = format!("{tenant_id}/session-log");
     if state.acl.evaluate(&trust, AclOp::Write, &locus) != AclDecision::Allow {
         tracing::warn!(locus = %locus, "session_trace: ACL Write deny");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    // C3a (EX-C3a-1) : à ON, l'append de trace est une écriture — scope write exigé.
+    if !crate::api_v1::tenant_guard::write_scope_allowed(&state, &trust) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -156,9 +170,7 @@ pub async fn post_session_trace(
     let store = match &state.session_trace {
         Some(s) => s,
         None => {
-            tracing::error!(
-                "session_trace non câblé dans AppState — vérifier with_session_trace_path"
-            );
+            tracing::error!("session_trace not wired in AppState — check with_session_trace_path");
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
@@ -209,9 +221,10 @@ mod tests {
         TrustContext::BearerToken {
             kid: "test-kid".to_owned(),
             aud: "gradatum".to_owned(),
-            sub: "claude-code".to_owned(),
+            sub: "claude-code".into(),
             scopes: vec!["service".to_owned()],
-            tenant_id: "main".to_owned(),
+            tenant_id: "main".into(),
+            jti: None,
         }
     }
 

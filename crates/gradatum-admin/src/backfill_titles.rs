@@ -66,7 +66,7 @@ pub async fn backfill_titles(args: BackfillTitlesArgs) -> Result<BackfillTitlesR
 
     if !db_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le worker doit avoir démarré au moins une fois",
+            "index.db not found: {} — the worker must have started at least once",
             db_path.display()
         );
     }
@@ -86,7 +86,7 @@ fn run_backfill_sync(
     limit: Option<usize>,
 ) -> Result<BackfillTitlesReport> {
     let conn =
-        rusqlite::Connection::open(db_path).context("ouverture index.db pour backfill-titles")?;
+        rusqlite::Connection::open(db_path).context("opening index.db for backfill-titles")?;
 
     // Enable WAL for concurrent read/write with gradatum-server.
     conn.execute_batch("PRAGMA journal_mode=WAL;")
@@ -104,15 +104,15 @@ fn run_backfill_sync(
     // Collect into a Vec to release the Statement before the UPDATEs.
     let mut stmt = conn
         .prepare(&query)
-        .context("préparation SELECT notes sans titre")?;
+        .context("preparing SELECT notes without title")?;
 
     let rows: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![tenant], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
-        .context("exécution SELECT notes sans titre")?
+        .context("executing SELECT notes without title")?
         .collect::<std::result::Result<_, _>>()
-        .context("collecte notes sans titre")?;
+        .context("collecting notes without title")?;
 
     drop(stmt);
 
@@ -143,7 +143,7 @@ fn run_backfill_sync(
     // Apply mode: UPDATE inside a single transaction.
     let tx = conn
         .unchecked_transaction()
-        .context("début transaction backfill-titles")?;
+        .context("starting backfill-titles transaction")?;
 
     for (id, body) in &rows {
         // `extract_h1_title` returns `Option<String>` with built-in empty filtering —

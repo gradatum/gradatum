@@ -15,7 +15,7 @@ async fn upsert_then_get_content_hash() {
 
     idx.upsert_note(&note).await.unwrap();
 
-    let stored = idx.get_content_hash(note.id).await.unwrap();
+    let stored = idx.get_content_hash("main", note.id).await.unwrap();
     assert_eq!(
         stored,
         Some(note.content_hash),
@@ -28,7 +28,7 @@ async fn get_content_hash_missing_returns_none() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let id = gradatum_core::identity::NoteId::new();
 
-    let result = idx.get_content_hash(id).await.unwrap();
+    let result = idx.get_content_hash("main", id).await.unwrap();
     assert!(result.is_none(), "note absente doit retourner None");
 }
 
@@ -76,7 +76,11 @@ async fn upsert_update_content_hash() {
     };
     idx.upsert_note(&updated).await.unwrap();
 
-    let stored = idx.get_content_hash(note.id).await.unwrap().unwrap();
+    let stored = idx
+        .get_content_hash("main", note.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         stored, updated_hash,
         "après upsert, le content_hash doit être mis à jour"

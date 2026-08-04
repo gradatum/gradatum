@@ -44,13 +44,13 @@ pub async fn backfill(args: BackfillArgs) -> Result<usize> {
 
     if !queue_path.exists() {
         anyhow::bail!(
-            "queue.sqlite introuvable : {} — exécuter `gradatum-admin init` d'abord",
+            "queue.sqlite not found: {} — run `gradatum-admin init` first",
             queue_path.display()
         );
     }
     if !index_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le worker doit avoir démarré au moins une fois",
+            "index.db not found: {} — the worker must have started at least once",
             index_path.display()
         );
     }
@@ -61,17 +61,15 @@ pub async fn backfill(args: BackfillArgs) -> Result<usize> {
     // Opens the index read-only for the scan: no WAL PRAGMA or migrations
     // needed (schema already exists).
     let candidates = collect_unembedded_notes(&index_path, &tenant, args.limit)
-        .context("scan notes sans embedding")?;
+        .context("scanning notes without embedding")?;
 
     if candidates.is_empty() {
-        eprintln!(
-            "backfill: 0 jobs enqueued — toutes les notes sont déjà embedded (tenant='{tenant}')"
-        );
+        eprintln!("backfill: 0 jobs enqueued — all notes are already embedded (tenant='{tenant}')");
         return Ok(0);
     }
 
     let total = candidates.len();
-    eprintln!("backfill: {total} notes sans embedding trouvées (tenant='{tenant}') — enqueue...");
+    eprintln!("backfill: {total} notes without embedding found (tenant='{tenant}') — enqueue...");
 
     // ── Enqueue via SqliteQueue (async) ──────────────────────────────────────
     let queue = gradatum_queue::SqliteQueue::new(&queue_path)
@@ -87,7 +85,7 @@ pub async fn backfill(args: BackfillArgs) -> Result<usize> {
         let job = gradatum_queue::NewJob {
             tenant_id: tenant.clone(),
             kind: "embed_note".to_string(),
-            payload: serde_json::to_vec(&payload).context("sérialisation payload embed_note")?,
+            payload: serde_json::to_vec(&payload).context("embed_note payload serialization")?,
             max_attempts: 3,
         };
         queue.enqueue(job).await.context("enqueue embed_note")?;
@@ -113,7 +111,7 @@ fn collect_unembedded_notes(
     tenant: &str,
     limit: Option<usize>,
 ) -> Result<Vec<(String, String)>> {
-    let conn = rusqlite::Connection::open(index_path).context("ouverture index.db en lecture")?;
+    let conn = rusqlite::Connection::open(index_path).context("opening index.db read-only")?;
 
     let limit_clause = limit.map(|n| format!("LIMIT {n}")).unwrap_or_default();
 
@@ -129,18 +127,16 @@ fn collect_unembedded_notes(
          {limit_clause}"
     );
 
-    let mut stmt = conn
-        .prepare(&query)
-        .context("préparation requête backfill")?;
+    let mut stmt = conn.prepare(&query).context("preparing backfill query")?;
     let rows = stmt
         .query_map(rusqlite::params![tenant], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
-        .context("exécution requête backfill")?;
+        .context("executing backfill query")?;
 
     let candidates: Vec<(String, String)> = rows
         .collect::<std::result::Result<_, _>>()
-        .context("collecte résultats backfill")?;
+        .context("collecting backfill results")?;
 
     Ok(candidates)
 }

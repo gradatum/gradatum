@@ -16,6 +16,7 @@ use axum::http::{Request, StatusCode};
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::{JwtService, TokenScope};
 use gradatum_core::index::Index;
+use gradatum_core::scope::TenantId;
 use gradatum_embed::error::EmbedError;
 use gradatum_embed::{EmbedBackend, Embedder};
 use gradatum_index::SqliteIndex;
@@ -185,7 +186,7 @@ async fn insert_trace(
         ref_: None,
     };
     store
-        .insert_at("main", &row, created)
+        .insert_at(&TenantId::new("main"), &row, created)
         .await
         .expect("insert_trace")
 }

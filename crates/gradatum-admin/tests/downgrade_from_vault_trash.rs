@@ -59,13 +59,13 @@ fn insert_note(index_path: &std::path::Path, body_text: &str, status: &str) -> S
 /// Crée un fichier `.md` dans la structure réelle à 4 niveaux :
 ///   `.vault-trash/<date>/dedup/<section>/<name>.md`
 fn create_trash_md_deep(
-    vault_mem: &std::path::Path,
+    legacy_vault: &std::path::Path,
     date: &str,
     section: &str,
     name: &str,
     body: &str,
 ) {
-    let dir = vault_mem
+    let dir = legacy_vault
         .join(".vault-trash")
         .join(date)
         .join("dedup")
@@ -76,8 +76,8 @@ fn create_trash_md_deep(
 
 /// Crée un fichier `.md` dans la structure legacy à 2 niveaux (pour tests mixed) :
 ///   `.vault-trash/<date>/<name>.md`
-fn create_trash_md_legacy(vault_mem: &std::path::Path, date: &str, name: &str, body: &str) {
-    let dir = vault_mem.join(".vault-trash").join(date);
+fn create_trash_md_legacy(legacy_vault: &std::path::Path, date: &str, name: &str, body: &str) {
+    let dir = legacy_vault.join(".vault-trash").join(date);
     fs::create_dir_all(&dir).expect("mkdir .vault-trash/date");
     fs::write(dir.join(format!("{name}.md")), body).expect("write trash .md legacy");
 }
@@ -143,7 +143,7 @@ async fn match_and_downgrade_existing_note() {
     let body = "Acme example agent runtime documentation primary embedded host infrastructure \
                 Phase 2 avec déclencheurs Subagent-Driven Development pipeline et my-project \
                 council obligatoire pour les choix transversaux sur services LIVE en production \
-                gradatum vault memory mcp stub bridge 13 tools alpha.9 Phase 2.1.2.";
+                gradatum legacy-vault mcp stub bridge 13 tools alpha.9 Phase 2.1.2.";
 
     let id = insert_note(&index_path, body, "live");
     // Structure réelle 4 niveaux : <date>/dedup/<section>/<file>.md
@@ -200,7 +200,7 @@ async fn dry_run_does_not_modify_db() {
     let body = "Acme example agent runtime documentation primary embedded host infrastructure \
                 Phase 2 avec déclencheurs Subagent-Driven Development pipeline et my-project \
                 council obligatoire pour les choix transversaux sur services LIVE en production \
-                gradatum vault memory mcp stub bridge 13 tools dry-run scenario alpha.9.";
+                gradatum legacy-vault mcp stub bridge 13 tools dry-run scenario alpha.9.";
 
     let id = insert_note(&index_path, body, "live");
     // Structure réelle 4 niveaux : <date>/dedup/<section>/<file>.md
@@ -419,7 +419,7 @@ async fn test_dry_run_with_real_structure() {
                           walkdir récursif minDepth deux maxDepth dix garde-fou ok scan.";
     let body_reference = "Note reference architecture embedded backend hypervisor \
                           dry-run test quatre niveaux dedup section reference fichier md \
-                          gradatum vault memory mcp stub bridge alpha 9 Phase 2.1.2 fix \
+                          gradatum legacy-vault mcp stub bridge alpha 9 Phase 2.1.2 fix \
                           bug 46 backlog Phase 2.2 scan profondeur insuffisante résolu.";
     let body_unmatched = "Note sans correspondance dans gradatum pour test not_matched.";
 

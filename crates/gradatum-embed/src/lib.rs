@@ -24,7 +24,7 @@
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee.
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible additions only within `1.x`.
 //! See [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 
 #![forbid(unsafe_code)]

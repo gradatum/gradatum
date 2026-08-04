@@ -2,7 +2,7 @@
 
 > Umbrella SDK facade — re-exports curated subsets of focused crates via Cargo feature flags.
 
-**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -12,21 +12,29 @@ sub-crates through Cargo feature gates, letting you pull in only what you need.
 The core runtime is a structured memory store for AI agents: write Markdown notes, curate
 them via LLM, embed them for semantic search, and query them over HTTP or MCP.
 
-All public traits carry `#[stability::unstable]` — no API stability guarantee before v1.0.
+Public API under [SemVer 2.0.0](https://semver.org): backward-compatible additions only
+within `1.x`, breaking changes deferred to the next major. Traits documented as unstable or
+experimental in their rustdoc (`IndexStore`, `VectorStore`, `DocumentStore` in `gradatum-core`)
+carry a finer-grained tier per
+[RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md) (AM1).
 
 ## Feature Flags
 
-| Feature | Re-exported crate | Description |
-|---|---|---|
-| `core` | `gradatum-core` | Shared primitives (always useful as a baseline) |
-| `client` | `gradatum-sdk-rs` | Rust HTTP client for the gradatum-server API (planned) |
+| Feature | Default | Re-exported crate | Description |
+|---|---|---|---|
+| `core` | ✅ | `gradatum-core` | Shared primitives (always useful as a baseline) |
+| `client` | — | `gradatum-sdk-rs` | Rust HTTP client for the gradatum-server API (planned — currently a placeholder with no client surface) |
 
 ## Usage
 
+`core` being the default feature, a plain install already exposes `gradatum::core`:
+
 ```toml
 [dependencies]
-gradatum = { version = "0.7.6", features = ["core"] }
+gradatum = "1.0.0"
 ```
+
+Opt out with `gradatum = { version = "1.0.0", default-features = false }`.
 
 ```rust
 use gradatum::core::error::GradatumError;
@@ -58,10 +66,10 @@ use gradatum::VERSION;
 | [`gradatum-warden`](https://crates.io/crates/gradatum-warden) | L0 network guard: IP filter + rate limit |
 | [`gradatum-server`](https://crates.io/crates/gradatum-server) | HTTP/MCP server daemon (port 19090) |
 | [`gradatum-worker`](https://crates.io/crates/gradatum-worker) | Async queue consumer (Apalis-backed) |
-| [`gradatum-admin`](https://crates.io/crates/gradatum-admin) | Operator CLI: init, migrate, backfill, api-key |
-| [`gradatum-cli`](https://crates.io/crates/gradatum-cli) | End-user CLI: write, search, read |
+| [`gradatum-admin`](https://crates.io/crates/gradatum-admin) | Operator CLI: init, token, api-key, backfill, jobs, vault lifecycle |
+| [`gradatum-cli`](https://crates.io/crates/gradatum-cli) | End-user CLI — planned, currently a stub that exits 1 |
 | [`gradatum-mcp-stub`](https://crates.io/crates/gradatum-mcp-stub) | MCP stdio adapter forwarding tool calls to the HTTP API |
-| [`gradatum-sdk-rs`](https://crates.io/crates/gradatum-sdk-rs) | Rust SDK client for the HTTP API |
+| [`gradatum-sdk-rs`](https://crates.io/crates/gradatum-sdk-rs) | Rust SDK client for the HTTP API (planned — placeholder, no client surface) |
 
 ## License
 

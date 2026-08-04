@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "argon2id bearer verification + scope enforcement"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 gradatum-core.workspace = true

@@ -6,10 +6,13 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Storage trait + OpenDAL backends + NFS reject guard (caveat C11)"
+description = "Storage trait + OpenDAL backends + NFS reject guard"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "0.7.0" }
+gradatum-core = { path = "../gradatum-core", version = "1.0.0" }
 async-trait   = { workspace = true }
 opendal       = { workspace = true }
 thiserror     = { workspace = true }

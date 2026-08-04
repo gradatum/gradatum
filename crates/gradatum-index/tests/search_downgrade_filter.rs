@@ -28,9 +28,16 @@ async fn seed_note(
         .await
         .expect("upsert_note ne doit pas échouer");
     if downgraded {
-        idx.downgrade_note(&note_id, "test-downgrade", None)
-            .await
-            .expect("downgrade_note ne doit pas échouer");
+        idx.downgrade_note(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            &note_id,
+            "test-downgrade",
+            None,
+        )
+        .await
+        .expect("downgrade_note ne doit pas échouer");
     }
     note_id
 }

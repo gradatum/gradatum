@@ -2,11 +2,11 @@
 //!
 //! ## Couverture
 //!
-//! - `curate_with_occurred_at_sets_anchor_src_occurred_at` (rouge→vert Task 3) :
+//! - `curate_with_occurred_at_sets_anchor_src_occurred_at` (rouge→vert) :
 //!   `CurateSpec.occurred_at = Some("2026-01-15")` → `persist_curated` reçoit
 //!   `temporal.anchor_src = "occurred_at"` et `temporal.anchor_ms = ms(2026-01-15T00:00:00Z)`.
 //!
-//! - `curate_without_occurred_at_anchor_src_is_created` (backward-compat Task 4) :
+//! - `curate_without_occurred_at_anchor_src_is_created` (backward-compat) :
 //!   `CurateSpec.occurred_at = None` → `temporal.anchor_src = "created"`,
 //!   `temporal.anchor_ms ≈ now`.
 //!
@@ -226,22 +226,40 @@ impl InternalClient for CapturingClient {
         })
     }
 
-    async fn delete_note(&self, _ulid: &str) -> Result<(), InternalClientError> {
+    async fn delete_note(&self, _vault_id: &str, _ulid: &str) -> Result<(), InternalClientError> {
         Ok(())
     }
 
-    async fn get_note(&self, ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+    async fn get_note(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError> {
         // Délègue au TestInternalClient qui lit depuis le vault (chemins reclassification C-1).
         test_internal_client::TestInternalClient::new(
             Arc::clone(&self.vault),
             Arc::clone(&self.index),
         )
-        .get_note(ulid)
+        .get_note(vault_id, ulid)
+        .await
+    }
+
+    async fn get_note_status(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<Option<String>, InternalClientError> {
+        test_internal_client::TestInternalClient::new(
+            Arc::clone(&self.vault),
+            Arc::clone(&self.index),
+        )
+        .get_note_status(vault_id, ulid)
         .await
     }
 
     async fn get_note_embedding(
         &self,
+        _vault_id: &str,
         _ulid: &str,
         _embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
@@ -250,7 +268,7 @@ impl InternalClient for CapturingClient {
         })
     }
 
-    async fn get_trust(&self, _ulid: &str) -> Result<f32, InternalClientError> {
+    async fn get_trust(&self, _vault_id: &str, _ulid: &str) -> Result<f32, InternalClientError> {
         Ok(0.5)
     }
 
@@ -317,7 +335,7 @@ impl InternalClient for CapturingClient {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Task 3 — occurred_at:"2026-01-15" → anchor_src="occurred_at" + anchor_ms correct.
+/// occurred_at:"2026-01-15" → anchor_src="occurred_at" + anchor_ms correct.
 ///
 /// Valide que la chaîne `CurateSpec.occurred_at` → ExtraFields → `resolve_temporal_anchor`
 /// → `PersistCuratedRequest.temporal` produit l'ancre événementielle attendue.
@@ -349,6 +367,7 @@ async fn curate_with_occurred_at_sets_anchor_src_occurred_at() {
         Data::new(client as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -481,7 +500,7 @@ async fn seed_note_with_anchor(
     inner
         .persist_curated(&PersistCuratedRequest {
             note_id: note_id.to_string(),
-            tenant_id: "main".to_string(),
+            tenant_id: "main".to_string().into(),
             title: "C-1 seed note".to_string(),
             body: body.to_string(),
             section: "decisions".to_string(),
@@ -498,6 +517,8 @@ async fn seed_note_with_anchor(
             }),
             links: vec![],
             provenance: None,
+            curator_decision: None,
+            target_vault: None,
         })
         .await
         .expect("seed_note_with_anchor — invariant test fixture");
@@ -603,6 +624,7 @@ async fn reclassify_with_occurred_at_uses_occurred_at_anchor() {
         Data::new(client as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -675,6 +697,7 @@ async fn reclassify_without_occurred_at_no_clobber_existing_anchor() {
         Data::new(client as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -748,6 +771,7 @@ async fn vault_classify_without_occurred_at_preserves_anchor() {
         Data::new(client as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -822,6 +846,7 @@ async fn reclassify_created_only_no_clobber() {
         Data::new(client as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -893,7 +918,7 @@ async fn vault_write_rmw_with_occurred_at_sets_anchor_occurred_at() {
             Arc::clone(&fixture.index),
         );
         let dto = inner
-            .get_note(&note_id.to_string())
+            .get_note("main", &note_id.to_string())
             .await
             .expect("note seedée doit être lisible — invariant fixture");
         hex_to_bytes32(&dto.sha256_hex)
@@ -926,6 +951,7 @@ async fn vault_write_rmw_with_occurred_at_sets_anchor_occurred_at() {
         Data::new(client as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -987,7 +1013,7 @@ async fn vault_write_rmw_without_occurred_at_preserves_existing_anchor() {
             Arc::clone(&fixture.index),
         );
         let dto = inner
-            .get_note(&note_id.to_string())
+            .get_note("main", &note_id.to_string())
             .await
             .expect("note seedée doit être lisible — invariant fixture");
         hex_to_bytes32(&dto.sha256_hex)
@@ -1019,6 +1045,7 @@ async fn vault_write_rmw_without_occurred_at_preserves_existing_anchor() {
         Data::new(client as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -1070,7 +1097,7 @@ async fn vault_write_rmw_without_occurred_at_no_spurious_created_entry() {
     inner_seed
         .persist_curated(&PersistCuratedRequest {
             note_id: note_id.to_string(),
-            tenant_id: "main".to_string(),
+            tenant_id: "main".to_string().into(),
             title: "C-1 seed note (pas de temporal)".to_string(),
             body: seed_body.to_string(),
             section: "decisions".to_string(),
@@ -1082,6 +1109,8 @@ async fn vault_write_rmw_without_occurred_at_no_spurious_created_entry() {
             temporal: None, // pas d'entrée initiale
             links: vec![],
             provenance: None,
+            curator_decision: None,
+            target_vault: None,
         })
         .await
         .expect("seed sans temporal — invariant fixture");
@@ -1103,7 +1132,7 @@ async fn vault_write_rmw_without_occurred_at_no_spurious_created_entry() {
             Arc::clone(&fixture.index),
         );
         let dto = inner
-            .get_note(&note_id.to_string())
+            .get_note("main", &note_id.to_string())
             .await
             .expect("note seedée doit être lisible — invariant fixture");
         hex_to_bytes32(&dto.sha256_hex)
@@ -1134,6 +1163,7 @@ async fn vault_write_rmw_without_occurred_at_no_spurious_created_entry() {
         Data::new(client as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -1161,7 +1191,7 @@ async fn vault_write_rmw_without_occurred_at_no_spurious_created_entry() {
     );
 }
 
-/// Task 4 — backward-compat : sans occurred_at → anchor_src="created" + anchor_ms ≈ now.
+/// backward-compat : sans occurred_at → anchor_src="created" + anchor_ms ≈ now.
 ///
 /// Valide que l'absence de `occurred_at` préserve le comportement historique :
 /// `resolve_temporal_anchor` retourne `(created_ms, AnchorSrc::Created)`.
@@ -1193,6 +1223,7 @@ async fn curate_without_occurred_at_anchor_src_is_created() {
         Data::new(client as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 

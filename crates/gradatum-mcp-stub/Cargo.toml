@@ -7,13 +7,15 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Adapter MCP stdio → HTTP gradatum-server (thin proxy)"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "gradatum-mcp-stub"
 path = "src/main.rs"
 
 [dependencies]
-gradatum-core.workspace = true
 gradatum-dto = { workspace = true, features = ["schemars"] }
 schemars.workspace = true
 # rmcp avec feature transport-io (stdio) en plus du workspace "server"+"macros"

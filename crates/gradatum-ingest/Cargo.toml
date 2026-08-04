@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Code-ingest pipeline: tree-sitter parse → derived code symbols → index-only notes"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 readme = "README.md"
 
 # Feature flags

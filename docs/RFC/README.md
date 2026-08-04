@@ -9,7 +9,7 @@ RFCs are required for any change to `gradatum-core` public traits, workspace str
 | Number | Title | Status | Date | Affected crates |
 |---|---|---|---|---|
 | [RFC-0001](RFC-0001-versioning-gradatum-core.md) | Trait stability tiers and versioning for `gradatum-core` | `accepted` | 2026-05-03 | `gradatum-core`, all consumers |
-| [RFC-0002](RFC-0002-cross-platform-support.md) | Cross-platform support: Linux primary + Windows secondary | `accepted` | 2026-05-04 | `gradatum-storage`, `gradatum-chat`, `gradatum-embed`; workspace-wide portability rules |
+| [RFC-0002](RFC-0002-cross-platform-support.md) | Cross-platform support: Linux primary + Windows secondary | `superseded` (was `accepted`) — Linux-only since 2026-06-05 | 2026-05-04 | `gradatum-storage`, `gradatum-chat`, `gradatum-embed`; workspace-wide portability rules |
 | [RFC-0003](RFC-0003-http-api-surface-and-mcp-integration.md) | HTTP API surface and MCP integration topology | `accepted` | 2026-05-04 | `gradatum-server`, `gradatum-mcp-stub` |
 | [RFC-0005](RFC-0005-self-improvement.md) | Self-improvement: agent reflexive capability building from classified knowledge base | `proposal` | 2026-05-05 | new crate `gradatum-self-improvement` (Phase 3+ target) |
 
@@ -20,7 +20,8 @@ RFCs are required for any change to `gradatum-core` public traits, workspace str
 3. **Resolution:** Marked `accepted`, `postponed`, or `rejected`. Rejected RFCs remain in the repo for historical reference.
 4. **Implementation:** Tracked issue created; implementation PRs cross-reference the RFC number.
 
-**RFC numbering is monotonic and never reused.**
+**RFC numbering is monotonic and never reused.** The index jumps from `0003` to `0005`: no
+RFC-0004 exists in this repository, and per the rule above the number is not reassigned.
 
 ## Templates and guidance
 

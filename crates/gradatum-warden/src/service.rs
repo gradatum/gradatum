@@ -95,11 +95,11 @@ where
             {
                 Some(ip) => ip,
                 None => {
-                    tracing::warn!("warden: ConnectInfo absent — requête rejetée (fail-closed)");
+                    tracing::warn!("warden: ConnectInfo absent — request rejected (fail-closed)");
                     let resp = Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .body(ResBody::default())
-                        .expect("réponse 403 statique — ne peut pas échouer");
+                        .expect("static 403 response — cannot fail");
                     return Ok(resp);
                 }
             };
@@ -113,11 +113,11 @@ where
                     inner.call(req).await
                 }
                 WardenDecision::DenyIp => {
-                    tracing::warn!(ip = %ip, "warden: IP refusée (filtre CIDR)");
+                    tracing::warn!(ip = %ip, "warden: IP refused (CIDR filter)");
                     let resp = Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .body(ResBody::default())
-                        .expect("réponse 403 statique — ne peut pas échouer");
+                        .expect("static 403 response — cannot fail");
                     Ok(resp)
                 }
                 WardenDecision::DenyRateLimit => {
@@ -127,12 +127,12 @@ where
                         .as_ref()
                         .map(|rl| rl.wait_time_secs(ip))
                         .unwrap_or(1);
-                    tracing::debug!(ip = %ip, retry_secs, "warden: rate limit dépassé");
+                    tracing::debug!(ip = %ip, retry_secs, "warden: rate limit exceeded");
                     let resp = Response::builder()
                         .status(StatusCode::TOO_MANY_REQUESTS)
                         .header("retry-after", retry_secs.to_string())
                         .body(ResBody::default())
-                        .expect("réponse 429 statique — ne peut pas échouer");
+                        .expect("static 429 response — cannot fail");
                     Ok(resp)
                 }
             }

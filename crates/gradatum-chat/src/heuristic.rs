@@ -28,7 +28,7 @@ use crate::error::ChatError;
 fn re_wikilink() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\[\[[^\]]+\]\]").expect("re_wikilink est un pattern littéral valide")
+        Regex::new(r"\[\[[^\]]+\]\]").expect("re_wikilink is a valid literal pattern")
     })
 }
 
@@ -37,7 +37,7 @@ fn re_decisions() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?i)\b(decision|architecture|lesson|lessons.learned)\b")
-            .expect("re_decisions est un pattern littéral valide")
+            .expect("re_decisions is a valid literal pattern")
     })
 }
 
@@ -46,7 +46,7 @@ fn re_bugs() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?i)\b(bug|issue|error|erreur|crash|traceback|panic)\b")
-            .expect("re_bugs est un pattern littéral valide")
+            .expect("re_bugs is a valid literal pattern")
     })
 }
 
@@ -92,7 +92,7 @@ impl Heuristic {
             return (
                 0.50,
                 NoteStatus::PendingReview,
-                "corps trop court — revue humaine conseillée".into(),
+                "body too short — human review advised".into(),
             );
         }
 
@@ -113,7 +113,7 @@ impl Heuristic {
         // Frontmatter avec tags
         if has_tags {
             confidence += 0.10;
-            reason_parts.push("tags présents");
+            reason_parts.push("tags present");
         }
 
         // --- Patterns sémantiques ---
@@ -122,10 +122,10 @@ impl Heuristic {
             // Décision / architecture / lesson → admission claire
             confidence = confidence.max(0.80);
             let reason = if reason_parts.is_empty() {
-                "keyword decision/architecture/lesson — admission recommandée".into()
+                "keyword decision/architecture/lesson — admission recommended".into()
             } else {
                 format!(
-                    "keyword decision/architecture/lesson + {} — admission recommandée",
+                    "keyword decision/architecture/lesson + {} — admission recommended",
                     reason_parts.join(", ")
                 )
             };
@@ -161,7 +161,7 @@ impl Heuristic {
         };
 
         let reason = if reason_parts.is_empty() {
-            "aucun signal sémantique fort".into()
+            "no strong semantic signal".into()
         } else {
             format!("signaux: {}", reason_parts.join(", "))
         };

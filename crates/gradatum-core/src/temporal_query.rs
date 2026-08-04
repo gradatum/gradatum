@@ -38,24 +38,24 @@ impl TimelineCursor {
     pub fn decode(s: &str) -> Result<Self, GradatumError> {
         let (ms, id) = s.split_once('.').ok_or_else(|| {
             GradatumError::Validation(ValidationError::InvalidInput(
-                "cursor malformé: séparateur absent".into(),
+                "malformed cursor: missing separator".into(),
             ))
         })?;
         let anchor_ms = ms.parse::<i64>().map_err(|_| {
             GradatumError::Validation(ValidationError::InvalidInput(
-                "cursor malformé: anchor_ms".into(),
+                "malformed cursor: anchor_ms".into(),
             ))
         })?;
         if id.is_empty() {
             return Err(GradatumError::Validation(ValidationError::InvalidInput(
-                "cursor malformé: note_id vide".into(),
+                "malformed cursor: empty note_id".into(),
             )));
         }
         // V4 — borne défensive : un ULID fait 26 chars, on tolère 32. Au-delà,
         // c'est un cursor forgé (jamais émis par encode()) → rejet.
         if id.len() > 32 {
             return Err(GradatumError::Validation(ValidationError::InvalidInput(
-                "cursor malformé: note_id surdimensionné".into(),
+                "malformed cursor: oversized note_id".into(),
             )));
         }
         Ok(Self {
@@ -169,7 +169,7 @@ pub fn parse_temporal_str_as_ms(s: &str) -> Option<i64> {
         use chrono::TimeZone as _;
         let dt = chrono::Utc.from_utc_datetime(
             &d.and_hms_opt(0, 0, 0)
-                .expect("hms(0,0,0) est un horaire valide — ne peut pas échouer"),
+                .expect("hms(0,0,0) is a valid time — cannot fail"),
         );
         return Some(dt.timestamp_millis());
     }

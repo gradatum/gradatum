@@ -154,6 +154,7 @@ fn make_engine_spike_config(
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
         messages: Default::default(),
+        router: Default::default(),
     }
 }
 

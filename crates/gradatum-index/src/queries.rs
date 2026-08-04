@@ -30,17 +30,10 @@ use chrono::Utc;
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Escapes SQLite LIKE wildcards `%`, `_`, and `\` in a pattern string.
-///
-/// SQLite accepts an `ESCAPE '\\'` clause: a `\` preceding `%` or `_` makes them
-/// literal. This function prefixes each `%`, `_`, and `\` with `\`.
-///
-/// Must be used with `ESCAPE '\\'` in the SQL query.
-///
-/// # Canonical H1 extraction rule
-///
 /// Extracts the H1 title from a Markdown body, aligned with the SQL predicate used
 /// by `title_lookup` (`body_text LIKE '# %'`).
+///
+/// # Canonical H1 extraction rule
 ///
 /// The **first line** must start **exactly** with `"# "` (hash + space,
 /// no leading space before `#`). The remainder is trimmed and returned.
@@ -78,6 +71,12 @@ pub fn extract_h1_title(body: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Escapes the SQLite LIKE wildcards `%`, `_` and `\` in a pattern string.
+///
+/// SQLite accepts an `ESCAPE '\\'` clause: a `\` in front of `%` or `_` makes the
+/// character literal. This function prefixes every `%`, `_` and `\` with `\`, and the
+/// resulting pattern must be used together with `ESCAPE '\\'` in the query.
+///
 /// ```text
 /// escape_like_pattern("User%")   → "User\\%"
 /// escape_like_pattern("Note_1")  → "Note\\_1"
@@ -349,7 +348,7 @@ impl SqliteIndex {
     ///
     /// Returns the ULID of the first matching note, or `None`.
     ///
-    /// ## Two-pass resolution (since v0.7.3)
+    /// ## Two-pass resolution
     ///
     /// 1. **Column exact-match**: queries `title = ?2` (no LIKE — no escaping needed).
     ///    The column is populated by `upsert_note_title` on every `persist_curated`.
@@ -436,23 +435,22 @@ impl SqliteIndex {
         }
     }
 
-    /// Vérifie qu'une note existe et est `live` par son `note_id` (ULID string).
+    /// Checks that a note exists and is `live`, by its `note_id` (ULID string).
     ///
-    /// Utilisé pour la résolution ULID-first des wikilinks `[[section:ULID]]` :
-    /// quand le wikilink contient directement un ULID, il suffit de vérifier
-    /// l'existence sans passer par la correspondance H1.
+    /// Used for the ULID-first resolution of `[[section:ULID]]` wikilinks: when the link
+    /// already carries a ULID, existence is all that needs checking — no H1 matching.
     ///
-    /// Exclut les sentinelles (`id LIKE '__sentinel__%'`) et les notes
-    /// dont le statut n'est pas `'live'` (downgraded, archived, etc.).
+    /// Sentinels (`id LIKE '__sentinel__%'`) and notes whose status is not `'live'`
+    /// (downgraded, archived, …) are excluded.
     ///
-    /// # Retour
+    /// ## Return value
     ///
-    /// - `Ok(Some(id))` si la note existe et est `live`.
-    /// - `Ok(None)` si la note est absente, downgraded, ou sentinelle.
+    /// - `Ok(Some(id))` if the note exists and is `live`.
+    /// - `Ok(None)` if the note is absent, downgraded, or a sentinel.
     ///
     /// # Errors
     ///
-    /// Retourne `GradatumError::Storage` si la requête SQLite échoue.
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
     pub async fn id_lookup(
         &self,
         vault_id: &str,
@@ -574,7 +572,7 @@ impl SqliteIndex {
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if the SQLite query fails.
-    #[must_use = "le résultat doit être propagé via ?"]
+    #[must_use = "the result must be propagated via ?"]
     pub async fn backlink_count(
         &self,
         vault_id: &str,
@@ -629,7 +627,7 @@ impl SqliteIndex {
                             gradatum_core::identity::NoteId(u),
                         )),
                         Err(_) => Err(GradatumError::Storage(format!(
-                            "get_note_created_and_indegree: note absente et note_id non-ULID: {note_id}"
+                            "get_note_created_and_indegree: note absent and non-ULID note_id: {note_id}"
                         ))),
                     };
                 }

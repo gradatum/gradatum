@@ -1,20 +1,27 @@
-//! `gradatum-admin project-map backfill-changelog` — création en masse de cartes
-//! project-map depuis le CHANGELOG.
+//! `gradatum-admin project-map backfill-changelog` — bulk creation of project-map cards
+//! from a CHANGELOG file.
 //!
 //! ## Modes
 //!
-//! - **Dry-run** (défaut) : affiche chaque payload (title + source_marker) sans
-//!   appeler `POST /api/v1/vault_write`. Le report indique `would_create`.
-//! - **Réel** : appelle `vault_write` pour chaque nouvelle carte. L'idempotence
-//!   est garantie par un test de pré-existence via `vault_search` du marqueur.
+//! - **Dry-run** (the default): prints each payload (title and source marker) without
+//!   calling `POST /api/v1/vault_write`. The report only fills `would_create`.
+//! - **Apply**: calls `vault_write` for every card that does not exist yet. Idempotence
+//!   comes from a pre-existence check on the card's source marker.
 //!
 //! ## Idempotence
 //!
-//! Avant chaque write, `client.marker_exists(marker)` est appelé. Si la note
-//! existe déjà, la carte est sautée. La détection est en 4 étapes : (1) fast-path
-//! snippet/title BM25, (2) fallback `vault_read` sur les hits retournés, (3)
-//! fallback déterministe `vault_list` + `vault_read` exhaustif si `vault_search`
-//! retourne exactement 50 hits (éjection ranking possible — section ≥ 50 cartes).
+//! Before each write, [`crate::changelog_backfill::VaultWriteClient::marker_exists`] is
+//! called and the card is skipped when the note already exists. Detection proceeds in
+//! three stages:
+//!
+//! 1. Fast path — the marker appears in the title or snippet of a `vault_search` hit.
+//! 2. Fallback — read the full body of each hit, because the full-text snippet may have
+//!    truncated the marker.
+//! 3. Deterministic fallback — page through the whole `project-map` section with
+//!    `vault_list` and read every body not already checked. It runs when the search
+//!    reported more corpus matches than it returned, or when it returned a full page of
+//!    50 hits, both of which mean relevance ranking may have pushed the target out of
+//!    the results.
 //!
 //! ## Mockable client
 //!
@@ -31,13 +38,16 @@ use async_trait::async_trait;
 use crate::changelog_parse::parse_changelog;
 use crate::project_map_card::{VaultWriteCard, render_card};
 
-/// Vrai si `marker` apparaît dans `haystack` avec une frontière droite valide.
+/// Returns `true` when `marker` occurs in `haystack` with a valid right boundary.
 ///
-/// Anti-collision sous-chaîne : la seule ambiguïté réelle entre marqueurs est
-/// l'extension numérique (`pm-feature-source:F-4` ⊂ `...F-42`,
-/// `changelog/0.5.2/added/0` ⊂ `.../01`). Une occurrence ne compte que si le
-/// caractère qui suit n'est PAS un chiffre ASCII (ou s'il n'y a pas de caractère
-/// suivant). Case-sensitive, littéral exact (markers machine-générés — P2 reviewer).
+/// Plain substring matching would produce false positives, because the only real
+/// ambiguity between markers is a numeric extension: `pm-feature-source:F-4` is a prefix
+/// of `...F-42`, and `changelog/0.5.2/added/0` is a prefix of `.../01`. An occurrence
+/// therefore counts only when the following character is not an ASCII digit, or when
+/// there is no following character at all.
+///
+/// Matching is case-sensitive and literal, which is safe because markers are
+/// machine-generated.
 fn marker_matches(haystack: &str, marker: &str) -> bool {
     if marker.is_empty() {
         return false;
@@ -54,28 +64,28 @@ fn marker_matches(haystack: &str, marker: &str) -> bool {
     false
 }
 
-/// Timeout par défaut pour les appels HTTP vers le serveur gradatum (cap DoS — ADN 5).
+/// Default timeout for HTTP calls to the gradatum server; bounds the time a single
+/// request can hold the run hostage.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Client pour `POST /api/v1/vault_write` et vérification d'idempotence.
+/// Client for `POST /api/v1/vault_write` and for the idempotence pre-check.
 ///
-/// Mockable dans les tests — l'implémentation réelle utilise reqwest.
+/// Kept as a trait so tests can substitute an in-memory double; the real implementation
+/// is [`HttpVaultClient`].
 #[async_trait]
 pub trait VaultWriteClient: Send + Sync + 'static {
-    /// Vérifie si une note avec ce marqueur source existe déjà.
+    /// Reports whether a note carrying this source marker already exists.
     ///
     /// # Errors
     ///
-    /// Retourne une erreur si l'appel HTTP échoue ou si le parsing de la
-    /// réponse est invalide.
+    /// The HTTP call fails, or the response cannot be parsed.
     async fn marker_exists(&self, marker: &str) -> Result<bool>;
 
-    /// `POST /api/v1/vault_write` — crée une note. Retourne l'ULID de la note créée.
+    /// `POST /api/v1/vault_write` — creates a note and returns its ULID.
     ///
     /// # Errors
     ///
-    /// Retourne une erreur si l'appel HTTP échoue ou si le statut de réponse
-    /// n'est pas 200/201.
+    /// The HTTP call fails, or the server answers with a non-success status.
     async fn vault_write(&self, card: &VaultWriteCard) -> Result<String>;
 }
 
@@ -90,12 +100,12 @@ pub struct HttpVaultClient {
 }
 
 impl HttpVaultClient {
-    /// Crée un client HTTP en échangeant l'api-key contre un JWT.
+    /// Builds an HTTP client, exchanging the API key for a JWT up front.
     ///
     /// # Errors
     ///
-    /// - Si l'échange api-key échoue (HTTP != 2xx ou body invalide).
-    /// - Si la construction du client `reqwest` échoue.
+    /// - The API key exchange fails: non-2xx status, or an unusable response body.
+    /// - The underlying `reqwest` client cannot be built.
     pub async fn new(base_url: &str, api_key: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
@@ -118,24 +128,24 @@ impl HttpVaultClient {
             .bearer_auth(api_key)
             .send()
             .await
-            .context("échange api-key (POST /auth/exchange)")?;
+            .context("api-key exchange (POST /auth/exchange)")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("échange api-key échoué : HTTP {status} — {body}");
+            bail!("api-key exchange failed: HTTP {status} — {body}");
         }
 
         let payload: serde_json::Value = resp
             .json()
             .await
-            .context("parsing réponse /auth/exchange")?;
+            .context("parsing /auth/exchange response")?;
         // Champ JWT = "token" (struct ExchangeResponse.token — auth_routes.rs:42).
         // Le fallback "jwt" est conservé par défaut de robustesse si la struct évolue.
         let jwt = payload["token"]
             .as_str()
             .or_else(|| payload["jwt"].as_str())
-            .context("champ 'token' absent de la réponse /auth/exchange")?
+            .context("'token' field absent from /auth/exchange response")?
             .to_string();
 
         Ok(Self {
@@ -145,20 +155,19 @@ impl HttpVaultClient {
         })
     }
 
-    /// Énumère TOUS les paths d'une section via `POST /api/v1/vault_list` avec
-    /// pagination complète (suit `next_cursor` jusqu'à épuisement).
+    /// Enumerates every path of a section through `POST /api/v1/vault_list`, following
+    /// `next_cursor` until the listing is exhausted.
     ///
-    /// Garantit 0 faux-négatif quelle que soit la taille de la section : la borne
-    /// limit=1000 par page est transparente — la boucle suit les pages jusqu'à
-    /// `next_cursor == null`.
+    /// The per-page limit of 1000 is therefore invisible to callers, and the result
+    /// cannot miss an entry however large the section is.
     ///
-    /// Used as a deterministic fallback in `marker_exists` when `vault_search`
-    /// did not return the target card (BM25 ranking may eject low-scoring matches
-    /// from the top-N results).
+    /// Used as a deterministic fallback in [`VaultWriteClient::marker_exists`] when
+    /// `vault_search` did not return the target card, since relevance ranking may eject
+    /// low-scoring matches from the top-N results.
     ///
     /// # Errors
     ///
-    /// Erreur si un appel HTTP échoue ou si le parsing de la réponse est invalide.
+    /// An HTTP call fails, or a response cannot be parsed.
     async fn vault_list_section_paths(&self, section: &str) -> Result<Vec<String>> {
         let url = format!("{}/api/v1/vault_list", self.base_url);
         let mut all_paths: Vec<String> = Vec::new();
@@ -169,7 +178,10 @@ impl HttpVaultClient {
             page += 1;
             let mut body = serde_json::json!({
                 "section": section,
-                // limit=1000 = maximum accepté par vault_list (VaultListRequest.limit max).
+                // ⚠️ vault_list borne `limit` à 200 (`unwrap_or(20).clamp(1, 200)`) : les
+                // 1000 demandés ici sont silencieusement ramenés à 200 par le serveur.
+                // La valeur est laissée telle quelle — la pagination par `cursor`
+                // ci-dessous couvre le reste, donc le backfill reste complet.
                 "limit": 1000
             });
             if let Some(ref c) = cursor {
@@ -189,11 +201,11 @@ impl HttpVaultClient {
 
             if !resp.status().is_success() {
                 let status = resp.status();
-                bail!("vault_list page={page} échoué : HTTP {status} — section={section}");
+                bail!("vault_list page={page} failed: HTTP {status} — section={section}");
             }
 
             let payload: serde_json::Value = resp.json().await.with_context(|| {
-                format!("parsing réponse vault_list page={page} section={section}")
+                format!("parsing vault_list response page={page} section={section}")
             })?;
 
             // Champ entries = VaultListResponse.entries (dto.rs:180).
@@ -214,12 +226,12 @@ impl HttpVaultClient {
         Ok(all_paths)
     }
 
-    /// Lit le body markdown complet d'une note (`content`) via `POST /api/v1/vault_read`.
+    /// Reads a note's full Markdown body through `POST /api/v1/vault_read`.
     ///
     /// # Errors
     ///
-    /// Erreur si l'appel HTTP échoue, si le statut n'est pas 2xx, ou si le champ
-    /// `content` est absent de la réponse.
+    /// The HTTP call fails, the status is not 2xx, or the response carries no `content`
+    /// field.
     async fn vault_read_content(&self, path: &str) -> Result<String> {
         let url = format!("{}/api/v1/vault_read", self.base_url);
         let resp = self
@@ -235,19 +247,19 @@ impl HttpVaultClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            bail!("vault_read échoué : HTTP {status} — path={path}");
+            bail!("vault_read failed: HTTP {status} — path={path}");
         }
 
         let payload: serde_json::Value = resp
             .json()
             .await
-            .with_context(|| format!("parsing réponse vault_read path={path}"))?;
+            .with_context(|| format!("parsing vault_read response path={path}"))?;
 
         // Champ markdown = `content` (VaultReadResponse.content, dto.rs:154).
         payload["content"]
             .as_str()
             .map(str::to_string)
-            .with_context(|| format!("champ 'content' absent de la réponse vault_read path={path}"))
+            .with_context(|| format!("'content' field absent from vault_read response path={path}"))
     }
 }
 
@@ -277,11 +289,11 @@ impl VaultWriteClient for HttpVaultClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            bail!("vault_search échoué : HTTP {status}");
+            bail!("vault_search failed: HTTP {status}");
         }
 
         let payload: serde_json::Value =
-            resp.json().await.context("parsing réponse vault_search")?;
+            resp.json().await.context("parsing vault_search response")?;
 
         // Correction bug P1 : le champ API réel est `items`, pas `results`.
         // Référence : VaultSearchResponse.items (gradatum-server/src/api_v1/dto.rs:117).
@@ -307,7 +319,7 @@ impl VaultWriteClient for HttpVaultClient {
         for hit in &items {
             let path = hit["path"]
                 .as_str()
-                .context("hit vault_search sans champ 'path' (réponse malformée)")?;
+                .context("vault_search hit without 'path' field (malformed response)")?;
             searched_paths.insert(path.to_string());
             let body = self.vault_read_content(path).await?;
             if marker_matches(&body, marker) {
@@ -369,11 +381,11 @@ impl VaultWriteClient for HttpVaultClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("vault_write échoué : HTTP {status} — {body}");
+            bail!("vault_write failed: HTTP {status} — {body}");
         }
 
         let payload: serde_json::Value =
-            resp.json().await.context("parsing réponse vault_write")?;
+            resp.json().await.context("parsing vault_write response")?;
         let ulid = payload["note_id"]
             .as_str()
             .or_else(|| payload["id"].as_str())
@@ -383,57 +395,64 @@ impl VaultWriteClient for HttpVaultClient {
     }
 }
 
-/// Arguments pour la sous-commande `backfill-changelog`.
+/// Arguments for the `backfill-changelog` sub-command.
 pub struct BackfillChangelogArgs {
-    /// Chemin du fichier CHANGELOG.md.
+    /// Path to the `CHANGELOG.md` file.
     pub changelog_path: PathBuf,
-    /// Version SemVer minimale incluse.
+    /// Lowest SemVer version to include.
     pub from_version: String,
-    /// Version SemVer maximale incluse.
+    /// Highest SemVer version to include.
     pub to_version: String,
-    /// Mode apply : `false` (défaut) = dry-run preview, `true` = POST réel vers le vault.
+    /// Apply mode: `false` (the default) previews, `true` writes to the vault.
     ///
-    /// Garde-fou : si `apply == true` et `api_key` est vide, `run_backfill` retourne `Err`
-    /// avant tout accès réseau.
+    /// Guard rail: when `apply` is `true` and `api_key` is empty, [`run_backfill`]
+    /// returns an error before touching the network.
     pub apply: bool,
-    /// URL de base du serveur gradatum.
+    /// Base URL of the gradatum server.
     pub server_url: String,
-    /// Clé API pour l'authentification.
+    /// API key used for authentication.
     pub api_key: String,
-    /// Inclut les sections méta (Tests, Internal, Documentation…) comme cartes KindKind::Task.
-    /// Par défaut false : seules les sections Keep-a-Changelog standard sont incluses.
+    /// Include meta sections (`Tests`, `Internal`, `Documentation`, …) as task cards.
+    ///
+    /// Defaults to `false`, in which case only the standard Keep a Changelog sections
+    /// are turned into cards.
     pub include_meta: bool,
 }
 
-/// Rapport d'un run de backfill changelog.
+/// Report of a CHANGELOG back-fill run.
 #[derive(Debug, Default, Clone)]
 #[must_use]
 pub struct BackfillChangelogReport {
-    /// Nombre total d'entrées parsées depuis le CHANGELOG.
+    /// Total number of entries parsed out of the CHANGELOG.
     pub parsed: usize,
-    /// (dry-run) Nombre de notes qui seraient créées.
+    /// Dry-run only: number of notes that would be created.
+    ///
+    /// A dry-run does not query the vault, so this counts every parsed entry, including
+    /// entries whose card already exists.
     pub would_create: usize,
-    /// (dry-run) Nombre de notes sautées (déjà existantes).
+    /// Always `0`: a dry-run performs no existence check, so nothing is ever counted
+    /// here. Kept for symmetry with [`Self::skipped`].
     pub would_skip: usize,
-    /// (réel) Nombre de notes effectivement créées.
+    /// Apply mode only: number of notes actually created.
     pub created: usize,
-    /// (réel) Nombre de notes sautées (déjà existantes).
+    /// Apply mode only: number of notes skipped because the card already existed.
     pub skipped: usize,
-    /// Nombre d'entrées méta skippées (sections hors allowlist, include_meta=false).
+    /// Number of entries dropped because their section is outside the allow-list, which
+    /// only happens when `include_meta` is `false`.
     pub skipped_meta: usize,
 }
 
-/// Orchestre le backfill des entrées CHANGELOG vers le vault gradatum.
+/// Drives the back-fill of CHANGELOG entries into the gradatum vault.
 ///
-/// Sans `apply` (défaut) : affiche chaque payload (title + source_marker) sur stdout,
-/// ne POST rien. Avec `apply=true` : vérifie l'idempotence via `marker_exists` avant
-/// chaque write.
+/// Without `apply` (the default) each payload — title and source marker — is printed to
+/// stdout and nothing is posted. With `apply` set, idempotence is checked through
+/// [`VaultWriteClient::marker_exists`] before every write.
 ///
 /// # Errors
 ///
-/// Retourne `Err` si `apply == true` et `api_key` est vide (garde-fou avant tout accès
-/// réseau), si le parsing CHANGELOG échoue, ou si un appel HTTP produit une erreur
-/// non-récupérable.
+/// Returns an error when `apply` is `true` and `api_key` is empty (a guard rail that
+/// fires before any network access), when the CHANGELOG cannot be read, or when an HTTP
+/// call fails unrecoverably.
 pub async fn run_backfill<C: VaultWriteClient>(
     args: &BackfillChangelogArgs,
     client: &C,
@@ -444,7 +463,7 @@ pub async fn run_backfill<C: VaultWriteClient>(
     }
 
     let content = std::fs::read_to_string(&args.changelog_path)
-        .with_context(|| format!("lecture CHANGELOG : {}", args.changelog_path.display()))?;
+        .with_context(|| format!("reading CHANGELOG: {}", args.changelog_path.display()))?;
 
     // Parse une fois pour compter les entrées totales (include_meta=true) afin d'alimenter
     // skipped_meta, puis parse avec le flag réel pour la boucle de write.
@@ -476,20 +495,18 @@ pub async fn run_backfill<C: VaultWriteClient>(
             let exists = client
                 .marker_exists(&entry.source_marker)
                 .await
-                .with_context(|| {
-                    format!("vérification idempotence marker={}", entry.source_marker)
-                })?;
+                .with_context(|| format!("idempotency check marker={}", entry.source_marker))?;
 
             if exists {
                 report.skipped += 1;
-                tracing::debug!(marker = %entry.source_marker, "carte déjà existante — skip");
+                tracing::debug!(marker = %entry.source_marker, "map already exists — skip");
             } else {
                 client
                     .vault_write(&card)
                     .await
-                    .with_context(|| format!("vault_write pour marker={}", entry.source_marker))?;
+                    .with_context(|| format!("vault_write for marker={}", entry.source_marker))?;
                 report.created += 1;
-                tracing::info!(marker = %entry.source_marker, "carte créée");
+                tracing::info!(marker = %entry.source_marker, "map created");
             }
         }
     }

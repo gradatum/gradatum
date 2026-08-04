@@ -338,7 +338,9 @@ const RULES: &[Rule] = &[
     },
     Rule {
         emitted: "gradatum_curator_decisions_total",
-        fold_label: Some("action"),
+        // F-66 : fold over `path` → per-path totals (`curator.decisions.fast_admit`, …),
+        // the traffic-share-by-decision-path signal the tuning gate consumes.
+        fold_label: Some("path"),
         prefix: "curator.decisions",
         aggregate: false,
         group: "write",
@@ -363,7 +365,7 @@ const HTTP_REQUESTS_EMITTED: &str = "gradatum_http_requests_total";
 /// Préfixes de familles stub toujours listés au catalog (à 0, non instrumentés).
 const STUB_PREFIXES: &[(&str, &str, &str)] = &[
     // (prefix, group, unit)
-    ("curator.decisions", "write", "decisions"),
+    // curator.decisions is now instrumented (F-66) — only llm.calls remains a stub.
     ("llm.calls", "write", "calls"),
 ];
 
@@ -497,7 +499,7 @@ pub fn series_meta(series_key: &str) -> Option<CuratedSeriesMeta> {
         group: rule.group,
         kind: rule.kind,
         unit: rule.unit,
-        instrumented: !matches!(rule.prefix, "curator.decisions" | "llm.calls"),
+        instrumented: !matches!(rule.prefix, "llm.calls"),
     })
 }
 
@@ -561,14 +563,14 @@ mod tests {
         m.http_requests
             .get_or_create(&HttpReqLabels {
                 method: "GET".into(),
-                path: "/api/v1/vault_search",
+                path: "/api/v1/vault_search".into(),
                 status: 200,
             })
             .inc();
         m.http_requests
             .get_or_create(&HttpReqLabels {
                 method: "GET".into(),
-                path: "/api/v1/vault_read",
+                path: "/api/v1/vault_read".into(),
                 status: 503,
             })
             .inc();
@@ -607,11 +609,8 @@ mod tests {
     #[test]
     fn stub_catalog_entries_are_marked_not_instrumented() {
         let stubs = stub_catalog_entries();
-        assert!(
-            stubs
-                .iter()
-                .any(|e| e.key == "curator.decisions" && !e.instrumented)
-        );
+        // curator.decisions is instrumented since F-66 → no longer a stub entry.
+        assert!(stubs.iter().all(|e| e.key != "curator.decisions"));
         assert!(
             stubs
                 .iter()

@@ -7,6 +7,782 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Docker deployment.** Multi-service `docker-compose.yml` with 6 binaries (server, worker,
+  admin, gateway, engine, MCP stub), network isolation (`network_mode: service:` for the
+  worker), token environment injection, and CPU-only llama.cpp configuration for the engine.
+  The `Dockerfile` is a single multi-stage build producing all six binaries from the workspace.
+- **Engine deployment formalisation.** `gradatum-admin install` gains `--with-engine` and
+  `--with-gateway` flags; `scripts/deploy-gradatum-local.sh` gains `--engine` for coordinated
+  engine+server deployment. Engine documentation and usage examples added to `docs/`.
+
+### Fixed
+
+- **Multi-tenant hardening (production path).** Stale-lease recovery now runs `complete()` and
+  `fail()` on `SqliteQueueStore` — the production queue backend — rather than on the `jobs_v2`
+  admin path only, closing a critical isolation gap where a stale lease left a job permanently
+  stuck. JWT verification now validates `iss` and `sub` claims; revocation is tenant-scoped.
+  ApiKey listing filters by tenant. Worker dequeue properly documents tenant attribution via
+  `ensure_job_tenant`.
+
+## [1.0.0] — 2026-08-04
+
+First stable release. SemVer strict starts here: public APIs on `1.x` follow the LTS
+promise described in `RELEASE-POLICY.md`. This release closes the multi-tenant/multi-vault
+isolation foundation, completes the FR→EN user-facing string migration, and aligns the
+full workspace (27 publishable crates) to `1.0.0`.
+
+### Breaking changes
+
+- **`gradatum-core`: the four storage extension traits change signature — every out-of-tree
+  implementation must be rewritten.** `IndexStore`, `DocumentStore`, `QueueStore` and
+  `VectorStore` are the contract boundary for third-party storage backends (RFC-0001), and
+  **24 of their methods** now carry an explicit vault or tenant scope. **17 of the 24 have no
+  default implementation**, deliberately: a defaulted method would let an existing backend keep
+  compiling while silently ignoring the new scope — green tests over unscoped code, which is the
+  exact failure mode this release closes. For those 17, an external backend stops compiling until
+  every impl is updated.
+
+  **The remaining 7 carry a pre-existing default body, kept as is, and that default is a silent
+  success.** `IndexStore::count_fts_matches` returns `Ok((0, false))`; `get_statuses` and
+  `get_anchor_ms_batch` return an empty map; `set_note_trust` and `delete_redirect_by_ulid`
+  return `Ok(0)`; `QueueStore::count_jobs_by_status` returns an empty map and `latest_job`
+  returns `Ok(None)`. A backend that does not update them keeps compiling and answers *no match*
+  / *no row touched* against an `AclCheckedVaultId` it never read — the very failure mode
+  described above, left open on those seven. **What this release guarantees is therefore narrower
+  than a full stop**: a hard compile break on 17 methods, not a proof that every re-scoped method
+  honours its scope. Out-of-tree implementors must audit the seven by hand; removing those
+  defaults is itself source-breaking and cannot land inside `1.x`.
+
+  The change is not uniform, and the shape decides how each impl adapts:
+  - **10 methods take an ACL-checked vault handle** — the new
+    `gradatum_core::scope::AclCheckedVaultId`, obtained through `attest_read_checked`,
+    `attest_write_checked` or `for_system_task`, never built from a bare string. Three of them
+    **gain** the parameter in leading position: `DocumentStore::downgrade_note`,
+    `patch_note_status`, `update_note_locus`. The other seven **retype** a vault parameter they
+    already carried — `&VaultId` → `&AclCheckedVaultId` for `IndexStore::count_fts_matches`,
+    `search_fts_with_snippet`, `timeline`; `&str` → `&AclCheckedVaultId` for
+    `IndexStore::get_anchor_ms_batch`, `get_statuses`, `get_titles_sections` and
+    `VectorStore::search_semantic`.
+  - **9 methods gain an untyped leading `vault_id: &str`** — `IndexStore::get_trust`,
+    `set_note_trust`, `resolve_redirect`, `upsert_redirect`, `delete_redirect_by_ulid`,
+    `DocumentStore::get_content_hash`, `upsert_note_title`, `VectorStore::get_note_embedding`,
+    `insert_note_embedding`. These carry the scope without carrying the attestation: the type
+    does not prove the vault was ACL-checked, so the responsibility stays at the call site.
+    Converging them onto `AclCheckedVaultId` would itself be a source-breaking retype, so it
+    cannot land inside `1.x` — the split between the two groups is frozen until `2.0.0`.
+  - **`IndexStore::search_fts_for_forget` retypes** its vault parameter `&str` → `&VaultId`;
+    arity unchanged.
+  - **The four `QueueStore` methods take a tenant filter, not a vault.** `get`, `cancel` and
+    `count_jobs_by_status` gain a trailing `tenant_filter: Option<&str>`; `latest_job`
+    converts the `&str` it already had into `Option<&str>`. `None` means no tenant clause and
+    is byte-identical to `0.8.0`; `Some(t)` adds `tenant_id = t`, which is what makes a
+    cross-tenant `get` read as `None` (404 anti-disclosure at the handler) and a cross-tenant
+    `cancel` a no-op on zero rows.
+  - **`DocumentStore::upsert_note_title` also changes its return type**, `Result<()>` →
+    `Result<usize>`. It is the only method in the group that breaks *callers* and not just
+    implementors.
+- **`gradatum-core`: `OverrideScope::Locus` and `OverrideScope::Bearer` become struct variants
+  carrying their vault.** `Locus(LocusId)` is now `Locus { vault: VaultId, locus: LocusId }`
+  and `Bearer(BearerId)` is now `Bearer { vault: VaultId, bearer: BearerId }`;
+  `Vault(VaultId)` is unchanged. Construction and pattern matching both break — a tuple
+  pattern no longer applies to either variant. The `IndexStore::upsert_override_raw` and
+  `get_override_raw` signatures are untouched (they take `&OverrideScope`), so the break
+  surfaces at the construction and match sites, not on the trait. **The vault is the isolation
+  key**: `upsert_override_raw` used to persist both scopes under the sentinel
+  `vault_id = '_unset'`, a bucket shared by every vault, so under the composite primary key
+  `(vault_id, note_id, scope_kind, scope_id, override_type)` introduced by migration `0034`
+  two vaults holding an override on the same `note_id` and the same `scope_id` clobbered each
+  other on write and read across vaults on read. Migration `0036` re-keys the legacy
+  `'_unset'` rows to `'main'` — one column value changes, no schema change, and
+  `Vault`-scoped overrides never used the sentinel. The serialized form changes with the
+  variants:
+  `#[serde(tag = "kind", content = "id")]` now emits
+  `{ "kind": "locus", "id": { "vault": "main", "locus": "decisions" } }` where it emitted
+  `{ "kind": "locus", "id": "decisions" }`.
+- **`gradatum-curator`: `CuratorPipelineConfig` loses three public fields** —
+  `llm_review_endpoint`, `llm_review_model`, `llm_review_timeout_ms`. They were parsed and
+  propagated into the struct but never read by the pipeline. `CuratorPipelineConfig` is not
+  `#[non_exhaustive]`, so removing them breaks both literal construction and field access for
+  any external consumer. Callers that set or read these fields must drop them: the review
+  endpoint, model, and timeout are taken from `[curator.llm]` `base_url` / `model` /
+  `timeout_ms`.
+- **`server.toml`: `auth.jwt_public_key_path` and `auth.jwt_private_key_path` removed.** The
+  JWT signing material is the seed at `<storage.root>/config/jwt-signing-key.secret`
+  (`kid = gradatum-v0`), now the single source of truth for both `gradatum-server` and
+  `gradatum-admin token issue`. **Existing configs still boot**: a `server.toml` that still
+  carries these two keys is accepted and the keys are ignored.
+  **One case requires operator action before upgrading.** The key directory used to be the
+  parent of `jwt_private_key_path` whenever that parent sat under `storage.root`, and falls
+  back to `<storage.root>/config` otherwise; it is now always `<storage.root>/config`. A
+  deployment whose seed lived under `storage.root` but outside `config/` — for example
+  `jwt_private_key_path = "<storage.root>/secrets/jwt.private.pem"` — will find no seed at
+  the new location and **generate a fresh one at first boot, invalidating every JWT in
+  circulation** (API keys are unaffected — they are verified against their own store). The
+  server logs a `WARN` naming the path, but the boot succeeds and nothing
+  distinguishes this case from a legitimate first startup. Move the existing
+  `jwt-signing-key.secret` into `<storage.root>/config/` before upgrading, or plan for every
+  consumer to re-exchange its API key. Deployments already using the default layout are
+  unaffected. `gradatum-admin init` no longer generates the PEM pair, and any previously
+  generated PEM files are inert.
+- **`gradatum-worker --db` is now validated.** The flag stays optional; when supplied, a value
+  that diverges from the path derived from `storage.root` makes the worker refuse to start.
+  Previously a divergent `--db` silently created a second, empty queue database — the worker
+  then acquired leadership and processed zero jobs without reporting an error.
+- **`gradatum-admin api-key create`: `--scopes` is now required, and a scope set that grants
+  no write access is refused.** Write access comes only from the exact scopes `write`,
+  `admin` or `service` (`gradatum_acl_auth::WRITE_SCOPES`); anything else — `vault_write`
+  included — grants none. The command previously defaulted `--scopes` to `vault_read` and
+  accepted any string, so `api-key create --owner x` minted a key that looked writable and
+  was rejected on every write once `multi_tenant.enabled = true`. Two invocations change:
+  omitting `--scopes` is now a usage error, and a read-only key must say so explicitly —
+  `--scopes vault_read --read-only`. Scripts that already pass a write scope are unaffected.
+  The check covers **creation only**: `api-key rotate` carries the source key's scopes over
+  unchanged, and keys already in the store are not revalidated, so an existing key may still
+  carry a scope that grants nothing — list them with `api-key list` and rotate deliberately.
+- **`gradatum-gateway`: `token_counter::estimate_total_tokens` removed.** It returned
+  `estimate_input_tokens(request)` plus the requested `max_tokens`, and had no production
+  caller left. **There is no drop-in replacement**; `token_counter::estimate_input_tokens`
+  stays public and callers recompose the old result explicitly:
+  `estimate_input_tokens(req).saturating_add(u64::from(req.max_tokens.unwrap_or(0)))`.
+  Note that the gateway itself no longer sums that way — the request path now reserves a
+  per-axis output floor (`max(max_tokens, reasoning reserve)`) so a reasoning block is
+  counted even when `max_tokens` is absent. That reserve is crate-internal, so an external
+  consumer cannot reproduce the gateway's exact cap arithmetic; only the input estimate is
+  public.
+- **`gradatum-vault`: `Vault::tenant_id()` renamed to `Vault::vault_id()`.** Same signature
+  (`-> &VaultId`) and same returned value — the rename resolves a real ambiguity, not a
+  cosmetic one. The accessor never returned the authenticated principal: it returns the
+  **physical namespace** of the vault, the `<vault_id>/` directory on disk. Callers that
+  wanted the namespace rename the call and are done. Callers that read `tenant_id()`
+  expecting the *caller's identity* were reading the wrong value already: the principal is
+  a `TenantId`, carried by the request's `TrustContext` and obtained through
+  `TrustContext::tenant_id() -> Option<&TenantId>` — never from a `Vault` handle. That
+  accessor changed signature in this release too; see the next entry.
+- **`gradatum-core`: `TrustContext::tenant_id()` now returns `Option<&TenantId>` instead of
+  `Option<&str>`.** Same typed-principal move as `Vault::vault_id()` above: the authenticated
+  principal is a `TenantId` newtype rather than a bare string, so the namespace/principal
+  confusion cannot be reintroduced silently. Callers needing the bare string append one call
+  — `ctx.tenant_id().map(TenantId::as_str)` — byte-identical to the previous return value.
+  **The JSON wire format is unchanged**: `TenantId` is `#[serde(transparent)]`, so any
+  payload carrying it serializes exactly as the string did; this is a source-only break.
+  The type is not re-exported by `gradatum-dto` — import it from `gradatum_core::scope`.
+- **`gradatum-dto`: `tenant_id` moves from `TenantId` to `Option<TenantId>` on 23 public
+  request DTOs, and the wire default `"main"` disappears from the contract.** The field
+  carried `#[serde(default = "default_main")]`, so an omitted `tenant_id` deserialized as the
+  `"main"` principal; it now carries `#[serde(default, skip_serializing_if = "Option::is_none")]`
+  and an omission stays `None`. **Omitting the field is the nominal case**: the server derives
+  the effective tenant from the credential identity (JWT / API key) in
+  `api_v1::tenant_guard::effective_tenant`, and a context carrying no tenant — anything
+  non-Bearer — is refused with `403`. A `tenant_id` that *is* supplied stays checked for
+  consistency, unchanged: accepted when it equals the credential's tenant (a harmless echo),
+  refused with `403` when it diverges. The field becomes *ignorable*, not *mandatory*: it is
+  no more required than before, it has simply stopped standing in for the principal.
+  **Wire consumers gain a case rather than lose one**: a key belonging to tenant `x` that
+  omitted `tenant_id` used to deserialize as `"main"`, diverge from the credential and take a
+  `403`; it now resolves `x`. The JSON Schema published by the MCP tool surface drops the
+  `"default": "main"` annotation on every affected input accordingly.
+  **The break is source-level, for Rust callers of the DTO structs**, which are not
+  `#[non_exhaustive]`: literal construction and field reads both need adapting. Wrap the value
+  — `tenant_id: Some(TenantId::new("x"))` — or, preferably, write `None` and let the server
+  derive the principal from the credential.
+- **`gradatum-dto`: `default_main()` is removed.** It existed only as the
+  `#[serde(default = "default_main")]` helper behind the `tenant_id` fields above; with the
+  wire default gone it has no remaining call site, and is deleted rather than kept as a typed
+  no-op on a surface SemVer would freeze for the whole `1.x` line. An external DTO that used it
+  must supply its own helper, or follow the same move and make its own `tenant_id` field
+  `Option<TenantId>`. The companion `default_main_vault() -> VaultId`, covering the `vault_id`
+  namespace axis, is untouched: it is new in `1.0.0`, still public, and still the
+  `#[serde(default)]` helper behind `ArchiveEntryDto::vault_id`.
+- **`VaultGrant.tenant_id` is now a `TenantId`, and the grant lookup takes `&TenantId`.**
+  Three source-breaking signatures, same typed-principal move as above:
+  `gradatum_core::scope::VaultGrant::tenant_id` moves from `String` to `TenantId`;
+  `gradatum_core::index_store::IndexStore::tenant_grants` and
+  `gradatum_index::SqliteIndex::tenant_grants` take `&TenantId` instead of `&str`.
+  Callers holding a bare string wrap it — `TenantId::new(s)`, unvalidated and
+  byte-identical — and callers reading the field append `.as_str()`.
+  This is a **public-surface consistency pass, not a security hardening**: no production
+  code reads `VaultGrant::tenant_id` at all (the tenant is matched by the
+  `WHERE g.tenant_id = ?1` clause of the SQL lookup, never by comparing the field in
+  Rust), so nothing is enforced that was not enforced before. Its value is that the
+  principal can no longer be confused with a `VaultId` at a call site, on a surface that
+  SemVer would otherwise freeze for the whole `1.x` line.
+  **The wire format is unchanged and covered by a test**: `TenantId` is
+  `#[serde(transparent)]`, so a serialized `VaultGrant` is byte-identical to the one
+  `0.8.0` produced, and the SQLite column stays a plain `TEXT` — no migration.
+  One minor narrowing comes with it: the two constructors `VaultGrant::new` and
+  `VaultGrant::new_scoped` move from `impl Into<String>` to `impl Into<TenantId>`, which
+  accepts `&str` and `String` but no longer `Cow<str>`, `Box<str>` or `char`. Internal
+  impact is nil — `VaultGrant` is constructed at a single production site.
+- **`gradatum-admin`: `VaultRenameArgs` fields `ancien` / `nouveau` renamed to
+  `current_title` / `new_title`.** The struct is public on both export paths
+  (`gradatum_admin::VaultRenameArgs` and `gradatum_admin::vault_rename::VaultRenameArgs`),
+  so any external caller constructing it must rename the two fields. Types and semantics are
+  unchanged (`String` / `String`), as are the `root` and `tenant` fields. These were the last
+  French identifiers on the public API surface; they are renamed now rather than frozen by
+  SemVer for the whole `1.x` line. The FR→EN entry under *Changed* covers user-facing
+  **messages** — it does not imply this field rename, which is a separate source-breaking
+  change.
+  **The `gradatum-admin vault rename` CLI is not broken**: both arguments stay positional, in
+  the same order and count, so existing operator scripts keep working unchanged. Only the
+  help labels move, from `<ANCIEN> <NOUVEAU>` to `<CURRENT_TITLE> <NEW_TITLE>`.
+- **`gradatum-server`: `api_v1::dto::SearchHit` gains a public `vault_id` field and becomes
+  `#[non_exhaustive]`.** The attribute is the wider of the two changes: from another crate,
+  `SearchHit` can no longer be built as a struct literal nor destructured exhaustively — for
+  *any* field, not only the new one — so there is no source-compatible migration for a
+  downstream literal. That is deliberate and matches how the type is used: `SearchHit` is a
+  response type, produced by the server and read by consumers, and the attribute is what lets
+  further fields land during `1.x` without another major bump. There is no public constructor
+  and none is planned; a `SearchHit` is obtained by deserializing a `vault_search` response.
+  Reading fields, pattern matching with a trailing `..`, `Debug` and `serde` are all
+  unaffected. Wire consumers are not affected either — see the `vault_search` entry under
+  *Added*; this is a source-level break, and only for Rust callers that use the type directly
+  rather than through the HTTP or MCP surface.
+- **`#[non_exhaustive]` added to five public enums** — `TrustContext` and `StudioScope`
+  (`gradatum_core::trust`), `JobScope` (`gradatum_core::job`), `AclOp` and `AclDecision`
+  (`gradatum_acl_policy`). Deliberate hardening ahead of the `1.x` API freeze: new variants
+  can then be introduced within `1.x` without a major bump. It is itself a breaking change:
+  downstream `match` expressions over these enums must carry a `_` arm — exhaustive matching
+  no longer compiles. Constructing the existing variants is unaffected. On the authorization
+  path the `_` arm must be **fail-closed** (`evaluate` denies any unwired variant). Note the
+  asymmetry with `CuratorPipelineConfig` above: this pass targeted the authorization/ACL/job
+  enums, plus the `SearchHit` response DTO listed separately above; it did **not** target
+  configuration structs, so `CuratorPipelineConfig` enters `1.0.0` *without*
+  `#[non_exhaustive]` — every field added to it during `1.x` will cost a major bump. That was
+  not an oversight left open: the struct has neither a `Default` impl nor a public
+  constructor, and it is built as a literal from another crate — `impl
+  From<&WorkerCuratorConfig> for CuratorPipelineConfig` in `gradatum-worker` — which
+  `#[non_exhaustive]` forbids. Adding the attribute would have required shipping a builder or
+  a constructor — an API addition — on the eve of the freeze.
+- **`gradatum-worker`: a job whose scope carries no vault is refused when
+  `multi_tenant.enabled = true`.** A scope determines a vault only if it *carries* one:
+  `JobScope::Vault(v)` does; `VaultWide`, `Locus`, `Notes` and `Session` do not — they say
+  *what* the work covers, never *where* it lives. Those four used to fall through to `"main"`;
+  with the flag on they now fail the job terminally (`HandlerError::Business`, message
+  `ambiguous job vault: … the enqueue site must carry JobScope::Vault(v)`).
+  **With the flag off nothing changes**: `"main"` is the only vault, so it is *the* answer and
+  not an arbitrary pick, and resolution stays byte-identical to `0.8.0`. The resolved vault is
+  what scopes destructive access — `delete_note` in the purge handler, `persist_forget` in the
+  forget handler — so silently electing one vault out of N was a corruption path, not a
+  convenience: a job could list its candidates in one vault and mutate homonyms in another.
+  Three handlers consume the resolution (`handle_purge`, `handle_forget`, `handle_distill`);
+  `handle_curate` and `handle_embed` do not and are unaffected.
+  **Every enqueue path feeding those handlers carries `Vault(v)` — with one conditional
+  exception, named here rather than glossed over.** The paths, enumerated: `POST /api/v1/jobs`
+  (`api_v1::jobs_v2`), which takes the vault from the authentication context and never from the
+  request body; `POST /api/v1/vault_forget` and the `vault_forget` MCP tool, which share
+  `api_v1::forget::build_forget_job_record`; and `gradatum-admin vault forget`, which has its
+  own builder — see the next entry. Each of those carries `Vault(v)` unconditionally.
+  **The exception is the distill cron** (`gradatum-worker::schedules::build_distill_job_record`):
+  its outer `JobSpec.scope` carries `Vault(tenant_id)` **only when `[multi_tenant] enabled =
+  true`**, and stays `JobScope::Locus(locus)` when the flag is off. That is not a hole — with
+  the flag off, `Locus` resolves to `"main"`, the only vault, so the job is scoped exactly as
+  before and byte-identically to the single-vault behaviour. The distinction matters only if
+  the flag is read as irrelevant to this path; it is not. That function's own doc-comment
+  states the same condition, and is the authority on it.
+  **The curate path still enqueues
+  `JobScope::VaultWide`** (`build_curate_job_record`, reached from `vault_write`): it is not one
+  of the three consumers of the resolution, and it carries its tenant in `CurateSpec.tenant_id`
+  instead. Read the guarantee as scoped to the handlers that consume `resolve_job_vault`, not as
+  a property of every job record in the queue.
+- **`gradatum-admin vault forget`: one `Job::Forget` is enqueued per vault, and the enqueue
+  line changed.** The command used to build a single record scoped `JobScope::VaultWide`; it
+  now emits `JobScope::Vault(v)`, one job per targeted vault. Three consequences for
+  operators, one of them affecting *every* invocation:
+  **(1) The enqueue line now names the vault.** It moved from `Job::Forget enqueued : <ulid>`
+  to `Job::Forget enqueued (vault <v>) : <ulid>`, still followed by
+  `Poll : gradatum-admin jobs get <ulid>`. This applies to the ordinary single-vault case
+  too — any script matching the old line breaks. A `vault forget agent --vaults a,b`
+  invocation now prints **one such pair per vault** rather than one for the whole run;
+  duplicate vaults are collapsed and input order is preserved. The other sub-commands
+  (`topic`, `locus`) target a single vault and enqueue a single job.
+  **(2) `vault forget locus --tenant X` with `X ≠ "main"` now fails when
+  `multi_tenant.enabled = false`.** The targeting flag is `--tenant` and is shared by all
+  three sub-commands; there is no `--vault` flag. **The previous behaviour was wrong, not
+  merely different**: the preview listed candidates in `X` (its SQL filters on
+  `notes.vault_id`) while the worker derived the mutation vault from `VaultWide` and resolved
+  it to `"main"` — so the command forgot `main`'s homonyms, or nothing at all, and reported
+  success either way. Note *where* the failure surfaces: the CLI still exits `0` after
+  enqueuing, and the terminal error (`unsupported vault scope (mono-vault): 'X' ≠ 'main'`) is
+  read on the job, with `gradatum-admin jobs get <job_ulid>`. The symmetric case is the
+  point of the change: with multi-tenant mode on, `--tenant X` now genuinely operates on `X`.
+  **(3) The preview is grouped by vault.** Its header gained a vault count —
+  `=== vault forget preview (N eligible, M excluded, K vault(s)) ===` — and each vault gets a
+  `-- vault: <v> --` block. The `[DRY-RUN]` hint is unchanged and still lists the union of
+  eligible ULIDs, so the double-confirmation handshake is unchanged: the operator confirms the
+  whole set once with `--confirm-ulids`, and the command splits it per vault, each job
+  confirming only its own ULIDs.
+- **`gradatum-worker`: `InternalClient::get_note` gains a leading `vault_id` parameter** —
+  `get_note(&self, vault_id: &str, ulid: &str)`. It was the last note read left unscoped on
+  the trait; `get_note_status`, `get_note_embedding`, `get_trust` and `delete_note` already
+  carried a vault. An unscoped read-back resolves to `"main"` server-side
+  (`resolve_read_back_reader`, `vault.unwrap_or("main")`), so a caller working in a secondary
+  vault read `main`'s homonym and the note *read* was not necessarily the note *mutated*. The
+  method is called on protection guards, which is what made the divergence silent. **No
+  default implementation is provided, deliberately**: a defaulted method would have let
+  existing implementations keep compiling while ignoring the new parameter — green tests over
+  unscoped code. External implementors must add the parameter and forward it; callers pass the
+  vault they are scoped on. In a mono-vault deployment `vault_id` is always `"main"`, which is
+  the server's own default, so the request on the wire is byte-identical to the previous one.
+- **Public API surface, measured against the published baseline.** `cargo public-api` on
+  `gradatum-core`, `0.7.6` → `1.0.0`, run with `--all-features` and the three
+  `--omit` filters (`blanket-impls`, `auto-trait-impls`, `auto-derived-impls`) — the exact
+  invocation of `public-api/regen.sh`.
+  **The item counts are deliberately not reproduced here.** They live in
+  `public-api/baseline/_INDEX.tsv`, which carries the per-crate totals and is regenerated and
+  committed together with the surface files themselves. Read that file.
+  **That omission is a correction, not a stylistic preference.** This entry has twice carried
+  counts that were correct when written and false days later. It first read
+  `0 removed, 56 changed, 113 added` — still reproducible at `17294c76` (2026-07-28) — and was
+  then re-measured and re-anchored to a release-head commit. Anchoring a figure to a commit was
+  not enough: the head moved again, `crates/gradatum-core/src/` moved with it, and the count
+  drifted a second time. The `create_feature_card` API described under *Added* is itself part
+  of that drift — the same document announced a feature and, a few paragraphs above, a surface
+  count that excluded it. A count that must be re-anchored at every commit is a maintenance
+  burden that has already failed twice; the generated index does not have that property.
+  **The removals are the whole `gradatum_core::acl` module, enumerated in full:**
+  ```
+  pub mod   gradatum_core::acl
+  pub trait gradatum_core::acl::ACLFilter
+  pub fn    ACLFilter::filter(&self, &'a [Note], &BearerId) -> Vec<&'a Note>
+  pub trait gradatum_core::acl::AclPolicy
+  pub fn    AclPolicy::allow_read  (&self, &Note, &BearerId) -> bool
+  pub fn    AclPolicy::allow_write (&self, &Note, &BearerId) -> bool
+  pub fn    AclPolicy::allow_delete(&self, &Note, &BearerId) -> bool
+  ```
+  **Migration — `ACLFilter`: removed, no replacement, nothing to do.** The trait had no
+  implementor and no caller anywhere in the workspace, and no listing endpoint ever went
+  through it, so implementing it hid nothing from anyone. There is no successor trait and
+  none is needed.
+  **Migration — `AclPolicy`: removed, and the extension point goes with it.** The access
+  control that actually runs is `gradatum_acl_policy::AclEngine` —
+  `evaluate(&TrustContext, AclOp, &str) -> AclDecision`, glob-based, deny-wins, built from a
+  preset via `AclEngine::from_preset_str`. Read that as a statement of *where the check lives
+  now*, not as a migration path, because it is not one: `AclEngine` is a concrete struct, not
+  a trait, so an out-of-tree crate that **implemented** `AclPolicy` to supply its own policy
+  has **no supported way to do so on `1.x`** — third-party rules engines are not currently
+  pluggable. `AclOp` moreover carries only `Read` and `Write`: `allow_delete` has no
+  equivalent at all. Whether external policy implementations come back is deferred to
+  RFC-0002 (RFC-0001 §12, Q4), which is not resolved. The module was removed rather than
+  frozen because it was dead: its traits documented themselves as the core of access control
+  while holding zero implementations, and freezing that for the whole `1.x` line was the
+  worse option.
+  **Scope of the measurement, and what keeps it from going stale again.** The narrative above
+  covers `gradatum-core`. The other publishable crates are covered by a mechanism rather than
+  by hand: `public-api/baseline/` holds one committed surface
+  file per **library** crate — 26 files against 27 publishable crates, because
+  `gradatum-mcp-stub` is bin-only and has no baseline: its published surface is covered by the
+  rustdoc gate but by no API-surface gate. `public-api/baseline/_INDEX.tsv` carries the
+  per-crate item counts and their total; read that file rather than any figure quoted here.
+  The CI `public-api` job runs `./public-api/regen.sh --check` over all of them, blocking on
+  push to `main` as well as on pull requests. **What that gate guards is the baseline files —
+  not any figure written in this changelog.** A surface change landed without a matching
+  re-baseline fails CI; a re-baseline landed while a count quoted in prose goes unupdated does
+  not fail, and cannot, because the gate never reads this file. That asymmetry is exactly how
+  the counts this entry used to quote went stale while CI stayed green, and it is why the entry
+  now points at the generated index instead of restating it. Two blind spots are documented in
+  `public-api/README.md` and are not closed: `#[doc(hidden)]` items are invisible to the tool
+  (four published crates measure 1 item each and are effectively uncovered), and
+  `--omit auto-derived-impls` hides the `impl From` generated by `#[from]`.
+  The changed items resolve to a much smaller set of distinct symbols than their raw count
+  suggests, each trait method counting twice because it is re-exported at the crate root — a
+  further reason not to read a raw item count as a change count. The additions are dominated
+  by the rights-model newtypes (`TenantId`, `AclCheckedVaultId`, `VaultGrant`, `GrantAccess`,
+  `TenantStatus`), the `AgentId` newtype, and the `AuditScanRow` and `AnnPartitionDeficit`
+  row types.
+  **Removals in the other crates were re-measured against `0.7.6`, and every one of them is
+  already described above**: `gradatum-curator` 3 (the `llm_review_*` fields),
+  `gradatum-dto` 1 (`default_main`), `gradatum-vault` 2 (`Vault::tenant_id`, counted twice
+  for the crate-root re-export), `gradatum-index` 20 — sixteen being the `SqliteIndex`
+  inherent methods that mirror the trait re-scoping, the remaining four being
+  `delete_temporal_entry` and `get_replaced_by`, which are not removals but gain a vault
+  parameter and are present at the release head with the new signature. No removal outside
+  `gradatum_core::acl` was left undocumented. Three crates could not be diffed against
+  `0.7.6` at all — `gradatum-studio` was never published at that version, and the `0.7.6`
+  baselines of `gradatum-engine` and `gradatum-search` are not buildable — so for those
+  three, no breaking change was established, which is not the same as none existing.
+
+- **`gradatum-markdown`: `MarkdownError::Yaml` no longer exposes the YAML backend's error
+  type.** The variant now carries an opaque `gradatum_markdown::YamlError` instead of
+  `serde_yml::Error`, and the `impl From<serde_yml::Error> for MarkdownError` is removed.
+  Code that matches the variant (`Err(MarkdownError::Yaml(_))`) and code that reads the
+  message (`Display`, `to_string()`) are **unaffected**: the message is unchanged and still
+  embeds the backend diagnostic verbatim, line and column included. Only two things break —
+  naming the inner type (`Yaml(e) => /* e: serde_yml::Error */`) and relying on the `From`
+  conversion through `?`. Both were leaks of an implementation detail: the backing YAML
+  crate has now changed three times (`serde_yaml` → `serde_yml` → `serde_norway`) and each
+  change was a breaking one purely because of this exposure. `1.0.0` is the last opportunity
+  to close it without a further major, which is why it is done here rather than deferred.
+  `YamlError` deliberately does not forward `Error::source` to the backend error, so the
+  concrete type cannot be recovered by `downcast_ref` either.
+- **Minimum supported Rust version (MSRV) raised from `1.88` to `1.91`.** A toolchain older than
+  `1.91` no longer builds any crate of the workspace. The bump is not a choice of style: it
+  is the requirement of `opendal` `0.58`, itself the first release line whose `opendal-core`
+  demands `quick-xml >= 0.41` — the threshold that closes RUSTSEC-2026-0194 and
+  RUSTSEC-2026-0195 (see *Security*). Every consumer pinned to an older toolchain must
+  upgrade it before upgrading to `1.0.0`; there is no feature flag that avoids this.
+- **`AuthConfig.revocation_store` (server config) is now a typed value (`sqlite` | `memory`)
+  instead of a plain string.** Any other value — a typo, a wrong case — is now a startup
+  error. Previously, the guard that refuses to run the in-memory revocation store in
+  production only rejected the exact string `"memory"`, while store selection only matched
+  the exact string `"sqlite"`: a third value passed the guard *and* silently selected the
+  in-memory store, which loses every token revocation on restart with a single `warn!` log
+  line as the only trace. Deployments already using `"sqlite"` or `"memory"` are unaffected.
+- **`gradatum-worker`'s DLQ cleanup schedule now refuses `retention_days = 0` at config parse
+  time.** `0` used to set the cleanup cutoff to "now" and irreversibly purge the entire
+  dead-letter queue on the next tick. The 30-day default is unaffected and still applies
+  when the key is omitted.
+
+### Deprecated
+
+- **`[curator] llm_review_endpoint` / `llm_review_model` / `llm_review_timeout_ms`** are still
+  parsed by `gradatum-worker` but have no effect. The worker logs a `WARN` at boot naming the
+  keys present and the settings that actually apply (`[curator.llm]` `base_url` / `model` /
+  `timeout_ms`). Remove them from your configuration.
+- **`gradatum-server`: `api_v1::dto::SearchHit::trust` enters `1.0.0` already deprecated**
+  (`#[deprecated(since = "0.4.8")]`). It is hardcoded to `0.5` and has never reflected the
+  actual trust of a source; the real values are `scores.trust_raw` and `scores.trust_decayed`,
+  emitted when the request carries `include_scores: true`. The field is **not** removed here:
+  it is part of the `1.0.0` public surface, so under the `1.x` LTS promise it stays on the
+  wire and in the Rust struct until `2.0.0`. Reading it emits a deprecation warning at compile
+  time; serialization is unchanged, so existing wire clients keep working untouched.
+
+### Added
+
+- **Multi-tenant vault isolation foundation (F-63/F-18).** A `VaultGrant` substrate
+  (`TenantId`/`VaultId` newtypes, migration `0030`) backs a per-vault handle registry with
+  vault lifecycle management (provision, suspend, soft-delete, purge). Every read/write path
+  — notes, search, ANN, archive, temporal index, cache, jobs, config — is scoped through an
+  ACL-checked vault handle instead of a single implicit vault. The ANN index is partitioned
+  by `(vault_id, embedder_id)` (migration `0038`); child tables carry composite foreign keys
+  tying rows to `(vault_id, note_id)` (migrations `0033`, `0034`, `0039`). Job rows carry a
+  tenant (migration `011`, `gradatum_jobs.tenant_id`); note that the worker's `dequeue` and
+  `dequeue_by_kind` select the next pending job without a tenant clause, so the queue is
+  tenant-attributed but not tenant-partitioned at dequeue time. Per-vault config
+  overrides fall back to the global config when unset. Gated behind
+  `multi_tenant.enabled` (default `false` — opt-in; single-vault deployments are
+  byte-identical to `0.x` behavior).
+- **Multi-user identity (F-45).** JWT identity issuance is governed by a configurable
+  allow-list of keys, and the JWT `jti` is propagated into the audit trail for real
+  per-identity attribution. Per-key **write**-scope enforcement is gated behind
+  `multi_tenant.enabled` (default `false`): with multi-tenant mode off, a key's scopes are
+  recorded but not checked on the request path — a key created with `--scopes vault_read` can
+  still write. With multi-tenant mode on, a write requires the key to carry one of `write`,
+  `admin`, `service` (`WRITE_SCOPES`, exact string match); any other scope value is
+  read-only. **Read access is never governed by key scopes**, in either mode — it is
+  governed by vault grants and the locus ACL. Write-scope enforcement outside multi-tenant
+  mode is planned for a `1.x` release.
+- **Per-note usage salience in `vault_search` (opt-in, default off).** A usage-weighted
+  salience factor (reads, search hits, top-3 surfacing, recall acceptance) can be folded
+  into ranking; a companion audit path detects notes that have become irrelevant and can
+  auto-downgrade them, and a `distill_pressure` cron counts live, non-`processed` notes per
+  locus and enqueues a `Job::Distill` for a locus once that count crosses a threshold
+  (weekly by default, capped per tick). Off by default like the salience factor itself.
+- **`build_sha` in `--version`** for `gradatum-server` and `gradatum-worker`, plus
+  deploy-time build-SHA verification, to make "what's actually running" a checkable fact.
+- **`vault_search` results carry their source vault.** Every hit gains a `vault_id` field
+  naming the vault it was read from. It is always present — on the cross-vault path it is
+  the request's target, not the caller's own vault — so a result states its origin instead
+  of leaving the caller to infer it from the request it sent. That inference was the
+  problem: it breaks the moment a single hit is quoted, cached or merged away from its
+  response, and a client aggregating several vaults had no way to tell the results apart.
+  `vault_id` and `path` together form the full address of a note; `path` alone is only
+  unique within a vault. On the wire the change is purely additive — a JSON string on each
+  item — and clients that ignore unknown fields are unaffected. The MCP surface passes it
+  through unchanged: `vault_search` declares no `outputSchema` and returns no
+  `structuredContent`, so there is nothing for an MCP client to validate the extra field
+  against.
+- **`create_feature_card`, a new MCP tool: project-map feature cards whose `F-XX` number is
+  assigned by the server.** The caller no longer picks the number. The body carries the
+  non-feature roles (`project`, `status`, `kind`, `release`, `version`) and must **not**
+  contain a `[[feature:…]]` link — a body that does is rejected, the number being the
+  server's to assign. The call is asynchronous: it returns
+  `{ feature, number, job_id, note_id, poll_url }`, and the card is only confirmed written
+  by polling `job_status`.
+- **`job_status`, a new MCP tool: the state of an asynchronous job, by `job_id`.** It returns
+  `{ status, terminal, error, conflict, result_note }` and answers the one question a caller
+  of an async write has — keep polling, or conclude? **`terminal` is the field to branch on**,
+  never a hardcoded set of state names: `terminal = true` means conclude, `terminal = false`
+  means keep polling, and the set behind the flag can grow within `1.x` without any client
+  change. The distinction is not intuitive in one case: **`Failed` is not terminal** — a retry
+  is still pending — so a client that concludes on `Failed`, or on anything that is not
+  `Done`, reports an outcome for a job that is still running. The response is a snapshot at
+  an instant; the caller re-polls, there is no server-side wait.
+- **Configuration fallbacks became observable: `gradatum_config_degraded`.** When a worker
+  configuration section is absent or fails to parse, the worker falls back to that section's
+  defaults and keeps running — a deliberate choice, but one that used to be silent, so a typo
+  in a section name was indistinguishable from a section left out on purpose. The worker now
+  publishes a gauge per section, labelled with the cause of the fallback. **The gauge is
+  published even when nothing is degraded** (value `0`, `cause="none"`): a monitoring probe
+  can therefore distinguish *healthy* from *not reporting*, which an alert-on-presence design
+  cannot. An absent series is not a zero.
+- **`gradatum-worker` applies the database migrations it depends on.** The worker created its
+  own queue tables but relied on `gradatum-server` having applied migrations `006`–`011`
+  first. Against a database where that had not happened, every Apalis task failed on a missing
+  table, the monitor drained, and the process **exited with status 0** — a startup failure
+  indistinguishable from a clean shutdown. The worker now runs the migrations itself. On a
+  fresh database, whichever of the two processes loses the race exits with an error and is
+  restarted against a migrated schema.
+- **Opt-in `compact` response mode on the MCP read tools.** `vault_search`, `vault_read`,
+  `vault_timeline` and `vault_lessons_recall` each accept a boolean `compact` request field.
+  When set, the server returns `{ "compact": "<text>" }` — a plain-text rendering of the same
+  result — instead of the full typed response. It exists for LLM consumers, for which the
+  JSON scaffolding and the metadata blocks are pure token cost. **The default is `false` and
+  the full response is unchanged**, so this is additive for every existing client. Note this
+  is a *different* mechanism from `vault_context`'s `mode: "compact"` introduced in `0.7.6`:
+  that one selects a *retrieval strategy* (which notes are inlined versus returned as stubs),
+  this one selects a *rendering* of an unchanged result set. They do not interact.
+- **The CycloneDX SBOM is attached to the GitHub Release and is byte-reproducible.** It was
+  previously generated as a short-lived CI artifact that nothing consumed. Two properties are
+  now guaranteed. *Scope*: only publishable crates enter the artifact, the list being derived
+  from `cargo metadata`'s `publish` field rather than from a text search, and a CI gate fails
+  if the number of files produced diverges from the number of publishable crates. *Determinism*:
+  `SOURCE_DATE_EPOCH` is pinned to the tagged commit's date, without which the tool assigns a
+  random `serialNumber` per run — a third party can regenerate the SBOM from the tag's sources
+  and compare byte for byte. Component `bom-ref`s, which used to embed the absolute build-machine
+  path, are normalised to a relative form uniformly, leaving the `dependencies` graph consistent.
+
+### Changed
+
+- **`gradatum-worker`, `gradatum-gateway` and `gradatum-admin`: public API surface cut down
+  to their entry points.** These three crates are meant to be run as binaries, not imported
+  as libraries, and almost everything that used to be `pub` is now hidden from the published
+  API. Measured by the project's own API-surface count, across this release:
+  `gradatum-worker` 324 → 1, `gradatum-gateway` 630 → 1, `gradatum-admin` 406 → 1.
+  **This is a documentation and measurement change, not a visibility reduction.** The items stay
+  `pub` behind `#[doc(hidden)]`: code that already imports them keeps compiling. What changes is
+  that they no longer appear in the rendered rustdoc, and that `cargo public-api` — which skips
+  `#[doc(hidden)]` — stops measuring them, which is why the counts collapse to 1 and why these
+  crates fall into the `public-api` blind spot recorded under *Breaking changes*, in the entry
+  on the surface-count scope. Running the binaries themselves is
+  unaffected.
+- **All remaining user-facing strings migrated FR→EN (F-102 completion).** CLI, HTTP API,
+  tracing, and typed `#[error]` messages across the workspace are now English. A CI gate
+  (`scripts/scan-fr-strings.sh`) guards against regressions, **within a bounded scope it states
+  itself**: it matches a vocabulary, not a language, so French built entirely from words outside
+  its detection core passes. Its own header records the consequence — a hit is never fixed
+  alone; search the family by the fragment, not by the word that triggered the match. Read a
+  green run as *no French from the known vocabulary*, not as *no French*. This covers
+  **message text only** and
+  is not source-breaking; the one French→English rename that does touch a public API — the
+  `VaultRenameArgs` fields — is listed under *Breaking changes*.
+- **Every published crate aligned to `1.0.0`** — the workspace version plus 34 inter-crate
+  version constraints (22 root `[workspace.dependencies]` + 12 across 8 crates) were bumped
+  together; all 27 publishable crates verified at a single version. The `gradatum-cli` crate
+  is a placeholder (not yet implemented) and is **not republished at `1.0.0`**. Its `0.7.6`
+  release remains on crates.io and stays installable — published crate versions are never
+  removed. A real implementation is expected with the agent runtime at `2.0.0`.
+- **CI toolchain pinning** consolidated to a single source of truth instead of duplicated
+  per-job versions.
+- **The `gradatum` facade crate now enables its `core` feature by default.** A plain
+  `gradatum = "1.0.0"` (or `cargo add gradatum`) re-exports `gradatum-core` as
+  `gradatum::core`; previously a bare install exposed only the `VERSION` constant, and
+  `features = ["core"]` had to be requested explicitly. Opt out with
+  `default-features = false`.
+
+### Fixed
+
+- Closed a class of cross-vault isolation gaps found during the multi-tenant hardening pass
+  (ACL-checked vault resolution on read-back, cache partitioning by vault, archive/temporal
+  index scoping, cross-tenant job visibility, ANN cross-vault eviction).
+- **`gradatum-admin token issue` produced tokens the server rejected with `401`.** The CLI
+  signed with `config/jwt.private.pem` (`kid = gradatum-admin-issued`) while the server signs
+  and verifies with the `jwt-signing-key.secret` seed (`kid = gradatum-v0`). The CLI now signs
+  with the server's key; token verification on the `/auth/exchange` path is unchanged.
+- `cargo-cyclonedx` SBOM generation: removed an invalid `--output-cdx` flag rejected by
+  `cargo-cyclonedx` 0.5.9.
+- **The forget handler listed its candidates in one vault and mutated them in another.**
+  `handle_forget` took the listing vault from `ForgetScope.vault` and the mutation vault from
+  `JobSpec.scope`; the two could disagree, and did on every `gradatum-admin vault forget`
+  invocation naming a `--tenant` other than `"main"`. `JobSpec.scope` is now the single
+  source of vault truth and drives listing and mutation alike, while `ForgetScope.vault*` is
+  demoted to a consistency assertion (`ensure_forget_scope_vault`): a disagreement fails the
+  job terminally instead of electing one of the two. A multi-vault `ForgetScope::Agent`
+  arriving on a single job is refused for the same reason — one job targets exactly one
+  vault, and the enqueue site fans out. The `dispatch` path was aligned in the same pass: its
+  two note reads now pass the job's own tenant, the same namespace the downstream persist
+  already used. See the two `vault forget` entries under *Breaking changes* for the
+  operator-visible half of this fix.
+- **`recall_lessons`, reachable through the publicly re-exported `gradatum_core::IndexStore`
+  trait, panicked when called with `limit > 100`.** A crates.io consumer requesting more
+  than 100 results would crash the call; the bundled HTTP path caps its own requests at 20
+  and never hit the bug. Also fixed: `limit = 0` used to return one result instead of zero.
+  Both are now correct — a `limit` above 100 returns its full requested count, and
+  `limit = 0` returns nothing.
+- **The MCP `initialize` handshake now negotiates the protocol version instead of ignoring
+  the client's.** The handler answered with the server's default version unconditionally: the
+  version requested by the client fed peer bookkeeping and never the response, so any client
+  on an earlier protocol version was rejected with no recourse. Behaviour now follows the
+  specification — a supported requested version is echoed back verbatim; otherwise the server
+  answers with its most recent one and leaves the client to decide whether to disconnect,
+  which is what the spec prescribes for an unknown dated version rather than a JSON-RPC error.
+  The fallback emits an observable `WARN` instead of staying silent. The set of servable
+  versions is read from the MCP library's own list, not from a local copy. The defect lived
+  **only on the HTTP path**: the stdio transport renegotiates after the handler, whereas the
+  stateless Streamable HTTP transport serialises the handler's answer verbatim — a test on a
+  duplex transport would have passed without the fix, so the regression test drives the real
+  HTTP service.
+
+### Security
+
+- **The YAML backend moved from `serde_yml` to `serde_norway`, resolving two unpatched
+  `unsound` advisories instead of silencing them.** `serde_yml` 0.0.12 carried
+  RUSTSEC-2025-0068 (unsound emitter) and its `libyml` 0.0.5 backend carried
+  RUSTSEC-2025-0067, both with `patched = []` and both repositories archived upstream — no
+  bump could have fixed either. The `deny.toml` exemption that covered this was wrong twice
+  over, and both errors were measured before removal: it asserted that "only the
+  `Deserializer` is used", whereas the note **write** path (`gradatum-markdown`'s
+  `write_parsed`) called `to_string`, i.e. the very emitter the advisory targets, on
+  frontmatter partly controlled by the client; and it covered only `serde_yml`, leaving
+  RUSTSEC-2025-0067 on `libyml` covered by no entry at all. Both crates have left the
+  resolved graph (`cargo tree -i` reports "did not match any packages"), and the exemption is
+  removed rather than reworded — both advisories disappear from the audit output because the
+  crates carrying them are gone, not because they are silenced.
+  `serde-yaml-ng`, named as the intended
+  target in `CONTRIBUTING.md`, was rejected on measurement: its `unsafe-libyaml` backend has
+  been archived since March 2024 and would have reproduced the same dead end.
+  `serde_norway` 0.9.42 carries no advisory and maintains its own backend fork.
+  **Note integrity is unaffected**: hashes are computed over the RFC 8785 JCS canonical form
+  of the deserialized `Frontmatter`, never over the rendered YAML. Verified across the
+  2 618 notes of the production vault — 0 `Frontmatter` divergence, 0 `ContentHash`
+  divergence, 0 round-trip failure in either direction. The on-disk *rendering* does change
+  (timestamps are no longer quoted), which is a diff, not a migration: the rendering was
+  already not an invariant, 586 of those 2 618 notes still carrying the pre-`serde_yml`
+  format — a format this change restores.
+- **RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (`quick-xml`) are closed by an upgrade, not
+  exempted.** Both are denial-of-service advisories (CVSS 7.5 — quadratic attribute
+  duplicate-checking, unbounded `NsReader` allocation) whose only fix threshold is
+  `quick-xml >= 0.41.0`, with no backport on the `0.39`/`0.40` lines. They reached the tree
+  through `opendal`, which while pinned to `0.51.0` could not satisfy that threshold at any
+  version: no `opendal` below `0.58` requires `quick-xml >= 0.41`. Two load-bearing `ignore`
+  entries in `deny.toml` covered them in the meantime. `opendal` is now pinned to `=0.58.1`
+  — the first line whose `opendal-core` demands `quick-xml ^0.41` (since `0.56` the crate is
+  split into a facade plus `opendal-core` and `opendal-service-*`, and the requirement is
+  read on core, not on the facade; `0.58.0` was yanked upstream). `quick-xml` is now present
+  in `Cargo.lock` at a single version, `0.41.0`, and the monolithic `reqsign` is gone from
+  the lockfile entirely, replaced by the split `reqsign-core` / `reqsign-*` crates. **Both
+  `ignore` entries were removed from `deny.toml` rather than reworded**: the advisories are
+  absent because the vulnerable versions are absent. The cost of this upgrade is the MSRV
+  bump to `1.91` listed under *Breaking changes*.
+- **RUSTSEC-2023-0071 (`rsa` 0.9.10, the "Marvin" timing side-channel key recovery, CVSS 5.9)
+  remains in `Cargo.lock`, deliberately un-exempted in `deny.toml`.** No patched release
+  exists at any version. It is arbitrated in `.cargo/audit.toml` instead, and the distinction
+  matters: `cargo audit` reads the lockfile flat, whereas `cargo deny check` resolves the
+  crate graph with the features actually selected. `rsa` reaches **no** resolved graph —
+  `cargo tree -i rsa@0.9.10 --target all` prints nothing, across every target and edge kind
+  — because both of its paths sit behind unselected features: `sqlx` is pulled with the
+  SQLite driver only and never `mysql`, and the `reqsign-*` crates arrive only through
+  `opendal`'s cloud backends. Those backends are opt-in features of `gradatum-storage`
+  (`s3`, `gcs`, `azure`), the default is `["fs"]`, and no crate in the workspace enables any
+  of them. Adding an `ignore` entry to `deny.toml` would be worse than useless: it currently
+  produces a dead entry (`advisory-not-detected`), and it would *disarm the gate for the
+  future* — today, enabling `sqlx`'s `mysql` driver or any cloud backend would bring `rsa`
+  into the resolved graph and fail `cargo deny check`, which is exactly the signal wanted.
+  **`gradatum-storage` is a published crate**, and it is the workspace's only `opendal`
+  consumer: a downstream user who turns on `s3`, `gcs` or `azure` pulls that code into their
+  own build graph and inherits this advisory with it, for which no fix is available at any
+  version. Enable a cloud backend with that in mind. The consequence is that the two tools
+  disagree on this one entry — one finding versus zero — which is each tool behaving
+  correctly, not a regression.
+- **`event-listener` upgraded `5.4.1` → `5.4.2`, closing RUSTSEC-2026-0221.** Unlike the
+  `quick-xml` advisories, this one bites on a path that is genuinely compiled and linked —
+  the crate is reached both through `async-lock` → `moka` (the cache layer) and through
+  `sqlx-core` (the database layer). It is fixed by the bump, not exempted; `deny.toml` is
+  untouched. `patched = [">= 5.4.2"]` is an intra-semver patch bump, so no manifest changed.
+  Side effect: `5.4.2` dropped its `concurrent-queue` dependency, which nothing else
+  referenced, so it leaves the lockfile too.
+
+### Known limitations
+
+- **`expected_sha256` guards the update path, and only the update path.** On
+  `VaultWriteRequest` the field is honoured whenever `note_id` designates a **live** note:
+  before writing, the curate worker compares it against that note's stored content
+  (`Vault::write_if_match`, reached in production through
+  `Registry::write_if_match_internal`). A stale hash **aborts the write** — the note is left
+  intact, the job terminates in `JobStatus::Conflict`, and a `WriteConflictDto` carries the
+  winning `current_sha256`. Four limits bound that guarantee:
+  - **Creation is not guarded.** With `note_id` omitted the write targets a freshly
+    pre-allocated ULID and the field is ignored. With `note_id` set to a never-indexed ULID
+    there is no current content to compare against, and the write is unconditional.
+  - **The conflict is asynchronous.** `POST /api/v1/vault_write` answers `202`; a hash
+    mismatch produces no synchronous `409`. A caller that does not poll `job_status` until
+    `terminal = true` never observes the conflict.
+  - **A missing hash is a different, synchronous rejection.** Writing over a live note with
+    no `expected_sha256` is refused with `409` (intent guard), as is supplying the field on a
+    ghost note (indexed, `.md` missing) whose hash cannot be verified against any content.
+  - **The guard is scoped to the curate path, and is not atomic.** `write_if_match` reads,
+    compares, then writes, with no storage-layer lock holding that sequence together. The
+    hash is consulted by the curate handler only: it guards a note against a competing
+    *curate* writer, not against every writer. No deployment shape turns it into a lock on
+    the note — in particular, running a single worker process does not make it one, since
+    the `curate` worker itself defaults to a concurrency of 2 and the `forget`, `distill`
+    and `embed` workers run alongside it.
+
+  `PersistForgetRequest` carries no `expected_sha256` at all, and
+  `PersistDistillRequest.expected_sha256` stays inert: the distill handler never reads it.
+  Both write paths are unconditional. That exposure is **directional** — one of the two
+  orderings is in fact covered, and it is not the one a reader tends to assume.
+  `VaultWriteRequest::expected_sha256` documents which is which; being the field the MCP
+  tool schema renders, it is the copy a calling agent actually reads.
+- **Repeated `vault forget` is idempotent.** Before mutating a note the forget handler re-reads
+  it and skips the ones already forgotten, preserving the original `forgotten_at` and
+  `forgotten_by` instead of overwriting them with the second run's values. The skip still
+  re-synchronises the index, so a note whose file and index disagree converges rather than
+  staying stale.
+
+## [0.8.0] — 2026-07-14
+
+Train "stability memory vault". On-demand delete is now **archival** (reversible), gated
+behind an operator-only surface; all agent-facing mutations of the archive lifecycle stay
+off the public API and MCP. User-facing strings are now English.
+
+### Added
+
+- **On-demand delete = archival (F-100).** A delete moves the note's `.md` + `.history/`
+  under `.archive/` (mirror layout) and records a row in the registry-driven `archive_index`
+  table, instead of destroying data. Recoverable for the retention window; a **durable JSONL
+  audit tombstone** is written before the cascade (hard precondition: no irreversible cascade
+  without a durable recovery trace).
+- **Retention GC, registry-driven (F-100).** Archives past their 60-day (configurable)
+  retention deadline are physically destroyed by a boot/interval GC selecting from the
+  registry — never a filesystem scan. Destroyed/restored rows survive as history traces.
+- **Restore to quarantine (F-100).** Restoring an archive re-indexes the note as
+  `pending-review` (re-enters the curator pipeline, not live) with a 409 on ULID collision;
+  promotion back to live goes through the curator, never automatically.
+- **Operator CLI `gradatum-admin` archive lifecycle (F-100).** `delete`, `archives list`,
+  `archives purge`, and `archives restore` (single ULID or `--from/--to [--section]` range),
+  all dry-run-by-default with server-side confirmation. Reaches the internal loopback admin
+  namespace (`127.0.0.1`, dedicated admin token distinct from the worker token) — never a
+  public route.
+- **MCP `vault_archives_list` (read-only, F-100).** Agents can *see* archives (to prepare
+  operator CLI commands) but can never delete, restore, or purge via MCP or the public API.
+- **`archive_index.vault_id` (F-100).** The archive registry now carries the owning vault
+  (mirror of `notes.vault_id`) plus an optional vault filter on listing — anticipating the
+  multi-vault work of the 1.x line.
+- **Audit / dedup job (F-51), default OFF.** Opt-in background job (Option A) — no behavior
+  change unless explicitly enabled.
+
+### Changed
+
+- **User-facing strings migrated to English (F-102).** Operator/CLI/API-facing messages are
+  now English for the public release surface.
+- **Curator instrumentation (F-66).** Curator outcomes are now instrumented per
+  section × outcome, improving observability of the classification path.
+- **Code-map resolution qualified (F-70).** Already shipped LIVE in 0.7.9; recorded here for
+  completeness in the public train.
+
+## [0.7.7] — 2026-07-06
+
+### Added
+
+- **`gradatum-engine`: `--backend-sampling` accepted in the `extra_args` allow-list.**
+  Permits the llama.cpp b9780+ GPU-side token sampling flag, removing a CPU sampling
+  bottleneck (host-visible write-combined logit copy) — up to ~3.6× decode throughput
+  on large-vocabulary models. Operators must ensure the target `llama-server` is b9780+
+  for the flag to take effect (older binaries reject the argument and the child fails to
+  start — fail-closed).
+
 ## [0.7.6] — 2026-07-03
 
 Upgrade from v0.6.4: one breaking server API change — `vault_context` is redesigned; its

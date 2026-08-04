@@ -73,13 +73,11 @@ pub async fn handler(
 ) -> Result<impl IntoResponse, ApiError> {
     // Request validation.
     if body.query.is_empty() {
-        return Err(ApiError::InvalidBody(
-            "query ne peut pas être vide".to_string(),
-        ));
+        return Err(ApiError::InvalidBody("query cannot be empty".to_string()));
     }
     if body.documents.is_empty() {
         return Err(ApiError::InvalidBody(
-            "documents ne peut pas être vide".to_string(),
+            "documents cannot be empty".to_string(),
         ));
     }
 
@@ -92,9 +90,9 @@ pub async fn handler(
     // Check reranker availability — 503 when absent (feature not configured,
     // distinct from a transient backend error which would return 502).
     let reranker = state.reranker.as_ref().ok_or_else(|| {
-        tracing::warn!("POST /v1/rerank : aucun reranker configuré");
+        tracing::warn!("POST /v1/rerank: no reranker configured");
         ApiError::ServiceUnavailable {
-            message: "aucun reranker configuré dans AppState".to_string(),
+            message: "no reranker configured in AppState".to_string(),
         }
     })?;
 
@@ -130,12 +128,12 @@ pub async fn handler(
             .await
             .map_err(|join_err| {
                 ApiError::Backend(LlmError::Custom {
-                    message: format!("reranker task paniqué: {}", join_err),
+                    message: format!("reranker task panicked: {}", join_err),
                 })
             })?
             .map_err(|e| {
                 ApiError::Backend(LlmError::Custom {
-                    message: format!("erreur reranker: {}", e),
+                    message: format!("reranker error: {}", e),
                 })
             })?;
 
@@ -146,7 +144,7 @@ pub async fn handler(
     debug_assert_eq!(
         scores.len(),
         doc_count,
-        "reranker.rerank() doit retourner exactement doc_count scores (got {}, expected {})",
+        "reranker.rerank() must return exactly doc_count scores (got {}, expected {})",
         scores.len(),
         doc_count
     );
@@ -177,7 +175,7 @@ pub async fn handler(
     tracing::debug!(
         returned = results.len(),
         total = doc_count,
-        "rerank terminé"
+        "rerank complete"
     );
 
     Ok((StatusCode::OK, Json(RerankResponse { results })))

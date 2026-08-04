@@ -9,6 +9,7 @@
 //! - `with_job_store()` wired (`SqliteQueueStore` on `queue.sqlite`)
 
 mod api_v1;
+mod audit_job;
 mod audit_jsonl;
 mod auth_routes;
 mod config;
@@ -17,10 +18,10 @@ mod curated_metrics;
 mod event_log_store;
 mod health;
 mod internal;
-mod jwt_key_boot;
 mod mcp_usage;
 mod metrics;
 mod middleware;
+mod note_usage_store;
 mod proactive_recall;
 mod proactive_recall_store;
 mod proactive_surface_store;
@@ -56,8 +57,26 @@ use gradatum_auth::revocation::boot_guard_check;
 use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+/// Chaîne rendue par `--version` : version sémantique **suivie du SHA du commit de build**.
+///
+/// Format stable, garanti extractible par script (`deploy-gradatum-local.sh`) :
+/// `gradatum-server <semver> (build_sha <sha>)`
+///
+/// La valeur `<sha>` est celle injectée au compile-time par `build.rs`
+/// (`cargo:rustc-env=BUILD_SHA`), identique au champ `build_sha` de `GET /health`.
+/// Elle vaut `unknown` lorsque le SHA n'a pas pu être résolu au build (absence de
+/// `.git`, build depuis un tarball) — le repli est porté par `build.rs`, qui
+/// n'échoue jamais. `env!` est donc toujours résoluble ici : `build.rs` émet la
+/// variable de façon inconditionnelle.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (build_sha ",
+    env!("BUILD_SHA"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
-#[command(version, about = "gradatum-server façade HTTP/MCP")]
+#[command(version = VERSION, about = "gradatum-server HTTP/MCP facade")]
 struct Cli {
     /// Path to the TOML configuration file (optional — defaults apply otherwise).
     #[arg(long)]
@@ -68,59 +87,60 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = ServerConfig::load(cli.config.as_deref())
-        .map_err(|e| anyhow::anyhow!("échec chargement config : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("config loading failed: {e}"))?;
     init_tracing(&cfg.log.format);
+
+    // F-110 Phase 2 : validation fail-loud de la config salience (k_norm > 0).
+    if let Err(e) = cfg.salience.validate() {
+        anyhow::bail!("invalid config: {e}");
+    }
+    // F-111 : validation fail-loud de la config downgrade (bornes spec §3).
+    if let Err(e) = cfg.downgrade.validate() {
+        anyhow::bail!("invalid config: {e}");
+    }
+    // C3 (post-mortem L6) : garde deploy — chaque override salience per-vault doit être valide
+    // (k_norm > 0) avant que la salience globale ne consulte la map `salience_per_vault`.
+    if let Err(e) = cfg.validate_per_vault_salience() {
+        anyhow::bail!("invalid config: {e}");
+    }
 
     info!(
         bind = %cfg.server.bind,
         metrics_bind = %cfg.server.metrics_bind,
         version = env!("CARGO_PKG_VERSION"),
-        "gradatum-server démarrage"
+        "gradatum-server starting"
     );
 
     // C7 strict : le listener métriques doit être loopback — pas de TLS escape (contrairement à C3).
     if !cfg.server.metrics_bind.ip().is_loopback() {
         anyhow::bail!(
-            "metrics_bind doit être loopback (caveat C7) : adresse refusée = {}",
+            "metrics_bind must be loopback (caveat C7): address rejected = {}",
             cfg.server.metrics_bind
         );
     }
 
     // AUTH-T6 : boot_guard_check caveat C2 — refuse memory store si bind est non-loopback.
     let bind_is_loopback = cfg.server.bind.ip().is_loopback();
-    boot_guard_check(bind_is_loopback, &cfg.auth.revocation_store)
+    boot_guard_check(bind_is_loopback, cfg.auth.revocation_store.as_str())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // F-13 + fix P0 persistance clé JWT :
     // Load-or-generate la seed Ed25519 depuis le répertoire de config.
     // - Si jwt-signing-key.secret existe (perms ≤ 600) → charger.
-    // - Si absent → générer + écrire atomiquement (tmp+chmod600+rename) + log INFO.
+    // - Si absent → générer + écrire atomiquement (tmp+chmod600+rename) + log WARN.
     // La clé n'est JAMAIS loggée — seul le chemin est tracé.
     //
-    // Répertoire de la clé :
-    // - Si jwt_private_key_path est sous storage.root → utiliser son parent.
-    // - Sinon (config par défaut hors storage.root, ou path non dérivable)
-    //   → utiliser storage.root/config/ (accessible dans l'env de test et prod).
-    let jwt_key_dir = {
-        let default_dir = cfg.storage.root.join("config");
-        let derived = cfg
-            .auth
-            .jwt_private_key_path
-            .parent()
-            .map(|p| p.to_path_buf());
-        // N'utiliser le parent dérivé que s'il est sous storage.root ou s'il s'agit
-        // d'un chemin configuré explicitement (≠ défaut /var/lib/gradatum/config).
-        // Heuristique : si le parent contient storage.root comme préfixe → sous contrôle.
-        match derived {
-            Some(ref parent) if parent.starts_with(&cfg.storage.root) => parent.clone(),
-            _ => default_dir,
-        }
-    };
+    // SSOT : répertoire dérivé par `gradatum_core::paths::config_dir`, le helper
+    // qu'utilise aussi `gradatum-admin token issue`. Une dérivation locale ici
+    // (ancienne heuristique sur le parent de `auth.jwt_private_key_path`) pouvait
+    // désigner un répertoire que la CLI ne trouvait pas : les jetons émis par
+    // l'opérateur étaient alors signés d'une clé absente du serveur → 401.
+    let jwt_key_dir = gradatum_core::paths::config_dir(&cfg.storage.root);
 
     // Créer le répertoire si absent (idempotent).
     tokio::fs::create_dir_all(&jwt_key_dir)
         .await
-        .with_context(|| format!("création du répertoire clé JWT: {}", jwt_key_dir.display()))?;
+        .with_context(|| format!("creating JWT key directory: {}", jwt_key_dir.display()))?;
     // V2 : restreindre le répertoire à 0o700 (owner only) APRÈS create_dir_all.
     // Nécessaire même si write_atomic le refait : le répertoire existant depuis un boot
     // précédent pourrait avoir des permissions trop ouvertes (ex. 0o755 umask).
@@ -128,24 +148,20 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| {
             format!(
-                "chmod 0o700 du répertoire clé JWT: {}",
+                "chmod 0o700 on JWT key directory: {}",
                 jwt_key_dir.display()
             )
         })?;
 
-    // kid dérivé du nom du fichier (sans extension) pour la traçabilité.
-    // Exemple : "jwt.private.pem" → kid = "gradatum-v0".
-    // Défaut fixe pour garantir la stabilité du kid entre boots.
-    let jwt_kid = "gradatum-v0".to_string();
-
-    let jwt_service = crate::jwt_key_boot::load_or_generate_jwt_key(
+    // `kid` et audience sont portés par `gradatum_auth::key_store` — jamais
+    // redéclarés ici : `JwtService::verify` rejette un `kid` divergent avant
+    // toute crypto, signataire et vérificateur doivent partager le même littéral.
+    let jwt_service = gradatum_auth::key_store::load_or_generate(
         &jwt_key_dir,
-        jwt_kid,
-        "gradatum".to_string(),
         cfg.auth.jwt_ttl_human_secs,
         cfg.auth.jwt_ttl_service_secs,
     )
-    .context("chargement ou génération de la clé de signature JWT")?;
+    .context("loading or generating JWT signing key")?;
 
     // T1 P2.0c : SqliteQueue câblée sur storage.root/db/queue.sqlite.
     // T2 P2.0c : Vault câblé sur storage.root/vault/ (créé si absent).
@@ -157,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
     if cfg.storage.legacy_alias_used() {
         tracing::warn!(
             "[storage].db_path is deprecated, use vault_index_path. \
-             Retrait prévu en alpha.7+1. Voir CHANGELOG v0.1.0-alpha.7."
+             Removal planned in alpha.7+1. See CHANGELOG v0.1.0-alpha.7."
         );
     }
 
@@ -173,10 +189,10 @@ async fn main() -> anyhow::Result<()> {
     if cfg.storage.vault_index_path_override_diverges() {
         let canonical = canon_vault_index_path(&cfg.storage.root);
         anyhow::bail!(
-            "vault_index_path divergent du chemin canonique — split index non supporté avant v0.5.3.\n\
-             \tConfiguré : {}\n\
-             \tCanonique  : {}\n\
-             Alignez [storage].vault_index_path avec le chemin canonique ou supprimez l'override.",
+            "vault_index_path diverges from the canonical path — split index not supported before v0.5.3.\n\
+             \tConfigured: {}\n\
+             \tCanonical : {}\n\
+             Align [storage].vault_index_path with the canonical path or remove the override.",
             cfg.storage.vault_index_path.display(),
             canonical.display()
         );
@@ -185,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
     // SSOT : chemin queue via helper canonique (interdit root.join("db/queue.sqlite") direct).
     let queue_path = queue_db_path(&cfg.storage.root);
     let vault_path = cfg.storage.root.join("vault");
+    // F-100 P1-1 — piste d'audit durable : sous-répertoire `audit/` sous la racine storage.
+    // Câblé au boot (fail-fast si création impossible) → `state.audit` = JsonlFileSink en prod,
+    // condition dure du tombstone (delete.rs) réellement armée (jamais le no-op sink).
+    let audit_dir = cfg.storage.root.join("audit");
     // SSOT : vault_index_path LU depuis la config — jamais inventé ici.
     // StorageConfig::from(StorageConfigRaw) applique canon_vault_index_path() en défaut.
     let search_path = cfg.storage.vault_index_path.clone();
@@ -198,13 +218,13 @@ async fn main() -> anyhow::Result<()> {
     let ann_ext_registered = if cfg.search.ann_backend == crate::config::AnnBackend::SqliteVec {
         match crate::vec_ext::register_sqlite_vec() {
             Ok(()) => {
-                tracing::info!("sqlite-vec extension enregistrée (vec0 disponible)");
+                tracing::info!("sqlite-vec extension registered (vec0 available)");
                 true
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "sqlite-vec extension non enregistrée — ann_backend forcé brute-force"
+                    "sqlite-vec extension not registered — ann_backend forced to brute-force"
                 );
                 false
             }
@@ -227,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
         .with_queue_path(&queue_path)
         .await
         .context("queue init failed")?
-        .with_vault_path(&vault_path)
+        .with_vault_path(&vault_path, gradatum_core::scope::VaultId::new("main"))
         .await
         .context("vault init failed")?
         .with_search_path_ann(
@@ -241,16 +261,35 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         .context("search index init failed")?
+        // F-100 P1-1 — câblage du sink d'audit JSONL durable (remplace NoopAuditSink).
+        // Créé au boot ; échec (permissions) = fail-fast, cohérent avec la précondition
+        // dure « échec tombstone → abort delete » qui doit pouvoir se déclencher en prod.
+        .with_audit_dir(&audit_dir)
+        .await
+        .context("audit sink init failed")?
         // F-17 — decay-trust depuis [scoring] config (défaut : activé, distilled=90j).
         .with_scoring(gradatum_search::TrustDecayConfig {
             enabled: cfg.scoring.trust_decay_enabled,
             half_life_days: cfg.scoring.half_life_days.clone(),
         })
+        // F-110 Phase 2 — salience depuis [salience] config (défaut OFF ⇒ None ⇒ byte-identical).
+        .with_salience(cfg.salience.resolve())
+        // L6 — overrides salience per-vault (A6) pré-résolus au boot (défaut : map vide ⇒ tout
+        // vault retombe sur le global ⇒ byte-identical). Consultés seulement à salience ON.
+        .with_salience_per_vault(cfg.resolve_salience_per_vault())
         // F-35 Task 11 — câblage context config (budget, top_n, skills, embed_timeout).
         .with_context(cfg.context.clone())
         // v0.7.5 F-85 T5 — intervalles des tâches récurrentes disponibles dans
         // `GET /api/v1/system/scheduled` via task_interval_secs SSOT.
         .with_server_config(cfg.clone());
+
+    // A7 (Task 4) — bootstrap des handles de vaults au boot. À flag `multi_tenant` OFF
+    // (défaut LIVE) : no-op strict, le registre reste le singleton `{main}` (byte-identical).
+    // À flag ON : enregistre un handle réel par vault actif (`list_active_vaults`).
+    state
+        .bootstrap_active_vaults()
+        .await
+        .context("vault bootstrap failed")?;
 
     // ANN-5 backfill au boot : remplir la table vec0 depuis les embeddings existants.
     //
@@ -260,42 +299,139 @@ async fn main() -> anyhow::Result<()> {
     if ann_ext_registered {
         match state.search.backfill_ann_index().await {
             Ok(n) => {
-                tracing::info!(backfilled = n, "ANN vec0 backfill au boot");
+                tracing::info!(backfilled = n, "ANN vec0 backfill at boot");
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "ANN vec0 backfill au boot échoué — service continue"
+                    "ANN vec0 backfill at boot failed — service continues"
+                );
+            }
+        }
+
+        // F-100 1.1 — GC one-shot des vecteurs ANN orphelins (deploy = restart = boot).
+        // C4-1e Groupe B Task 17 : GC scopé par partition — une passe par vault actif à
+        // flag ON (`list_active_vaults`), sur `["main"]` seul à flag OFF (byte-identical
+        // mono-vault). Idempotent, non-fatal : une erreur n'interrompt pas le démarrage.
+        let gc_vaults: Vec<gradatum_core::scope::VaultId> = if cfg.multi_tenant.enabled {
+            match state.search.list_active_vaults().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ANN vec0 GC: list_active_vaults failed — GC skipped this boot"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            vec![gradatum_core::scope::VaultId::new("main")]
+        };
+        for vault_id in &gc_vaults {
+            match state.search.gc_orphan_ann(vault_id).await {
+                Ok(n) => {
+                    tracing::info!(
+                        vault_id = %vault_id,
+                        orphans_removed = n,
+                        "ANN vec0 GC orphans at boot"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        vault_id = %vault_id,
+                        error = %e,
+                        "ANN vec0 GC orphans at boot failed — service continues"
+                    );
+                }
+            }
+        }
+
+        // Gate de santé ANN au boot — compare, par partition `(vault_id, embedder_id)`, les
+        // paires éligibles de `note_embeddings` (source de vérité) aux lignes réellement
+        // présentes dans `note_embeddings_ann` (index dérivé).
+        //
+        // Placé APRÈS le backfill ET le GC : le backfill doit avoir écrit, et une ligne
+        // orpheline (note supprimée) gonflerait le comptage indexé.
+        //
+        // Fail-closed assumé, appliqué côté index (`SqliteIndex::ann_health_gate` détient le
+        // flag) : un déficit — ou une mesure non concluante — coupe le chemin ANN et la
+        // recherche sémantique repasse en brute-force exact. Le boot n'est JAMAIS interrompu :
+        // la correction des résultats ne dépend pas de l'ANN, seule la latence en dépend.
+        // Motif : `search_semantic` ne retombe en brute-force que sur `Err`, jamais sur
+        // `Ok(vec![])` — une partition trouée rend l'axe sémantique silencieusement muet.
+        //
+        // Skippé byte-identique sur le chemin BruteForce : ce bloc vit dans
+        // `if ann_ext_registered`, et le gate lui-même sort avant toute requête quand le flag
+        // ANN est à `false` (double garde).
+        match state.search.ann_health_gate().await {
+            Ok(deficits) => {
+                state
+                    .metrics
+                    .ann_deficit_partitions
+                    .set(i64::try_from(deficits.len()).unwrap_or(i64::MAX));
+                if deficits.is_empty() {
+                    tracing::info!("ANN health gate at boot: every partition fully indexed");
+                } else {
+                    for deficit in &deficits {
+                        tracing::error!(
+                            vault_id = %deficit.vault_id,
+                            embedder_id = %deficit.embedder_id,
+                            eligible = deficit.eligible,
+                            indexed = deficit.indexed,
+                            missing = deficit.eligible.saturating_sub(deficit.indexed),
+                            "ANN health gate at boot: incomplete partition — rows missing from note_embeddings_ann"
+                        );
+                    }
+                    tracing::error!(
+                        deficit_partitions = deficits.len(),
+                        "ANN health gate at boot FAILED — ANN path disabled, semantic search \
+                         served by exact brute-force until a restart rebuilds the index"
+                    );
+                }
+            }
+            Err(e) => {
+                // Jauge laissée INCHANGÉE (pas de remise à `0`) : une mesure qui n'a pas pu
+                // conclure ne doit pas se présenter comme « zéro déficit » — cohérent avec la
+                // réconciliation disque du boot. Le chemin ANN est déjà fermé par le gate.
+                tracing::error!(
+                    error = %e,
+                    "ANN health gate at boot could not conclude — ANN path disabled (a gate that \
+                     did not run is not a pass)"
                 );
             }
         }
     }
 
-    // AUTH-T6 : câbler le revocation store (sqlite ou memory selon config).
-    let state = if cfg.auth.revocation_store == "sqlite" {
-        // Créer le répertoire db/ si absent (le store crée le fichier, pas le dossier).
-        if let Some(parent) = revocation_db_path.parent() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("création du répertoire revocation db: {}", parent.display())
-            })?;
+    // AUTH-T6 : câbler le revocation store. Le `match` est exhaustif par construction —
+    // le champ est typé (`RevocationStoreKind`), donc aucune troisième valeur ne peut
+    // atteindre ce point : une coquille est refusée au chargement de la configuration.
+    let state = match cfg.auth.revocation_store {
+        crate::config::RevocationStoreKind::Sqlite => {
+            // Créer le répertoire db/ si absent (le store crée le fichier, pas le dossier).
+            if let Some(parent) = revocation_db_path.parent() {
+                tokio::fs::create_dir_all(parent).await.with_context(|| {
+                    format!("creating revocation db directory: {}", parent.display())
+                })?;
+            }
+            let state = state
+                .with_revocation_path(&revocation_db_path)
+                .await
+                .context("revocation store init failed")?;
+            tracing::info!(
+                path = %revocation_db_path.display(),
+                "SqliteRevocationStore ready"
+            );
+            state
         }
-        let state = state
-            .with_revocation_path(&revocation_db_path)
-            .await
-            .context("revocation store init failed")?;
-        tracing::info!(
-            path = %revocation_db_path.display(),
-            "SqliteRevocationStore ready"
-        );
-        state
-    } else {
-        // revocation_store != "sqlite" → InMemoryRevocationStore déjà initialisé par AppState::new()
-        // Le WARN DEV ONLY est émis par InMemoryRevocationStore::new() dans with_jwt().
-        tracing::warn!(
-            store = %cfg.auth.revocation_store,
-            "revocation_store non-sqlite — InMemoryRevocationStore actif (DEV ONLY)"
-        );
-        state
+        crate::config::RevocationStoreKind::Memory => {
+            // InMemoryRevocationStore déjà initialisé par AppState::new().
+            // Le WARN DEV ONLY est émis par InMemoryRevocationStore::new() dans with_jwt().
+            tracing::warn!(
+                "revocation_store=memory — InMemoryRevocationStore active (DEV ONLY): \
+                 revocations are lost on restart"
+            );
+            state
+        }
     };
 
     // AUTH-T5 : câbler le store d'API keys (SqliteApiKeyStore en production).
@@ -308,7 +444,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(parent) = api_keys_db_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .with_context(|| format!("création du répertoire api_keys db: {}", parent.display()))?;
+            .with_context(|| format!("creating api_keys db directory: {}", parent.display()))?;
     }
     let state = state
         .with_api_keys_path(&api_keys_db_path)
@@ -323,6 +459,12 @@ async fn main() -> anyhow::Result<()> {
     // Fail-closed : si le fichier est absent, DENY-ALL (warn loggé dans with_acl_preset_path).
     let state = state.with_acl_preset_path(&cfg.acl.preset_path);
 
+    // B6′b : intégrité référentielle `api_keys.owner` ↔ `consumer.identity`, mesurée ici
+    // parce que c'est le premier point du boot où les DEUX moitiés de la relation sont
+    // chargées (store api-keys câblé plus haut, preset ACL juste au-dessus).
+    // Non bloquante par construction : signale, ne refuse jamais le démarrage.
+    state.reconcile_key_owners().await;
+
     // P0-1 Phase 4.2bis : câblage QueueStore v81 pour endpoints F-16 (/api/v1/jobs/*).
     //
     // Utilise le même fichier SQLite que le worker (Option A code audit — cohérence single
@@ -336,7 +478,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(parent) = jobs_db_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .with_context(|| format!("création répertoire jobs db: {}", parent.display()))?;
+            .with_context(|| format!("creating jobs db directory: {}", parent.display()))?;
     }
     let jobs_opts = SqliteConnectOptions::new()
         .filename(&jobs_db_path)
@@ -381,7 +523,7 @@ async fn main() -> anyhow::Result<()> {
         probe_embed_health(&cfg.embed.endpoint).await;
         state.with_embedder(Arc::new(embedder))
     } else {
-        tracing::warn!("embed.enabled=false — Noop embedder actif (aucun embedding généré)");
+        tracing::warn!("embed.enabled=false — Noop embedder active (no embedding generated)");
         state
     };
 
@@ -396,7 +538,7 @@ async fn main() -> anyhow::Result<()> {
         .context("EventLogStore init failed")?;
     tracing::info!(
         path = %search_path.display(),
-        "EventLogStore (B1) câblé sur index.db"
+        "EventLogStore (B1) wired on index.db"
     );
 
     // session-log Tier 1 (council Art.15bis 2026-06-12) — câblage SessionTraceStore
@@ -408,7 +550,7 @@ async fn main() -> anyhow::Result<()> {
         .context("SessionTraceStore init failed")?;
     tracing::info!(
         path = %search_path.display(),
-        "SessionTraceStore (session-log Tier 1) câblé sur index.db"
+        "SessionTraceStore (session-log Tier 1) wired on index.db"
     );
 
     // Surface proactive pré-calculée (F-46, Active Recall v0.7.1) — câblage ProactiveSurfaceStore
@@ -420,7 +562,7 @@ async fn main() -> anyhow::Result<()> {
         .context("ProactiveSurfaceStore init failed")?;
     tracing::info!(
         path = %search_path.display(),
-        "ProactiveSurfaceStore (surface proactive F-46) câblé sur index.db"
+        "ProactiveSurfaceStore (proactive surface F-46) wired on index.db"
     );
 
     // Sessions + feedback proactif (F-46, Active Recall v0.7.1) — câblage ProactiveRecallStore
@@ -432,7 +574,7 @@ async fn main() -> anyhow::Result<()> {
         .context("ProactiveRecallStore init failed")?;
     tracing::info!(
         path = %search_path.display(),
-        "ProactiveRecallStore (sessions+feedback recall proactif F-46) câblé sur index.db"
+        "ProactiveRecallStore (proactive recall sessions+feedback F-46) wired on index.db"
     );
 
     // Télémétrie usage read-paths (v0.5.3 #4) — ReadUsageCounterStore sur index.db.
@@ -443,7 +585,18 @@ async fn main() -> anyhow::Result<()> {
         .context("ReadUsageCounterStore init failed")?;
     tracing::info!(
         path = %search_path.display(),
-        "ReadUsageCounterStore (télémétrie read-paths) câblé sur index.db"
+        "ReadUsageCounterStore (read-paths telemetry) wired on index.db"
+    );
+
+    // Télémétrie usage PAR NOTE (F-110 Phase 1) — NoteUsageStore sur index.db.
+    // La migration 0029 (table note_usage) est exécutée par `with_search_path`.
+    let state = state
+        .with_note_usage_path(&search_path)
+        .await
+        .context("NoteUsageStore init failed")?;
+    tracing::info!(
+        path = %search_path.display(),
+        "NoteUsageStore (per-note salience telemetry F-110) wired on index.db"
     );
 
     // Télémétrie usage — seed Prometheus au boot depuis la DB (P1-3 reviewer).
@@ -455,14 +608,14 @@ async fn main() -> anyhow::Result<()> {
         let read_usage_store_seed = state
             .read_usage
             .as_ref()
-            .expect("ReadUsageCounterStore câblé — invariant post with_read_usage_path");
+            .expect("ReadUsageCounterStore wired — invariant post with_read_usage_path");
         if let Err(e) =
             crate::telemetry_flush::seed_metrics_from_db(read_usage_store_seed, &state.metrics)
                 .await
         {
             tracing::warn!(
                 error = %e,
-                "seed_metrics_from_db échoué au boot — familles Prometheus non seedées (non fatal)"
+                "seed_metrics_from_db failed at boot — Prometheus families not seeded (non fatal)"
             );
         }
     }
@@ -480,13 +633,13 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(
                     error = %e,
                     task = task_name,
-                    "seed_scheduled_task échoué au boot (non fatal)"
+                    "seed_scheduled_task failed at boot (non fatal)"
                 );
             }
         }
         tracing::info!(
             count = ALL_SCHEDULED_TASKS.len(),
-            "tâches récurrentes seedées au boot"
+            "recurring tasks seeded at boot"
         );
     }
 
@@ -508,7 +661,13 @@ async fn main() -> anyhow::Result<()> {
         let read_usage_store = state
             .read_usage
             .clone()
-            .expect("ReadUsageCounterStore câblé — invariant post with_read_usage_path");
+            .expect("ReadUsageCounterStore wired — invariant post with_read_usage_path");
+        // F-110 : accumulateur + store per-note, flushés au même tick (second flush best-effort).
+        let note_usage_accumulators = state.note_usage_accumulators.clone();
+        let note_usage_store = state
+            .note_usage
+            .clone()
+            .expect("NoteUsageStore wired — invariant post with_note_usage_path");
         let metrics = state.metrics.clone();
         let search_flush = state.search.clone();
         let interval_secs_flush = crate::scheduled_tasks::task_interval_secs(
@@ -546,13 +705,29 @@ async fn main() -> anyhow::Result<()> {
                     window_h,
                 )
                 .await;
+
+                // F-110 : second flush best-effort per-note — un échec n'impacte ni la
+                // requête ni le flush read_usage/MCP (télémétrie, fenêtre en cours perdue).
+                if let Err(e) = crate::telemetry_flush::flush_note_usage(
+                    &note_usage_accumulators,
+                    &note_usage_store,
+                    &metrics,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "telemetry-flush: note_usage flush failed — window lost"
+                    );
+                }
+
                 let duration_ms = start.elapsed().as_millis() as i64;
                 let (outcome, err_msg) = match &flush_result {
                     Ok(()) => (TaskOutcome::Ok, None),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "telemetry-flush : flush_batch échoué — hits perdus pour cette fenêtre"
+                            "telemetry-flush: flush_batch failed — hits lost for this window"
                         );
                         (TaskOutcome::Error, Some(e.to_string()))
                     }
@@ -567,7 +742,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 {
-                    tracing::warn!(error = %e, "record_task_run télémétrie-flush échoué (non fatal)");
+                    tracing::warn!(error = %e, "record_task_run telemetry-flush failed (non fatal)");
                 }
             }
         });
@@ -623,7 +798,7 @@ async fn main() -> anyhow::Result<()> {
                 let (outcome, err_msg) = match &result {
                     Ok(()) => (TaskOutcome::Ok, None),
                     Err(e) => {
-                        tracing::warn!(error = %e, "metric-sample : échantillonnage échoué");
+                        tracing::warn!(error = %e, "metric-sample: sampling failed");
                         (TaskOutcome::Error, Some(e.clone()))
                     }
                 };
@@ -637,7 +812,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 {
-                    tracing::warn!(error = %e, "record_task_run metric-sample échoué (non fatal)");
+                    tracing::warn!(error = %e, "record_task_run metric-sample failed (non fatal)");
                 }
             }
         });
@@ -653,7 +828,7 @@ async fn main() -> anyhow::Result<()> {
         let event_log_store = state
             .event_log
             .clone()
-            .expect("EventLogStore câblé — invariant post with_event_log_path");
+            .expect("EventLogStore wired — invariant post with_event_log_path");
         let metrics = state.metrics.clone();
         let search_elog = state.search.clone();
         let interval_secs_elog = crate::scheduled_tasks::task_interval_secs(
@@ -700,12 +875,12 @@ async fn main() -> anyhow::Result<()> {
                             purged = purged,
                             retention_days = retention_cfg.retention_days,
                             max_rows = retention_cfg.max_rows,
-                            "event_log rétention : purge terminée"
+                            "event_log retention: purge complete"
                         );
                         (TaskOutcome::Ok, None)
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "event_log purge échouée — non fatal");
+                        tracing::warn!(error = %e, "event_log purge failed — non fatal");
                         let msg = e.to_string();
                         (TaskOutcome::Error, Some(msg))
                     }
@@ -720,7 +895,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 {
-                    tracing::warn!(error = %e, "record_task_run purge-event-log échoué (non fatal)");
+                    tracing::warn!(error = %e, "record_task_run purge-event-log failed (non fatal)");
                 }
 
                 // Mise à jour gauge Prometheus.
@@ -729,7 +904,47 @@ async fn main() -> anyhow::Result<()> {
                         metrics.event_log_rows.set(count as i64);
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "event_log count échoué — gauge non mise à jour");
+                        tracing::warn!(error = %e, "event_log count failed — gauge not updated");
+                    }
+                }
+            }
+        });
+    }
+
+    // F-100 incrément 1.6 — GC de rétention des archives (piloté par le registre).
+    //
+    // Tâche interval serveur : le filesystem du vault est mono-propriétaire (côté
+    // serveur), donc la destruction physique des archives ne peut pas être déléguée
+    // au worker. `Vault::run_archive_gc` sélectionne les archives échues via le
+    // registre `archive_index`, détruit leurs fichiers et marque `gc_at` (la ligne
+    // survit comme trace). Self-contained — ne touche QUE `.archive/` + registre.
+    {
+        let vault_gc = state.vault.clone();
+        let gc_interval_secs = cfg.archive.gc_interval_secs.max(60);
+        let gc_batch_limit = cfg.archive.gc_batch_limit as usize;
+
+        tokio::spawn(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            use tokio::time::{Duration, MissedTickBehavior, interval};
+
+            let mut ticker = interval(Duration::from_secs(gc_interval_secs));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Premier tick immédiat consommé — la 1re passe réelle arrive à t=interval.
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                match vault_gc.run_archive_gc(now_ms, gc_batch_limit).await {
+                    Ok(0) => {}
+                    Ok(destroyed) => {
+                        tracing::info!(destroyed, "GC archives: retention — archives destroyed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "GC archives: pass failed — non-fatal");
                     }
                 }
             }
@@ -745,7 +960,7 @@ async fn main() -> anyhow::Result<()> {
         let session_trace_store = state
             .session_trace
             .clone()
-            .expect("SessionTraceStore câblé — invariant post with_session_trace_path");
+            .expect("SessionTraceStore wired — invariant post with_session_trace_path");
         let search_strace = state.search.clone();
         let interval_secs_strace = crate::scheduled_tasks::task_interval_secs(
             crate::scheduled_tasks::TASK_PURGE_SESSION_TRACE,
@@ -786,12 +1001,12 @@ async fn main() -> anyhow::Result<()> {
                             purged = purged,
                             retention_days = retention_cfg.retention_days,
                             max_rows = retention_cfg.max_rows,
-                            "session_trace rétention : purge terminée"
+                            "session_trace retention: purge complete"
                         );
                         (TaskOutcome::Ok, None)
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "session_trace purge échouée — non fatal");
+                        tracing::warn!(error = %e, "session_trace purge failed — non fatal");
                         let msg = e.to_string();
                         (TaskOutcome::Error, Some(msg))
                     }
@@ -806,7 +1021,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 {
-                    tracing::warn!(error = %e, "record_task_run purge-session-trace échoué (non fatal)");
+                    tracing::warn!(error = %e, "record_task_run purge-session-trace failed (non fatal)");
                 }
             }
         });
@@ -822,7 +1037,7 @@ async fn main() -> anyhow::Result<()> {
         let read_usage_store = state
             .read_usage
             .clone()
-            .expect("ReadUsageCounterStore câblé — invariant post with_read_usage_path");
+            .expect("ReadUsageCounterStore wired — invariant post with_read_usage_path");
         let search_rusage = state.search.clone();
         let interval_secs_rusage = crate::scheduled_tasks::task_interval_secs(
             crate::scheduled_tasks::TASK_PURGE_READ_USAGE,
@@ -861,13 +1076,13 @@ async fn main() -> anyhow::Result<()> {
                                 purged = purged,
                                 retention_days = retention_cfg.retention_days,
                                 cutoff_window_h = cutoff_window_h,
-                                "read_usage_counters rétention : purge terminée"
+                                "read_usage_counters retention: purge complete"
                             );
                         }
                         (TaskOutcome::Ok, None)
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "read_usage_counters purge échouée — non fatal");
+                        tracing::warn!(error = %e, "read_usage_counters purge failed — non fatal");
                         let msg = e.to_string();
                         (TaskOutcome::Error, Some(msg))
                     }
@@ -882,7 +1097,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 {
-                    tracing::warn!(error = %e, "record_task_run purge-read-usage échoué (non fatal)");
+                    tracing::warn!(error = %e, "record_task_run purge-read-usage failed (non fatal)");
                 }
             }
         });
@@ -891,9 +1106,17 @@ async fn main() -> anyhow::Result<()> {
     // Review auto-promote — promeut staging/pending-review âgés > N jours.
     // Miroir structurel de la tâche event_log (non-fatal, self-contained, MissedTickBehavior::Skip).
     {
-        let promote_cfg = cfg.review_promote.clone();
+        // L6 : la config COMPLÈTE est capturée (plus seulement `[review_promote]`) pour que la
+        // boucle per-vault ON de `promote_tick` puisse résoudre `review_promote_for(vault_id)`.
+        // Le chemin OFF (`promote_once`) continue d'utiliser `server_cfg.review_promote` global.
+        let promote_server_cfg = cfg.clone();
+        let multi_tenant_enabled = cfg.multi_tenant.enabled;
         let index = state.search.clone();
         let vault = state.vault.clone();
+        // A1 (caveat pré-flip) : registre de handles pour router chaque write ON vers le
+        // Vault CIBLE (`resolve(&vault_id)`), plus le singleton `main`. À flag OFF le tick
+        // délègue à `promote_once` (singleton `vault`) — le registre n'est pas consulté.
+        let vaults = state.vaults.clone();
         let metrics = state.metrics.clone();
         let interval_secs_promote = crate::scheduled_tasks::task_interval_secs(
             crate::scheduled_tasks::TASK_REVIEW_PROMOTE,
@@ -920,19 +1143,21 @@ async fn main() -> anyhow::Result<()> {
                     .as_millis() as i64;
 
                 let start = std::time::Instant::now();
-                let stats = crate::review_promote::promote_once(
+                let stats = crate::review_promote::promote_tick(
                     &index,
                     &vault,
+                    &vaults,
                     &metrics,
-                    &promote_cfg,
+                    &promote_server_cfg,
                     now_ms,
+                    multi_tenant_enabled,
                 )
                 .await;
                 let duration_ms = start.elapsed().as_millis() as i64;
                 let (outcome, err_msg) = if stats.errors > 0 {
                     (
                         TaskOutcome::Error,
-                        Some(format!("{} erreur(s) de promotion", stats.errors)),
+                        Some(format!("{} promotion error(s)", stats.errors)),
                     )
                 } else {
                     (TaskOutcome::Ok, None)
@@ -947,7 +1172,80 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 {
-                    tracing::warn!(error = %e, "record_task_run review-promote échoué (non fatal)");
+                    tracing::warn!(error = %e, "record_task_run review-promote failed (non fatal)");
+                }
+            }
+        });
+    }
+
+    // F-51 audit / dedup — passe rétrospective (rapport pur, jamais de mutation).
+    // Miroir structurel de review_promote (non-fatal, self-contained, MissedTickBehavior::Skip).
+    // Désactivée par défaut (cfg.audit.enabled = false).
+    {
+        let audit_cfg = cfg.audit.clone();
+        // F-111 : capturer AVANT le spawn (la task ne voit pas `state`/AppState).
+        let downgrade_cfg = cfg.downgrade.clone();
+        let note_usage = state.note_usage.clone();
+        let index = state.search.clone();
+        let metrics = state.metrics.clone();
+        let storage_root = cfg.storage.root.clone();
+        let interval_secs_audit = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_AUDIT_DEDUP,
+            &cfg,
+        );
+
+        tokio::spawn(async move {
+            use gradatum_core::scheduled_health::TaskOutcome;
+            use std::time::{SystemTime, UNIX_EPOCH};
+            use tokio::time::{Duration, MissedTickBehavior, interval};
+
+            let mut ticker = interval(Duration::from_secs(interval_secs_audit));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            ticker.tick().await; // premier tick consommé immédiatement
+
+            loop {
+                ticker.tick().await;
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+
+                let start = std::time::Instant::now();
+                // F-111 : downgrader concret (mute l'index directement, post-guards).
+                let downgrader = crate::audit_job::IndexDowngrader(index.clone());
+                let stats = crate::audit_job::audit_once(
+                    &index,
+                    &metrics,
+                    &audit_cfg,
+                    &downgrade_cfg,
+                    note_usage.as_ref(),
+                    Some(&downgrader),
+                    &storage_root,
+                    "main",
+                    now_ms,
+                )
+                .await;
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let (outcome, err_msg) = if stats.errors > 0 {
+                    (
+                        TaskOutcome::Error,
+                        Some(format!("{} audit error(s)", stats.errors)),
+                    )
+                } else {
+                    (TaskOutcome::Ok, None)
+                };
+                if let Err(e) = index
+                    .record_task_run(
+                        crate::scheduled_tasks::TASK_AUDIT_DEDUP,
+                        outcome,
+                        duration_ms,
+                        err_msg.as_deref(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "record_task_run audit-dedup failed (non fatal)");
                 }
             }
         });
@@ -961,6 +1259,9 @@ async fn main() -> anyhow::Result<()> {
     {
         let pr_cfg = cfg.proactive_recall.clone();
         let pr_state = state.clone();
+        // Flag-gate du tick (A5, caveat pré-flip) : à OFF la surface reste mono-`"main"`
+        // (byte-identical) ; à ON la boucle itère les vaults actifs, chacun scopé.
+        let pr_multi_tenant_enabled = cfg.multi_tenant.enabled;
         let interval_secs_pr = crate::scheduled_tasks::task_interval_secs(
             crate::scheduled_tasks::TASK_PROACTIVE_REFRESH,
             &cfg,
@@ -987,16 +1288,19 @@ async fn main() -> anyhow::Result<()> {
                     .as_millis() as i64;
 
                 let start = std::time::Instant::now();
-                let refresh_result =
-                    crate::proactive_recall::refresh::proactive_refresh_once(&pr_state, &pr_cfg)
-                        .await;
+                let refresh_result = crate::proactive_recall::refresh::proactive_refresh_tick(
+                    &pr_state,
+                    &pr_cfg,
+                    pr_multi_tenant_enabled,
+                )
+                .await;
                 let duration_ms = start.elapsed().as_millis() as i64;
                 let (outcome, err_msg) = match &refresh_result {
                     Ok(_) => (TaskOutcome::Ok, None),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "proactive_recall: refresh échoué — skip tick (non fatal)"
+                            "proactive_recall: refresh failed — skip tick (non fatal)"
                         );
                         (TaskOutcome::Error, Some(e.to_string()))
                     }
@@ -1012,7 +1316,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 {
-                    tracing::warn!(error = %e, "record_task_run proactive-refresh échoué (non fatal)");
+                    tracing::warn!(error = %e, "record_task_run proactive-refresh failed (non fatal)");
                 }
             }
         });
@@ -1068,12 +1372,12 @@ async fn main() -> anyhow::Result<()> {
                             purged = purged,
                             retention_days = retention_cfg.retention_days,
                             max_rows = retention_cfg.max_rows,
-                            "proactive_recall rétention : purge terminée"
+                            "proactive_recall retention: purge complete"
                         );
                         (TaskOutcome::Ok, None)
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "proactive_recall purge échouée — non fatal");
+                        tracing::warn!(error = %e, "proactive_recall purge failed — non fatal");
                         let msg = e.to_string();
                         (TaskOutcome::Error, Some(msg))
                     }
@@ -1088,7 +1392,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 {
-                    tracing::warn!(error = %e, "record_task_run active-recall-purge échoué (non fatal)");
+                    tracing::warn!(error = %e, "record_task_run active-recall-purge failed (non fatal)");
                 }
             }
         });
@@ -1111,6 +1415,16 @@ async fn main() -> anyhow::Result<()> {
         crate::config::validate_internal_token(raw_token).map_err(|e| anyhow::anyhow!("{e}"))?;
         let secret = secrecy::SecretString::from(raw_token.clone());
         state.with_internal_api_token(secret)
+    } else {
+        state
+    };
+
+    // API admin (F-100 1.6) — token admin DISTINCT du worker (delete/restore/purge CLI).
+    // Même validation de longueur ; fail-closed si absent (endpoints admin désactivés).
+    let state = if let Some(ref raw_token) = cfg.internal_api.admin_token {
+        crate::config::validate_internal_token(raw_token).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let secret = secrecy::SecretString::from(raw_token.clone());
+        state.with_admin_api_token(secret)
     } else {
         state
     };
@@ -1138,7 +1452,7 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let notify_ready = || {
         if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
-            tracing::debug!(error = %e, "sd_notify ready ignoré (exécution hors systemd)");
+            tracing::debug!(error = %e, "sd_notify ready ignored (running outside systemd)");
         }
     };
 
@@ -1147,18 +1461,20 @@ async fn main() -> anyhow::Result<()> {
     let app_metrics = state.metrics.clone();
     tokio::spawn(async move {
         if let Err(e) = metrics::spawn_metrics_listener(metrics_bind, app_metrics).await {
-            error!(error = %e, "metrics listener arrêté avec erreur");
+            error!(error = %e, "metrics listener stopped with error");
         }
     });
 
-    // API interne (v0.5.3 Wave 2) — spawn listener loopback :19092 si token configuré.
-    if state.internal_api_token.is_some() {
+    // API interne (v0.5.3 Wave 2) — spawn listener loopback :19092 si un token (worker
+    // OU admin F-100 1.6) est configuré. Chaque sous-routeur reste fail-closed sur SON
+    // token : worker et admin sont indépendants sur le même listener.
+    if state.internal_api_token.is_some() || state.admin_api_token.is_some() {
         let internal_bind = cfg.internal_api.bind;
         let internal_router = internal::build_internal_router(state.clone());
         tokio::spawn(async move {
             if let Err(e) = internal::spawn_internal_listener(internal_bind, internal_router).await
             {
-                error!(error = %e, "listener API interne arrêté avec erreur");
+                error!(error = %e, "internal API listener stopped with error");
             }
         });
     }
@@ -1172,14 +1488,14 @@ async fn main() -> anyhow::Result<()> {
     // le signal doit déjà être capturé par l'OS (le noyau met en file).
     // Applicable aux deux paths (TLS et cleartext) — les Signal sont move'd dans les closures.
     let mut shutdown_sigterm =
-        signal(SignalKind::terminate()).expect("installer SIGTERM — OS UNIX requis");
+        signal(SignalKind::terminate()).expect("install SIGTERM — UNIX OS required");
     let mut shutdown_sigint =
-        signal(SignalKind::interrupt()).expect("installer SIGINT — OS UNIX requis");
+        signal(SignalKind::interrupt()).expect("install SIGINT — UNIX OS required");
 
     match tls_config {
         // --- HTTPS path: axum-server terminates TLS via rustls ---
         Some(rustls_config) => {
-            info!(addr = %cfg.server.bind, "serveur en écoute (TLS natif)");
+            info!(addr = %cfg.server.bind, "server listening (native TLS)");
             #[cfg(target_os = "linux")]
             notify_ready();
 
@@ -1190,11 +1506,11 @@ async fn main() -> anyhow::Result<()> {
             let shutdown_handle = handle.clone();
             tokio::spawn(async move {
                 tokio::select! {
-                    _ = shutdown_sigterm.recv() => info!("SIGTERM reçu, drain en cours (TLS)"),
-                    _ = shutdown_sigint.recv() => info!("SIGINT reçu, drain en cours (TLS)"),
+                    _ = shutdown_sigterm.recv() => info!("SIGTERM received, draining (TLS)"),
+                    _ = shutdown_sigint.recv() => info!("SIGINT received, draining (TLS)"),
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                info!("signal d'arrêt traité (TLS)");
+                info!("shutdown signal handled (TLS)");
                 mcp_cancel.cancel();
                 shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
             });
@@ -1204,8 +1520,8 @@ async fn main() -> anyhow::Result<()> {
                 .serve(make_service)
                 .await
                 .map_err(|e| {
-                    error!(error = %e, "serveur TLS arrêté avec erreur");
-                    anyhow::anyhow!("erreur axum-server TLS serve : {e}")
+                    error!(error = %e, "TLS server stopped with error");
+                    anyhow::anyhow!("axum-server TLS serve error: {e}")
                 })?;
         }
         // --- Cleartext path (LIVE, unchanged): loopback behind reverse proxy ---
@@ -1213,8 +1529,8 @@ async fn main() -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(cfg.server.bind).await?;
             let actual_addr = listener
                 .local_addr()
-                .expect("obtenir l'adresse locale après bind — le listener est actif");
-            info!(addr = %actual_addr, "serveur en écoute");
+                .expect("obtaining local address after bind — the listener is active");
+            info!(addr = %actual_addr, "server listening");
 
             // Émettre l'adresse bound sur stdout pour permettre aux tests (et aux scripts)
             // de connaître le port alloué dynamiquement (bind sur :0) et de confirmer
@@ -1231,22 +1547,22 @@ async fn main() -> anyhow::Result<()> {
             axum::serve(listener, make_service)
                 .with_graceful_shutdown(async move {
                     tokio::select! {
-                        _ = shutdown_sigterm.recv() => info!("SIGTERM reçu, drain en cours"),
-                        _ = shutdown_sigint.recv() => info!("SIGINT reçu, drain en cours"),
+                        _ = shutdown_sigterm.recv() => info!("SIGTERM received, draining"),
+                        _ = shutdown_sigint.recv() => info!("SIGINT received, draining"),
                     }
                     // Drain minimal T1 : 50ms. Budget complet (30s) implémenté au niveau router.
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    info!("signal d'arrêt traité");
+                    info!("shutdown signal handled");
                     mcp_cancel.cancel();
                 })
                 .await
                 .map_err(|e| {
-                    error!(error = %e, "serveur arrêté avec erreur");
-                    anyhow::anyhow!("erreur axum serve : {e}")
+                    error!(error = %e, "server stopped with error");
+                    anyhow::anyhow!("axum serve error: {e}")
                 })?;
         }
     }
-    info!("gradatum-server arrêté proprement");
+    info!("gradatum-server shut down cleanly");
     Ok(())
 }
 
@@ -1271,7 +1587,7 @@ async fn load_tls_config(
         .await
         .with_context(|| {
             format!(
-                "chargement TLS fail-closed : impossible de charger cert={} / key={}",
+                "TLS fail-closed loading: cannot load cert={} / key={}",
                 tls.cert_path.display(),
                 tls.key_path.display()
             )
@@ -1389,7 +1705,22 @@ fn build_router(
         .merge(studio_router);
 
     // Fusion : les routes unauthed ne voient pas le layer JWT.
-    authed.merge(unauthed).with_state(state)
+    //
+    // Métriques HTTP : appliquées EN DERNIER, donc couche la PLUS EXTERNE, sur le routeur
+    // complet — toutes les routes sont comptées (/health, /api/v1/*, /mcp, /ui/*, fallback
+    // 404) y compris les 403/429 rendus par le WardenLayer et les 401 de l'auth middleware.
+    //
+    // `Router::layer` s'exécute APRÈS le routage (axum 0.8) : l'extension `MatchedPath` est
+    // disponible dans le middleware, donc le label `path` est le MOTIF de route
+    // (`/api/v1/vault/unforgot/{ulid}`) et jamais l'URL concrète — cardinalité bornée par la
+    // table de routage. Voir `crate::middleware::http_metrics_middleware`.
+    authed
+        .merge(unauthed)
+        .layer(middleware::from_fn_with_state(
+            state.metrics.clone(),
+            crate::middleware::http_metrics_middleware,
+        ))
+        .with_state(state)
 }
 
 /// Non-blocking TCP health probe for the embedding endpoint at startup.
@@ -1409,7 +1740,7 @@ async fn probe_embed_health(endpoint: &str) {
         None => {
             tracing::warn!(
                 endpoint = %endpoint,
-                "semantic search disabled — embed endpoint URL invalide (format inattendu)"
+                "semantic search disabled — invalid embed endpoint URL (unexpected format)"
             );
             return;
         }
@@ -1437,5 +1768,119 @@ async fn probe_embed_health(endpoint: &str) {
                 "semantic search disabled — embed endpoint unreachable (timeout 2s)"
             );
         }
+    }
+}
+
+// ─── Tests unitaires du wiring routeur ───────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    /// Construit le routeur **de production** (`build_router`) avec un `AppState`
+    /// de test (clé JWT éphémère, registres placeholder — aucune I/O disque).
+    ///
+    /// Rate limiting désactivé : le `WardenLayer` exige `ConnectInfo` dans les extensions,
+    /// que `oneshot` n'injecte pas. Sans effet sur ce qui est prouvé ici — le layer
+    /// métriques est la couche la PLUS EXTERNE, en amont du warden.
+    fn production_app() -> (AppState, axum::Router) {
+        let state = AppState::new();
+        let (mcp_service, _cancel) = api_v1::mcp::build_mcp_service(state.clone());
+        let rl = crate::config::RateLimitConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let studio = crate::config::StudioConfig {
+            ui_dir: PathBuf::from("/nonexistent-ui-dir-for-tests"),
+        };
+        let app = build_router(state.clone(), &rl, &studio, mcp_service);
+        (state, app)
+    }
+
+    /// Lignes d'échantillons (hors `#`) de la famille demandée dans le registry.
+    fn series_lines(state: &AppState, family: &str) -> Vec<String> {
+        let mut buf = String::new();
+        prometheus_client::encoding::text::encode(&mut buf, &state.metrics.registry)
+            .expect("encoding du registry ne doit pas échouer");
+        buf.lines()
+            .filter(|l| !l.starts_with('#') && l.starts_with(family))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Le layer métriques est réellement monté sur le routeur de production :
+    /// une requête traversant l'app produit un échantillon observable.
+    #[tokio::test]
+    async fn production_router_records_http_requests() {
+        let (state, app) = production_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .expect("request builder invariant");
+        let resp = app
+            .oneshot(req)
+            .await
+            .expect("le routeur ne doit pas paniquer");
+        assert_eq!(resp.status(), StatusCode::OK, "/health répond 200");
+
+        let lines = series_lines(&state, "gradatum_http_requests_total");
+        assert!(
+            !lines.is_empty(),
+            "le layer métriques doit être monté sur build_router — 0 échantillon = non câblé"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#"path="/health""#) && l.contains(r#"status="200""#)),
+            "échantillon /health status=200 attendu, lignes = {lines:?}"
+        );
+
+        let durations = series_lines(&state, "gradatum_http_request_duration_seconds_count");
+        assert!(
+            durations.iter().any(|l| l.contains(r#"path="/health""#)),
+            "l'histogramme de durée doit être alimenté aussi, lignes = {durations:?}"
+        );
+    }
+
+    /// Sur une route paramétrique RÉELLE de la table de production, le label `path` est le
+    /// motif — l'ULID concret n'apparaît nulle part (garde-fou cardinalité).
+    #[tokio::test]
+    async fn production_router_labels_parametric_route_with_its_pattern() {
+        const ULID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let (state, app) = production_app();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/vault/unforgot/{ULID}"))
+            .body(Body::empty())
+            .expect("request builder invariant");
+        let resp = app
+            .oneshot(req)
+            .await
+            .expect("le routeur ne doit pas paniquer");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "sans bearer, le handler rend 401"
+        );
+
+        let lines = series_lines(&state, "gradatum_http_requests_total");
+        assert!(
+            lines.iter().all(|l| !l.contains(ULID)),
+            "aucune série ne doit contenir l'ULID concret, lignes = {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#"path="/api/v1/vault/unforgot/{ulid}""#)
+                    && l.contains(r#"status="401""#)),
+            "le motif de route doit être le label, lignes = {lines:?}"
+        );
     }
 }

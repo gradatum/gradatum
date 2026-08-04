@@ -97,7 +97,7 @@ pub async fn run(args: DowngradeFromTrashArgs) -> Result<DowngradeStats> {
         // .vault-trash directory is a valid and expected state on a clean vault.
         let stats = DowngradeStats::default();
         eprintln!(
-            "info: .vault-trash absent ({}) — rien à migrer (idempotent)",
+            "info: .vault-trash absent ({}) — nothing to migrate (idempotent)",
             trash_dir.display()
         );
         eprintln!(
@@ -115,7 +115,7 @@ pub async fn run(args: DowngradeFromTrashArgs) -> Result<DowngradeStats> {
     let index_path = vault_index_path(&args.gradatum_root);
     if !index_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le worker doit avoir démarré au moins une fois",
+            "index.db not found: {} — the worker must have started at least once",
             index_path.display()
         );
     }
@@ -139,7 +139,7 @@ pub async fn run(args: DowngradeFromTrashArgs) -> Result<DowngradeStats> {
     // Hoisted here: one preparation, the Statement is reused.
     let mut stmt = conn
         .prepare("SELECT id, status FROM notes WHERE substr(body_text, 1, 200) = ?1 LIMIT 1")
-        .context("préparation requête match")?;
+        .context("preparing match query")?;
 
     // Recursive walk of .vault-trash/**/*.md — supports all depths:
     //   - 2-level legacy: .vault-trash/<date>/<file>.md         (min_depth=2)
@@ -155,7 +155,7 @@ pub async fn run(args: DowngradeFromTrashArgs) -> Result<DowngradeStats> {
         .filter_map(|e| {
             // Skip unreadable entries (permissions) without interrupting the walk.
             e.map_err(|err| {
-                eprintln!("[WARN] entrée inaccessible dans .vault-trash : {err}");
+                eprintln!("[WARN] inaccessible entry in .vault-trash: {err}");
             })
             .ok()
         })
@@ -206,7 +206,7 @@ pub async fn run(args: DowngradeFromTrashArgs) -> Result<DowngradeStats> {
                 // Incrementing before a failed read and then decrementing would risk
                 // underflow (usize wraps on overflow in release mode if the first
                 // file encountered is unreadable).
-                eprintln!("[WARN] lecture impossible {} : {e}", path.display());
+                eprintln!("[WARN] cannot read {} : {e}", path.display());
                 continue; // compteur PAS incrémenté pour les fichiers illisibles
             }
         };

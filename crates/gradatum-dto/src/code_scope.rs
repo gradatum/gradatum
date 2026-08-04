@@ -59,7 +59,7 @@ pub const DEFAULT_BODY_BUDGET_TOKENS: usize = 4_000;
 ///   mid-body. Entries without a body (stale or span absent): `body=null` omitted from
 ///   JSON (`skip_serializing_if`).
 ///
-/// ## Additive `include_callers` field (fully backward-compatible, v0.6.3)
+/// ## Additive `include_callers` field (fully backward-compatible)
 ///
 /// - `include_callers` (default `false`): if `true`, each entry receives a `callers` field
 ///   listing the qualified names of symbols that declare this symbol in their outgoing `deps`
@@ -122,7 +122,7 @@ pub const MAX_CALLERS_PER_ENTRY: usize = 50;
 /// (`skip_serializing_if = "Option::is_none"` — guarantees byte-for-byte parity
 /// with `include_body=false`).
 ///
-/// ## `callers` field (additive, v0.6.3)
+/// ## `callers` field (additive)
 ///
 /// Present only if `include_callers=true` in the request. Contains the qualified names
 /// of symbols that list this symbol in their outgoing `deps` (reverse-dependency lookup).

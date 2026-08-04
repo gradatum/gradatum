@@ -85,7 +85,7 @@ impl HttpEmbedder {
                 .timeout(timeout)
                 .build()
                 // SAFETY: the default reqwest configuration cannot fail.
-                .expect("construction du client reqwest avec timeout par défaut"),
+                .expect("reqwest client build with default timeout"),
             endpoint,
             model,
             timeout,
@@ -102,7 +102,7 @@ impl HttpEmbedder {
             .timeout(timeout)
             .build()
             // SAFETY: same as `new` — trivial configuration.
-            .expect("construction du client reqwest avec timeout personnalisé");
+            .expect("reqwest client build with custom timeout");
         self
     }
 
@@ -130,11 +130,11 @@ impl HttpEmbedder {
         let parsed: EmbeddingsResponse = resp
             .json()
             .await
-            .map_err(|e| EmbedError::InvalidResponse(format!("désérialisation JSON: {e}")))?;
+            .map_err(|e| EmbedError::InvalidResponse(format!("JSON deserialization: {e}")))?;
 
         if parsed.data.is_empty() {
             return Err(EmbedError::InvalidResponse(
-                "data[] vide dans la réponse".into(),
+                "empty data[] in response".into(),
             ));
         }
 
@@ -198,7 +198,7 @@ impl Embedder for HttpEmbedder {
         // SAFETY: embed_batch returns exactly 1 vector for 1 text when the response is valid.
         Ok(out
             .pop()
-            .expect("embed_batch a retourné exactement 1 vecteur pour 1 texte"))
+            .expect("embed_batch returned exactly 1 vector for 1 text"))
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {

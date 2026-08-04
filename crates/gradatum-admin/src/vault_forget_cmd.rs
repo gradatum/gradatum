@@ -12,7 +12,9 @@
 //!
 //! ## Protected sections
 //!
-//! `agent-issues` and `council` are automatically excluded from every batch.
+//! The `agent-issues`, `council`, `project-map` and `identity` sections are automatically
+//! excluded from every batch. The list is read from `Section::PROTECTED_FORGET` in
+//! `gradatum-core`, not duplicated here.
 //!
 //! ## Direct SQLite access
 //!
@@ -88,8 +90,8 @@ pub struct ForgetCommonArgs {
     #[arg(long, default_value = "/var/lib/gradatum")]
     pub root: PathBuf,
 
-    /// Target tenant (`vault_id`), default `"main"`.
-    #[arg(long, default_value = "main")]
+    /// Target tenant (`vault_id`).
+    #[arg(long)]
     pub tenant: String,
 
     /// Actor triggering the forget (recorded in frontmatters).
@@ -187,95 +189,190 @@ pub async fn run_forget(cmd: ForgetCmd) -> Result<()> {
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 
+/// A **mono-vault** forget batch: the target vault, its scope narrowed down to that single
+/// vault, and the eligible / excluded partition resolved within THAT vault.
+struct VaultBatch {
+    vault: String,
+    scope: ForgetScope,
+    eligible: Vec<String>,
+    excluded: Vec<(String, String)>,
+}
+
+/// Splits a `ForgetScope` into **mono-vault** scopes, one per targeted vault.
+///
+/// Operator ruling of 2026-07-27: **a job carries exactly one vault**. A
+/// `ForgetScope::Agent` targeting N vaults therefore produces N jobs — one per vault, each
+/// scoped `JobScope::Vault(v)` — never a single job spanning N vaults. `Topic` and `Locus`
+/// carry only one vault: they return a singleton.
+///
+/// The vault is carried over into the `ForgetScope` of every batch (`Topic.vault = Some(v)`,
+/// `Agent.vaults = [v]`), so that both halves of the `JobSpec` state the same thing:
+/// this is exactly what `ensure_forget_scope_vault` checks on the worker side.
+fn fan_out_by_vault(scope: &ForgetScope, tenant: &str) -> Result<Vec<(String, ForgetScope)>> {
+    match scope {
+        ForgetScope::Topic {
+            query,
+            vault,
+            limit,
+        } => {
+            let v = vault.clone().unwrap_or_else(|| tenant.to_string());
+            Ok(vec![(
+                v.clone(),
+                ForgetScope::Topic {
+                    query: query.clone(),
+                    vault: Some(v),
+                    limit: *limit,
+                },
+            )])
+        }
+        ForgetScope::Locus { vault, locus } => Ok(vec![(
+            vault.clone(),
+            ForgetScope::Locus {
+                vault: vault.clone(),
+                locus: locus.clone(),
+            },
+        )]),
+        ForgetScope::Agent { agent_id, vaults } => {
+            let targets: Vec<String> = if vaults.is_empty() {
+                vec![tenant.to_string()]
+            } else {
+                vaults.clone()
+            };
+            // Dédoublonnage : un vault répété produirait deux jobs sur la même cible,
+            // donc un double-forget à confirmer deux fois. Ordre d'entrée préservé.
+            let mut seen = std::collections::HashSet::new();
+            Ok(targets
+                .into_iter()
+                .filter(|v| seen.insert(v.clone()))
+                .map(|v| {
+                    let scope = ForgetScope::Agent {
+                        agent_id: agent_id.clone(),
+                        vaults: vec![v.clone()],
+                    };
+                    (v, scope)
+                })
+                .collect())
+        }
+        // ForgetScope is #[non_exhaustive] — guard for future variants.
+        _ => anyhow::bail!("ForgetScope scope not supported by this version of gradatum-admin"),
+    }
+}
+
 async fn run_forget_scope(scope: ForgetScope, common: ForgetCommonArgs) -> Result<()> {
     // SSOT : chemin via helper canonique — jamais root.join(...) manuel.
     let db_path = vault_index_path(&common.root);
     if !db_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le server doit avoir démarré au moins une fois",
+            "index.db not found: {} — the server must have started at least once",
             db_path.display()
         );
     }
 
-    // Resolve scope → (note_id, section).
-    let candidates = resolve_scope_direct(&db_path, &scope, &common.tenant).await?;
+    // Fan-out : un lot par vault, résolu DANS ce vault. Aucun lot ne mêle deux vaults.
+    let mut batches: Vec<VaultBatch> = Vec::new();
+    for (vault, vault_scope) in fan_out_by_vault(&scope, &common.tenant)? {
+        let candidates = resolve_scope_direct(&db_path, &vault_scope, &vault).await?;
 
-    // Partition into eligible / excluded.
-    let mut eligible: Vec<String> = Vec::new();
-    let mut excluded: Vec<(String, String)> = Vec::new();
-
-    for (ulid, section) in candidates {
-        if is_protected(&section) {
-            excluded.push((ulid, section));
-        } else {
-            eligible.push(ulid);
+        let mut eligible: Vec<String> = Vec::new();
+        let mut excluded: Vec<(String, String)> = Vec::new();
+        for (ulid, section) in candidates {
+            if is_protected(&section) {
+                excluded.push((ulid, section));
+            } else {
+                eligible.push(ulid);
+            }
         }
+        batches.push(VaultBatch {
+            vault,
+            scope: vault_scope,
+            eligible,
+            excluded,
+        });
     }
 
-    // Print preview.
+    let all_eligible: Vec<String> = batches.iter().flat_map(|b| b.eligible.clone()).collect();
+    let total_excluded: usize = batches.iter().map(|b| b.excluded.len()).sum();
+
+    // Print preview — par vault, pour que l'opérateur voie OÙ chaque note sera oubliée.
     println!(
-        "=== vault forget preview ({} éligible(s), {} exclue(s)) ===",
-        eligible.len(),
-        excluded.len(),
+        "=== vault forget preview ({} eligible, {} excluded, {} vault(s)) ===",
+        all_eligible.len(),
+        total_excluded,
+        batches.len(),
     );
-    if eligible.is_empty() {
-        println!("Aucune note éligible.");
-    } else {
-        println!("Notes éligibles :");
-        for ulid in &eligible {
-            println!("  {ulid}");
+    for batch in &batches {
+        println!("-- vault: {} --", batch.vault);
+        if batch.eligible.is_empty() {
+            println!("No eligible note.");
+        } else {
+            println!("Eligible notes:");
+            for ulid in &batch.eligible {
+                println!("  {ulid}");
+            }
         }
-    }
-    if !excluded.is_empty() {
-        println!("Notes exclues (sections protégées) :");
-        for (ulid, section) in &excluded {
-            println!("  {ulid}  (section: {section})");
+        if !batch.excluded.is_empty() {
+            println!("Excluded notes (protected sections):");
+            for (ulid, section) in &batch.excluded {
+                println!("  {ulid}  (section: {section})");
+            }
         }
     }
 
     // Dry-run: stop here.
     if !common.execute {
         println!(
-            "\n[DRY-RUN] Pour exécuter, relancer avec --execute --confirm-ulids \"{}\"",
-            eligible.join(","),
+            "\n[DRY-RUN] To execute, re-run with --execute --confirm-ulids \"{}\"",
+            all_eligible.join(","),
         );
         return Ok(());
     }
 
-    // Verify confirm_ulids.
-    let mut expected_sorted = eligible.clone();
+    // Verify confirm_ulids — sur l'UNION des vaults : l'opérateur confirme la totalité de
+    // ce que la preview a annoncé, la répartition par vault reste faite ici.
+    let mut expected_sorted = all_eligible.clone();
     expected_sorted.sort();
     let mut confirmed_sorted = common.confirm_ulids.clone();
     confirmed_sorted.sort();
 
     if expected_sorted != confirmed_sorted {
         anyhow::bail!(
-            "confirm_ulids mismatch : {} attendus, {} fournis — relancer en dry-run pour obtenir la liste exacte",
+            "confirm_ulids mismatch: {} expected, {} provided — re-run in dry-run to get the exact list",
             expected_sorted.len(),
             confirmed_sorted.len(),
         );
     }
 
-    if eligible.is_empty() {
-        println!("Aucune note à oublier — opération annulée.");
+    if all_eligible.is_empty() {
+        println!("No note to forget — operation cancelled.");
         return Ok(());
     }
 
-    // Enqueue Job::Forget into queue.sqlite.
+    // Enqueue — un Job::Forget par vault ayant au moins une note éligible.
     let pool = open_queue_pool(&common.root).await?;
     let store = SqliteQueueStore::new(pool);
 
-    let record = build_forget_job_record(
-        scope,
-        common.confirm_ulids.clone(),
-        common.forgotten_by.clone(),
-    );
-    let job_ulid = store
-        .enqueue(record)
-        .await
-        .context("erreur enqueue Job::Forget")?;
+    println!();
+    for batch in batches {
+        if batch.eligible.is_empty() {
+            continue;
+        }
+        let vault = batch.vault;
+        let record = build_forget_job_record(
+            &vault,
+            batch.scope,
+            // Chaque job ne confirme QUE les ULIDs de son propre vault.
+            batch.eligible,
+            common.forgotten_by.clone(),
+        );
+        let job_ulid = store
+            .enqueue(record)
+            .await
+            .with_context(|| format!("Job::Forget enqueue error (vault {vault})"))?;
 
-    println!("\nJob::Forget enqueued : {job_ulid}\nPoll : gradatum-admin jobs get {job_ulid}");
+        println!(
+            "Job::Forget enqueued (vault {vault}) : {job_ulid}\nPoll : gradatum-admin jobs get {job_ulid}"
+        );
+    }
     Ok(())
 }
 
@@ -302,8 +399,8 @@ fn resolve_scope_sync(
     scope: &ForgetScope,
     tenant: &str,
 ) -> Result<Vec<(String, String)>> {
-    let conn = rusqlite::Connection::open(db_path)
-        .context("ouverture index.db pour vault-forget preview")?;
+    let conn =
+        rusqlite::Connection::open(db_path).context("opening index.db for vault-forget preview")?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA query_only=1;")
         .context("PRAGMA read-only")?;
 
@@ -318,7 +415,7 @@ fn resolve_scope_sync(
 
             if query.len() > 512 {
                 anyhow::bail!(
-                    "query FTS trop longue ({} > 512 chars) — réduire la recherche",
+                    "FTS query too long ({} > 512 chars) — narrow the search",
                     query.len()
                 );
             }
@@ -420,14 +517,27 @@ fn resolve_scope_sync(
             Ok(rows)
         }
         // ForgetScope is #[non_exhaustive] — guard for future variants.
-        _ => anyhow::bail!("scope ForgetScope non supporté par cette version de gradatum-admin"),
+        _ => anyhow::bail!("ForgetScope scope not supported by this version of gradatum-admin"),
     }
 }
 
 // ── Enqueue ───────────────────────────────────────────────────────────────────
 
-/// Builds a `JobRecord` for a `Job::Forget` job.
+/// Builds a `JobRecord` for a **mono-vault** `Job::Forget` job.
+///
+/// `JobSpec.scope = JobScope::Vault(vault_id)` — never `VaultWide`. That field, and it
+/// alone, is what `resolve_job_vault` consumes on the worker side to scope both the listing
+/// AND the mutation; a `VaultWide` was rejected terminally as soon as `multi_tenant` is ON
+/// (`gradatum-admin vault forget` inoperative), and when OFF it elected `"main"` without
+/// ever confronting that choice with the vault requested through `--tenant`.
+///
+/// `Vault(v)` covers both regimes without the CLI having to read the server
+/// configuration: when OFF, `resolve_job_vault` accepts `Vault("main")` (identical to the
+/// previous `VaultWide` behaviour) and rejects any other vault — which is correct, a single
+/// vault exists then. The pattern is the one of `build_distill_job_record`, minus the flag
+/// parameter that has become useless here.
 fn build_forget_job_record(
+    vault_id: &str,
     scope: ForgetScope,
     confirm_ulids: Vec<String>,
     forgotten_by: Option<String>,
@@ -445,7 +555,7 @@ fn build_forget_job_record(
             kind: Job::Forget(spec),
             class: JobClass::Human,
             mode: JobMode::Batch,
-            scope: JobScope::VaultWide,
+            scope: JobScope::Vault(vault_id.to_string()),
             priority: JobPriority::Normal,
         },
         scheduling: JobScheduling {
@@ -481,18 +591,15 @@ async fn open_queue_pool(root: &std::path::Path) -> Result<SqlitePool> {
     // SSOT : chemin via helper canonique — jamais root.join(...) manuel.
     let db_path = queue_db_path(root);
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    let pool = SqlitePool::connect(&url).await.with_context(|| {
-        format!(
-            "impossible d'ouvrir la queue SQLite : {}",
-            db_path.display()
-        )
-    })?;
+    let pool = SqlitePool::connect(&url)
+        .await
+        .with_context(|| format!("cannot open the SQLite queue: {}", db_path.display()))?;
     apply_sqlite_pragmas(&pool)
         .await
-        .context("erreur pragmas WAL queue")?;
+        .context("queue WAL pragmas error")?;
     run_migrations(&pool)
         .await
-        .context("erreur migrations queue")?;
+        .context("queue migrations error")?;
     Ok(pool)
 }
 
@@ -516,6 +623,7 @@ mod tests {
     #[test]
     fn build_forget_job_record_dry_run_false() {
         let record = build_forget_job_record(
+            "main",
             ForgetScope::Topic {
                 query: "test".to_string(),
                 vault: None,
@@ -532,6 +640,90 @@ mod tests {
         } else {
             panic!("attendu Job::Forget");
         }
+    }
+
+    /// A2-bis — le job porte `JobScope::Vault(tenant)`, jamais `VaultWide`.
+    ///
+    /// Discriminant : avec le `VaultScope::VaultWide` en dur d'avant le lot,
+    /// `resolve_job_vault` refusait terminalement le job dès `multi_tenant = ON`
+    /// (« ambiguous job vault ») — `gradatum-admin vault forget` était inopérant.
+    #[test]
+    fn build_forget_job_record_carries_the_target_vault() {
+        let record = build_forget_job_record(
+            "vault-b",
+            ForgetScope::Locus {
+                vault: "vault-b".to_string(),
+                locus: "inbox/".to_string(),
+            },
+            vec![],
+            None,
+        );
+        assert!(
+            matches!(&record.spec.scope, JobScope::Vault(v) if v == "vault-b"),
+            "JobSpec.scope doit porter le vault ciblé : {:?}",
+            record.spec.scope
+        );
+    }
+
+    /// A2-bis — un `Agent` visant N vaults produit N scopes mono-vault (fan-out),
+    /// dédoublonnés, et chaque scope reporte SON vault.
+    #[test]
+    fn fan_out_by_vault_splits_agent_scope_per_vault() {
+        let scope = ForgetScope::Agent {
+            agent_id: "curator".to_string(),
+            vaults: vec![
+                "main".to_string(),
+                "vault-b".to_string(),
+                "main".to_string(),
+            ],
+        };
+        let out = fan_out_by_vault(&scope, "main").expect("fan-out agent");
+        assert_eq!(
+            out.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>(),
+            vec!["main", "vault-b"],
+            "un job par vault distinct, ordre d'entrée préservé"
+        );
+        for (vault, scope) in &out {
+            match scope {
+                ForgetScope::Agent { vaults, .. } => assert_eq!(
+                    vaults.as_slice(),
+                    std::slice::from_ref(vault),
+                    "chaque scope éclaté ne porte que SON vault"
+                ),
+                other => panic!("attendu ForgetScope::Agent, obtenu {other:?}"),
+            }
+        }
+    }
+
+    /// A2-bis — `Agent` sans vault explicite retombe sur `--tenant` (un seul job).
+    #[test]
+    fn fan_out_by_vault_agent_without_vaults_uses_tenant() {
+        let scope = ForgetScope::Agent {
+            agent_id: "curator".to_string(),
+            vaults: vec![],
+        };
+        let out = fan_out_by_vault(&scope, "vault-b").expect("fan-out agent sans vaults");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "vault-b");
+    }
+
+    /// A2-bis — `Topic` sans vault explicite est matérialisé sur `--tenant` : le scope
+    /// enqueué ne peut plus être muet, donc plus diverger du `JobScope::Vault`.
+    #[test]
+    fn fan_out_by_vault_topic_materialises_the_tenant() {
+        let scope = ForgetScope::Topic {
+            query: "q".to_string(),
+            vault: None,
+            limit: None,
+        };
+        let out = fan_out_by_vault(&scope, "vault-b").expect("fan-out topic");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "vault-b");
+        assert!(
+            matches!(&out[0].1, ForgetScope::Topic { vault: Some(v), .. } if v == "vault-b"),
+            "le vault doit être matérialisé dans le scope : {:?}",
+            out[0].1
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use gradatum_cache::{EffectiveNoteCache, EffectiveNoteCacheConfig};
 use gradatum_core::identity::{ContentHash, NoteId};
+use gradatum_core::scope::VaultId;
 
 // ────────────────────────────────────────────────────────
 // T6 : éviction TTL — entrée expirée retourne None sur get
@@ -21,10 +22,12 @@ async fn ttl_eviction_returns_none_after_expiry() {
     };
     let cache = EffectiveNoteCache::new(cfg);
     let id = NoteId::new();
-    let key = (id, 0u64);
+    let key = (VaultId::new("main"), id, 0u64);
     let hash = ContentHash([0x42; 32]);
 
-    cache.insert(key, dummy_effective_note(id), hash).await;
+    cache
+        .insert(key.clone(), dummy_effective_note(id), hash)
+        .await;
     // run_pending_tasks nécessaire pour que entry_count reflète l'insert
     // (moka met à jour les compteurs de façon lazy).
     cache.run_pending_tasks().await;
@@ -68,7 +71,11 @@ async fn max_capacity_eviction_keeps_count_bounded() {
     for _ in 0..20 {
         let id = NoteId::new();
         cache
-            .insert((id, 0), dummy_effective_note(id), ContentHash([0; 32]))
+            .insert(
+                (VaultId::new("main"), id, 0),
+                dummy_effective_note(id),
+                ContentHash([0; 32]),
+            )
             .await;
     }
 

@@ -46,7 +46,7 @@ pub enum ProactiveRecallError {
     #[error("proactive_recall JSON : {0}")]
     Json(#[from] serde_json::Error),
     /// Le thread bloquant a échoué (panic ou annulation) — impossible en pratique.
-    #[error("proactive_recall thread blocking échoué")]
+    #[error("proactive_recall blocking thread failed")]
     Blocking,
 }
 

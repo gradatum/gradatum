@@ -154,7 +154,7 @@ async fn vault_open_after_create_preserves_state() {
 // --- 5. tenant_id_defaults_to_main ---
 
 /// Vérifie que le vault créé avec le tenant "main" expose bien "main" via
-/// `vault.tenant_id()` — invariant D10 (tenant_id mandatory).
+/// `vault.vault_id()` — invariant D10 (tenant_id mandatory).
 ///
 /// Note : Vault::create exige un VaultId explicite — le fallback "main" est assuré
 /// par Vault::open (lit config.toml). Ce test valide le chemin create.
@@ -166,7 +166,7 @@ async fn tenant_id_defaults_to_main() {
         .expect("vault::create");
 
     assert_eq!(
-        vault.tenant_id().as_str(),
+        vault.vault_id().as_str(),
         "main",
         "tenant_id doit être 'main'"
     );

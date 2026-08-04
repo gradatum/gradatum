@@ -148,7 +148,7 @@ impl apalis::prelude::Acknowledge<JobOutput, (), RandomId> for GradatumAcknowled
                 None => {
                     // Should never occur if record_to_task correctly injects the Ulid.
                     error!(
-                        "ack: Ulid absent des parts.data — job non retrouvable, status REST Running"
+                        "ack: Ulid absent from parts.data — job not retrievable, REST status Running"
                     );
                     return Ok(());
                 }
@@ -168,12 +168,12 @@ impl apalis::prelude::Acknowledge<JobOutput, (), RandomId> for GradatumAcknowled
                             job_id = %job_id,
                             error = %e,
                             desc = %desc,
-                            "ack: store.complete échoué — status restera Running"
+                            "ack: store.complete failed — status will stay Running"
                         );
                     } else {
                         tracing::info!(
                             job_id = %job_id,
-                            "ack: job marqué Done"
+                            "ack: job marked Done"
                         );
                     }
                 }
@@ -183,14 +183,14 @@ impl apalis::prelude::Acknowledge<JobOutput, (), RandomId> for GradatumAcknowled
                             job_id = %job_id,
                             error = %e,
                             handler_error = %err_msg,
-                            "ack: store.fail échoué — status restera Running"
+                            "ack: store.fail failed — status will stay Running"
                         );
                     } else {
                         warn!(
                             job_id = %job_id,
                             attempt = att,
                             handler_error = %err_msg,
-                            "ack: job marqué Failed"
+                            "ack: job marked Failed"
                         );
                     }
                 }
@@ -264,14 +264,44 @@ pub fn build_gradatum_backend(
                 // batch then re-enqueue; fails with `loop` (false), passes with
                 // this pattern. The 200 ms debounce stays BEFORE the dequeue.
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                match store.dequeue_by_kind(kind).await {
+                // P0-3 — Tenant filter: `None` = shared worker pool.
+                //
+                // The current deployment architecture uses a SINGLE worker pool
+                // (one Monitor with N workers per kind) that serves ALL tenants.
+                // Passing `None` to `dequeue_by_kind` means "no tenant filter" —
+                // the worker fetches jobs from any tenant.
+                //
+                // This is safe because:
+                // 1. Tenant isolation is enforced at the HANDLER level:
+                //    `ensure_job_tenant()` validates the tenant_id from the job
+                //    payload before any write operation. A job with an invalid
+                //    or mismatched tenant is rejected with `HandlerError::Business`
+                //    (terminal, max_retries=0 → DLQ, not reprocessed).
+                // 2. All vault operations (`InternalClient`, `IndexStore`)
+                //    use the tenant from the job payload, not the worker identity.
+                //    The worker itself has no tenant affiliation.
+                // 3. Queue browsing APIs (`list`, `get`, `cancel`) support
+                //    optional tenant filtering — the server-side authz layer
+                //    scopes the filter to the requesting tenant, not the worker.
+                //
+                // Alternative considered: per-tenant worker pools. Rejected for
+                // the current deployment scale — a single shared pool with
+                // handler-level isolation is simpler and sufficient until the
+                // number of active tenants exceeds ~10, at which point a
+                // per-tenant pool (with `tenant_filter = Some("tenant-x")`)
+                // would reduce contention on the shared queue.
+                //
+                // Integration test: `tests/worker_multitenant_shared_pool.rs`
+                // proves that a shared worker pool correctly processes jobs from
+                // different tenants without cross-tenant data leakage.
+                match store.dequeue_by_kind(kind, None).await {
                     Ok(Some(record)) => {
                         let task = record_to_task(record);
                         Some((Ok(Some(task)), store))
                     }
                     Ok(None) => {
                         // Empty queue — yield Idle and return control to the worker.
-                        debug!("gradatum_backend: file vide (Idle), re-poll dans 200ms");
+                        debug!("gradatum_backend: empty queue (Idle), re-poll in 200ms");
                         Some((Ok(None), store))
                     }
                     Err(e) => {
@@ -432,10 +462,17 @@ mod tests {
             async fn enqueue(&self, _: JobRecord) -> Result<Ulid, gradatum_core::QueueError> {
                 unimplemented!()
             }
-            async fn dequeue(&self) -> Result<Option<JobRecord>, gradatum_core::QueueError> {
+            async fn dequeue(
+                &self,
+                _tenant_filter: Option<&str>,
+            ) -> Result<Option<JobRecord>, gradatum_core::QueueError> {
                 unimplemented!()
             }
-            async fn get(&self, _: Ulid) -> Result<Option<JobRecord>, gradatum_core::QueueError> {
+            async fn get(
+                &self,
+                _: Ulid,
+                _: Option<&str>,
+            ) -> Result<Option<JobRecord>, gradatum_core::QueueError> {
                 unimplemented!()
             }
             async fn complete(
@@ -453,7 +490,11 @@ mod tests {
             ) -> Result<(), gradatum_core::QueueError> {
                 unimplemented!()
             }
-            async fn cancel(&self, _: Ulid) -> Result<(), gradatum_core::QueueError> {
+            async fn cancel(
+                &self,
+                _: Ulid,
+                _: Option<&str>,
+            ) -> Result<(), gradatum_core::QueueError> {
                 unimplemented!()
             }
             async fn fail_dlq(&self, _: Ulid, _: &str) -> Result<(), gradatum_core::QueueError> {

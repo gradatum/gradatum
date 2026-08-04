@@ -38,9 +38,15 @@ pub struct ServerConfig {
     /// Session-log Tier 1 (`session_trace`) retention.
     #[serde(default)]
     pub session_trace: SessionTraceConfig,
+    /// Archives des notes supprimées (F-100 incrément 1.6) — rétention avant GC physique.
+    #[serde(default)]
+    pub archive: ArchiveConfig,
     /// Search scoring — trust decay (RRF layer).
     #[serde(default)]
     pub scoring: ScoringConfig,
+    /// Search scoring — usage salience. Default OFF.
+    #[serde(default)]
+    pub salience: SalienceConfig,
     /// Studio web UI — `ServeDir` for `/ui/*`.
     #[serde(default)]
     pub studio: StudioConfig,
@@ -63,6 +69,18 @@ pub struct ServerConfig {
     /// Wired: tâche tokio interval dans `main.rs`.
     #[serde(default)]
     pub review_promote: ReviewPromoteConfig,
+
+    /// Passe d'audit / déduplication rétrospective du vault (F-51, Option A).
+    ///
+    /// Détecte les doublons / déchets et produit un **rapport** (jamais de mutation).
+    /// Désactivée par défaut. Wired: tâche tokio interval dans `main.rs`.
+    #[serde(default)]
+    pub audit: AuditConfig,
+
+    /// Oubli gradué F-111 — axe pertinence de la passe d'audit + exécuteur
+    /// auto-downgrade (réversible, jamais delete). Désactivé par défaut (gate §7).
+    #[serde(default)]
+    pub downgrade: DowngradeConfig,
 
     /// Configuration for the context assembly pipeline.
     ///
@@ -90,6 +108,55 @@ pub struct ServerConfig {
     /// ```
     #[serde(default)]
     pub proactive_recall: ProactiveRecallConfig,
+
+    /// Substrat multi-vault C1 (F-63, plan v1.0.0 A5). Défaut : OFF.
+    ///
+    /// OFF ⇒ verrou legacy mono-vault `"main"` (`tenant_is_authorized`), comportement
+    /// **inchangé** — les tables `tenants`/`tenant_vault_grants`
+    /// (migration 0030) ne sont jamais consultées. ON ⇒ allow-list consultée à chaque
+    /// requête (middleware) et sur chaque chemin d'écriture (EX-C1-2).
+    /// Rollback = repasser le flag à OFF.
+    #[serde(default)]
+    pub multi_tenant: MultiTenantConfig,
+
+    /// Overrides de configuration PAR vault (A6, F-63 multi-vault) — couche minimale.
+    ///
+    /// Map `vault_id -> override partiel`. **Défaut : vide** → toute résolution retombe sur
+    /// la config globale (aucun override configuré
+    /// ⇒ chemins inchangés). Lecture seule via [`ServerConfig::salience_for`] /
+    /// [`ServerConfig::review_promote_for`] : pas de rechargement dynamique, pas d'UI, pas
+    /// d'écriture — juste la capacité de lire un override s'il est présent (YAGNI). Étendre
+    /// la surface surchargeable = ajouter un champ `Option<…>` dans [`PerVaultOverride`] +
+    /// un résolveur `_for` dédié ; ne pas généraliser avant un besoin per-vault réel.
+    #[serde(default)]
+    pub per_vault: std::collections::HashMap<String, PerVaultOverride>,
+}
+
+/// Override de configuration pour un vault donné (A6, YAGNI minimal).
+///
+/// Chaque champ est optionnel : `None` ⇒ le résolveur retombe sur la config globale de
+/// [`ServerConfig`]. Seuls `salience` et `review_promote` sont surchargeables (les seuls
+/// besoins per-vault identifiés à l'horizon flip). Un override absent de la map est
+/// équivalent à un `PerVaultOverride` tout-`None` : global exact.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PerVaultOverride {
+    /// Surcharge de la config salience pour ce vault. `None` ⇒ global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salience: Option<SalienceConfig>,
+    /// Surcharge de la config d'auto-promotion review pour ce vault. `None` ⇒ global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_promote: Option<ReviewPromoteConfig>,
+}
+
+/// Substrat multi-vault (C1, F-63) — voir [`ServerConfig::multi_tenant`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MultiTenantConfig {
+    /// Active le chemin lookup allow-list `tenant_vault_grants`. Défaut : `false`.
+    ///
+    /// INV-P1-3 : aucune activation d'un 2e vault en écriture avant le fix ACL
+    /// cross-vault (C2) — ce flag reste OFF partout en production sur le train C1.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Studio web UI configuration.
@@ -225,6 +292,84 @@ impl Default for ScoringConfig {
         Self {
             trust_decay_enabled: Self::default_trust_decay_enabled(),
             half_life_days: Self::default_half_lives(),
+        }
+    }
+}
+
+/// Search scoring configuration — usage salience.
+///
+/// Adds the 4th multiplicative factor `(1 + gamma × s/(s+k_norm))` to the composite,
+/// fed by the `note_usage` table. **Default OFF** — when `enabled = false`,
+/// responses are byte-identical to a build without salience.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SalienceConfig {
+    /// Enables the salience factor. Default: `false` (deferred activation gate).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Boost coefficient — max boost `× (1 + gamma)`. Default `0.10`.
+    #[serde(default = "SalienceConfig::default_gamma")]
+    pub gamma: f64,
+    /// Soft-saturation constant (must be > 0 — validated at boot). Default `10.0`.
+    #[serde(default = "SalienceConfig::default_k_norm")]
+    pub k_norm: f64,
+    /// Per-kind weights. Absent kind = weight 0 (ignored).
+    #[serde(default = "SalienceConfig::default_kind_weights")]
+    pub kind_weights: std::collections::HashMap<String, f64>,
+}
+
+impl SalienceConfig {
+    fn default_gamma() -> f64 {
+        0.10
+    }
+    fn default_k_norm() -> f64 {
+        10.0
+    }
+    fn default_kind_weights() -> std::collections::HashMap<String, f64> {
+        [
+            ("read", 3.0),
+            ("recall-accepted", 5.0),
+            ("search-hit-top3", 2.0),
+            ("recall-surfaced", 1.0),
+            ("search-hit", 0.5),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    /// Fail-loud boot validation: `k_norm` must be strictly positive.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with a human-readable message when `k_norm <= 0`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.k_norm <= 0.0 {
+            return Err(format!(
+                "[salience] k_norm must be > 0 (got {})",
+                self.k_norm
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolves into scoring params — `None` when disabled (the disable lever).
+    #[must_use]
+    pub fn resolve(&self) -> Option<gradatum_search::SalienceParams> {
+        self.enabled.then(|| gradatum_search::SalienceParams {
+            gamma: self.gamma,
+            k_norm: self.k_norm,
+            kind_weights: self.kind_weights.clone(),
+        })
+    }
+}
+
+impl Default for SalienceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gamma: Self::default_gamma(),
+            k_norm: Self::default_k_norm(),
+            kind_weights: Self::default_kind_weights(),
         }
     }
 }
@@ -460,6 +605,42 @@ impl From<StorageConfigRaw> for StorageConfig {
     }
 }
 
+/// Backing store for the JWT revocation list.
+///
+/// Typed rather than `String` so that any unknown value — a typo, a wrong case — is a
+/// **deserialization error at startup** instead of a silent degraded mode. Before this
+/// hardening, any third value passed [`gradatum_auth::revocation::boot_guard_check`]
+/// (which rejects only the exact string `"memory"`) *and* selected the in-memory store in
+/// `main.rs` (which selects SQLite only on the exact string `"sqlite"`): token revocations
+/// were then lost on every restart, with a single `warn!` as the only signal.
+///
+/// The wire representation is lowercase: `"sqlite"` | `"memory"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationStoreKind {
+    /// Persistent SQLite store — production default, survives a restart.
+    Sqlite,
+    /// In-memory store — DEV only, loses all revocations on restart. Refused by
+    /// [`gradatum_auth::revocation::boot_guard_check`] on a non-loopback bind (caveat C2).
+    Memory,
+}
+
+impl RevocationStoreKind {
+    /// Wire representation — identical to the string produced by `serde`.
+    ///
+    /// Bridges to [`gradatum_auth::revocation::boot_guard_check`], whose `&str` signature
+    /// is part of the published API of `gradatum-auth`. This is the **single** conversion
+    /// point; its agreement with `serde` is pinned by a test, so the guard and the
+    /// serialized form can never diverge.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Memory => "memory",
+        }
+    }
+}
+
 /// JWT authentication, revocation, and API-key configuration.
 ///
 /// Example `server.toml` schema:
@@ -471,14 +652,23 @@ impl From<StorageConfigRaw> for StorageConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    pub jwt_public_key_path: PathBuf,
-    pub jwt_private_key_path: PathBuf,
+    // NOTE: `jwt_public_key_path` and `jwt_private_key_path` used to sit here.
+    // Neither was ever read to obtain a signing key: the server signs and
+    // verifies with the raw Ed25519 seed `<storage.root>/config/jwt-signing-key.secret`
+    // (see `gradatum_auth::key_store`). `jwt_public_key_path` had no reader at
+    // all; `jwt_private_key_path` was consumed only for its parent directory.
+    // Keeping them advertised a key-rotation surface that did nothing — rotating
+    // the PEM changed no signature, and the only real key was documented nowhere.
+    // They are ignored when still present in `server.toml` (no `deny_unknown_fields`).
     /// TTL for human/Studio tokens (default 3600 s = 1 h).
     pub jwt_ttl_human_secs: u64,
     /// TTL for service bearer tokens (default 86400 s = 24 h).
     pub jwt_ttl_service_secs: u64,
     /// `"memory"` (DEV only, emits WARN) | `"sqlite"` (production default).
-    pub revocation_store: String,
+    ///
+    /// Any other value is **refused when the configuration is loaded** — the server does
+    /// not start. See [`RevocationStoreKind`].
+    pub revocation_store: RevocationStoreKind,
     pub revocation_db_path: Option<PathBuf>,
     /// Path to the API-key SQLite database.
     ///
@@ -602,6 +792,44 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// Archive retention configuration (F-100 increment 1.6).
+///
+/// A deleted note is **archived** (moved under `.archive/`) rather than destroyed;
+/// the registry-driven GC physically destroys archives older than `retention_days`.
+/// Default: 60 days.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveConfig {
+    /// Days an archived note is retained before the GC destroys it. Default: 60.
+    #[serde(default = "default_archive_retention_days")]
+    pub retention_days: u32,
+    /// Interval between archive-GC passes in seconds. Default: 21600 (6 h).
+    #[serde(default = "default_archive_gc_interval_secs")]
+    pub gc_interval_secs: u64,
+    /// Maximum archives destroyed per GC pass (anti-burst cap). Default: 500.
+    #[serde(default = "default_archive_gc_batch_limit")]
+    pub gc_batch_limit: u32,
+}
+
+fn default_archive_retention_days() -> u32 {
+    60
+}
+fn default_archive_gc_interval_secs() -> u64 {
+    21_600 // 6h
+}
+fn default_archive_gc_batch_limit() -> u32 {
+    500
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_archive_retention_days(),
+            gc_interval_secs: default_archive_gc_interval_secs(),
+            gc_batch_limit: default_archive_gc_batch_limit(),
+        }
+    }
+}
+
 /// Event-log retention configuration.
 ///
 /// Default TTL: 30 days.
@@ -677,6 +905,153 @@ impl Default for ReviewPromoteConfig {
             age_days: default_review_promote_age_days(),
             interval_secs: default_review_promote_interval_secs(),
             max_per_tick: default_review_promote_max_per_tick(),
+        }
+    }
+}
+
+/// F-51 audit / dedup pass configuration.
+///
+/// Detection-only (Option A): the pass writes a report artifact under the storage root and
+/// never mutates the vault. **Disabled by default** — no silent activation. Detection
+/// thresholds are not exposed here: they live in
+/// [`gradatum_curator::audit::AuditThresholds::default`] until an operator needs to vary them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Enable or disable the audit pass. Default: `false`.
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
+    /// Interval between audit passes in seconds. Default: 86400 (24 h). Floor 60 s in `main.rs`.
+    #[serde(default = "default_audit_interval_secs")]
+    pub interval_secs: u64,
+    /// Safety cap on notes scanned per pass (anti-DoS on the O(n²) pairing). Default: 5000.
+    #[serde(default = "default_audit_max_scan")]
+    pub max_scan: usize,
+}
+
+fn default_audit_enabled() -> bool {
+    false
+}
+fn default_audit_interval_secs() -> u64 {
+    86_400 // 24 h
+}
+fn default_audit_max_scan() -> usize {
+    5_000
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_audit_enabled(),
+            interval_secs: default_audit_interval_secs(),
+            max_scan: default_audit_max_scan(),
+        }
+    }
+}
+
+/// F-111 graduated-forgetting (auto-downgrade) configuration.
+///
+/// Drives the relevance axis of the audit pass: old, unused, low-trust `live`
+/// notes are proposed (dry-run) and — behind `enabled` (default `false`) — auto
+/// **downgraded** (reversible, never deleted), capped and window-guarded.
+/// **Disabled by default** — activation is opt-in via configuration. Thresholds mirror
+/// [`gradatum_curator::audit::IrrelevanceThresholds`] defaults (90 / 0.6 / 30).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DowngradeConfig {
+    /// Enables the auto-downgrade executor. Default `false` (gated activation §7).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum note age (days) before a note can be a candidate. Default 90.
+    #[serde(default = "default_downgrade_age_min_days")]
+    pub age_min_days: u32,
+    /// Trust strictly below this value qualifies. Default 0.6.
+    #[serde(default = "default_downgrade_trust_max")]
+    pub trust_max: f64,
+    /// Usage observation window (days). Default 30.
+    #[serde(default = "default_downgrade_usage_window_days")]
+    pub usage_window_days: u32,
+    /// Safety cap on downgrades per pass. Default 50.
+    #[serde(default = "default_downgrade_max_per_run")]
+    pub max_per_run: usize,
+    /// Extra protected sections (kebab-case) added to the base set. The base set
+    /// ([`gradatum_core::section::Section::PROTECTED_DOWNGRADE`]) is never removable by config.
+    #[serde(default)]
+    pub protected_extra: Vec<String>,
+}
+
+fn default_downgrade_age_min_days() -> u32 {
+    90
+}
+fn default_downgrade_trust_max() -> f64 {
+    0.6
+}
+fn default_downgrade_usage_window_days() -> u32 {
+    30
+}
+fn default_downgrade_max_per_run() -> usize {
+    50
+}
+
+impl DowngradeConfig {
+    /// Fail-loud boot validation of the configuration invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with a human-readable message when any bound is violated:
+    /// `age_min_days ≥ 1`, `usage_window_days ≥ 1`, `max_per_run ≥ 1`,
+    /// `0.0 < trust_max ≤ 1.0`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.age_min_days < 1 {
+            return Err("[downgrade] age_min_days must be >= 1".to_string());
+        }
+        if self.usage_window_days < 1 {
+            return Err("[downgrade] usage_window_days must be >= 1".to_string());
+        }
+        if self.max_per_run < 1 {
+            return Err("[downgrade] max_per_run must be >= 1".to_string());
+        }
+        if !(self.trust_max > 0.0 && self.trust_max <= 1.0) {
+            return Err(format!(
+                "[downgrade] trust_max must be in (0.0, 1.0] (got {})",
+                self.trust_max
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolves the config thresholds into the curator rule input.
+    #[must_use]
+    pub fn thresholds(&self) -> gradatum_curator::audit::IrrelevanceThresholds {
+        gradatum_curator::audit::IrrelevanceThresholds {
+            age_min_days: self.age_min_days,
+            trust_max: self.trust_max,
+            usage_window_days: self.usage_window_days,
+        }
+    }
+
+    /// The effective protected set: base [`gradatum_core::section::Section::PROTECTED_DOWNGRADE`]
+    /// ∪ `protected_extra`. The base entries are never removable by config (add-only).
+    #[must_use]
+    pub fn protected_sections(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = gradatum_core::section::Section::PROTECTED_DOWNGRADE.to_vec();
+        for s in &self.protected_extra {
+            let s = s.as_str();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
+    }
+}
+
+impl Default for DowngradeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            age_min_days: default_downgrade_age_min_days(),
+            trust_max: default_downgrade_trust_max(),
+            usage_window_days: default_downgrade_usage_window_days(),
+            max_per_run: default_downgrade_max_per_run(),
+            protected_extra: Vec::new(),
         }
     }
 }
@@ -784,10 +1159,10 @@ impl Default for ServerConfig {
             server: HttpConfig {
                 bind: "127.0.0.1:19090"
                     .parse()
-                    .expect("adresse loopback par défaut invalide — constante littérale"),
+                    .expect("invalid default loopback address — literal constant"),
                 metrics_bind: "127.0.0.1:19091"
                     .parse()
-                    .expect("adresse métriques loopback par défaut invalide — constante littérale"),
+                    .expect("invalid default metrics loopback address — literal constant"),
                 tls: None,
             },
             storage: StorageConfig {
@@ -799,11 +1174,9 @@ impl Default for ServerConfig {
                 vault_index_path_override_diverges: false,
             },
             auth: AuthConfig {
-                jwt_public_key_path: PathBuf::from("/var/lib/gradatum/config/jwt.public.pem"),
-                jwt_private_key_path: PathBuf::from("/var/lib/gradatum/config/jwt.private.pem"),
                 jwt_ttl_human_secs: 3600,
                 jwt_ttl_service_secs: 86400,
-                revocation_store: "sqlite".to_string(),
+                revocation_store: RevocationStoreKind::Sqlite,
                 // None = auto-dérivé depuis storage.root dans main.rs.
                 // Un chemin absolu ici court-circuiterait le fallback et casserait le smoke test
                 // (le répertoire /var/lib/gradatum/ n'existe pas en dev/test).
@@ -823,13 +1196,20 @@ impl Default for ServerConfig {
             embed: EmbedConfig::default(),
             event_log: EventLogConfig::default(),
             session_trace: SessionTraceConfig::default(),
+            archive: ArchiveConfig::default(),
             scoring: ScoringConfig::default(),
+            salience: SalienceConfig::default(),
             studio: StudioConfig::default(),
             internal_api: InternalApiConfig::default(),
             search: SearchConfig::default(),
             review_promote: ReviewPromoteConfig::default(),
+            audit: AuditConfig::default(),
+            downgrade: DowngradeConfig::default(),
             context: ContextConfig::default(),
             proactive_recall: ProactiveRecallConfig::default(),
+            multi_tenant: MultiTenantConfig::default(),
+            // Défaut vide : aucun override per-vault ⇒ résolveurs = global exact (byte-identical).
+            per_vault: std::collections::HashMap::new(),
         }
     }
 }
@@ -841,11 +1221,11 @@ impl Default for ServerConfig {
 /// manually because `#[from] Box<T>` does not generate `From<T>`.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("erreur figment : {0}")]
+    #[error("figment error: {0}")]
     Figment(Box<figment::Error>),
     #[error(
-        "bind/TLS fail-closed : bind={bind} est non-loopback sans TLS configuré. \
-        Conseil : définir [server.tls] ou changer bind à 127.0.0.1:19090"
+        "bind/TLS fail-closed: bind={bind} is non-loopback without TLS configured. \
+        Advice: set [server.tls] or change bind to 127.0.0.1:19090"
     )]
     BindTlsRefused { bind: SocketAddr },
 }
@@ -898,6 +1278,95 @@ impl ServerConfig {
             }),
         }
     }
+
+    /// Config salience EFFECTIVE pour `vault_id` — override per-vault si présent, sinon global (A6).
+    ///
+    /// Aucun override configuré (cas par défaut) ⇒ renvoie `&self.salience` (global exact).
+    /// Lecture seule, sans allocation. Voir [`ServerConfig::per_vault`].
+    ///
+    /// Câblé au boot (L6) via [`ServerConfig::resolve_salience_per_vault`] : les params résolus
+    /// par vault sont pré-calculés et injectés dans `AppState::salience_per_vault`, jamais
+    /// résolus dans le read hot-path (aucune allocation par requête).
+    #[must_use]
+    pub fn salience_for(&self, vault_id: &str) -> &SalienceConfig {
+        self.per_vault
+            .get(vault_id)
+            .and_then(|o| o.salience.as_ref())
+            .unwrap_or(&self.salience)
+    }
+
+    /// Config review-promote EFFECTIVE pour `vault_id` — override per-vault si présent, sinon global (A6).
+    ///
+    /// Aucun override configuré (cas par défaut) ⇒ renvoie `&self.review_promote` (global exact).
+    /// Lecture seule, sans allocation. Voir [`ServerConfig::per_vault`].
+    ///
+    /// Câblé (L6) dans la boucle per-vault ON de [`crate::review_promote::promote_tick`] : chaque
+    /// vault actif est promu selon sa config effective. Le chemin OFF (`promote_once`, mono-`main`)
+    /// n'en dépend pas (byte-identical).
+    #[must_use]
+    pub fn review_promote_for(&self, vault_id: &str) -> &ReviewPromoteConfig {
+        self.per_vault
+            .get(vault_id)
+            .and_then(|o| o.review_promote.as_ref())
+            .unwrap_or(&self.review_promote)
+    }
+
+    /// Pré-résout les params salience EFFECTIFS par vault, pour injection au boot dans
+    /// `AppState::salience_per_vault` (L6, overrides A6 `[per_vault.<id>.salience]`).
+    ///
+    /// Contient une entrée pour CHAQUE vault porteur d'un override salience (présent), la valeur
+    /// encodant l'état résolu — `Some(params)` si actif, `None` si désactivé (cf. sémantique à
+    /// TROIS états ci-dessous, via [`SalienceConfig::resolve`]). **Map vide** si aucun override
+    /// salience ⇒ tout vault retombe sur le global dans le hot-path (chemin byte-identical). Tout
+    /// le coût de résolution est payé UNE fois au boot — aucune allocation au read-time.
+    ///
+    /// Sémantique à TROIS états — un override *présent* est TOUJOURS inséré, seul un vault
+    /// **sans** override est absent de la map. Alignée sur `review_promote`
+    /// (`review_promote_for` + `if !cfg_eff.enabled { continue }`) :
+    /// - vault **absent** ⇒ aucun override ⇒ le hot-path retombe sur le global ;
+    /// - `Some(params)` ⇒ override présent ET actif (`enabled = true`) ⇒ params raffinés ;
+    /// - `None` ⇒ override présent qui **désactive** la salience (`enabled = false`) ⇒ le
+    ///   hot-path honore la désactivation (salience neutralisée pour ce vault) au lieu de
+    ///   retomber par erreur sur le global. C'est le fix du footgun C1 (post-mortem L6) :
+    ///   `enabled = false` désactivait l'INVERSE (retombée silencieuse sur le global actif).
+    #[must_use]
+    pub fn resolve_salience_per_vault(
+        &self,
+    ) -> std::collections::HashMap<String, Option<std::sync::Arc<gradatum_search::SalienceParams>>>
+    {
+        self.per_vault
+            .iter()
+            .filter_map(|(vid, ov)| {
+                // Ne retenir que les vaults porteurs d'un override salience (absent ⇒ global).
+                ov.salience.as_ref()?;
+                // `Some` si l'override est actif, `None` s'il désactive (symétrie disable).
+                let entry = self.salience_for(vid).resolve().map(std::sync::Arc::new);
+                Some((vid.clone(), entry))
+            })
+            .collect()
+    }
+
+    /// Garde deploy (C3, post-mortem L6) : valide fail-loud CHAQUE override salience per-vault
+    /// (`[per_vault.<id>.salience]`) au boot, avec la même règle que le global
+    /// ([`SalienceConfig::validate`] : `k_norm > 0`).
+    ///
+    /// La map `salience_per_vault` est consultée dès que la salience GLOBALE est active
+    /// (indépendamment de `multi_tenant`) ; un override per-vault invalide (ex. `k_norm <= 0`)
+    /// produirait sinon des `SalienceParams` corrompus injectés silencieusement dans le
+    /// hot-path. Cette garde interdit le boot tant qu'un override n'est pas validé.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie `Err` (message préfixé du vault fautif) dès qu'un override échoue à `validate`.
+    pub fn validate_per_vault_salience(&self) -> Result<(), String> {
+        for (vault_id, ov) in &self.per_vault {
+            if let Some(sal) = ov.salience.as_ref() {
+                sal.validate()
+                    .map_err(|e| format!("[per_vault.{vault_id}.salience] {e}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -920,6 +1389,85 @@ mod scoring_defaults_tests {
         assert_eq!(from_config.get("distilled").copied(), Some(90.0));
         // human-decision absent = pas de decay (trust non périssable).
         assert!(!from_config.contains_key("human-decision"));
+    }
+}
+
+#[cfg(test)]
+mod salience_config_tests {
+    use super::*;
+
+    // F-110 Phase 2 : défaut = OFF avec les tunables spec
+    #[test]
+    fn salience_config_default_is_disabled_with_spec_values() {
+        let c = SalienceConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.gamma, 0.10);
+        assert_eq!(c.k_norm, 10.0);
+        assert_eq!(c.kind_weights.get("read"), Some(&3.0));
+        assert_eq!(c.kind_weights.get("recall-accepted"), Some(&5.0));
+        assert_eq!(c.kind_weights.get("search-hit-top3"), Some(&2.0));
+        assert_eq!(c.kind_weights.get("recall-surfaced"), Some(&1.0));
+        assert_eq!(c.kind_weights.get("search-hit"), Some(&0.5));
+    }
+
+    // k_norm ≤ 0 ⇒ rejet (fail-loud au boot)
+    #[test]
+    fn salience_config_rejects_non_positive_k_norm() {
+        let c = SalienceConfig {
+            k_norm: 0.0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        let c = SalienceConfig {
+            k_norm: -1.0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        assert!(SalienceConfig::default().validate().is_ok());
+    }
+
+    // resolve : OFF ⇒ None ; ON ⇒ Some(params fidèles)
+    #[test]
+    fn salience_config_resolve_maps_enabled_flag() {
+        assert!(SalienceConfig::default().resolve().is_none());
+        let c = SalienceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let p = c.resolve().expect("enabled ⇒ Some");
+        assert_eq!(p.gamma, 0.10);
+        assert_eq!(p.k_norm, 10.0);
+        assert_eq!(p.kind_weights.len(), 5);
+    }
+
+    // TOML partiel : section absente ⇒ défaut OFF (non-régression config existantes)
+    #[test]
+    fn salience_config_absent_section_defaults_off() {
+        let toml = r#"
+            [server]
+            bind = "127.0.0.1:19090"
+            metrics_bind = "127.0.0.1:19091"
+
+            [storage]
+            root = "/var/lib/gradatum"
+            vault_index_path = "/var/lib/gradatum/db/index.sqlite"
+
+            [auth]
+            jwt_public_key_path = "/x"
+            jwt_private_key_path = "/y"
+            jwt_ttl_human_secs = 3600
+            jwt_ttl_service_secs = 86400
+            revocation_store = "memory"
+
+            [acl]
+            preset_path = "/x"
+
+            [log]
+            format = "json"
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml).expect("parse");
+        assert!(!cfg.salience.enabled);
+        assert_eq!(cfg.salience.k_norm, 10.0);
     }
 }
 
@@ -1347,6 +1895,19 @@ pub struct InternalApiConfig {
     /// avant tout accès. La conversion se fait après lecture config, jamais loggué.
     #[serde(default)]
     pub token: Option<String>,
+
+    /// Token de l'API admin (F-100 incrément 1.6 — delete/restore/purge opérateur).
+    ///
+    /// **Distinct** de `token` (worker) : gate les endpoints `/internal/v1/admin/*`
+    /// via `X-Gradatum-Admin: Bearer <token>`. Le worker (qui ne détient que `token`)
+    /// ne peut PAS atteindre la surface de mutation admin. `None` = endpoints admin
+    /// désactivés (fail-closed). Sur le même listener loopback que le worker.
+    ///
+    /// Note : stocké en `String` pour la désérialisation TOML. Converti en
+    /// `secrecy::SecretString` par `main.rs` via `state.with_admin_api_token()`.
+    /// wired: `gradatum-server/src/internal/admin_auth.rs`. Jamais loggué.
+    #[serde(default)]
+    pub admin_token: Option<String>,
 }
 
 impl InternalApiConfig {
@@ -1363,6 +1924,7 @@ impl Default for InternalApiConfig {
         Self {
             bind: Self::default_bind(),
             token: None,
+            admin_token: None,
         }
     }
 }
@@ -1376,6 +1938,10 @@ impl std::fmt::Debug for InternalApiConfig {
         f.debug_struct("InternalApiConfig")
             .field("bind", &self.bind)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "admin_token",
+                &self.admin_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -1406,7 +1972,7 @@ impl std::fmt::Debug for InternalApiConfig {
 pub fn validate_internal_token(token: &str) -> Result<(), String> {
     if token.len() < MIN_INTERNAL_TOKEN_LEN {
         return Err(format!(
-            "token API interne trop court ({} chars < {} minimum) —              utilisez un token fort (ex: `openssl rand -hex 32`)",
+            "internal API token too short ({} chars < {} minimum) — use a strong token (e.g. `openssl rand -hex 32`)",
             token.len(),
             MIN_INTERNAL_TOKEN_LEN
         ));
@@ -1431,11 +1997,16 @@ mod internal_api_config_tests {
         let cfg = InternalApiConfig {
             bind: "127.0.0.1:19092".parse().unwrap(),
             token: Some("super-secret-token-32-chars-long".to_string()),
+            admin_token: Some("super-secret-admin-token-32-chars".to_string()),
         };
         let debug_str = format!("{cfg:?}");
         assert!(
             !debug_str.contains("super-secret-token-32-chars-long"),
             "le token réel NE DOIT PAS apparaître dans Debug : {debug_str:?}"
+        );
+        assert!(
+            !debug_str.contains("super-secret-admin-token-32-chars"),
+            "le token admin réel NE DOIT PAS apparaître dans Debug : {debug_str:?}"
         );
         assert!(
             debug_str.contains("[REDACTED]"),
@@ -1475,8 +2046,8 @@ mod internal_api_config_tests {
         );
         let err = result.unwrap_err();
         assert!(
-            err.contains("trop court"),
-            "message d'erreur doit mentionner 'trop court' : {err:?}"
+            err.contains("too short"),
+            "message d'erreur doit mentionner 'too short' : {err:?}"
         );
         assert!(
             err.contains("openssl rand -hex 32"),
@@ -1622,5 +2193,277 @@ mod context_config_tests {
         assert_eq!(cfg.context.default_budget_tokens, 2000);
         assert_eq!(cfg.context.top_n_candidates, 50);
         assert_eq!(cfg.context.max_skills, 3);
+    }
+}
+
+#[cfg(test)]
+mod downgrade_config_tests {
+    use super::*;
+
+    #[test]
+    fn downgrade_config_defaults_off_with_spec_values() {
+        let c = DowngradeConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.age_min_days, 90);
+        assert_eq!(c.trust_max, 0.6);
+        assert_eq!(c.usage_window_days, 30);
+        assert_eq!(c.max_per_run, 50);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn downgrade_config_validation_fail_loud() {
+        assert!(
+            DowngradeConfig {
+                age_min_days: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            DowngradeConfig {
+                usage_window_days: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            DowngradeConfig {
+                max_per_run: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            DowngradeConfig {
+                trust_max: 0.0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            DowngradeConfig {
+                trust_max: 1.5,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn downgrade_config_protected_base_not_removable() {
+        let c = DowngradeConfig {
+            protected_extra: vec!["experiments".into()],
+            ..Default::default()
+        };
+        let p = c.protected_sections();
+        assert!(p.contains(&"council")); // base toujours là
+        assert!(p.contains(&"decisions")); // base toujours là
+        assert!(p.contains(&"experiments")); // extension ajoutée
+    }
+}
+
+#[cfg(test)]
+mod per_vault_config_tests {
+    use super::*;
+
+    /// Défaut (map `per_vault` vide) : tout vault retombe sur la config globale exacte —
+    /// résolveurs byte-identical au comportement pré-A6. Vérifie l'identité de référence
+    /// (le résolveur renvoie bien `&self.salience` / `&self.review_promote`, pas une copie).
+    #[test]
+    fn per_vault_config_override_falls_back_to_global() {
+        let cfg = ServerConfig::default();
+        assert!(
+            cfg.per_vault.is_empty(),
+            "invariant : aucun override par défaut"
+        );
+
+        // salience : même pointeur que le global (aucune allocation, pas de divergence).
+        assert!(
+            std::ptr::eq(cfg.salience_for("main"), &cfg.salience),
+            "salience_for(main) doit retomber sur la config globale"
+        );
+        assert!(
+            std::ptr::eq(cfg.salience_for("vault-b"), &cfg.salience),
+            "salience_for(vault inconnu) doit retomber sur la config globale"
+        );
+
+        // review_promote : idem.
+        assert!(
+            std::ptr::eq(cfg.review_promote_for("main"), &cfg.review_promote),
+            "review_promote_for(main) doit retomber sur la config globale"
+        );
+        assert!(
+            std::ptr::eq(cfg.review_promote_for("vault-b"), &cfg.review_promote),
+            "review_promote_for(vault inconnu) doit retomber sur la config globale"
+        );
+    }
+
+    /// Override présent : le vault ciblé lit l'override, les autres restent au global.
+    #[test]
+    fn override_applied_when_present() {
+        let mut cfg = ServerConfig::default();
+        // Global salience = OFF par défaut ; override vault-b = ON avec gamma distinct.
+        assert!(!cfg.salience.enabled, "précondition : global salience OFF");
+
+        let ov_salience = SalienceConfig {
+            enabled: true,
+            gamma: 0.99,
+            ..SalienceConfig::default()
+        };
+        let ov_review = ReviewPromoteConfig {
+            age_days: 999,
+            ..ReviewPromoteConfig::default()
+        };
+        cfg.per_vault.insert(
+            "vault-b".to_string(),
+            PerVaultOverride {
+                salience: Some(ov_salience),
+                review_promote: Some(ov_review),
+            },
+        );
+
+        // vault-b lit l'override.
+        let sb = cfg.salience_for("vault-b");
+        assert!(sb.enabled, "vault-b : salience override actif");
+        assert!(
+            (sb.gamma - 0.99).abs() < f64::EPSILON,
+            "vault-b : gamma override lu"
+        );
+        assert_eq!(
+            cfg.review_promote_for("vault-b").age_days,
+            999,
+            "vault-b : review_promote override lu"
+        );
+
+        // main (pas d'override) reste au global exact.
+        assert!(
+            !cfg.salience_for("main").enabled,
+            "main : salience reste global (OFF)"
+        );
+        assert_eq!(
+            cfg.review_promote_for("main").age_days,
+            cfg.review_promote.age_days,
+            "main : review_promote reste global"
+        );
+    }
+
+    /// Preuve B (L6) — équivalence défaut per-vault == global résolu.
+    ///
+    /// Salience globale ON, AUCUN override per-vault : `resolve_salience_per_vault` renvoie une
+    /// map VIDE, et `salience_for(<n'importe quel vault>).resolve()` égale le global résolu (ce
+    /// qui est injecté dans `AppState::salience`). C'est la garantie que, map vide, le hot-path
+    /// (`salience_per_vault.get(v).unwrap_or(global)`) utilise exactement le global.
+    #[test]
+    fn resolve_salience_per_vault_empty_matches_global_resolved() {
+        let cfg = ServerConfig {
+            salience: SalienceConfig {
+                enabled: true,
+                gamma: 0.42,
+                k_norm: 7.5,
+                ..SalienceConfig::default()
+            },
+            ..Default::default()
+        };
+
+        // Aucun override ⇒ map pré-résolue VIDE (le hot-path retombe donc sur le global).
+        assert!(
+            cfg.resolve_salience_per_vault().is_empty(),
+            "sans override, la map per-vault pré-résolue est vide"
+        );
+
+        // Le global résolu (== contenu de AppState::salience) est bien Some avec les params posés.
+        // `SalienceParams` n'implémente pas PartialEq ⇒ comparaison champ par champ.
+        let global = cfg.salience.resolve().expect("global salience ON ⇒ Some");
+        for vault in ["main", "vault-inconnu"] {
+            let resolved = cfg
+                .salience_for(vault)
+                .resolve()
+                .expect("défaut per-vault ⇒ global ON ⇒ Some");
+            assert!(
+                (resolved.gamma - global.gamma).abs() < f64::EPSILON,
+                "{vault} : gamma == global résolu"
+            );
+            assert!(
+                (resolved.k_norm - global.k_norm).abs() < f64::EPSILON,
+                "{vault} : k_norm == global résolu"
+            );
+            assert_eq!(
+                resolved.kind_weights, global.kind_weights,
+                "{vault} : kind_weights == global résolu"
+            );
+        }
+    }
+
+    /// Preuve B (suite) — TOUT override salience présent est pré-résolu dans la map : actif ⇒
+    /// `Some(params)`, désactivé (`enabled=false`) ⇒ `None` (fix C1). Un vault sans override en
+    /// est absent (⇒ fallback global au read-time).
+    #[test]
+    fn resolve_salience_per_vault_contains_all_present_overrides() {
+        let cfg = ServerConfig {
+            salience: SalienceConfig {
+                enabled: true,
+                ..SalienceConfig::default()
+            },
+            per_vault: [
+                (
+                    "vault-on".to_string(),
+                    PerVaultOverride {
+                        salience: Some(SalienceConfig {
+                            enabled: true,
+                            gamma: 0.99,
+                            ..SalienceConfig::default()
+                        }),
+                        review_promote: None,
+                    },
+                ),
+                (
+                    "vault-off".to_string(),
+                    PerVaultOverride {
+                        // Override qui DÉSACTIVE la salience pour ce vault (résout à None).
+                        salience: Some(SalienceConfig {
+                            enabled: false,
+                            ..SalienceConfig::default()
+                        }),
+                        review_promote: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        let map = cfg.resolve_salience_per_vault();
+        // vault-on : override actif ⇒ pré-résolu en `Some(params)`.
+        let on = map
+            .get("vault-on")
+            .expect("vault-on présent dans la map")
+            .as_ref()
+            .expect("vault-on : override actif ⇒ Some(params)");
+        assert!(
+            (on.gamma - 0.99).abs() < f64::EPSILON,
+            "vault-on : gamma override pré-résolu"
+        );
+        // vault-off (fix C1) : override `enabled=false` ⇒ PRÉSENT avec valeur `None`
+        // (désactivation honorée au read-time, symétrie review_promote), et NON plus absent.
+        assert!(
+            map.contains_key("vault-off"),
+            "vault-off (override enabled=false) doit être présent (désactivation explicite)"
+        );
+        assert!(
+            map.get("vault-off").expect("vault-off présent").is_none(),
+            "vault-off : override enabled=false ⇒ valeur None (salience neutralisée)"
+        );
+        assert_eq!(
+            map.len(),
+            2,
+            "les DEUX overrides (actif + désactivé) sont dans la map"
+        );
     }
 }

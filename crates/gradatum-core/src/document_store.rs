@@ -17,13 +17,15 @@ use crate::error::GradatumError;
 use crate::identity::{ContentHash, NoteId};
 use crate::index::NoteRecord;
 use crate::note::Note;
-use crate::scope::VaultId;
+use crate::scope::{AclCheckedVaultId, VaultId};
 use crate::status::NoteStatus;
 
 /// CRUD storage contract for notes — async, thread-safe.
 ///
 /// Implemented by `gradatum-index::SqliteIndex`.
-/// Consumed by `gradatum-vault` and `gradatum-context` without depending on the concrete SQLite implementation.
+/// Consumed by `gradatum-vault` without depending on the concrete SQLite implementation.
+/// (An earlier revision named a second consumer, `gradatum-context`; no such crate exists
+/// in the workspace.)
 ///
 /// ## Stability
 ///
@@ -33,8 +35,8 @@ use crate::status::NoteStatus;
 ///
 /// ## Contention
 ///
-/// In v0.3.0, the three traits (`DocumentStore`, `IndexStore`, `VectorStore`) share
-/// a single `Arc<Mutex<Connection>>`. Implementations must ensure `MutexGuard`
+/// The current implementation shares a single `Arc<Mutex<Connection>>` between the three
+/// traits (`DocumentStore`, `IndexStore`, `VectorStore`). Implementations must ensure `MutexGuard`
 /// does not cross `.await` points. Physical connection separation is planned for a later release.
 #[async_trait]
 pub trait DocumentStore: Send + Sync {
@@ -52,10 +54,20 @@ pub trait DocumentStore: Send + Sync {
     /// Will be renamed `write` when `Note` is renamed to `Document`.
     async fn write_note(&self, note: &Note) -> Result<(), GradatumError>;
 
-    /// Returns the stored `ContentHash` for a note, if it exists in the index.
+    /// Returns the stored `ContentHash` for a note within a vault, if it exists.
     ///
-    /// Returns `None` if the note has not yet been indexed.
-    async fn get_content_hash(&self, id: NoteId) -> Result<Option<ContentHash>, GradatumError>;
+    /// Returns `None` if the note has not yet been indexed in `vault_id`.
+    ///
+    /// ## Vault scoping
+    ///
+    /// `vault_id` scopes the lookup to a single tenant: with the composite key
+    /// `(vault_id, id)`, a homonymous note (same ULID) in another vault must not be
+    /// returned. This is the freshness source of the moka cache validator.
+    async fn get_content_hash(
+        &self,
+        vault_id: &str,
+        id: NoteId,
+    ) -> Result<Option<ContentHash>, GradatumError>;
 
     /// Returns the full record for a note by its ULID.
     ///
@@ -86,12 +98,22 @@ pub trait DocumentStore: Send + Sync {
     /// Updates `status`, `status_reason`, `replaced_by`, `status_changed`, `updated`.
     /// Idempotent if the note is already downgraded.
     ///
+    /// ## Vault scoping
+    ///
+    /// `vault` is the ACL-Write-checked target vault ([`AclCheckedVaultId`]). The mutation
+    /// filters `WHERE vault_id = <vault> AND id = <note_id>` on the vault-shared `notes`
+    /// table: a note owned by another vault is invisible (`NoteNotFound`), closing the
+    /// cross-vault mutation-by-ULID hole. At `multi_tenant.enabled = false` the vault is
+    /// always `main`, so the added predicate is transparent (byte-identical).
+    ///
     /// # Errors
     ///
-    /// - `GradatumError::NoteNotFound` if the note is absent.
+    /// - `GradatumError::NoteNotFound` if the note is absent **from `vault`** (same 404
+    ///   whether the note exists in another vault or not at all — no existence oracle).
     /// - `GradatumError::Storage` on SQLite error.
     async fn downgrade_note(
         &self,
+        vault: &AclCheckedVaultId,
         note_id: &NoteId,
         reason: &str,
         replaced_by: Option<&NoteId>,
@@ -103,12 +125,18 @@ pub trait DocumentStore: Send + Sync {
     /// `status_changed` is updated only when `status` is supplied.
     /// `updated` is always refreshed.
     ///
+    /// ## Vault scoping
+    ///
+    /// `vault` is the ACL-Write-checked target vault: the mutation filters
+    /// `WHERE vault_id = <vault> AND id = <note_id>` — see [`Self::downgrade_note`].
+    ///
     /// # Errors
     ///
-    /// - `GradatumError::NoteNotFound` if no note matches `note_id`.
+    /// - `GradatumError::NoteNotFound` if no note matches `note_id` **in `vault`**.
     /// - `GradatumError::Storage` on SQLite error.
     async fn patch_note_status(
         &self,
+        vault: &AclCheckedVaultId,
         note_id: &NoteId,
         status: Option<&str>,
         status_reason: Option<&str>,
@@ -122,11 +150,17 @@ pub trait DocumentStore: Send + Sync {
     /// Consistent with `downgrade_note` / `patch_note_status`. Idempotent (no-op UPDATE
     /// when the value is unchanged). `new_locus` must already be validated via `LocusId::parse`.
     ///
+    /// ## Vault scoping
+    ///
+    /// `vault` is the ACL-Write-checked target vault: the mutation filters
+    /// `WHERE vault_id = <vault> AND id = <note_id>` — see [`Self::downgrade_note`].
+    ///
     /// # Errors
-    /// - `GradatumError::NoteNotFound` if no note matches `note_id`.
+    /// - `GradatumError::NoteNotFound` if no note matches `note_id` **in `vault`**.
     /// - `GradatumError::Storage` on SQLite error.
     async fn update_note_locus(
         &self,
+        vault: &AclCheckedVaultId,
         note_id: &NoteId,
         new_locus: &crate::scope::LocusId,
     ) -> Result<(), GradatumError>;
@@ -135,11 +169,22 @@ pub trait DocumentStore: Send + Sync {
     ///
     /// Idempotent. In production the curator logs failures without propagating.
     /// Via this trait, the result is propagated — the caller decides whether to ignore it.
+    /// Returns the number of rows affected (`0` if no note matches `(vault_id, note_id)`).
+    ///
+    /// ## Vault scoping (C4-1e, A2)
+    ///
+    /// The mutation filters `WHERE vault_id = <vault_id> AND id = <note_id>`: a write
+    /// targeting one vault never touches a homonymous note in another vault.
     ///
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if the SQLite query fails.
-    async fn upsert_note_title(&self, note_id: &NoteId, title: &str) -> Result<(), GradatumError>;
+    async fn upsert_note_title(
+        &self,
+        vault_id: &str,
+        note_id: &NoteId,
+        title: &str,
+    ) -> Result<usize, GradatumError>;
 
     // ── Semantic Forget ───────────────────────────────────────────────────────
 
@@ -163,6 +208,33 @@ pub trait DocumentStore: Send + Sync {
         note_id: &str,
         by: Option<&str>,
     ) -> Result<(), GradatumError>;
+
+    /// Re-asserts the forgotten mark WITHOUT rewriting the audit columns.
+    ///
+    /// Sets `forgotten=1` and leaves `forgotten_at` / `forgotten_by` untouched, `NULL`
+    /// included. Repairs an index that reports a note as live while the vault frontmatter
+    /// reports it as forgotten — a divergence produced by two ordinary paths, not by a
+    /// race: `vault_unforgot` clears the index mark without touching the `.md`, and the
+    /// internal `persist/forget` endpoint answers `200` best-effort when its
+    /// `mark_forgotten` step fails after the vault write succeeded.
+    ///
+    /// Distinct from [`Self::mark_forgotten`], which stamps `forgotten_at`/`forgotten_by`
+    /// unconditionally: replaying that one on an already-forgotten note destroys the audit
+    /// trail of the FIRST forget. Repairing the index must cost nothing in auditability.
+    ///
+    /// ## Boundary
+    ///
+    /// Index only, like [`Self::mark_forgotten`] — never the YAML frontmatter.
+    ///
+    /// ## Idempotence
+    ///
+    /// Fully idempotent: every column, `forgotten` included, is left unchanged on replay.
+    ///
+    /// # Errors
+    ///
+    /// - `GradatumError::NoteNotFound` if no note matches `note_id`.
+    /// - `GradatumError::Storage` if the SQLite query fails.
+    async fn reassert_forgotten(&self, vault_id: &str, note_id: &str) -> Result<(), GradatumError>;
 
     /// Clears the forgotten mark on a note.
     ///

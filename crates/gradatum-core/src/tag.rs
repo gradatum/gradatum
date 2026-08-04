@@ -63,23 +63,24 @@ impl Tag {
         &self.0
     }
 
-    /// Normalise une chaîne arbitraire en `Tag` valide, sans rejeter.
+    /// Coerces an arbitrary string into a valid `Tag` instead of rejecting it.
     ///
-    /// Algorithme (infaillible, retourne `None` uniquement si le résultat est vide) :
+    /// The algorithm never fails; it returns `None` only when nothing usable is left:
     ///
-    /// 1. Lowercase de l'entrée entière.
-    /// 2. Tout run de caractères hors `[a-z0-9]` est remplacé par **un seul** `-`.
-    /// 3. Trim des `-` en tête et en queue (implicite : les runs invalides en tête/queue
-    ///    ne sont jamais émis).
-    /// 4. Troncature à 64 caractères, suivie d'un re-trim du `-` final si la troncature
-    ///    coupe au milieu d'un run.
-    /// 5. Si le résultat est vide → `None` (tag inrécupérable).
-    /// 6. Sinon → `Some(Tag(résultat))`. La valeur produite satisfait toujours `Tag::new`.
+    /// 1. Lowercase the whole input.
+    /// 2. Replace every run of characters outside `[a-z0-9]` with a **single** `-`.
+    /// 3. Trim leading and trailing `-` (implicitly: invalid runs at either end are
+    ///    never emitted).
+    /// 4. Truncate to 64 characters, then drop a trailing `-` if the truncation landed
+    ///    in the middle of a run.
+    /// 5. If the result is empty, return `None` (nothing recoverable in the input).
+    /// 6. Otherwise return `Some(Tag(result))`. The produced value always satisfies
+    ///    [`Tag::new`].
     ///
-    /// `Tag::new` (validation stricte) est conservé inchangé pour les call-sites
-    /// qui veulent rejeter explicitement les entrées non conformes.
+    /// [`Tag::new`] (strict validation) is left untouched for call sites that want to
+    /// reject non-conforming input outright.
     ///
-    /// ## Exemples
+    /// ## Examples
     ///
     /// ```
     /// use gradatum_core::tag::Tag;
@@ -89,7 +90,7 @@ impl Tag {
     /// assert_eq!(Tag::normalize("P1").as_ref().map(Tag::as_str), Some("p1"));
     /// assert_eq!(Tag::normalize("___"), None);
     /// assert_eq!(Tag::normalize(""), None);
-    /// // Tags déjà valides sont inchangés.
+    /// // Already-valid tags are returned unchanged.
     /// assert_eq!(Tag::normalize("knowledge-base").as_ref().map(Tag::as_str), Some("knowledge-base"));
     /// ```
     pub fn normalize(s: impl Into<String>) -> Option<Self> {

@@ -4,7 +4,9 @@
 
 This guide covers:
 - [§0 — Obtaining binaries](#0-obtaining-binaries): which archive to use for each role.
-- [§1–§12 — Engine deployment](#1-how-the-supervisor-works): deploying `gradatum-engine` in single-host or multi-instance mode, wired into `gradatum-gateway`.
+- [§1–§11 — Engine deployment](#1-how-the-supervisor-works): deploying `gradatum-engine` in single-host or multi-instance mode, wired into `gradatum-gateway`.
+- [§12 — App-host upgrade order](#12-app-host-upgrade-order-gradatum-server-before-gradatum-worker): why `gradatum-server` must be upgraded before `gradatum-worker`, and how to prove which commit is live.
+- [§13 — Troubleshooting](#13-troubleshooting): engine startup and runtime symptoms.
 
 ---
 
@@ -25,7 +27,7 @@ All three archives are covered by a single `SHA256SUMS` file. Each archive ships
 **Download and verify (example for the server archive):**
 
 ```bash
-VERSION=v0.7.6
+VERSION=v1.0.0
 ARCH=x86_64-unknown-linux-gnu
 
 curl -fLO "https://github.com/gradatum/gradatum/releases/download/${VERSION}/gradatum-server-${VERSION}-${ARCH}.tar.gz"
@@ -46,7 +48,7 @@ Repeat the same steps for `gradatum-llm` and `gradatum-mcp` as needed. Install t
 
 ### 0.2 Build from source
 
-**Prerequisites:** Rust stable (MSRV 1.88), `gcc` or `clang`, `libsqlite3-dev`.
+**Prerequisites:** Rust stable (MSRV 1.91), `gcc` or `clang`, `libsqlite3-dev`.
 
 ```bash
 git clone https://github.com/gradatum/gradatum.git
@@ -260,7 +262,7 @@ gradatum_url = "http://127.0.0.1:19090"
 # ── Extra flags (allow-list) ─────────────────────────────────────────────────
 # Additional flags passed verbatim to llama-server, after all authoritative flags.
 # Only flags in the allow-list are accepted; anything else causes a startup error.
-# See Section 4 for the complete allow-list.
+# See Section 6 for the complete allow-list.
 extra_args = []
 ```
 
@@ -365,8 +367,10 @@ that control network binding, authentication, model URLs, or arbitrary file path
 | Reproducibility | `--seed`/`-s` |
 | Performance | `--poll` |
 | SWA / cache reuse | `--swa-full`, `--cache-reuse` |
+| Unified KV cache | `--kv-unified` |
+| Prefix-cache slot routing | `--slot-prompt-similarity` |
 | Reasoning | `--reasoning`, `--reasoning-format`, `--reasoning-budget` |
-| Sampling | `--temp`/`--temperature`, `--top-k`, `--top-p`, `--min-p`, `--presence-penalty`, `--repeat-penalty`, `--n-predict`/`-n` |
+| Sampling | `--temp`/`--temperature`, `--top-k`, `--top-p`, `--min-p`, `--presence-penalty`, `--repeat-penalty`, `--n-predict`/`-n`, `--backend-sampling` |
 
 **Always rejected (security boundary):**
 
@@ -382,7 +386,7 @@ silently override the configured value.
 
 ## 7. Security properties
 
-> **Security note**: the default ACL is a permissive single-tenant policy (allow-all) in v0.x. Configure a stricter AclPolicy before exposing gradatum on a network.
+> **Security note**: the default ACL is **fail-closed**. With no preset file at `[acl] preset_path` (default `/var/lib/gradatum/config/bearer.toml`), the engine falls back to DENY-ALL and every locus is denied — an identity with no matching `[[consumer]]` block is refused. Configure an ACL preset (shipped preset or your own) to grant access. Multi-tenant isolation (`multi_tenant.enabled`) is opt-in and off by default; note that per-key **write scopes** are only enforced when it is on — see `SECURITY.md` for that caveat.
 
 ### 6.1 Bind address (fail-closed)
 
@@ -611,14 +615,110 @@ new port, and stop the old instance.
 
 ---
 
-## 12. Troubleshooting
+## 12. App-host upgrade order: `gradatum-server` before `gradatum-worker`
+
+`gradatum-server` and `gradatum-worker` are **not independently versionable**. The worker
+drives the vault through internal HTTP routes served by `gradatum-server`, and releases add
+routes to that surface. A worker newer than its server therefore calls endpoints the server
+does not expose yet.
+
+> **Rule** — upgrade both binaries in the same operation. Stop the worker first, start the
+> server first. Never upgrade the worker alone.
+
+```
+stop  gradatum-worker  →  stop  gradatum-server
+install both binaries
+start gradatum-server  →  start gradatum-worker
+```
+
+Stopping the worker first lets it drain against a server that is still up; starting the
+server first means the worker never runs a single job against an older server. The repo's
+`scripts/deploy-gradatum-local.sh` already applies this order — the constraint is written
+here for manual, partial, or rolling upgrades, which is where it gets broken.
+
+### Why the order matters
+
+The rule is not a convention: skipping it silently forfeits the fix a release ships.
+
+Concrete case, v1.0.0. When the forget job meets a note already forgotten, it skips it —
+re-running the full forget would re-stamp `forgotten_at`/`forgotten_by` at call time and
+destroy the audit trail of the *first* forget. But the skip alone used to leave the index
+mark unrepaired: the index still said "live" while the frontmatter said "forgotten", so the
+note stayed **searchable** although the vault declared it forgotten. To close that, the skip
+branch now calls a route only the new server exposes:
+
+```
+POST /internal/v1/note/{ulid}/forget-resync?vault_id=<vault_id>
+```
+
+Against an **older** server the route does not exist, so the server answers `404`. The
+worker's HTTP client treats every 4xx as terminal (no retry), maps `404` to a client-side
+`NotFound` error, logs a WARN, and **carries on with the batch**.
+
+That is a clean degradation, and deliberately so: the note *is* forgotten in the vault, so
+failing the batch would be the worse outcome. Nothing crashes, nothing is lost, no job is
+stuck. What does not happen is the repair — the index stays out of sync, which is exactly
+the defect the release closes. **Clean is not the same as harmless**, and because it is
+silent you will not see it unless you read the logs.
+
+### Observable symptom when the order is inverted
+
+In the worker journal (`journalctl -u gradatum-worker`):
+
+```
+forget: index resync failed — note left desynchronised (searchable), batch continues
+```
+
+Functionally: notes that were forgotten **remain findable through search**, indefinitely —
+the WARN is emitted once per affected note per forget run, not retried in the background.
+
+> The `404` is ambiguous read on its own: the *new* server also returns `404` when no index
+> row exists for that (ULID, `vault_id`). Do not infer a version skew from the WARN alone —
+> confirm it against `/health`, below.
+
+### Verify the deployed commit, not just the version
+
+`scripts/deploy-gradatum-local.sh` **does not build** unless `--build` is passed: it copies
+`target/release/{gradatum-server,gradatum-worker}` as they are. If the last build in that
+tree ran under the dev profile, `target/release` still holds an earlier build, and the
+deploy reports success while installing a stale binary — the same silent-skew class as the
+one above.
+
+The semantic version does not catch this: it is identical across dozens of consecutive
+commits. The build commit does.
+
+```bash
+# Server: /health carries both fields
+curl -s http://127.0.0.1:19090/health | jq -r '.version, .build_sha'
+
+# Expected reference
+git rev-parse --short HEAD
+```
+
+`build_sha` must equal `HEAD`. A value of `unknown` means the binary was built outside a git
+checkout — that is an absence of proof, not a match.
+
+The worker has **no `/health` endpoint of its own**; check it through its version string,
+which both binaries print in the same stable format:
+
+```bash
+gradatum-server --version   # gradatum-server <semver> (build_sha <sha>)
+gradatum-worker --version   # gradatum-worker <semver> (build_sha <sha>)
+```
+
+Both must report the same `build_sha` — that is the check that catches a half-applied
+upgrade, and it is the one worth running after any manual deploy.
+
+---
+
+## 13. Troubleshooting
 
 | Symptom | Likely cause | Action |
 |---|---|---|
 | `EngineError::ModelLoad: llama_server_bin canonicalize failed` | Binary not found at configured path | Install `llama-server` to `/usr/local/bin/` |
 | `EngineError::ModelLoad: ... is outside the allowed prefix` | Binary path outside allowed prefix | Place binary in `/usr/local/bin/` or `/opt/gradatum/bin/` |
 | `EngineError::ModelLoad: model_path: path must be under /opt/gradatum/models/` | Model file outside allowed prefix | Move GGUF to `/opt/gradatum/models/` |
-| `EngineError::BadRequest: extra_args: flag '...' is not allowed` | Flag not in allow-list | Remove the flag or check Section 5 |
+| `EngineError::BadRequest: extra_args: flag '...' is not allowed` | Flag not in allow-list | Remove the flag or check Section 6 |
 | `/health` returns `503` immediately | Child startup failed or timed out | Check `journalctl -u gradatum-engine-chat` for child stderr |
 | `/health` returns `503` after running fine | Restart budget exhausted (flapping child) | Check model compatibility with your `llama-server` version |
 | GPU not used despite `gpu_layers > 0` | Missing GPU runtime or env vars not injected | Verify the GPU runtime is installed; env vars prefixed `VK_*`/`CUDA_*` etc. are auto-injected |

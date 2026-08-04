@@ -1,0 +1,76 @@
+pub mod gradatum_warden
+pub mod gradatum_warden::config
+pub struct gradatum_warden::config::WardenConfig
+pub gradatum_warden::config::WardenConfig::bypass_loopback: bool
+pub gradatum_warden::config::WardenConfig::enabled: bool
+pub gradatum_warden::config::WardenConfig::ip_allow: alloc::vec::Vec<ipnet::ipnet::IpNet>
+pub gradatum_warden::config::WardenConfig::ip_deny: alloc::vec::Vec<ipnet::ipnet::IpNet>
+pub gradatum_warden::config::WardenConfig::rate_limit_burst: u32
+pub gradatum_warden::config::WardenConfig::rate_limit_per_minute: u32
+impl core::default::Default for gradatum_warden::config::WardenConfig
+pub fn gradatum_warden::config::WardenConfig::default() -> Self
+pub mod gradatum_warden::error
+pub enum gradatum_warden::error::WardenDecision
+pub gradatum_warden::error::WardenDecision::Allow
+pub gradatum_warden::error::WardenDecision::Bypass
+pub gradatum_warden::error::WardenDecision::DenyIp
+pub gradatum_warden::error::WardenDecision::DenyRateLimit
+pub enum gradatum_warden::error::WardenError
+pub gradatum_warden::error::WardenError::InvalidRateLimit(u32, u32)
+pub mod gradatum_warden::ip
+pub mod gradatum_warden::ip::filter
+pub fn gradatum_warden::ip::filter::ip_allowed(core::net::ip_addr::IpAddr, &[ipnet::ipnet::IpNet], &[ipnet::ipnet::IpNet]) -> bool
+pub fn gradatum_warden::ip::ip_allowed(core::net::ip_addr::IpAddr, &[ipnet::ipnet::IpNet], &[ipnet::ipnet::IpNet]) -> bool
+pub mod gradatum_warden::layer
+pub struct gradatum_warden::layer::WardenLayer
+impl gradatum_warden::layer::WardenLayer
+pub fn gradatum_warden::layer::WardenLayer::new(gradatum_warden::config::WardenConfig) -> core::result::Result<Self, gradatum_warden::error::WardenError>
+impl<S> tower_layer::Layer<S> for gradatum_warden::layer::WardenLayer
+pub type gradatum_warden::layer::WardenLayer::Service = gradatum_warden::service::WardenService<S>
+pub fn gradatum_warden::layer::WardenLayer::layer(&self, S) -> Self::Service
+pub mod gradatum_warden::rate
+pub mod gradatum_warden::rate::per_ip
+pub struct gradatum_warden::rate::per_ip::PerIpRateLimiter
+impl gradatum_warden::rate::per_ip::PerIpRateLimiter
+pub fn gradatum_warden::rate::per_ip::PerIpRateLimiter::check(&self, core::net::ip_addr::IpAddr) -> bool
+pub fn gradatum_warden::rate::per_ip::PerIpRateLimiter::new(u32, u32) -> core::result::Result<Self, gradatum_warden::error::WardenError>
+pub fn gradatum_warden::rate::per_ip::PerIpRateLimiter::wait_time_secs(&self, core::net::ip_addr::IpAddr) -> u64
+impl core::fmt::Debug for gradatum_warden::rate::per_ip::PerIpRateLimiter
+pub fn gradatum_warden::rate::per_ip::PerIpRateLimiter::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct gradatum_warden::rate::PerIpRateLimiter
+impl gradatum_warden::rate::per_ip::PerIpRateLimiter
+pub fn gradatum_warden::rate::per_ip::PerIpRateLimiter::check(&self, core::net::ip_addr::IpAddr) -> bool
+pub fn gradatum_warden::rate::per_ip::PerIpRateLimiter::new(u32, u32) -> core::result::Result<Self, gradatum_warden::error::WardenError>
+pub fn gradatum_warden::rate::per_ip::PerIpRateLimiter::wait_time_secs(&self, core::net::ip_addr::IpAddr) -> u64
+impl core::fmt::Debug for gradatum_warden::rate::per_ip::PerIpRateLimiter
+pub fn gradatum_warden::rate::per_ip::PerIpRateLimiter::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub mod gradatum_warden::service
+pub struct gradatum_warden::service::WardenService<S>
+impl<S, ReqBody, ResBody> tower_service::Service<http::request::Request<ReqBody>> for gradatum_warden::service::WardenService<S> where S: tower_service::Service<http::request::Request<ReqBody>, Response = http::response::Response<ResBody>> + core::clone::Clone + core::marker::Send + 'static, <S as tower_service::Service>::Future: core::marker::Send + 'static, <S as tower_service::Service>::Error: core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>, ReqBody: core::marker::Send + 'static, ResBody: core::default::Default + core::marker::Send + 'static
+pub type gradatum_warden::service::WardenService<S>::Error = <S as tower_service::Service<http::request::Request<ReqBody>>>::Error
+pub type gradatum_warden::service::WardenService<S>::Future = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<<gradatum_warden::service::WardenService<S> as tower_service::Service<http::request::Request<ReqBody>>>::Response, <gradatum_warden::service::WardenService<S> as tower_service::Service<http::request::Request<ReqBody>>>::Error>> + core::marker::Send)>>
+pub type gradatum_warden::service::WardenService<S>::Response = http::response::Response<ResBody>
+pub fn gradatum_warden::service::WardenService<S>::call(&mut self, http::request::Request<ReqBody>) -> Self::Future
+pub fn gradatum_warden::service::WardenService<S>::poll_ready(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::result::Result<(), Self::Error>>
+pub enum gradatum_warden::WardenDecision
+pub gradatum_warden::WardenDecision::Allow
+pub gradatum_warden::WardenDecision::Bypass
+pub gradatum_warden::WardenDecision::DenyIp
+pub gradatum_warden::WardenDecision::DenyRateLimit
+pub enum gradatum_warden::WardenError
+pub gradatum_warden::WardenError::InvalidRateLimit(u32, u32)
+pub struct gradatum_warden::WardenConfig
+pub gradatum_warden::WardenConfig::bypass_loopback: bool
+pub gradatum_warden::WardenConfig::enabled: bool
+pub gradatum_warden::WardenConfig::ip_allow: alloc::vec::Vec<ipnet::ipnet::IpNet>
+pub gradatum_warden::WardenConfig::ip_deny: alloc::vec::Vec<ipnet::ipnet::IpNet>
+pub gradatum_warden::WardenConfig::rate_limit_burst: u32
+pub gradatum_warden::WardenConfig::rate_limit_per_minute: u32
+impl core::default::Default for gradatum_warden::config::WardenConfig
+pub fn gradatum_warden::config::WardenConfig::default() -> Self
+pub struct gradatum_warden::WardenLayer
+impl gradatum_warden::layer::WardenLayer
+pub fn gradatum_warden::layer::WardenLayer::new(gradatum_warden::config::WardenConfig) -> core::result::Result<Self, gradatum_warden::error::WardenError>
+impl<S> tower_layer::Layer<S> for gradatum_warden::layer::WardenLayer
+pub type gradatum_warden::layer::WardenLayer::Service = gradatum_warden::service::WardenService<S>
+pub fn gradatum_warden::layer::WardenLayer::layer(&self, S) -> Self::Service

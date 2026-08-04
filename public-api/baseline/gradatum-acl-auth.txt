@@ -1,0 +1,101 @@
+pub mod gradatum_acl_auth
+pub mod gradatum_acl_auth::api_key
+pub enum gradatum_acl_auth::api_key::ApiKeyError
+pub gradatum_acl_auth::api_key::ApiKeyError::AlreadyRevoked
+pub gradatum_acl_auth::api_key::ApiKeyError::ArgonHash(alloc::string::String)
+pub gradatum_acl_auth::api_key::ApiKeyError::Crypto(alloc::string::String)
+pub gradatum_acl_auth::api_key::ApiKeyError::InvalidTenant(alloc::string::String)
+pub gradatum_acl_auth::api_key::ApiKeyError::NotFound
+pub gradatum_acl_auth::api_key::ApiKeyError::Sql(sqlx_core::error::Error)
+pub struct gradatum_acl_auth::api_key::ApiKey
+pub gradatum_acl_auth::api_key::ApiKey::created_at: i64
+pub gradatum_acl_auth::api_key::ApiKey::description: core::option::Option<alloc::string::String>
+pub gradatum_acl_auth::api_key::ApiKey::hash: alloc::string::String
+pub gradatum_acl_auth::api_key::ApiKey::id: ulid::Ulid
+pub gradatum_acl_auth::api_key::ApiKey::last_used_at: core::option::Option<i64>
+pub gradatum_acl_auth::api_key::ApiKey::owner: gradatum_core::scope::AgentId
+pub gradatum_acl_auth::api_key::ApiKey::prefix: alloc::string::String
+pub gradatum_acl_auth::api_key::ApiKey::revoked_at: core::option::Option<i64>
+pub gradatum_acl_auth::api_key::ApiKey::scopes: alloc::vec::Vec<alloc::string::String>
+pub gradatum_acl_auth::api_key::ApiKey::tenant_id: gradatum_core::scope::TenantId
+impl gradatum_acl_auth::api_key::ApiKey
+pub fn gradatum_acl_auth::api_key::ApiKey::is_revoked(&self) -> bool
+pub struct gradatum_acl_auth::api_key::ApiKeyMaterial
+pub gradatum_acl_auth::api_key::ApiKeyMaterial::prefix: alloc::string::String
+pub gradatum_acl_auth::api_key::ApiKeyMaterial::secret: alloc::string::String
+pub struct gradatum_acl_auth::api_key::SqliteApiKeyStore
+impl gradatum_acl_auth::api_key::SqliteApiKeyStore
+pub async fn gradatum_acl_auth::api_key::SqliteApiKeyStore::init(&std::path::Path) -> core::result::Result<Self, gradatum_acl_auth::api_key::ApiKeyError>
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::with_non_main_tenants(self) -> Self
+impl gradatum_acl_auth::api_key::ApiKeyStore for gradatum_acl_auth::api_key::SqliteApiKeyStore
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::create<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 gradatum_core::scope::AgentId, alloc::vec::Vec<alloc::string::String>, alloc::string::String, core::option::Option<alloc::string::String>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::list<'life0, 'life1, 'async_trait>(&'life0 self, bool, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_acl_auth::api_key::ApiKey>, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::revoke<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::rotate<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::verify<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKey, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub const gradatum_acl_auth::api_key::KEY_PREFIX: &str
+pub const gradatum_acl_auth::api_key::SECRET_LEN: usize
+pub const gradatum_acl_auth::api_key::WRITE_SCOPES: &[&str]
+pub trait gradatum_acl_auth::api_key::ApiKeyStore: core::marker::Send + core::marker::Sync
+pub fn gradatum_acl_auth::api_key::ApiKeyStore::create<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 gradatum_core::scope::AgentId, alloc::vec::Vec<alloc::string::String>, alloc::string::String, core::option::Option<alloc::string::String>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::ApiKeyStore::list<'life0, 'life1, 'async_trait>(&'life0 self, bool, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_acl_auth::api_key::ApiKey>, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::ApiKeyStore::revoke<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::ApiKeyStore::rotate<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::ApiKeyStore::verify<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKey, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl gradatum_acl_auth::api_key::ApiKeyStore for gradatum_acl_auth::api_key::SqliteApiKeyStore
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::create<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 gradatum_core::scope::AgentId, alloc::vec::Vec<alloc::string::String>, alloc::string::String, core::option::Option<alloc::string::String>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::list<'life0, 'life1, 'async_trait>(&'life0 self, bool, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_acl_auth::api_key::ApiKey>, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::revoke<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::rotate<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::verify<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKey, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::has_write_scope(&[alloc::string::String]) -> bool
+pub enum gradatum_acl_auth::ApiKeyError
+pub gradatum_acl_auth::ApiKeyError::AlreadyRevoked
+pub gradatum_acl_auth::ApiKeyError::ArgonHash(alloc::string::String)
+pub gradatum_acl_auth::ApiKeyError::Crypto(alloc::string::String)
+pub gradatum_acl_auth::ApiKeyError::InvalidTenant(alloc::string::String)
+pub gradatum_acl_auth::ApiKeyError::NotFound
+pub gradatum_acl_auth::ApiKeyError::Sql(sqlx_core::error::Error)
+pub struct gradatum_acl_auth::ApiKey
+pub gradatum_acl_auth::ApiKey::created_at: i64
+pub gradatum_acl_auth::ApiKey::description: core::option::Option<alloc::string::String>
+pub gradatum_acl_auth::ApiKey::hash: alloc::string::String
+pub gradatum_acl_auth::ApiKey::id: ulid::Ulid
+pub gradatum_acl_auth::ApiKey::last_used_at: core::option::Option<i64>
+pub gradatum_acl_auth::ApiKey::owner: gradatum_core::scope::AgentId
+pub gradatum_acl_auth::ApiKey::prefix: alloc::string::String
+pub gradatum_acl_auth::ApiKey::revoked_at: core::option::Option<i64>
+pub gradatum_acl_auth::ApiKey::scopes: alloc::vec::Vec<alloc::string::String>
+pub gradatum_acl_auth::ApiKey::tenant_id: gradatum_core::scope::TenantId
+impl gradatum_acl_auth::api_key::ApiKey
+pub fn gradatum_acl_auth::api_key::ApiKey::is_revoked(&self) -> bool
+pub struct gradatum_acl_auth::ApiKeyMaterial
+pub gradatum_acl_auth::ApiKeyMaterial::prefix: alloc::string::String
+pub gradatum_acl_auth::ApiKeyMaterial::secret: alloc::string::String
+pub struct gradatum_acl_auth::SqliteApiKeyStore
+impl gradatum_acl_auth::api_key::SqliteApiKeyStore
+pub async fn gradatum_acl_auth::api_key::SqliteApiKeyStore::init(&std::path::Path) -> core::result::Result<Self, gradatum_acl_auth::api_key::ApiKeyError>
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::with_non_main_tenants(self) -> Self
+impl gradatum_acl_auth::api_key::ApiKeyStore for gradatum_acl_auth::api_key::SqliteApiKeyStore
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::create<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 gradatum_core::scope::AgentId, alloc::vec::Vec<alloc::string::String>, alloc::string::String, core::option::Option<alloc::string::String>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::list<'life0, 'life1, 'async_trait>(&'life0 self, bool, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_acl_auth::api_key::ApiKey>, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::revoke<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::rotate<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::verify<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKey, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub const gradatum_acl_auth::KEY_PREFIX: &str
+pub const gradatum_acl_auth::SECRET_LEN: usize
+pub const gradatum_acl_auth::VERSION: &str
+pub const gradatum_acl_auth::WRITE_SCOPES: &[&str]
+pub trait gradatum_acl_auth::ApiKeyStore: core::marker::Send + core::marker::Sync
+pub fn gradatum_acl_auth::ApiKeyStore::create<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 gradatum_core::scope::AgentId, alloc::vec::Vec<alloc::string::String>, alloc::string::String, core::option::Option<alloc::string::String>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::ApiKeyStore::list<'life0, 'life1, 'async_trait>(&'life0 self, bool, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_acl_auth::api_key::ApiKey>, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::ApiKeyStore::revoke<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::ApiKeyStore::rotate<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::ApiKeyStore::verify<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKey, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl gradatum_acl_auth::api_key::ApiKeyStore for gradatum_acl_auth::api_key::SqliteApiKeyStore
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::create<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 gradatum_core::scope::AgentId, alloc::vec::Vec<alloc::string::String>, alloc::string::String, core::option::Option<alloc::string::String>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::list<'life0, 'life1, 'async_trait>(&'life0 self, bool, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_acl_auth::api_key::ApiKey>, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::revoke<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::rotate<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKeyMaterial, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::api_key::SqliteApiKeyStore::verify<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_acl_auth::api_key::ApiKey, gradatum_acl_auth::api_key::ApiKeyError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_acl_auth::has_write_scope(&[alloc::string::String]) -> bool

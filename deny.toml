@@ -6,19 +6,40 @@
 #   - Unmaintained crates: WARN (monitored, not blocking)
 #   - Licenses: allow-list only (Apache-2.0 compatible stack)
 #   - Sources: crates.io only, no unknown registries or git deps
-#   - Banned crates: gradatum-llm / gradatum-acl (deleted in W1), *-sys without explicit allow
+#   - Banned crates: gradatum-llm / gradatum-acl (deleted in W1) — par NOM EXACT uniquement
+#   - `*-sys` : convention de revue HUMAINE, non mécanisée. Aucune règle de ce fichier ne
+#     détecte ni n'avertit sur un `*-sys`. Détail + red-proof dans le bloc [bans] plus bas.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [advisories] — RustSec advisory database
 # ─────────────────────────────────────────────────────────────────────────────
 [advisories]
 # cargo-deny 0.19+ syntax (post-migration 2026-05-03 — ci.yml fix débloqué)
-# - Vulnerabilities: DENY by default (no field needed)
-# - Yanked versions: DENY by default (no field needed)
-# - Unsound code: handled via RUSTSEC advisories (DENY by default)
-# - Notice-level: removed in v2
-# Unmaintained crates: scope filter — "all" = workspace + transitive (strict)
+#
+# ⚠️ PORTÉE COMMUNE À TOUT CE BLOC — mesurée, pas supposée (lot I-005, 2026-07-30) :
+# cargo-deny n'évalue QUE le graphe résolu (`cargo metadata`, features/cibles appliquées),
+# là où `cargo audit` lit Cargo.lock À PLAT. Mesuré sur ce dépôt à `9b7bc5e6` :
+#   Cargo.lock = 689 crates · graphe résolu par défaut = 546 · `--all-features` = 689.
+# Les 143 crates d'écart (deps optionnelles non sélectionnées) sont INVISIBLES à toute
+# règle ci-dessous, quel que soit son niveau. Un « DENY » ici ne vaut donc jamais
+# « couvert » : il vaut « DENY dans le périmètre résolu ». Cf. bloc rsa/RUSTSEC-2023-0071.
+#
+# - Vulnerabilities : DENY par défaut (aucun champ requis) — vérifié : RUSTSEC-2023-0071
+#   sort en `error[vulnerability]` dès que le crate entre dans le graphe résolu.
+# - Yanked versions : WARN par défaut, PAS deny. Vérifié 2026-07-30 : `spin 0.9.8` est yanked
+#   et présent dans le graphe résolu ; le gate rend `warning[yanked]` et EXIT 0. Passer
+#   `yanked = "deny"` rendrait FAILED sur ce cas réel — arbitrage non tranché, pas appliqué ici.
+# - Notice-level : supprimé en v2.
+#
+# `unmaintained` ET `unsound` sont des SCOPES (enum ["all","workspace","transitive","none"]),
+# pas des niveaux de lint — passer `unsound = "deny"` est une erreur de config (`unexpected-value`).
+# Défaut de `unsound` mesuré = "workspace" : un advisory unsound porté par un crate TRANSITIF
+# n'était pas évalué du tout. C'était l'angle mort du lot I-013 (RUSTSEC-2025-0067 / libyml,
+# absent y compris de la sortie ROUGE du gate). Red-proof I-005 sur témoin hors dépôt
+# (serde_yml 0.0.12 -> libyml 0.0.5) : champ absent -> seul 0068 (direct) est vu ;
+# `unsound = "all"` -> 0067 (transitif) ET 0068 sont vus.
 unmaintained = "all"
+unsound = "all"
 
 # Ignored advisory IDs (RUSTSEC-YYYY-NNNN format)
 # RUSTSEC-2024-0436 — `paste` crate (proc-macro): unsound use of transmute on non-repr(C) types.
@@ -36,21 +57,67 @@ ignore = [
     # (paste n'est plus tiré transitivement depuis fastembed 4.6.0 avec default-features=false).
     # Entrée conservée en commentaire pour traçabilité — PR-3 HTTP stack bump.
     { id = "RUSTSEC-2025-0141", reason = "bincode v2 unmaintained (no security issue) — migration to alternative deferred Phase 2.1+ after data format stabilisation" },
-    # RUSTSEC-2025-0068 — serde_yml 0.0.12 unsound (emitter segfault).
-    # Introduit par PR-1 (serde_yaml → serde_yml drop-in, commit 32eb2c9).
-    # Usage : lecture YAML uniquement via Deserializer — le Serializer/emitter non-sûr n'est pas activé.
-    # Pas de fix upstream disponible (dépôt archivé). Migration serde-yaml-ng prévue PR-5+ si stable.
-    { id = "RUSTSEC-2025-0068", reason = "serde_yml 0.0.12 : seul le Deserializer est utilisé (lecture config YAML) — Serializer/emitter non sûr non activé. Dépôt archivé, migration planifiée PR-5+ supply chain hardening." },
-    # RUSTSEC-2026-0194 / -0195 — quick-xml 0.36.2 (2 DoS : quadratic attribute-dup check + unbounded
-    #   namespace allocation dans NsReader). Transitif via opendal 0.51.0 → gradatum-storage.
-    #   NON ATTEIGNABLE : gradatum-storage a `default = ["fs"]` ; les backends cloud s3/gcs/azure
-    #   (seuls à parser du XML de réponse via quick-xml) sont opt-in et activés par AUCUN consommateur
-    #   du workspace (le code n'utilise que `services::Fs`). Le chemin XML vulnérable n'est jamais
-    #   exercé. Bump 0.36→0.41 nécessiterait opendal ≥0.54 (breaking) pour une vuln non-atteignable.
-    #   Revisiter si un backend cloud est activé OU si opendal bump quick-xml ≥0.41.
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.36.2 DoS transitif opendal — backends cloud (seuls à parser XML) opt-in non activés (default=fs). Chemin non atteignable. Revisit si backend cloud activé." },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.36.2 DoS transitif opendal — backends cloud (seuls à parser XML) opt-in non activés (default=fs). Chemin non atteignable. Revisit si backend cloud activé." },
+    # RUSTSEC-2025-0068 (serde_yml) — RETIRÉ : lot I-013 a migré serde_yml → serde_norway.
+    # Le motif de l'exemption était de surcroît faux sur deux points, mesurés avant retrait :
+    #   1. Usage — il affirmait que « seul le Deserializer est utilisé ». Le chemin d'ÉCRITURE
+    #      des notes (writer.rs) appelait `to_string`, donc le Serializer/emitter visé par
+    #      l'advisory, sur du frontmatter partiellement contrôlé par le client.
+    #   2. Portée — il ne couvrait que serde_yml. Son backend `libyml 0.0.5` porte
+    #      RUSTSEC-2025-0067 (unsound, patched = []), qu'AUCUNE entrée `ignore` ne couvrait.
+    # `serde_yml` et `libyml` ont tous deux quitté le graphe résolu (`cargo tree -i` : « did not
+    # match any packages »), donc les deux advisories disparaissent sans exemption.
+    # Entrée conservée en commentaire pour traçabilité — cf. CHANGELOG 1.0.0.
+    # RUSTSEC-2026-0194 / -0195 (quick-xml, 2 DoS) — RÉSOLUS, plus aucune exemption.
+    #   Trace historique (l'exemption a existé, voici pourquoi elle n'existe plus) :
+    #   Ces deux DoS (dup-check d'attributs quadratique + allocation NsReader non bornée,
+    #   7.5 high, corrigés en quick-xml 0.41.0) arrivaient via opendal. Tant qu'opendal restait
+    #   épinglé 0.51.0, le graphe résolu tirait quick-xml 0.36.2 (via opendal-core) et Cargo.lock
+    #   listait 0.37.5 (via reqsign, hors graphe résolu) ; AUCUN opendal < 0.58 n'exigeait
+    #   quick-xml >= 0.41, le seuil de correction (`patched = [">= 0.41.0"]`, pas de backport
+    #   0.39.x/0.40.x) était donc inatteignable. Deux `ignore` LOAD-BEARING couvraient les deux
+    #   IDs (leur retrait faisait passer `cargo deny check advisories` FAILED, vérifié 2026-07-28).
+    #   La vuln n'était de surcroît pas atteignable au CODE (default=fs, backends s3/gcs/azure
+    #   parseurs XML non activés par aucun consommateur du workspace).
+    #   Résolution (2026-07-31) : bump opendal 0.51.0 -> 0.58.1 — premier palier dont
+    #   `opendal-core` exige quick-xml ^0.41.0 (depuis 0.56 la crate est éclatée en façade +
+    #   `opendal-core` + `opendal-service-*` ; le requirement quick-xml se lit sur core, pas
+    #   sur la façade). 0.58.0 était YANKED (bug ctor macOS auto-register, apache/opendal#7923) ;
+    #   0.58.1 publiée non yankée le 2026-07-31. Le bump relève la MSRV workspace 1.88 -> 1.91
+    #   (exigence d'opendal 0.58). quick-xml 0.36.2 et 0.37.5 quittent Cargo.lock, remplacés par
+    #   >= 0.41 : les deux advisories disparaissent SANS exemption — `cargo audit` ne remonte plus
+    #   aucun des deux IDs, `cargo deny check advisories` reste EXIT 0. Entrées `ignore` retirées.
+    #   Dette F-133 close par ce bump — decisions/01KYTEK9ZKVTZM5BW22B5FDYQQ,
+    #   project-map/01KYTEN62BM6VGDNZWWQEBG3ST.
 ]
+
+# ── RUSTSEC-2023-0071 / rsa 0.9.10 — Marvin Attack (5.9 medium, AUCUN correctif amont) ──
+#
+# DÉLIBÉRÉMENT ABSENT de la liste `ignore` ci-dessus. Ce n'est pas un oubli.
+#
+# Chemins (re-mesurés `cargo audit`, 2026-07-31 — post bump opendal 0.51.0 -> 0.58.1) :
+#   rsa 0.9.10 → sqlx-mysql 0.8.6 → sqlx-macros-core → sqlx-macros → sqlx 0.8.6 → 8 crates du workspace
+#   rsa 0.9.10 → reqsign-google 3.0.3 / reqsign-core 3.2.0 / reqsign-azure-storage 3.1.1
+#              → opendal-service-{gcs,s3,azblob} 0.58.1 → opendal 0.58.1 → gradatum-storage
+#   (l'ancien libellé « reqsign 0.16.5 → opendal 0.51.0 » est PÉRIMÉ : reqsign monolithique a
+#    disparu avec le bump ; il est éclaté en reqsign-core + reqsign-{google,aws-v4,azure-storage,
+#    file-read-tokio}, dont trois — google, core, azure-storage — déclarent rsa en dépendance.)
+#
+# Motif d'inatteignabilité — les DEUX chemins passent par une feature non sélectionnée :
+# `sqlx` est tiré avec le driver sqlite seul (jamais `mysql`), et `reqsign` n'arrive que par
+# les features cloud d'opendal. `cargo tree -i rsa@0.9.10 --target all` rend « nothing to
+# print » : la crate n'est dans AUCUN graphe résolu, toutes cibles et tous types d'arêtes
+# confondus. Elle n'existe que comme ligne de Cargo.lock, que `cargo audit` scanne à plat.
+#
+# Pourquoi PAS une entrée `ignore` — vérifié empiriquement le 2026-07-28 : l'ajouter produit
+# `warning[advisory-not-detected]: no crate matched advisory criteria` (entrée morte), et
+# surtout elle DÉSARMERAIT le gate pour l'avenir. Aujourd'hui, activer la feature `mysql` de
+# sqlx ou un backend cloud ferait entrer rsa dans le graphe résolu et `cargo deny check`
+# passerait FAILED — exactement le signal qu'on veut. Un `ignore` le supprimerait en silence,
+# pour une vuln sans correctif amont. La justification vit donc ici, pas dans `ignore`.
+#
+# Conséquence assumée : `cargo audit` (Cargo.lock à plat) et `cargo deny check` (graphe résolu)
+# DIVERGENT sur cette entrée — 1 vuln remontée vs 0. C'est le comportement correct des deux
+# outils, pas une régression. Revisiter si un correctif rsa paraît, ou si `mysql`/cloud est activé.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [licenses] — SPDX license allow-list
@@ -64,6 +131,8 @@ ignore = [
 #   Zlib                 — permissive, used by miniz_oxide (compression in rustls stack)
 #   ISC                  — OpenBSD-style permissive; used by ring crypto primitives
 #   0BSD                 — zero-clause BSD, maximally permissive; used by some proc-macro crates
+#   OFL-1.1              — SIL Open Font License; fonts (IBM Plex Sans / JetBrains Mono /
+#                          Spectral) redistributed inside gradatum-studio's dist/ bundle
 # ─────────────────────────────────────────────────────────────────────────────
 [licenses]
 # cargo-deny 0.19+ syntax (post-migration 2026-05-03 — PR #611)
@@ -81,6 +150,7 @@ allow = [
     "Zlib",
     "ISC",
     "0BSD",
+    "OFL-1.1",
 ]
 
 # Minimum confidence for license detection (SPDX heuristics)
@@ -100,7 +170,23 @@ multiple-versions = "warn"
 
 # Wildcarded semver deps (e.g. version = "*")
 # "warn" en Phase 0bis-bis car les workspace internal deps utilisent souvent path = ".." sans version
-# Escalate to "deny" + allow-wildcard-paths = true Phase 1 si cargo-deny v2 supporte
+#
+# ⚠️ CE QUE CE RÉGLAGE FAIT RÉELLEMENT — mesuré sur cargo-deny 0.19.9, 2026-07-30 :
+#   - "warn" ne fait ÉCHOUER aucun gate : `cargo deny check bans` rend `bans ok`, EXIT 0.
+#     C'est une notification dans le log, pas un garde-fou. Toute phrase de ce fichier qui
+#     dit « fails CI » à propos de `wildcards = "warn"` est fausse par construction.
+#   - Le check ne détecte QUE le requirement LITTÉRAL `*` (book /checks/bans/cfg.html :
+#     « when a dependency is specified with the `*` (wildcard) version »). Un requirement
+#     simplement non épinglé n'est PAS un wildcard pour cargo-deny. Red-proof sur crate
+#     témoin hors dépôt : `libc = "*"` -> `error[wildcard]` ; `cfg-if = "1.0"` -> rien.
+#
+# Coût de l'escalade, MESURÉ le 2026-07-30, NON APPLIQUÉ ici (arbitrage non tranché) :
+#   - `wildcards = "deny"` seul        -> `bans FAILED`, EXIT 2 : 23 deps sur 3 crates
+#     (gradatum-bench 7, index-parity-tests 2, v1-parity-tests 14). Toutes sont des
+#     `{ path = "../…" }` internes SANS champ `version`, donc lues comme `*`. Aucune dep
+#     externe n'est en cause.
+#   - `wildcards = "deny"` + `allow-wildcard-paths = true` -> `bans ok`, EXIT 0.
+#     L'option EXISTE bien en 0.19.9 : la réserve « si cargo-deny v2 supporte » est levée.
 wildcards = "warn"
 
 # Highlight crates that are only in the build graph via deny-listed paths
@@ -147,25 +233,66 @@ deny = [
 #   1. Workspace Cargo.toml uses exact `=version` pins — Cargo enforces single version.
 #   2. deny.toml lists these crates in `skip` to suppress spurious multiple-version
 #      warnings from transitive sub-deps within the apalis ecosystem itself.
-#   3. Any addition of apalis* without `=` pin fails CI (wildcards = "warn" escalating
-#      to "deny" in Phase 1 per policy above).
+#   3. ⚠️ CORRIGÉ 2026-07-30 — ce point affirmait : « Any addition of apalis* without `=`
+#      pin fails CI (wildcards = "warn" escalating to "deny") ». FAUX sur DEUX plans,
+#      mesurés sur cargo-deny 0.19.9 :
+#      (a) `wildcards = "warn"` ne fait échouer aucune CI — `bans ok`, EXIT 0. Seul
+#          `"deny"` rend EXIT 2, et il n'est pas activé (cf. bloc `wildcards` ci-dessus).
+#      (b) Même passé à `"deny"`, le check ne voit QUE le requirement littéral `*`.
+#          Un `apalis = "1.0.0-rc.9"` (sans `=`) n'est PAS un wildcard pour cargo-deny :
+#          il passerait sans un mot, quelle que soit la valeur de `wildcards`.
+#      Ce qui tient réellement le pin, c'est le point 1 (Cargo impose la version exacte
+#      déclarée) plus la revue humaine. AUCUN gate cargo-deny ne détecte un apalis
+#      dé-épinglé. Ne pas compter sur ce fichier pour cette garantie.
 #
 # Upgrade path: update workspace Cargo.toml pin + update this comment block.
 # Refs: docs/decisions/ARCH-D15-apalis-embedded.md §D-09
 
-# ── *-sys crates: warn unless explicitly allow-listed ─────────────────────
-# Raw FFI bindings introduce unsafe code and platform-specific build deps.
-# Policy: any *-sys crate must be explicitly reviewed and added to the
-# skip list below. Default = warn so we are notified without blocking CI
-# on crates already present (e.g. libsqlite3-sys bundled with rusqlite).
+# ── *-sys crates : convention de revue HUMAINE — RIEN N'EST ARMÉ ──────────
+# Raw FFI bindings introduce unsafe code and platform-specific build deps :
+# l'intention de les revoir une par une reste valable. Ce qui suit dit ce que
+# l'OUTIL fait, pour ne pas confondre l'intention avec un garde-fou.
+#
+# ⚠️ CORRIGÉ 2026-07-30 — ce bloc annonçait : « any *-sys crate must be explicitly
+# reviewed and added to the skip list below. Default = warn so we are notified ».
+# Les deux moitiés sont fausses. Mesuré sur cargo-deny 0.19.9 :
+#   1. `skip` ne concerne QUE le check `multiple-versions` — book /checks/bans/cfg.html :
+#      « allows you to temporarily ignore a crate during duplicate detection ». AUCUNE
+#      sémantique d'allow-list, donc y inscrire un `*-sys` n'enregistre aucune approbation.
+#      Preuve rendue par l'outil lui-même sur CE fichier : `warning[unnecessary-skip]:
+#      skip 'libsqlite3-sys' applied to a crate with only one version`.
+#   2. Il n'y a pas de « default = warn » pour les `*-sys` : AUCUNE règle de ce fichier
+#      ne les détecte. Un nouveau `*-sys` entrerait dans le graphe en SILENCE — EXIT 0,
+#      zéro diagnostic, à tous les niveaux de log.
+#   3. `deny` ne matche que des noms EXACTS (PackageSpec), ni glob ni regex. Red-proof :
+#      `deny = [{ name = "*-sys" }]` -> `bans ok`, EXIT 0, alors que 3 `*-sys` sont dans
+#      le graphe résolu (aws-lc-sys, libsqlite3-sys, linux-raw-sys) ; contrôle avec
+#      `{ name = "libsqlite3-sys" }` -> `error[banned]`, EXIT 2. Le motif n'est pas
+#      seulement inopérant, il est SILENCIEUX : aucun avertissement d'entrée non matchée.
+#
+# À quelle condition cette politique deviendrait mécanique (mesuré, NON appliqué ici) :
+#   - cargo-deny 0.19.9 n'offre aucun ban par motif de nom -> il faudrait un step CI maison
+#     (p.ex. `cargo metadata` filtré sur `-sys$`, diffé contre une allow-list versionnée).
+#   - Le seul levier natif approchant est `[bans.build] allow-build-scripts = [...]`
+#     (presque tout `*-sys` porte un build.rs). Mesuré à `[]` : `bans FAILED` avec
+#     69 crates à énumérer, dont `anyhow`, `libc`, `serde` — outil name-agnostic,
+#     coût d'entrée sans rapport avec l'objectif. Non retenu.
+#
+# Les entrées ci-dessous sont donc des exemptions `multiple-versions`, RIEN D'AUTRE.
 skip = [
-    # rusqlite uses bundled SQLite via libsqlite3-sys — reviewed, approved
-    # (no system libsqlite3 dependency, reproducible build, no FFI leakage)
+    # rusqlite uses bundled SQLite via libsqlite3-sys — revue HUMAINE faite et approuvée
+    # (no system libsqlite3 dependency, reproducible build, no FFI leakage).
+    # ⚠️ Cette entrée est un no-op aujourd'hui : une seule version au graphe, cargo-deny
+    # rend `warning[unnecessary-skip]`. Elle documente la revue, elle ne l'applique pas.
     { name = "libsqlite3-sys" },
     # apalis ecosystem: apalis-sqlite pulls apalis-sql + apalis-core as transitive deps.
     # Multiple versions may appear across apalis/apalis-sql/apalis-sqlite/apalis-cron
     # sub-dependency resolution — skip to suppress false-positive multiple-version warns.
     # Real version enforcement: exact `=` pins in workspace Cargo.toml (see D-09 block above).
+    # ⚠️ Mesuré 2026-07-30 : le doublon anticipé ne se produit PAS aujourd'hui — cargo-deny
+    # rend `warning[unnecessary-skip]` sur 'apalis-core' (une seule version) et
+    # `warning[unmatched-skip]: skipped crate 'apalis-sql' was not encountered` (absent du
+    # graphe résolu). Les deux entrées sont préventives, pas actives. Conservées telles quelles.
     { name = "apalis-core" },
     { name = "apalis-sql" },
 ]

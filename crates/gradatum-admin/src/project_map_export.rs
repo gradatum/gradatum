@@ -1,52 +1,58 @@
-//! `gradatum-admin project-map export-features --json` — projection JSON des cartes-feature.
+//! `gradatum-admin project-map export-features --json` — JSON projection of feature cards.
 //!
-//! Produit un tableau JSON trié par identifiant F-XX croissant, destiné à alimenter
-//! le gate CI T4 (miroir-site) ou un audit complet (`--include-dropped`).
+//! Produces a JSON array sorted by ascending feature identifier. It feeds two consumers:
+//! the continuous-integration check that the published website mirrors the vault, and a
+//! full audit when `--include-dropped` is passed.
 //!
-//! ## Architecture
+//! ## Layout
 //!
-//! - [`crate::project_map_export::export_features_from_conn`] : logique SQL pure, prend une connexion rusqlite.
-//!   Testable avec `Connection::open_in_memory()`.
-//! - [`crate::project_map_export::export_features`] : wrapper async pour l'usage CLI (`spawn_blocking`).
+//! - [`crate::project_map_export::export_features_from_conn`] holds the pure SQL logic
+//!   and takes an open `rusqlite` connection, so it can be tested against
+//!   `Connection::open_in_memory()`.
+//! - [`crate::project_map_export::export_features`] is the async wrapper used by the CLI,
+//!   running the blocking work on a dedicated thread.
 //!
-//! ## Projection partagée (DRY)
+//! ## Shared projection
 //!
-//! La transformation `notes brutes → Vec<FeatureEntry>` est déléguée à
-//! [`gradatum_core::project_map::project_map_feature_entries`] — SSOT partagée
-//! avec le handler HTTP `GET /api/v1/project-map/export-features`.
+//! Turning raw notes into `Vec<FeatureEntry>` is delegated to
+//! [`gradatum_core::project_map::project_map_feature_entries`], which is the single
+//! implementation shared with the HTTP handler behind
+//! `GET /api/v1/project-map/export-features`.
 //!
-//! ## Filtrage
+//! ## Filtering
 //!
-//! - Seules les cartes avec `[[feature:F-XX]]` sont considérées (exclut les
-//!   cartes changelog historiques sans rôle feature).
-//! - Miroir-site (`include_dropped = false`) : exclut uniquement `release:dropped`.
-//!   Les cartes `version:<proj>/backlog` sont **incluses** (Règle A NOMENCLATURE
-//!   §10e) avec `version = "vX.Y.Z"` — le discriminant d'exclusion est le champ
-//!   `release`, pas la nullité de version.
-//! - Audit complet (`include_dropped = true`) : toutes les cartes-feature.
-//! - Les notes lifecycle `status='downgraded'`/`'garbage'` sont toujours exclues
-//!   (filtre SQL, indépendant du flag).
+//! - Only cards carrying a `[[feature:…]]` link are considered, which leaves out
+//!   historical changelog cards that play no feature role.
+//! - Website mirror (`include_dropped = false`): `release:dropped` cards are excluded,
+//!   and so is every card whose kind is not `FEATURE`. Cards pinned to the sentinel
+//!   `version:<project>/backlog` are **kept**, and exported with a placeholder version
+//!   string rather than a null one — exclusion is decided by the `release` and `kind`
+//!   links, never by the absence of a concrete version.
+//! - Full audit (`include_dropped = true`): every feature card, whatever its release
+//!   status and kind. Despite its name the flag lifts both filters at once.
+//! - Notes whose lifecycle status is `downgraded` or `garbage` are always excluded by the
+//!   SQL query itself, whatever the flag says.
 //!
-//! ## Tri
+//! ## Ordering
 //!
-//! Tri par identifiant `F-XX` croissant (numérique sur la partie `\d{2,3}`).
+//! Ascending feature identifier, compared numerically on the digits of the identifier.
 
 use anyhow::{Context, Result};
 
 // Réexportation des types partagés pour compatibilité avec les appelants existants.
 pub use gradatum_core::project_map::{ExportOptions, FeatureEntry};
 
-/// Logique SQL pure — prend une connexion existante, testable avec
+/// Pure SQL logic: takes an already-open connection, which makes it testable against
 /// `Connection::open_in_memory()`.
 ///
-/// Interroge `notes` section `'project-map'` (exclut `downgraded`/`garbage`),
-/// collecte le body_text et le title de chaque note, et délègue la projection
-/// à [`gradatum_core::project_map::project_map_feature_entries`].
+/// Queries the `project-map` section of `notes`, excluding the `downgraded` and `garbage`
+/// lifecycle states, collects the body and title of each note, and delegates the
+/// projection to [`gradatum_core::project_map::project_map_feature_entries`].
 ///
 /// # Errors
 ///
-/// - Si la requête SQL échoue.
-/// - Si une ligne ne peut pas être lue.
+/// - The SQL query fails.
+/// - A row cannot be read.
 pub fn export_features_from_conn(
     conn: &rusqlite::Connection,
     vault: &str,
@@ -66,7 +72,7 @@ pub fn export_features_from_conn(
 
     let mut stmt = conn
         .prepare(sql)
-        .context("préparation requête export-features")?;
+        .context("preparing export-features query")?;
 
     // Collecte (body_text, title).
     // `title` est nullable en prod (migration 0005 : `ADD COLUMN title TEXT` sans NOT NULL).
@@ -79,9 +85,9 @@ pub fn export_features_from_conn(
                 row.get::<_, Option<String>>(1)?.unwrap_or_default(),
             ))
         })
-        .context("exécution requête export-features")?
+        .context("executing export-features query")?
         .collect::<std::result::Result<Vec<_>, _>>()
-        .context("lecture lignes export-features")?;
+        .context("reading export-features rows")?;
 
     // Délégation de la projection pure à gradatum-core (SSOT partagée avec le serveur).
     Ok(gradatum_core::project_map::project_map_feature_entries(
@@ -89,15 +95,15 @@ pub fn export_features_from_conn(
     ))
 }
 
-/// Async wrapper : ouvre l'index SQLite et délègue à `export_features_from_conn`.
+/// Async wrapper: opens the SQLite index and delegates to [`export_features_from_conn`].
 ///
-/// `root` est le répertoire racine Gradatum (ex. `/var/lib/gradatum`).
+/// `root` is the Gradatum root directory, for example `/var/lib/gradatum`.
 ///
 /// # Errors
 ///
-/// - Si `index.db` est introuvable.
-/// - Si la connexion SQLite échoue.
-/// - Si la requête SQL échoue.
+/// - `index.db` cannot be found, meaning the server has never started on this root.
+/// - The SQLite connection cannot be opened.
+/// - The SQL query fails.
 pub async fn export_features(
     root: &std::path::Path,
     vault: &str,
@@ -108,7 +114,7 @@ pub async fn export_features(
     let db_path = vault_index_path(root);
     if !db_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le serveur doit avoir démarré au moins une fois",
+            "index.db not found: {} — the server must have started at least once",
             db_path.display()
         );
     }

@@ -4,10 +4,12 @@
 //! Sort order: `anchor_ms DESC, note_id DESC`. Filters: `doc_kind`/`from_ms`/`to_ms`.
 //! Opaque cursor pagination. ACL `Read` on locus `{tenant}/timeline`.
 
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json, extract::State, http::StatusCode};
 use gradatum_core::trust::TrustContext;
 use serde::Serialize;
 
+use crate::api_v1::compact::{self, CompactBody};
 use crate::api_v1::dto::VaultTimelineRequest;
 use crate::state::AppState;
 
@@ -39,14 +41,24 @@ pub async fn vault_timeline(
     State(state): State<AppState>,
     Extension(trust): Extension<TrustContext>,
     Json(req): Json<VaultTimelineRequest>,
-) -> Result<Json<VaultTimelineResponse>, StatusCode> {
-    crate::api_v1::logic::vault_timeline_impl(&state, &trust, req)
+) -> Result<Response, StatusCode> {
+    // Read the opt-in flag before `req` is moved into the impl.
+    let want_compact = req.compact;
+    let resp = crate::api_v1::logic::vault_timeline_impl(&state, &trust, req)
         .await
-        .map(Json)
         .map_err(|e| {
             if matches!(e, gradatum_core::error::GradatumError::Storage(_)) {
                 tracing::error!(err = %e, "vault_timeline: storage failed");
             }
             crate::api_v1::logic::err_to_status(&e)
+        })?;
+    // `compact=false` returns exactly `Json(resp)` as before → byte-for-byte identical.
+    Ok(if want_compact {
+        Json(CompactBody {
+            compact: compact::render_timeline(&resp),
         })
+        .into_response()
+    } else {
+        Json(resp).into_response()
+    })
 }

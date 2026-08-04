@@ -94,7 +94,7 @@ async fn upsert_note_with_locus_and_author() {
 
     idx.upsert_note(&note).await.unwrap();
 
-    let stored = idx.get_content_hash(note.id).await.unwrap();
+    let stored = idx.get_content_hash("main", note.id).await.unwrap();
     assert_eq!(stored, Some(content_hash));
 }
 

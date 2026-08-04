@@ -107,7 +107,7 @@ impl VaultAwareSender {
         if let Some(tx) = &self.0 {
             // try_send: non-blocking. Drop on full channel (silent backpressure).
             if let Err(e) = tx.try_send(event) {
-                tracing::debug!("vault_aware event droppé (canal plein ou fermé): {}", e);
+                tracing::debug!("vault_aware event dropped (channel full or closed): {}", e);
             }
         }
     }
@@ -134,14 +134,14 @@ pub fn start_vault_aware_task(
             if !ep.starts_with("http://") && !ep.starts_with("https://") {
                 tracing::warn!(
                     endpoint = %ep,
-                    "vault_aware: endpoint invalide (doit commencer par http:// ou https://) — hook désactivé"
+                    "vault_aware: invalid endpoint (must start with http:// or https://) — hook disabled"
                 );
                 return Ok(VaultAwareSender::disabled());
             }
             ep.clone()
         }
         _ => {
-            tracing::debug!("vault_aware désactivé — aucun endpoint configuré");
+            tracing::debug!("vault_aware disabled — no endpoint configured");
             return Ok(VaultAwareSender::disabled());
         }
     };
@@ -194,14 +194,14 @@ pub fn start_vault_aware_task(
             }
         }
 
-        tracing::debug!("vault_aware background task terminé");
+        tracing::debug!("vault_aware background task finished");
     });
 
     tracing::info!(
         endpoint = %endpoint,
         batch_size = batch_size,
         flush_interval_secs = flush_interval.as_secs(),
-        "vault_aware hook activé"
+        "vault_aware hook enabled"
     );
 
     Ok(VaultAwareSender(Some(tx)))
@@ -222,14 +222,14 @@ async fn flush_batch(client: &reqwest::Client, endpoint: &str, batch: &mut Vec<Q
             tracing::debug!(
                 status = resp.status().as_u16(),
                 count = count,
-                "vault_aware batch flush: réponse non-200 (ignorée)"
+                "vault_aware batch flush: non-200 response (ignored)"
             );
         }
         Err(e) => {
             tracing::debug!(
                 error = %e,
                 count = count,
-                "vault_aware batch flush: erreur réseau (ignorée)"
+                "vault_aware batch flush: network error (ignored)"
             );
         }
     }

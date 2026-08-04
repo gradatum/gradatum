@@ -1,4 +1,4 @@
-//! Task 1 — Slice A v0.7.3 : `title_lookup` résolution colonne-first.
+//! v0.7.3 : `title_lookup` résolution colonne-first.
 //!
 //! Prouve que `title_lookup` résout d'abord la colonne `title` (exact-match)
 //! avant le fallback LIKE H1. Déclencheur du fix : âme sans H1 introuvable (smoke 6′).
@@ -37,7 +37,7 @@ async fn title_lookup_resolves_by_title_column_when_populated() {
     idx.upsert_note(&note).await.expect("upsert_note");
 
     // Peuple la colonne `title` séparément (comme le fait vault_write via persist_curated).
-    idx.upsert_note_title(&note_id, "identity/x")
+    idx.upsert_note_title("main", &note_id, "identity/x")
         .await
         .expect("upsert_note_title");
 
@@ -99,7 +99,7 @@ async fn title_lookup_excludes_non_live_with_title_column() {
     );
     let note_id = note.id;
     idx.upsert_note(&note).await.expect("upsert_note");
-    idx.upsert_note_title(&note_id, "identity/x")
+    idx.upsert_note_title("main", &note_id, "identity/x")
         .await
         .expect("upsert_note_title");
 
@@ -135,7 +135,7 @@ async fn title_lookup_collision_policy_column_wins() {
     );
     let id_a = note_a.id;
     idx.upsert_note(&note_a).await.expect("upsert_note note_a");
-    idx.upsert_note_title(&id_a, "dup")
+    idx.upsert_note_title("main", &id_a, "dup")
         .await
         .expect("upsert_note_title note_a");
 
@@ -176,7 +176,7 @@ async fn title_lookup_parity_column_equals_h1() {
     idx.upsert_note(&note).await.expect("upsert_note");
 
     // Peuple la colonne avec la même valeur que le H1 (cas corpus dominant).
-    idx.upsert_note_title(&note_id, "Gradatum Architecture")
+    idx.upsert_note_title("main", &note_id, "Gradatum Architecture")
         .await
         .expect("upsert_note_title");
 

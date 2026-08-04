@@ -1,0 +1,140 @@
+pub mod gradatum_engine
+pub mod gradatum_engine::config
+pub enum gradatum_engine::config::ModelKind
+pub gradatum_engine::config::ModelKind::Chat
+pub gradatum_engine::config::ModelKind::Embed
+pub enum gradatum_engine::config::RuntimeKind
+pub gradatum_engine::config::RuntimeKind::LlamaServer
+pub gradatum_engine::config::RuntimeKind::Onnx
+pub enum gradatum_engine::config::SpecType
+pub gradatum_engine::config::SpecType::DraftEagle3
+pub gradatum_engine::config::SpecType::DraftMtp
+pub gradatum_engine::config::SpecType::DraftSimple
+pub gradatum_engine::config::SpecType::NgramCache
+pub gradatum_engine::config::SpecType::NgramMapK
+pub gradatum_engine::config::SpecType::NgramMapK4v
+pub gradatum_engine::config::SpecType::NgramMod
+pub gradatum_engine::config::SpecType::NgramSimple
+pub struct gradatum_engine::config::EngineConfig
+pub gradatum_engine::config::EngineConfig::agent_id: core::option::Option<alloc::string::String>
+pub gradatum_engine::config::EngineConfig::bind_addr: core::option::Option<core::net::ip_addr::IpAddr>
+pub gradatum_engine::config::EngineConfig::body_limit_bytes: usize
+pub gradatum_engine::config::EngineConfig::child_port: u16
+pub gradatum_engine::config::EngineConfig::child_restart_max: u32
+pub gradatum_engine::config::EngineConfig::context_len: u32
+pub gradatum_engine::config::EngineConfig::draft_model_path: core::option::Option<alloc::string::String>
+pub gradatum_engine::config::EngineConfig::extra_args: alloc::vec::Vec<alloc::string::String>
+pub gradatum_engine::config::EngineConfig::gpu_layers: u32
+pub gradatum_engine::config::EngineConfig::gradatum_url: core::option::Option<alloc::string::String>
+pub gradatum_engine::config::EngineConfig::llama_server_bin: std::path::PathBuf
+pub gradatum_engine::config::EngineConfig::max_tokens: u32
+pub gradatum_engine::config::EngineConfig::metrics_port: core::option::Option<u16>
+pub gradatum_engine::config::EngineConfig::min_stable_uptime_secs: u64
+pub gradatum_engine::config::EngineConfig::mmproj_path: core::option::Option<std::path::PathBuf>
+pub gradatum_engine::config::EngineConfig::model_kind: gradatum_engine::config::ModelKind
+pub gradatum_engine::config::EngineConfig::model_path: alloc::string::String
+pub gradatum_engine::config::EngineConfig::n_threads: u32
+pub gradatum_engine::config::EngineConfig::parallel: u32
+pub gradatum_engine::config::EngineConfig::port: u16
+pub gradatum_engine::config::EngineConfig::runtime: gradatum_engine::config::RuntimeKind
+pub gradatum_engine::config::EngineConfig::spec_draft_n_max: core::option::Option<u32>
+pub gradatum_engine::config::EngineConfig::spec_draft_p_min: core::option::Option<f32>
+pub gradatum_engine::config::EngineConfig::spec_type: core::option::Option<gradatum_engine::config::SpecType>
+pub gradatum_engine::config::EngineConfig::startup_timeout_secs: u64
+pub gradatum_engine::config::EngineConfig::timeout_secs: u64
+pub gradatum_engine::config::EngineConfig::warm_up: alloc::string::String
+impl gradatum_engine::config::EngineConfig
+pub fn gradatum_engine::config::EngineConfig::from_toml(&str) -> core::result::Result<Self, toml::de::error::Error>
+pub fn gradatum_engine::config::EngineConfig::load_local(&std::path::Path) -> core::result::Result<Self, alloc::boxed::Box<figment::error::Error>>
+pub fn gradatum_engine::config::EngineConfig::model_alias(&self) -> alloc::string::String
+pub fn gradatum_engine::config::EngineConfig::provider_alias(&self) -> alloc::string::String
+pub fn gradatum_engine::config::EngineConfig::resolved_bind_addr(&self) -> core::net::ip_addr::IpAddr
+pub fn gradatum_engine::config::EngineConfig::resolved_metrics_port(&self) -> u16
+pub fn gradatum_engine::config::EngineConfig::validate(&self) -> core::result::Result<(), anyhow::Error>
+pub mod gradatum_engine::error
+pub enum gradatum_engine::error::EngineError
+pub gradatum_engine::error::EngineError::BadRequest(alloc::string::String)
+pub gradatum_engine::error::EngineError::Inference(alloc::string::String)
+pub gradatum_engine::error::EngineError::ModelLoad(alloc::string::String)
+pub gradatum_engine::error::EngineError::Oom
+pub gradatum_engine::error::EngineError::Timeout
+impl gradatum_engine::error::EngineError
+pub fn gradatum_engine::error::EngineError::kind(&self) -> &'static str
+pub fn gradatum_engine::error::EngineError::status(&self) -> u16
+pub mod gradatum_engine::health
+pub struct gradatum_engine::health::HealthSnapshot
+pub gradatum_engine::health::HealthSnapshot::backend: &'static str
+pub gradatum_engine::health::HealthSnapshot::model: alloc::string::String
+pub gradatum_engine::health::HealthSnapshot::status: &'static str
+pub gradatum_engine::health::HealthSnapshot::warm_up_state: &'static str
+pub struct gradatum_engine::health::HealthState
+impl gradatum_engine::health::HealthState
+pub fn gradatum_engine::health::HealthState::is_ready(&self) -> bool
+pub fn gradatum_engine::health::HealthState::new(&str) -> Self
+pub fn gradatum_engine::health::HealthState::set_ready(&self)
+pub fn gradatum_engine::health::HealthState::set_unhealthy(&self)
+pub fn gradatum_engine::health::HealthState::snapshot(&self) -> gradatum_engine::health::HealthSnapshot
+pub const fn gradatum_engine::health::compiled_backend() -> &'static str
+pub mod gradatum_engine::metrics
+pub struct gradatum_engine::metrics::EngineMetrics
+impl gradatum_engine::metrics::EngineMetrics
+pub fn gradatum_engine::metrics::EngineMetrics::new() -> Self
+pub fn gradatum_engine::metrics::EngineMetrics::record_event_log_error(&self, &str)
+pub fn gradatum_engine::metrics::EngineMetrics::record_request(&self, &str, u16, u64)
+pub fn gradatum_engine::metrics::EngineMetrics::render(&self) -> alloc::string::String
+impl core::default::Default for gradatum_engine::metrics::EngineMetrics
+pub fn gradatum_engine::metrics::EngineMetrics::default() -> Self
+pub struct gradatum_engine::metrics::EventLogErrLabels
+pub gradatum_engine::metrics::EventLogErrLabels::status_code: alloc::string::String
+impl prometheus_client::encoding::EncodeLabelSet for gradatum_engine::metrics::EventLogErrLabels
+pub fn gradatum_engine::metrics::EventLogErrLabels::encode(&self, prometheus_client::encoding::LabelSetEncoder<'_>) -> core::result::Result<(), core::fmt::Error>
+pub struct gradatum_engine::metrics::ReqLabels
+pub gradatum_engine::metrics::ReqLabels::route: alloc::string::String
+pub gradatum_engine::metrics::ReqLabels::status_code: alloc::string::String
+impl prometheus_client::encoding::EncodeLabelSet for gradatum_engine::metrics::ReqLabels
+pub fn gradatum_engine::metrics::ReqLabels::encode(&self, prometheus_client::encoding::LabelSetEncoder<'_>) -> core::result::Result<(), core::fmt::Error>
+pub mod gradatum_engine::runtime
+pub struct gradatum_engine::runtime::ForwardProxy
+impl gradatum_engine::runtime::ForwardProxy
+pub fn gradatum_engine::runtime::ForwardProxy::new(reqwest::async_impl::client::Client, alloc::string::String) -> Self
+pub mod gradatum_engine::server
+pub struct gradatum_engine::server::AppState
+pub gradatum_engine::server::AppState::body_limit_bytes: usize
+pub gradatum_engine::server::AppState::health: alloc::sync::Arc<gradatum_engine::health::HealthState>
+pub gradatum_engine::server::AppState::metrics: alloc::sync::Arc<gradatum_engine::metrics::EngineMetrics>
+pub gradatum_engine::server::AppState::model_name: alloc::string::String
+pub gradatum_engine::server::AppState::provider: alloc::string::String
+pub gradatum_engine::server::AppState::proxy: gradatum_engine::runtime::ForwardProxy
+pub gradatum_engine::server::AppState::sink: alloc::sync::Arc<dyn gradatum_core::event_sink::EventSink>
+pub gradatum_engine::server::AppState::timeout_secs: u64
+pub struct gradatum_engine::server::EngineServer
+impl gradatum_engine::server::EngineServer
+pub fn gradatum_engine::server::EngineServer::metrics_router(alloc::sync::Arc<gradatum_engine::metrics::EngineMetrics>) -> axum::routing::Router
+pub fn gradatum_engine::server::EngineServer::router(gradatum_engine::server::AppState) -> axum::routing::Router
+pub fn gradatum_engine::server::EngineServer::test_app_with_child(alloc::string::String, u64, usize) -> axum::routing::Router
+pub mod gradatum_engine::sink
+pub struct gradatum_engine::sink::HttpEventSink
+impl gradatum_engine::sink::HttpEventSink
+pub fn gradatum_engine::sink::HttpEventSink::new(alloc::string::String, zeroize::Zeroizing<alloc::string::String>, zeroize::Zeroizing<alloc::string::String>, core::option::Option<alloc::string::String>, alloc::sync::Arc<gradatum_engine::metrics::EngineMetrics>) -> Self
+impl gradatum_core::event_sink::EventSink for gradatum_engine::sink::HttpEventSink
+pub fn gradatum_engine::sink::HttpEventSink::emit<'life0, 'async_trait>(&'life0 self, gradatum_core::event_sink::EngineEvent) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub async fn gradatum_engine::sink::exchange_api_key_for_jwt(&zeroize::Zeroizing<alloc::string::String>, &str) -> anyhow::Result<zeroize::Zeroizing<alloc::string::String>>
+pub mod gradatum_engine::supervisor
+pub enum gradatum_engine::supervisor::ChildState
+pub gradatum_engine::supervisor::ChildState::Ready
+pub gradatum_engine::supervisor::ChildState::Starting
+pub gradatum_engine::supervisor::ChildState::StartupTimeout
+pub struct gradatum_engine::supervisor::LlamaServerSupervisor
+pub gradatum_engine::supervisor::LlamaServerSupervisor::client: reqwest::async_impl::client::Client
+impl gradatum_engine::supervisor::LlamaServerSupervisor
+pub fn gradatum_engine::supervisor::LlamaServerSupervisor::child_base_url(&self) -> alloc::string::String
+pub fn gradatum_engine::supervisor::LlamaServerSupervisor::new(gradatum_engine::config::EngineConfig) -> core::result::Result<alloc::sync::Arc<Self>, gradatum_engine::error::EngineError>
+pub async fn gradatum_engine::supervisor::LlamaServerSupervisor::shutdown(&self)
+pub async fn gradatum_engine::supervisor::LlamaServerSupervisor::spawn_child(&self) -> core::result::Result<(), gradatum_engine::error::EngineError>
+pub async fn gradatum_engine::supervisor::LlamaServerSupervisor::supervise_loop(alloc::sync::Arc<Self>, alloc::sync::Arc<gradatum_engine::health::HealthState>, core::option::Option<std::time::Instant>)
+pub async fn gradatum_engine::supervisor::LlamaServerSupervisor::wait_ready(&self, &gradatum_engine::health::HealthState) -> gradatum_engine::supervisor::ChildState
+pub fn gradatum_engine::supervisor::canonicalize_bin_path(&std::path::Path) -> core::result::Result<std::path::PathBuf, gradatum_engine::error::EngineError>
+pub fn gradatum_engine::supervisor::inject_allowed_env(&mut tokio::process::Command)
+pub fn gradatum_engine::supervisor::validate_bin_path(&std::path::Path) -> core::result::Result<(), gradatum_engine::error::EngineError>
+pub fn gradatum_engine::supervisor::validate_extra_args(&[alloc::string::String]) -> core::result::Result<(), gradatum_engine::error::EngineError>
+pub const gradatum_engine::VERSION: &str

@@ -80,7 +80,9 @@
 //! the fixed-before-parametric ordering rule.
 
 pub mod code_scope;
+pub mod compact;
 pub mod dashboard;
+pub mod delete;
 pub mod dto;
 pub mod event_log;
 pub mod forget;
@@ -169,6 +171,16 @@ pub fn router() -> Router<AppState> {
         )
         .route("/vault/forgotten", get(forget::vault_forgotten_list))
         .route("/vault/unforgot/{ulid}", post(forget::vault_unforgot))
+        // ── F-100 incrément 1.6 — listing archives LECTURE SEULE (read-only) ──
+        //
+        // Le delete/restore/purge (mutations) N'existent PAS sur le routeur public :
+        // ils vivent uniquement dans le namespace interne loopback (CLI opérateur).
+        // Seul le listing des archives est exposé ici (l'agent/opérateur PRÉPARE ses
+        // commandes CLI). Body limit 4 KiB : payload nominal < 512 o (filtres + cursor).
+        .route(
+            "/vault_archives_list",
+            post(handlers::vault_archives_list).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         // ── F-60 Lesson Recall (v0.4.4) — GET fixe, BM25-only, aucun LLM ─────
         .route("/lessons/recall", get(lessons::lessons_recall))
         // ── F-46 Proactive Recall (v0.7.1) — POST fixe, in-process B' ─────────
@@ -207,6 +219,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/project-map/export-features",
             get(project_map::export_features),
+        )
+        // ── Création de carte-feature à numéro serveur — POST fixe, auth Write ──
+        //
+        // Le serveur alloue le `F-XX`, l'injecte, et enqueue la carte (le client ne fournit
+        // jamais le numéro). Route entièrement fixe (fixed-before-parametric). POST mutant.
+        .route(
+            "/project-map/create-feature",
+            post(project_map::create_feature),
         )
         // ── F-37 S1.3 Dashboard (v0.4.6) — GET fixe, auth Read ───────────────
         .route("/dashboard", get(dashboard::dashboard))

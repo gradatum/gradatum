@@ -308,7 +308,7 @@ async fn cow_history_not_indexed_in_sqlite() {
 
     // L'index ne contient que 1 note (la version courante, pas le snapshot).
     // On vérifie via get_content_hash : la note id est présente dans l'index.
-    let stored_hash = vault.index().get_content_hash(id).await.unwrap();
+    let stored_hash = vault.index().get_content_hash("main", id).await.unwrap();
     assert!(
         stored_hash.is_some(),
         "la note courante doit être présente dans l'index"

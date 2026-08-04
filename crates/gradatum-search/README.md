@@ -2,7 +2,7 @@
 
 > Hybrid search orchestration: BM25 full-text (SQLite FTS5), semantic vector (cosine), cross-encoder reranking, and RRF fusion.
 
-**Status**: 0.7.6 — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -17,8 +17,9 @@ two complementary signals and fuses them with Reciprocal Rank Fusion:
 - **Cross-encoder reranker** — optional ONNX-backed reranker for precision re-scoring of
   the top-N fusion results.
 
-The crate also re-exports `SqliteIndex` (from `gradatum-index`) together with the
-associated query types: `AuthorRow`, `Lineage`, `NoteRecord`, `SearchHitRaw`.
+The crate exposes RRF fusion, multi-factor scoring and the reranker abstraction only.
+Index query types (`SqliteIndex`, `AuthorRow`, `Lineage`, `NoteRecord`, `SearchHitRaw`) are
+**not** re-exported here — depend on `gradatum-index` directly for those.
 
 **Recency signal**: the `recency_factor` in composite scoring uses `anchor_ms`
 from the temporal index as the decay reference (exponential decay applied at the RRF layer).
@@ -30,7 +31,7 @@ paths.
 
 ```toml
 [dependencies]
-gradatum-search = "0.7.6"
+gradatum-search = "1.0.0"
 ```
 
 ```rust

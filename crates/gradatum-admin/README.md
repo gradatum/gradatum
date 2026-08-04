@@ -2,7 +2,7 @@
 
 > Operator CLI for gradatum: init, token, api-key, backfill, jobs, vault rename/forget.
 
-**Status**: Alpha (v0.7.6) — internal (not published to crates.io). API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -21,7 +21,11 @@ gradatum-admin init --preset hierarchical --root /var/lib/gradatum
 gradatum-admin init --root /var/lib/gradatum --force   # re-init
 ```
 
-Generates: Ed25519 keypair, admin bearer token, `server.toml`, SQLite queue, ACL preset.
+Generates: the admin bearer token, `server.toml`, the ACL preset, and the SQLite
+databases (`queue`, `revocation`, `api_keys`).
+
+`init` does **not** create the JWT signing key: `gradatum-server` generates
+`config/jwt-signing-key.secret` at first boot and is its sole owner.
 
 ### token
 
@@ -36,11 +40,18 @@ gradatum-admin token issue --root /var/lib/gradatum --sub mcp-stub --scopes vaul
 Create and manage API keys for consumers.
 
 ```bash
-gradatum-admin api-key create --root /var/lib/gradatum --owner agent-1
+gradatum-admin api-key create --root /var/lib/gradatum --owner agent-1 --scopes write
+gradatum-admin api-key create --root /var/lib/gradatum --owner reader-1 --scopes vault_read --read-only
 gradatum-admin api-key list   --root /var/lib/gradatum
 gradatum-admin api-key revoke --root /var/lib/gradatum --prefix ak_abcdef01
 gradatum-admin api-key rotate --root /var/lib/gradatum --prefix ak_abcdef01
 ```
+
+Write access is granted only by the scopes `write`, `admin` and `service`. `create`
+refuses any other scope set unless `--read-only` is passed, so it never mints a key
+whose scopes promise write access the key does not have. The check runs on `create`
+only: `rotate` reuses the source key's scopes as-is without revalidating them, and
+keys already in the store are left untouched.
 
 ### backfill-embeddings
 

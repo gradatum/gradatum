@@ -146,7 +146,7 @@ async fn seed_live_note(fixture: &helpers::DispatcherFixture, title: &str, body:
     // Upsert du titre pour le fallback title_lookup (rétrocompat).
     fixture
         .index
-        .upsert_note_title(&note.id, title)
+        .upsert_note_title(note.frontmatter.vault_id.as_str(), &note.id, title)
         .await
         .expect("upsert_note_title seed note");
     note.id.to_string()

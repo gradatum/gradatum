@@ -84,10 +84,10 @@ use gradatum_curator::routing::heuristic_route;
 struct DatasetNote {
     path: String,
     title: String,
-    /// Section legacy — dans les datasets produits par le classifieur Z.2, ce champ
-    /// s'appelle `vault_mem_section`. L'alias `legacy_section_hint` couvre une variante
-    /// ancienne. Non utilisé dans les métriques, conservé pour traçabilité.
-    #[serde(alias = "legacy_section_hint", alias = "vault_mem_section")]
+    /// Section legacy issue des datasets produits par le classifieur Z.2, portée par
+    /// la clé `legacy_section_hint`. Non utilisée dans les métriques, conservée pour
+    /// traçabilité.
+    #[serde(alias = "legacy_section_hint")]
     legacy_section: String,
     /// Body (500 chars max) — présent depuis le fix Z.2d (merger avec source JSONL).
     body_preview: String,

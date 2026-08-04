@@ -54,7 +54,7 @@ describe('useAuth — login', () => {
   });
 
   it('stocke le JWT en localStorage pour persistence (W4 livrable-1 — relâchement délibéré tracé)', async () => {
-    // W4: Decision SecurityAuditor Option 1 — JWT moves from sessionStorage to localStorage (TTL 24h JWT)
+    // JWT stocké en localStorage (et non sessionStorage) : TTL 24 h, survit au rechargement d'onglet.
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,

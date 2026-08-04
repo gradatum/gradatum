@@ -2,7 +2,7 @@
 
 > Async queue consumer — processes curator and embedding jobs from the SQLite Apalis queue.
 
-**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -63,10 +63,13 @@ gradatum-worker --config /etc/gradatum/server.toml
 
 ## Configuration (TOML, shared with gradatum-server)
 
+Per-job-kind worker settings live under `[apalis.workers.<kind>]`:
+
 ```toml
-[worker]
-concurrency = 4
-lease_timeout_ms = 300000
+[apalis.workers.curate]
+concurrency = 4      # default 2
+timeout_secs = 300   # default 30
+max_retries = 3      # default 3
 ```
 
 ## License

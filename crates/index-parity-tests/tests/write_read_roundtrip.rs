@@ -49,7 +49,7 @@ async fn content_hash_roundtrips() {
     idx.write_note(&note).await.expect("write_note");
 
     let stored = idx
-        .get_content_hash(id)
+        .get_content_hash("main", id)
         .await
         .expect("get_content_hash")
         .expect("hash présent");
@@ -78,7 +78,7 @@ async fn get_note_absent_returns_none() {
     );
 
     let hash = idx
-        .get_content_hash(absent)
+        .get_content_hash("main", absent)
         .await
         .expect("get_content_hash absent");
     assert!(hash.is_none(), "hash absent → None");

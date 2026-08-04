@@ -44,7 +44,7 @@ const GROUP_ORDER = ['usage', 'context', 'server', 'write'];
 const REFRESH_MS = 60_000;
 
 // ── ChartBlock — fetch timeseries + rendu pour un ChartSpec ──────────────────
-// P2-B (Auditeur) : affiche `error` en état distinct AVANT le check xs.length===0.
+// Affiche `error` en état distinct AVANT le check xs.length===0 : un état d'erreur ne doit pas être masqué par l'absence de données.
 // P2-A : pas de refreshMs — la fenêtre glissante est pilotée par le parent.
 
 function ChartBlock({
@@ -81,7 +81,7 @@ function ChartBlock({
 }
 
 // ── MetricsSection — catalog + range selector + groupes accordéon ─────────────
-// P2-A (Auditeur) : tick parent pilote le refresh → fenêtre glissante réelle.
+// Le tick parent pilote le refresh → fenêtre glissante réelle.
 
 function MetricsSection() {
   const { catalog, loading, error } = useMetricsCatalog();

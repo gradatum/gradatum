@@ -32,11 +32,12 @@
 //!
 //! ## Circuit breaker `Chat` (legacy)
 //!
-//! [`circuit_breaker::CircuitBreakerChat`] wrapping `Chat` — used by `gradatum-curator`.
+//! [`circuit_breaker::CircuitBreakerChat`] wrapping `Chat` — legacy, not wired in `1.0.0`
+//! (no construction site outside this crate).
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantees.
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible additions only within `1.x`.
 //! See [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 
 #![forbid(unsafe_code)]

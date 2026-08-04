@@ -28,7 +28,7 @@ async fn seed_note_with_emb(idx: &SqliteIndex, note_id_str: &str, emb: &[f32]) {
     idx.seed_note(note_id_str, "decisions", "corps de test")
         .await
         .expect("seed_note");
-    idx.insert_note_embedding(&note_id, "bge-m3", emb.len() as u16, emb)
+    idx.insert_note_embedding("main", &note_id, "bge-m3", emb.len() as u16, emb)
         .await
         .expect("insert_note_embedding");
 }
@@ -64,7 +64,15 @@ async fn test_ann_brute_force_default() {
 
     let query = axis_vec(dim, 0); // cosine 1.0 avec note 1, 0.0 avec note 2
     let results = idx
-        .search_semantic("main", "bge-m3", &query, 2, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "bge-m3",
+            &query,
+            2,
+            None,
+        )
         .await
         .expect("search_semantic brute-force doit réussir");
 
@@ -118,7 +126,15 @@ async fn test_ann_fallback_brute_force_when_extension_absent() {
     // Le résultat doit être non-vide (les embeddings sont dans note_embeddings, accessible
     // sans extension).
     let results = idx
-        .search_semantic("main", "bge-m3", &query, 2, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "bge-m3",
+            &query,
+            2,
+            None,
+        )
         .await
         .expect("search_semantic doit réussir même avec ann_enabled=true et extension absente");
 
@@ -158,7 +174,15 @@ async fn test_ann_disable_reverts_to_brute_force() {
 
     let query = axis_vec(dim, 0);
     let results = idx
-        .search_semantic("main", "bge-m3", &query, 1, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "bge-m3",
+            &query,
+            1,
+            None,
+        )
         .await
         .expect("search_semantic doit réussir avec ann_enabled=false");
 
@@ -274,7 +298,15 @@ async fn test_ann_routes_to_sqlite_vec_when_extension_loaded() {
     // Requête ANN.
     let query = axis_vec(dim, 0);
     let results = idx
-        .search_semantic("main", "bge-m3", &query, 1, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "bge-m3",
+            &query,
+            1,
+            None,
+        )
         .await
         .expect("search_semantic ANN");
 

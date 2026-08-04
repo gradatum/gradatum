@@ -2,7 +2,7 @@
 
 > `Chat` and `LlmBackend` traits with heuristic, HTTP, and no-op backends, plus a circuit-breaker decorator.
 
-**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -18,8 +18,9 @@ It exposes two trait levels:
 | `HttpChat` | Yes | Any OpenAI-compatible `/v1/chat/completions` endpoint |
 | `Noop` | None | Returns a fixed verdict — tests and disabled-LLM configurations |
 
-`CircuitBreakerChat` wraps any `Chat` backend with automatic fallback to the heuristic
-on consecutive failures.
+`CircuitBreakerChat` wraps any `Chat` backend and fails fast with `ChatError::CircuitOpen`
+for the cooldown window once the consecutive-failure threshold is reached — the caller
+chooses the fallback.
 
 **`LlmBackend` trait** (low-level, prompt-oriented)
 
@@ -39,7 +40,7 @@ and transparent fallback to `HeuristicBackend` on consecutive failures.
 
 ```toml
 [dependencies]
-gradatum-chat = "0.7.6"
+gradatum-chat = "1.0.0"
 ```
 
 ## License

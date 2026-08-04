@@ -12,7 +12,6 @@ use std::time::Instant;
 
 use gradatum_acl_policy::{AclDecision, AclOp};
 use gradatum_core::error::GradatumError;
-use gradatum_core::scope::VaultId;
 use gradatum_core::trust::TrustContext;
 use gradatum_dto::{
     ProactiveHit, ProactiveRecallFeedbackRequest, ProactiveRecallRequest, ProactiveRecallResponse,
@@ -23,6 +22,7 @@ use crate::api_v1::logic::{locus_for_section, locus_for_tenant};
 use crate::api_v1::tenant_guard::effective_tenant;
 use crate::context::retrieval::retrieve_candidates;
 use crate::metrics::ProactiveRecallModeLabel;
+use crate::note_usage_store::{KIND_RECALL_ACCEPTED, KIND_RECALL_SURFACED};
 use crate::state::AppState;
 
 pub mod refresh;
@@ -129,13 +129,13 @@ const MAX_ACCEPTED_ULIDS: usize = 64;
 /// `decisions`). Au pull, un appelant dont les `read_patterns` n'autorisent pas une
 /// section recevrait des notes cachées = **bypass ACL**. On applique donc, **dans les
 /// deux modes**, un re-filtrage par section réutilisant le predicate exact de
-/// `vault_context` (`acl.evaluate(Read, {tenant}/{section})`) — voir [`section_readable`].
+/// `vault_context` (`acl.evaluate(Read, {tenant}/{section})`) — voir `section_readable`.
 /// La liste `surfaced` enregistrée en session est la liste **POST-filtrage ACL**
 /// (consistency with the `accepted ⊆ surfaced` validation).
 ///
 /// ## Tenant
 ///
-/// Le tenant effectif est dérivé du JWT ([`effective_tenant`]) — le `req.tenant_id`
+/// Le tenant effectif est dérivé du JWT (`effective_tenant`) — le `req.tenant_id`
 /// du body est seulement vérifié pour cohérence (divergence → `Forbidden`). Le gate
 /// de base ACL porte sur `{tenant}/main`, comme `vault_authors`/`vault_tags`.
 ///
@@ -168,7 +168,7 @@ pub async fn proactive_recall(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
     if state
@@ -226,7 +226,7 @@ pub async fn proactive_recall(
             .map_err(|e| GradatumError::Storage(format!("proactive_recall insert_session: {e}")))?;
     } else {
         tracing::warn!(
-            "proactive_recall: proactive_recall store absent (None) — session non persistée"
+            "proactive_recall: proactive_recall store absent (None) — session not persisted"
         );
     }
 
@@ -236,6 +236,15 @@ pub async fn proactive_recall(
         .proactive_recall_duration
         .get_or_create(&mode_label)
         .observe(start.elapsed().as_secs_f64());
+
+    // F-110 : télémétrie salience per-note — +recall-surfaced par note surfacée
+    // (POST-filtrage ACL, `surfaced`), best-effort. Signal moyen (présentation, pas
+    // acceptation). `record()` ne panique/propage jamais.
+    for note_id in &surfaced {
+        state
+            .note_usage_accumulators
+            .record(&tenant, note_id, KIND_RECALL_SURFACED, now_ms);
+    }
 
     Ok(ProactiveRecallResponse {
         recall_id,
@@ -263,7 +272,7 @@ pub async fn proactive_recall(
 /// ## Validation (ordre)
 ///
 /// 1. ACL/tenant (ci-dessus).
-/// 2. Safety cap : `accepted_ulids.len()` ≤ [`MAX_ACCEPTED_ULIDS`] — sinon `InvalidInput`
+/// 2. Safety cap : `accepted_ulids.len()` ≤ `MAX_ACCEPTED_ULIDS` — sinon `InvalidInput`
 ///    (400), AVANT toute lecture SQL (anti-DoS).
 /// 3. `recall_id` existe **dans le tenant effectif** ([`crate::proactive_recall_store::ProactiveRecallStore::get_surfaced`])
 ///    — sinon `InvalidInput` (400). Le filtre tenant interdit le feedback cross-tenant (IDOR).
@@ -295,7 +304,7 @@ pub async fn proactive_recall_feedback(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
     if state
@@ -311,7 +320,7 @@ pub async fn proactive_recall_feedback(
     // doit pas déclencher d'allocation/parse proportionnels à sa taille.
     if req.accepted_ulids.len() > MAX_ACCEPTED_ULIDS {
         return Err(GradatumError::InvalidInput(format!(
-            "trop d'accepted_ulids ({} > {MAX_ACCEPTED_ULIDS})",
+            "too many accepted_ulids ({} > {MAX_ACCEPTED_ULIDS})",
             req.accepted_ulids.len()
         )));
     }
@@ -319,7 +328,7 @@ pub async fn proactive_recall_feedback(
     // ── Store présent ? Absent → recall_id introuvable (400) ───────────────────
     let Some(store) = state.proactive_recall.as_ref() else {
         return Err(GradatumError::InvalidInput(
-            "proactive_recall store indisponible — recall_id introuvable".into(),
+            "proactive_recall store unavailable — recall_id not found".into(),
         ));
     };
 
@@ -331,17 +340,17 @@ pub async fn proactive_recall_feedback(
             GradatumError::Storage(format!("proactive_recall_feedback get_surfaced: {e}"))
         })?
         .ok_or_else(|| {
-            GradatumError::InvalidInput(format!("recall_id inconnu : {}", req.recall_id))
+            GradatumError::InvalidInput(format!("unknown recall_id: {}", req.recall_id))
         })?;
 
     // ── Parse ULID + invariant `accepted ⊆ surfaced` ──────────────────────────
     let surfaced_set: HashSet<&str> = surfaced.iter().map(String::as_str).collect();
     for ulid in &req.accepted_ulids {
         Ulid::from_string(ulid)
-            .map_err(|_| GradatumError::InvalidInput(format!("ULID accepté mal formé : {ulid}")))?;
+            .map_err(|_| GradatumError::InvalidInput(format!("malformed accepted ULID: {ulid}")))?;
         if !surfaced_set.contains(ulid.as_str()) {
             return Err(GradatumError::InvalidInput(format!(
-                "ULID accepté hors surface présentée (accepted ⊄ surfaced) : {ulid}"
+                "accepted ULID outside the presented surface (accepted ⊄ surfaced): {ulid}"
             )));
         }
     }
@@ -361,6 +370,15 @@ pub async fn proactive_recall_feedback(
         .proactive_accepted
         .inc_by(req.accepted_ulids.len() as u64);
 
+    // F-110 : télémétrie salience per-note — +recall-accepted par ULID validé
+    // (⊆ surfaced, garde ci-dessus qui passe AVANT). APRÈS record_feedback réussi,
+    // best-effort. Signal fort (acceptation explicite F-46).
+    for ulid in &req.accepted_ulids {
+        state
+            .note_usage_accumulators
+            .record(&tenant, ulid, KIND_RECALL_ACCEPTED, now_ms);
+    }
+
     Ok(())
 }
 
@@ -373,7 +391,7 @@ pub async fn proactive_recall_feedback(
 /// [`GradatumError::Storage`] sur échec SQL de `get_surface`.
 async fn read_surface(state: &AppState, tenant: &str) -> Result<Vec<ProactiveHit>, GradatumError> {
     let Some(store) = state.proactive_surface.as_ref() else {
-        tracing::debug!("proactive_recall: proactive_surface store absent (None) — surface vide");
+        tracing::debug!("proactive_recall: proactive_surface store absent (None) — empty surface");
         return Ok(Vec::new());
     };
     let surface = store
@@ -400,7 +418,7 @@ async fn contextual_hits(
     sections: Option<&[String]>,
     limit: usize,
 ) -> Result<Vec<ProactiveHit>, GradatumError> {
-    let vault_id = VaultId::new(tenant);
+    let vault_id = crate::api_v1::tenant_guard::own_vault_checked(tenant);
     // `Option<&[String]>` → `Option<Vec<&str>>` pour la signature de retrieve_candidates.
     let sections_owned: Option<Vec<&str>> =
         sections.map(|s| s.iter().map(String::as_str).collect());
@@ -433,7 +451,7 @@ async fn contextual_hits(
     // Hydratation titre + section par batch (anti-N+1, comme proactive_refresh_once).
     let meta = state
         .search
-        .get_titles_sections(vault_id.as_str(), &candidate_ids)
+        .get_titles_sections(&vault_id, &candidate_ids)
         .await?;
 
     // `snippet` vide en Task 10 (le corps n'est pas chargé ici — parité avec Task 8).

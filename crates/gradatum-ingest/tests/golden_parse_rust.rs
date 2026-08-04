@@ -1048,30 +1048,27 @@ fn free_function_caller_unchanged() {
     );
 }
 
-// ── P2-1 : method_call_expression — documentation des limites + cas résolvable ─
+// ── F-70 (v0.8.0) : résolution qualifiée des appels de méthode ──────────────
 //
-// Contexte : `code_scope_reverse_deps_batch` cherche par `qualified_name` exact
-// (`Type::method`). Pour `method_call_expression`, seul le terminal est stocké
-// (`"method"`), ce qui ne matche pas `"Type::method"` dans reverse-deps.
+// Contexte : `code_scope_reverse_deps` cherche par `qualified_name` exact
+// (`Type::method`). Avant F-70, `self.method()` ne stockait que le terminal
+// (`"method"`), aveugle à `reverse_deps("Type::method")`.
 //
-// Le type du receiver n'est pas résolvable syntaxiquement sans analyse sémantique :
-// - `self.method()` : receiver = `self` keyword → type = Type de l'impl courant (inconnu)
-// - `instance.method()` : receiver = identifier → type inconnu
-// - `self.field.method()` : receiver = field_expression → type inconnu
-// Ces cas requièrent une résolution de type complète (dette connue, hors scope).
+// F-70 tâche 4.1 : le type de `self` EST connu syntaxiquement — c'est le type du
+// bloc impl courant (déjà calculé par le parser). `self.parse()` dans `impl Parser`
+// résout donc `Parser::parse` (terminal `parse` conservé EN PLUS).
+// F-70 tâche 4.3 (précision > rappel) : les receivers non résolvables
+// syntaxiquement (chaînage, inférence) retombent sur le terminal seul — jamais
+// de faux positif dans le graphe inverse.
 //
-// Cas résolvable syntaxiquement sans analyse sémantique :
-// `scoped_identifier` dans le receiver d'un `method_call_expression` est très rare
-// en Rust idiomatique (nécessite `<Type as Trait>::method(self)` via call_expression).
-//
-// Ce fix (P2-1 code-only) documente honnêtement les limites et renforce l'extraction
-// des méthodes via `method_call_expression` : le terminal est toujours émis, et les
-// cas avec receiver `self` n'inventent PAS de qualified_name.
+// NOTE : ce bloc de tests remplace l'ancien invariant P2-1 « self n'invente jamais
+// de qualified_name », délibérément superseded par 4.1 : le type de self n'est PAS
+// inventé, il est lu du bloc impl.
 
-/// Snippet : appels de méthode via `method_call_expression`.
+/// Snippet : appels de méthode via `field_expression` (grammaire 0.24.2).
 ///
-/// - `self.parse()` : receiver `self` → seul le terminal `"parse"` stocké.
-/// - `input.split("x")` : méthode stdlib → filtrée (STDLIB_NOISE_METHODS).
+/// - `self.parse()` : receiver `self` → terminal `"parse"` ET qualifié `"Parser::parse"` (F-70).
+/// - `process("x")` : appel de fonction libre → terminal `"process"`.
 const SNIPPET_METHOD_CALL_LIMITS: &str = r#"
 pub struct Parser {
     input: String,
@@ -1124,13 +1121,14 @@ fn method_call_terminal_is_emitted() {
     );
 }
 
-/// `method_call_self_receiver_no_invented_qualified` :
-/// `self.parse()` → ne doit PAS produire `"Parser::parse"` (type de `self` non résolvable).
+/// `method_call_self_receiver_resolves_qualified` (F-70 tâche 4.1) :
+/// `self.parse()` dans `impl Parser` DOIT produire `"Parser::parse"` — le type de
+/// `self` est celui du bloc impl courant (résolution syntaxique, pas d'invention).
 ///
-/// Invariant : on n'invente pas de qualified_name quand le type n'est pas résolvable.
-/// Un faux-positif `"Parser::parse"` dans reverse-deps serait pire qu'une absence.
+/// Remplace l'ancien invariant P2-1 (« self n'invente jamais de qualified_name »),
+/// délibérément superseded : le terminal `"parse"` reste présent EN PLUS.
 #[test]
-fn method_call_self_receiver_no_invented_qualified() {
+fn method_call_self_receiver_resolves_qualified() {
     let symbols = parse_rust_file("src/method_limits.rs", SNIPPET_METHOD_CALL_LIMITS, true)
         .expect("parse ok");
 
@@ -1140,9 +1138,324 @@ fn method_call_self_receiver_no_invented_qualified() {
         .expect("Parser::run doit être extrait");
 
     assert!(
-        !run.deps.contains(&"Parser::parse".to_string()),
-        "self.parse() ne doit PAS produire 'Parser::parse' (type de self inconnu \
-         syntaxiquement — faux-positif interdit). deps={:?}",
+        run.deps.contains(&"Parser::parse".to_string()),
+        "self.parse() dans impl Parser DOIT produire 'Parser::parse' (F-70 4.1). deps={:?}",
         run.deps
+    );
+    assert!(
+        run.deps.contains(&"parse".to_string()),
+        "le terminal 'parse' doit rester présent EN PLUS du qualifié. deps={:?}",
+        run.deps
+    );
+}
+
+// ── F-70 (v0.8.0) : résolution qualifiée self + bindings typés ──────────────
+//
+// Tâche 4.1 : `self.method()` → `Type::method` (type du bloc impl).
+// Tâche 4.2 : bindings locaux typés (`let x: T`, params typés) → `T::method`.
+// Tâche 4.3 : précision > rappel — receiver non résolvable → terminal seul.
+
+/// Snippet couvrant self, binding `let` typé, param typé, inférence, chaînage.
+const SNIPPET_F70_QUALIFIED: &str = r#"
+pub struct SqliteIndex {
+    n: u32,
+}
+
+fn make() -> SqliteIndex {
+    SqliteIndex { n: 0 }
+}
+
+impl SqliteIndex {
+    /// self.upsert() → SqliteIndex::upsert (tâche 4.1).
+    pub fn run(&self) -> u32 {
+        self.upsert()
+    }
+
+    /// self.clone() → filtré (STDLIB_NOISE_METHODS) : ni terminal ni qualifié.
+    pub fn dup(&self) -> SqliteIndex {
+        self.clone()
+    }
+
+    pub fn upsert(&self) -> u32 {
+        1
+    }
+
+    pub fn begin(&self) -> SqliteIndex {
+        make()
+    }
+}
+
+/// let s: SqliteIndex → s.upsert() = SqliteIndex::upsert (tâche 4.2).
+pub fn binding_caller() -> u32 {
+    let s: SqliteIndex = make();
+    s.upsert()
+}
+
+/// param typé store: SqliteIndex → store.upsert() = SqliteIndex::upsert (tâche 4.2).
+pub fn param_caller(store: SqliteIndex) -> u32 {
+    store.upsert()
+}
+
+/// let s = make() (inférence) → s.upsert() = terminal seul, PAS de qualifié (tâche 4.3).
+pub fn infer_caller() -> u32 {
+    let s = make();
+    s.upsert()
+}
+
+/// chaînage store.begin().upsert() : begin résolu (receiver = store typé),
+/// upsert NON résolu (receiver = call_expression) → terminal seul (tâche 4.3).
+pub fn chain_caller(store: SqliteIndex) -> u32 {
+    store.begin().upsert()
+}
+"#;
+
+/// Helper : récupère les deps d'un symbole par qualified_name.
+fn deps_of<'a>(symbols: &'a [gradatum_ingest::DerivedSymbol], qname: &str) -> &'a [String] {
+    symbols
+        .iter()
+        .find(|s| s.qualified_name == qname)
+        .unwrap_or_else(|| {
+            let all: Vec<&str> = symbols.iter().map(|s| s.qualified_name.as_str()).collect();
+            panic!("symbole '{qname}' absent. présents : {all:?}");
+        })
+        .deps
+        .as_slice()
+}
+
+/// Tâche 4.1 : `self.upsert()` → deps contient `"upsert"` ET `"SqliteIndex::upsert"`.
+#[test]
+fn f70_self_call_resolved_to_impl_type() {
+    let symbols = parse_rust_file("src/idx.rs", SNIPPET_F70_QUALIFIED, true).expect("parse ok");
+    let deps = deps_of(&symbols, "SqliteIndex::run");
+    assert!(
+        deps.contains(&"upsert".to_string()),
+        "terminal 'upsert' attendu. deps={deps:?}"
+    );
+    assert!(
+        deps.contains(&"SqliteIndex::upsert".to_string()),
+        "qualifié 'SqliteIndex::upsert' attendu (self résolu). deps={deps:?}"
+    );
+}
+
+/// Tâche 4.2 : `let s: SqliteIndex; s.upsert()` → `"SqliteIndex::upsert"`.
+#[test]
+fn f70_typed_let_binding_resolved() {
+    let symbols = parse_rust_file("src/idx.rs", SNIPPET_F70_QUALIFIED, true).expect("parse ok");
+    let deps = deps_of(&symbols, "binding_caller");
+    assert!(
+        deps.contains(&"upsert".to_string()),
+        "terminal 'upsert' attendu. deps={deps:?}"
+    );
+    assert!(
+        deps.contains(&"SqliteIndex::upsert".to_string()),
+        "qualifié 'SqliteIndex::upsert' attendu (binding typé). deps={deps:?}"
+    );
+}
+
+/// Tâche 4.2 : param typé `store: SqliteIndex` → `store.upsert()` = `"SqliteIndex::upsert"`.
+#[test]
+fn f70_typed_param_resolved() {
+    let symbols = parse_rust_file("src/idx.rs", SNIPPET_F70_QUALIFIED, true).expect("parse ok");
+    let deps = deps_of(&symbols, "param_caller");
+    assert!(
+        deps.contains(&"SqliteIndex::upsert".to_string()),
+        "qualifié 'SqliteIndex::upsert' attendu (param typé). deps={deps:?}"
+    );
+}
+
+/// Tâche 4.3 : `let s = make()` (inférence) → terminal seul, ZÉRO faux positif.
+#[test]
+fn f70_inferred_binding_not_resolved() {
+    let symbols = parse_rust_file("src/idx.rs", SNIPPET_F70_QUALIFIED, true).expect("parse ok");
+    let deps = deps_of(&symbols, "infer_caller");
+    assert!(
+        deps.contains(&"upsert".to_string()),
+        "terminal 'upsert' attendu. deps={deps:?}"
+    );
+    assert!(
+        !deps.contains(&"SqliteIndex::upsert".to_string()),
+        "type inféré non explicite → PAS de qualifié (précision > rappel). deps={deps:?}"
+    );
+}
+
+/// Tâche 4.3 : chaînage `store.begin().upsert()` — receiver de `upsert` = call_expression
+/// (non un identifier simple) → terminal seul, PAS de qualifié (zéro faux positif).
+#[test]
+fn f70_chained_receiver_not_resolved() {
+    let symbols = parse_rust_file("src/idx.rs", SNIPPET_F70_QUALIFIED, true).expect("parse ok");
+    let deps = deps_of(&symbols, "chain_caller");
+    // upsert : receiver = call_expression (store.begin()) → non résolu, terminal seul.
+    assert!(
+        deps.contains(&"upsert".to_string()),
+        "terminal 'upsert' attendu. deps={deps:?}"
+    );
+    assert!(
+        !deps.contains(&"SqliteIndex::upsert".to_string()),
+        "receiver chaîné (call_expression) non résolvable → PAS de qualifié. deps={deps:?}"
+    );
+}
+
+/// Tâche 4.3 / filtre stdlib : `self.clone()` → ni `"clone"` ni `"SqliteIndex::clone"`.
+#[test]
+fn f70_self_stdlib_method_still_filtered() {
+    let symbols = parse_rust_file("src/idx.rs", SNIPPET_F70_QUALIFIED, true).expect("parse ok");
+    let deps = deps_of(&symbols, "SqliteIndex::dup");
+    assert!(
+        !deps.contains(&"clone".to_string()),
+        "terminal stdlib 'clone' doit rester filtré. deps={deps:?}"
+    );
+    assert!(
+        !deps.contains(&"SqliteIndex::clone".to_string()),
+        "self.clone() ne doit PAS produire 'SqliteIndex::clone' (filtre stdlib). deps={deps:?}"
+    );
+}
+
+/// Non-régression : `A::b()` (scoped_identifier) stocke toujours les DEUX formes.
+#[test]
+fn f70_scoped_call_still_stores_both_forms() {
+    const S: &str = r#"
+pub struct Token;
+impl Token {
+    pub fn new() -> Token { Token }
+}
+pub fn caller() -> Token {
+    Token::new()
+}
+"#;
+    let symbols = parse_rust_file("src/tok.rs", S, true).expect("parse ok");
+    let deps = deps_of(&symbols, "caller");
+    assert!(
+        deps.contains(&"new".to_string()),
+        "terminal 'new' attendu (non-régression Axe C). deps={deps:?}"
+    );
+    assert!(
+        deps.contains(&"Token::new".to_string()),
+        "qualifié 'Token::new' attendu (non-régression Axe C). deps={deps:?}"
+    );
+}
+
+// ── F-70 audit post-mortem : fixes precision-first C1 + R1 ──────────────────
+
+/// C1 (P1) : rebind explicite→inféré du même nom. `fn transform(x: Foo){ let x = make_bar();
+/// x.run() }` — le type réel de `x` au point d'appel est `Bar`, PAS `Foo`. Un binding inféré
+/// du même nom doit RETIRER le type précédent (rebind = drop). Assert : ABSENCE de `Foo::run`.
+#[test]
+fn f70_c1_reinferred_shadow_drops_typed() {
+    const S: &str = r#"
+pub struct Foo;
+pub struct Bar;
+impl Foo { pub fn run(&self) -> u32 { 0 } }
+impl Bar { pub fn run(&self) -> u32 { 1 } }
+fn make_bar() -> Bar { Bar }
+pub fn transform(x: Foo) -> u32 {
+    let x = make_bar();
+    x.run()
+}
+"#;
+    let symbols = parse_rust_file("src/shadow.rs", S, true).expect("parse ok");
+    let deps = deps_of(&symbols, "transform");
+    assert!(
+        deps.contains(&"run".to_string()),
+        "terminal 'run' attendu. deps={deps:?}"
+    );
+    assert!(
+        !deps.contains(&"Foo::run".to_string()),
+        "rebind inféré `let x = make_bar()` masque le param `x: Foo` → PAS de 'Foo::run' \
+         (faux positif prouve par la revue de code). deps={deps:?}"
+    );
+    assert!(
+        !deps.contains(&"Bar::run".to_string()),
+        "type du rebind non explicite (inféré) → PAS de 'Bar::run' non plus. deps={deps:?}"
+    );
+}
+
+/// R1 (P2) : types conteneurs/wrappers stdlib exclus de la qualification.
+/// `let v: Vec<u32>; v.sort_by(..)` → pas de `Vec::sort_by` (bruit).
+#[test]
+fn f70_r1_container_type_not_qualified() {
+    const S: &str = r#"
+fn make() -> Vec<u32> { vec![] }
+pub fn sorter() -> u32 {
+    let mut v: Vec<u32> = make();
+    v.sort_by(|a, b| a.cmp(b));
+    0
+}
+"#;
+    let symbols = parse_rust_file("src/cont.rs", S, true).expect("parse ok");
+    let deps = deps_of(&symbols, "sorter");
+    assert!(
+        !deps.contains(&"Vec::sort_by".to_string()),
+        "type conteneur stdlib Vec → PAS de 'Vec::sort_by'. deps={deps:?}"
+    );
+}
+
+/// C1-bis (re-audit, prouvé) : shadowing par destructuring composite = faux positif.
+/// `fn destr(x: Foo){ let (x, _y) = pair(); x.run() }` — le type réel de `x` est le
+/// résultat du destructuring (u32), PAS Foo. Le rebind par tuple_pattern doit poisonner
+/// `x` (≥2 sites → drop). Assert : ABSENCE de `Foo::run`.
+#[test]
+fn f70_c1bis_destructuring_shadow_drops_typed() {
+    const S: &str = r#"
+pub struct Foo;
+impl Foo { pub fn run(&self) -> u32 { 0 } }
+fn pair() -> (u32, u32) { (1, 2) }
+pub fn destr(x: Foo) -> u32 {
+    let (x, _y) = pair();
+    x.run()
+}
+"#;
+    let symbols = parse_rust_file("src/destr.rs", S, true).expect("parse ok");
+    let deps = deps_of(&symbols, "destr");
+    assert!(
+        deps.contains(&"run".to_string()),
+        "terminal 'run' attendu. deps={deps:?}"
+    );
+    assert!(
+        !deps.contains(&"Foo::run".to_string()),
+        "rebind par destructuring `let (x, _y) = pair()` masque `x: Foo` → PAS de 'Foo::run' \
+         (faux positif prouvé au re-audit). deps={deps:?}"
+    );
+}
+
+/// Non-régression : un paramètre destructuré `fn f((a, _): (Foo, u32))` reste NON résolu
+/// (comportement safe actuel — `a.run()` ne doit pas produire `Foo::run`).
+#[test]
+fn f70_c1bis_destructured_param_stays_unresolved() {
+    const S: &str = r#"
+pub struct Foo;
+impl Foo { pub fn run(&self) -> u32 { 0 } }
+pub fn param_destr((a, _): (Foo, u32)) -> u32 {
+    a.run()
+}
+"#;
+    let symbols = parse_rust_file("src/pdestr.rs", S, true).expect("parse ok");
+    let deps = deps_of(&symbols, "param_destr");
+    assert!(
+        !deps.contains(&"Foo::run".to_string()),
+        "param destructuré → type par élément non attribué → PAS de 'Foo::run'. deps={deps:?}"
+    );
+}
+
+/// R1 (P2) : wrapper `Arc<Foo>` — mis-qualification Deref évitée.
+/// `let x: Arc<Foo>; x.run()` (méthode de Foo via Deref) → PAS de `Arc::run` (faux), terminal seul.
+#[test]
+fn f70_r1_deref_wrapper_not_misqualified() {
+    const S: &str = r#"
+use std::sync::Arc;
+pub struct Foo;
+impl Foo { pub fn run(&self) -> u32 { 0 } }
+pub fn arc_caller(x: Arc<Foo>) -> u32 {
+    x.run()
+}
+"#;
+    let symbols = parse_rust_file("src/wrap.rs", S, true).expect("parse ok");
+    let deps = deps_of(&symbols, "arc_caller");
+    assert!(
+        deps.contains(&"run".to_string()),
+        "terminal 'run' attendu. deps={deps:?}"
+    );
+    assert!(
+        !deps.contains(&"Arc::run".to_string()),
+        "wrapper Arc → PAS de 'Arc::run' (mis-qualification Deref évitée). deps={deps:?}"
     );
 }

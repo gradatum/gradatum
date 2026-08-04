@@ -29,11 +29,12 @@
 //!
 //! `parse(write_parsed(parse(x)?)) == parse(x)` (idempotent over one cycle).
 //! Equality holds on values, not on the exact textual representation
-//! (`serde_yml` may reorder YAML fields).
+//! (the YAML backend may reorder fields or requote scalars).
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee. See
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible
+//! additions only within `1.x`. See
 //! [RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 
 #![forbid(unsafe_code)]
@@ -46,7 +47,7 @@ mod wikilink;
 mod writer;
 
 // Re-exports publics.
-pub use error::MarkdownError;
+pub use error::{MarkdownError, YamlError};
 pub use parser::{ParsedNote, parse};
 pub use wikilink::{Wikilink, wikilinks};
 pub use writer::{write, write_parsed};

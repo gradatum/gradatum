@@ -1,0 +1,23 @@
+pub mod gradatum_ingest
+pub enum gradatum_ingest::IngestError
+pub gradatum_ingest::IngestError::Internal(alloc::string::String)
+pub gradatum_ingest::IngestError::ParseError
+pub gradatum_ingest::IngestError::ParseError::path: alloc::string::String
+pub gradatum_ingest::IngestError::ParseError::reason: alloc::string::String
+pub struct gradatum_ingest::DerivedSymbol
+pub gradatum_ingest::DerivedSymbol::ambiguous: bool
+pub gradatum_ingest::DerivedSymbol::deps: alloc::vec::Vec<alloc::string::String>
+pub gradatum_ingest::DerivedSymbol::doc_comment: core::option::Option<alloc::string::String>
+pub gradatum_ingest::DerivedSymbol::kind: alloc::string::String
+pub gradatum_ingest::DerivedSymbol::qualified_name: alloc::string::String
+pub gradatum_ingest::DerivedSymbol::signature: core::option::Option<alloc::string::String>
+pub gradatum_ingest::DerivedSymbol::source_path: alloc::string::String
+pub gradatum_ingest::DerivedSymbol::span: core::option::Option<(u32, u32)>
+pub gradatum_ingest::DerivedSymbol::visibility: alloc::string::String
+pub fn gradatum_ingest::build_derived_notes(&str, alloc::vec::Vec<gradatum_ingest::DerivedSymbol>) -> alloc::vec::Vec<gradatum_index::sqlite::DerivedNote>
+pub fn gradatum_ingest::content_hash_source(&[u8]) -> alloc::string::String
+pub fn gradatum_ingest::parse_bash_file(&str, &str) -> core::result::Result<alloc::vec::Vec<gradatum_ingest::DerivedSymbol>, gradatum_ingest::IngestError>
+pub fn gradatum_ingest::parse_python_file(&str, &str, bool) -> core::result::Result<alloc::vec::Vec<gradatum_ingest::DerivedSymbol>, gradatum_ingest::IngestError>
+pub fn gradatum_ingest::parse_rust_file(&str, &str, bool) -> core::result::Result<alloc::vec::Vec<gradatum_ingest::DerivedSymbol>, gradatum_ingest::IngestError>
+pub fn gradatum_ingest::parse_tsx_file(&str, &str, bool) -> core::result::Result<alloc::vec::Vec<gradatum_ingest::DerivedSymbol>, gradatum_ingest::IngestError>
+pub fn gradatum_ingest::parse_typescript_file(&str, &str, bool) -> core::result::Result<alloc::vec::Vec<gradatum_ingest::DerivedSymbol>, gradatum_ingest::IngestError>

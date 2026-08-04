@@ -1,7 +1,11 @@
 //! Novelty filter — SHA-256 + MinHash 128 permutations Jaccard 0.92.
 //!
-//! Applied first in the curator cascade to detect exact duplicates
-//! (by content hash) and near-duplicates (via MinHash Jaccard estimation).
+//! Detects exact duplicates (by content hash) and near-duplicates (via MinHash
+//! Jaccard estimation). This module is **provided but not wired into
+//! [`CuratorPipeline`]'s `process` in 1.0.0** (planned post-1.0); the pipeline
+//! currently emits the default `novelty = Admitted` verdict for every note.
+//!
+//! [`CuratorPipeline`]: crate::CuratorPipeline
 
 use sha2::{Digest, Sha256};
 
@@ -43,7 +47,7 @@ pub fn shingles(text: &str, k: usize) -> Vec<u64> {
         // La tranche [0..8] est garantie par la taille fixe du digest SHA-256.
         let bytes: [u8; 8] = digest[0..8]
             .try_into()
-            .expect("SHA-256 digest contient toujours ≥ 8 octets");
+            .expect("SHA-256 digest always contains ≥ 8 bytes");
         out.push(u64::from_le_bytes(bytes));
     }
     out

@@ -6,7 +6,14 @@ use gradatum_auth::jwt::{JwtError, JwtService, TokenScope};
 fn make_service() -> JwtService {
     let mut csprng = rand::rngs::OsRng;
     let signing = SigningKey::generate(&mut csprng);
-    JwtService::new(signing, "kid-test".into(), "gradatum".into(), 3600, 86400)
+    JwtService::new(
+        signing,
+        "kid-test".into(),
+        "gradatum".into(),
+        "gradatum".into(),
+        3600,
+        86400,
+    )
 }
 
 #[test]
@@ -69,13 +76,21 @@ fn aud_mismatch_rejected() {
         signing.clone(),
         "kid-test".into(),
         "gradatum".into(),
+        "gradatum".into(),
         3600,
         86400,
     );
     let token = svc.sign("u", &[], TokenScope::Human, "main").unwrap();
 
-    // Même clé, kid identique, mais audience différente → InvalidAudience
-    let other = JwtService::new(signing, "kid-test".into(), "other-aud".into(), 3600, 86400);
+    // Même clé, kid identique, issuer identique, mais audience différente → InvalidAudience
+    let other = JwtService::new(
+        signing,
+        "kid-test".into(),
+        "gradatum".into(),
+        "other-aud".into(),
+        3600,
+        86400,
+    );
     assert!(matches!(
         other.verify(&token),
         Err(JwtError::InvalidAudience)
@@ -86,8 +101,63 @@ fn aud_mismatch_rejected() {
 fn kid_mismatch_rejected() {
     let mut csprng = rand::rngs::OsRng;
     let s1 = SigningKey::generate(&mut csprng);
-    let svc1 = JwtService::new(s1.clone(), "kid-1".into(), "g".into(), 3600, 86400);
+    let svc1 = JwtService::new(
+        s1.clone(),
+        "kid-1".into(),
+        "g".into(),
+        "g".into(),
+        3600,
+        86400,
+    );
     let token = svc1.sign("u", &[], TokenScope::Human, "main").unwrap();
-    let svc2 = JwtService::new(s1, "kid-2".into(), "g".into(), 3600, 86400);
+    let svc2 = JwtService::new(s1, "kid-2".into(), "g".into(), "g".into(), 3600, 86400);
     assert!(matches!(svc2.verify(&token), Err(JwtError::InvalidKid)));
+}
+
+#[test]
+fn iss_mismatch_rejected() {
+    // Même clé, même kid, mais issuer différent → InvalidIssuer (P1 #7).
+    let mut csprng = rand::rngs::OsRng;
+    let signing = SigningKey::generate(&mut csprng);
+    let svc = JwtService::new(
+        signing.clone(),
+        "kid-test".into(),
+        "gradatum".into(),
+        "gradatum".into(),
+        3600,
+        86400,
+    );
+    let token = svc.sign("u", &[], TokenScope::Human, "main").unwrap();
+
+    let other_iss = JwtService::new(
+        signing,
+        "kid-test".into(),
+        "other-issuer".into(),
+        "gradatum".into(),
+        3600,
+        86400,
+    );
+    assert!(matches!(
+        other_iss.verify(&token),
+        Err(JwtError::InvalidIssuer)
+    ));
+}
+
+#[test]
+fn sub_claim_present_in_verified_claims() {
+    // Le `sub` est obligatoire et doit être non-vide (P1 #8).
+    let svc = make_service();
+    let token = svc.sign("agent-1", &[], TokenScope::Human, "main").unwrap();
+    let claims = svc.verify(&token).unwrap();
+    assert_eq!(claims.sub, "agent-1");
+    assert!(!claims.sub.is_empty(), "sub doit être non-vide");
+}
+
+#[test]
+fn iss_claim_present_in_verified_claims() {
+    // Le `iss` est propagé fidèlement dans les claims (P1 #7).
+    let svc = make_service();
+    let token = svc.sign("u", &[], TokenScope::Human, "main").unwrap();
+    let claims = svc.verify(&token).unwrap();
+    assert_eq!(claims.iss, "gradatum");
 }

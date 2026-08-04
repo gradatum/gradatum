@@ -22,15 +22,22 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
 };
-use gradatum_acl_policy::{AclDecision, AclOp};
 use gradatum_core::scope::VaultId;
 use gradatum_core::trust::TrustContext;
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
-/// Single-vault tenant — aligned with `vault_status`.
-const TENANT: &str = "main";
+/// Vault namespace ciblé par ce handler (dimension NAMESPACE, distincte du
+/// principal `TenantId`).
+///
+/// Déploiement single-vault : toujours `main`, aligné sur `vault_status`. Point de
+/// résolution **typé** remplaçant l'ancien `const TENANT: &str` — en multi-vault
+/// (Groupe B) il deviendra un routage par registre plutôt qu'un littéral.
+#[must_use]
+pub fn target_vault() -> VaultId {
+    VaultId::new("main")
+}
 
 /// Query parameters for `GET /api/v1/review`.
 #[derive(Debug, Deserialize)]
@@ -90,11 +97,11 @@ pub async fn list_review(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // ACL : lecture transverse (file de revue couvre toutes les sections).
-    let acl_locus = format!("{TENANT}/review");
-    if state.acl.evaluate(&trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    // T9 (A3-handlers) : OFF = ACL Read legacy sur `main/review` (byte-identical,
+    // lecture transverse toutes sections) ; ON = vault effectif du principal JWT.
+    let vault_id =
+        crate::api_v1::tenant_guard::resolve_read_vault(&state, &trust, target_vault(), "review")
+            .await?;
 
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
 
@@ -109,8 +116,6 @@ pub async fn list_review(
         }
         None => None,
     };
-
-    let vault_id = VaultId::new(TENANT);
 
     // limit + 1 pour détecter la page suivante sans seconde requête.
     let mut rows = state

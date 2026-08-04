@@ -48,7 +48,7 @@ use crate::{
     registry::RequestLogEntry,
     slot_passthrough::{extract_slot_id, inject_slot_id_if_needed},
     smart_router,
-    token_counter::estimate_total_tokens,
+    token_counter::estimate_input_tokens,
     vault_aware::{CostAttribution, make_qa_event},
 };
 
@@ -92,7 +92,7 @@ pub async fn handler(
         tracing::warn!(
             count = tools.len(),
             max = max_tools,
-            "trop d'outils dans la requête — rejetée HTTP 400"
+            "too many tools in request — rejected HTTP 400"
         );
         return Err(ApiError::TooManyTools {
             count: tools.len(),
@@ -100,17 +100,73 @@ pub async fn handler(
         });
     }
 
-    // Hard token cap.
+    // Reasoning/modality resolution — computed BEFORE the ctx cap-check so the headroom
+    // accounts for the reasoning output. Two orthogonal axes: `has_image_request` (vision,
+    // = image presence) and `reasoning` (precedence override > router > default no-think).
+    let has_image_request = body.messages.iter().any(|m| m.has_image());
+    let reasoning_override: Option<bool> = headers
+        .get("x-reasoning-mode")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "think" | "reasoning" | "true" => Some(true),
+            "no-think" | "no_think" | "nothink" | "false" => Some(false),
+            _ => None,
+        });
+    // Router (curator + pre-classifier) — queried only when there is no explicit override
+    // (saves latency) and when enabled. Its outcome carries the source (Router or Fallback).
+    let router_outcome = if reasoning_override.is_none()
+        && let Some(router) = &state.router
+    {
+        let query: String = body
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::commons::chat::Role::User))
+            .map(|m| m.content.text_content())
+            .unwrap_or_default();
+        let (decision, source, latency) = router
+            .resolve(&query, has_image_request, &state.metrics)
+            .await;
+        // Metric 2 (SYSTEM routing decision, all requests) — the < 150 ms SLA targets THIS,
+        // not the curator sub-path (metric 1, logged in `router::resolve`). Both are also
+        // exported as Prometheus histograms inside `router::resolve`.
+        tracing::info!(
+            router_system_latency_ms = latency.as_millis() as u64,
+            source = source.as_str(),
+            decision,
+            "reasoning routing decided"
+        );
+        Some((decision, source))
+    } else {
+        None
+    };
+    let (reasoning, reasoning_source) =
+        smart_router::resolve_reasoning(reasoning_override, router_outcome);
+    // Routing decision counter by source (override|router|default|fallback) — denominator
+    // of the fallback rate, recorded once per request (all axes, router on or off).
+    state
+        .metrics
+        .record_router_decision(reasoning_source.as_str());
+
+    // Hard token cap — fail-loud, jamais de downgrade silencieux (council 01KWVXAWB3).
+    // Headroom raisonnement : plancher de sortie fixe par axe (`max(max_tokens, reserve)`)
+    // pour que le bloc `<think>` soit compté même quand `max_tokens` est absent
+    // (corrige le sous-comptage à `max_tokens = None`).
     let cap = state.config.server.max_total_tokens;
     if cap > 0 {
-        let total = estimate_total_tokens(&body);
+        let output_budget = u64::from(body.max_tokens.unwrap_or(0)).max(
+            smart_router::reasoning_output_reserve(reasoning, has_image_request),
+        );
+        let total = estimate_input_tokens(&body).saturating_add(output_budget);
         if total > cap {
             tracing::warn!(
                 consumer = %client_ip,
                 total_tokens = total,
                 cap = cap,
+                reasoning,
+                vision = has_image_request,
                 model = %body.model,
-                "cap tokens dépassé — requête rejetée HTTP 413"
+                "token cap exceeded (reasoning headroom included) — request rejected HTTP 413"
             );
             return Err(ApiError::ContextLengthExceeded { total, cap });
         }
@@ -127,7 +183,7 @@ pub async fn handler(
             tracing::warn!(
                 consumer = %client_ip,
                 model = %body.model,
-                "alias inconnu — requête rejetée HTTP 404"
+                "unknown alias — request rejected HTTP 404"
             );
             ApiError::AliasNotFound {
                 alias: body.model.clone(),
@@ -174,18 +230,31 @@ pub async fn handler(
     // with an explicit 503 when the primary vision provider is down — a text-only fallback
     // without an mmproj model must never receive a content-array image (silently wrong output).
     // Logging: only the count of image messages is logged, never the URL value (base64 ~1 MiB).
-    let has_image_request = body.messages.iter().any(|m| m.has_image());
+    // `has_image_request` is the vision axis, already computed before the cap-check.
     if has_image_request && !effective_alias.vision_capable {
         let image_msg_count = body.messages.iter().filter(|m| m.has_image()).count();
         tracing::warn!(
             alias = %body.model,
             image_message_count = image_msg_count,
-            "requête multimodale vers alias non vision_capable — rejetée HTTP 400"
+            "multimodal request to non vision_capable alias — rejected HTTP 400"
         );
         return Err(ApiError::VisionNotSupported {
             alias: body.model.clone(),
         });
     }
+
+    // Apply the resolved reasoning/modality — ALWAYS (the default is no-think). Critical:
+    // Qwen3.5's template defaults to think OPEN, so a no-think default MUST inject
+    // `enable_thinking = false` explicitly. Sets the per-mode sampling preset + the
+    // `enable_thinking` flag (follows the reasoning axis). Observable: the decision and its
+    // precedence source are logged (never a silent downgrade — council 01KWVXAWB3).
+    smart_router::apply_reasoning(&mut body, reasoning, has_image_request);
+    tracing::info!(
+        reasoning,
+        vision = has_image_request,
+        source = reasoning_source.as_str(),
+        "reasoning mode resolved (per-mode sampling + enable_thinking)"
+    );
 
     let slot_id = extract_slot_id(&headers);
     let model_alias = body.model.clone();
@@ -273,7 +342,7 @@ pub async fn handler(
             error_message: error_msg,
         };
         if let Err(e) = registry.log_request(entry).await {
-            tracing::warn!("erreur journalisation requête chat: {}", e);
+            tracing::warn!("chat request logging error: {}", e);
         }
     });
 
@@ -302,8 +371,8 @@ pub async fn handler(
 /// A text-only fallback without an mmproj model would produce silently wrong output
 /// on a content-array image. Deterministic skip is the only safe guarantee.
 ///
-/// `pub(crate)` : partagé avec `handlers::messages` pour éviter la duplication
-/// de la logique de dispatch (ADN 3 Factorisé).
+/// Crate-visible because `handlers::messages` shares it, so the dispatch logic exists
+/// in exactly one place.
 pub(crate) async fn dispatch_with_fallback(
     state: &AppState,
     body: ChatCompletionRequest,
@@ -351,7 +420,7 @@ pub(crate) async fn dispatch_with_fallback(
                 tracing::warn!(
                     primary = %alias.provider,
                     error = %primary_err,
-                    "primary vision provider échoué — fallback skipé (requête image)"
+                    "primary vision provider failed — fallback skipped (image request)"
                 );
                 return (
                     Err(ApiError::ServiceUnavailable {
@@ -379,7 +448,7 @@ pub(crate) async fn dispatch_with_fallback(
                 primary = %alias.provider,
                 fallback = %fb_provider,
                 error = %primary_err,
-                "primary provider échoué — tentative fallback"
+                "primary provider failed — attempting fallback"
             );
 
             let fb_model = alias.fallback_model.as_deref().unwrap_or(&alias.model);
@@ -396,7 +465,7 @@ pub(crate) async fn dispatch_with_fallback(
                     tracing::warn!(
                         fallback = %fb_provider,
                         error = %fb_err,
-                        "fallback provider également échoué"
+                        "fallback provider also failed"
                     );
                     // Double failure: return the last model attempted.
                     (Err(fb_err), fb_provider.clone(), None, fb_model.to_string())
@@ -450,7 +519,7 @@ pub(crate) async fn dispatch_stream_with_fallback(
                 tracing::warn!(
                     primary = %alias.provider,
                     error = %primary_err,
-                    "primary vision provider échoué (stream) — fallback skipé"
+                    "primary vision provider failed (stream) — fallback skipped"
                 );
                 return Err(ApiError::ServiceUnavailable {
                     message: format!(
@@ -469,7 +538,7 @@ pub(crate) async fn dispatch_stream_with_fallback(
                 primary = %alias.provider,
                 fallback = %fb_provider,
                 error = %primary_err,
-                "primary provider échoué (stream) — tentative fallback"
+                "primary provider failed (stream) — attempting fallback"
             );
 
             let fb_result = try_provider_stream(state, body, fb_provider, fb_model).await;
@@ -484,7 +553,7 @@ pub(crate) async fn dispatch_stream_with_fallback(
                     tracing::warn!(
                         fallback = %fb_provider,
                         error = %fb_err,
-                        "fallback provider également échoué (stream)"
+                        "fallback provider also failed (stream)"
                     );
                     // FIX 1 : comptabiliser l'échec du fallback stream dans le circuit breaker.
                     if let ApiError::Backend(ref llm_err) = fb_err {
@@ -500,15 +569,15 @@ pub(crate) async fn dispatch_stream_with_fallback(
     }
 }
 
-/// Tente un appel streaming à un provider spécifique.
+/// Attempts a streaming call against one specific provider.
 ///
-/// Retourne le `ChatCompletionStream` brut (avant sérialisation SSE).
-/// Ne supporte pas le slot-passthrough (format opaque incompatible).
+/// Returns the raw `ChatCompletionStream`, before any SSE serialization. Slot-passthrough
+/// is not supported on this path: its opaque payload format is incompatible.
 ///
 /// # Errors
-/// - `ApiError::Backend(LlmError::ProviderUnavailable)` si le circuit breaker est ouvert.
-/// - `ApiError::ProviderNotFound` si le provider est absent de la config.
-/// - `ApiError::Backend(...)` si le provider retourne une erreur.
+/// - `ApiError::Backend(LlmError::ProviderUnavailable)` when the circuit breaker is open.
+/// - `ApiError::ProviderNotFound` when the provider is absent from the configuration.
+/// - `ApiError::Backend(...)` when the provider itself returns an error.
 async fn try_provider_stream(
     state: &AppState,
     mut body: ChatCompletionRequest,
@@ -518,11 +587,11 @@ async fn try_provider_stream(
     if !state.providers.circuit_breakers.should_allow(provider_name) {
         tracing::warn!(
             provider = %provider_name,
-            "circuit breaker ouvert (stream)"
+            "circuit breaker open (stream)"
         );
         return Err(ApiError::Backend(LlmError::ProviderUnavailable {
             provider: provider_name.to_string(),
-            reason: "circuit breaker ouvert".to_string(),
+            reason: "circuit breaker open".to_string(),
         }));
     }
 
@@ -560,11 +629,11 @@ async fn try_provider(
     if !state.providers.circuit_breakers.should_allow(provider_name) {
         tracing::warn!(
             provider = %provider_name,
-            "circuit breaker ouvert"
+            "circuit breaker open"
         );
         return Err(ApiError::Backend(LlmError::ProviderUnavailable {
             provider: provider_name.to_string(),
-            reason: "circuit breaker ouvert".to_string(),
+            reason: "circuit breaker open".to_string(),
         }));
     }
 
@@ -602,7 +671,7 @@ async fn try_provider(
             .body(Body::from_stream(sse_body))
             .map_err(|e| {
                 ApiError::Backend(LlmError::Custom {
-                    message: format!("erreur construction réponse SSE: {}", e),
+                    message: format!("SSE response construction error: {}", e),
                 })
             })?;
 
@@ -683,7 +752,7 @@ async fn try_provider_with_slot(
             .body(Body::from(body_bytes))
             .map_err(|e| {
                 ApiError::Backend(LlmError::Custom {
-                    message: format!("erreur construction réponse erreur: {}", e),
+                    message: format!("error response construction error: {}", e),
                 })
             });
     }
@@ -705,7 +774,7 @@ async fn try_provider_with_slot(
             .body(Body::from_stream(byte_stream))
             .map_err(|e| {
                 ApiError::Backend(LlmError::Custom {
-                    message: format!("erreur construction réponse SSE slot: {}", e),
+                    message: format!("SSE slot response construction error: {}", e),
                 })
             })
     } else {
@@ -724,7 +793,7 @@ async fn try_provider_with_slot(
             .body(Body::from(body_bytes))
             .map_err(|e| {
                 ApiError::Backend(LlmError::Custom {
-                    message: format!("erreur construction réponse JSON slot: {}", e),
+                    message: format!("JSON slot response construction error: {}", e),
                 })
             })
     }
@@ -743,12 +812,12 @@ fn sse_stream_from_chunks(
             Ok(chunk) => match serde_json::to_string(&chunk) {
                 Ok(json) => format!("data: {}\n\n", json),
                 Err(e) => {
-                    tracing::warn!("erreur sérialisation chunk SSE: {}", e);
+                    tracing::warn!("SSE chunk serialization error: {}", e);
                     return Ok(bytes::Bytes::new());
                 }
             },
             Err(e) => {
-                tracing::error!("erreur stream backend: {}", e);
+                tracing::error!("backend stream error: {}", e);
                 circuit_breakers.record_failure(&provider_id, &e);
                 "data: [DONE]\n\n".to_string()
             }
@@ -838,6 +907,7 @@ mod tests {
             logging: LoggingConfig::default(),
             vault_aware: VaultAwareConfig::default(),
             messages: Default::default(),
+            router: Default::default(),
         };
 
         AppState::for_test(config)
@@ -893,6 +963,9 @@ mod tests {
             tools: None,
             tool_choice: None,
             top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
             stop: None,
             chat_template_kwargs: None,
         };

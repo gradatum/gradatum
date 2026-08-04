@@ -35,22 +35,24 @@ fn init_creates_full_layout_and_files() {
         "admin.bearer.txt chmod = {mode:o}, expected 0600"
     );
 
-    // JWT private key chmod 0600
-    let priv_key = root.join("config/jwt.private.pem");
-    assert!(priv_key.is_file(), "jwt.private.pem missing");
-    let mode = priv_key.metadata().unwrap().permissions().mode() & 0o777;
-    assert_eq!(
-        mode, 0o600,
-        "jwt.private.pem chmod = {mode:o}, expected 0600"
+    // v1.0.0 — `init` ne génère PLUS de paire PEM JWT.
+    //
+    // Ces deux fichiers n'étaient lus par aucun composant runtime : le serveur
+    // signe et vérifie avec la seed brute `config/jwt-signing-key.secret` qu'il
+    // crée lui-même au premier boot. Les scaffolder faisait sauvegarder et
+    // tourner à l'opérateur des fichiers sans effet.
+    assert!(
+        !root.join("config/jwt.private.pem").exists(),
+        "init ne doit plus générer jwt.private.pem (clé jamais lue par le runtime)"
     );
-
-    // JWT public key chmod 0644
-    let pub_key = root.join("config/jwt.public.pem");
-    assert!(pub_key.is_file(), "jwt.public.pem missing");
-    let mode = pub_key.metadata().unwrap().permissions().mode() & 0o777;
-    assert_eq!(
-        mode, 0o644,
-        "jwt.public.pem chmod = {mode:o}, expected 0644"
+    assert!(
+        !root.join("config/jwt.public.pem").exists(),
+        "init ne doit plus générer jwt.public.pem (clé jamais lue par le runtime)"
+    );
+    // La vraie clé appartient au serveur : init ne la crée pas non plus.
+    assert!(
+        !root.join("config/jwt-signing-key.secret").exists(),
+        "la seed de signature est créée par gradatum-server au premier boot, pas par init"
     );
 
     // bearer.toml exists chmod 0640

@@ -245,7 +245,7 @@ async fn budget_used_assembled_reflects_full_text_including_scaffolding() {
     // L'en-tête "Contexte assemblé pour" et les marqueurs "— source: [["
     // font partie du scaffolding render_assembled — ils ne sont PAS dans le body de la note.
     assert!(
-        assembled_text.contains("Contexte assemblé pour"),
+        assembled_text.contains("Context assembled for"),
         "en-tête scaffolding absent de assembled_text — resp={resp}"
     );
     assert!(

@@ -2,7 +2,7 @@
 
 > SQLite-backed durable job queue with atomic lease acquisition and automatic recovery.
 
-**Status**: 0.x — API not yet stable. Apache-2.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -27,7 +27,7 @@ The crate provides two APIs:
 
 ```toml
 [dependencies]
-gradatum-queue = "0.7.6"
+gradatum-queue = "1.0.0"
 ```
 
 ```rust

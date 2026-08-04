@@ -1,39 +1,19 @@
-//! Tests smoke MCP tool vault_downgrade.
+//! Test smoke du schéma MCP de `vault_downgrade`.
 //!
-//! Ces tests vérifient statiquement :
-//!   1. La présence de `vault_downgrade` dans la liste canonique `EXPECTED_TOOL_NAMES`.
-//!   2. Le schéma JSON du DTO `VaultDowngradeRequest` : `note_id` + `reason` required,
-//!      `replaced_by` optionnel.
+//! Vérifie statiquement le schéma JSON du DTO `VaultDowngradeRequest` : `note_id` +
+//! `reason` required, `replaced_by` optionnel.
 //!
-//! Aucun serveur requis — tests unitaires purs.
-
-/// Vérifie que `vault_downgrade` fait partie de la liste canonique des tools exposés.
-///
-/// Si ce test échoue, le tool a été retiré de `EXPECTED_TOOL_NAMES`.
-#[test]
-fn vault_downgrade_in_expected_tool_names() {
-    // La liste canonique vit dans le test `list_tools_count_matches_expected` de
-    // main.rs (mod tests). On la redéclare ici pour isoler ce test.
-    const EXPECTED: &[&str] = &[
-        "vault_search",
-        "vault_read",
-        "vault_list",
-        "vault_status",
-        "vault_graph",
-        "vault_links",
-        "vault_trace",
-        "vault_context",
-        "vault_authors",
-        "vault_tags",
-        "vault_write",
-        "vault_classify",
-        "vault_downgrade",
-    ];
-    assert!(
-        EXPECTED.contains(&"vault_downgrade"),
-        "vault_downgrade absent de la liste canonique EXPECTED_TOOL_NAMES. liste={EXPECTED:?}"
-    );
-}
+//! Aucun serveur requis — test unitaire pur.
+//!
+//! ## Ce que ce fichier ne teste plus, et pourquoi
+//!
+//! Il portait un `vault_downgrade_in_expected_tool_names` qui déclarait une liste locale
+//! de 13 noms puis assertait que cette liste contenait `vault_downgrade` : une constante
+//! confrontée à elle-même, verte par construction, sans jamais toucher le catalogue servi.
+//! `gradatum-mcp-stub` étant un crate binaire, un test d'intégration ne peut pas atteindre
+//! `tool_catalogue()` — la propriété visée n'est donc pas réparable ici. Elle est désormais
+//! réellement vérifiée par `catalogue_expose_exactement_les_outils_canoniques`, dans le
+//! `mod tests` de `src/main.rs`.
 
 /// Vérifie le schéma JSON de `VaultDowngradeRequest` :
 ///   - `note_id` → required

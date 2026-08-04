@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 /// Ranking mode for [`LessonsRecallRequest`].
 ///
 /// Controls the final ordering of BM25 results after `recall_lessons`.
-/// When absent or `Relevance`, the legacy BM25 order is preserved (rétro-compat).
+/// When absent or `Relevance`, the legacy BM25 order is preserved (backward-compat).
 ///
 /// # Wire encoding
 /// `"relevance"` or `"recency-boosted"` (kebab-case, serde `rename_all`).
 ///
-/// # Comportement par défaut
-/// `None` / absent → BM25 order inchangé (hook LIVE `lesson-recall.sh` en dépend).
+/// # Default behaviour
+/// `None` / absent → BM25 order unchanged (LIVE hook `lesson-recall.sh` depends on it).
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -26,7 +26,7 @@ pub enum RankMode {
     /// Legacy BM25 order — default when the field is absent.
     ///
     /// A `rank=relevance` request is a no-op: it produces the same result as omitting
-    /// the field entirely. This preserves the rétro-compat invariant bit-for-bit.
+    /// the field entirely. This preserves the backward-compat invariant bit-for-bit.
     Relevance,
     /// Multiply each BM25 rank-proxy score by `recency_factor(anchor_ms, now_ms)`,
     /// then re-sort descending. Fresh lessons surface first.
@@ -82,29 +82,41 @@ pub struct LessonsRecallRequest {
     pub limit: Option<u32>,
     /// Optional ranking mode.
     ///
-    /// - absent / `"relevance"` → BM25 order (legacy behaviour, hook LIVE en dépend).
+    /// - absent / `"relevance"` → BM25 order (legacy behaviour, LIVE hook depends on it).
     /// - `"recency-boosted"` → rank-proxy × `recency_factor`, then sort descending.
     ///
     /// The field is optional and `deny_unknown_fields` is already set on this struct,
-    /// so the addition is rétro-compat: existing callers that omit the field continue
+    /// so the addition is backward-compat: existing callers that omit the field continue
     /// to receive BM25-ordered results without any change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<RankMode>,
     /// Opt-in semantic (embedding) recall mode.
     ///
-    /// - absent / `false` → chemin BM25 `recall_lessons` INCHANGÉ (rétro-compat absolue).
-    ///   Les callers LIVE (hook `lesson-recall.sh`, agents, MCP) qui n'envoient pas ce champ
-    ///   continuent à recevoir les résultats BM25 sans modification.
-    /// - `true` → retrieval hybride RRF (`retrieve_candidates`) + hydratation ULID +
-    ///   filtres `codified` / `class` en Rust. Si embed KO → fallback silencieux BM25.
+    /// - absent / `false` → BM25 `recall_lessons` path UNCHANGED (absolute backward-compat).
+    ///   LIVE callers (hook `lesson-recall.sh`, agents, MCP) that do not send this field
+    ///   keep receiving BM25 results without any change.
+    /// - `true` → hybrid RRF retrieval, then ULID hydration, then the `codified` and
+    ///   `class` filters applied in Rust. If embedding fails, silently falls back to BM25.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic: Option<bool>,
-    /// Requête textuelle pour la recherche sémantique (opt-in, `semantic = true`).
+    /// Text query for semantic search (opt-in, `semantic = true`).
     ///
-    /// Si absent quand `semantic = true`, la classe (`class`) est utilisée comme requête
-    /// par défaut. Ignoré si `semantic = false` / absent.
+    /// If absent when `semantic = true`, the class (`class`) is used as the default
+    /// query. Ignored if `semantic = false` / absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    /// If `true`, the server returns a **compact** rendering instead of the full
+    /// [`LessonsRecallResponse`]: an object `{ "compact": "<text>" }` listing each
+    /// lesson as `<ulid> — <title> :: <snippet>` (snippet truncated to 120 chars,
+    /// newlines flattened), dropping `tags` and `anchor_ms`.
+    ///
+    /// Optimises token cost for LLM consumers (the compaction is a product feature).
+    ///
+    /// Opt-in (default `false`): when absent, the response is **byte-for-byte identical**
+    /// to the historical [`LessonsRecallResponse`]. Existing callers (LIVE hook
+    /// `lesson-recall.sh`, agents, MCP) are unaffected.
+    #[serde(default)]
+    pub compact: bool,
 }
 
 /// A lesson returned by the recall endpoint.

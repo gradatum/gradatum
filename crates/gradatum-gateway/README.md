@@ -2,20 +2,24 @@
 
 > Unified LLM router — named aliases, multi-provider fallback, circuit-breaker, and reranker endpoint.
 
-**Status**: v0.7.6 — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
 
 `gradatum-gateway` is the LLM routing layer of gradatum. It exposes an OpenAI-compatible HTTP
-API and dispatches requests to backend providers via a configurable alias registry.
+API alongside the Anthropic Messages API, and dispatches requests to backend providers via a
+configurable alias registry.
 
 Key capabilities:
 
 - **Named aliases** — map logical model names (e.g. `curator`, `embed`, `default`) to concrete
   backend providers (local engine instances, remote HTTP endpoints).
+- **Anthropic Messages API** — `POST /v1/messages` (JSON and SSE streaming, full tool use) and
+  `POST /v1/messages/count_tokens`, translated to and from the internal OpenAI-shaped format.
 - **Circuit-breaker with local fallback** — on primary failure, routes automatically to a
-  configured fallback provider without surfacing errors to the caller.
+  configured fallback provider. Exception: image (vision) requests never fall back to a
+  text-only provider — an explicit 503 is returned instead.
 - **Unified chat + embed routing** — single gateway handles both `/v1/chat/completions` and
   `/v1/embeddings` endpoints across all aliases.
 - **Reranker endpoint** — `POST /v1/rerank` backed by a `Reranker` implementation.

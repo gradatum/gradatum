@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::default_main;
+use gradatum_core::scope::TenantId;
 
 /// Request body for `vault_classify` — synchronous heuristic re-classification of an existing note.
 ///
@@ -13,9 +13,11 @@ use crate::default_main;
 pub struct VaultClassifyRequest {
     /// ULID identifier of the note to re-classify.
     pub note_id: String,
-    /// Target tenant (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Target tenant (principal) — optional; when omitted the server resolves it
+    /// from the credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
 }
 
 /// Response body for `vault_classify` — result of the offline heuristic classification.

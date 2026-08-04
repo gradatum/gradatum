@@ -7,11 +7,14 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Parse/serialize MD + frontmatter YAML + wikilinks extraction"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 gradatum-core.workspace = true
 serde.workspace = true
-serde_yml.workspace = true
+serde_norway.workspace = true
 thiserror.workspace = true
 regex.workspace = true
 once_cell.workspace = true

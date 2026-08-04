@@ -153,6 +153,7 @@ async fn handle_curate_vault_write_honors_prealloc_note_id() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_curate");

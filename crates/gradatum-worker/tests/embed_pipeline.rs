@@ -71,7 +71,7 @@ impl InternalClient for EmbedTestClient {
         let note_id = NoteId(note_ulid);
 
         self.index
-            .insert_note_embedding(&note_id, &req.embedder_id, req.dim, &req.vector)
+            .insert_note_embedding("main", &note_id, &req.embedder_id, req.dim, &req.vector)
             .await
             .map_err(|e| InternalClientError::ServerError {
                 status: 500,
@@ -99,23 +99,36 @@ impl InternalClient for EmbedTestClient {
         unimplemented!()
     }
 
-    async fn delete_note(&self, _ulid: &str) -> Result<(), InternalClientError> {
+    async fn delete_note(&self, _vault_id: &str, _ulid: &str) -> Result<(), InternalClientError> {
         unimplemented!()
     }
 
-    async fn get_note(&self, _ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+    async fn get_note(
+        &self,
+        _vault_id: &str,
+        _ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError> {
+        unimplemented!()
+    }
+
+    async fn get_note_status(
+        &self,
+        _vault_id: &str,
+        _ulid: &str,
+    ) -> Result<Option<String>, InternalClientError> {
         unimplemented!()
     }
 
     async fn get_note_embedding(
         &self,
+        _vault_id: &str,
         _ulid: &str,
         _embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
         unimplemented!()
     }
 
-    async fn get_trust(&self, _ulid: &str) -> Result<f32, InternalClientError> {
+    async fn get_trust(&self, _vault_id: &str, _ulid: &str) -> Result<f32, InternalClientError> {
         unimplemented!()
     }
 
@@ -339,7 +352,7 @@ async fn embed_note_success_persists_embedding() {
 
     // Vérifier l'embedding persisté
     let vec = index
-        .get_note_embedding(&note_id, "mock-bge-small")
+        .get_note_embedding("main", &note_id, "mock-bge-small")
         .await
         .unwrap();
     assert!(
@@ -456,7 +469,7 @@ async fn embed_note_dim_mismatch_job_fails() {
 
     // Aucun embedding ne doit avoir été persisté
     let vec = index
-        .get_note_embedding(&note_id, "mock-mismatch")
+        .get_note_embedding("main", &note_id, "mock-mismatch")
         .await
         .unwrap();
     assert!(

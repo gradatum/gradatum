@@ -43,7 +43,7 @@ pub async fn metrics_handler_server(State(state): State<AppState>) -> Result<Res
     // Encodage des métriques server
     let mut buf = String::new();
     encode(&mut buf, &state.metrics.registry).map_err(|e| {
-        tracing::error!(error = %e, "metrics_handler_server: encodage server échoué");
+        tracing::error!(error = %e, "metrics_handler_server: server encoding failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -69,7 +69,7 @@ pub async fn metrics_handler_server(State(state): State<AppState>) -> Result<Res
         )
         .body(Body::from(buf))
         .map_err(|e| {
-            tracing::error!(error = %e, "metrics_handler_server: construction réponse échouée");
+            tracing::error!(error = %e, "metrics_handler_server: response construction failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -90,6 +90,6 @@ async fn scrape_worker_metrics() -> Option<String> {
     // Scrape non câblé — retourne None gracieusement.
     // Écart E-16 : concaténation complète nécessite dep directe reqwest côté server.
     let _ = url;
-    tracing::debug!("metrics_proxy: scrape worker :19091 — non câblé (E-16)");
+    tracing::debug!("metrics_proxy: scrape worker :19091 — not wired (E-16)");
     None
 }

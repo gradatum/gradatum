@@ -14,6 +14,8 @@
 #[doc(hidden)]
 pub mod api_v1;
 #[doc(hidden)]
+pub mod audit_job;
+#[doc(hidden)]
 pub mod audit_jsonl;
 #[doc(hidden)]
 pub mod auth_routes;
@@ -37,6 +39,8 @@ pub mod metrics;
 pub mod metrics_proxy;
 #[doc(hidden)]
 pub mod middleware;
+#[doc(hidden)]
+pub mod note_usage_store;
 #[doc(hidden)]
 pub mod proactive_recall;
 #[doc(hidden)]

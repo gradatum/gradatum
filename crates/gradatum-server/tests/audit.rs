@@ -22,6 +22,7 @@ fn make_event(ts: chrono::DateTime<chrono::Utc>, note_id: &str) -> HttpAuditEven
             kid: "k1".into(),
             sub: "test-agent".into(),
             aud: "gradatum".into(),
+            jti: None,
         },
         tenant_id: "main".into(),
         locus: "decisions/test-note".into(),
@@ -170,4 +171,45 @@ async fn multiple_events_same_day_appended() {
             serde_json::from_str(line).unwrap_or_else(|e| panic!("Ligne {i} invalide : {e}"));
         assert_eq!(parsed["note_id"], format!("note-{i}"));
     }
+}
+
+/// C3a (F-45, EX-C3a-2) : l'acteur d'audit porte le `jti` du token quand il est
+/// présent — la ligne JSONL identifie l'instance de token révocable.
+#[tokio::test]
+async fn actor_jti_present_in_jsonl_when_bearer_jwt() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sink = JsonlFileSink::new(tmp.path().to_path_buf());
+    let ts = chrono::Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+
+    let mut event = make_event(ts, "01HXYZAUDITJTI0000000000");
+    event.actor.jti = Some("01JTIULID000000000000000000".into());
+    sink.record(event).await.unwrap();
+
+    let content = std::fs::read_to_string(tmp.path().join("audit.2026-07-18.jsonl")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        parsed["actor"]["jti"], "01JTIULID000000000000000000",
+        "le jti doit apparaître dans l'acteur : {parsed}"
+    );
+}
+
+/// C3a (EX-C3a-2) : `jti = None` (api-key directe, contexts non-Bearer) → la clé
+/// `jti` est ABSENTE de la ligne JSONL (rétrocompat stricte avec les lignes
+/// historiques, `skip_serializing_if`).
+#[tokio::test]
+async fn actor_jti_absent_from_jsonl_when_none() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sink = JsonlFileSink::new(tmp.path().to_path_buf());
+    let ts = chrono::Utc.with_ymd_and_hms(2026, 7, 18, 13, 0, 0).unwrap();
+
+    sink.record(make_event(ts, "01HXYZAUDITNOJTI00000000"))
+        .await
+        .unwrap();
+
+    let content = std::fs::read_to_string(tmp.path().join("audit.2026-07-18.jsonl")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(
+        parsed["actor"].get("jti").is_none(),
+        "jti None ne doit pas être sérialisé (rétrocompat JSONL) : {parsed}"
+    );
 }

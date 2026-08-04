@@ -30,11 +30,16 @@ pub enum VaultError {
     /// Optimistic-lock conflict: the supplied `expected_sha256` does not match
     /// the current hash of the note. Carries the current hash to enable resolution.
     ///
-    /// Produced by `write_if_match` when
-    /// `expected_sha256 != current_sha256` and the note already exists.
-    ///
     /// The `[u8; 32]` is the current SHA-256 hash (the value held by the concurrent winner).
-    #[error("conflit optimistic-lock : hash courant = {current_sha256}", current_sha256 = gradatum_core::identity::ContentHash(*(.0)).hex())]
+    ///
+    /// **Never constructed — by design, even though the optimistic lock is now live.**
+    /// `write_if_match` (wired into production via
+    /// [`crate::Registry::write_if_match_internal`]) signals a mismatch through
+    /// [`crate::write::WriteResult::Conflict`], a **success value** — not through this error
+    /// variant. No code in the workspace produces `VaultError::Conflict`; the `match` arms
+    /// that map it are defensive only. Callers must not use it to detect a conflict: the
+    /// conflict is an `Ok(WriteResult::Conflict)`, not an `Err`.
+    #[error("optimistic-lock conflict: current hash = {current_sha256}", current_sha256 = gradatum_core::identity::ContentHash(*(.0)).hex())]
     Conflict([u8; 32]),
 }
 

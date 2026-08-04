@@ -48,9 +48,10 @@ async fn trust_stub(
                     TrustContext::BearerToken {
                         kid: "test-kid".to_string(),
                         aud: "gradatum".to_string(),
-                        sub: token.to_string(),
+                        sub: token.into(),
                         scopes: vec!["read".to_string(), "write".to_string()],
-                        tenant_id: "main".to_string(),
+                        tenant_id: "main".into(),
+                        jti: None,
                     }
                 } else {
                     TrustContext::Unauthenticated

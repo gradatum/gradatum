@@ -96,11 +96,19 @@ fn test_config() -> CircuitConfig {
     CircuitConfig {
         failure_threshold: 5,
         failure_window: Duration::from_secs(60),
+        // Cooldowns en SECONDES, pas en millisecondes (anti-flake, 2026-07-29).
+        // Le franchissement d'un cooldown est piloté par `advance_test_clock`
+        // (horloge logique) ; le NON-franchissement, lui, dépend du wall-clock
+        // réel écoulé entre `trip_open()` et l'assertion. Avec 50 ms, cette marge
+        // était franchie sous instrumentation `llvm-cov` + tests parallèles du
+        // même binaire -> `is_open()` renvoyait false et le gate `coverage`
+        // échouait (job 14332, 2026-07-29). Les paliers gardent le même rapport
+        // 1:2:4:8 : la sémantique du backoff exponentiel est inchangée.
         open_durations: vec![
-            Duration::from_millis(50),
-            Duration::from_millis(100),
-            Duration::from_millis(200),
-            Duration::from_millis(400),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            Duration::from_secs(40),
         ],
         success_threshold: 2,
     }
@@ -179,8 +187,8 @@ async fn open_to_halfopen_after_timeout() {
     }
     assert!(cb.is_open(), "circuit doit être ouvert");
 
-    // Avancer au-delà du cooldown (50ms) — déterministe (D2.3)
-    cb.advance_test_clock(100);
+    // Avancer au-delà du cooldown (5s) — déterministe (D2.3)
+    cb.advance_test_clock(10_000);
 
     assert!(
         !cb.is_open(),
@@ -198,7 +206,8 @@ async fn halfopen_to_closed_with_2_successes() {
     let cfg = CircuitConfig {
         failure_threshold: 5,
         failure_window: Duration::from_secs(60),
-        open_durations: vec![Duration::from_millis(50)],
+        // Cooldown en secondes — cf. note anti-flake dans `test_config()`.
+        open_durations: vec![Duration::from_secs(5)],
         success_threshold: 2,
     };
     let cb = CircuitBreaker::new(
@@ -216,8 +225,8 @@ async fn halfopen_to_closed_with_2_successes() {
     }
     assert!(cb.is_open());
 
-    // Avancer au-delà du cooldown (50ms) → HalfOpen — déterministe (D2.3)
-    cb.advance_test_clock(100);
+    // Avancer au-delà du cooldown (5s) → HalfOpen — déterministe (D2.3)
+    cb.advance_test_clock(10_000);
     assert!(cb.is_half_open());
 
     // 1er succès en HalfOpen
@@ -247,8 +256,8 @@ async fn halfopen_to_open_retrp_with_backoff() {
     }
     assert!(cb.is_open(), "circuit doit être ouvert");
 
-    // Avancer au-delà du 1er cooldown (50ms) → HalfOpen — déterministe (D2.3)
-    cb.advance_test_clock(100);
+    // Avancer au-delà du 1er cooldown (5s) → HalfOpen — déterministe (D2.3)
+    cb.advance_test_clock(10_000);
     assert!(cb.is_half_open());
 
     // Re-trip : une failure en HalfOpen → réouvre avec backoff
@@ -261,12 +270,13 @@ async fn halfopen_to_open_retrp_with_backoff() {
 
     // open_count doit être > 1 (backoff exponentiel actif).
     // Note: open_count est privé, on vérifie indirectement via is_open().
-    // À +60ms le circuit est encore ouvert car le 2ème cooldown est 100ms.
-    // Horloge logique exacte → borne 60 < 100 franche (anti-flake D2.3).
-    cb.advance_test_clock(60);
+    // À +6s le circuit est encore ouvert car le 2ème cooldown est 10s.
+    // Horloge logique exacte → borne 6s < 10s franche, et la marge résiduelle
+    // (4s) n'est plus franchissable par le wall-clock réel du test (anti-flake).
+    cb.advance_test_clock(6_000);
     assert!(
         cb.is_open(),
-        "avec backoff exponentiel, le 2ème cooldown (100ms) doit toujours être actif à +60ms"
+        "avec backoff exponentiel, le 2ème cooldown (10s) doit toujours être actif à +6s"
     );
 }
 

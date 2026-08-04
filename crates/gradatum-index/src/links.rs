@@ -65,19 +65,23 @@ pub fn title_to_slug(title: &str) -> String {
 // ── SqliteIndex inherent methods ──────────────────────────────────────────────
 
 impl SqliteIndex {
-    /// Inserts or updates a redirect `old_slug → ulid`.
+    /// Inserts or updates a redirect `old_slug → ulid`, scoped to `vault_id`.
     ///
+    /// `vault_id`: namespace of the redirect — part of the composite primary key
+    /// `(vault_id, title_slug)` (migration 0035). Two vaults may register the same
+    /// slug without clobbering each other.
     /// `renamed_at_ms`: rename timestamp in Unix epoch milliseconds.
     ///
-    /// Idempotent: `INSERT OR REPLACE` — a double rename of the same slug is tolerated
-    /// (the last ULID wins). This is intentional: if a note is renamed twice,
-    /// only the latest current ULID is relevant.
+    /// Idempotent: `INSERT OR REPLACE` — a double rename of the same `(vault_id, slug)`
+    /// is tolerated (the last ULID wins). This is intentional: if a note is renamed
+    /// twice, only the latest current ULID is relevant.
     ///
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if the INSERT fails.
     pub async fn upsert_redirect(
         &self,
+        vault_id: &str,
         slug: &str,
         ulid: &Ulid,
         renamed_at_ms: i64,
@@ -85,26 +89,34 @@ impl SqliteIndex {
         let conn = self.conn.lock().await;
         let ulid_str = ulid.to_string();
         conn.execute(
-            "INSERT OR REPLACE INTO redirect_table (title_slug, ulid, renamed_at) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![slug, ulid_str, renamed_at_ms],
+            "INSERT OR REPLACE INTO redirect_table (vault_id, title_slug, ulid, renamed_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![vault_id, slug, ulid_str, renamed_at_ms],
         )
         .map_err(|e| GradatumError::Storage(format!("upsert_redirect : {e}")))?;
         Ok(())
     }
 
-    /// Looks up the current ULID for an old title slug.
+    /// Looks up the current ULID for an old title slug within `vault_id`.
     ///
-    /// Returns `Some(ulid)` if the slug exists in `redirect_table`, `None` otherwise.
+    /// Scoped to `vault_id` (composite PK `(vault_id, title_slug)`, migration 0035):
+    /// a slug registered in another vault is never resolved here.
+    ///
+    /// Returns `Some(ulid)` if the slug exists in `redirect_table` for this vault,
+    /// `None` otherwise.
     ///
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if the query fails.
-    pub async fn lookup_redirect(&self, slug: &str) -> Result<Option<Ulid>, GradatumError> {
+    pub async fn lookup_redirect(
+        &self,
+        vault_id: &str,
+        slug: &str,
+    ) -> Result<Option<Ulid>, GradatumError> {
         let conn = self.conn.lock().await;
         match conn.query_row(
-            "SELECT ulid FROM redirect_table WHERE title_slug = ?1",
-            [slug],
+            "SELECT ulid FROM redirect_table WHERE vault_id = ?1 AND title_slug = ?2",
+            rusqlite::params![vault_id, slug],
             |row| row.get::<_, String>(0),
         ) {
             Ok(ulid_str) => {
@@ -150,21 +162,21 @@ mod tests {
         let ulid = Ulid::new();
 
         // Upsert d'un redirect
-        idx.upsert_redirect("ancien-titre", &ulid, 1_700_000_000_000)
+        idx.upsert_redirect("main", "ancien-titre", &ulid, 1_700_000_000_000)
             .await
             .expect("upsert_redirect ne doit pas échouer");
 
         // Résolution via trait IndexStore
         let store: Arc<dyn IndexStore> = Arc::new(idx);
         let found = store
-            .resolve_redirect("ancien-titre")
+            .resolve_redirect("main", "ancien-titre")
             .await
             .expect("resolve_redirect ne doit pas échouer");
         assert_eq!(found, Some(ulid), "le ULID résolu doit correspondre");
 
         // Slug inconnu → None
         let none = store
-            .resolve_redirect("inconnu")
+            .resolve_redirect("main", "inconnu")
             .await
             .expect("resolve_redirect slug inconnu ne doit pas échouer");
         assert!(none.is_none(), "slug inconnu → None");
@@ -178,15 +190,15 @@ mod tests {
         let ulid1 = Ulid::new();
         let ulid2 = Ulid::new();
 
-        idx.upsert_redirect("titre-a", &ulid1, 1_000)
+        idx.upsert_redirect("main", "titre-a", &ulid1, 1_000)
             .await
             .expect("upsert 1");
-        idx.upsert_redirect("titre-a", &ulid2, 2_000)
+        idx.upsert_redirect("main", "titre-a", &ulid2, 2_000)
             .await
             .expect("upsert 2 — replace");
 
         let found = idx
-            .lookup_redirect("titre-a")
+            .lookup_redirect("main", "titre-a")
             .await
             .expect("lookup_redirect ne doit pas échouer");
         assert_eq!(found, Some(ulid2), "le second upsert remplace le premier");

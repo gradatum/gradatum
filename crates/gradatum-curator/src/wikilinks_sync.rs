@@ -1,34 +1,34 @@
-//! Résolution synchrone des wikilinks — variante inline déterministe pour
-//! les contextes sans runtime async (admin backfill, tests unitaires).
+//! Synchronous wikilink resolution — a deterministic inline variant for contexts with no
+//! async runtime (admin backfill, unit tests).
 //!
-//! Réutilise la sémantique de [`crate::wikilinks::extract_wikilinks`],
-//! [`crate::wikilinks::parse_ulid_target`] et
-//! [`gradatum_core::project_map::reserved_node_target`] sans I/O ni trait HTTP.
+//! Reuses the semantics of [`crate::wikilinks::extract_wikilinks`],
+//! [`crate::wikilinks::parse_ulid_target`] and
+//! [`gradatum_core::project_map::reserved_node_target`], with no I/O and no HTTP trait.
 //!
-//! ## Différence avec `resolve_wikilinks_via_client`
+//! ## Difference with `resolve_wikilinks_via_client`
 //!
-//! La version async du worker envoie des requêtes HTTP vers `/internal/v1/id-lookup`
-//! et `/internal/v1/title-lookup`. Cette version reçoit deux closures `FnMut` et
-//! résout directement — utile dans `spawn_blocking` (admin) où instancier un
-//! runtime tokio serait un anti-pattern.
+//! The worker's async version issues HTTP requests to `/internal/v1/id-lookup` and
+//! `/internal/v1/title-lookup`. This version takes two `FnMut` closures and resolves
+//! directly — useful inside `spawn_blocking` (admin path), where spinning up a Tokio
+//! runtime would be an anti-pattern.
 
-/// Résout les wikilinks `[[...]]` du `body` de façon **synchrone**.
+/// Resolves the `[[...]]` wikilinks of `body` **synchronously**.
 ///
-/// Applique exactement la même sémantique que `resolve_wikilinks_via_client` :
-/// 1. Nœuds réservés (`project:` / `status:` / `kind:` / `version:`) → arête
-///    synthétique directe via [`gradatum_core::project_map::reserved_node_target`].
-/// 2. Cibles ULID (`section:ULID` ou ULID nu) → appel `id_lookup_fn(tenant, ulid_str)`.
-/// 3. Autres (titre libre) → appel `title_lookup_fn(tenant, target)`.
+/// Applies exactly the same semantics as `resolve_wikilinks_via_client`:
+/// 1. reserved nodes (`project:` / `status:` / `kind:` / `version:`) become a direct
+///    synthetic edge via [`gradatum_core::project_map::reserved_node_target`];
+/// 2. ULID targets (`section:ULID` or a bare ULID) call `id_lookup_fn(tenant, ulid_str)`;
+/// 3. anything else (a free-form title) calls `title_lookup_fn(tenant, target)`.
 ///
-/// # Retour
+/// # Returns
 ///
-/// Paires `(src_note_id, dst)`. Liens non résolus (lookup retourne `None`) sont
-/// silencieusement ignorés (comportement non-fatal identique à la version async).
+/// `(src_note_id, dst)` pairs. Unresolved links — where the lookup returns `None` — are
+/// silently skipped, the same non-fatal behaviour as the async version.
 ///
-/// # Errors
+/// # Failure handling
 ///
-/// Les erreurs des closures sont propagées comme `None` (loggées en `warn`) —
-/// comportement identique à la version async (`resolve_wikilinks_via_client` non-fatal).
+/// Closure failures are surfaced as `None`, logged at `warn` level and skipped; this
+/// function never returns an error, matching the non-fatal async version.
 #[must_use]
 pub fn resolve_wikilinks_sync(
     tenant: &str,
@@ -57,7 +57,7 @@ pub fn resolve_wikilinks_sync(
                     src_note_id,
                     target,
                     ulid = %ulid_str,
-                    "resolve_wikilinks_sync: id_lookup retourne None — lien ignoré"
+                    "resolve_wikilinks_sync: id_lookup returns None — link ignored"
                 );
             }
             continue;
@@ -70,7 +70,7 @@ pub fn resolve_wikilinks_sync(
             tracing::warn!(
                 src_note_id,
                 target,
-                "resolve_wikilinks_sync: title_lookup retourne None — lien ignoré"
+                "resolve_wikilinks_sync: title_lookup returns None — link ignored"
             );
         }
     }

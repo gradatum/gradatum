@@ -145,23 +145,49 @@ async fn golden_semantic_order_is_stable() {
     let dim: u16 = 3;
 
     // ALPHA : [1.0, 0.0, 0.0] — cosine 1.0 avec query identique
-    idx.insert_note_embedding(&note_alpha, "golden-embedder", dim, &[1.0f32, 0.0, 0.0])
-        .await
-        .unwrap();
+    idx.insert_note_embedding(
+        "main",
+        &note_alpha,
+        "golden-embedder",
+        dim,
+        &[1.0f32, 0.0, 0.0],
+    )
+    .await
+    .unwrap();
 
     // BETA : [0.0, 1.0, 0.0] — cosine 0.0 (orthogonal à query)
-    idx.insert_note_embedding(&note_beta, "golden-embedder", dim, &[0.0f32, 1.0, 0.0])
-        .await
-        .unwrap();
+    idx.insert_note_embedding(
+        "main",
+        &note_beta,
+        "golden-embedder",
+        dim,
+        &[0.0f32, 1.0, 0.0],
+    )
+    .await
+    .unwrap();
 
     // GAMMA : [0.6, 0.8, 0.0] — norme ≈ 1.0, cosine 0.6 avec query
-    idx.insert_note_embedding(&note_gamma, "golden-embedder", dim, &[0.6f32, 0.8, 0.0])
-        .await
-        .unwrap();
+    idx.insert_note_embedding(
+        "main",
+        &note_gamma,
+        "golden-embedder",
+        dim,
+        &[0.6f32, 0.8, 0.0],
+    )
+    .await
+    .unwrap();
 
     // Query vers [1.0, 0.0, 0.0] → ALPHA cosine 1.0, GAMMA cosine 0.6, BETA cosine 0.0
     let results = idx
-        .search_semantic("main", "golden-embedder", &[1.0f32, 0.0, 0.0], 3, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "golden-embedder",
+            &[1.0f32, 0.0, 0.0],
+            3,
+            None,
+        )
         .await
         .unwrap();
 

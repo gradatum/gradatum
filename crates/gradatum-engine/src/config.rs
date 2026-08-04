@@ -4,9 +4,9 @@
 //!
 //! 1. Local TOML file (`EngineConfig::load_local(path)`) via figment.
 //! 2. Environment variables prefixed with `GRADATUM_ENGINE_` (override).
-//! 3. Central source `/api/v1/config/:binary` = deferred figment provider
-//!    (endpoint not implemented by design in v0.x — deferred to a future config-central
-//!    phase; the `load_local` path is the only supported source).
+//! 3. Central source `/api/v1/config/:binary` = deferred figment provider. The endpoint
+//!    is deliberately not implemented; the `load_local` path is the only supported
+//!    source.
 //!
 //! ## Security
 //!
@@ -47,6 +47,69 @@ pub enum RuntimeKind {
     LlamaServer,
     /// ONNX Runtime backend — deferred (design-only).
     Onnx,
+}
+
+/// Speculative-decoding strategy passed to `llama-server` via `--spec-type`.
+///
+/// Closed set mirroring the `llama-server` `--spec-type` accepted values. Deserialization
+/// rejects any value outside this set (serde "unknown variant" error listing the valid set),
+/// so no separate string validation is needed — this is the same closed-set-as-enum pattern
+/// as [`ModelKind`] and [`RuntimeKind`].
+///
+/// - `Draft*` variants drive draft-model speculative decoding and **require** a companion
+///   [`EngineConfig::draft_model_path`] (checked by [`EngineConfig::validate`]).
+/// - `Ngram*` variants are self-contained (n-gram based) and must **not** carry a draft
+///   model — supplying one is rejected as dead configuration.
+///
+/// `--spec-type` is intentionally excluded from `ALLOWED_EXTRA_FLAGS`: the strategy must be
+/// configured through this dedicated field, never via `extra_args`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub enum SpecType {
+    /// Draft-model speculative decoding, simple strategy.
+    #[serde(rename = "draft-simple")]
+    DraftSimple,
+    /// Draft-model speculative decoding, EAGLE-3 strategy.
+    #[serde(rename = "draft-eagle3")]
+    DraftEagle3,
+    /// Draft-model speculative decoding, Multi-Token-Prediction (MTP) strategy.
+    #[serde(rename = "draft-mtp")]
+    DraftMtp,
+    /// N-gram lookup, simple strategy (no draft model).
+    #[serde(rename = "ngram-simple")]
+    NgramSimple,
+    /// N-gram map, key strategy (no draft model).
+    #[serde(rename = "ngram-map-k")]
+    NgramMapK,
+    /// N-gram map, key-4-value strategy (no draft model).
+    #[serde(rename = "ngram-map-k4v")]
+    NgramMapK4v,
+    /// N-gram modulo strategy (no draft model).
+    #[serde(rename = "ngram-mod")]
+    NgramMod,
+    /// N-gram cache strategy (no draft model).
+    #[serde(rename = "ngram-cache")]
+    NgramCache,
+}
+
+impl SpecType {
+    /// Canonical `--spec-type` argument value (inverse of the serde rename).
+    pub(crate) fn as_arg(&self) -> &'static str {
+        match self {
+            Self::DraftSimple => "draft-simple",
+            Self::DraftEagle3 => "draft-eagle3",
+            Self::DraftMtp => "draft-mtp",
+            Self::NgramSimple => "ngram-simple",
+            Self::NgramMapK => "ngram-map-k",
+            Self::NgramMapK4v => "ngram-map-k4v",
+            Self::NgramMod => "ngram-mod",
+            Self::NgramCache => "ngram-cache",
+        }
+    }
+
+    /// `true` for the `draft-*` strategies, which require a separate draft model.
+    fn requires_draft_model(&self) -> bool {
+        matches!(self, Self::DraftSimple | Self::DraftEagle3 | Self::DraftMtp)
+    }
 }
 
 /// Configuration for a `gradatum-engine` instance.
@@ -108,7 +171,9 @@ pub struct EngineConfig {
     ///
     /// - `Some(url)`: the engine builds an `HttpEventSink` and posts events to
     ///   `{url}/api/v1/event-log`. The URL is validated by `validate_loopback_url`
-    ///   (anti-SSRF: loopback or validated unicast) — this validation is performed at
+    ///   (anti-SSRF: **loopback only** — a literal IP must satisfy `is_loopback()`, and a
+    ///   hostname must resolve to loopback addresses exclusively. A routable unicast
+    ///   address is rejected) — this validation is performed at
     ///   **binary startup** (`bin/gradatum-engine.rs`), not by [`EngineConfig::validate`]
     ///   (which validates `model_path` and `bind_addr` only).
     /// - `None`: the engine uses an `InMemorySink` (test/dev sink, no POST).
@@ -175,6 +240,81 @@ pub struct EngineConfig {
     /// `ALLOWED_EXTRA_FLAGS` — vision must be configured through this dedicated field.
     #[serde(default)]
     pub mmproj_path: Option<PathBuf>,
+
+    /// Speculative-decoding draft model (GGUF), injected as `--spec-draft-model <path>`.
+    ///
+    /// `None` = no draft-model speculative decoding. When `Some`, the path is canonicalized
+    /// and validated under `/opt/gradatum/models/` by [`EngineConfig::validate`] (same
+    /// constraint as `model_path`/`mmproj_path`).
+    ///
+    /// Coherence with [`Self::spec_type`] is enforced by `validate()`: it must be present
+    /// **iff** `spec_type` is a `draft-*` variant.
+    ///
+    /// **Runtime requirement**: `--spec-draft-model` (and the `draft-*` strategies) require
+    /// `llama-server` ≥ b9780. Older builds do **not** support draft-model speculative
+    /// decoding — a `draft-*` config against such a build makes the child crash-loop within
+    /// the bounded restart budget with no cause visible on the engine side.
+    ///
+    /// **Never via `extra_args`**: `--spec-draft-model` is intentionally excluded from
+    /// `ALLOWED_EXTRA_FLAGS`.
+    #[serde(default)]
+    pub draft_model_path: Option<String>,
+
+    /// Speculative-decoding strategy, injected as `--spec-type <value>`.
+    ///
+    /// `None` = no speculative decoding. See [`SpecType`] for the closed set of accepted
+    /// values (deserialization rejects anything else). Coherence with
+    /// [`Self::draft_model_path`] is enforced by [`EngineConfig::validate`].
+    ///
+    /// **Runtime requirement**: the `draft-*` variants require `llama-server` ≥ b9780. Older
+    /// builds only support the `ngram-*` variants — a `draft-*` config against such a build
+    /// makes the child crash-loop within the bounded restart budget with no cause visible on
+    /// the engine side.
+    ///
+    /// **Never via `extra_args`**: `--spec-type` is intentionally excluded from
+    /// `ALLOWED_EXTRA_FLAGS`.
+    #[serde(default)]
+    pub spec_type: Option<SpecType>,
+
+    /// Maximum number of speculative draft tokens, injected as `--spec-draft-n-max <n>`.
+    ///
+    /// `None` = the `llama-server` default: behaviour is unchanged, bit-for-bit identical
+    /// to omitting the flag. When `Some(n)`, tunes how many tokens the speculation
+    /// proposes per step.
+    ///
+    /// **Model-agnostic**: this is a generic speculation knob — no per-model logic. The optimal
+    /// value depends on the draft-model acceptance profile and is chosen by the operator via
+    /// config, never hard-coded here.
+    ///
+    /// Coherence with [`Self::spec_type`] is enforced by [`EngineConfig::validate`]: `Some(n)`
+    /// requires `spec_type` to be set (a draft-token budget with no speculation strategy would be
+    /// dead config), and `n` must be within `1..=16` (generic safety bounds, not a model value).
+    ///
+    /// **Never via `extra_args`**: `--spec-draft-n-max` is intentionally excluded from
+    /// `ALLOWED_EXTRA_FLAGS` — it must go through this dedicated field.
+    #[serde(default)]
+    pub spec_draft_n_max: Option<u32>,
+
+    /// Minimum draft-token probability for speculative decoding, injected as
+    /// `--spec-draft-p-min <p>`.
+    ///
+    /// `None` = the `llama-server` default: behaviour is unchanged, bit-for-bit identical
+    /// to omitting the flag. When `Some(p)`, draft tokens whose greedy probability falls
+    /// below `p` are pruned before verification (confidence-based pruning).
+    ///
+    /// **Model-agnostic**: this is a generic speculation knob — no per-model logic. The optimal
+    /// value depends on the draft-model confidence profile and is chosen by the operator via
+    /// config, never hard-coded here.
+    ///
+    /// Coherence with [`Self::spec_type`] is enforced by [`EngineConfig::validate`]: `Some(p)`
+    /// requires `spec_type` to be set (a pruning threshold with no speculation strategy would be
+    /// dead config), and `p` must be finite and within `0.0..=1.0` (a probability; `NaN` and
+    /// out-of-range values are rejected).
+    ///
+    /// **Never via `extra_args`**: `--spec-draft-p-min` is intentionally excluded from
+    /// `ALLOWED_EXTRA_FLAGS` — it must go through this dedicated field.
+    #[serde(default)]
+    pub spec_draft_p_min: Option<f32>,
 
     /// `llama-server` startup timeout in seconds.
     ///
@@ -320,6 +460,111 @@ fn validate_model_prefix(path: &std::path::Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Validates the coherence between `spec_type` and `draft_model_path` (pure, no filesystem).
+///
+/// Enforces the biconditional "a draft model is present **iff** the strategy is `draft-*`",
+/// which rules out silently-ignored (dead) configuration:
+///
+/// - `spec_type` is `draft-*` but no `draft_model_path` → error (draft strategy needs a model).
+/// - `draft_model_path` is set but `spec_type` is `None` → error (strictest choice — no
+///   implicit `draft-simple` default).
+/// - `draft_model_path` is set but `spec_type` is an `ngram-*` variant → error (the draft
+///   model would never be used).
+///
+/// `ngram-*` without a draft model, and both `None`, are valid.
+///
+/// # Errors
+/// Returns `anyhow::Error` with an explanatory message on any incoherent combination.
+fn validate_spec_decoding(
+    spec_type: Option<&SpecType>,
+    draft_model_path: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    match (spec_type, draft_model_path.is_some()) {
+        (Some(st), false) if st.requires_draft_model() => anyhow::bail!(
+            "spec_type '{}' requires draft_model_path to be set (draft-* strategies need a draft model)",
+            st.as_arg()
+        ),
+        (None, true) => anyhow::bail!(
+            "draft_model_path is set but spec_type is missing — \
+             set spec_type to a draft-* value or remove draft_model_path"
+        ),
+        (Some(st), true) if !st.requires_draft_model() => anyhow::bail!(
+            "draft_model_path is set but spec_type '{}' does not use a draft model — \
+             remove draft_model_path or select a draft-* spec_type",
+            st.as_arg()
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Validates the speculative draft-token budget `spec_draft_n_max` (pure, no filesystem).
+///
+/// Generic, model-agnostic bounds — no per-model value is baked in:
+///
+/// - `Some(n)` while `spec_type` is `None` → error (a draft-token budget with no speculation
+///   strategy is silently-ignored dead config).
+/// - `n` outside `1..=16` → error (`0` disables speculation implicitly, which must instead be
+///   expressed by leaving `spec_type` unset; the upper cap is a generic anti-footgun bound).
+///
+/// `None` (any `spec_type`) is valid → the `llama-server` default applies unchanged.
+///
+/// # Errors
+/// Returns `anyhow::Error` with an explanatory message on any incoherent combination.
+fn validate_spec_draft_n_max(
+    spec_type: Option<&SpecType>,
+    n_max: Option<u32>,
+) -> Result<(), anyhow::Error> {
+    let Some(n) = n_max else {
+        return Ok(());
+    };
+    if spec_type.is_none() {
+        anyhow::bail!(
+            "spec_draft_n_max is set but spec_type is missing — \
+             set spec_type to enable speculation or remove spec_draft_n_max"
+        );
+    }
+    if !(1..=16).contains(&n) {
+        anyhow::bail!(
+            "spec_draft_n_max {n} is out of range (allowed: 1..=16); \
+             leave spec_type unset to disable speculation instead of using 0"
+        );
+    }
+    Ok(())
+}
+
+/// Validates the speculative draft-token pruning threshold `spec_draft_p_min` (pure, no fs).
+///
+/// Generic, model-agnostic bounds — no per-model value is baked in:
+///
+/// - `Some(p)` while `spec_type` is `None` → error (a pruning threshold with no speculation
+///   strategy is silently-ignored dead config).
+/// - `p` non-finite (`NaN`, `±∞`) or outside `0.0..=1.0` → error (`p` is a probability).
+///
+/// `None` (any `spec_type`) is valid → the `llama-server` default applies unchanged.
+///
+/// # Errors
+/// Returns `anyhow::Error` with an explanatory message on any incoherent combination.
+fn validate_spec_draft_p_min(
+    spec_type: Option<&SpecType>,
+    p_min: Option<f32>,
+) -> Result<(), anyhow::Error> {
+    let Some(p) = p_min else {
+        return Ok(());
+    };
+    if spec_type.is_none() {
+        anyhow::bail!(
+            "spec_draft_p_min is set but spec_type is missing — \
+             set spec_type to enable speculation or remove spec_draft_p_min"
+        );
+    }
+    if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+        anyhow::bail!(
+            "spec_draft_p_min {p} is invalid (must be a finite probability in 0.0..=1.0)"
+        );
+    }
+    Ok(())
+}
+
 /// Checks constraints on an IPv4 address (internal helper).
 ///
 /// `display` is the textual representation of the original address (may be an
@@ -385,6 +630,15 @@ impl EngineConfig {
             validate_model_prefix(mmproj).map_err(|e| anyhow::anyhow!("mmproj_path : {e}"))?;
         }
 
+        // --- speculative decoding: coherence first (cheap, no fs), then path prefix ---
+        validate_spec_decoding(self.spec_type.as_ref(), self.draft_model_path.as_deref())?;
+        validate_spec_draft_n_max(self.spec_type.as_ref(), self.spec_draft_n_max)?;
+        validate_spec_draft_p_min(self.spec_type.as_ref(), self.spec_draft_p_min)?;
+        if let Some(draft) = &self.draft_model_path {
+            validate_model_prefix(std::path::Path::new(draft))
+                .map_err(|e| anyhow::anyhow!("draft_model_path : {e}"))?;
+        }
+
         // --- bind_addr: fail-closed ---
         if let Some(addr) = self.bind_addr {
             validate_bind_addr(addr)?;
@@ -412,8 +666,8 @@ impl EngineConfig {
     /// Loads the config from a local TOML file and overrides from `GRADATUM_ENGINE_*` env vars.
     ///
     /// Uses figment to load the local TOML file. The central source
-    /// (`/api/v1/config/:binary`) is a deferred figment provider (not implemented
-    /// by design in v0.x — deferred to a future config-central phase).
+    /// (`/api/v1/config/:binary`) is a deferred figment provider and is deliberately not
+    /// implemented.
     ///
     /// **Security note**: this method only parses and deserializes. It does NOT validate
     /// `model_path`. Call [`EngineConfig::validate()`] afterwards for path and bind-address
@@ -885,6 +1139,262 @@ mmproj_path = "/opt/gradatum/models/mmproj-F16.gguf"
         assert!(
             result.is_err(),
             "validate_model_prefix doit rejeter un chemin hors /opt/gradatum/models/"
+        );
+    }
+
+    // --- speculative decoding (spec_type / draft_model_path) ---
+
+    #[test]
+    fn parses_spec_type_and_draft_model_path() {
+        let toml = r#"
+[engine]
+model_path       = "/opt/gradatum/models/qwen3-27b.gguf"
+model_kind       = "chat"
+port             = 8080
+spec_type        = "draft-mtp"
+draft_model_path = "/opt/gradatum/models/qwen3-0.6b-draft.gguf"
+"#;
+        let c = EngineConfig::from_toml(toml).unwrap();
+        assert_eq!(
+            c.spec_type,
+            Some(SpecType::DraftMtp),
+            "spec_type draft-mtp parsé"
+        );
+        assert_eq!(
+            c.draft_model_path.as_deref(),
+            Some("/opt/gradatum/models/qwen3-0.6b-draft.gguf"),
+            "draft_model_path parsé"
+        );
+    }
+
+    #[test]
+    fn spec_fields_default_is_none() {
+        let toml = "[engine]\nmodel_path=\"x\"\nmodel_kind=\"chat\"\nport=11435\n";
+        let c = EngineConfig::from_toml(toml).unwrap();
+        assert!(
+            c.spec_type.is_none(),
+            "défaut spec_type = None (rétrocompat)"
+        );
+        assert!(
+            c.draft_model_path.is_none(),
+            "défaut draft_model_path = None (rétrocompat)"
+        );
+        assert!(
+            c.spec_draft_n_max.is_none(),
+            "défaut spec_draft_n_max = None (rétrocompat)"
+        );
+        assert!(
+            c.spec_draft_p_min.is_none(),
+            "défaut spec_draft_p_min = None (rétrocompat)"
+        );
+    }
+
+    #[test]
+    fn parses_spec_draft_p_min() {
+        let toml = "[engine]\nmodel_path=\"x\"\nmodel_kind=\"chat\"\nport=1\nspec_type=\"draft-mtp\"\ndraft_model_path=\"/opt/gradatum/models/d.gguf\"\nspec_draft_p_min=0.75\n";
+        let c = EngineConfig::from_toml(toml).unwrap();
+        assert_eq!(
+            c.spec_draft_p_min,
+            Some(0.75),
+            "spec_draft_p_min=0.75 parsé"
+        );
+    }
+
+    #[test]
+    fn spec_draft_p_min_with_spec_type_ok() {
+        // Bornes incluses 0.0 et 1.0 valides quand spec_type est défini.
+        for p in [0.0_f32, 0.5, 1.0] {
+            assert!(
+                validate_spec_draft_p_min(Some(&SpecType::DraftMtp), Some(p)).is_ok(),
+                "spec_draft_p_min={p} avec spec_type défini → OK"
+            );
+        }
+        // None (avec ou sans spec_type) est toujours valide.
+        assert!(
+            validate_spec_draft_p_min(Some(&SpecType::NgramSimple), None).is_ok(),
+            "spec_draft_p_min=None → OK (défaut llama-server)"
+        );
+        assert!(
+            validate_spec_draft_p_min(None, None).is_ok(),
+            "les deux None → OK"
+        );
+    }
+
+    #[test]
+    fn spec_draft_p_min_without_spec_type_rejected() {
+        let result = validate_spec_draft_p_min(None, Some(0.5));
+        assert!(
+            result.is_err(),
+            "spec_draft_p_min sans spec_type doit être rejeté (config morte)"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("spec_type"),
+            "message doit citer spec_type"
+        );
+    }
+
+    #[test]
+    fn spec_draft_p_min_out_of_range_or_nan_rejected() {
+        // Hors bornes 0.0..=1.0 + NaN + infini.
+        for p in [-0.1_f32, 1.1, f32::NAN, f32::INFINITY] {
+            assert!(
+                validate_spec_draft_p_min(Some(&SpecType::DraftMtp), Some(p)).is_err(),
+                "spec_draft_p_min={p} doit être rejeté (borne/finitude)"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_spec_draft_n_max() {
+        let toml = "[engine]\nmodel_path=\"x\"\nmodel_kind=\"chat\"\nport=1\nspec_type=\"draft-mtp\"\ndraft_model_path=\"/opt/gradatum/models/d.gguf\"\nspec_draft_n_max=2\n";
+        let c = EngineConfig::from_toml(toml).unwrap();
+        assert_eq!(c.spec_draft_n_max, Some(2), "spec_draft_n_max=2 parsé");
+    }
+
+    #[test]
+    fn spec_draft_n_max_with_spec_type_ok() {
+        // Bornes incluses 1 et 16 valides quand spec_type est défini.
+        for n in [1_u32, 8, 16] {
+            assert!(
+                validate_spec_draft_n_max(Some(&SpecType::DraftMtp), Some(n)).is_ok(),
+                "spec_draft_n_max={n} avec spec_type défini → OK"
+            );
+        }
+        // None (avec ou sans spec_type) est toujours valide.
+        assert!(
+            validate_spec_draft_n_max(Some(&SpecType::NgramSimple), None).is_ok(),
+            "spec_draft_n_max=None → OK (défaut llama-server)"
+        );
+        assert!(
+            validate_spec_draft_n_max(None, None).is_ok(),
+            "les deux None → OK"
+        );
+    }
+
+    #[test]
+    fn spec_draft_n_max_without_spec_type_rejected() {
+        let result = validate_spec_draft_n_max(None, Some(2));
+        assert!(
+            result.is_err(),
+            "spec_draft_n_max sans spec_type doit être rejeté (config morte)"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("spec_type"),
+            "message doit citer spec_type"
+        );
+    }
+
+    #[test]
+    fn spec_draft_n_max_out_of_range_rejected() {
+        // 0 et 17 hors bornes 1..=16.
+        assert!(
+            validate_spec_draft_n_max(Some(&SpecType::DraftMtp), Some(0)).is_err(),
+            "spec_draft_n_max=0 doit être rejeté (borne basse)"
+        );
+        assert!(
+            validate_spec_draft_n_max(Some(&SpecType::DraftMtp), Some(17)).is_err(),
+            "spec_draft_n_max=17 doit être rejeté (borne haute)"
+        );
+    }
+
+    #[test]
+    fn spec_type_ngram_variants_parse() {
+        for (raw, expected) in [
+            ("ngram-simple", SpecType::NgramSimple),
+            ("ngram-map-k", SpecType::NgramMapK),
+            ("ngram-map-k4v", SpecType::NgramMapK4v),
+            ("ngram-mod", SpecType::NgramMod),
+            ("ngram-cache", SpecType::NgramCache),
+            ("draft-simple", SpecType::DraftSimple),
+            ("draft-eagle3", SpecType::DraftEagle3),
+        ] {
+            let toml = format!(
+                "[engine]\nmodel_path=\"x\"\nmodel_kind=\"chat\"\nport=1\nspec_type=\"{raw}\"\n"
+            );
+            let c = EngineConfig::from_toml(&toml).unwrap();
+            assert_eq!(c.spec_type, Some(expected), "spec_type '{raw}' parsé");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_spec_type() {
+        let toml =
+            "[engine]\nmodel_path=\"x\"\nmodel_kind=\"chat\"\nport=1\nspec_type=\"draft-bogus\"\n";
+        assert!(
+            EngineConfig::from_toml(toml).is_err(),
+            "spec_type hors ensemble fermé doit être rejeté à la désérialisation"
+        );
+    }
+
+    #[test]
+    fn spec_decoding_coherent_combinations_ok() {
+        // Aucun spec.
+        assert!(
+            validate_spec_decoding(None, None).is_ok(),
+            "les deux None → OK"
+        );
+        // ngram-* sans draft model.
+        assert!(
+            validate_spec_decoding(Some(&SpecType::NgramSimple), None).is_ok(),
+            "ngram-* sans draft model → OK"
+        );
+        // draft-* AVEC draft model.
+        assert!(
+            validate_spec_decoding(
+                Some(&SpecType::DraftMtp),
+                Some("/opt/gradatum/models/d.gguf")
+            )
+            .is_ok(),
+            "draft-* + draft model → OK"
+        );
+    }
+
+    #[test]
+    fn spec_decoding_draft_without_model_rejected() {
+        let result = validate_spec_decoding(Some(&SpecType::DraftMtp), None);
+        assert!(
+            result.is_err(),
+            "draft-mtp sans draft_model_path doit être rejeté"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("draft-mtp"),
+            "message doit citer la stratégie"
+        );
+    }
+
+    #[test]
+    fn spec_decoding_model_without_spec_type_rejected() {
+        let result = validate_spec_decoding(None, Some("/opt/gradatum/models/d.gguf"));
+        assert!(
+            result.is_err(),
+            "draft_model_path sans spec_type doit être rejeté (choix strict)"
+        );
+    }
+
+    #[test]
+    fn spec_decoding_model_with_ngram_rejected() {
+        // draft model fourni avec une stratégie ngram-* = config morte → rejet.
+        let result = validate_spec_decoding(
+            Some(&SpecType::NgramCache),
+            Some("/opt/gradatum/models/d.gguf"),
+        );
+        assert!(
+            result.is_err(),
+            "draft_model_path + ngram-* doit être rejeté (draft model jamais utilisé)"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_draft_model_path_outside_prefix() {
+        // Même garantie que mmproj : un draft_model_path hors /opt/gradatum/models/ est rejeté.
+        // On teste la fonction de validation de préfixe directement (model_path 'x' échouerait avant).
+        let draft = "/tmp/gradatum-engine-draft-test.gguf";
+        let _ = std::fs::write(draft, b"fake");
+        let result = super::validate_model_prefix(std::path::Path::new(draft));
+        let _ = std::fs::remove_file(draft);
+        assert!(
+            result.is_err(),
+            "validate_model_prefix doit rejeter un draft_model_path hors /opt/gradatum/models/"
         );
     }
 

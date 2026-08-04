@@ -72,7 +72,7 @@ impl InternalClient for TestClient {
 
         let frontmatter = Frontmatter {
             schema_version: 1,
-            vault_id: VaultId::new(&req.tenant_id),
+            vault_id: VaultId::new(req.tenant_id.as_str()),
             locus: None,
             section,
             status,
@@ -126,7 +126,7 @@ impl InternalClient for TestClient {
         let note_id = NoteId(note_ulid);
 
         self.index
-            .insert_note_embedding(&note_id, &req.embedder_id, req.dim, &req.vector)
+            .insert_note_embedding("main", &note_id, &req.embedder_id, req.dim, &req.vector)
             .await
             .map_err(|e| InternalClientError::ServerError {
                 status: 500,
@@ -154,11 +154,30 @@ impl InternalClient for TestClient {
         unimplemented!()
     }
 
-    async fn delete_note(&self, _ulid: &str) -> Result<(), InternalClientError> {
+    async fn delete_note(&self, _vault_id: &str, _ulid: &str) -> Result<(), InternalClientError> {
         unimplemented!()
     }
 
-    async fn get_note(&self, ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+    async fn get_note_status(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<Option<String>, InternalClientError> {
+        self.index
+            .get_note_status(vault_id, ulid)
+            .await
+            .map(|opt| opt.map(|s| s.to_string()))
+            .map_err(|e| InternalClientError::ServerError {
+                status: 500,
+                body: format!("{e}"),
+            })
+    }
+
+    async fn get_note(
+        &self,
+        _vault_id: &str,
+        ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError> {
         use gradatum_core::identity::NoteId;
         use ulid::Ulid;
 
@@ -194,13 +213,14 @@ impl InternalClient for TestClient {
 
     async fn get_note_embedding(
         &self,
+        _vault_id: &str,
         _ulid: &str,
         _embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
         unimplemented!()
     }
 
-    async fn get_trust(&self, _ulid: &str) -> Result<f32, InternalClientError> {
+    async fn get_trust(&self, _vault_id: &str, _ulid: &str) -> Result<f32, InternalClientError> {
         unimplemented!()
     }
 
@@ -310,7 +330,7 @@ fn encode_write_payload(title: &str, body: &str, section_hint: Option<&str>) -> 
         author: None,
         tags: vec![],
         section_hint: section_hint.map(|s| s.to_string()),
-        tenant_id: "main".to_string(),
+        tenant_id: Some("main".to_string().into()),
         expected_sha256: None,
         note_id: None,
         occurred_at: None,
@@ -328,7 +348,7 @@ fn encode_write_payload_with_note_id(title: &str, body: &str, note_id: &str) -> 
         author: None,
         tags: vec![],
         section_hint: None,
-        tenant_id: "main".to_string(),
+        tenant_id: Some("main".to_string().into()),
         expected_sha256: None,
         note_id: Some(note_id.to_string()),
         occurred_at: None,
@@ -343,7 +363,7 @@ fn encode_write_payload_with_note_id(title: &str, body: &str, note_id: &str) -> 
 fn encode_classify_payload(note_id: &str) -> Vec<u8> {
     let req = VaultClassifyRequest {
         note_id: note_id.to_string(),
-        tenant_id: "main".to_string(),
+        tenant_id: Some("main".to_string().into()),
     };
     bincode::serde::encode_to_vec(&req, bincode_std()).expect("encode VaultClassifyRequest bincode")
 }
@@ -356,7 +376,7 @@ fn encode_downgrade_payload(note_id: &str, reason: &str) -> Vec<u8> {
         note_id: note_id.to_string(),
         reason: reason.to_string(),
         replaced_by: None,
-        tenant_id: "main".to_string(),
+        tenant_id: Some("main".to_string().into()),
     };
     bincode::serde::encode_to_vec(&req, bincode_std())
         .expect("encode VaultDowngradeRequest bincode")
@@ -559,10 +579,19 @@ struct MockCuratorProcess {
 
 #[async_trait::async_trait]
 impl gradatum_curator::CuratorProcess for MockCuratorProcess {
-    async fn process(&self, _note: gradatum_curator::Note) -> gradatum_curator::CurateOutcome {
+    async fn process_traced(
+        &self,
+        _note: gradatum_curator::Note,
+    ) -> (
+        gradatum_curator::CurateOutcome,
+        gradatum_curator::CurationPath,
+    ) {
         self.call_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.outcome.clone()
+        (
+            self.outcome.clone(),
+            gradatum_curator::CurationPath::FastAdmit,
+        )
     }
 }
 

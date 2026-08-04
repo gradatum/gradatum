@@ -4,12 +4,13 @@
 //! (defined in `sqlite.rs`).
 //!
 //! Exposes: `write_note`, `get_content_hash`, `get_note`, `list_by_status`,
-//! `downgrade_note`, `patch_note_status`, `mark_forgotten`, `unmark_forgotten`, `list_forgotten`.
+//! `downgrade_note`, `patch_note_status`, `mark_forgotten`, `reassert_forgotten`,
+//! `unmark_forgotten`, `list_forgotten`.
 //!
 //! ## Contention
 //!
 //! All three traits (`DocumentStore`, `IndexStore`, `VectorStore`) share a single
-//! `Arc<Mutex<Connection>>` (v0.3.0 design). Physical separation was introduced in v0.4.0.
+//! `Arc<Mutex<Connection>>`.
 
 use async_trait::async_trait;
 
@@ -35,8 +36,12 @@ impl DocumentStore for SqliteIndex {
     }
 
     /// Returns the content hash — delegates to the `get_content_hash` inherent method.
-    async fn get_content_hash(&self, id: NoteId) -> Result<Option<ContentHash>, GradatumError> {
-        self.get_content_hash(id).await
+    async fn get_content_hash(
+        &self,
+        vault_id: &str,
+        id: NoteId,
+    ) -> Result<Option<ContentHash>, GradatumError> {
+        self.get_content_hash(vault_id, id).await
     }
 
     /// Returns the full note record — delegates to `get_note_inner` (concrete method in `queries.rs`).
@@ -62,37 +67,46 @@ impl DocumentStore for SqliteIndex {
     /// Downgrades a note — delegates to `SqliteIndex::downgrade_note`.
     async fn downgrade_note(
         &self,
+        vault: &gradatum_core::scope::AclCheckedVaultId,
         note_id: &NoteId,
         reason: &str,
         replaced_by: Option<&NoteId>,
     ) -> Result<(), GradatumError> {
-        self.downgrade_note(note_id, reason, replaced_by).await
+        self.downgrade_note(vault, note_id, reason, replaced_by)
+            .await
     }
 
     /// Partial status PATCH — delegates to `SqliteIndex::patch_note_status`.
     async fn patch_note_status(
         &self,
+        vault: &gradatum_core::scope::AclCheckedVaultId,
         note_id: &NoteId,
         status: Option<&str>,
         status_reason: Option<&str>,
         replaced_by: Option<&NoteId>,
     ) -> Result<(), GradatumError> {
-        self.patch_note_status(note_id, status, status_reason, replaced_by)
+        self.patch_note_status(vault, note_id, status, status_reason, replaced_by)
             .await
     }
 
     /// Upserts a note title — delegates to `SqliteIndex::upsert_note_title`.
-    async fn upsert_note_title(&self, note_id: &NoteId, title: &str) -> Result<(), GradatumError> {
-        self.upsert_note_title(note_id, title).await
+    async fn upsert_note_title(
+        &self,
+        vault_id: &str,
+        note_id: &NoteId,
+        title: &str,
+    ) -> Result<usize, GradatumError> {
+        self.upsert_note_title(vault_id, note_id, title).await
     }
 
     /// Moves the locus of a note — delegates to `SqliteIndex::update_note_locus`.
     async fn update_note_locus(
         &self,
+        vault: &gradatum_core::scope::AclCheckedVaultId,
         note_id: &NoteId,
         new_locus: &gradatum_core::scope::LocusId,
     ) -> Result<(), GradatumError> {
-        self.update_note_locus(note_id, new_locus).await
+        self.update_note_locus(vault, note_id, new_locus).await
     }
 
     // ── Semantic Forget ───────────────────────────────────────────────────────
@@ -105,6 +119,12 @@ impl DocumentStore for SqliteIndex {
         by: Option<&str>,
     ) -> Result<(), GradatumError> {
         self.mark_forgotten(vault_id, note_id, by).await
+    }
+
+    /// Re-asserts the forgotten mark without touching the audit columns —
+    /// delegates to `SqliteIndex::reassert_forgotten`.
+    async fn reassert_forgotten(&self, vault_id: &str, note_id: &str) -> Result<(), GradatumError> {
+        self.reassert_forgotten(vault_id, note_id).await
     }
 
     /// Clears the forgotten mark — delegates to `SqliteIndex::unmark_forgotten`.

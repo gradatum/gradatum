@@ -2,7 +2,7 @@
 
 > Vault domain logic: write pipeline, lifecycle management, metadata overrides, drift detection, and effective-note cache.
 
-**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -13,8 +13,9 @@ primitives. It owns the full note write pipeline and vault lifecycle.
 Responsibilities:
 
 - **Write pipeline** — computes `ContentHash`, persists the Markdown file via
-  `gradatum-storage`, upserts the note into `gradatum-index`, and enqueues curation and
-  embedding jobs.
+  `gradatum-storage`, and upserts the note into `gradatum-index`. Curation and embedding
+  jobs are enqueued upstream by `gradatum-server` / `gradatum-worker`; this crate depends
+  on no queue and enqueues nothing itself.
 - **Lifecycle** — `Vault::create` / `Vault::open`: initialises vault layout, sets
   `tenant_id`, and wires storage + index handles.
 - **Registry trait** — `Registry` (async trait) decouples the server from the concrete
@@ -32,7 +33,7 @@ Responsibilities:
 
 ```toml
 [dependencies]
-gradatum-vault = "0.7.6"
+gradatum-vault = "1.0.0"
 ```
 
 ```rust

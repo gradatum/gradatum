@@ -2,7 +2,7 @@
 //!
 //! Couvre :
 //! 1. `get_scheduled_unauthenticated_is_401` — auth obligatoire.
-//! 2. `get_scheduled_returns_200_with_8_tasks` — 8 tâches après seed, champs attendus.
+//! 2. `get_scheduled_returns_200_with_9_tasks` — 9 tâches après seed, champs attendus.
 //! 3. `get_scheduled_interval_secs_via_ssot` — interval_secs == task_interval_secs SSOT.
 
 use std::sync::Arc;
@@ -131,21 +131,21 @@ async fn get_scheduled_unauthenticated_is_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// Avec token valide + 8 tâches seedées → 200 avec tableau de 8 tâches.
+/// Avec token valide + 9 tâches seedées → 200 avec tableau de 9 tâches.
 ///
 /// Vérifie :
 /// - HTTP 200
-/// - `tasks` est un tableau de 8 éléments (ALL_SCHEDULED_TASKS)
+/// - `tasks` est un tableau de 9 éléments (ALL_SCHEDULED_TASKS)
 /// - chaque tâche contient les 8 champs attendus
 /// - `last_run_ms` = null (jamais tické), `run_count` = 0, `errors_24h` = 0
 /// - `interval_secs` ≥ 60 (plancher garanti par task_interval_secs)
 /// - tous les noms correspondent à ALL_SCHEDULED_TASKS
 #[tokio::test]
-async fn get_scheduled_returns_200_with_8_tasks() {
+async fn get_scheduled_returns_200_with_9_tasks() {
     let (app, state, idx) = build_app().await;
     let token = sign(&state);
 
-    // Seed des 8 tâches (INSERT OR IGNORE — idempotent).
+    // Seed des 9 tâches (INSERT OR IGNORE — idempotent).
     for task in ALL_SCHEDULED_TASKS {
         idx.seed_scheduled_task(task)
             .await
@@ -162,7 +162,11 @@ async fn get_scheduled_returns_200_with_8_tasks() {
     let tasks = json["tasks"]
         .as_array()
         .expect("tasks doit être un tableau");
-    assert_eq!(tasks.len(), 8, "8 tâches attendues");
+    assert_eq!(
+        tasks.len(),
+        9,
+        "9 tâches attendues (F-51 audit-dedup incluse)"
+    );
 
     // Vérifier que les 7 noms canoniques sont tous présents.
     let names: Vec<&str> = tasks
@@ -248,7 +252,7 @@ async fn get_scheduled_interval_secs_via_ssot() {
     let token = sign(&state);
     let cfg = ServerConfig::default();
 
-    // Seed des 8 tâches.
+    // Seed des 9 tâches.
     for task in ALL_SCHEDULED_TASKS {
         idx.seed_scheduled_task(task)
             .await

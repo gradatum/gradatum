@@ -7,11 +7,14 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "LLM-powered note curation layer: admits, routes, classifies, organises and retires notes within a vault"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-gradatum-core  = { path = "../gradatum-core", version = "0.7.0" }
-gradatum-chat  = { path = "../gradatum-chat", version = "0.7.0" }
-gradatum-index = { path = "../gradatum-index", version = "0.7.0" }
+gradatum-core  = { path = "../gradatum-core", version = "1.0.0" }
+gradatum-chat  = { path = "../gradatum-chat", version = "1.0.0" }
+gradatum-index = { path = "../gradatum-index", version = "1.0.0" }
 async-trait.workspace = true
 chrono.workspace = true
 once_cell.workspace = true

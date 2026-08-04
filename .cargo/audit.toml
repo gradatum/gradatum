@@ -1,0 +1,49 @@
+# Configuration de `cargo audit` (RustSec) — gradatum
+# Lu par cargo-audit 0.22.1 depuis `.cargo/audit.toml` (emplacement vérifié
+# empiriquement le 2026-07-31 : un `audit.toml` à la racine du dépôt N'EST PAS lu,
+# EXIT reste 1 ; seul `.cargo/audit.toml` fait passer le gate à EXIT 0).
+#
+# ── RUSTSEC-2023-0071 / rsa 0.9.10 — Marvin Attack (5.9 medium) ──────────────────
+#
+# Unique exemption de ce fichier, et volontairement la seule. Elle fait taire
+# `cargo audit` — PAS `cargo deny`. Répartition des rôles :
+#   • `cargo audit` lit `Cargo.lock` À PLAT : il signale toute crate présente dans
+#     le lockfile, qu'elle soit compilée ou non. rsa y figure comme simple ligne.
+#   • `cargo deny check` lit le GRAPHE RÉSOLU : il ne voit que ce qui est
+#     effectivement tiré par les features activées.
+# On fait donc taire l'outil qui regarde au mauvais endroit, pas la détection.
+# `deny.toml` ne porte AUCUNE exemption pour rsa (c'est documenté et délibéré,
+# cf. le bloc dédié en bas de `deny.toml`) : si la faille devenait atteignable,
+# c'est `cargo deny` qui partirait ROUGE. La détection reste armée là où elle
+# compte.
+#
+# Inatteignabilité — re-mesurée le 2026-07-31 :
+#   cargo tree -i rsa -e normal                        -> « nothing to print »
+#   cargo tree -i rsa --target all -e normal,build,dev -> « nothing to print »
+#   grep -rn '"mysql"' --include=Cargo.toml .          -> aucune activation
+# rsa n'est dans AUCUN graphe résolu, toutes cibles et tous types d'arêtes
+# confondus. Les deux chemins que `cargo audit` exhibe passent par une feature
+# non sélectionnée :
+#   rsa 0.9.10 → sqlx-mysql 0.8.6 → sqlx-macros-core → … → sqlx 0.8.6 (driver
+#     sqlite seul ; la feature `mysql` de sqlx n'est jamais activée) ;
+#   rsa 0.9.10 → reqsign-google 3.0.3 / reqsign-core 3.2.0 / reqsign-azure-storage
+#     3.1.1 → opendal-service-{gcs,s3,azblob} 0.58.1 → opendal 0.58.1 →
+#     gradatum-storage (backends cloud d'opendal, non activés — seul le service
+#     local est utilisé).
+#
+# Absence de correctif amont : advisory ouverte depuis 2023-11 avec `patched = []`,
+# aucun `rsa` corrigé publié, aucune date annoncée. `cargo audit` rend
+# « Solution: No fixed upgrade is available! ». Sans exemption, le gate resterait
+# ROUGE indéfiniment — le « rouge normalisé » qu'une leçon du dépôt condamne : un
+# job rouge permanent finit par masquer les rouges qui, eux, comptent.
+#
+# Condition de revisite (fait vérifiable, pas intention) — retirer cette entrée dès
+# que L'UN de ces trois faits est vrai :
+#   1. un `rsa` corrigé (advisory `patched` non vide) paraît en amont ;
+#   2. la feature `mysql` de `sqlx` est activée dans un Cargo.toml du workspace ;
+#   3. `cargo tree -i rsa --target all -e normal,build,dev` cesse de rendre
+#      « nothing to print » (rsa entre dans le graphe résolu, p.ex. activation
+#      d'un backend cloud opendal).
+# Dans ces cas, `cargo deny` partira rouge de lui-même : c'est le signal attendu.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

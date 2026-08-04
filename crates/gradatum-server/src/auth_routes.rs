@@ -93,7 +93,10 @@ struct ErrorResponse {
 ///
 /// - `400` if the `Authorization` header is absent or malformed
 /// - `401` if the API key is unknown or revoked
-/// - `403` if the key's `tenant_id` is not `"main"` (mono-vault invariant)
+/// - `403` if the key's tenant is not allowed to mint a JWT :
+///   `multi_tenant.enabled = false` → `tenant_id ≠ "main"` (mono-vault invariant) ;
+///   `enabled = true` → tenant absent de l'allow-list `tenant_vault_grants`
+///   (non provisionné, suspendu, soft-deleted, ou erreur de lookup — fail-closed)
 /// - `500` on internal SQLite or JWT signing error
 pub async fn exchange(
     State(state): State<AppState>,
@@ -108,7 +111,7 @@ pub async fn exchange(
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error:
-                        "Authorization header absent ou format invalide (attendu: Bearer ak_...)",
+                        "Authorization header absent or invalid format (expected: Bearer ak_...)",
                 }),
             )
                 .into_response();
@@ -133,60 +136,79 @@ pub async fn exchange(
     } else {
         &secret[..]
     };
-    tracing::debug!(prefix = %prefix_display, "tentative d'échange API key → JWT");
+    tracing::debug!(prefix = %prefix_display, "API key → JWT exchange attempt");
 
     // Vérification argon2id via le store.
     let key = match state.api_keys.verify(&secret).await {
         Ok(k) => k,
         Err(ApiKeyError::AlreadyRevoked) => {
-            tracing::warn!(prefix = %prefix_display, "tentative d'échange avec clé révoquée");
+            tracing::warn!(prefix = %prefix_display, "exchange attempt with revoked key");
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
-                    error: "clé API invalide ou révoquée",
+                    error: "invalid or revoked API key",
                 }),
             )
                 .into_response();
         }
         Err(ApiKeyError::NotFound) => {
-            tracing::debug!(prefix = %prefix_display, "clé API non trouvée ou secret incorrect");
+            tracing::debug!(prefix = %prefix_display, "API key not found or incorrect secret");
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
-                    error: "clé API invalide ou révoquée",
+                    error: "invalid or revoked API key",
                 }),
             )
                 .into_response();
         }
         Err(e) => {
-            tracing::error!(error = %e, "erreur interne lors de la vérification API key");
+            tracing::error!(error = %e, "internal error during API key verification");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: "erreur interne — réessayer plus tard",
+                    error: "internal error — retry later",
                 }),
             )
                 .into_response();
         }
     };
 
-    // SÉCU P0 cross-tenant (Lot 1) — gate à la source.
-    // Tant que le vault est mono-physique "main", aucun JWT ne doit être émis pour
-    // un tenant ≠ "main". `/auth/exchange` étant l'UNIQUE émetteur de JWT (Path 2),
-    // ce refus garantit qu'aucun bearer non-main ne peut exister dans tout le système
-    // (handlers présents ET futurs). Restrictive-only : zéro impact pour les clés "main".
-    if key.tenant_id != "main" {
+    // Gate tenant à la source — `/auth/exchange` est l'UNIQUE émetteur de JWT (Path 2).
+    //
+    // - `multi_tenant.enabled = false` (défaut, byte-identical) : SÉCU P0 cross-tenant
+    //   (Lot 1) — tant que le vault est mono-physique "main", aucun JWT ne doit être
+    //   émis pour un tenant ≠ "main". Restrictive-only : zéro impact clés "main".
+    // - `enabled = true` (C3a, F-45 identités) : l'émission est gouvernée par la MÊME
+    //   allow-list que le middleware (`tenant_vault_grants`, tenant `active` + ≥1 grant,
+    //   fail-closed sur erreur de lookup) — une clé d'un tenant non provisionné,
+    //   suspendu ou soft-deleted n'obtient jamais de JWT.
+    if state.server_config.multi_tenant.enabled {
+        if !crate::middleware::tenant_grants_authorize(&state, key.tenant_id.as_str()).await {
+            tracing::warn!(
+                owner = %key.owner,
+                tenant = %key.tenant_id,
+                prefix = %prefix_display,
+                "exchange denied: tenant not authorized by grant allow-list (no JWT mint)"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: "tenant not authorized (no active grant) — no JWT minted",
+                }),
+            )
+                .into_response();
+        }
+    } else if key.tenant_id != "main" {
         tracing::warn!(
             owner = %key.owner,
             tenant = %key.tenant_id,
             prefix = %prefix_display,
-            "échange refusé : clé API tenant ≠ main (invariant mono-vault, aucun mint JWT)"
+            "exchange denied: API key tenant ≠ main (mono-vault invariant, no JWT mint)"
         );
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
-                error:
-                    "tenant non supporté (mono-vault v0.4.x) — seul le tenant 'main' est autorisé",
+                error: "unsupported tenant (mono-vault v0.4.x) — only tenant 'main' is allowed",
             }),
         )
             .into_response();
@@ -195,15 +217,21 @@ pub async fn exchange(
     // Signature du token JWT avec le scope sélectionné.
     let token = match state
         .jwt
-        .sign(&key.owner, &key.scopes, token_scope, &key.tenant_id)
-    {
+        // Frontière `JwtService::sign(sub: &str)` — le claim JWT reste `String`
+        // (typage différé, cf. `AgentId`). `as_str` est byte-identical.
+        .sign(
+            key.owner.as_str(),
+            &key.scopes,
+            token_scope,
+            key.tenant_id.as_str(),
+        ) {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!(error = %e, "erreur de signature JWT lors de l'échange");
+            tracing::error!(error = %e, "JWT signature error during exchange");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: "erreur interne — réessayer plus tard",
+                    error: "internal error — retry later",
                 }),
             )
                 .into_response();
@@ -216,7 +244,7 @@ pub async fn exchange(
         prefix = %prefix_display,
         scope = ?token_scope,
         ttl_secs = ttl_secs,
-        "échange API key → JWT réussi"
+        "API key → JWT exchange succeeded"
     );
 
     (
@@ -225,7 +253,9 @@ pub async fn exchange(
             token,
             ttl_secs,
             scopes: key.scopes.clone(),
-            tenant_id: key.tenant_id.clone(),
+            // Frontière DTO (`ExchangeResponse.tenant_id: String`, typage réservé Task 7).
+            // `.to_string()` via `Display` = valeur identique, wire inchangé.
+            tenant_id: key.tenant_id.to_string(),
             kid: state.jwt.kid().to_string(),
         }),
     )

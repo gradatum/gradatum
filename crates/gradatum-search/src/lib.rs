@@ -16,7 +16,7 @@
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee.
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible additions only within `1.x`.
 //! See the [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 
 #![forbid(unsafe_code)]
@@ -37,18 +37,14 @@ pub use rrf::{RrfHit, rrf_fuse};
 
 /// Re-exports multi-factor scoring functions and trust decay utilities.
 pub use scoring::{
-    DEFAULT_TRUST_HALF_LIVES, GAMMA_TRUST, ResolvedWeights, ScoringWeightsWire, TrustDecayConfig,
-    composite_score, composite_score_weighted, composite_score_with_trust, default_half_lives,
-    pagerank_factor, recency_factor, resolve_weights, trust_decay_factor,
+    DEFAULT_TRUST_HALF_LIVES, GAMMA_TRUST, ResolvedWeights, SalienceParams, ScoringWeightsWire,
+    TrustDecayConfig, apply_salience, composite_score, composite_score_weighted,
+    composite_score_with_trust, default_half_lives, pagerank_factor, recency_factor,
+    resolve_weights, salience_factor, salience_weighted_sum, trust_decay_factor,
 };
 
 /// Re-exports the `Reranker` trait and `NoopReranker`.
 pub use reranker::{NoopReranker, Reranker};
-
-/// Re-exports `SqliteIndex` and query types from `gradatum-index`.
-///
-/// `gradatum-server::AppState.search` consumes these types directly.
-pub use gradatum_index::{AuthorRow, Lineage, NoteRecord, SearchHitRaw, SqliteIndex};
 
 /// Crate version (from `workspace.package.version`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

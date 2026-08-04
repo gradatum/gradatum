@@ -53,19 +53,19 @@ use crate::{
     vault_aware::{CostAttribution, make_qa_event},
 };
 
-/// Période d'émission des `ping` SSE pendant l'attente du premier token de l'engine.
+/// Interval between SSE `ping` events while waiting for the backend's first token.
 ///
-/// Maintient la connexion active côté client (Claude Code idle-timeout ~113s) pendant le
-/// prefill d'un gros contexte (~90-110s sur Qwen3-VL-30B). 5s laisse une marge confortable
-/// vis-à-vis du timeout client et d'éventuels proxies intermédiaires.
+/// Keeps the connection alive on the client side during the prefill of a large context,
+/// which can take longer than a typical client idle timeout. Five seconds leaves a
+/// comfortable margin against both the client timeout and any intermediate proxy.
 const SSE_KEEPALIVE_PERIOD: Duration = Duration::from_secs(5);
 
 // ── Enveloppe erreur Anthropic ────────────────────────────────────────────────
 
-/// Corps d'erreur au format Anthropic Messages API.
+/// Error body in Anthropic Messages API format.
 ///
-/// Distinct du format OpenAI `{"error": {...}}` utilisé par les autres routes.
-/// Limité aux routes `/v1/messages*`.
+/// Distinct from the OpenAI `{"error": {...}}` shape used by the other routes; scoped to
+/// the `/v1/messages*` routes.
 #[derive(serde::Serialize)]
 struct AnthropicErrorBody {
     #[serde(rename = "type")]
@@ -80,10 +80,10 @@ struct AnthropicErrorDetail {
     message: String,
 }
 
-/// Mappe un code HTTP vers le `error.type` Anthropic correspondant.
+/// Maps an HTTP status code to the matching Anthropic `error.type` label.
 ///
-/// Partagé entre la réponse d'erreur HTTP ([`anthropic_error_response`]) et l'event SSE
-/// `error` émis en cours de stream (branche stream de [`messages_handler_inner`]).
+/// Shared between the HTTP error response ([`anthropic_error_response`]) and the `error`
+/// SSE event emitted mid-stream by [`messages_handler_inner`].
 fn anthropic_error_type(status_code: u16) -> &'static str {
     match status_code {
         400 => "invalid_request_error",
@@ -96,22 +96,22 @@ fn anthropic_error_type(status_code: u16) -> &'static str {
     }
 }
 
-/// Construit une réponse HTTP avec l'enveloppe d'erreur Anthropic.
+/// Builds an HTTP response carrying the Anthropic error envelope.
 ///
-/// Mapping HTTP status → `error.type` Anthropic :
+/// HTTP status → Anthropic `error.type`:
 /// - 400 → `invalid_request_error`
 /// - 401 → `authentication_error`
 /// - 404 → `not_found_error`
 /// - 413 → `request_too_large`
 /// - 429 → `rate_limit_error`
-/// - 500 → `api_error`
-/// - 503/529 → `overloaded_error`
+/// - 503 / 529 → `overloaded_error`
+/// - any other status → `api_error`
 ///
-/// # Sécurité (V4 — security-reviewer)
-/// `ApiError::AliasNotFound` expose la liste complète des alias dans son `Display` —
-/// ce serait une fuite d'informations de configuration interne vers le client.
-/// La liste n'est PAS transmise au client : seul un message générique est retourné.
-/// Le détail complet reste accessible côté serveur via les traces de l'appelant.
+/// # Security
+/// The `Display` implementation of `ApiError::AliasNotFound` lists every configured alias,
+/// which would leak internal configuration to the client. That list is **not** sent: the
+/// client receives a generic `"model not found"` message, while the full detail stays
+/// server-side in the caller's traces.
 fn anthropic_error_response(api_err: ApiError) -> Response {
     let status_code = api_err.status_code();
     // V4 (security-reviewer P1) : ne pas exposer la liste des alias au client.
@@ -135,22 +135,21 @@ fn anthropic_error_response(api_err: ApiError) -> Response {
 
 // ── Extracteur JSON Anthropic custom ─────────────────────────────────────────
 
-/// Extracteur JSON custom pour les routes `/v1/messages`.
+/// Custom JSON extractor for the `/v1/messages` routes.
 ///
-/// Intercepte les erreurs de désérialisation JSON (body invalide, champ manquant)
-/// qu'Axum transformerait normalement en réponse 422 au format texte, et les
-/// convertit en enveloppe d'erreur Anthropic HTTP 400.
+/// Intercepts JSON deserialization failures (malformed body, missing field) that Axum
+/// would otherwise surface as a plain-text 422, and converts them into an Anthropic error
+/// envelope with HTTP 400.
 ///
-/// # Implémentation
-/// Utilise `Json<T>` d'Axum en interne pour la désérialisation.
-/// En cas d'échec, construit une réponse Anthropic `invalid_request_error`.
+/// Public because it appears in the signature of the public handlers.
 ///
-/// # Sécurité (ADN 5)
-/// Le message d'erreur de serde (détail technique) est transmis tel quel car
-/// il ne contient aucune information de configuration interne — c'est un diagnostic
-/// de parsing du corps de la requête utilisateur.
-/// Extracteur JSON Anthropic — utilisé dans les signatures des handlers `pub`.
-/// `pub` requis pour satisfaire la règle de visibilité Rust (handler pub + extracteur).
+/// # Implementation
+/// Delegates deserialization to Axum's `Json<T>`. On failure, builds an Anthropic
+/// `invalid_request_error` response.
+///
+/// # Security
+/// The serde error message is forwarded verbatim: it is a parse diagnostic about the
+/// caller's own request body and carries no internal configuration detail.
 pub struct AnthropicJson<T>(T);
 
 impl<T, S> FromRequest<S> for AnthropicJson<T>
@@ -180,22 +179,24 @@ where
     }
 }
 
-/// Handler pour `POST /v1/messages`.
+/// Handler for `POST /v1/messages`.
 ///
-/// Deux branches :
-/// - `stream:true`  → SSE Anthropic via `dispatch_stream_with_fallback` + `chunks_to_anthropic_sse`.
-/// - `stream:false` → JSON Anthropic via `dispatch_with_fallback` + `chat_to_anthropic`.
+/// Two branches:
+/// - `stream: true` → Anthropic SSE, via the streaming dispatch path and the SSE state
+///   machine;
+/// - `stream: false` → Anthropic JSON, via the unary dispatch path and response translation.
 ///
-/// Le routage modèle est 100% configurable via `[messages] model_map` + `default_alias`
-/// dans le TOML — aucun nom de modèle n'est codé en dur ici.
+/// Model routing is fully configuration-driven through `[messages] model_map` and
+/// `default_alias` in the TOML file — no model name is hardcoded here.
 ///
-/// Les erreurs sont retournées au format Anthropic `{"type":"error","error":{...}}`
-/// (distinct du format OpenAI des autres routes).
+/// Errors are returned in the Anthropic envelope `{"type":"error","error":{...}}`, distinct
+/// from the OpenAI shape used by the other routes.
 ///
 /// # Errors
-/// - `ApiError::InvalidBody` : corps JSON invalide ou désérialisation impossible.
-///   → 400 enveloppe Anthropic via `AnthropicJson` extracteur.
-/// - Toutes les erreurs de dispatch (Backend, AliasNotFound, etc.).
+/// - A malformed or undeserializable JSON body → HTTP 400 in the Anthropic envelope,
+///   produced by the [`AnthropicJson`] extractor.
+/// - Every dispatch error (backend failure, unknown alias, rate limit, …), rendered in the
+///   same Anthropic envelope.
 #[instrument(skip(state, connect_info, _headers, body), fields(model))]
 pub async fn handler(
     State(state): State<AppState>,
@@ -209,8 +210,8 @@ pub async fn handler(
     }
 }
 
-/// Logique interne du handler `/v1/messages` — retourne `ApiError` pour conversion
-/// vers l'enveloppe Anthropic par `handler`.
+/// Inner logic of the `/v1/messages` handler — returns `ApiError` so that [`handler`]
+/// converts it into the Anthropic error envelope.
 async fn messages_handler_inner(
     state: AppState,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -244,7 +245,7 @@ async fn messages_handler_inner(
         tracing::warn!(
             count = tools.len(),
             max = max_tools,
-            "trop d'outils dans la requête /v1/messages — rejetée HTTP 400"
+            "too many tools in /v1/messages request — rejected HTTP 400"
         );
         return Err(ApiError::TooManyTools {
             count: tools.len(),
@@ -262,7 +263,7 @@ async fn messages_handler_inner(
                 total_tokens = total,
                 cap = cap,
                 model = %body.model,
-                "cap tokens dépassé sur /v1/messages — requête rejetée HTTP 413"
+                "token cap exceeded on /v1/messages — request rejected HTTP 413"
             );
             return Err(ApiError::ContextLengthExceeded { total, cap });
         }
@@ -271,14 +272,14 @@ async fn messages_handler_inner(
     // V3 (security-reviewer P2) — Bornes sur Vec non bornés.
     // L'API Anthropic impose une limite implicite sur ces dimensions.
 
-    /// Nombre maximal de messages par requête (aligné sur les limites Anthropic observées).
+    /// Maximum number of messages accepted in a single request (safety cap).
     const MAX_MESSAGES_PER_REQUEST: usize = 500;
 
     if body.messages.len() > MAX_MESSAGES_PER_REQUEST {
         tracing::warn!(
             count = body.messages.len(),
             max = MAX_MESSAGES_PER_REQUEST,
-            "trop de messages dans la requête /v1/messages — rejetée HTTP 400"
+            "too many messages in /v1/messages request — rejected HTTP 400"
         );
         return Err(ApiError::InvalidBody(format!(
             "messages array exceeds limit: {} > {} (maximum allowed)",
@@ -294,7 +295,7 @@ async fn messages_handler_inner(
             tracing::warn!(
                 count = stop_seqs.len(),
                 max = MAX_STOP_SEQUENCES,
-                "trop de stop_sequences dans la requête /v1/messages — rejetée HTTP 400"
+                "too many stop_sequences in /v1/messages request — rejected HTTP 400"
             );
             return Err(ApiError::InvalidBody(format!(
                 "stop_sequences array exceeds limit: {} > {} (maximum allowed)",
@@ -327,7 +328,7 @@ async fn messages_handler_inner(
             tracing::warn!(
                 model = %body.model,
                 resolved = %resolved_alias_name,
-                "alias Anthropic résolu en '{}' mais introuvable dans la config",
+                "Anthropic alias resolved to '{}' but not found in config",
                 resolved_alias_name,
             );
             ApiError::AliasNotFound {
@@ -419,7 +420,7 @@ async fn messages_handler_inner(
                     tracing::warn!(
                         error = %detail,
                         status,
-                        "dispatch stream /v1/messages échoué — event error SSE (stream déjà ouvert)"
+                        "/v1/messages stream dispatch failed — SSE error event (stream already open)"
                     );
                     (
                         StreamDispatch::Failed {
@@ -472,7 +473,7 @@ async fn messages_handler_inner(
                         error_message,
                     };
                     if let Err(e) = registry.log_request(entry).await {
-                        tracing::warn!("erreur journalisation requête messages (stream): {}", e);
+                        tracing::warn!("messages request logging error (stream): {}", e);
                     }
                 });
             }
@@ -494,7 +495,7 @@ async fn messages_handler_inner(
             .body(Body::from_stream(sse_body))
             .map_err(|e| {
                 ApiError::Backend(crate::commons::error::LlmError::Custom {
-                    message: format!("erreur construction réponse SSE Anthropic: {}", e),
+                    message: format!("Anthropic SSE response construction error: {}", e),
                 })
             })?;
 
@@ -576,7 +577,7 @@ async fn messages_handler_inner(
                     error_message: error_msg,
                 };
                 if let Err(e) = registry.log_request(entry).await {
-                    tracing::warn!("erreur journalisation requête messages: {}", e);
+                    tracing::warn!("messages request logging error: {}", e);
                 }
             });
         }
@@ -587,22 +588,17 @@ async fn messages_handler_inner(
 
         let body_bytes = axum::body::to_bytes(dispatch_response.into_body(), 4 * 1024 * 1024)
             .await
-            .map_err(|e| {
-                ApiError::InvalidBody(format!("impossible de lire la réponse backend: {}", e))
-            })?;
+            .map_err(|e| ApiError::InvalidBody(format!("cannot read backend response: {}", e)))?;
 
         let chat_resp: crate::commons::chat::ChatCompletionResponse =
             serde_json::from_slice(&body_bytes).map_err(|e| {
-                ApiError::InvalidBody(format!(
-                    "impossible de désérialiser la réponse backend: {}",
-                    e
-                ))
+                ApiError::InvalidBody(format!("cannot deserialize backend response: {}", e))
             })?;
 
         // Traduction interne → Anthropic.
         let anthropic_resp =
             translate::chat_to_anthropic(&chat_resp, &model_name).map_err(|e| {
-                ApiError::InvalidBody(format!("erreur traduction réponse vers Anthropic: {}", e))
+                ApiError::InvalidBody(format!("response-to-Anthropic translation error: {}", e))
             })?;
 
         Ok((StatusCode::OK, Json(anthropic_resp)).into_response())
@@ -611,12 +607,13 @@ async fn messages_handler_inner(
 
 // ── Estimation de tokens depuis MessagesRequest ───────────────────────────────
 
-/// Estime le nombre total de tokens d'une `MessagesRequest` Anthropic.
+/// Estimates the total token count of an Anthropic [`MessagesRequest`].
 ///
-/// Heuristique : chars/4 (même logique que `count_tokens_inner`).
-/// Utilisée pour la gate `max_total_tokens` (V2 security-reviewer) AVANT dispatch.
+/// Uses the same `characters / 4` heuristic as the `count_tokens` route. Feeds the
+/// `max_total_tokens` guard, which runs **before** dispatch.
 ///
-/// Inclut `max_tokens` (output budgétaire) pour un total conservateur.
+/// The request's `max_tokens` (the output budget) is included, so the total is
+/// deliberately conservative.
 fn estimate_tokens_from_messages_request(body: &MessagesRequest) -> u64 {
     let mut char_count: usize = 0;
 
@@ -683,41 +680,43 @@ fn estimate_tokens_from_messages_request(body: &MessagesRequest) -> u64 {
 
 // ── count_tokens ─────────────────────────────────────────────────────────────
 
-/// Réponse de `POST /v1/messages/count_tokens`.
+/// Response body of `POST /v1/messages/count_tokens`.
 #[derive(serde::Serialize)]
 struct CountTokensResponse {
     input_tokens: u32,
 }
 
-/// Handler pour `POST /v1/messages/count_tokens`.
+/// Handler for `POST /v1/messages/count_tokens`.
 ///
-/// Estime le nombre de tokens d'entrée sans appeler le backend.
+/// Estimates the input token count without calling any backend.
 ///
-/// # Heuristique (documentée, intentionnellement approchée)
-/// L'estimation est basée sur la règle empirique « 4 caractères ≈ 1 token »
-/// largement utilisée pour les modèles BPE (GPT-*, Claude-*).
-/// Ce n'est pas un tokenizer réel — l'objectif est de fournir un budget indicatif
-/// pour Claude Code, pas un compte exact.
+/// # Heuristic — deliberately approximate
+/// The estimate applies the common `4 characters ≈ 1 token` rule of thumb for BPE
+/// tokenizers. This is **not** a real tokenizer: the goal is to give a client an
+/// indicative budget, not an exact count.
 ///
-/// Composantes additionnées :
-/// 1. Longueur des textes de tous les messages (system inclus)
-/// 2. Longueur des définitions d'outils (nom + description + schema JSON)
+/// Contributions summed before the division:
+/// 1. the text of every message, including `system`;
+/// 2. `256` characters per image block (conservative flat approximation);
+/// 3. the name of every `tool_use` block;
+/// 4. tool definitions — name, description, and the serialized JSON schema.
 ///
-/// Le résultat est arrondi à l'entier supérieur (pas de plancher à 0 si texte vide).
+/// The division rounds up, with a floor of one token whenever any content was counted.
+/// A fully empty request yields `0`.
 ///
-/// # `max_tokens` absent (P1-B fix)
-/// Contrairement à `/v1/messages`, `count_tokens` n'exige PAS `max_tokens`.
-/// On utilise `CountTokensRequest` (DTO dédié sans `max_tokens`) pour accepter les
-/// requêtes conformes à l'API Anthropic count_tokens.
+/// # No `max_tokens` required
+/// Unlike `/v1/messages`, this route does not require `max_tokens`. It therefore
+/// deserializes into [`CountTokensRequest`], a dedicated DTO without that field, so that
+/// requests conforming to the Anthropic `count_tokens` API are accepted as-is.
 ///
-/// # Sécurité (V5 — security-reviewer P1)
-/// Applique le même gate de rate-limiting que `/v1/messages` — sans ça, un client
-/// authentifié pouvait spammer indéfiniment cette route sans contrainte.
+/// # Security
+/// The same rate-limit guard as `/v1/messages` applies; without it, an authenticated
+/// client could call this route without any bound.
 ///
 /// # Errors
-/// - `ApiError::InvalidBody` : corps JSON invalide.
+/// - A malformed JSON body → HTTP 400.
 ///
-/// Les erreurs sont retournées au format Anthropic (enveloppe `{"type":"error",...}`).
+/// Errors use the Anthropic envelope `{"type":"error", ...}`.
 pub async fn count_tokens_handler(
     State(state): State<AppState>,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,

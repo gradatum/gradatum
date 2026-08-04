@@ -71,22 +71,27 @@ const WORKER_SYSTEM_KID: &str = "gradatum-worker";
 /// misalignment errors or `UnexpectedVariant`.
 ///
 /// Canonical order in `gradatum_dto::VaultWriteRequest`:
-/// 1. `title`           String
-/// 2. `body`            String
-/// 3. `author`          Option<String>
-/// 4. `tags`            Vec<String>
-/// 5. `section_hint`    Option<String>
-/// 6. `tenant_id`       String   (default "main")
-/// 7. `expected_sha256` Option<String>
-/// 8. `note_id`         Option<String>   ← pre-allocated ULID
+/// 1. `title`           `String`
+/// 2. `body`            `String`
+/// 3. `author`          `Option<String>`
+/// 4. `tags`            `Vec<String>`
+/// 5. `section_hint`    `Option<String>`
+/// 6. `tenant_id`       `Option<TenantId>`  (A1 — omitted client-side, `Some(_)` at enqueue)
+/// 7. `expected_sha256` `Option<String>`
+/// 8. `note_id`         `Option<String>`   ← pre-allocated ULID
 use gradatum_dto::VaultWriteRequest;
 
 /// `vault_classify` request decoded from the queue bincode payload.
+///
+/// Lot A1: `tenant_id` is an `Option<String>` (positional mirror of
+/// `gradatum_dto::VaultClassifyRequest.tenant_id: Option<TenantId>`, transparent) —
+/// the encoder always sets `Some(_)` (the effective tenant is resolved server-side before
+/// enqueue), so `skip_serializing_if` never fires on the wire (bincode decoding stays aligned).
 #[derive(Debug, Serialize, Deserialize)]
 struct VaultClassifyRequest {
     note_id: String,
-    #[serde(default = "default_main")]
-    tenant_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
 }
 
 /// `vault_downgrade` request decoded from the queue bincode payload.
@@ -96,12 +101,8 @@ struct VaultDowngradeRequest {
     reason: String,
     #[serde(default)]
     replaced_by: Option<String>,
-    #[serde(default = "default_main")]
-    tenant_id: String,
-}
-
-fn default_main() -> String {
-    "main".into()
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
 }
 
 // ── NoopAuditSink ─────────────────────────────────────────────────────────────
@@ -228,7 +229,7 @@ impl Dispatcher {
                     job_id = job.id,
                     kind = %job.kind,
                     error = %e,
-                    "job échoué — enregistrement pour retry ou dead-letter"
+                    "job failed — recording for retry or dead-letter"
                 );
                 self.queue.fail(job.id, &e.to_string()).await?;
             }
@@ -264,7 +265,7 @@ impl Dispatcher {
                 kind = %job.kind,
                 outcome = "ok",
                 duration_ms = duration_ms,
-                "job traité"
+                "job processed"
             );
             return Ok(());
         }
@@ -272,11 +273,11 @@ impl Dispatcher {
         let client = self
             .client
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("client non configuré — appeler with_client"))?;
+            .ok_or_else(|| anyhow::anyhow!("client not configured — call with_client"))?;
         let curator = self
             .curator
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("curator non configuré — appeler with_curator"))?;
+            .ok_or_else(|| anyhow::anyhow!("curator not configured — call with_curator"))?;
 
         match job.kind.as_str() {
             // ── curate : novelty + routing + tags → client.persist_curated ───────
@@ -319,7 +320,7 @@ impl Dispatcher {
                 match curate_outcome {
                     CurateOutcome::Admitted { decisions } => {
                         let status =
-                            write_status.expect("Admitted → Some(Live) par outcome_to_status");
+                            write_status.expect("Admitted → Some(Live) by outcome_to_status");
 
                         // ── B5: resolve wikilinks BEFORE persist_curated ──────────
                         //
@@ -336,7 +337,7 @@ impl Dispatcher {
 
                         let persist_req = PersistCuratedRequest {
                             note_id: prealloc_note_id.clone(),
-                            tenant_id: job.tenant_id.clone(),
+                            tenant_id: job.tenant_id.clone().into(),
                             title: req.title.clone(),
                             body: req.body.clone(),
                             section: decisions.canonical_section.clone(),
@@ -348,6 +349,9 @@ impl Dispatcher {
                             temporal: None,
                             links: resolved_links,
                             provenance: None,
+                            // Legacy dispatch path — not instrumented (F-66).
+                            curator_decision: None,
+                            target_vault: None,
                         };
 
                         client
@@ -359,7 +363,7 @@ impl Dispatcher {
                         tracing::info!(
                             job_id = job.id,
                             section = %decisions.canonical_section,
-                            "note admise et persistée via InternalClient"
+                            "note admitted and persisted via InternalClient"
                         );
 
                         // Automatic chaining: enqueue embed_note after a successful curate write.
@@ -378,7 +382,7 @@ impl Dispatcher {
                             tracing::warn!(
                                 note_id = %prealloc_note_id,
                                 error = %e,
-                                "chaînage embed_note enqueue échoué — backfill pourra re-tenter"
+                                "embed_note enqueue chaining failed — backfill may retry"
                             );
                         }
                     }
@@ -388,12 +392,12 @@ impl Dispatcher {
                         tracing::info!(
                             job_id = job.id,
                             reason = %reason,
-                            "note rejetée par le curator — aucune écriture"
+                            "note rejected by the curator — no write"
                         );
                     }
                     CurateOutcome::Pending { decisions, reason } => {
                         let status = write_status
-                            .expect("Pending → Some(PendingReview) par outcome_to_status");
+                            .expect("Pending → Some(PendingReview) by outcome_to_status");
 
                         // ── B5: resolve wikilinks BEFORE persist_curated (Pending parity) ──
                         let resolved_links = resolve_wikilinks_via_client(
@@ -406,7 +410,7 @@ impl Dispatcher {
 
                         let persist_req = PersistCuratedRequest {
                             note_id: prealloc_note_id.clone(),
-                            tenant_id: job.tenant_id.clone(),
+                            tenant_id: job.tenant_id.clone().into(),
                             title: req.title.clone(),
                             body: req.body.clone(),
                             section: decisions.canonical_section.clone(),
@@ -418,6 +422,9 @@ impl Dispatcher {
                             temporal: None,
                             links: resolved_links,
                             provenance: None,
+                            // Legacy dispatch path — not instrumented (F-66).
+                            curator_decision: None,
+                            target_vault: None,
                         };
 
                         client
@@ -429,7 +436,7 @@ impl Dispatcher {
                         tracing::info!(
                             job_id = job.id,
                             reason = %reason,
-                            "note mise en PendingReview via InternalClient (revue manuelle requise)"
+                            "note moved to PendingReview via InternalClient (manual review required)"
                         );
 
                         // Automatic chaining: enqueue embed_note after a successful curate write.
@@ -447,7 +454,7 @@ impl Dispatcher {
                             tracing::warn!(
                                 note_id = %prealloc_note_id,
                                 error = %e,
-                                "chaînage embed_note enqueue échoué — backfill pourra re-tenter"
+                                "embed_note enqueue chaining failed — backfill may retry"
                             );
                         }
                     }
@@ -464,14 +471,14 @@ impl Dispatcher {
                 tracing::info!(
                     job_id = job.id,
                     note_id = %req.note_id,
-                    "job classify — cascade curator complète"
+                    "job classify — full curator cascade"
                 );
 
                 // Read the existing note via the internal client.
                 let existing = client
-                    .get_note(&req.note_id)
+                    .get_note(&job.tenant_id, &req.note_id)
                     .await
-                    .context("get_note pour classify")?;
+                    .context("get_note for classify")?;
 
                 // Build the CuratorNote from the existing note.
                 let title_for_curator = gradatum_curator::extract_h1_title(&existing.body)
@@ -491,14 +498,14 @@ impl Dispatcher {
                 match curate_outcome {
                     CurateOutcome::Admitted { decisions } => {
                         let status =
-                            write_status.expect("Admitted → Some(Live) par outcome_to_status");
+                            write_status.expect("Admitted → Some(Live) by outcome_to_status");
 
                         // Merge curator tags with existing tags
                         let merged_tags = build_merged_tags(&existing.tags, &decisions.tags);
 
                         let persist_req = PersistCuratedRequest {
                             note_id: req.note_id.clone(),
-                            tenant_id: job.tenant_id.clone(),
+                            tenant_id: job.tenant_id.clone().into(),
                             title: gradatum_curator::extract_h1_title(&existing.body)
                                 .unwrap_or_else(|| existing.section.clone()),
                             body: existing.body.clone(),
@@ -511,6 +518,9 @@ impl Dispatcher {
                             temporal: None,
                             links: vec![],
                             provenance: None,
+                            // Legacy dispatch path — not instrumented (F-66).
+                            curator_decision: None,
+                            target_vault: None,
                         };
 
                         client
@@ -522,18 +532,18 @@ impl Dispatcher {
                         tracing::info!(
                             job_id = job.id,
                             section = %decisions.canonical_section,
-                            "note reclassifiée via InternalClient (Admitted)"
+                            "note reclassified via InternalClient (Admitted)"
                         );
                     }
                     CurateOutcome::Pending { decisions, reason } => {
                         let status = write_status
-                            .expect("Pending → Some(PendingReview) par outcome_to_status");
+                            .expect("Pending → Some(PendingReview) by outcome_to_status");
 
                         let merged_tags = build_merged_tags(&existing.tags, &decisions.tags);
 
                         let persist_req = PersistCuratedRequest {
                             note_id: req.note_id.clone(),
-                            tenant_id: job.tenant_id.clone(),
+                            tenant_id: job.tenant_id.clone().into(),
                             title: gradatum_curator::extract_h1_title(&existing.body)
                                 .unwrap_or_else(|| existing.section.clone()),
                             body: existing.body.clone(),
@@ -546,6 +556,9 @@ impl Dispatcher {
                             temporal: None,
                             links: vec![],
                             provenance: None,
+                            // Legacy dispatch path — not instrumented (F-66).
+                            curator_decision: None,
+                            target_vault: None,
                         };
 
                         client
@@ -565,7 +578,7 @@ impl Dispatcher {
                         tracing::warn!(
                             job_id = job.id,
                             reason = %reason,
-                            "classify rejeté — note inchangée"
+                            "classify rejected — note unchanged"
                         );
                     }
                 }
@@ -582,19 +595,19 @@ impl Dispatcher {
                     job_id = job.id,
                     note_id = %req.note_id,
                     reason = %req.reason,
-                    "job downgrade — rétrogradation de la note"
+                    "job downgrade — note downgrade"
                 );
 
                 // Read the existing note via the internal client.
                 let existing = client
-                    .get_note(&req.note_id)
+                    .get_note(&job.tenant_id, &req.note_id)
                     .await
-                    .context("get_note pour downgrade")?;
+                    .context("get_note for downgrade")?;
 
                 // Parse existing status and validate state machine.
                 let existing_status = parse_status_kebab(&existing.status).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "statut inconnu '{}' pour la note {} (downgrade)",
+                        "unknown status '{}' for note {} (downgrade)",
                         existing.status,
                         req.note_id
                     )
@@ -602,7 +615,7 @@ impl Dispatcher {
 
                 if !existing_status.can_transition_to(NoteStatus::Deprecated) {
                     anyhow::bail!(
-                        "transition invalide {:?} → Deprecated pour la note {} — seul Live est autorisé",
+                        "invalid transition {:?} → Deprecated for note {} — only Live is allowed",
                         existing_status,
                         req.note_id
                     );
@@ -610,7 +623,7 @@ impl Dispatcher {
 
                 let persist_req = PersistCuratedRequest {
                     note_id: req.note_id.clone(),
-                    tenant_id: job.tenant_id.clone(),
+                    tenant_id: job.tenant_id.clone().into(),
                     title: gradatum_curator::extract_h1_title(&existing.body)
                         .unwrap_or_else(|| existing.section.clone()),
                     body: existing.body.clone(),
@@ -623,6 +636,9 @@ impl Dispatcher {
                     temporal: None,
                     links: vec![],
                     provenance: None,
+                    // Legacy dispatch path — not instrumented (F-66).
+                    curator_decision: None,
+                    target_vault: None,
                 };
 
                 client
@@ -633,12 +649,12 @@ impl Dispatcher {
                 outcome = "deprecated";
                 tracing::info!(
                     job_id = job.id,
-                    "note rétrogradée vers Deprecated via InternalClient"
+                    "note downgraded to Deprecated via InternalClient"
                 );
             }
 
             other => {
-                anyhow::bail!("kind de job inconnu : {other:?}");
+                anyhow::bail!("unknown job kind: {other:?}");
             }
         }
 
@@ -651,7 +667,7 @@ impl Dispatcher {
             kind = %job.kind,
             outcome = outcome,
             duration_ms = duration_ms,
-            "job traité"
+            "job processed"
         );
 
         Ok(())
@@ -709,7 +725,7 @@ impl Dispatcher {
             tracing::info!(
                 job_id = job.id,
                 note_id = %note_id_str,
-                "embed_note skipped — body vide"
+                "embed_note skipped — empty body"
             );
             return Ok(());
         }
@@ -733,13 +749,16 @@ impl Dispatcher {
 
         // Validate ULID format before calling persist_embedding.
         Ulid::from_string(note_id_str)
-            .map_err(|e| anyhow::anyhow!("embed_note: ULID invalide '{note_id_str}': {e}"))?;
+            .map_err(|e| anyhow::anyhow!("embed_note: invalid ULID '{note_id_str}': {e}"))?;
 
         let persist_req = PersistEmbeddingRequest {
             note_id: note_id_str.to_string(),
             embedder_id: embedder.embedder_id().to_string(),
             dim: embedder.dim(),
             vector: vec,
+            // C4-1e Slice B3 (MIGRATE) : le worker émet le vault réel du job.
+            // OFF → job.tenant_id == "main" (single-owner DB) = byte-identical.
+            vault_id: Some(job.tenant_id.clone().into()),
         };
 
         client
@@ -770,6 +789,7 @@ impl Dispatcher {
                     kid: WORKER_SYSTEM_KID.into(),
                     sub: "gradatum-worker".into(),
                     aud: "gradatum".into(),
+                    jti: None,
                 },
                 tenant_id: job.tenant_id.clone(),
                 locus: format!("{}/{}", job.tenant_id, job.kind),
@@ -783,7 +803,7 @@ impl Dispatcher {
                 tracing::warn!(
                     job_id = job.id,
                     error = %e,
-                    "échec écriture audit — le job est quand même marqué complet"
+                    "audit write failed — the job is still marked complete"
                 );
             }
         }

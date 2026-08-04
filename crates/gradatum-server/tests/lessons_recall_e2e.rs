@@ -1,4 +1,4 @@
-//! Tests E2E F-60 L2 — `GET /api/v1/lessons/recall`.
+//! Tests E2E F-60 — `GET /api/v1/lessons/recall`.
 //!
 //! Couvre :
 //! 1. `recall_returns_lessons_by_class` — recall par classe, payload conforme
@@ -9,7 +9,7 @@
 //! 5. `recall_default_limit_5` — sans `limit`, défaut 5 appliqué.
 //! 6. `recall_latency_under_50ms` — assert latence < 50 ms sur fixtures.
 //!
-//! ## Task 3 — F-68 semantic opt-in
+//! ## F-68 semantic opt-in
 //!
 //! 7. `hydrate_lessons_by_ulids_returns_tags_anchor` — hydratation directe par ULID,
 //!    retourne tags + anchor_ms.
@@ -280,7 +280,7 @@ async fn recall_default_limit_5() {
 
 // ── Task 2 — F-68 recency ranking ─────────────────────────────────────────────
 
-/// Task 2 — F-68 : `rank=recency-boosted` met la leçon la plus fraîche en tête.
+/// F-68 : `rank=recency-boosted` met la leçon la plus fraîche en tête.
 ///
 /// 2 leçons, même classe `deploy`, corpus identique (scores BM25 quasi-identiques).
 /// Leçon A : `anchor_ms = 0` (epoch Unix, très ancienne — `recency_factor` ≈ 0).
@@ -338,7 +338,7 @@ async fn recall_rank_recency_boosted_surfaces_fresh() {
     );
 }
 
-/// Task 2 — F-68 parité : `rank` absent == `rank=relevance` == ordre BM25 inchangé.
+/// F-68 parité : `rank` absent == `rank=relevance` == ordre BM25 inchangé.
 ///
 /// Rétro-compat BLOQUANTE : le hook LIVE `lesson-recall.sh` (F-60) appelle
 /// `/lessons/recall` sans le champ `rank`. Son comportement ne doit pas changer.
@@ -428,7 +428,7 @@ async fn recall_rank_default_is_legacy_order() {
 
 // ── Tests L2 originaux ─────────────────────────────────────────────────────────
 
-/// Test 6 : latence < 50 ms sur fixtures (assert perf du contrat L2).
+/// Test 6 : latence < 50 ms sur fixtures (assert perf du contrat lessons-recall).
 ///
 /// In-memory SQLite, ~20 leçons — le chemin BM25-only doit rester très en deçà
 /// de la cible 50 ms. Marge large pour absorber la variance CI.
@@ -472,7 +472,7 @@ async fn recall_latency_under_50ms() {
 // - `semantic: Option<bool>` + `query: Option<String>` dans `LessonsRecallRequest`.
 // - Chemin sémantique dans `lessons_recall_impl` : retrieve_candidates → hydrate → filtre.
 
-/// Task 3 — Hydratation directe par ULIDs : retourne tags, anchor_ms, title.
+/// Hydratation directe par ULIDs : retourne tags, anchor_ms, title.
 ///
 /// Vérifie que `hydrate_lessons_by_ulids` retourne les métadonnées complètes d'une
 /// leçon depuis l'index SQLite (pas via FTS/BM25 — lookup pur par id).
@@ -550,19 +550,19 @@ async fn hydrate_lessons_by_ulids_returns_tags_anchor() {
     assert!(hits_none.is_empty(), "slice vide → résultat vide");
 }
 
-/// Task 3 — `semantic=true` + FakeEmbedder : note trouvée via cosine même si BM25
+/// `semantic=true` + FakeEmbedder : note trouvée via cosine même si BM25
 /// seul (sur la requête libre) ne la trouverait pas.
 ///
 /// ## Scénario
 ///
-/// - Leçon L1: body="alpha-nonce-unique" (ne matche pas la query "beta-paraphrase-T3"),
+/// - Leçon nº1: body="alpha-nonce-unique" (ne matche pas la query "beta-paraphrase-T3"),
 ///   embedding = FakeEmbedder.embed("beta-paraphrase-T3") → cosine=1.0 avec la requête.
-/// - Leçon L2: body="beta-paraphrase-T3 deploy rollout", embedding propre. Trouvée BM25+sem.
+/// - Leçon nº2: body="beta-paraphrase-T3 deploy rollout", embedding propre. Trouvée BM25+sem.
 /// - `semantic=true, query="beta-paraphrase-T3", class="deploy"` :
-///   BM25 de retrieve_candidates rate L1 (body ne matche pas), sémantique la trouve → L1 incluse.
-/// - `semantic=false` (défaut) : `recall_lessons("deploy")` → L1 et L2 trouvées via tag.
+///   BM25 de retrieve_candidates rate la nº1 (body ne matche pas), sémantique la trouve → nº1 incluse.
+/// - `semantic=false` (défaut) : `recall_lessons("deploy")` → nº1 et nº2 trouvées via tag.
 ///
-/// Assertion clé : L1 est dans le résultat `semantic=true` (chemin sémantique contribue).
+/// Assertion clé : la nº1 est dans le résultat `semantic=true` (chemin sémantique contribue).
 #[tokio::test]
 async fn recall_semantic_finds_paraphrase() {
     use gradatum_embed::EmbedBackend;
@@ -692,7 +692,7 @@ async fn recall_semantic_finds_paraphrase() {
     );
 }
 
-/// Task 3 — `semantic=true` : leçon taguée `codified` exclue même via le chemin sémantique.
+/// `semantic=true` : leçon taguée `codified` exclue même via le chemin sémantique.
 ///
 /// Le filtre `codified` doit s'appliquer après hydratation ULID, identiquement au chemin BM25.
 #[tokio::test]
@@ -776,7 +776,7 @@ async fn recall_semantic_preserves_codified_exclusion() {
     );
 }
 
-/// Task 3 — `semantic=true` : hits dont le tag ≠ class sont écartés post-hydratation.
+/// `semantic=true` : hits dont le tag ≠ class sont écartés post-hydratation.
 ///
 /// `retrieve_candidates` cherche dans toutes les notes de `lessons-learned` par cosine.
 /// Les notes dont les tags ne contiennent PAS la classe demandée doivent être filtrées

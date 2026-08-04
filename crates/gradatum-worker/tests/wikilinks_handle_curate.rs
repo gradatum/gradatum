@@ -58,10 +58,13 @@ impl QueueStore for NoopQueueStore {
     async fn enqueue(&self, _job: JobRecord) -> Result<Ulid, QueueError> {
         Ok(Ulid::new())
     }
-    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError> {
+    async fn dequeue(
+        &self,
+        __tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
         Ok(None)
     }
-    async fn get(&self, _id: Ulid) -> Result<Option<JobRecord>, QueueError> {
+    async fn get(&self, _id: Ulid, _tenant: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
         Ok(None)
     }
     async fn complete(&self, _id: Ulid, _result: JobResult) -> Result<(), QueueError> {
@@ -70,7 +73,7 @@ impl QueueStore for NoopQueueStore {
     async fn fail(&self, _id: Ulid, _err: &str, _attempt: u32) -> Result<(), QueueError> {
         Ok(())
     }
-    async fn cancel(&self, _id: Ulid) -> Result<(), QueueError> {
+    async fn cancel(&self, _id: Ulid, _tenant: Option<&str>) -> Result<(), QueueError> {
         Ok(())
     }
     async fn fail_dlq(&self, _id: Ulid, _err: &str) -> Result<(), QueueError> {
@@ -175,7 +178,7 @@ async fn seed_note(fixture: &HandleCurateFixture, title: &str, body: &str) -> St
         .expect("seed write_note");
     fixture
         .index
-        .upsert_note_title(&note.id, title)
+        .upsert_note_title(note.frontmatter.vault_id.as_str(), &note.id, title)
         .await
         .expect("seed upsert_note_title");
     note.id.to_string()
@@ -275,9 +278,14 @@ async fn handle_curate_admitted_persists_wikilinks_in_links_field() {
     let curator_data = Data::new(Arc::clone(&fixture.curator));
     let queue_data = Data::new(Arc::clone(&fixture.queue));
 
-    let result =
-        gradatum_worker::apalis_handlers::handle_curate(job, client_data, curator_data, queue_data)
-            .await;
+    let result = gradatum_worker::apalis_handlers::handle_curate(
+        job,
+        client_data,
+        curator_data,
+        queue_data,
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await;
     assert!(
         result.is_ok(),
         "handle_curate ne doit pas échouer — err={result:?}"
@@ -335,9 +343,14 @@ async fn handle_curate_pending_persists_wikilinks_in_links_field() {
     let curator_data = Data::new(Arc::clone(&fixture.curator));
     let queue_data = Data::new(Arc::clone(&fixture.queue));
 
-    let result =
-        gradatum_worker::apalis_handlers::handle_curate(job, client_data, curator_data, queue_data)
-            .await;
+    let result = gradatum_worker::apalis_handlers::handle_curate(
+        job,
+        client_data,
+        curator_data,
+        queue_data,
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await;
     assert!(
         result.is_ok(),
         "handle_curate (Pending path) ne doit pas échouer — err={result:?}"
@@ -381,9 +394,14 @@ async fn handle_curate_unresolved_wikilink_is_non_fatal() {
     let curator_data = Data::new(Arc::clone(&fixture.curator));
     let queue_data = Data::new(Arc::clone(&fixture.queue));
 
-    let result =
-        gradatum_worker::apalis_handlers::handle_curate(job, client_data, curator_data, queue_data)
-            .await;
+    let result = gradatum_worker::apalis_handlers::handle_curate(
+        job,
+        client_data,
+        curator_data,
+        queue_data,
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await;
     assert!(
         result.is_ok(),
         "P0-C : wikilink non résolu ne doit pas faire échouer handle_curate — err={result:?}"

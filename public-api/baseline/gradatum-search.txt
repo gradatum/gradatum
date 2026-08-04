@@ -1,0 +1,138 @@
+pub mod gradatum_search
+pub mod gradatum_search::reranker
+pub struct gradatum_search::reranker::JinaOnnxReranker
+impl gradatum_search::reranker::JinaOnnxReranker
+pub fn gradatum_search::reranker::JinaOnnxReranker::from_file(&str) -> core::result::Result<Self, gradatum_core::error::GradatumError>
+impl gradatum_search::reranker::Reranker for gradatum_search::reranker::JinaOnnxReranker
+pub fn gradatum_search::reranker::JinaOnnxReranker::max_batch_size(&self) -> usize
+pub fn gradatum_search::reranker::JinaOnnxReranker::requires_body(&self) -> bool
+pub fn gradatum_search::reranker::JinaOnnxReranker::rerank(&self, &str, &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<alloc::vec::Vec<f32>, gradatum_core::error::GradatumError>
+pub struct gradatum_search::reranker::NoopReranker
+impl gradatum_search::reranker::Reranker for gradatum_search::reranker::NoopReranker
+pub fn gradatum_search::reranker::NoopReranker::max_batch_size(&self) -> usize
+pub fn gradatum_search::reranker::NoopReranker::requires_body(&self) -> bool
+pub fn gradatum_search::reranker::NoopReranker::rerank(&self, &str, &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<alloc::vec::Vec<f32>, gradatum_core::error::GradatumError>
+pub trait gradatum_search::reranker::Reranker: core::marker::Send + core::marker::Sync
+pub fn gradatum_search::reranker::Reranker::max_batch_size(&self) -> usize
+pub fn gradatum_search::reranker::Reranker::requires_body(&self) -> bool
+pub fn gradatum_search::reranker::Reranker::rerank(&self, &str, &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<alloc::vec::Vec<f32>, gradatum_core::error::GradatumError>
+impl gradatum_search::reranker::Reranker for gradatum_search::reranker::JinaOnnxReranker
+pub fn gradatum_search::reranker::JinaOnnxReranker::max_batch_size(&self) -> usize
+pub fn gradatum_search::reranker::JinaOnnxReranker::requires_body(&self) -> bool
+pub fn gradatum_search::reranker::JinaOnnxReranker::rerank(&self, &str, &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<alloc::vec::Vec<f32>, gradatum_core::error::GradatumError>
+impl gradatum_search::reranker::Reranker for gradatum_search::reranker::NoopReranker
+pub fn gradatum_search::reranker::NoopReranker::max_batch_size(&self) -> usize
+pub fn gradatum_search::reranker::NoopReranker::requires_body(&self) -> bool
+pub fn gradatum_search::reranker::NoopReranker::rerank(&self, &str, &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<alloc::vec::Vec<f32>, gradatum_core::error::GradatumError>
+pub mod gradatum_search::rrf
+pub struct gradatum_search::rrf::RrfHit
+pub gradatum_search::rrf::RrfHit::anchor_ms: core::option::Option<i64>
+pub gradatum_search::rrf::RrfHit::bm25_rank: core::option::Option<u32>
+pub gradatum_search::rrf::RrfHit::is_semantic_only: bool
+pub gradatum_search::rrf::RrfHit::note_id: alloc::string::String
+pub gradatum_search::rrf::RrfHit::rrf_score: f64
+pub gradatum_search::rrf::RrfHit::section: alloc::string::String
+pub gradatum_search::rrf::RrfHit::sem_rank: core::option::Option<u32>
+pub gradatum_search::rrf::RrfHit::snippet: core::option::Option<alloc::string::String>
+pub gradatum_search::rrf::RrfHit::status: alloc::string::String
+pub gradatum_search::rrf::RrfHit::title: core::option::Option<alloc::string::String>
+pub fn gradatum_search::rrf::rrf_fuse(&[(alloc::string::String, f64)], &[(alloc::string::String, f32)], f64, usize) -> alloc::vec::Vec<gradatum_search::rrf::RrfHit>
+pub mod gradatum_search::scoring
+pub struct gradatum_search::scoring::ResolvedWeights
+pub gradatum_search::scoring::ResolvedWeights::pagerank: f64
+pub gradatum_search::scoring::ResolvedWeights::recency: f64
+pub gradatum_search::scoring::ResolvedWeights::trust: f64
+impl core::default::Default for gradatum_search::scoring::ResolvedWeights
+pub fn gradatum_search::scoring::ResolvedWeights::default() -> Self
+pub struct gradatum_search::scoring::SalienceParams
+pub gradatum_search::scoring::SalienceParams::gamma: f64
+pub gradatum_search::scoring::SalienceParams::k_norm: f64
+pub gradatum_search::scoring::SalienceParams::kind_weights: std::collections::hash::map::HashMap<alloc::string::String, f64>
+pub struct gradatum_search::scoring::ScoringWeightsWire
+pub gradatum_search::scoring::ScoringWeightsWire::pagerank: core::option::Option<f64>
+pub gradatum_search::scoring::ScoringWeightsWire::recency: core::option::Option<f64>
+pub gradatum_search::scoring::ScoringWeightsWire::trust: core::option::Option<f64>
+pub struct gradatum_search::scoring::TrustDecayConfig
+pub gradatum_search::scoring::TrustDecayConfig::enabled: bool
+pub gradatum_search::scoring::TrustDecayConfig::half_life_days: std::collections::hash::map::HashMap<alloc::string::String, f64>
+impl gradatum_search::scoring::TrustDecayConfig
+pub fn gradatum_search::scoring::TrustDecayConfig::resolve(&self, core::option::Option<f32>, core::option::Option<&str>, f64) -> core::option::Option<(f64, f64, core::option::Option<f64>)>
+impl core::default::Default for gradatum_search::scoring::TrustDecayConfig
+pub fn gradatum_search::scoring::TrustDecayConfig::default() -> Self
+pub const gradatum_search::scoring::DEFAULT_TRUST_HALF_LIVES: &[(&str, f64)]
+pub const gradatum_search::scoring::GAMMA_TRUST: f64
+pub fn gradatum_search::scoring::apply_salience(f64, f64, &gradatum_search::scoring::SalienceParams) -> f64
+pub fn gradatum_search::scoring::composite_score(f64, f64, f64) -> f64
+pub fn gradatum_search::scoring::composite_score_weighted(f64, f64, f64, core::option::Option<(f64, f64, core::option::Option<f64>)>, &gradatum_search::scoring::ResolvedWeights) -> f64
+pub fn gradatum_search::scoring::composite_score_with_trust(f64, f64, f64, core::option::Option<(f64, f64, core::option::Option<f64>)>) -> f64
+pub fn gradatum_search::scoring::default_half_lives() -> std::collections::hash::map::HashMap<alloc::string::String, f64>
+pub fn gradatum_search::scoring::pagerank_factor(u64) -> f64
+pub fn gradatum_search::scoring::recency_factor(i64, i64) -> f64
+pub fn gradatum_search::scoring::resolve_weights(core::option::Option<&gradatum_search::scoring::ScoringWeightsWire>) -> gradatum_search::scoring::ResolvedWeights
+pub fn gradatum_search::scoring::salience_factor(f64, f64) -> f64
+pub fn gradatum_search::scoring::salience_weighted_sum(&[(alloc::string::String, u64)], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> f64
+pub fn gradatum_search::scoring::trust_decay_factor(f64, f64, core::option::Option<f64>) -> f64
+pub struct gradatum_search::NoopReranker
+impl gradatum_search::reranker::Reranker for gradatum_search::reranker::NoopReranker
+pub fn gradatum_search::reranker::NoopReranker::max_batch_size(&self) -> usize
+pub fn gradatum_search::reranker::NoopReranker::requires_body(&self) -> bool
+pub fn gradatum_search::reranker::NoopReranker::rerank(&self, &str, &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<alloc::vec::Vec<f32>, gradatum_core::error::GradatumError>
+pub struct gradatum_search::ResolvedWeights
+pub gradatum_search::ResolvedWeights::pagerank: f64
+pub gradatum_search::ResolvedWeights::recency: f64
+pub gradatum_search::ResolvedWeights::trust: f64
+impl core::default::Default for gradatum_search::scoring::ResolvedWeights
+pub fn gradatum_search::scoring::ResolvedWeights::default() -> Self
+pub struct gradatum_search::RrfHit
+pub gradatum_search::RrfHit::anchor_ms: core::option::Option<i64>
+pub gradatum_search::RrfHit::bm25_rank: core::option::Option<u32>
+pub gradatum_search::RrfHit::is_semantic_only: bool
+pub gradatum_search::RrfHit::note_id: alloc::string::String
+pub gradatum_search::RrfHit::rrf_score: f64
+pub gradatum_search::RrfHit::section: alloc::string::String
+pub gradatum_search::RrfHit::sem_rank: core::option::Option<u32>
+pub gradatum_search::RrfHit::snippet: core::option::Option<alloc::string::String>
+pub gradatum_search::RrfHit::status: alloc::string::String
+pub gradatum_search::RrfHit::title: core::option::Option<alloc::string::String>
+pub struct gradatum_search::SalienceParams
+pub gradatum_search::SalienceParams::gamma: f64
+pub gradatum_search::SalienceParams::k_norm: f64
+pub gradatum_search::SalienceParams::kind_weights: std::collections::hash::map::HashMap<alloc::string::String, f64>
+pub struct gradatum_search::ScoringWeightsWire
+pub gradatum_search::ScoringWeightsWire::pagerank: core::option::Option<f64>
+pub gradatum_search::ScoringWeightsWire::recency: core::option::Option<f64>
+pub gradatum_search::ScoringWeightsWire::trust: core::option::Option<f64>
+pub struct gradatum_search::TrustDecayConfig
+pub gradatum_search::TrustDecayConfig::enabled: bool
+pub gradatum_search::TrustDecayConfig::half_life_days: std::collections::hash::map::HashMap<alloc::string::String, f64>
+impl gradatum_search::scoring::TrustDecayConfig
+pub fn gradatum_search::scoring::TrustDecayConfig::resolve(&self, core::option::Option<f32>, core::option::Option<&str>, f64) -> core::option::Option<(f64, f64, core::option::Option<f64>)>
+impl core::default::Default for gradatum_search::scoring::TrustDecayConfig
+pub fn gradatum_search::scoring::TrustDecayConfig::default() -> Self
+pub const gradatum_search::DEFAULT_TRUST_HALF_LIVES: &[(&str, f64)]
+pub const gradatum_search::GAMMA_TRUST: f64
+pub const gradatum_search::VERSION: &str
+pub trait gradatum_search::Reranker: core::marker::Send + core::marker::Sync
+pub fn gradatum_search::Reranker::max_batch_size(&self) -> usize
+pub fn gradatum_search::Reranker::requires_body(&self) -> bool
+pub fn gradatum_search::Reranker::rerank(&self, &str, &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<alloc::vec::Vec<f32>, gradatum_core::error::GradatumError>
+impl gradatum_search::reranker::Reranker for gradatum_search::reranker::JinaOnnxReranker
+pub fn gradatum_search::reranker::JinaOnnxReranker::max_batch_size(&self) -> usize
+pub fn gradatum_search::reranker::JinaOnnxReranker::requires_body(&self) -> bool
+pub fn gradatum_search::reranker::JinaOnnxReranker::rerank(&self, &str, &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<alloc::vec::Vec<f32>, gradatum_core::error::GradatumError>
+impl gradatum_search::reranker::Reranker for gradatum_search::reranker::NoopReranker
+pub fn gradatum_search::reranker::NoopReranker::max_batch_size(&self) -> usize
+pub fn gradatum_search::reranker::NoopReranker::requires_body(&self) -> bool
+pub fn gradatum_search::reranker::NoopReranker::rerank(&self, &str, &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<alloc::vec::Vec<f32>, gradatum_core::error::GradatumError>
+pub fn gradatum_search::apply_salience(f64, f64, &gradatum_search::scoring::SalienceParams) -> f64
+pub fn gradatum_search::composite_score(f64, f64, f64) -> f64
+pub fn gradatum_search::composite_score_weighted(f64, f64, f64, core::option::Option<(f64, f64, core::option::Option<f64>)>, &gradatum_search::scoring::ResolvedWeights) -> f64
+pub fn gradatum_search::composite_score_with_trust(f64, f64, f64, core::option::Option<(f64, f64, core::option::Option<f64>)>) -> f64
+pub fn gradatum_search::default_half_lives() -> std::collections::hash::map::HashMap<alloc::string::String, f64>
+pub fn gradatum_search::pagerank_factor(u64) -> f64
+pub fn gradatum_search::recency_factor(i64, i64) -> f64
+pub fn gradatum_search::resolve_weights(core::option::Option<&gradatum_search::scoring::ScoringWeightsWire>) -> gradatum_search::scoring::ResolvedWeights
+pub fn gradatum_search::rrf_fuse(&[(alloc::string::String, f64)], &[(alloc::string::String, f32)], f64, usize) -> alloc::vec::Vec<gradatum_search::rrf::RrfHit>
+pub fn gradatum_search::salience_factor(f64, f64) -> f64
+pub fn gradatum_search::salience_weighted_sum(&[(alloc::string::String, u64)], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> f64
+pub fn gradatum_search::trust_decay_factor(f64, f64, core::option::Option<f64>) -> f64

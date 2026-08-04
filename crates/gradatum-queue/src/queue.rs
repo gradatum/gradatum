@@ -42,8 +42,14 @@ pub enum QueueError {
     /// Masking this as `Pending` would silently re-queue jobs that may be in
     /// an unknown terminal state, risking duplicate processing or infinite retries.
     /// Surfacing a hard error lets the caller detect and alert on data corruption.
-    #[error("statut de job corrompu en base : {0:?}")]
+    #[error("corrupted job status in database: {0:?}")]
     CorruptedStatus(String),
+    /// Job is not in `leased` state or the lease has expired — the caller
+    /// attempted to `complete()` or `fail()` a job it does not hold a valid
+    /// lease on. This is a correctness guard against stale-lease processing
+    /// (multi-tenant isolation, P0 #5).
+    #[error("job {0} is not leased or lease expired — cannot complete/fail")]
+    NotLeased(JobId),
 }
 
 /// Opaque job identifier (AUTOINCREMENT `i64`, stable in the database).
@@ -52,7 +58,10 @@ pub type JobId = i64;
 /// Data required to enqueue a new job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewJob {
-    /// Isolated tenant (currently always `"main"`).
+    /// Isolated tenant. Carries the **resolved** tenant, not a constant: all four
+    /// production construction sites (`gradatum-server::api_v1::write`,
+    /// `gradatum-admin::backfill_embeddings`, and two in `gradatum-worker::dispatch`)
+    /// propagate the tenant resolved upstream. Only tests hardcode `"main"`.
     pub tenant_id: String,
     /// Job type, e.g. `"curate"`, `"embed"`.
     pub kind: String,
@@ -238,6 +247,96 @@ mod get_tests {
                 );
             }
             other => panic!("attendu CorruptedStatus, obtenu {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod stale_lease_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn make_job(kind: &str) -> NewJob {
+        NewJob {
+            tenant_id: "main".to_string(),
+            kind: kind.to_string(),
+            payload: vec![1, 2, 3],
+            max_attempts: 3,
+        }
+    }
+
+    /// `complete()` sur un job non-leased (encore `pending`) → `NotLeased` (P0 #5).
+    #[tokio::test]
+    async fn complete_rejects_non_leased_job() {
+        let q = SqliteQueue::in_memory().await.expect("queue");
+        let id = q.enqueue(make_job("curate")).await.expect("enqueue");
+
+        let result = q.complete(id).await;
+        assert!(
+            result.is_err(),
+            "complete sur un job pending doit échouer, obtenu Ok"
+        );
+        match result.unwrap_err() {
+            QueueError::NotLeased(jid) => assert_eq!(jid, id),
+            other => panic!("attendu NotLeased, obtenu {:?}", other),
+        }
+    }
+
+    /// `fail()` sur un job non-leased → `NotLeased` (P0 #5).
+    #[tokio::test]
+    async fn fail_rejects_non_leased_job() {
+        let q = SqliteQueue::in_memory().await.expect("queue");
+        let id = q.enqueue(make_job("curate")).await.expect("enqueue");
+
+        let result = q.fail(id, "erreur test").await;
+        assert!(result.is_err(), "fail sur un job pending doit échouer");
+        match result.unwrap_err() {
+            QueueError::NotLeased(jid) => assert_eq!(jid, id),
+            other => panic!("attendu NotLeased, obtenu {:?}", other),
+        }
+    }
+
+    /// `complete()` après un lease + `complete` déjà fait → `NotLeased` (idempotence guarded).
+    #[tokio::test]
+    async fn complete_rejects_already_done_job() {
+        let q = SqliteQueue::in_memory().await.expect("queue");
+        let id = q.enqueue(make_job("curate")).await.expect("enqueue");
+        let _leased = q
+            .lease(&["curate"], Duration::from_secs(60))
+            .await
+            .expect("lease")
+            .expect("Some");
+        q.complete(id).await.expect("premier complete OK");
+
+        // Deuxième complete → le job n'est plus `leased` → NotLeased.
+        let result = q.complete(id).await;
+        assert!(result.is_err(), "deuxième complete doit échouer");
+        match result.unwrap_err() {
+            QueueError::NotLeased(_) => {}
+            other => panic!("attendu NotLeased, obtenu {:?}", other),
+        }
+    }
+
+    /// `complete()` avec un lease expiré (0 ms) → `NotLeased`.
+    #[tokio::test]
+    async fn complete_rejects_expired_lease() {
+        let q = SqliteQueue::in_memory().await.expect("queue");
+        let id = q.enqueue(make_job("curate")).await.expect("enqueue");
+        // Lease de 1 ms pour que le lease expire quasi-instantanément.
+        let _leased = q
+            .lease(&["curate"], Duration::from_millis(1))
+            .await
+            .expect("lease")
+            .expect("Some");
+
+        // Attendre que le lease expire.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let result = q.complete(id).await;
+        assert!(result.is_err(), "complete sur lease expiré doit échouer");
+        match result.unwrap_err() {
+            QueueError::NotLeased(_) => {}
+            other => panic!("attendu NotLeased, obtenu {:?}", other),
         }
     }
 }
@@ -453,35 +552,52 @@ impl Queue for SqliteQueue {
 
     async fn complete(&self, id: JobId) -> Result<(), QueueError> {
         let now = Self::now_ms()?;
-        sqlx::query(
+        // Garde stale-lease (P0 #5) : refuse complete si le job n'est pas leased
+        // ou si le lease a expiré. Sans cette garde, un worker peut marquer `done`
+        // un job dont le lease a expiré et qu'un autre worker a déjà repris.
+        let result = sqlx::query(
             "UPDATE jobs_v2
              SET status = 'done', lease_until = NULL, leased_by = NULL, updated_at = ?
-             WHERE id = ?",
+             WHERE id = ?
+               AND status = 'leased'
+               AND lease_until > ?",
         )
         .bind(now)
         .bind(id)
+        .bind(now)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(QueueError::NotLeased(id));
+        }
         Ok(())
     }
 
     async fn fail(&self, id: JobId, err: &str) -> Result<(), QueueError> {
         let now = Self::now_ms()?;
         // If attempts >= max_attempts -> dead; otherwise back to pending for retry.
-        sqlx::query(
+        // Garde stale-lease (P0 #5) : refuse fail si le job n'est pas leased
+        // ou si le lease a expiré.
+        let result = sqlx::query(
             "UPDATE jobs_v2
              SET status     = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
                  last_error = ?,
                  updated_at  = ?,
                  lease_until = NULL,
                  leased_by   = NULL
-             WHERE id = ?",
+             WHERE id = ?
+               AND status = 'leased'
+               AND lease_until > ?",
         )
         .bind(err)
         .bind(now)
         .bind(id)
+        .bind(now)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(QueueError::NotLeased(id));
+        }
         Ok(())
     }
 

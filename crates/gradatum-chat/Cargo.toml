@@ -6,7 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Trait Chat + 3 impls (Heuristic/HttpChat/Noop) + CircuitBreaker — OpenAI-compatible backend pour curator LLM gating"
+description = "Chat trait + 3 impls (Heuristic/HttpChat/Noop) + CircuitBreaker — OpenAI-compatible backend for curator LLM gating"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
@@ -18,7 +21,7 @@ default = []
 windows-native-tls = ["reqwest/native-tls"]
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "0.7.0" }
+gradatum-core = { path = "../gradatum-core", version = "1.0.0" }
 async-trait   = { workspace = true }
 chrono        = { workspace = true }
 once_cell     = { workspace = true }

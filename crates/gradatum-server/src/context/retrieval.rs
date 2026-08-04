@@ -41,7 +41,7 @@
 //! | Embedding reuse | `query_embedding` returned in outcome |
 
 use gradatum_core::error::GradatumError;
-use gradatum_core::scope::VaultId;
+use gradatum_core::scope::AclCheckedVaultId;
 use gradatum_embed::EmbedBackend;
 use ulid::Ulid;
 
@@ -133,7 +133,7 @@ pub struct RetrievalOutcome {
 /// (dégradation gracieuse → `embed_fallback=true`).
 pub async fn retrieve_candidates(
     state: &AppState,
-    vault_id: &VaultId,
+    vault_id: &AclCheckedVaultId,
     query: &str,
     sections: Option<&[&str]>,
     top_n: usize,
@@ -153,7 +153,7 @@ pub async fn retrieve_candidates(
                 tracing::warn!(
                     err = %e,
                     note_id = %ulid_str,
-                    "retrieve_candidates: backlinks failed, ULID-direct sans backlinks"
+                    "retrieve_candidates: backlinks failed, ULID-direct without backlinks"
                 );
                 vec![]
             });
@@ -244,7 +244,7 @@ pub async fn retrieve_candidates(
                 let sem_result = state
                     .search
                     .search_semantic(
-                        vault_id.as_str(),
+                        vault_id,
                         state.embedder.embedder_id(),
                         &emb,
                         top_n * 2,
@@ -266,10 +266,8 @@ pub async fn retrieve_candidates(
                             } else {
                                 let ids: Vec<String> =
                                     hits.iter().map(|(id, _)| id.to_string()).collect();
-                                let sec_result = state
-                                    .search
-                                    .get_titles_sections(vault_id.as_str(), &ids)
-                                    .await;
+                                let sec_result =
+                                    state.search.get_titles_sections(vault_id, &ids).await;
                                 crate::api_v1::handlers::filter_semantic_by_sections(
                                     hits,
                                     wanted_secs,

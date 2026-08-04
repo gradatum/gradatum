@@ -35,15 +35,18 @@
 //! | GET  | `/api/v1/vault_authors` | bearer required |
 //! | GET  | `/api/v1/vault_tags`    | bearer required |
 
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json, extract::State, http::StatusCode};
 use gradatum_core::error::GradatumError;
 use gradatum_core::trust::TrustContext;
 
+use crate::api_v1::compact::{self, CompactBody};
+
 use crate::api_v1::dto::{
     VaultAuthorsResponse, VaultContextRequest, VaultContextResponse, VaultGraphRequest,
     VaultGraphResponse, VaultLinksRequest, VaultLinksResponse, VaultListRequest, VaultListResponse,
-    VaultReadRequest, VaultReadResponse, VaultSearchRequest, VaultSearchResponse,
-    VaultStatusResponse, VaultTagsResponse, VaultTraceRequest, VaultTraceResponse,
+    VaultReadRequest, VaultSearchRequest, VaultStatusResponse, VaultTagsResponse,
+    VaultTraceRequest, VaultTraceResponse,
 };
 use crate::state::AppState;
 
@@ -189,8 +192,8 @@ pub(crate) fn filter_semantic_by_section(
         Err(e) => {
             tracing::warn!(
                 err = %e,
-                "vault_search: get_titles_sections (filtre section sémantique) échoué \
-                 — dégradation BM25-only (hits sémantiques écartés ce tour)"
+                "vault_search: get_titles_sections (semantic section filter) failed \
+                 — BM25-only degradation (semantic hits dropped this round)"
             );
             Vec::new()
         }
@@ -234,8 +237,8 @@ pub(crate) fn filter_semantic_by_sections(
         Err(e) => {
             tracing::warn!(
                 err = %e,
-                "retrieve_candidates: get_titles_sections (filtre multi-sections sémantique) \
-                 échoué — dégradation BM25-only (hits sémantiques écartés ce tour)"
+                "retrieve_candidates: get_titles_sections (semantic multi-section filter) \
+                 failed — BM25-only degradation (semantic hits dropped this round)"
             );
             Vec::new()
         }
@@ -271,8 +274,8 @@ pub(crate) fn filter_semantic_by_status(
         Err(e) => {
             tracing::warn!(
                 err = %e,
-                "vault_search: get_statuses (filtre statut sémantique) échoué \
-                 — dégradation BM25-only (hits sémantiques écartés ce tour)"
+                "vault_search: get_statuses (semantic status filter) failed \
+                 — BM25-only degradation (semantic hits dropped this round)"
             );
             Vec::new()
         }
@@ -291,7 +294,14 @@ pub(crate) fn filter_semantic_by_status(
 /// 2. Clamp `limit` to [1, 50], default 10.
 /// 3. Call `search_fts(vault_id, query, limit)` → `Vec<NoteId>`.
 /// 4. For each `NoteId`: `get_note(vault_id, id)` → snippet (first 50 chars of body).
-/// 5. Return `SearchHit { path: "<section>/<id>", score, snippet }`.
+/// 5. Return `SearchHit { vault_id, path: "<section>/<id>", score, snippet }`.
+///
+/// ## Provenance
+///
+/// Every result carries the `vault_id` it was read from — the vault the search
+/// actually ran against, which on the cross-vault path is the request's target
+/// rather than the caller's own vault. Clients never have to infer the origin of
+/// a hit from the request they sent.
 ///
 /// ## Score
 ///
@@ -317,16 +327,26 @@ pub async fn vault_search(
     State(state): State<AppState>,
     Extension(trust): Extension<TrustContext>,
     Json(req): Json<VaultSearchRequest>,
-) -> Result<Json<VaultSearchResponse>, StatusCode> {
-    crate::api_v1::logic::vault_search_impl(&state, &trust, req)
+) -> Result<Response, StatusCode> {
+    // Read the opt-in flag before `req` is moved into the impl.
+    let want_compact = req.compact;
+    let resp = crate::api_v1::logic::vault_search_impl(&state, &trust, req)
         .await
-        .map(Json)
         .map_err(|e| {
             if matches!(e, gradatum_core::error::GradatumError::Storage(_)) {
                 tracing::error!(err = %e, "vault_search: backend failed");
             }
             crate::api_v1::logic::err_to_status(&e)
+        })?;
+    // `compact=false` returns exactly `Json(resp)` as before → byte-for-byte identical.
+    Ok(if want_compact {
+        Json(CompactBody {
+            compact: compact::render_search(&resp),
         })
+        .into_response()
+    } else {
+        Json(resp).into_response()
+    })
 }
 
 // ── vault_read ────────────────────────────────────────────────────────────────
@@ -352,10 +372,11 @@ pub async fn vault_read(
     State(state): State<AppState>,
     Extension(trust): Extension<TrustContext>,
     Json(req): Json<VaultReadRequest>,
-) -> Result<Json<VaultReadResponse>, StatusCode> {
-    crate::api_v1::logic::vault_read_impl(&state, &trust, req)
+) -> Result<Response, StatusCode> {
+    // Read the opt-in flag before `req` is moved into the impl.
+    let want_compact = req.compact;
+    let resp = crate::api_v1::logic::vault_read_impl(&state, &trust, req)
         .await
-        .map(Json)
         .map_err(|e| {
             match &e {
                 gradatum_core::error::GradatumError::NoteNotFound(_)
@@ -365,7 +386,16 @@ pub async fn vault_read(
                 }
             }
             crate::api_v1::logic::err_to_status(&e)
+        })?;
+    // `compact=false` returns exactly `Json(resp)` as before → byte-for-byte identical.
+    Ok(if want_compact {
+        Json(CompactBody {
+            compact: compact::render_read(&resp),
         })
+        .into_response()
+    } else {
+        Json(resp).into_response()
+    })
 }
 
 // ── vault_list ────────────────────────────────────────────────────────────────
@@ -387,6 +417,30 @@ pub async fn vault_list(
         .map_err(|e| {
             if matches!(e, gradatum_core::error::GradatumError::Storage(_)) {
                 tracing::error!(err = %e, "vault_list: list_notes failed");
+            }
+            crate::api_v1::logic::err_to_status(&e)
+        })
+}
+
+// ── vault_archives_list (F-100 1.6 — read-only) ────────────────────────────────
+
+/// `POST /api/v1/vault_archives_list`
+///
+/// **Lecture seule** : liste le registre d'archives (notes archivées par delete
+/// on-demand). Filtres section/temps/gc/restored + pagination. Aucune mutation — le
+/// delete/restore/purge vivent uniquement dans le namespace interne (CLI opérateur).
+/// ACL Read.
+pub async fn vault_archives_list(
+    State(state): State<AppState>,
+    Extension(trust): Extension<TrustContext>,
+    Json(req): Json<gradatum_dto::VaultArchivesListRequest>,
+) -> Result<Json<gradatum_dto::VaultArchivesListResponse>, StatusCode> {
+    crate::api_v1::logic::vault_archives_list_impl(&state, &trust, req)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            if matches!(e, gradatum_core::error::GradatumError::Storage(_)) {
+                tracing::error!(err = %e, "vault_archives_list: registry failed");
             }
             crate::api_v1::logic::err_to_status(&e)
         })
@@ -541,8 +595,10 @@ pub async fn vault_context(
 
 /// `GET /api/v1/vault_authors`
 ///
-/// Lists distinct authors in the vault (tenant `"main"`).
-/// Delegates to `state.search.distinct_authors("main")`.
+/// Lists distinct authors in the caller's effective vault.
+/// Delegates to `vault_authors_impl`, which resolves the tenant-scoped vault
+/// (JWT-derived when multi-tenant is enabled) and calls
+/// `state.search.distinct_authors(vault_id)`.
 /// Notes without an author (`author_id IS NULL`) are excluded.
 pub async fn vault_authors(
     State(state): State<AppState>,
@@ -563,8 +619,10 @@ pub async fn vault_authors(
 
 /// `GET /api/v1/vault_tags`
 ///
-/// Lists distinct tags in the vault (tenant `"main"`) with their usage frequency.
-/// Delegates to `state.search.distinct_tags("main")`.
+/// Lists distinct tags in the caller's effective vault with their usage frequency.
+/// Delegates to `vault_tags_impl`, which resolves the tenant-scoped vault
+/// (JWT-derived when multi-tenant is enabled) and calls
+/// `state.search.distinct_tags(vault_id)`.
 pub async fn vault_tags(
     State(state): State<AppState>,
     Extension(trust): Extension<TrustContext>,

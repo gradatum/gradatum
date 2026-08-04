@@ -49,7 +49,7 @@ async fn vault_read_falls_back_to_redirect_after_rename() {
     let slug = title_to_slug("Ancien Titre");
     env.state
         .search
-        .upsert_redirect(&slug, &nid.0, chrono::Utc::now().timestamp_millis())
+        .upsert_redirect("main", &slug, &nid.0, chrono::Utc::now().timestamp_millis())
         .await
         .expect("upsert_redirect simulation rename");
 

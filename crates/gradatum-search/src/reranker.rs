@@ -145,7 +145,7 @@ mod onnx {
                 .map_err(|e| GradatumError::Inference(format!("ort load model: {e}")))?;
 
             let model_dir = Path::new(model_path).parent().ok_or_else(|| {
-                GradatumError::Inference("model_path sans répertoire parent".into())
+                GradatumError::Inference("model_path without parent directory".into())
             })?;
             let tokenizer_path = model_dir.join("tokenizer.json");
 
@@ -266,7 +266,7 @@ mod onnx {
                 let logit = data
                     .first()
                     .copied()
-                    .ok_or_else(|| GradatumError::Inference("logits vide".into()))?;
+                    .ok_or_else(|| GradatumError::Inference("empty logits".into()))?;
                 // Sigmoid → [0.0, 1.0]
                 let score = 1.0 / (1.0 + (-logit).exp());
                 scores.push(score);

@@ -35,7 +35,7 @@ The role of `Lead maintainer` is intentionally singular and explicit. It exists 
 
 Structural changes follow the RFC workflow:
 
-1. **Draft.** Open a PR adding `rfcs/NNNN-short-title.md` based on [`RFC-TEMPLATE.md`](RFC-TEMPLATE.md).
+1. **Draft.** Open a PR adding `docs/RFC/RFC-NNNN-short-title.md` based on [`RFC-TEMPLATE.md`](RFC-TEMPLATE.md). See [`docs/RFC/README.md`](docs/RFC/README.md) for the current index.
 2. **Discussion.** Minimum 7 days open for comment. Maintainers and reviewers discuss inline.
 3. **Resolution.** One of: `accepted` (merged with status updated to `accepted`), `postponed` (filed for later), `rejected` (PR closed with rationale).
 4. **Implementation.** A new tracking issue is opened referencing the RFC. The implementation may span multiple PRs; each cross-references the RFC number.

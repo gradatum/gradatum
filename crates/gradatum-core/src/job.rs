@@ -185,11 +185,19 @@ pub struct CurateSpec {
     /// Suggested section (optional — the curator may override).
     #[serde(default)]
     pub section_hint: Option<String>,
-    /// Expected SHA-256 hash for optimistic locking (optional).
+    /// Expected SHA-256 of the note being overwritten (optional — CREATE-vs-RMW discriminator).
     ///
-    /// When `Some`, the worker checks that the note's current hash matches
-    /// before writing. On mismatch: job marked `Conflict`, note not overwritten.
-    /// `None` = unconditional write (backward-compatible behaviour).
+    /// **Active compare-and-swap.** On the RMW branch (`Some`), the worker forwards this
+    /// hash to the internal persist API, which performs a compare-and-swap against the note's
+    /// stored content. A `Some` holding a *stale* hash makes the write FAIL: the job terminates
+    /// in `JobStatus::Conflict`, the note is left INTACT (no overwrite), and the conflict payload
+    /// carries the current hash so the caller can resolve it. Only a hash matching the current
+    /// content lets the in-place write proceed. `None` selects the CREATE branch: a freshly
+    /// pre-allocated ULID is written unconditionally (never conflicts).
+    ///
+    /// The value also drives temporal-anchor handling: `Some` means "in-place update", so an
+    /// absent `occurred_at` leaves the existing anchor untouched instead of re-stamping it with
+    /// the current time.
     ///
     /// Serialised in bincode as `Option<[u8; 32]>` (32 fixed bytes or `None`).
     /// Payload overhead: +33 bytes (1 bincode discriminant + 32-byte hash) — negligible.
@@ -549,8 +557,20 @@ pub enum ForgetScope {
 ///
 /// ## Idempotence
 ///
-/// A double forget is idempotent: `mark_forgotten` updates the timestamp if
-/// the note is already forgotten — no error.
+/// A double forget is idempotent and **preserves the first forget's audit trail**: a note
+/// already carrying `forgotten: true` is skipped, so `forgotten_at` and `forgotten_by` keep
+/// the values of the FIRST forget — they are never re-stamped with the second job's actor
+/// or timestamp. That trail is the only record of when the destructive act happened and who
+/// ordered it; overwriting it would be the actual data loss.
+///
+/// The skip still repairs the index: if the index reports the note as live while the
+/// frontmatter reports it as forgotten, the handler re-asserts the index mark alone
+/// (`DocumentStore::reassert_forgotten`), leaving both audit columns untouched. Both
+/// properties are kept — never one traded for the other.
+///
+/// This is a JOB-level invariant. One layer down, `DocumentStore::mark_forgotten` does
+/// overwrite `forgotten_at`/`forgotten_by` on every call — but the skip above means it is
+/// no longer reached for an already-forgotten note, so that behaviour never surfaces here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgetSpec {
     /// Resolution scope — determines the target notes.
@@ -697,7 +717,7 @@ impl Default for DistillSource {
 // ValidateSpec — Job::Validate payload (F-43)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Payload for `Job::Validate` (F-43) — deterministic validation of a distilled note
+/// Payload for `Job::Validate` — deterministic validation of a distilled note
 /// before persistence. Carries the synthesis + its sources (texts + trusts) so the worker
 /// can score purely, without re-reading the vault.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -814,6 +834,105 @@ pub struct JobSpec {
     pub priority: JobPriority,
 }
 
+/// Returns the tenant **served** by a job, derived from its spec (source = the
+/// spec, never the caller).
+///
+/// Used at enqueue time to stamp `gradatum_jobs.tenant_id`, and then as the tenant
+/// filter that enforces isolation when `multi_tenant` is enabled.
+///
+/// The extraction matches on the `Job` kind **exhaustively** — no `_` wildcard — so
+/// that every future variant MUST be handled explicitly. This is a security guard
+/// rail: the compiler refuses to let a new kind be added without deciding its tenant,
+/// which closes the leak class "new kind silently falls back to `main`".
+///
+/// Kinds that carry a tenant or vault:
+/// - `Curate` → [`CurateSpec::tenant_id`]
+/// - `Ingest` → [`IngestSource::vault`]
+/// - `Embed` → [`EmbedSpec::tenant_id`] (enqueued after curate)
+/// - `Validate` → [`ValidateSpec::tenant_id`] (enqueued after distill; carries title and body)
+/// - `Distill` → [`DistillSource::scope`] · `Forget` → [`ForgetSpec::scope`]
+/// - `Export` → [`ExportSource::scope`] · `Migrate` → [`MigrateSource::target`]
+///   (both carry a [`JobScope`]; enqueued only from the admin CLI today, yet still
+///   extracted explicitly rather than through a wildcard)
+///
+/// # Repli : le vault du job, pas `"main"`
+///
+/// A kind that carries **no** tenant of its own (`Purge`, `Backup`, `Audit`… — and
+/// a `Distill`/`Export`/`Forget` whose inner scope describes *what* rather than
+/// *where*) falls back to the vault carried by [`JobSpec::scope`], because A2-bis
+/// posits **one job = exactly one vault**: `JobScope::Vault(v)` *is* the tenant the
+/// job serves, and it is the very value the worker resolves before touching any
+/// index (`resolve_job_vault`). Deriving the stamp from anything else would let the
+/// queue and the worker disagree on which vault a job belongs to.
+///
+/// The literal `"main"` remains as the **last** resort only, when neither the kind
+/// nor the job scope carries a vault — the mono-vault case (`multi_tenant` off, or a
+/// system/cron job scoped `VaultWide`), where `"main"` is *the* answer rather than
+/// an arbitrary pick. Same reasoning, and same wording, as `resolve_job_vault`.
+#[must_use]
+pub fn spec_tenant(spec: &JobSpec) -> &str {
+    // Repli commun : le vault porté par le job lui-même (A2-bis), sinon mono-vault.
+    let job_vault = job_scope_vault(&spec.scope).unwrap_or("main");
+    match &spec.kind {
+        Job::Curate(c) => c.tenant_id.as_str(),
+        Job::Ingest(i) => i.vault.as_str(),
+        Job::Embed(e) => e.tenant_id.as_str(),
+        Job::Validate(v) => v.tenant_id.as_str(),
+        Job::Distill(d) => job_scope_vault(&d.scope).unwrap_or(job_vault),
+        Job::Forget(f) => forget_scope_vault(&f.scope).unwrap_or(job_vault),
+        // Export/Migrate portent un VaultScope — enqueue admin/CLI-only aujourd'hui
+        // (pas de site LIVE), mais traités explicitement pour l'exhaustivité.
+        Job::Export(e) => job_scope_vault(&e.scope).unwrap_or(job_vault),
+        Job::Migrate(m) => job_scope_vault(&m.target).unwrap_or(job_vault),
+        // Kinds système/cron sans tenant porté → le vault du job.
+        Job::Agent
+        | Job::Pipeline
+        | Job::Collect
+        | Job::Backup
+        | Job::Purge(_)
+        | Job::ReIndex(_)
+        | Job::Summarize
+        | Job::Audit
+        | Job::Consolidate
+        | Job::Review
+        | Job::Classify
+        | Job::Merge
+        | Job::Annotate
+        | Job::Notify(_) => job_vault,
+    }
+}
+
+/// Vault **carried** by a [`JobScope`] — `Vault(v)` → `Some(v)`, anything else → `None`.
+///
+/// `None` is not "main": it means the scope says *what* the work covers, never *where*
+/// it lives. Electing a vault is the caller's decision, made explicit at the call site.
+fn job_scope_vault(scope: &JobScope) -> Option<&str> {
+    match scope {
+        JobScope::Vault(v) => Some(v.as_str()),
+        _ => None,
+    }
+}
+
+/// Vault **carried** by a [`ForgetScope`] — `None` when the scope elects no single vault.
+///
+/// - `Topic { vault }` → the vault if set, else `None`.
+/// - `Locus { vault }` → the vault.
+/// - `Agent { vaults }` → the single vault if exactly one is targeted, else `None`
+///   (multi-vault agent forget is not scopable to one tenant — decision (a)). The
+///   worker refuses such a job anyway (`ensure_forget_scope_vault`), so falling back
+///   to the job vault here narrows nothing: it merely stops mislabelling the job as
+///   `"main"`'s.
+fn forget_scope_vault(scope: &ForgetScope) -> Option<&str> {
+    match scope {
+        ForgetScope::Topic { vault, .. } => vault.as_deref(),
+        ForgetScope::Locus { vault, .. } => Some(vault.as_str()),
+        ForgetScope::Agent { vaults, .. } => match vaults.as_slice() {
+            [only] => Some(only.as_str()),
+            _ => None,
+        },
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // JobClass
 // ─────────────────────────────────────────────────────────────────────────────
@@ -856,7 +975,11 @@ pub enum JobMode {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Scope of a job — what the work operates on.
+///
+/// `#[non_exhaustive]`: new scope variants may be added within the `1.x` line, so
+/// downstream matches must carry a `_` arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum JobScope {
     /// The entire vault.
     VaultWide,
@@ -866,6 +989,13 @@ pub enum JobScope {
     Notes(Vec<Ulid>),
     /// An agent session (isolated context).
     Session(Ulid),
+    /// A single explicit vault.
+    ///
+    /// When `multi_tenant.enabled = true`, every periodic job is enqueued once **per
+    /// active vault** with this scope, so no job ever spans two vaults. When the flag
+    /// is off, a job carrying `Vault(v)` with `v != "main"` is rejected terminally by
+    /// the worker (fail-closed).
+    Vault(String),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -880,7 +1010,7 @@ pub enum JobScope {
 /// - `Api`    → `Normal`  (machine call — acceptable latency)
 /// - `System` → `Low`     (background cron task — must not block agents)
 ///
-/// Wired in `GradatumQueue.dequeue()` via `ORDER BY priority DESC`.
+/// Wired in `GradatumQueue.dequeue(None)` via `ORDER BY priority DESC`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum JobPriority {
     /// Active agent and human jobs — response expected.
@@ -1018,6 +1148,10 @@ pub enum JobStatus {
     /// Terminal state without retry — the note was NOT modified.
     /// Read `lifecycle.result.result_note_md` to retrieve the `current_sha256`
     /// encoded as JSON (`{ "current_sha256": "hex...", "attempted_sha256": "hex..." }`).
+    ///
+    /// Reached on the RMW branch of a curate job: when the `expected_sha256` carried by
+    /// `CurateSpec` is stale, the compare-and-swap fails and the job terminates here with
+    /// the note left intact — see `CurateSpec::expected_sha256`.
     Conflict,
 }
 
@@ -1185,8 +1319,8 @@ impl JobOutput {
             files: vec![],
             result_note_md: format!(
                 "## DRY-RUN — {description}\n\n\
-                 **Simulation uniquement — aucune écriture effectuée.**\n\n\
-                 Notes qui auraient été affectées : {would_affect}\n",
+                 **Simulation only — no writes performed.**\n\n\
+                 Notes that would have been affected: {would_affect}\n",
             ),
         }
     }
@@ -1378,6 +1512,13 @@ pub struct JobFilter {
     /// `None` = start of list. `Some(ulid)` = jobs after (ASC) or before (DESC) this ULID.
     /// Use `next_cursor` from the previous API response.
     pub cursor: Option<Ulid>,
+    /// Tenant filter (L1+L2 isolation).
+    ///
+    /// `None` = no tenant clause (byte-identical / OFF). `Some(t)` =
+    /// `AND tenant_id = t` (list only the tenant's jobs). Additive field:
+    /// a pre-existing `JobFilter` JSON deserialises with `tenant = None`.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 impl Default for JobFilter {
@@ -1391,6 +1532,7 @@ impl Default for JobFilter {
             order: JobOrder::CreatedAsc,
             limit: 50,
             cursor: None,
+            tenant: None,
         }
     }
 }
@@ -1502,8 +1644,10 @@ pub trait JobSource {
 /// Job queue storage contract — L0 `gradatum-core`.
 ///
 /// Implementations:
-/// - `SqliteQueueStore` in `gradatum-db-sqlite` (default, embedded)
-/// - `LibsqlQueueStore` in `gradatum-db-sqlite` (remote, opt-in)
+/// - `SqliteQueueStore` in `gradatum-db-sqlite` (default, embedded).
+///
+/// There is no `LibsqlQueueStore`: `gradatum-db-sqlite` states so in its own module
+/// documentation. No remote/opt-in backend exists.
 ///
 /// # Errors
 ///
@@ -1518,13 +1662,21 @@ pub trait QueueStore: Send + Sync {
 
     /// Dequeues the next ready job (atomic lease).
     ///
+    /// `tenant_filter`: `None` = no tenant clause (backward-compatible, single-tenant) ;
+    /// `Some(t)` = `AND tenant_id = t` (multi-tenant isolation ON — a worker of tenant A
+    /// never dequeues a job of tenant B).
+    ///
     /// Returns `None` if the queue is empty or no job is ready.
-    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError>;
+    async fn dequeue(&self, tenant_filter: Option<&str>) -> Result<Option<JobRecord>, QueueError>;
 
     /// Dequeues the next ready job filtered by `kind` (atomic lease).
     ///
     /// Guarantees that a `curate` worker never receives an `Embed` or `ReIndex`
     /// job, eliminating the routing race condition (DLQ `UnexpectedVariant` bug).
+    ///
+    /// `tenant_filter`: `None` = no tenant clause (backward-compatible, single-tenant) ;
+    /// `Some(t)` = `AND tenant_id = t` (multi-tenant isolation ON — a worker of tenant A
+    /// never dequeues a job of tenant B).
     ///
     /// # Default implementation
     ///
@@ -1536,12 +1688,24 @@ pub trait QueueStore: Send + Sync {
     ///
     /// `kind`: name of the `Job` variant as returned by [`job_kind_str`] —
     /// e.g. `"Curate"`, `"Embed"`, `"ReIndex"`.
-    async fn dequeue_by_kind(&self, _kind: &str) -> Result<Option<JobRecord>, QueueError> {
-        self.dequeue().await
+    async fn dequeue_by_kind(
+        &self,
+        _kind: &str,
+        tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
+        self.dequeue(tenant_filter).await
     }
 
     /// Retrieves a job by identifier — `None` if not found.
-    async fn get(&self, id: Ulid) -> Result<Option<JobRecord>, QueueError>;
+    ///
+    /// `tenant_filter`: `None` = no tenant clause (byte-identical / OFF) ;
+    /// `Some(t)` = `AND tenant_id = t` (isolation ON — a job of another tenant
+    /// reads as `None`, enabling a 404 anti-disclosure at the handler).
+    async fn get(
+        &self,
+        id: Ulid,
+        tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError>;
 
     /// Marks a job as `Done` with its result.
     async fn complete(&self, id: Ulid, result: JobResult) -> Result<(), QueueError>;
@@ -1550,7 +1714,11 @@ pub trait QueueStore: Send + Sync {
     async fn fail(&self, id: Ulid, err: &str, attempt: u32) -> Result<(), QueueError>;
 
     /// Cancels a job (`Cancelled`).
-    async fn cancel(&self, id: Ulid) -> Result<(), QueueError>;
+    ///
+    /// `tenant_filter`: `None` = no tenant clause (byte-identical / OFF) ;
+    /// `Some(t)` = `AND tenant_id = t` (isolation ON — cancelling another
+    /// tenant's job is a no-op: 0 row affected, the job stays active).
+    async fn cancel(&self, id: Ulid, tenant_filter: Option<&str>) -> Result<(), QueueError>;
 
     /// Sends a job to the dead-letter queue (`DLQ`) — max retries reached.
     async fn fail_dlq(&self, id: Ulid, err: &str) -> Result<(), QueueError>;
@@ -1594,9 +1762,14 @@ pub trait QueueStore: Send + Sync {
     ///
     /// Returns an empty map. Database-backed stores (e.g. `SqliteQueueStore`)
     /// override with a native `GROUP BY status` (single query).
+    ///
+    /// `tenant_filter`: `None` = no tenant clause (byte-identical / OFF) ;
+    /// `Some(t)` = `WHERE tenant_id = t` (counts only the tenant's jobs).
     async fn count_jobs_by_status(
         &self,
+        tenant_filter: Option<&str>,
     ) -> Result<std::collections::HashMap<JobStatus, u64>, QueueError> {
+        let _ = tenant_filter;
         Ok(std::collections::HashMap::new())
     }
 
@@ -1620,7 +1793,7 @@ pub trait QueueStore: Send + Sync {
     /// Returns `Ok(0)` (no-op). Database-backed stores (e.g. `SqliteQueueStore`)
     /// override with a native `DELETE FROM ... WHERE status = 'DLQ'`. Mocks and
     /// in-memory stores inherit the no-op.
-    #[must_use = "le nombre de jobs DLQ supprimés doit être consommé (compte rendu prune)"]
+    #[must_use = "the number of deleted DLQ jobs must be consumed (prune report)"]
     async fn delete_dlq_jobs(&self, _older_than: Option<DateTime<Utc>>) -> Result<u64, QueueError> {
         Ok(0)
     }
@@ -1648,25 +1821,25 @@ pub trait QueueStore: Send + Sync {
     /// # Default implementation
     ///
     /// Returns `Ok(0)`. Database-backed stores override.
-    #[must_use = "le compte DLQ ciblé doit être consommé (dry-run prune)"]
+    #[must_use = "the targeted DLQ count must be consumed (dry-run prune)"]
     async fn count_dlq_jobs(&self, _older_than: Option<DateTime<Utc>>) -> Result<u64, QueueError> {
         Ok(0)
     }
 
-    /// Rattrapage DAG : promeuvet les jobs `Waiting` dont toutes les dépendances
-    /// sont `Done` mais dont la cascade post-commit n'a pas été exécutée.
+    /// Dependency-graph catch-up: promotes the `Waiting` jobs whose dependencies are
+    /// all `Done` but whose post-commit cascade never ran.
     ///
-    /// Appelée par le sweep périodique (`run_sweep_once`) comme filet de rattrapage.
-    /// N'est PAS le chemin nominal — le chemin nominal est `cascade_check_and_promote`
-    /// appelé immédiatement après `complete()`.
+    /// Called by the periodic sweep (`run_sweep_once`) as a safety net. This is **not**
+    /// the nominal path — nominally, `cascade_check_and_promote` runs immediately after
+    /// `complete()`.
     ///
     /// # Returns
     ///
-    /// Le nombre de jobs `Waiting` promus en `Pending`.
+    /// The number of `Waiting` jobs promoted to `Pending`.
     ///
     /// # Errors
     ///
-    /// Retourne `QueueError::Storage` en cas d'erreur d'accès à la base.
+    /// Returns `QueueError::Storage` if the database cannot be accessed.
     ///
     /// # Default implementation
     ///
@@ -1687,16 +1860,20 @@ pub trait QueueStore: Send + Sync {
     /// `ORDER BY id DESC`. Since ULID `id` is monotonic, lexicographic order
     /// on `id` is equivalent to creation order.
     ///
-    /// The `tenant` parameter allows future multi-tenant filtering. Single-tenant
-    /// stores (e.g. `SqliteQueueStore`, whose `gradatum_jobs` table has no tenant
-    /// column) ignore it and document that fact.
+    /// `tenant_filter`: `None` = no tenant clause (byte-identical / OFF, closes
+    /// L2 as-is) ; `Some(t)` = `WHERE tenant_id = t` (latest job of that tenant
+    /// only — dashboard isolation).
     ///
     /// # Default implementation
     ///
     /// Returns `None` (queue considered empty). Database-backed stores override
     /// with a native `ORDER BY id DESC LIMIT 1`.
-    #[must_use = "le dernier job retourné doit être consommé ou explicitement ignoré"]
-    async fn latest_job(&self, _tenant: &str) -> Result<Option<JobRecord>, QueueError> {
+    #[must_use = "the last returned job must be consumed or explicitly ignored"]
+    async fn latest_job(
+        &self,
+        tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
+        let _ = tenant_filter;
         Ok(None)
     }
 
@@ -1761,30 +1938,38 @@ pub trait QueueStore: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 pub enum QueueError {
     /// Storage error (SQLite driver, libsql, etc.).
-    #[error("erreur de stockage : {0}")]
+    #[error("storage error: {0}")]
     Storage(String),
 
     /// Job not found by identifier.
-    #[error("job introuvable : {0}")]
+    #[error("job not found: {0}")]
     NotFound(Ulid),
 
     /// JSON payload serialisation/deserialisation error.
-    #[error("erreur de sérialisation : {0}")]
+    #[error("serialization error: {0}")]
     Serialization(String),
 
     /// Invalid state transition (e.g. `Done → Running`).
-    #[error("transition d'état invalide : {0}")]
+    #[error("invalid state transition: {0}")]
     InvalidTransition(String),
 
     /// Operation cancelled (timeout, shutdown).
-    #[error("opération annulée : {0}")]
+    #[error("operation cancelled: {0}")]
     Cancelled(String),
+
+    /// Job is not in `Running` status or its lease has expired — the caller
+    /// attempted to `complete()` or `fail()` a job it does not hold a valid
+    /// lease on. This is a correctness guard against stale-lease processing:
+    /// prevents a worker from completing or failing a job after its lease has
+    /// been taken over by another worker (or expired).
+    #[error("job {0} is not leased or lease expired — cannot complete/fail")]
+    NotLeased(Ulid),
 
     /// Operation not implemented in this version.
     ///
     /// Used instead of `todo!()` to cleanly signal a deferred trait method
     /// implementation. Must never panic in production.
-    #[error("opération non implémentée : {method}")]
+    #[error("operation not implemented: {method}")]
     NotImplemented {
         /// Name of the unimplemented method.
         method: &'static str,
@@ -2341,5 +2526,233 @@ mod tests {
         let json = r#"{"note_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","tenant_id":"main"}"#;
         let spec: CurateSpec = serde_json::from_str(json).expect("deserialization CurateSpec");
         assert_eq!(spec.occurred_at, None);
+    }
+
+    /// `spec_tenant` extrait le tenant SERVI par le job depuis son spec (pas
+    /// l'appelant), avec fallback `"main"`.
+    #[test]
+    fn spec_tenant_extracts_per_kind() {
+        let mk = |kind: Job| JobSpec {
+            kind,
+            class: JobClass::System,
+            mode: JobMode::Batch,
+            scope: JobScope::VaultWide,
+            priority: JobPriority::Normal,
+        };
+
+        // Curate → CurateSpec.tenant_id
+        let curate = mk(Job::Curate(CurateSpec {
+            tenant_id: "alice".into(),
+            ..Default::default()
+        }));
+        assert_eq!(spec_tenant(&curate), "alice");
+
+        // Ingest → IngestSource.vault
+        let ingest = mk(Job::Ingest(IngestSource {
+            source: IngestInputSource::Url {
+                url: "http://x".into(),
+            },
+            vault: "bob".into(),
+            locus: "rag/".into(),
+            strategy: IngestStrategy::Auto,
+            dry_run: false,
+        }));
+        assert_eq!(spec_tenant(&ingest), "bob");
+
+        // Distill → DistillSource.scope : Vault(v) sinon "main"
+        let distill_wide = mk(Job::Distill(DistillSource {
+            scope: JobScope::VaultWide,
+            ..Default::default()
+        }));
+        assert_eq!(spec_tenant(&distill_wide), "main");
+        let distill_v = mk(Job::Distill(DistillSource {
+            scope: JobScope::Vault("carol".into()),
+            ..Default::default()
+        }));
+        assert_eq!(spec_tenant(&distill_v), "carol");
+
+        // Forget → ForgetScope
+        let forget_topic = mk(Job::Forget(ForgetSpec {
+            scope: ForgetScope::Topic {
+                query: "q".into(),
+                vault: Some("dave".into()),
+                limit: None,
+            },
+            ..Default::default()
+        }));
+        assert_eq!(spec_tenant(&forget_topic), "dave");
+        let forget_topic_none = mk(Job::Forget(ForgetSpec {
+            scope: ForgetScope::Topic {
+                query: "q".into(),
+                vault: None,
+                limit: None,
+            },
+            ..Default::default()
+        }));
+        assert_eq!(spec_tenant(&forget_topic_none), "main");
+        let forget_locus = mk(Job::Forget(ForgetSpec {
+            scope: ForgetScope::Locus {
+                vault: "erin".into(),
+                locus: "inbox/".into(),
+            },
+            ..Default::default()
+        }));
+        assert_eq!(spec_tenant(&forget_locus), "erin");
+        // Agent : un seul vault → ce vault ; multi-vault → "main" (isolation-safe).
+        let forget_agent_1 = mk(Job::Forget(ForgetSpec {
+            scope: ForgetScope::Agent {
+                agent_id: "a".into(),
+                vaults: vec!["frank".into()],
+            },
+            ..Default::default()
+        }));
+        assert_eq!(spec_tenant(&forget_agent_1), "frank");
+        let forget_agent_multi = mk(Job::Forget(ForgetSpec {
+            scope: ForgetScope::Agent {
+                agent_id: "a".into(),
+                vaults: vec!["x".into(), "y".into()],
+            },
+            ..Default::default()
+        }));
+        assert_eq!(spec_tenant(&forget_agent_multi), "main");
+
+        // Embed → EmbedSpec.tenant_id (enqueué LIVE après curate — apalis_handlers:1945).
+        let embed = mk(Job::Embed(EmbedSpec {
+            note_id: Ulid::new(),
+            tenant_id: "eve".into(),
+            force_regenerate: false,
+        }));
+        assert_eq!(spec_tenant(&embed), "eve");
+
+        // Validate → ValidateSpec.tenant_id (enqueué LIVE après distill — porte title+body).
+        let validate = mk(Job::Validate(ValidateSpec {
+            tenant_id: "frank".into(),
+            ..Default::default()
+        }));
+        assert_eq!(spec_tenant(&validate), "frank");
+
+        // Export → ExportSource.scope (VaultScope) : Vault(v) sinon "main" (admin/CLI-only).
+        let export = mk(Job::Export(ExportSource {
+            scope: JobScope::Vault("grace".into()),
+            filter: None,
+            format: ExportFormat::Json,
+            target: "exports/x.json".into(),
+            template: None,
+        }));
+        assert_eq!(spec_tenant(&export), "grace");
+        let export_wide = mk(Job::Export(ExportSource {
+            scope: JobScope::VaultWide,
+            filter: None,
+            format: ExportFormat::Json,
+            target: "exports/x.json".into(),
+            template: None,
+        }));
+        assert_eq!(spec_tenant(&export_wide), "main");
+
+        // Migrate → MigrateSource.target (VaultScope), admin/CLI-only.
+        let migrate = mk(Job::Migrate(MigrateSource {
+            from_path: "/p".into(),
+            mode: MigrateMode::RawMarkdown,
+            conflict: ConflictStrategy::Skip,
+            dry_run: true,
+            target: JobScope::Vault("heidi".into()),
+        }));
+        assert_eq!(spec_tenant(&migrate), "heidi");
+
+        // Fallback global — kind sans tenant porté, job sans vault porté.
+        assert_eq!(spec_tenant(&mk(Job::Backup)), "main");
+    }
+
+    /// A6' — quand le kind ne porte aucun tenant, le repli est le vault du JOB
+    /// (`JobSpec.scope`), pas le littéral `"main"`.
+    ///
+    /// RED avant A6' : les quatre cas ci-dessous rendaient `"main"`, ce qui rendait
+    /// `Purge`/`Distill` inatteignables pour tout tenant ≠ main (l'anti-forge de
+    /// `POST /api/v1/jobs` comparait `"main"` au Bearer → 403 systématique) et
+    /// estampillait `gradatum_jobs.tenant_id = "main"` un job servant un autre vault.
+    ///
+    /// A2-bis pose « un job = exactement un vault » : `JobScope::Vault(v)` EST le
+    /// tenant servi — c'est déjà la valeur que le worker résout (`resolve_job_vault`)
+    /// avant tout accès index.
+    #[test]
+    fn spec_tenant_falls_back_to_job_vault_not_main() {
+        let scoped = |kind: Job, scope: JobScope| JobSpec {
+            kind,
+            class: JobClass::Api,
+            mode: JobMode::Batch,
+            scope,
+            priority: JobPriority::Normal,
+        };
+
+        // Purge : PurgeSpec ne porte aucun tenant → vault du job.
+        assert_eq!(
+            spec_tenant(&scoped(
+                Job::Purge(PurgeSpec::default()),
+                JobScope::Vault("alice".into())
+            )),
+            "alice",
+            "Purge doit servir le vault du job, pas 'main'"
+        );
+
+        // Distill dont le scope interne décrit le QUOI (Locus) → vault du job.
+        assert_eq!(
+            spec_tenant(&scoped(
+                Job::Distill(DistillSource {
+                    mode: DistillMode::Semantic,
+                    scope: JobScope::Locus("inbox/".into()),
+                    window: None,
+                    batch_limit: 500,
+                    confidence_threshold: 0.75,
+                    min_qa_events: None,
+                }),
+                JobScope::Vault("bob".into())
+            )),
+            "bob",
+            "Distill à scope Locus doit servir le vault du job, pas 'main'"
+        );
+
+        // Forget::Topic{vault:None} → vault du job (le scope n'élit rien).
+        assert_eq!(
+            spec_tenant(&scoped(
+                Job::Forget(ForgetSpec {
+                    scope: ForgetScope::Topic {
+                        query: "q".into(),
+                        vault: None,
+                        limit: None,
+                    },
+                    ..Default::default()
+                }),
+                JobScope::Vault("carol".into())
+            )),
+            "carol",
+            "Forget::Topic sans vault doit servir le vault du job, pas 'main'"
+        );
+
+        // Un vault PORTÉ par le spec prime toujours sur celui du job : c'est ce qui
+        // garde l'anti-forge discriminante (spec 'bob' vs job 'alice' → divergence).
+        assert_eq!(
+            spec_tenant(&scoped(
+                Job::Forget(ForgetSpec {
+                    scope: ForgetScope::Locus {
+                        vault: "bob".into(),
+                        locus: "inbox/".into(),
+                    },
+                    ..Default::default()
+                }),
+                JobScope::Vault("alice".into())
+            )),
+            "bob",
+            "le vault porté par le spec prime — sinon l'anti-forge devient aveugle"
+        );
+
+        // Repli ultime inchangé : ni le kind ni le job ne portent de vault → "main".
+        assert_eq!(
+            spec_tenant(&scoped(
+                Job::Purge(PurgeSpec::default()),
+                JobScope::VaultWide
+            )),
+            "main",
+            "mono-vault : 'main' reste LA réponse quand aucun vault n'est porté"
+        );
     }
 }

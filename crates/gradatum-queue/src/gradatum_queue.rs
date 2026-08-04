@@ -8,10 +8,10 @@
 //! - `SqliteQueueStore` → polling, atomic leases, `QueueEvent` broadcast
 //! - `GradatumQueue`   → `find_awaiting` DAG, `JobClass` exclusions (deferred)
 //!
-//! ## Délégation complète
+//! ## Full delegation
 //!
-//! Toutes les méthodes, y compris `find_awaiting` et `set_pending`,
-//! délèguent à [`SqliteQueueStore`] (pas de stub `NotImplemented` ici).
+//! Every method, `find_awaiting` and `set_pending` included, delegates to
+//! [`SqliteQueueStore`] — there is no `NotImplemented` stub here.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +43,9 @@ impl GradatumQueue {
 
     /// Returns a reference to the underlying [`SqliteQueueStore`].
     ///
-    /// Used by `gradatum-worker` for injection into `WorkerContext`.
+    /// **No caller in the workspace.** `gradatum-worker` does not use it, and no
+    /// `WorkerContext` type exists anywhere — the accessor is kept for external consumers
+    /// that need the concrete store behind the queue.
     #[must_use]
     pub fn store(&self) -> Arc<SqliteQueueStore> {
         Arc::clone(&self.inner)
@@ -56,12 +58,31 @@ impl QueueStore for GradatumQueue {
         self.inner.enqueue(job).await
     }
 
-    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError> {
-        self.inner.dequeue().await
+    async fn dequeue(&self, tenant_filter: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
+        self.inner.dequeue(tenant_filter).await
     }
 
-    async fn get(&self, id: Ulid) -> Result<Option<JobRecord>, QueueError> {
-        self.inner.get(id).await
+    /// Override the default trait impl — forwards to `SqliteQueueStore::dequeue_by_kind`
+    /// with native SQL `kind` filtering.
+    ///
+    /// The default trait impl (`dequeue(tenant_filter)`) ignores `kind`, which would
+    /// cause all workers to fetch any job regardless of kind — breaking the DLQ
+    /// routing fix. This override preserves the native `kind` filter in the SQL
+    /// `WHERE` clause, ensuring each worker fetches only jobs matching its handler.
+    async fn dequeue_by_kind(
+        &self,
+        kind: &str,
+        tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
+        self.inner.dequeue_by_kind(kind, tenant_filter).await
+    }
+
+    async fn get(
+        &self,
+        id: Ulid,
+        tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
+        self.inner.get(id, tenant_filter).await
     }
 
     async fn complete(&self, id: Ulid, result: JobResult) -> Result<(), QueueError> {
@@ -72,8 +93,8 @@ impl QueueStore for GradatumQueue {
         self.inner.fail(id, err, attempt).await
     }
 
-    async fn cancel(&self, id: Ulid) -> Result<(), QueueError> {
-        self.inner.cancel(id).await
+    async fn cancel(&self, id: Ulid, tenant_filter: Option<&str>) -> Result<(), QueueError> {
+        self.inner.cancel(id, tenant_filter).await
     }
 
     async fn fail_dlq(&self, id: Ulid, err: &str) -> Result<(), QueueError> {
@@ -124,6 +145,7 @@ impl QueueStore for GradatumQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gradatum_core::*;
     use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
     use sqlx::SqlitePool;
     use ulid::Ulid;
@@ -167,5 +189,96 @@ mod tests {
             result.is_ok(),
             "attendu Ok(()) (no-op idempotent) pour ULID inconnu, obtenu : {result:?}"
         );
+    }
+
+    /// `dequeue_by_kind` délègue à `SqliteQueueStore` avec le filtre `kind` natif SQL.
+    ///
+    /// Sans cet override, le défaut du trait ignore `kind` et appelle
+    /// `dequeue(tenant_filter)` — un worker embed pourrait recevoir un job Curate,
+    /// ce qui casse le fix routing DLQ (P1-5).
+    #[tokio::test]
+    async fn dequeue_by_kind_forwards_kind_filter() {
+        use gradatum_core::*;
+        let queue = make_queue().await;
+
+        // Enqueue 1 Curate + 1 Embed.
+        let curate = make_record_for_test(
+            Job::Curate(CurateSpec::default()),
+            JobClass::Agent,
+            JobStatus::Pending,
+        );
+        let embed = make_record_for_test(
+            Job::Embed(EmbedSpec {
+                note_id: Ulid::new(),
+                tenant_id: "main".to_string(),
+                force_regenerate: false,
+            }),
+            JobClass::Agent,
+            JobStatus::Pending,
+        );
+        let curate_id = curate.id;
+        let embed_id = embed.id;
+        queue.enqueue(curate).await.expect("enqueue Curate");
+        queue.enqueue(embed).await.expect("enqueue Embed");
+
+        // dequeue_by_kind("Curate") ne retourne QUE le Curate.
+        let got = queue
+            .dequeue_by_kind("Curate", None)
+            .await
+            .expect("dequeue_by_kind Curate")
+            .expect("doit retourner un job");
+        assert_eq!(
+            got.id, curate_id,
+            "dequeue_by_kind(Curate) doit retourner le job Curate"
+        );
+
+        // dequeue_by_kind("Embed") retourne l'Embed restant.
+        let got_embed = queue
+            .dequeue_by_kind("Embed", None)
+            .await
+            .expect("dequeue_by_kind Embed")
+            .expect("doit retourner un job");
+        assert_eq!(
+            got_embed.id, embed_id,
+            "dequeue_by_kind(Embed) doit retourner le job Embed"
+        );
+    }
+
+    fn make_record_for_test(job: Job, class: JobClass, status: JobStatus) -> JobRecord {
+        let now = chrono::Utc::now();
+        JobRecord {
+            id: Ulid::new(),
+            spec: JobSpec {
+                kind: job,
+                class,
+                mode: JobMode::Batch,
+                scope: JobScope::VaultWide,
+                priority: JobPriority::default_for(&class),
+            },
+            scheduling: JobScheduling {
+                trigger: TriggerSource::Demand,
+                scheduled_at: now,
+                await_jobs: vec![],
+                deadline: None,
+                cron_expr: None,
+            },
+            lifecycle: JobLifecycle {
+                status,
+                created_at: now,
+                started_at: None,
+                completed_at: None,
+                lease_until: None,
+                result: None,
+            },
+            retry: JobRetry::default(),
+            lineage: JobLineage {
+                triggered_by: None,
+                parent_job: None,
+                pipeline_id: None,
+                pipeline_step: None,
+                children: vec![],
+                cost_usd: None,
+            },
+        }
     }
 }

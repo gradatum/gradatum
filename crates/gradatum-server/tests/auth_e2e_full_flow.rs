@@ -24,6 +24,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::JwtService;
+use gradatum_core::scope::AgentId;
 use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
 use gradatum_queue::SqliteQueue;
 use gradatum_server::auth_routes::ExchangeResponse;
@@ -140,7 +141,7 @@ async fn e2e_api_key_to_jwt_to_vault_write_to_poll() {
     let material = state
         .api_keys
         .create(
-            "e2e-auth-writer",
+            &AgentId::new("e2e-auth-writer"),
             vec!["admin".into()],
             "main".into(),
             Some("clé de test E2E auth_e2e_full_flow".into()),
@@ -196,7 +197,7 @@ async fn e2e_api_key_to_jwt_to_vault_write_to_poll() {
     //
     // Note : le handler vault_write utilise `req.tenant_id` du body pour l'évaluation
     // ACL (locus = "main/main"). Le JWT est vérifié par le middleware auth_middleware
-    // et injecte `TrustContext::BearerToken { sub: "e2e-auth-writer", tenant_id: "main" }`.
+    // et injecte `TrustContext::BearerToken { sub: "e2e-auth-writer", tenant_id: "main", .. }`.
     let write_req = Request::builder()
         .method("POST")
         .uri("/api/v1/vault_write")
@@ -434,7 +435,12 @@ async fn e2e_exchange_expires_in_matches_service_ttl() {
 
     let material = state
         .api_keys
-        .create("e2e-auth-writer", vec!["read".into()], "main".into(), None)
+        .create(
+            &AgentId::new("e2e-auth-writer"),
+            vec!["read".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create api key ttl test");
 

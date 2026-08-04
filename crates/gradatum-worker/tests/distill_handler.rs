@@ -81,10 +81,13 @@ impl QueueStore for NoopQueueStore {
     async fn enqueue(&self, _job: JobRecord) -> Result<Ulid, QueueError> {
         Ok(Ulid::new())
     }
-    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError> {
+    async fn dequeue(
+        &self,
+        __tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
         Ok(None)
     }
-    async fn get(&self, _id: Ulid) -> Result<Option<JobRecord>, QueueError> {
+    async fn get(&self, _id: Ulid, _tenant: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
         Ok(None)
     }
     async fn complete(
@@ -97,7 +100,7 @@ impl QueueStore for NoopQueueStore {
     async fn fail(&self, _id: Ulid, _err: &str, _attempt: u32) -> Result<(), QueueError> {
         Ok(())
     }
-    async fn cancel(&self, _id: Ulid) -> Result<(), QueueError> {
+    async fn cancel(&self, _id: Ulid, _tenant: Option<&str>) -> Result<(), QueueError> {
         Ok(())
     }
     async fn fail_dlq(&self, _id: Ulid, _err: &str) -> Result<(), QueueError> {
@@ -166,10 +169,13 @@ impl QueueStore for CapturingQueueStore {
             .push(job);
         Ok(id)
     }
-    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError> {
+    async fn dequeue(
+        &self,
+        __tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
         Ok(None)
     }
-    async fn get(&self, _id: Ulid) -> Result<Option<JobRecord>, QueueError> {
+    async fn get(&self, _id: Ulid, _tenant: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
         Ok(None)
     }
     async fn complete(
@@ -182,7 +188,7 @@ impl QueueStore for CapturingQueueStore {
     async fn fail(&self, _id: Ulid, _err: &str, _attempt: u32) -> Result<(), QueueError> {
         Ok(())
     }
-    async fn cancel(&self, _id: Ulid) -> Result<(), QueueError> {
+    async fn cancel(&self, _id: Ulid, _tenant: Option<&str>) -> Result<(), QueueError> {
         Ok(())
     }
     async fn fail_dlq(&self, _id: Ulid, _err: &str) -> Result<(), QueueError> {
@@ -300,7 +306,7 @@ async fn write_note_with_embedding(
         .await
         .expect("write_note_with_id");
     fx.index
-        .insert_note_embedding(&written.id, "test-embedder", 3, &embedding)
+        .insert_note_embedding("main", &written.id, "test-embedder", 3, &embedding)
         .await
         .expect("insert_note_embedding");
     written.id
@@ -374,6 +380,7 @@ async fn dry_run_lists_clusters_without_mutation() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("dry-run ne doit pas échouer");
@@ -416,6 +423,7 @@ async fn real_mode_creates_pending_review_synthesis() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(Arc::clone(&queue) as Arc<dyn QueueStore + Send + Sync>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("mode réel ne doit pas échouer");
@@ -507,6 +515,7 @@ async fn processed_notes_never_reclustered() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::clone(&synth)),
         Data::new(Arc::clone(&queue1) as Arc<dyn QueueStore + Send + Sync>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("run 1");
@@ -541,6 +550,7 @@ async fn processed_notes_never_reclustered() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::clone(&synth)),
         Data::new(Arc::clone(&queue2) as Arc<dyn QueueStore + Send + Sync>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("run 2");
@@ -574,6 +584,7 @@ async fn synthesizer_failure_propagates_as_business_error() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(FailingSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -602,6 +613,7 @@ async fn vaultwide_refused_in_real_mode() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
     assert!(res.is_err(), "VaultWide en mode réel doit être refusé");
@@ -623,6 +635,7 @@ async fn vaultwide_allowed_in_dry_run() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("VaultWide dry-run autorisé");
@@ -672,11 +685,12 @@ async fn notes_without_embedding_skipped() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("note sans embedding ignorée sans erreur");
     assert!(
-        out.result_note_md.contains("1 note(s) candidate(s)"),
+        out.result_note_md.contains("1 candidate note(s)"),
         "seule la note avec embedding est candidate : {}",
         out.result_note_md
     );
@@ -775,11 +789,12 @@ async fn forgotten_notes_skipped_in_distill() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("dry-run");
     assert!(
-        out.result_note_md.contains("1 note(s) candidate(s)"),
+        out.result_note_md.contains("1 candidate note(s)"),
         "forgotten exclue → 1 seule candidate (Live) : {}",
         out.result_note_md
     );
@@ -804,11 +819,12 @@ async fn garbage_notes_skipped_in_distill() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("dry-run");
     assert!(
-        out.result_note_md.contains("1 note(s) candidate(s)"),
+        out.result_note_md.contains("1 candidate note(s)"),
         "Garbage exclue → 1 seule candidate (Live) : {}",
         out.result_note_md
     );
@@ -854,11 +870,12 @@ async fn batch_limit_applied_after_processed_filter() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("dry-run");
     assert!(
-        out.result_note_md.contains("2 note(s) candidate(s)"),
+        out.result_note_md.contains("2 candidate note(s)"),
         "P2-1 : f1/f2 atteignables malgré p1/p2 processed en tête : {}",
         out.result_note_md
     );
@@ -883,6 +900,7 @@ async fn empty_locus_rejected_in_real_mode() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
     assert!(
@@ -916,12 +934,13 @@ async fn out_of_range_threshold_clamped() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(queue),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("seuil clampé → pas de panique");
     // Seuil clampé à 1.0 : les vecteurs identiques (cosine=1.0 ≥ 1.0) sont regroupés.
     assert!(
-        out.result_note_md.contains("seuil cosine 1.00"),
+        out.result_note_md.contains("cosine threshold 1.00"),
         "{}",
         out.result_note_md
     );
@@ -946,6 +965,7 @@ async fn job_output_reports_enqueue_count() {
         Data::new(Arc::clone(&fx.embedder)),
         Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
         Data::new(Arc::clone(&queue) as Arc<dyn QueueStore + Send + Sync>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("mode réel");

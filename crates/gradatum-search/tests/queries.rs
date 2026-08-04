@@ -15,7 +15,7 @@ use gradatum_core::scope::VaultId;
 use gradatum_core::section::Section;
 use gradatum_core::status::NoteStatus;
 use gradatum_core::tag::Tag;
-use gradatum_search::SqliteIndex;
+use gradatum_index::SqliteIndex;
 use tempfile::TempDir;
 
 // ── Helpers de fixtures ───────────────────────────────────────────────────────
@@ -371,7 +371,7 @@ async fn title_lookup_collision_column_wins_over_h1() {
         .await
         .expect("upsert note_a collision");
     index
-        .upsert_note_title(&note_a.id, "dup")
+        .upsert_note_title("main", &note_a.id, "dup")
         .await
         .expect("upsert_note_title note_a collision");
 

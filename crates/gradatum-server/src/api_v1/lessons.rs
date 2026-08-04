@@ -21,14 +21,19 @@
 //! Purely FTS5 code path (no embedding, no RRF, no reranker). Target: <50 ms
 //! on the normalized lesson corpus.
 
+use axum::response::{IntoResponse, Response};
 use axum::{
     Extension, Json,
     extract::{Query, State},
     http::StatusCode,
 };
 use gradatum_core::trust::TrustContext;
-use gradatum_dto::{LessonsRecallRequest, LessonsRecallResponse};
+use gradatum_dto::LessonsRecallRequest;
 
+use crate::api_v1::compact::{self, CompactBody};
+
+use crate::api_v1::logic::LESSONS_TENANT;
+use crate::note_usage_store::KIND_SEARCH_HIT;
 use crate::state::AppState;
 
 /// `GET /api/v1/lessons/recall?class=<x>&limit=<n>`
@@ -46,16 +51,36 @@ pub async fn lessons_recall(
     State(state): State<AppState>,
     Extension(trust): Extension<TrustContext>,
     Query(params): Query<LessonsRecallRequest>,
-) -> Result<Json<LessonsRecallResponse>, StatusCode> {
-    crate::api_v1::logic::lessons_recall_impl(&state, &trust, params)
+) -> Result<Response, StatusCode> {
+    // Capture the opt-in flag + class before `params` is moved into the impl.
+    let want_compact = params.compact;
+    let class = params.class.clone();
+    let resp = crate::api_v1::logic::lessons_recall_impl(&state, &trust, params)
         .await
-        .map(Json)
         .map_err(|e| {
-            // TEMPORAIRE DEBUG — à supprimer après diagnostic 500
-            eprintln!("[DEBUG] lessons_recall error: {e:?}");
             if matches!(e, gradatum_core::error::GradatumError::Storage(_)) {
                 tracing::error!(err = %e, "lessons_recall: backend failed");
             }
             crate::api_v1::logic::err_to_status(&e)
+        })?;
+
+    // F-110 : télémétrie salience per-note — +search-hit par leçon retournée
+    // (recall par classe = search sémantique). APRÈS succès, best-effort. Tenant lessons
+    // = LESSONS_TENANT ("main"). Aucune mutation de la réponse.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for item in &resp.items {
+        state
+            .note_usage_accumulators
+            .record(LESSONS_TENANT, &item.ulid, KIND_SEARCH_HIT, now_ms);
+    }
+
+    // `compact=false` returns exactly `Json(resp)` as before → byte-for-byte identical.
+    Ok(if want_compact {
+        Json(CompactBody {
+            compact: compact::render_recall(&resp, &class),
         })
+        .into_response()
+    } else {
+        Json(resp).into_response()
+    })
 }

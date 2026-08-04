@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::default_main;
+use gradatum_core::scope::{TenantId, VaultId};
 
 /// Request body for `vault_search`.
 ///
@@ -15,9 +15,11 @@ use crate::default_main;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultSearchRequest {
-    /// Tenant identifier (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Tenant (principal) — optional; when omitted the server resolves it from the
+    /// credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// Full-text or semantic search query.
     pub query: String,
     /// Section filter (optional).
@@ -56,7 +58,8 @@ pub struct VaultSearchRequest {
     ///
     /// Absent or `null`: uses `tenant_id` (unchanged behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vault_id: Option<String>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub vault_id: Option<VaultId>,
     /// If `true`, enriches each result with a `scores` object detailing
     /// the composite score breakdown.
     ///
@@ -96,6 +99,19 @@ pub struct VaultSearchRequest {
     /// present, `from_ms` must be ≤ `to_ms` (otherwise `400 Bad Request`).
     #[serde(default)]
     pub to_ms: Option<i64>,
+    /// If `true`, the server returns a **compact** rendering instead of the full
+    /// `VaultSearchResponse`: an object `{ "compact": "<text>" }` where the text lists
+    /// each hit as `<ulid> [<score>]` plus the `corpus_match_count` absence-proof hint.
+    ///
+    /// Optimises token cost for LLM consumers (the compaction is a product feature,
+    /// not transport). Preserves the lexical-absence reasoning: when
+    /// `corpus_match_count == 0`, the rendering states the results are semantic
+    /// neighbours only (absence proven).
+    ///
+    /// Opt-in (default `false`): when absent, the response is **byte-for-byte identical**
+    /// to the historical `VaultSearchResponse`. Existing clients are unaffected.
+    #[serde(default)]
+    pub compact: bool,
 }
 
 /// Escapes SQLite LIKE metacharacters (`%`, `_`, `\`) in a value

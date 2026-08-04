@@ -29,6 +29,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::{Router, middleware};
 use gradatum_auth::jwt::TokenScope;
+use gradatum_core::scope::AgentId;
 use gradatum_core::trust::TrustContext;
 use gradatum_server::middleware::auth_middleware;
 use gradatum_server::state::AppState;
@@ -105,7 +106,7 @@ async fn bearer_api_key_valid_returns_authenticated() {
     let material = state
         .api_keys
         .create(
-            "mcp-client",
+            &AgentId::new("mcp-client"),
             vec!["read".to_string(), "write".to_string()],
             "main".to_string(),
             Some("clé MCP test".to_string()),
@@ -157,7 +158,7 @@ async fn bearer_api_key_revoked_returns_unauthenticated() {
     let material = state
         .api_keys
         .create(
-            "agent-revoke",
+            &AgentId::new("agent-revoke"),
             vec!["read".to_string()],
             "main".to_string(),
             None,
@@ -228,6 +229,7 @@ async fn bearer_jwt_expired_unchanged() {
     let short_jwt = JwtService::new(
         signing_key,
         "kid-test-expired".into(),
+        "gradatum".into(),
         "gradatum".into(),
         0, // ttl_human_secs = 0
         0, // ttl_service_secs = 0
@@ -310,7 +312,7 @@ async fn mcp_with_api_key_bearer_succeeds() {
     let material = state
         .api_keys
         .create(
-            "claude-code-mcp",
+            &AgentId::new("claude-code-mcp"),
             vec!["read".to_string(), "write".to_string()],
             "main".to_string(),
             Some("Claude Code MCP transport".to_string()),

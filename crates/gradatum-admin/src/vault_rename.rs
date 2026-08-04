@@ -30,9 +30,9 @@ pub struct VaultRenameArgs {
     /// Gradatum root directory (e.g. `/var/lib/gradatum`).
     pub root: PathBuf,
     /// Current title of the note (must exist with `status='live'`).
-    pub ancien: String,
+    pub current_title: String,
     /// New title to apply.
-    pub nouveau: String,
+    pub new_title: String,
     /// Target tenant (`vault_id`), default `"main"`.
     pub tenant: String,
 }
@@ -53,9 +53,16 @@ pub struct VaultRenameReport {
 /// The `notes.title` UPDATE and the `redirect_table` INSERT are performed inside
 /// a single transaction — either both succeed or neither does.
 ///
+/// ## Vault scoping
+///
+/// The `notes.title` UPDATE filters `WHERE id = <note_id> AND vault_id = <tenant>`
+/// (defense in depth: `note_id` is already resolved within `tenant` by the lookup,
+/// so the predicate removes no legitimate row). Without it, a rename targeting one
+/// vault would overwrite the title of a homonymous note (same id) in another vault.
+///
 /// ## Errors
 ///
-/// - `ancien` not found (`status='live'`, `vault_id=tenant`) → explicit error.
+/// - `current_title` not found (`status='live'`, `vault_id=tenant`) → explicit error.
 /// - Multiple notes share the same title → the first (`ORDER BY created ASC`) is renamed.
 /// - SQLite failure → propagated via `anyhow`.
 pub async fn vault_rename(args: VaultRenameArgs) -> Result<VaultRenameReport> {
@@ -63,27 +70,28 @@ pub async fn vault_rename(args: VaultRenameArgs) -> Result<VaultRenameReport> {
     let db_path = vault_index_path(&args.root);
     if !db_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le worker doit avoir démarré au moins une fois",
+            "index.db not found: {} — the worker must have started at least once",
             db_path.display()
         );
     }
-    let ancien = args.ancien.clone();
-    let nouveau = args.nouveau.clone();
+    let current_title = args.current_title.clone();
+    let new_title = args.new_title.clone();
     let tenant = args.tenant.clone();
-    tokio::task::spawn_blocking(move || run_rename_sync(&db_path, &tenant, &ancien, &nouveau))
-        .await
-        .context("spawn_blocking vault_rename")?
+    tokio::task::spawn_blocking(move || {
+        run_rename_sync(&db_path, &tenant, &current_title, &new_title)
+    })
+    .await
+    .context("spawn_blocking vault_rename")?
 }
 
 /// Synchronous rename implementation; called from `spawn_blocking`.
 fn run_rename_sync(
     db_path: &std::path::Path,
     tenant: &str,
-    ancien: &str,
-    nouveau: &str,
+    current_title: &str,
+    new_title: &str,
 ) -> Result<VaultRenameReport> {
-    let conn =
-        rusqlite::Connection::open(db_path).context("ouverture index.db pour vault-rename")?;
+    let conn = rusqlite::Connection::open(db_path).context("opening index.db for vault-rename")?;
 
     // WAL for concurrent access alongside gradatum-server.
     conn.execute_batch("PRAGMA journal_mode=WAL;")
@@ -96,17 +104,17 @@ fn run_rename_sync(
              WHERE vault_id = ?1 AND title = ?2 AND status = 'live'
              ORDER BY created ASC
              LIMIT 1",
-            rusqlite::params![tenant, ancien],
+            rusqlite::params![tenant, current_title],
             |row| row.get(0),
         )
         .with_context(|| {
             format!(
-                "note '{ancien}' introuvable (status='live', vault_id='{tenant}') — \
-                 vérifier le titre exact ou que la note est active"
+                "note '{current_title}' not found (status='live', vault_id='{tenant}') — \
+                 check the exact title or that the note is active"
             )
         })?;
 
-    let slug = title_to_slug(ancien);
+    let slug = title_to_slug(current_title);
     let renamed_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -115,25 +123,31 @@ fn run_rename_sync(
     // 2. Atomic transaction: UPDATE title + INSERT redirect.
     let tx = conn
         .unchecked_transaction()
-        .context("début transaction vault-rename")?;
+        .context("starting vault-rename transaction")?;
 
-    // UPDATE notes.title.
+    // UPDATE notes.title, scopé par vault_id (C4-1e, M3 : défense en profondeur).
+    //
+    // Sans le prédicat `vault_id`, un rename ciblant un tenant écrasait le titre
+    // d'une note homonyme (même id) dans un autre vault — le `tenant` est déjà
+    // résolu par le lookup ci-dessus (`:95`), simple réutilisation locale.
     let rows_updated = tx
         .execute(
-            "UPDATE notes SET title = ?1 WHERE id = ?2",
-            rusqlite::params![nouveau, note_id],
+            "UPDATE notes SET title = ?1 WHERE id = ?2 AND vault_id = ?3",
+            rusqlite::params![new_title, note_id, tenant],
         )
         .context("UPDATE notes.title")?;
 
     if rows_updated == 0 {
-        anyhow::bail!("UPDATE title n'a affecté aucune ligne pour note_id={note_id}");
+        anyhow::bail!("UPDATE title affected no row for note_id={note_id}");
     }
 
-    // INSERT OR REPLACE into redirect_table (idempotent).
+    // INSERT OR REPLACE into redirect_table (idempotent), scopé par vault_id
+    // (Groupe B, M4 : PK composite `(vault_id, title_slug)`, migration 0035).
+    // Le `tenant` est le vault courant, déjà résolu par le lookup ci-dessus (`:99`).
     tx.execute(
-        "INSERT OR REPLACE INTO redirect_table (title_slug, ulid, renamed_at) \
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![slug, note_id, renamed_at_ms],
+        "INSERT OR REPLACE INTO redirect_table (vault_id, title_slug, ulid, renamed_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![tenant, slug, note_id, renamed_at_ms],
     )
     .context("INSERT redirect_table")?;
 
@@ -173,7 +187,7 @@ mod tests {
         let nid = gradatum_core::identity::NoteId(
             ulid::Ulid::from_string(&ulid_str).expect("ULID parse setup"),
         );
-        idx.upsert_note_title(&nid, title)
+        idx.upsert_note_title("main", &nid, title)
             .await
             .expect("upsert_note_title setup");
 
@@ -196,8 +210,8 @@ mod tests {
             .to_path_buf();
         let args = VaultRenameArgs {
             root,
-            ancien: "Ancien Titre Test".to_string(),
-            nouveau: "Nouveau Titre Test".to_string(),
+            current_title: "Ancien Titre Test".to_string(),
+            new_title: "Nouveau Titre Test".to_string(),
             tenant: "main".to_string(),
         };
         let report = vault_rename(args)
@@ -240,6 +254,158 @@ mod tests {
         );
     }
 
+    /// Prépare une DB avec 2 vaults ("main" + "vault-b") partageant le MÊME id de
+    /// note (collision volontaire) — harnais isolation cross-vault (C4-1e, M3/A6).
+    ///
+    /// Vault physique unique (`root/vault/.gradatum/index.db`) ; deux lignes `notes`
+    /// y coexistent grâce à la clé composite `(vault_id, id)` (migration 0032).
+    /// Titre distinct par vault pour détecter une fuite d'écriture cross-vault.
+    ///
+    /// Retourne `(TempDir, PathBuf racine, String ULID colliding)`.
+    async fn setup_db_with_colliding_notes(
+        title_main: &str,
+        title_b: &str,
+    ) -> (TempDir, PathBuf, String) {
+        use gradatum_core::scope::VaultId;
+
+        let tmp = TempDir::new().expect("TempDir vault_rename cross-vault test");
+        let vault_path = tmp.path().join("vault");
+        let vault = gradatum_vault::Vault::create(&vault_path, VaultId::new("main"))
+            .await
+            .expect("Vault::create vault_rename cross-vault test");
+
+        let idx = vault.index();
+        let ulid_str = ulid::Ulid::new().to_string();
+        let nid = gradatum_core::identity::NoteId(
+            ulid::Ulid::from_string(&ulid_str).expect("ULID parse setup collision"),
+        );
+
+        // Note "main".
+        idx.seed_note_with_fts(&ulid_str, "decisions", &format!("# {title_main}\ncorps."))
+            .await
+            .expect("seed_note_with_fts main");
+        idx.upsert_note_title("main", &nid, title_main)
+            .await
+            .expect("upsert_note_title main");
+
+        // Note "vault-b", MÊME id que "main" — collision volontaire.
+        idx.seed_note_with_fts_vault(
+            &ulid_str,
+            "vault-b",
+            "decisions",
+            None,
+            &format!("# {title_b}\ncorps."),
+        )
+        .await
+        .expect("seed_note_with_fts_vault vault-b");
+        idx.upsert_note_title("vault-b", &nid, title_b)
+            .await
+            .expect("upsert_note_title vault-b");
+
+        let db_path = vault_path.join(".gradatum/index.db");
+        let root = db_path
+            .parent() // .gradatum/
+            .unwrap()
+            .parent() // vault/
+            .unwrap()
+            .parent() // tmp/
+            .unwrap()
+            .to_path_buf();
+        (tmp, root, ulid_str)
+    }
+
+    /// Test ON (isolation cross-vault) : renommer une note dans `vault-b` ne doit PAS
+    /// toucher la note homonyme (même id) de `main`. RED avant le fix de `:122`
+    /// (`UPDATE notes SET title = ?1 WHERE id = ?2` sans prédicat `vault_id`) :
+    /// l'UPDATE touche les deux lignes puisqu'elles partagent le même `id`.
+    #[tokio::test]
+    async fn vault_rename_does_not_cross_vault() {
+        let (_tmp, root, ulid_str) = setup_db_with_colliding_notes("doc-main", "doc-b").await;
+
+        let args = VaultRenameArgs {
+            root,
+            current_title: "doc-b".to_string(),
+            new_title: "doc-b-renamed".to_string(),
+            tenant: "vault-b".to_string(),
+        };
+        let report = vault_rename(args)
+            .await
+            .expect("vault_rename vault-b ne doit pas échouer");
+        assert_eq!(report.note_id, ulid_str);
+
+        // Relecture directe via le chemin connu construit par le setup
+        // (root/vault/.gradatum/index.db — SSOT `vault_index_path`).
+        let db_path = vault_index_path(_tmp.path());
+        let conn = rusqlite::Connection::open(&db_path).expect("open db post-rename");
+
+        let main_title: String = conn
+            .query_row(
+                "SELECT title FROM notes WHERE id = ?1 AND vault_id = 'main'",
+                [&ulid_str],
+                |r| r.get(0),
+            )
+            .expect("SELECT title main");
+        assert_eq!(
+            main_title, "doc-main",
+            "le titre de la note `main` ne doit PAS être écrasé par un rename ciblant `vault-b`"
+        );
+
+        let b_title: String = conn
+            .query_row(
+                "SELECT title FROM notes WHERE id = ?1 AND vault_id = 'vault-b'",
+                [&ulid_str],
+                |r| r.get(0),
+            )
+            .expect("SELECT title vault-b");
+        assert_eq!(
+            b_title, "doc-b-renamed",
+            "le titre de la note `vault-b` doit refléter le rename"
+        );
+    }
+
+    /// Test OFF (régime mono-vault, byte-identical) : le rename met bien à jour le
+    /// titre et crée le redirect — comportement inchangé par le durcissement de `:122`.
+    #[tokio::test]
+    async fn vault_rename_single_vault_unchanged() {
+        let (_tmp, db_path, ulid_str) = setup_db_with_note("Titre Mono Vault").await;
+
+        let root = db_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let args = VaultRenameArgs {
+            root,
+            current_title: "Titre Mono Vault".to_string(),
+            new_title: "Titre Mono Vault Renommé".to_string(),
+            tenant: "main".to_string(),
+        };
+        let report = vault_rename(args)
+            .await
+            .expect("vault_rename mono-vault ne doit pas échouer");
+        assert_eq!(report.note_id, ulid_str);
+
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        let title: String = conn
+            .query_row("SELECT title FROM notes WHERE id = ?1", [&ulid_str], |r| {
+                r.get(0)
+            })
+            .expect("SELECT title");
+        assert_eq!(title, "Titre Mono Vault Renommé");
+
+        let redirect_ulid: String = conn
+            .query_row(
+                "SELECT ulid FROM redirect_table WHERE title_slug = ?1",
+                [&report.slug],
+                |r| r.get(0),
+            )
+            .expect("SELECT redirect_table");
+        assert_eq!(redirect_ulid, ulid_str);
+    }
+
     #[tokio::test]
     async fn vault_rename_returns_error_when_note_not_found() {
         let (_tmp, db_path, _) = setup_db_with_note("Titre Existant").await;
@@ -254,8 +420,8 @@ mod tests {
             .to_path_buf();
         let args = VaultRenameArgs {
             root,
-            ancien: "Titre Inexistant XYZ".to_string(),
-            nouveau: "Nouveau".to_string(),
+            current_title: "Titre Inexistant XYZ".to_string(),
+            new_title: "Nouveau".to_string(),
             tenant: "main".to_string(),
         };
         let result = vault_rename(args).await;
@@ -265,8 +431,8 @@ mod tests {
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("introuvable"),
-            "message d'erreur doit mentionner 'introuvable' : {msg}"
+            msg.contains("not found"),
+            "message d'erreur doit mentionner 'not found' : {msg}"
         );
     }
 }

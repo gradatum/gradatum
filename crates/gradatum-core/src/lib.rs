@@ -4,8 +4,11 @@
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee. All public traits are tagged
-//! [`#[stability::unstable]`] or [`#[stability::experimental]`].
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
+//! additions only within `1.x`, breaking changes deferred to the next major. The
+//! finer-grained trait-stability tiers described in RELEASE-POLICY.md are **not applied
+//! in `1.0.0`**: no trait in this crate carries a `stability::` attribute, so treat the
+//! whole public surface as SemVer-strict.
 //! See the [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 //!
 //! ## Contents
@@ -14,19 +17,26 @@
 //! canonical frontmatter ([`frontmatter`]), provenance and trust scoring ([`provenance`],
 //! [`trust`]), JCS-canonical hashing ([`history`]), job types and the [`QueueStore`] trait
 //! ([`job`]), storage traits ([`DocumentStore`], [`IndexStore`], [`VectorStore`]),
-//! ACL evaluation ([`acl`]), and error types ([`error`]).
+//! and error types ([`error`]).
+//!
+//! ACL evaluation is **not** part of this crate: it lives in `gradatum-acl-policy`
+//! (`AclEngine::evaluate`, locus globs with deny-wins).
 //!
 //! ## Multi-tenancy invariant
 //!
-//! Every persisted row carries `tenant_id TEXT NOT NULL`.
-//! Default tenant: `"main"`. Aliased to `vault` in user-facing UI/CLI/SDK.
-//! Enforced at storage layer; ACL filters by `tenant_id` first.
+//! Note-scoped rows carry `vault_id TEXT NOT NULL` (default vault: `"main"`).
+//! Tenant scoping is carried by `tenant_id` on the credential, job and grant
+//! tables (`api_keys`, `gradatum_jobs`, `tenant_vault_grants`, `session_trace`,
+//! `event_log`, `note_usage`). Operational tables (`metric_sample`,
+//! `scheduled_task_health`, `file_checksums`, `proactive_recall_*`) carry
+//! neither column and are not tenant-scoped.
+//! ACL is evaluated on identity + locus globs, then vault access is attested
+//! via `AclCheckedVaultId`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
-pub mod acl;
 pub mod audit;
 pub mod author;
 pub mod config;
@@ -50,10 +60,11 @@ pub mod job;
 pub mod metric_sample;
 pub mod note;
 pub mod overrides;
-/// SSOT helpers pour les chemins canoniques du layout Gradatum.
+/// Single source of truth for the canonical paths of the Gradatum on-disk layout.
 ///
-/// Toute dérivation de chemin depuis `storage.root` ou `vault_dir` DOIT passer par ces helpers.
-/// Voir [`paths::vault_index_path`], [`paths::vault_dir_index_path`] et [`paths::queue_db_path`].
+/// Every path derived from `storage.root` or from a `vault/` directory MUST go through
+/// these helpers.
+/// See [`paths::vault_index_path`], [`paths::vault_dir_index_path`] and [`paths::queue_db_path`].
 pub mod paths;
 pub mod project_map;
 pub mod provenance;
@@ -144,10 +155,11 @@ pub use job::{
     // VaultScope alias
     VaultScope,
     job_kind_str,
+    spec_tenant,
 };
 
 pub use document_store::DocumentStore;
-pub use index_store::{AuthorRow, IndexStore, Lineage, ReviewQueueRow, SearchHitRaw};
+pub use index_store::{AuditScanRow, AuthorRow, IndexStore, Lineage, ReviewQueueRow, SearchHitRaw};
 pub use temporal_query::{TimelineCursor, TimelineFilter, TimelineRow, parse_temporal_str_as_ms};
 pub use vector_store::VectorStore;
 

@@ -31,9 +31,7 @@ const DEFAULT_MODEL: &str = "qwen3.6-35b-a3b-q4-k-xl";
 /// Extracts the first JSON block `{…}` from a string (handles LLM preamble).
 fn re_json_block() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"\{[^{}]*\}").expect("re_json_block est un pattern littéral valide")
-    })
+    RE.get_or_init(|| Regex::new(r"\{[^{}]*\}").expect("re_json_block is a valid literal pattern"))
 }
 
 /// System prompt injected to enforce a structured JSON response.
@@ -78,7 +76,7 @@ fn parse_status(s: &str) -> Result<NoteStatus, ChatError> {
         "draft" => Ok(NoteStatus::Draft),
         "deprecated" => Ok(NoteStatus::Deprecated),
         other => Err(ChatError::InvalidResponse(format!(
-            "statut LLM inconnu: {other:?} (attendu: live|pending-review|staging|garbage)"
+            "unknown LLM status: {other:?} (expected: live|pending-review|staging|garbage)"
         ))),
     }
 }
@@ -106,13 +104,13 @@ fn extract_verdict(content: &str) -> Result<LlmVerdict, ChatError> {
     }
 
     // Extraction regex du premier bloc JSON plat (pas de nesting — voir doc ci-dessus).
-    let caps = re_json_block().find(content).ok_or_else(|| {
-        ChatError::ParseFailure(format!("aucun bloc JSON trouvé dans: {content:?}"))
-    })?;
+    let caps = re_json_block()
+        .find(content)
+        .ok_or_else(|| ChatError::ParseFailure(format!("no JSON block found in: {content:?}")))?;
 
     serde_json::from_str::<LlmVerdict>(caps.as_str()).map_err(|e| {
         ChatError::ParseFailure(format!(
-            "JSON extrait invalide: {e} — contenu: {:?}",
+            "invalid extracted JSON: {e} — content: {:?}",
             caps.as_str()
         ))
     })
@@ -153,7 +151,7 @@ impl HttpChat {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .expect("la configuration reqwest par défaut est toujours valide");
+            .expect("the default reqwest configuration is always valid");
         Self {
             client,
             endpoint: endpoint.into(),
@@ -169,7 +167,7 @@ impl HttpChat {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .expect("timeout Duration est toujours valide pour reqwest");
+            .expect("timeout Duration is always valid for reqwest");
         Self {
             client,
             timeout,
@@ -202,7 +200,7 @@ impl Chat for HttpChat {
     ) -> Result<CuratorVerdict, ChatError> {
         // Sérialise la note comme contenu utilisateur (JSON compact).
         let note_content = serde_json::to_string(note)
-            .map_err(|e| ChatError::InvalidResponse(format!("sérialisation note échouée: {e}")))?;
+            .map_err(|e| ChatError::InvalidResponse(format!("note serialization failed: {e}")))?;
 
         let body = json!({
             "model": self.model,
@@ -225,7 +223,7 @@ impl Chat for HttpChat {
             .choices
             .into_iter()
             .next()
-            .ok_or_else(|| ChatError::InvalidResponse("réponse OpenAI vide (0 choices)".into()))?
+            .ok_or_else(|| ChatError::InvalidResponse("empty OpenAI response (0 choices)".into()))?
             .message
             .content;
 
@@ -234,7 +232,7 @@ impl Chat for HttpChat {
         // Validation confiance
         if !(0.0..=1.0).contains(&verdict.confidence) {
             return Err(ChatError::InvalidResponse(format!(
-                "confiance hors bornes: {} (attendu 0.0-1.0)",
+                "confidence out of bounds: {} (expected 0.0-1.0)",
                 verdict.confidence
             )));
         }

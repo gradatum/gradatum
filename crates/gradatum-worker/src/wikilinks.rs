@@ -90,7 +90,7 @@ pub async fn resolve_wikilinks_via_client(
                     tracing::debug!(
                         src = %src_note_id,
                         dst = %dst,
-                        "project-map wikilink typé — arête réservée synthétique"
+                        "typed project-map wikilink — synthetic reserved edge"
                     );
                     resolved_links.push(LinkDto {
                         src: src_note_id.to_string(),
@@ -128,7 +128,7 @@ pub async fn resolve_wikilinks_via_client(
             let _permit = sem_arc
                 .acquire()
                 .await
-                .expect("semaphore wikilinks résolution non fermé");
+                .expect("wikilinks resolution semaphore not closed");
             let result = if let Some(ulid) = maybe_ulid {
                 // Résolution ULID-first : [[section:ULID]] → id_lookup (existence + live).
                 client_arc.id_lookup(&tenant, &ulid.to_string()).await
@@ -148,7 +148,7 @@ pub async fn resolve_wikilinks_via_client(
                     src = %src_note_id,
                     dst = %dst_id,
                     target = %target,
-                    "B5 wikilink résolu — inclus dans persist_curated.links"
+                    "B5 wikilink resolved — included in persist_curated.links"
                 );
                 resolved_links.push(LinkDto {
                     src: src_note_id.to_string(),
@@ -158,18 +158,18 @@ pub async fn resolve_wikilinks_via_client(
             Ok((target, Ok(None))) => {
                 tracing::debug!(
                     target = %target,
-                    "B5 wikilink non résolu — note cible absente ou non-live"
+                    "B5 wikilink unresolved — target note absent or non-live"
                 );
             }
             Ok((target, Err(e))) => {
                 tracing::warn!(
                     err = %e,
                     target = %target,
-                    "B5 lookup failed — wikilink ignoré (non-fatal)"
+                    "B5 lookup failed — wikilink skipped (non-fatal)"
                 );
             }
             Err(e) => {
-                tracing::warn!(err = %e, "B5 title_lookup task panicked — wikilink ignoré");
+                tracing::warn!(err = %e, "B5 title_lookup task panicked — wikilink skipped");
             }
         }
     }
@@ -233,23 +233,44 @@ mod tests {
             unreachable!("MockClient: persist_distill non utilisé dans ce test")
         }
 
-        async fn delete_note(&self, _ulid: &str) -> Result<(), InternalClientError> {
+        async fn delete_note(
+            &self,
+            _vault_id: &str,
+            _ulid: &str,
+        ) -> Result<(), InternalClientError> {
             unreachable!("MockClient: delete_note non utilisé dans ce test")
         }
 
-        async fn get_note(&self, _ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+        async fn get_note(
+            &self,
+            _vault_id: &str,
+            _ulid: &str,
+        ) -> Result<NoteReadDto, InternalClientError> {
             unreachable!("MockClient: get_note non utilisé dans ce test")
+        }
+
+        async fn get_note_status(
+            &self,
+            _vault_id: &str,
+            _ulid: &str,
+        ) -> Result<Option<String>, InternalClientError> {
+            unreachable!("MockClient: get_note_status non utilisé dans ce test")
         }
 
         async fn get_note_embedding(
             &self,
+            _vault_id: &str,
             _ulid: &str,
             _embedder_id: &str,
         ) -> Result<EmbeddingReadDto, InternalClientError> {
             unreachable!("MockClient: get_note_embedding non utilisé dans ce test")
         }
 
-        async fn get_trust(&self, _ulid: &str) -> Result<f32, InternalClientError> {
+        async fn get_trust(
+            &self,
+            _vault_id: &str,
+            _ulid: &str,
+        ) -> Result<f32, InternalClientError> {
             unreachable!("MockClient: get_trust non utilisé dans ce test")
         }
 

@@ -11,11 +11,23 @@
 //!
 //! - `base_url` must be loopback — validated in the binary (anti-SSRF).
 //! - JWT is never logged and never included in error messages.
+//!
+//! ## Lazy JWT refresh
+//!
+//! The stored JWT (TTL 24 h) is refreshed lazily: on an HTTP `401` the sink
+//! re-exchanges the api-key for a fresh JWT and retries the POST **once**. This
+//! also covers token revocation and an auth-server restart. The refresh is
+//! reactive only — there is no background task. As the event-log is best-effort,
+//! losing the event that triggered the refresh is acceptable.
 use async_trait::async_trait;
 use chrono::Utc;
 use gradatum_core::event_sink::{EngineEvent, EventSink};
 use gradatum_dto::QaEventDto;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use zeroize::Zeroizing;
+
+use crate::metrics::EngineMetrics;
 
 /// Derives the semantic `feature_id` from the HTTP route.
 ///
@@ -34,22 +46,64 @@ fn derive_feature_id(route: &str) -> &'static str {
     }
 }
 
+/// Exchanges an api-key for a 24-hour JWT via `POST /auth/exchange`.
+///
+/// The route is mounted outside `/api/v1` (`unauthed.merge(auth_exchange)` in
+/// `gradatum-server` — no `/api/v1` prefix). Called at startup by the binary for
+/// the initial exchange, and lazily by [`HttpEventSink`] on a `401`.
+///
+/// # Errors
+///
+/// Returns an error if the request fails at the transport level, if the server
+/// answers with a non-2xx status, or if the response body has no `token` field.
+/// No error message ever contains the api-key or the JWT.
+pub async fn exchange_api_key_for_jwt(
+    api_key: &Zeroizing<String>,
+    base_url: &str,
+) -> anyhow::Result<Zeroizing<String>> {
+    let url = format!("{base_url}/auth/exchange");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let resp = client
+        .post(&url)
+        .bearer_auth(api_key.as_str())
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("api-key→JWT exchange failed ({url}): {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("api-key→JWT exchange → HTTP {} ({url})", resp.status());
+    }
+    let body: serde_json::Value = resp.json().await?;
+    let token = body["token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("exchange response missing 'token' field"))?;
+    Ok(Zeroizing::new(token.to_string()))
+}
+
 /// HTTP sink — posts `RequestServed` events to `/api/v1/event-log` on gradatum-server.
 ///
 /// `base_url`: e.g. `"http://127.0.0.1:19090"` (loopback).
-/// `jwt`: 24 h JWT obtained via api-key exchange.
+/// `jwt`: 24 h JWT obtained via api-key exchange, refreshed lazily on `401`.
 /// `agent_id`: semantic identifier of the emitting engine, propagated as-is in each event.
 pub struct HttpEventSink {
     /// Base URL of the gradatum server (loopback).
     base_url: String,
     /// JWT in `Zeroizing` for memory erasure on drop.
-    jwt: Zeroizing<String>,
+    ///
+    /// Behind a `RwLock` for interior mutability: `emit(&self, …)` reads it on
+    /// every POST and rewrites it on a lazy refresh. Reads dominate.
+    jwt: RwLock<Zeroizing<String>>,
+    /// api-key used to re-exchange a fresh JWT on `401` (never logged).
+    api_key: Zeroizing<String>,
     /// Reusable HTTP client (internal connection pool).
     client: reqwest::Client,
     /// Agent identifier propagated in `QaEventDto.agent_id`.
     ///
     /// `None` = legacy behaviour (`agent_id` absent from the event).
     agent_id: Option<String>,
+    /// Shared engine metrics — non-2xx / undelivered POSTs are counted here.
+    metrics: Arc<EngineMetrics>,
 }
 
 impl HttpEventSink {
@@ -57,19 +111,52 @@ impl HttpEventSink {
     ///
     /// # Arguments
     /// - `base_url`: loopback base URL (e.g. `"http://127.0.0.1:19090"`).
-    /// - `jwt`: 24 h JWT token (no static hardcoded JWT).
+    /// - `jwt`: initial 24 h JWT token (no static hardcoded JWT).
+    /// - `api_key`: api-key kept to re-exchange a fresh JWT on `401`.
     /// - `agent_id`: semantic identifier of the engine; `None` = legacy behaviour.
-    pub fn new(base_url: String, jwt: Zeroizing<String>, agent_id: Option<String>) -> Self {
+    /// - `metrics`: shared metrics used to count event-log delivery failures.
+    pub fn new(
+        base_url: String,
+        jwt: Zeroizing<String>,
+        api_key: Zeroizing<String>,
+        agent_id: Option<String>,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .expect("HTTP client construction — should not fail");
         Self {
             base_url,
-            jwt,
+            jwt: RwLock::new(jwt),
+            api_key,
             client,
             agent_id,
+            metrics,
         }
+    }
+
+    /// Posts the serialized event batch once and returns the HTTP status.
+    ///
+    /// Factored out so the nominal attempt and the post-refresh retry share the
+    /// exact same request shape (bearer, JSON array body, 2 s timeout). The lock
+    /// on the JWT is never held across this `await`: the caller passes a snapshot
+    /// `token` by value.
+    async fn post_event_log(
+        &self,
+        url: &str,
+        token: &str,
+        body: &[&QaEventDto],
+    ) -> Result<reqwest::StatusCode, reqwest::Error> {
+        let resp = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .json(body)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await?;
+        Ok(resp.status())
     }
 }
 
@@ -108,23 +195,84 @@ impl EventSink for HttpEventSink {
                 };
 
                 let url = format!("{}/api/v1/event-log", self.base_url);
-                // Best-effort, single attempt — short timeout (2 s) to avoid blocking serving
-                if let Err(e) = self
-                    .client
-                    .post(&url)
-                    .bearer_auth(self.jwt.as_str())
-                    .json(&[&dto]) // l'endpoint attend un tableau (Vec<QaEventDto>)
-                    .timeout(std::time::Duration::from_secs(2))
-                    .send()
-                    .await
-                {
-                    // Never fatal — best-effort — JWT is not logged.
-                    tracing::warn!(
-                        route = %route,
-                        error_kind = "event_log_post_failed",
-                        "HttpEventSink: POST /api/v1/event-log failed (best-effort)"
-                    );
-                    let _ = e; // silent drop — no detail to avoid JWT leak
+                // l'endpoint attend un tableau (Vec<QaEventDto>)
+                let body = [&dto];
+
+                // Snapshot the current JWT — the read lock is dropped before the
+                // POST await (never hold a lock across .await, ADN 2).
+                let token = { self.jwt.read().await.clone() };
+
+                // Best-effort: a failure never blocks inference. The HTTP status
+                // is now inspected (F-120) — a 401 is no longer a silent success.
+                match self.post_event_log(&url, token.as_str(), &body).await {
+                    Ok(status) if status.is_success() => {
+                        // Delivered — nothing to do.
+                    }
+                    Ok(status) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                        // JWT expired or revoked → count the 401, refresh, retry once.
+                        self.metrics.record_event_log_error(status.as_str());
+                        match exchange_api_key_for_jwt(&self.api_key, &self.base_url).await {
+                            Ok(fresh) => {
+                                // Update the stored JWT (write lock dropped before
+                                // the retry await — no lock across .await).
+                                {
+                                    *self.jwt.write().await = fresh.clone();
+                                }
+                                match self.post_event_log(&url, fresh.as_str(), &body).await {
+                                    Ok(retry_status) if retry_status.is_success() => {
+                                        // Recovered after refresh.
+                                    }
+                                    Ok(retry_status) => {
+                                        self.metrics.record_event_log_error(retry_status.as_str());
+                                        tracing::warn!(
+                                            route = %route,
+                                            status = retry_status.as_str(),
+                                            error_kind = "event_log_retry_non2xx",
+                                            "HttpEventSink: retry after JWT refresh still non-2xx (best-effort)"
+                                        );
+                                    }
+                                    Err(_e) => {
+                                        self.metrics.record_event_log_error("transport");
+                                        tracing::warn!(
+                                            route = %route,
+                                            error_kind = "event_log_retry_transport_failed",
+                                            "HttpEventSink: retry POST after JWT refresh failed at transport level (best-effort)"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(_e) => {
+                                // Refresh failed — the 401 is already counted. No
+                                // JWT/api-key detail is logged (exchange errors
+                                // never contain secrets, but stay conservative).
+                                tracing::warn!(
+                                    route = %route,
+                                    error_kind = "event_log_jwt_refresh_failed",
+                                    "HttpEventSink: api-key→JWT refresh failed on 401 (best-effort)"
+                                );
+                            }
+                        }
+                    }
+                    Ok(status) => {
+                        // Other non-2xx (4xx/5xx) — count, warn, no retry.
+                        self.metrics.record_event_log_error(status.as_str());
+                        tracing::warn!(
+                            route = %route,
+                            status = status.as_str(),
+                            error_kind = "event_log_non2xx",
+                            "HttpEventSink: POST /api/v1/event-log returned non-2xx (best-effort)"
+                        );
+                    }
+                    Err(_e) => {
+                        // Transport error (connection refused, timeout) — count, warn.
+                        // JWT is not logged; no detail to avoid any leak.
+                        self.metrics.record_event_log_error("transport");
+                        tracing::warn!(
+                            route = %route,
+                            error_kind = "event_log_post_failed",
+                            "HttpEventSink: POST /api/v1/event-log failed at transport level (best-effort)"
+                        );
+                    }
                 }
             }
             other => {
@@ -176,7 +324,9 @@ mod tests {
         let sink = HttpEventSink::new(
             format!("http://127.0.0.1:{port}"),
             Zeroizing::new("test-jwt".into()),
+            Zeroizing::new("test-api-key".into()),
             Some("engine-curator".into()),
+            Arc::new(EngineMetrics::new()),
         );
 
         sink.emit(EngineEvent::RequestServed {
@@ -227,7 +377,9 @@ mod tests {
         let sink = HttpEventSink::new(
             format!("http://127.0.0.1:{port}"),
             Zeroizing::new("test-jwt".into()),
+            Zeroizing::new("test-api-key".into()),
             Some("engine-embed".into()),
+            Arc::new(EngineMetrics::new()),
         );
 
         sink.emit(EngineEvent::RequestServed {
@@ -257,7 +409,9 @@ mod tests {
         let sink = HttpEventSink::new(
             format!("http://127.0.0.1:{port}"),
             Zeroizing::new("test-jwt".into()),
+            Zeroizing::new("test-api-key".into()),
             None,
+            Arc::new(EngineMetrics::new()),
         );
 
         sink.emit(EngineEvent::RequestServed {
@@ -296,7 +450,9 @@ mod tests {
         let sink = HttpEventSink::new(
             format!("http://127.0.0.1:{port}"),
             Zeroizing::new("test-jwt".into()),
+            Zeroizing::new("test-api-key".into()),
             None,
+            Arc::new(EngineMetrics::new()),
         );
 
         sink.emit(EngineEvent::ModelLoaded {
@@ -340,5 +496,174 @@ mod tests {
         })
         .await;
         assert_eq!(sink.snapshot().len(), 2);
+    }
+
+    // --- F-120 : refresh paresseux du JWT + comptage non-2xx ---
+
+    /// Stub qui simule un JWT périmé : le 1er POST event-log renvoie 401, les
+    /// suivants 200 (avec capture du body). Monte aussi `/auth/exchange` qui
+    /// renvoie un token rafraîchi et compte ses appels.
+    async fn start_stub_server_refresh() -> (
+        u16,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let eventlog_calls = Arc::new(AtomicUsize::new(0));
+        let exchange_calls = Arc::new(AtomicUsize::new(0));
+
+        let cap = captured.clone();
+        let ev_calls = eventlog_calls.clone();
+        let ex_calls = exchange_calls.clone();
+
+        let app = Router::new()
+            .route(
+                "/auth/exchange",
+                post(move || {
+                    let ex = ex_calls.clone();
+                    async move {
+                        ex.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "token": "refreshed-jwt-xyz" }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/event-log",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let cap = cap.clone();
+                    let ev = ev_calls.clone();
+                    async move {
+                        let n = ev.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            // Premier appel : JWT périmé → 401.
+                            StatusCode::UNAUTHORIZED
+                        } else {
+                            // Retry (JWT rafraîchi) → capture + 200.
+                            cap.lock().await.push(body);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (port, captured, exchange_calls)
+    }
+
+    /// Stub dont `/api/v1/event-log` renvoie toujours 500 (aucun retry attendu).
+    async fn start_stub_server_500() -> u16 {
+        use axum::{Router, http::StatusCode, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/api/v1/event-log",
+            post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        port
+    }
+
+    /// Sur 401, le sink ré-échange l'api-key contre un JWT frais, retry une fois,
+    /// livre l'événement, met à jour le JWT stocké et compte le 401 (F-120).
+    #[tokio::test]
+    async fn refreshes_jwt_on_401_and_retries() {
+        let (port, captured, exchange_calls) = start_stub_server_refresh().await;
+        let metrics = Arc::new(EngineMetrics::new());
+        let sink = HttpEventSink::new(
+            format!("http://127.0.0.1:{port}"),
+            Zeroizing::new("stale-jwt".into()),
+            Zeroizing::new("test-api-key".into()),
+            Some("engine-curator".into()),
+            metrics.clone(),
+        );
+
+        sink.emit(EngineEvent::RequestServed {
+            route: "/v1/chat/completions".into(),
+            model: "qwen3-4b".into(),
+            provider: "engine-curator".into(),
+            latency_ms: 42,
+            status_code: 200,
+        })
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Un seul re-exchange api-key→JWT déclenché par le 401.
+        assert_eq!(
+            exchange_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "un re-exchange api-key→JWT attendu sur 401"
+        );
+
+        // Le retry a livré le body (capturé sur le 2e POST, en 200).
+        {
+            let bodies = captured.lock().await;
+            assert_eq!(bodies.len(), 1, "le retry doit livrer l'événement");
+            let arr = bodies[0].as_array().unwrap();
+            assert_eq!(arr[0]["route"], "/v1/chat/completions");
+        }
+
+        // Le JWT stocké a été remplacé par le token rafraîchi.
+        {
+            let stored = sink.jwt.read().await;
+            assert_eq!(
+                stored.as_str(),
+                "refreshed-jwt-xyz",
+                "JWT stocké mis à jour après refresh"
+            );
+        }
+
+        // Le 401 initial est compté comme non-2xx (observabilité F-120).
+        let out = metrics.render();
+        assert!(
+            out.contains("engine_event_log_errors_total{status_code=\"401\"} 1"),
+            "le 401 doit être compté une fois : {out}"
+        );
+    }
+
+    /// Un 500 est compté comme non-2xx, sans retry, sans panic ni blocage (F-120).
+    #[tokio::test]
+    async fn counts_non2xx_500_without_retry_or_panic() {
+        let port = start_stub_server_500().await;
+        let metrics = Arc::new(EngineMetrics::new());
+        let sink = HttpEventSink::new(
+            format!("http://127.0.0.1:{port}"),
+            Zeroizing::new("test-jwt".into()),
+            Zeroizing::new("test-api-key".into()),
+            None,
+            metrics.clone(),
+        );
+
+        sink.emit(EngineEvent::RequestServed {
+            route: "/v1/chat/completions".into(),
+            model: "qwen3-4b".into(),
+            provider: "engine-curator".into(),
+            latency_ms: 42,
+            status_code: 200,
+        })
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Un 500 compté exactement une fois, pas de retry (le retry n'existe que sur 401).
+        let out = metrics.render();
+        assert!(
+            out.contains("engine_event_log_errors_total{status_code=\"500\"} 1"),
+            "un 500 doit être compté une fois (pas de retry) : {out}"
+        );
     }
 }

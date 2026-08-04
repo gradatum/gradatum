@@ -2,15 +2,22 @@
 //!
 //! ## Effects
 //! - Creates `{root}/{md,db,config}` with mode 0750
-//! - Generates an Ed25519 key pair (private 0600, public 0644) for JWT
 //! - Generates an admin bearer (32 random bytes, hex-encoded) → `config/admin.bearer.txt` 0600
 //! - Materializes the ACL preset TOML into `config/bearer.toml` 0640
 //! - Writes `config/server.toml` with default values 0640
 //!   (`jwt_ttl_human_secs=3600`, `jwt_ttl_service_secs=86400`, `revocation_store=sqlite`)
 //! - Initializes `db/queue.sqlite` and `db/revocation.sqlite` in WAL mode
 //!
+//! ## JWT signing key
+//!
+//! `init` does **not** create it. `gradatum-server` generates
+//! `config/jwt-signing-key.secret` (mode 0600) at first boot and is its sole
+//! owner; `gradatum-admin token issue` loads that same file. Until v1.0.0 `init`
+//! scaffolded a PKCS#8 PEM pair no runtime component ever read.
+//!
 //! ## Security
-//! - Silently refuses if `config/admin.bearer.txt` already exists (pass `--force` to override)
+//! - Refuses with an explicit error if `config/admin.bearer.txt` already exists; pass
+//!   `--force` to re-initialize
 //! - Bearer is printed to stdout **exactly once**, only in interactive mode
 
 use std::fs;
@@ -20,10 +27,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use gradatum_core::paths::queue_db_path;
-use pkcs8::LineEnding;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rusqlite::Connection;
@@ -71,30 +75,25 @@ pub fn run(args: InitArgs) -> Result<()> {
 
     if bearer_marker.exists() && !args.force {
         return Err(anyhow!(
-            "init déjà effectuée (admin.bearer.txt existe dans {}) ; \
-             passer --force pour ré-initialiser",
+            "init already performed (admin.bearer.txt exists in {}); \
+             pass --force to re-initialize",
             args.root.display()
         ));
     }
 
     create_layout(&args.root)?;
     // Under --force: remove existing secret files before regenerating.
-    // Required because generate_jwt_keys and generate_admin_bearer use create_new (O_EXCL),
-    // which fails if the file already exists — the intended behaviour in normal mode.
-    if args.force {
-        for secret_file in [
-            "config/jwt.private.pem",
-            "config/jwt.public.pem",
-            "config/admin.bearer.txt",
-        ] {
-            let p = args.root.join(secret_file);
-            if p.exists() {
-                fs::remove_file(&p)
-                    .with_context(|| format!("suppression (--force) de {}", p.display()))?;
-            }
-        }
+    // Required because generate_admin_bearer uses create_new (O_EXCL), which
+    // fails if the file already exists — the intended behaviour in normal mode.
+    //
+    // The JWT signing key is deliberately absent from this list: it belongs to
+    // `gradatum-server`, which creates it at first boot. Deleting it here would
+    // invalidate every JWT in circulation as a side effect of `init --force`.
+    // (API keys are verified against their own store and are unaffected.)
+    if args.force && bearer_marker.exists() {
+        fs::remove_file(&bearer_marker)
+            .with_context(|| format!("suppression (--force) de {}", bearer_marker.display()))?;
     }
-    generate_jwt_keys(&args.root)?;
     let bearer = generate_admin_bearer(&args.root)?;
     materialize_preset(&args.root, &args.preset, args.projects.as_deref())?;
     write_or_merge_server_toml(&args.root, &args.bind)?;
@@ -102,7 +101,7 @@ pub fn run(args: InitArgs) -> Result<()> {
 
     if !args.non_interactive {
         println!(
-            "\nBearer admin (sauvegardé dans {}, affiché UNE SEULE FOIS) :\n  {}",
+            "\nAdmin bearer (saved in {}, shown ONCE ONLY):\n  {}",
             bearer_marker.display(),
             bearer
         );
@@ -115,56 +114,20 @@ pub fn run(args: InitArgs) -> Result<()> {
 fn create_layout(root: &Path) -> Result<()> {
     for sub in ["md", "db", "config"] {
         let p = root.join(sub);
-        fs::create_dir_all(&p)
-            .with_context(|| format!("création du répertoire {}", p.display()))?;
+        fs::create_dir_all(&p).with_context(|| format!("creating directory {}", p.display()))?;
         fs::set_permissions(&p, fs::Permissions::from_mode(0o750))
-            .with_context(|| format!("chmod 0750 sur {}", p.display()))?;
+            .with_context(|| format!("chmod 0750 on {}", p.display()))?;
     }
     Ok(())
 }
 
-/// Generates an Ed25519 key pair in PKCS8/SPKI PEM format and writes it to `config/`.
-///
-/// - `jwt.private.pem` → mode 0600
-/// - `jwt.public.pem`  → mode 0644
-fn generate_jwt_keys(root: &Path) -> Result<()> {
-    let mut csprng = OsRng;
-    let signing = SigningKey::generate(&mut csprng);
-    let verifying = signing.verifying_key();
-
-    // Private key PKCS8 PEM
-    let priv_pem = signing
-        .to_pkcs8_pem(LineEnding::LF)
-        .context("encodage de la clé privée JWT en PKCS8 PEM")?;
-    let priv_path = root.join("config/jwt.private.pem");
-    // Atomic write: O_EXCL + mode 0o600 at creation — no world-readable window.
-    // If the file already exists, `create_new` fails → file already initialized.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&priv_path)
-        .with_context(|| {
-            format!(
-                "ouverture en création exclusive de {} (déjà initialisé ?)",
-                priv_path.display()
-            )
-        })?
-        .write_all(priv_pem.as_bytes())
-        .with_context(|| format!("écriture de {}", priv_path.display()))?;
-
-    // Public key SPKI PEM
-    let pub_pem = verifying
-        .to_public_key_pem(LineEnding::LF)
-        .context("encodage de la clé publique JWT en SPKI PEM")?;
-    let pub_path = root.join("config/jwt.public.pem");
-    fs::write(&pub_path, pub_pem.as_bytes())
-        .with_context(|| format!("écriture de {}", pub_path.display()))?;
-    fs::set_permissions(&pub_path, fs::Permissions::from_mode(0o644))
-        .with_context(|| format!("chmod 0644 sur {}", pub_path.display()))?;
-
-    Ok(())
-}
+// NOTE: `generate_jwt_keys` used to live here. It wrote a PKCS#8/SPKI PEM pair
+// (`config/jwt.private.pem` 0600 + `config/jwt.public.pem` 0644) that no runtime
+// component ever read: `gradatum-server` signs and verifies with the raw Ed25519
+// seed `config/jwt-signing-key.secret` (`gradatum_auth::key_store`), which it
+// creates itself at first boot. Scaffolding a key pair the runtime ignores made
+// operators back up and rotate the wrong files. The server now owns the key's
+// entire lifecycle; `init` no longer touches it.
 
 /// Generates an admin bearer (32 CSPRNG bytes, hex-encoded) and writes it to
 /// `config/admin.bearer.txt` with mode 0600.
@@ -185,12 +148,12 @@ fn generate_admin_bearer(root: &Path) -> Result<String> {
         .open(&path)
         .with_context(|| {
             format!(
-                "ouverture en création exclusive de {} (déjà initialisé ?)",
+                "exclusive-create open of {} (already initialized?)",
                 path.display()
             )
         })?
         .write_all(bearer.as_bytes())
-        .with_context(|| format!("écriture de {}", path.display()))?;
+        .with_context(|| format!("writing {}", path.display()))?;
 
     Ok(bearer)
 }
@@ -211,16 +174,16 @@ fn resolve_preset(preset: &str) -> Result<String> {
     if preset.contains('/') {
         // Explicit filesystem path (absolute or relative with directory component).
         fs::read_to_string(preset)
-            .with_context(|| format!("lecture du preset depuis le fichier '{preset}'"))
+            .with_context(|| format!("reading the preset from file '{preset}'"))
     } else {
         match preset {
             "hierarchical" => Ok(PRESET_HIERARCHICAL.to_owned()),
             "flat" => Ok(PRESET_FLAT.to_owned()),
             other => Err(anyhow!(
-                "preset inconnu : '{other}'. \
-                 Presets embarqués disponibles : hierarchical, flat. \
-                 Pour un preset custom, passer un chemin contenant '/' \
-                 (ex. --preset /etc/gradatum/mon-preset.toml)"
+                "unknown preset: '{other}'. \
+                 Available embedded presets: hierarchical, flat. \
+                 For a custom preset, pass a path containing '/' \
+                 (e.g. --preset /etc/gradatum/my-preset.toml)"
             )),
         }
     }
@@ -253,13 +216,13 @@ pub fn materialize_preset(root: &Path, preset: &str, projects: Option<&str>) -> 
         let backup = bearer_toml.with_extension(format!("toml.bak.{ts}"));
         fs::copy(&bearer_toml, &backup)
             .with_context(|| format!("backup {} → {}", bearer_toml.display(), backup.display()))?;
-        tracing::info!(backup = %backup.display(), "bearer.toml sauvegardé avant écrasement");
+        tracing::info!(backup = %backup.display(), "bearer.toml backed up before overwrite");
     }
 
     fs::write(&bearer_toml, materialized.as_bytes())
-        .with_context(|| format!("écriture de {}", bearer_toml.display()))?;
+        .with_context(|| format!("writing {}", bearer_toml.display()))?;
     fs::set_permissions(&bearer_toml, fs::Permissions::from_mode(0o640))
-        .with_context(|| format!("chmod 0640 sur {}", bearer_toml.display()))?;
+        .with_context(|| format!("chmod 0640 on {}", bearer_toml.display()))?;
 
     Ok(())
 }
@@ -269,10 +232,10 @@ pub fn materialize_preset(root: &Path, preset: &str, projects: Option<&str>) -> 
 /// Returns the raw `String` without writing — allows reuse in
 /// `write_or_merge_server_toml` and in integration tests.
 ///
-/// - `[storage].vault_index_path` — chemin canonique de l'index SQLite FTS5 ;
-///   **respecté par le server et le worker** via `gradatum-core::paths::vault_index_path`
-///   (canonical path, respected by both the server and the worker via `gradatum-core::paths::vault_index_path`).
-///   Deprecated alias `db_path` is still accepted for reading (backward compatibility).
+/// - `[storage].vault_index_path` — canonical path of the full-text SQLite index, honoured
+///   by both the server and the worker through `gradatum_core::paths::vault_index_path`.
+///   The deprecated alias `db_path` is still accepted when reading, for backward
+///   compatibility.
 /// - `jwt_ttl_human_secs = 3600`  (1 hour)
 /// - `jwt_ttl_service_secs = 86400` (24 hours)
 /// - `revocation_store = "sqlite"`
@@ -280,7 +243,7 @@ pub fn materialize_preset(root: &Path, preset: &str, projects: Option<&str>) -> 
 pub fn generate_server_toml_template(root: &Path, bind: &str) -> String {
     let root_str = root.display();
     format!(
-        r#"# Généré par `gradatum-admin init` — modifier avec précaution.
+        r#"# Generated by `gradatum-admin init` — edit with caution.
 
 [server]
 bind = "{bind}"
@@ -291,8 +254,10 @@ root = "{root_str}"
 vault_index_path = "{root_str}/vault/.gradatum/index.db"
 
 [auth]
-jwt_public_key_path = "{root_str}/config/jwt.public.pem"
-jwt_private_key_path = "{root_str}/config/jwt.private.pem"
+# The JWT signing key is not configurable: gradatum-server creates and reads
+# {root_str}/config/jwt-signing-key.secret (mode 0600). Back up THAT file —
+# losing it invalidates every JWT in circulation (API keys are unaffected:
+# revoke them through the api-key store).
 jwt_ttl_human_secs = 3600
 jwt_ttl_service_secs = 86400
 revocation_store = "sqlite"
@@ -307,8 +272,8 @@ format = "json"
 
 [embed]
 # Embedder HTTP.
-# Active la génération d'embeddings async via gradatum-worker → POST endpoint HTTP.
-# Sans cette section, le worker démarre embedder=None et skip silencieusement les jobs embed_note.
+# Enables async embedding generation via gradatum-worker → POST HTTP endpoint.
+# Without this section, the worker starts with embedder=None and silently skips embed_note jobs.
 # Default values — override in server.toml for your deployment.
 enabled = true
 endpoint = "http://localhost:8436/v1/embeddings"
@@ -348,20 +313,19 @@ fn write_or_merge_server_toml(root: &Path, bind: &str) -> Result<()> {
         let backup = p.with_extension(format!("toml.bak.{ts}"));
         fs::copy(&p, &backup)
             .with_context(|| format!("backup {} → {}", p.display(), backup.display()))?;
-        tracing::info!(backup = %backup.display(), "server.toml sauvegardé avant re-init");
+        tracing::info!(backup = %backup.display(), "server.toml backed up before re-init");
 
         // Merge user values
         let existing =
-            fs::read_to_string(&p).with_context(|| format!("lecture de {}", p.display()))?;
+            fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
         merge_user_config(&existing, &new_content)?
     } else {
         new_content
     };
 
-    fs::write(&p, final_content.as_bytes())
-        .with_context(|| format!("écriture de {}", p.display()))?;
+    fs::write(&p, final_content.as_bytes()).with_context(|| format!("writing {}", p.display()))?;
     fs::set_permissions(&p, fs::Permissions::from_mode(0o640))
-        .with_context(|| format!("chmod 0640 sur {}", p.display()))?;
+        .with_context(|| format!("chmod 0640 on {}", p.display()))?;
 
     Ok(())
 }
@@ -403,7 +367,7 @@ pub fn merge_user_config(existing: &str, new_template: &str) -> Result<String> {
             tracing::info!(
                 old = %old_path,
                 new = %new_path,
-                "merge server.toml — rename migration appliquée pré-walk"
+                "merge server.toml — rename migration applied pre-walk"
             );
         }
     }
@@ -426,7 +390,7 @@ pub fn merge_user_config(existing: &str, new_template: &str) -> Result<String> {
         preserved,
         new_keys,
         user_added,
-        "merge server.toml — valeurs préservées + nouvelles clés avec défauts + extensions user"
+        "merge server.toml — values preserved + new keys with defaults + user extensions"
     );
 
     Ok(result.to_string())
@@ -487,7 +451,7 @@ fn walk_and_merge(
                 // (user extension section/key)
                 target.insert(key.as_str(), source_item);
                 *user_added += 1;
-                tracing::info!(path = %full_path, "merge: section/key préservée (user extension)");
+                tracing::info!(path = %full_path, "merge: section/key preserved (user extension)");
             }
         }
     }
@@ -578,7 +542,7 @@ pub(crate) fn validate_server_toml(content: &str) -> Result<()> {
     content
         .parse::<toml_edit::DocumentMut>()
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("server.toml invalide : {e}"))
+        .map_err(|e| anyhow::anyhow!("invalid server.toml: {e}"))
 }
 
 /// Initializes `db/queue.sqlite`, `db/revocation.sqlite`, and `db/api_keys.sqlite` in WAL mode.
@@ -659,7 +623,7 @@ fn init_sqlite_dbs(root: &Path) -> Result<()> {
     if count > 0 {
         tracing::warn!(
             rows = count,
-            "api_keys table existe avec {} rows — re-init non-destructive",
+            "api_keys table exists with {} rows — non-destructive re-init",
             count
         );
     }

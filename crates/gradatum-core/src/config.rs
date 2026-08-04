@@ -81,45 +81,49 @@ pub struct EmbedConfig {
     /// Comparison is performed in `NoteStatus::is_embeddable(&EmbedConfig)` via
     /// `serde_kebab_repr()`.
     ///
-    /// **VIVANT** — lu par `NoteStatus::is_embeddable` dans `gradatum-core::status`.
+    /// **Wired** — read by `NoteStatus::is_embeddable` in [`crate::status`].
     pub embeddable_status: Option<Vec<String>>,
 
     /// Embedding model identifier (e.g. `"bge-m3"`, `"bge-small-en-v1.5"`).
     ///
-    /// **not yet wired (v0.6.x)** — présent pour rétrocompat config ; non lu par gradatum-server
-    /// (qui utilise `gradatum_server::config::EmbedConfig.model` directement).
+    /// **Not wired.** Kept so that existing configuration files stay loadable; the
+    /// server reads `gradatum_server::config::EmbedConfig.model` instead.
     pub embedder_id: Option<String>,
 
     /// Output vector dimensions. `None` → inferred from `embedder_id`.
     ///
-    /// **not yet wired (v0.6.x)** — non lu par les handlers de production.
+    /// **Not wired.** No production handler reads this field.
     pub dim: Option<u16>,
 
     /// Selected embedding backend.
     ///
     /// Values: `"http"` | `"fastembed"` | `"noop"`. `None` → `"http"`.
     ///
-    /// **not yet wired (v0.6.x)** — sélection backend via `gradatum_server::config::EmbedConfig`.
+    /// **Not wired.** The backend is selected through
+    /// `gradatum_server::config::EmbedConfig`.
     pub backend: Option<String>,
 
     /// Fallback backend when the primary backend is unavailable.
     ///
-    /// **not yet wired (v0.6.x)** — `FallbackEmbedder` non câblé en production.
+    /// **Not wired.** `FallbackEmbedder` is not enabled in production.
     pub fallback_backend: Option<String>,
 
     /// HTTP backend URL. Required when `backend = "http"`.
     ///
-    /// **not yet wired (v0.6.x)** — URL lue depuis `gradatum_server::config::EmbedConfig`.
+    /// **Not wired.** The effective URL comes from
+    /// `gradatum_server::config::EmbedConfig`.
     pub http_url: Option<String>,
 
     /// HTTP embedding request timeout in milliseconds.
     ///
-    /// **not yet wired (v0.6.x)** — timeout lu depuis `gradatum_server::config::EmbedConfig`.
+    /// **Not wired.** The effective timeout comes from
+    /// `gradatum_server::config::EmbedConfig`.
     pub http_timeout_ms: Option<u32>,
 
     /// Model name sent in the HTTP request.
     ///
-    /// **not yet wired (v0.6.x)** — model lu depuis `gradatum_server::config::EmbedConfig`.
+    /// **Not wired.** The effective model comes from
+    /// `gradatum_server::config::EmbedConfig`.
     pub http_model: Option<String>,
 }
 
@@ -127,96 +131,111 @@ pub struct EmbedConfig {
 ///
 /// Controls heuristic thresholds and LLM review for low-confidence notes.
 ///
-/// ## Câblage
+/// ## Wiring
 ///
-/// Les 9 champs ci-dessous sont lus depuis `config.toml` par sérialisation, mais
-/// le consommateur réel est `gradatum_worker::curator_loader::WorkerCuratorConfig`
-/// (via figment `extract_inner::<WorkerCuratorConfig>("curator")`).
-/// Ce struct `CuratorConfig` coexiste pour la cohérence schemale (VaultConfig) mais
-/// ne pilote PAS directement le pipeline — toujours passer par `WorkerCuratorConfig`.
+/// The nine fields below are deserialised from the vault `config.toml`, but this
+/// struct does **not** drive the curator pipeline. The pipeline is configured from
+/// the `[curator]` table of the server TOML, extracted into
+/// `gradatum_worker::curator_loader::WorkerCuratorConfig`. `CuratorConfig` exists so
+/// that [`VaultConfig`] describes the whole schema; change `WorkerCuratorConfig` when
+/// you want to change actual behaviour.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CuratorConfig {
     /// Heuristic direct-admit threshold (0.0–1.0).
     /// Notes scoring above are admitted without LLM review.
     ///
-    /// **not yet wired (v0.6.x)** — consommateur réel : `gradatum_worker::curator_loader::WorkerCuratorConfig`
+    /// **Not wired here** — effective consumer:
+    /// `gradatum_worker::curator_loader::WorkerCuratorConfig`.
     pub heuristic_admit_threshold: Option<f32>,
 
     /// Default status assigned by the heuristic (kebab-case string).
     ///
     /// **Architectural note**: `String` (not `NoteStatus`) keeps `config.rs`
-    /// free of domain types. Resolution happens in `gradatum-worker` via kebab-case comparison.
+    /// free of domain types.
     ///
-    /// **not yet wired (v0.6.x)** — consommateur réel : `gradatum_worker::curator_loader::WorkerCuratorConfig`
+    /// **Dead knob — no effective consumer.** The value is copied from here into
+    /// `gradatum_worker::curator_loader::WorkerCuratorConfig`, then into
+    /// `gradatum_curator::CuratorPipelineConfig`, and is **never read** by any of them. Setting it
+    /// in the TOML changes nothing: the status is decided by the pipeline's own logic.
+    /// (Contrast with `heuristic_admit_threshold`, whose chain does terminate in a read.)
     pub heuristic_default_status: Option<String>,
 
     /// Enables LLM review for notes below `confidence_threshold`.
     ///
-    /// **not yet wired (v0.6.x)** — consommateur réel : `gradatum_worker::curator_loader::WorkerCuratorConfig`
+    /// **Not wired here** — effective consumer:
+    /// `gradatum_worker::curator_loader::WorkerCuratorConfig`.
     pub llm_review_enabled: Option<bool>,
 
     /// Confidence threshold below which LLM review is triggered.
     ///
-    /// **not yet wired (v0.6.x)** — consommateur réel : `gradatum_worker::curator_loader::WorkerCuratorConfig`
+    /// **Not wired here** — effective consumer:
+    /// `gradatum_worker::curator_loader::WorkerCuratorConfig`.
     pub confidence_threshold: Option<f32>,
 
     /// LLM review endpoint URL (OpenAI Chat API compatible).
     ///
-    /// **not yet wired (v0.6.x)** — consommateur réel : `gradatum_worker::curator_loader::WorkerCuratorConfig`
+    /// **Deprecated — ignored.** Nothing reads it: the effective URL is
+    /// `[curator.llm] base_url`. The field is kept so that existing `server.toml`
+    /// files still load, and `gradatum-worker` logs a warning at boot when it is set,
+    /// naming the setting that actually applies.
     pub llm_review_endpoint: Option<String>,
 
     /// LLM model used for review.
     ///
-    /// **not yet wired (v0.6.x)** — consommateur réel : `gradatum_worker::curator_loader::WorkerCuratorConfig`
+    /// **Deprecated — ignored.** The effective model is `[curator.llm] model`.
+    /// See [`llm_review_endpoint`](Self::llm_review_endpoint).
     pub llm_review_model: Option<String>,
 
     /// LLM review request timeout in milliseconds.
     ///
-    /// **not yet wired (v0.6.x)** — consommateur réel : `gradatum_worker::curator_loader::WorkerCuratorConfig`
+    /// **Deprecated — ignored.** The effective timeout is `[curator.llm] timeout_ms`.
+    /// See [`llm_review_endpoint`](Self::llm_review_endpoint).
     pub llm_review_timeout_ms: Option<u32>,
 
     /// Maximum tokens the LLM reviewer may generate.
     ///
-    /// **not yet wired (v0.6.x)** — consommateur réel : `gradatum_worker::curator_loader::WorkerCuratorConfig`
+    /// **Not wired here** — effective consumer:
+    /// `gradatum_worker::curator_loader::WorkerCuratorConfig`.
     pub llm_review_max_tokens: Option<u32>,
 
     /// Behaviour on LLM failure or timeout.
     ///
     /// Values: `"pending-review-fallback"` | `"reject"` | `"admit-pending-review"`.
     ///
-    /// **not yet wired (v0.6.x)** — consommateur réel : `gradatum_worker::curator_loader::WorkerCuratorConfig`
+    /// **Not wired here** — effective consumer:
+    /// `gradatum_worker::curator_loader::WorkerCuratorConfig`.
     pub llm_review_fallback: Option<String>,
 }
 
 /// `[index]` section — index engine configuration.
 ///
-/// **Section entière non-câblée (v0.6.x)** — le backend SQLite est initialisé
-/// directement par `gradatum-server::state` sans passer par cette section.
-/// Déverrouillage prévu lors de la séparation index pluggable v0.6.x.
+/// **The whole section is inert.** The SQLite backend is initialised directly by
+/// `gradatum-server::state`, which never consults this section. It will only take
+/// effect once the index backend becomes pluggable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IndexConfig {
     /// Index backend. Values: `"sqlite"`. `None` → `"sqlite"`.
     ///
-    /// **not yet wired (v0.6.x)**
+    /// **Not wired** — parsed but never read.
     pub backend: Option<String>,
 
     /// FTS5 tokeniser for full-text search.
     ///
     /// Values: `"unicode61"` | `"ascii"` | `"porter"`. `None` → `"unicode61"`.
     ///
-    /// **not yet wired (v0.6.x)**
+    /// **Not wired** — parsed but never read.
     pub fts_tokenizer: Option<String>,
 }
 
 /// `[drift]` section — drift detector configuration.
 ///
-/// **Section entière non-câblée (v0.6.x)** — détection de drift non implémentée
-/// dans le worker. Déverrouillage prévu v0.6.x.
+/// **The whole section is inert.** Drift detection is not implemented in the worker
+/// yet; the field below is parsed but never acted upon.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DriftConfig {
     /// Interval between drift scans in seconds. `None` → `3600`.
     ///
-    /// **not yet wired (v0.6.x)**
+    /// **Not wired** — parsed but never read.
     pub scan_interval_seconds: Option<u32>,
 }
 
@@ -283,21 +302,21 @@ impl Default for HistoryConfig {
 ///
 /// Controls rotation, retention, and fsync mode for audit events.
 ///
-/// **Section entière non-câblée (v0.6.x)** — l'audit JSONL (`audit_jsonl.rs`)
-/// n'est pas piloté par `VaultConfig.audit` mais par sa propre config inline.
-/// Déverrouillage prévu lors de l'unification audit v0.6.x.
+/// **The whole section is inert.** The JSONL audit writer (`audit_jsonl.rs`) is not
+/// driven by `VaultConfig.audit` but by its own inline configuration. This section
+/// will only take effect once both audit paths are unified.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuditConfig {
     /// Audit log rotation policy.
     ///
     /// Values: `"daily"` | `"weekly"` | `"size-100mb"`. `None` → `"daily"`.
     ///
-    /// **not yet wired (v0.6.x)**
+    /// **Not wired** — parsed but never read.
     pub rotation: Option<String>,
 
     /// Retention period in days. `0` = infinite retention. `None` → `30`.
     ///
-    /// **not yet wired (v0.6.x)**
+    /// **Not wired** — parsed but never read.
     pub retention_days: Option<u32>,
 
     /// Strict fsync mode.
@@ -305,7 +324,7 @@ pub struct AuditConfig {
     /// `false` (default) = 64 KB `BufWriter` + fsync every 100 ms or 100 events.
     /// `true` = fsync per event, bypasses buffer (~200 µs/event on NVMe — forensic-grade).
     ///
-    /// **not yet wired (v0.6.x)**
+    /// **Not wired** — parsed but never read.
     #[serde(default)]
     pub strict_mode: bool,
 }

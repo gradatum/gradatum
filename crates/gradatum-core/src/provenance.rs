@@ -48,7 +48,7 @@ pub trait TrustLookup {
 /// If `section_hint ∈ TRUST_SCORES` → returns `section_hint` as-is.
 /// Otherwise (or if absent) → returns `"agent-log"` (conservative default).
 ///
-/// # Exemples
+/// # Examples
 ///
 /// ```
 /// use gradatum_core::provenance::resolve_provenance;
@@ -70,7 +70,7 @@ pub fn resolve_provenance(section_hint: Option<&str>) -> &'static str {
 
 /// Returns the static trust score for a known provenance, or `None` if unknown.
 ///
-/// # Exemples
+/// # Examples
 ///
 /// ```
 /// use gradatum_core::provenance::trust_for;

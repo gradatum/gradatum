@@ -7,9 +7,12 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "SQLite queue store: SqliteQueueStore — Apalis-backed async job queue for gradatum"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "0.7.0" }
+gradatum-core = { path = "../gradatum-core", version = "1.0.0" }
 
 async-trait   = { workspace = true }
 chrono        = { workspace = true }

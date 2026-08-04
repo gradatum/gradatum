@@ -49,7 +49,7 @@ pub enum ReadUsageError {
     #[error("read_usage SQLite : {0}")]
     Sqlite(#[from] rusqlite::Error),
     /// Thread de blocage échoué (panic ou annulation) — impossible en pratique.
-    #[error("read_usage thread blocking échoué")]
+    #[error("read_usage blocking thread failed")]
     Blocking,
 }
 

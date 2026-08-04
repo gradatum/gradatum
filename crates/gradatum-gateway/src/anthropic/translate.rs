@@ -1,15 +1,17 @@
 //! Anthropic ↔ internal (OpenAI-compatible) translation functions.
 //!
-//! This module is purely functional — no I/O, no Axum dependency.
-//! All functions are independently testable.
+//! This module is pure translation logic — no I/O and no Axum dependency; the only
+//! side effect is `tracing` diagnostics. Every function is independently testable.
 //!
 //! # Supported content types
 //! - Plain text (system, user, assistant messages)
 //! - Full tool use (tools[], tool_choice, tool_use/tool_result/image blocks)
 //!
 //! # Errors
-//! All functions return `Result<_, TranslateError>` to ensure errors are never
-//! silently dropped.
+//! The translation entry points that can reject their input — [`anthropic_to_chat`]
+//! and [`chat_to_anthropic`] — return `Result<_, TranslateError>`, so a rejection is
+//! never silently dropped. The remaining helpers are total functions on their input
+//! and return their value directly.
 
 use thiserror::Error;
 
@@ -25,40 +27,44 @@ use crate::commons::{
     },
 };
 
-/// Alias modèle par défaut utilisé quand aucun mapping explicite n'est configuré.
+/// Default model alias used when no explicit mapping is configured.
 ///
-/// TODO: make this configurable via `[messages] default_alias` in the TOML.
+/// Compile-time constant: it is not currently overridable from the TOML configuration.
 pub const DEFAULT_ALIAS: &str = "default";
 
-/// Erreur de traduction Anthropic ↔ interne.
+/// Error raised while translating between the Anthropic and internal formats.
 #[derive(Debug, Error, PartialEq)]
 pub enum TranslateError {
-    /// La réponse interne ne contient aucun choix.
-    #[error("réponse backend vide : aucun choix dans choices[]")]
+    /// The internal response carries no choice.
+    #[error("empty backend response: no choice in choices[]")]
     EmptyChoices,
-    /// URL d'image invalide : le schéma doit être `https://`.
+    /// Invalid image URL: the scheme must be `https://`.
     ///
-    /// Seules les URL HTTPS sont acceptées pour éviter SSRF via protocoles non chiffrés.
-    /// La valeur contient l'URL rejetée (masquée dans les logs pour éviter la fuite).
-    #[error("URL image invalide (schéma non-https) : schéma attendu https://")]
+    /// Only HTTPS URLs are accepted, to prevent SSRF over unencrypted protocols.
+    /// The payload holds the rejected URL; it is redacted from logs to avoid leaking it.
+    #[error("invalid image URL (non-https scheme): expected https:// scheme")]
     InvalidImageUrl(String),
 }
 
-/// Traduit une `MessagesRequest` Anthropic en `ChatCompletionRequest` interne.
+/// Translates an Anthropic [`MessagesRequest`] into an internal `ChatCompletionRequest`.
 ///
-/// # Comportement
-/// - Le champ `system` (texte ou blocs texte) est inséré en tête de `messages[]`
-///   comme message de rôle `system`.
-/// - Messages `user`/`assistant` : texte brut, blocs text, tool_use, tool_result, image.
-/// - `tools[]` Anthropic → `ToolDefinition[]` OpenAI (`input_schema` → `parameters`).
-/// - `tool_choice` Anthropic → OpenAI : auto→"auto", any→"required", tool→fonction forcée,
-///   none→"none".
-/// - `max_tokens`, `temperature`, `top_p`, `stop_sequences` mappés directement.
-/// - `resolved_model` est injecté dans le champ `model` (alias interne).
+/// # Behaviour
+/// - The `system` field (text or text blocks) is prepended to `messages[]` as a
+///   message with role `system`.
+/// - `user` / `assistant` messages: plain text, text blocks, tool_use, tool_result, image.
+/// - Anthropic `tools[]` → OpenAI `ToolDefinition[]` (`input_schema` → `parameters`).
+/// - Anthropic `tool_choice` → OpenAI: `auto` → `"auto"`, `any` → `"required"`,
+///   `tool` → forced function, `none` → `"none"`.
+/// - `max_tokens`, `temperature`, `top_p` and `stop_sequences` are mapped directly.
+/// - `resolved_model` is written into the `model` field (internal alias).
+/// - When `tools` are present and the client sent no `tool_choice`, `"auto"` is forced
+///   (see the module-level note on grammar generation in the llama.cpp backend).
 ///
 /// # Errors
-/// `TranslateError::EmptyChoices` n'est pas produit ici.
-/// This function is infallible — all content block types are supported.
+/// - [`TranslateError::InvalidImageUrl`] — propagated from message translation when an
+///   image block carries a URL whose scheme is not `https://`.
+///
+/// [`TranslateError::EmptyChoices`] is never produced here; it belongs to the response path.
 pub fn anthropic_to_chat(
     req: &MessagesRequest,
     resolved_model: &str,
@@ -120,6 +126,11 @@ pub fn anthropic_to_chat(
         max_tokens: Some(req.max_tokens),
         temperature: req.temperature,
         top_p: req.top_p,
+        // top_k/min_p/presence_penalty : non mappés depuis l'API Anthropic (hors périmètre A2).
+        // `None` = comportement inchangé (champs omis du body forwardé, cf. skip_serializing_if).
+        top_k: None,
+        min_p: None,
+        presence_penalty: None,
         stop: req.stop_sequences.clone(),
         stream: req.stream,
         tools,
@@ -128,50 +139,51 @@ pub fn anthropic_to_chat(
     })
 }
 
-/// Traduit un `AnthropicMessage` en `Vec<Message>` interne.
+/// Translates one [`AnthropicMessage`] into internal `Message` values.
 ///
-/// Retourne un vecteur car un message `role:"user"` contenant N blocs `tool_result`
-/// (tool-use parallèle) produit N messages `role:tool` distincts (convention OpenAI).
+/// Returns a vector because a `role:"user"` message carrying N `tool_result` blocks
+/// (parallel tool use) produces N distinct `role:tool` messages, per the OpenAI convention.
 ///
-/// Logique par rôle et contenu :
-/// - `role:"user"` avec N blocs `tool_result` → N messages `role:tool` (C1)
-/// - `role:"user"` avec texte/images → 1 message `role:user`
-/// - `role:"assistant"` avec blocs → 1 message assistant avec `tool_calls` si tool_use présent
+/// Dispatch by role and content:
+/// - `role:"user"` with N `tool_result` blocks → N `role:tool` messages
+/// - `role:"user"` with text or images → one `role:user` message
+/// - `role:"assistant"` with blocks → one assistant message, carrying `tool_calls`
+///   when `tool_use` blocks are present
+///
+/// An unrecognized role is logged and handled as `user`.
 ///
 /// # Errors
-/// - `TranslateError::InvalidImageUrl` si un bloc image contient une URL non-https.
+/// - [`TranslateError::InvalidImageUrl`] if an image block carries a non-HTTPS URL.
 fn translate_message(msg: &AnthropicMessage) -> Result<Vec<Message>, TranslateError> {
     match msg.role.as_str() {
         "user" => translate_user_message(&msg.content),
         "assistant" => Ok(vec![translate_assistant_message(&msg.content)]),
         other => {
-            tracing::warn!(role = %other, "rôle Anthropic inconnu — traité comme user");
+            tracing::warn!(role = %other, "unknown Anthropic role — treated as user");
             translate_user_message(&msg.content)
         }
     }
 }
 
-/// Traduit un message de rôle `user` en `Vec<Message>`.
+/// Translates a `user` message into internal `Message` values.
 ///
-/// # Convention OpenAI — tool-use parallèle (C1)
+/// # OpenAI convention — parallel tool use
 ///
-/// Quand Claude Code (ou tout client Anthropic) émet un tour `role:user` contenant
-/// N blocs `tool_result` (réponses à N `tool_use` parallèles), la convention OpenAI
-/// exige **un message `role:tool` par résultat** (chacun avec son `tool_call_id`).
+/// When a client emits a `role:user` turn carrying N `tool_result` blocks (the answers
+/// to N parallel `tool_use` calls), the OpenAI convention requires **one `role:tool`
+/// message per result**, each with its own `tool_call_id`. Collapsing them into a single
+/// message drops results 2..N and desynchronizes the agent loop on the backend side.
 ///
-/// Avant C1, le code ne traitait que `blocks.first()` et perdait les résultats 2..N,
-/// rendant la boucle agentique incohérente côté backend.
+/// # Mixed content (tool_result + text)
 ///
-/// # Contenu mixte (tool_result + texte)
+/// When the message holds both `tool_result` blocks and text or images:
+/// - each `tool_result` → one `role:tool` message, in order;
+/// - the remaining text and images → one extra trailing `role:user` message.
 ///
-/// Si le message contient à la fois des blocs `tool_result` et du texte/images :
-/// - Chaque `tool_result` → 1 message `role:tool` (dans l'ordre)
-/// - Le texte/images résiduel → 1 message `role:user` supplémentaire (en fin)
-///
-/// Aucun bloc n'est perdu.
+/// No block is dropped.
 ///
 /// # Errors
-/// - `TranslateError::InvalidImageUrl` si un bloc image contient une URL non-https (V5).
+/// - [`TranslateError::InvalidImageUrl`] if an image block carries a non-HTTPS URL.
 fn translate_user_message(content: &AnthropicContent) -> Result<Vec<Message>, TranslateError> {
     match content {
         AnthropicContent::Text(s) => Ok(vec![Message::user(s)]),
@@ -234,11 +246,12 @@ fn translate_user_message(content: &AnthropicContent) -> Result<Vec<Message>, Tr
     }
 }
 
-/// Traduit un message de rôle `assistant`.
+/// Translates an `assistant` message into a single internal `Message`.
 ///
-/// Gère :
-/// - Texte pur → message assistant texte
-/// - Blocs mixtes (text + tool_use) → message assistant avec `tool_calls` + contenu texte
+/// Handles:
+/// - plain text → a text-only assistant message;
+/// - mixed blocks (text + tool_use) → an assistant message carrying both `tool_calls`
+///   and the concatenated text content.
 fn translate_assistant_message(content: &AnthropicContent) -> Message {
     match content {
         AnthropicContent::Text(s) => Message::assistant(s),
@@ -257,7 +270,7 @@ fn translate_assistant_message(content: &AnthropicContent) -> Message {
                             tracing::warn!(
                                 tool_id = %id,
                                 error = %e,
-                                "échec sérialisation input tool_use → arguments vide"
+                                "tool_use input serialization failed → empty arguments"
                             );
                             "{}".to_string()
                         });
@@ -275,7 +288,7 @@ fn translate_assistant_message(content: &AnthropicContent) -> Message {
                     other => {
                         tracing::warn!(
                             block_type = ?other,
-                            "bloc inattendu dans message assistant — ignoré"
+                            "unexpected block in assistant message — skipped"
                         );
                     }
                 }
@@ -304,10 +317,14 @@ fn translate_assistant_message(content: &AnthropicContent) -> Message {
     }
 }
 
-/// Traduit une liste de blocs en `Vec<ContentPart>` OpenAI.
+/// Translates a list of content blocks into OpenAI `ContentPart` values.
 ///
-/// Blocs texte → `ContentPart::Text` ;
-/// blocs image base64 → `ContentPart::ImageUrl` avec data-URI.
+/// Text blocks become `ContentPart::Text`; image blocks become `ContentPart::ImageUrl`
+/// (a data-URI for base64 sources). Any other block type is skipped. When nothing is
+/// produced, a single empty text part is emitted so the message is never contentless.
+///
+/// # Errors
+/// - [`TranslateError::InvalidImageUrl`] if an image block carries a non-HTTPS URL.
 fn translate_content_blocks_to_parts(
     blocks: &[ContentBlock],
 ) -> Result<Vec<ContentPart>, TranslateError> {
@@ -340,19 +357,21 @@ fn translate_content_blocks_to_parts(
     Ok(parts)
 }
 
-/// Traduit une `ImageSource` Anthropic en `ContentPart::ImageUrl` OpenAI.
+/// Translates an Anthropic [`ImageSource`] into an OpenAI `ContentPart::ImageUrl`.
 ///
-/// Formats supportés :
-/// - `type:"base64"` → `data:<media_type>;base64,<data>` (toujours accepté)
-/// - `type:"url"` → URL distante (HTTPS uniquement — anti-SSRF)
+/// Supported source types:
+/// - `type:"base64"` → `data:<media_type>;base64,<data>` (always accepted; the media
+///   type defaults to `image/jpeg` when absent);
+/// - `type:"url"` → remote URL, HTTPS only.
+///
+/// Any other source type is logged and skipped, yielding `Ok(None)`.
 ///
 /// # Errors
-/// - `TranslateError::InvalidImageUrl` si le schéma de l'URL n'est pas `https://`.
+/// - [`TranslateError::InvalidImageUrl`] if the URL scheme is not `https://`.
 ///
-/// # Sécurité
-/// Seules les URL `https://` sont acceptées. Les URL `http://`, `ftp://`, vides,
-/// ou à schéma personnalisé sont rejetées pour éviter SSRF et exfiltration de données
-/// via protocoles non chiffrés.
+/// # Security
+/// Only `https://` URLs are accepted. `http://`, `ftp://`, empty, and custom-scheme URLs
+/// are rejected to prevent SSRF and data exfiltration over unencrypted protocols.
 fn translate_image_source(source: &ImageSource) -> Result<Option<ContentPart>, TranslateError> {
     match source.source_type.as_str() {
         "base64" => {
@@ -367,7 +386,7 @@ fn translate_image_source(source: &ImageSource) -> Result<Option<ContentPart>, T
             let url = source.url.as_deref().unwrap_or("").to_string();
             // Anti-SSRF : rejeter tout schéma non-https.
             if !url.starts_with("https://") {
-                tracing::warn!("URL image rejetée : schéma non-https (url tronquée pour logs)");
+                tracing::warn!("image URL rejected: non-https scheme (url truncated for logs)");
                 return Err(TranslateError::InvalidImageUrl(url));
             }
             Ok(Some(ContentPart::ImageUrl {
@@ -375,18 +394,19 @@ fn translate_image_source(source: &ImageSource) -> Result<Option<ContentPart>, T
             }))
         }
         other => {
-            tracing::warn!(source_type = %other, "type de source image inconnu — ignoré");
+            tracing::warn!(source_type = %other, "unknown image source type — skipped");
             Ok(None)
         }
     }
 }
 
-/// Extrait le texte d'un `tool_result.content`.
+/// Extracts the text carried by a `tool_result.content` value.
 ///
-/// Anthropic accepte :
-/// - `String` → texte direct
-/// - `Array` de blocs Text → concaténation
-/// - `null` → chaîne vide
+/// Anthropic accepts several shapes:
+/// - `String` → returned as-is;
+/// - `Array` of text blocks → concatenated;
+/// - `null` → empty string;
+/// - any other shape → the raw JSON serialization, so no information is lost.
 fn extract_tool_result_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => s.clone(),
@@ -401,55 +421,57 @@ fn extract_tool_result_text(content: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         other => {
             // Cas inattendu : on sérialise en JSON pour ne pas perdre l'info.
-            tracing::warn!("format tool_result.content inattendu — sérialisé en JSON brut");
+            tracing::warn!("unexpected tool_result.content format — serialized as raw JSON");
             other.to_string()
         }
     }
 }
 
-/// Supprime récursivement les mots-clés JSON Schema qui produisent des règles GBNF
-/// volumineuses dans llama.cpp, à tous les niveaux de nesting.
+/// Recursively strips the JSON Schema keywords that blow up grammar size in llama.cpp,
+/// at every nesting level.
 ///
-/// # Contexte
+/// # Background
 ///
-/// Le parser GBNF de llama.cpp b9780 génère des règles `integer-range` et autres
-/// constructions volumineuses pour les contraintes numériques et textuelles (`maximum`,
-/// `minimum`, `maxLength`, `pattern`, etc.). Ces règles peuvent dépasser la capacité
-/// du parser et provoquer `HTTP 400 "failed to parse grammar"`.
+/// The GBNF parser in llama.cpp expands numeric and textual constraints (`maximum`,
+/// `minimum`, `maxLength`, `pattern`, …) into large rule sets — notably `integer-range`
+/// rules for bounds such as `maximum = 9007199254740991`. On large tool catalogues the
+/// resulting grammar can exceed the parser's capacity and yield
+/// `HTTP 400 "failed to parse grammar"`.
 ///
-/// Ces contraintes ne sont pas critiques pour le fonctionnement du LLM — elles servent
-/// uniquement à la validation stricte du JSON Schema côté client. Les supprimer permet
-/// de réduire drastiquement la taille de la grammaire sans altérer la structure de la
-/// réponse attendue.
+/// Those constraints do not change what the model can produce; they only drive strict
+/// client-side JSON Schema validation. Removing them shrinks the grammar drastically
+/// while leaving the structure of the expected response untouched.
 ///
-/// # Mots-clés supprimés
+/// # Removed keywords
 ///
 /// `maximum`, `minimum`, `exclusiveMaximum`, `exclusiveMinimum`, `multipleOf`,
-/// `maxLength`, `minLength`, `pattern`, `maxItems`, `minItems`, `uniqueItems`
+/// `maxLength`, `minLength`, `pattern`, `maxItems`, `minItems`, `uniqueItems`.
 ///
-/// # Mots-clés conservés
+/// Every other key is preserved verbatim — including the structural ones (`type`,
+/// `properties`, `items`, `required`, `description`, `enum`, `format`,
+/// `additionalProperties`, `$defs`, `definitions`, `anyOf`, `oneOf`, `allOf`, `title`,
+/// `default`, `const`, `$ref`).
 ///
-/// `type`, `properties`, `items`, `required`, `description`, `enum`, `format`,
-/// `additionalProperties`, `$defs`, `definitions`, `anyOf`, `oneOf`, `allOf`,
-/// `title`, `default`, `const`, `$ref`
+/// # Determinism
 ///
-/// # Stabilité
+/// The output is deterministic: without the `preserve_order` feature, `serde_json::Map`
+/// is a `BTreeMap`, so keys are emitted in lexicographic order. Two calls on the same
+/// input produce byte-for-byte identical JSON. That property — not any insertion order —
+/// is what keeps the prompt prefix stable across requests, and therefore the backend's
+/// prompt cache effective.
 ///
-/// La sortie est déterministe : `serde_json::Map` sans la feature `preserve_order`
-/// utilise un `BTreeMap` (tri lexicographique des clés). Deux appels consécutifs
-/// avec la même entrée produisent exactement le même JSON octet-pour-octet.
-/// C'est cette propriété — et non un ordre d'insertion — qui garantit la stabilité
-/// du prompt-cache LCP (préfixe identique entre requêtes).
+/// # Recursion coverage
 ///
-/// # Niveaux traités récursivement
+/// - the current object (root);
+/// - `properties.<key>` → each value (sub-schema);
+/// - `items` → sub-schema, or array of sub-schemas;
+/// - `$defs` / `definitions` → each value (sub-schema);
+/// - `anyOf`, `oneOf`, `allOf` → arrays of sub-schemas;
+/// - `additionalProperties` → sub-schema when it is an object; a boolean is left as-is;
+/// - `prefixItems` (draft 2020-12 / schemars 1.0) → array of sub-schemas.
 ///
-/// - Objet courant (root)
-/// - `properties.<key>` → chaque valeur (sous-schéma)
-/// - `items` → sous-schéma
-/// - `$defs` / `definitions` → chaque valeur (sous-schéma)
-/// - `anyOf`, `oneOf`, `allOf` → tableaux de sous-schémas
-/// - `additionalProperties` → sous-schéma (si objet ; booléen laissé tel quel)
-/// - `prefixItems` (draft 2020-12 / schemars 1.0) → tableau de sous-schémas
+/// Deliberately not recursed: `patternProperties`, `not`, `if` / `then` / `else`,
+/// `contains`, `propertyNames` — none are emitted by the tool schemas seen in practice.
 pub(crate) fn sanitize_schema(value: serde_json::Value) -> serde_json::Value {
     // Mots-clés à supprimer : contraintes qui génèrent du GBNF-bloat.
     // La liste est statique et exhaustive — ne pas ajouter de mots-clés structurants.
@@ -544,13 +566,12 @@ pub(crate) fn sanitize_schema(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Traduit la liste de `Tool` Anthropic en `Vec<ToolDefinition>` OpenAI.
+/// Translates Anthropic [`Tool`] definitions into OpenAI `ToolDefinition` values.
 ///
-/// Mapping : `{name, description, input_schema}` → `{type:"function", function:{name, description, parameters:input_schema}}`.
+/// Mapping: `{name, description, input_schema}` → `{type:"function", function:{name, description, parameters:input_schema}}`.
 ///
-/// Les `input_schema` sont sanitizés via [`sanitize_schema`] pour supprimer les
-/// contraintes JSON Schema qui génèrent du GBNF-bloat dans llama.cpp (voir doc
-/// de [`sanitize_schema`] pour la liste des mots-clés supprimés).
+/// Each `input_schema` goes through [`sanitize_schema`], which strips the JSON Schema
+/// constraints that inflate llama.cpp grammars (see that function for the exact list).
 fn translate_tools(tools: &[Tool]) -> Vec<ToolDefinition> {
     tools
         .iter()
@@ -569,7 +590,7 @@ fn translate_tools(tools: &[Tool]) -> Vec<ToolDefinition> {
         .collect()
 }
 
-/// Traduit un `ToolChoice` Anthropic en `OpenAIToolChoice`.
+/// Translates an Anthropic [`ToolChoice`] into its OpenAI counterpart.
 ///
 /// | Anthropic | OpenAI |
 /// |---|---|
@@ -589,7 +610,7 @@ fn translate_tool_choice(tc: &ToolChoice) -> OpenAIToolChoice {
     }
 }
 
-/// Extrait le texte depuis un `SystemContent`.
+/// Extracts the concatenated text from a [`SystemContent`] value.
 fn extract_text_from_system(system: &SystemContent) -> String {
     match system {
         SystemContent::Text(s) => s.clone(),
@@ -607,14 +628,15 @@ fn extract_text_from_system(system: &SystemContent) -> String {
     }
 }
 
-/// Traduit une `ChatCompletionResponse` interne en `MessagesResponse` Anthropic.
+/// Translates an internal `ChatCompletionResponse` into an Anthropic [`MessagesResponse`].
 ///
-/// Handles plain text responses and mixed tool-call + text responses.
+/// Handles plain text responses and mixed tool-call + text responses. Only the first
+/// choice is translated.
 ///
-/// `model` est le nom de modèle à renvoyer dans la réponse (tel que reçu dans la requête).
+/// `model` is the model name to echo back in the response, as received in the request.
 ///
 /// # Errors
-/// `TranslateError::EmptyChoices` si `choices` est vide.
+/// - [`TranslateError::EmptyChoices`] if `choices` is empty.
 pub fn chat_to_anthropic(
     resp: &ChatCompletionResponse,
     model: &str,
@@ -680,23 +702,22 @@ pub fn chat_to_anthropic(
     })
 }
 
-/// Parse les arguments d'un tool_call OpenAI (String JSON) en `serde_json::Value`.
+/// Parses the arguments of an OpenAI tool call (a JSON string) into a `serde_json::Value`.
 ///
-/// Si le parse échoue, retourne un objet vide `{}` + tracing warn.
-/// Ne panic jamais (ADN 1).
+/// On a parse failure, logs a warning and returns an empty object `{}`. Never panics.
 fn parse_tool_arguments(arguments: &str, tool_id: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|e| {
         tracing::warn!(
             tool_id = %tool_id,
             arguments = %arguments,
             error = %e,
-            "parse arguments tool_call échoué — input remplacé par {{}}"
+            "tool_call arguments parse failed — input replaced with {{}}"
         );
         serde_json::Value::Object(serde_json::Map::new())
     })
 }
 
-/// Mappe un `finish_reason` OpenAI vers un `stop_reason` Anthropic.
+/// Maps an OpenAI `finish_reason` to the corresponding Anthropic `stop_reason`.
 ///
 /// | OpenAI `finish_reason` | Anthropic `stop_reason` |
 /// |---|---|
@@ -704,7 +725,7 @@ fn parse_tool_arguments(arguments: &str, tool_id: &str) -> serde_json::Value {
 /// | `"length"` | `"max_tokens"` |
 /// | `"tool_calls"` | `"tool_use"` |
 /// | `"stop_sequence"` | `"stop_sequence"` |
-/// | tout autre | `"end_turn"` (fallback sûr) |
+/// | anything else | `"end_turn"` (safe fallback) |
 #[must_use]
 pub fn map_stop_reason(finish_reason: &str) -> &'static str {
     match finish_reason {
@@ -716,9 +737,9 @@ pub fn map_stop_reason(finish_reason: &str) -> &'static str {
     }
 }
 
-/// Construit l'`AnthropicUsage` depuis l'`Usage` interne optionnel.
+/// Builds an [`AnthropicUsage`] from the optional internal `Usage`.
 ///
-/// Si `usage` est absent, retourne des zéros.
+/// Returns zeroed counters when `usage` is absent.
 fn build_usage(usage: Option<&crate::commons::chat::Usage>) -> AnthropicUsage {
     match usage {
         Some(u) => AnthropicUsage {

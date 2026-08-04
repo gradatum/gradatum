@@ -1,0 +1,76 @@
+# gradatum engine configuration — chat (CPU)
+#
+# Default install: chat model on CPU, loopback-only.
+# For GPU, set gpu_layers to a high value (e.g., 99) and uncomment extra_args.
+# For a second instance, copy this file and change port/child_port to unique values.
+#
+# Convention: /etc/gradatum/conf.d/70-engine-<name>.toml
+# Full field reference: docs/DEPLOYMENT.md §4
+# Usage examples: docs/DEPLOYMENT.md §5
+
+[engine]
+# ── Required ──────────────────────────────────────────────────────────────────
+# Path to the GGUF model file. Must be under /opt/gradatum/models/.
+model_path = "/opt/gradatum/models/<chat-model-name>.gguf"
+
+# Model type: "chat" (text generation) or "embed" (embeddings).
+model_kind = "chat"
+
+# Port the supervisor listens on (your API endpoint).
+port = 11435
+
+# ── Child process ─────────────────────────────────────────────────────────────
+# Port the llama-server child listens on (loopback only, not exposed).
+# Must be > 1024 and different from `port`.
+child_port = 11436
+
+# Number of parallel inference slots passed as --parallel to llama-server.
+parallel = 4
+
+# Path to the llama-server binary.
+# llama_server_bin = "/usr/local/bin/llama-server"  # décommenter si différent du défaut
+
+# ── Inference parameters ──────────────────────────────────────────────────────
+# Number of model layers to offload to GPU. 0 = CPU only.
+# Set to a large number (e.g. 99) to offload all layers.
+gpu_layers = 0
+
+# Number of CPU threads for inference.
+n_threads = 8
+
+# KV cache context length in tokens.
+context_len = 32768
+
+# Maximum tokens generated per chat request.
+max_tokens = 512
+
+# ── Startup and resilience ────────────────────────────────────────────────────
+# Time in seconds to wait for the child /health to return 200.
+startup_timeout_secs = 60
+
+# Total restart budget (not a rate-limit per window).
+child_restart_max = 3
+
+# Minimum uptime in seconds for a crash to be considered "stable" (not flapping).
+min_stable_uptime_secs = 30
+
+# ── Network ───────────────────────────────────────────────────────────────────
+# Bind address for the supervisor's listening port.
+# 127.0.0.1 = loopback-only. Set to a specific LAN IP to expose on the network.
+# 0.0.0.0 and :: are REJECTED (fail-closed).
+bind_addr = "127.0.0.1"
+
+# Request timeout in seconds.
+timeout_secs = 120
+
+# Maximum request body size in bytes (default: 32 MiB, hard cap: 256 MiB).
+# body_limit_bytes = 33554432   # décommenter pour ajuster
+
+# ── gradatum server ──────────────────────────────────────────────────────────
+# URL of the gradatum server for event logging and JWT exchange.
+gradatum_url = "http://127.0.0.1:19090"
+
+# ── GPU extra args (décommenter pour GPU) ────────────────────────────────────
+# Additional flags passed to llama-server. Only flags in the allow-list are
+# accepted (see docs/DEPLOYMENT.md §6).
+# extra_args = ["--flash-attn"]

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::default_main;
+use gradatum_core::scope::TenantId;
 
 /// Request body for `vault_history` — lists the copy-on-write snapshots of a note.
 ///
@@ -10,9 +10,11 @@ use crate::default_main;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultHistoryRequest {
-    /// Tenant identifier (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Tenant (principal) — optional; when omitted the server resolves it from the
+    /// credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// Note ULID (e.g. `"01JTEXAMPLE"`).
     pub note_id: String,
 }
@@ -25,9 +27,11 @@ pub struct VaultHistoryRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultHistoryGetRequest {
-    /// Tenant identifier (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Tenant (principal) — optional; when omitted the server resolves it from the
+    /// credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// Note ULID.
     pub note_id: String,
     /// Unix ms timestamp of the snapshot (obtained from `vault_history`).
@@ -43,9 +47,11 @@ pub struct VaultHistoryGetRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultRestoreRequest {
-    /// Tenant identifier (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Tenant (principal) — optional; when omitted the server resolves it from the
+    /// credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// ULID of the note to restore.
     pub note_id: String,
     /// Unix ms timestamp of the snapshot to restore.
@@ -61,9 +67,11 @@ pub struct VaultRestoreRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultDiffRequest {
-    /// Tenant identifier (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Tenant (principal) — optional; when omitted the server resolves it from the
+    /// credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// Note ULID.
     pub note_id: String,
     /// Version A: Unix ms timestamp or `"current"`.

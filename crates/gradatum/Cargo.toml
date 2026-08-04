@@ -7,8 +7,15 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Umbrella SDK facade — re-exports curated subsets of focused crates via Cargo features"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
+# `core` est activé par défaut : sans lui, `cargo add gradatum` n'exposerait que
+# `VERSION` (façade vide). `client` reste opt-in tant que `gradatum-sdk-rs` est un
+# placeholder sans surface cliente.
+default = ["core"]
 client = ["dep:gradatum-sdk-rs"]
 core = ["dep:gradatum-core"]
 

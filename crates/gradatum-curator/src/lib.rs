@@ -1,7 +1,7 @@
 //! # gradatum-curator
 //!
-//! Note curation pipeline: heuristic gating + LLM review for low-confidence notes
-//! + 3 fallback strategies + 5-step cascade.
+//! Note curation pipeline: heuristic routing + optional LLM review for low-confidence
+//! notes, with a fallback strategy applied on LLM failure.
 //!
 //! ## Legacy architecture (`Curator<C>`)
 //!
@@ -14,17 +14,25 @@
 //!   step 4 : LLM error → FallbackStrategy applied
 //! ```
 //!
-//! ## `CuratorPipeline` architecture
+//! ## `CuratorPipeline` architecture (as wired today)
 //!
 //! ```text
 //! CuratorPipeline::process(note) → CurateOutcome
 //!
-//!   step 1 : novelty   — SHA-256 exact match + MinHash 128-perm Jaccard ≥ 0.92
-//!   step 2 : routing   — regex heuristic over 11 gradatum sections
-//!   step 3 : tags      — TF-IDF top-5 + kebab-case
-//!   step 4 : wikilinks — regex extraction + Jaro-Winkler 0.88 fuzzy
-//!   step 5 : dedup     — cosine 0.95 over bge-small embeddings
+//!   step 0 : hint     — a valid explicit `section_hint` admits directly (bypass)
+//!   step 1 : routing  — regex heuristic over the canonical gradatum sections
+//!   step 2 : review   — LLM classification, ONLY for low-confidence notes and ONLY
+//!                       when `llm_review_enabled = true`; a fallback strategy is
+//!                       applied on LLM failure
 //! ```
+//!
+//! ## Not yet wired (post-1.0)
+//!
+//! `novelty`, `tags`, `wikilinks` and `dedup` belong to the target cascade but are **not
+//! yet wired**: every [`CurateOutcome`] carries their default verdicts
+//! (`novelty = Admitted`, `wikilinks = []`, `dedup = Unique`), and `tags` stays empty
+//! unless the optional LLM review runs and returns some. Only routing — and that LLM
+//! review — affects the decision today.
 //!
 //! ## Offline-first invariant
 //!
@@ -34,7 +42,7 @@
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee.
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible additions only within `1.x`.
 //! See [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 
 #![forbid(unsafe_code)]
@@ -46,7 +54,8 @@ pub mod decision;
 pub mod error;
 pub mod workflow;
 
-// ── Modules pipeline cascade 5 fonctions ────────────────────────────────────
+// ── Modules de curation (routing câblé ; novelty/tags/wikilinks/dedup fournis, non câblés) ──
+pub mod audit;
 pub mod dedup;
 pub mod novelty;
 pub mod routing;
@@ -99,8 +108,8 @@ pub struct CuratorLlmConfig {
 ///
 /// ## Gating fields
 ///
-/// Fields such as `llm_review_enabled` and `confidence_threshold` control cascade
-/// behaviour. Without explicit propagation they remain at their defaults (`false`,
+/// Fields such as `llm_review_enabled` and `confidence_threshold` control the
+/// pipeline's LLM-review gating. Without explicit propagation they remain at their defaults (`false`,
 /// `0.7`) regardless of the TOML configuration.
 #[derive(Debug, Clone)]
 pub struct CuratorPipelineConfig {
@@ -114,7 +123,10 @@ pub struct CuratorPipelineConfig {
     /// pipeline. Notes above this threshold are admitted without LLM review.
     pub heuristic_admit_threshold: Option<f32>,
     /// Default status assigned by the heuristic (kebab-case string).
-    /// `None` → `"pending-review"` by default in the pipeline.
+    ///
+    /// **Never read by the pipeline** — this field is propagated from the server TOML and
+    /// then ignored; `Some(_)` and `None` behave identically. The resulting status comes
+    /// from the pipeline's own decision logic, not from this value.
     pub heuristic_default_status: Option<String>,
     /// Enables LLM review for notes below `confidence_threshold`.
     /// `None` → `false` (LLM never called).
@@ -122,15 +134,13 @@ pub struct CuratorPipelineConfig {
     /// Confidence threshold below which LLM review is triggered.
     /// `None` → `0.7` (compatible with `Curator<C>::decide`).
     pub confidence_threshold: Option<f32>,
-    /// LLM endpoint URL for review (OpenAI Chat API compatible).
-    /// Redundant with `llm.base_url` but kept for TOML readability.
-    pub llm_review_endpoint: Option<String>,
-    /// LLM model used for review.
-    /// Redundant with `llm.model` but kept for TOML readability.
-    pub llm_review_model: Option<String>,
-    /// Timeout in milliseconds for LLM review calls.
-    /// `None` → falls back to `llm.timeout_ms` or 5000 ms.
-    pub llm_review_timeout_ms: Option<u32>,
+    // NOTE: `llm_review_endpoint`, `llm_review_model` and `llm_review_timeout_ms`
+    // used to sit here. They were carried all the way into this struct and then
+    // never read: the effective endpoint, model and timeout are `llm.base_url`,
+    // `llm.model` and `llm.timeout_ms` (see `from_config`). Fields duplicating a
+    // live setting without an implemented precedence rule are a config landmine —
+    // they were removed rather than wired, since wiring them would have silently
+    // redirected LLM traffic for any operator holding both.
     /// Maximum number of tokens generated by the review LLM.
     /// `None` → defers to the LLM backend default.
     pub llm_review_max_tokens: Option<u32>,
@@ -151,33 +161,40 @@ pub struct Note {
     pub title: String,
     /// Full Markdown body of the note.
     pub body: String,
-    /// Tags suggested by the creator (optional — supplemented by TF-IDF).
+    /// Tags suggested by the creator (optional). The pipeline does not consume them;
+    /// the caller carries them downstream alongside the outcome.
     pub tags_hint: Vec<String>,
     /// Section suggested by the creator (optional — validated by routing).
     pub section_hint: Option<String>,
 }
 
-/// Decisions produced by the curator cascade for a note.
+/// Decisions produced by the curation pipeline for a note.
 #[derive(Debug, Clone)]
 pub struct CuratorDecisions {
-    /// Canonical section assigned by the heuristic router.
+    /// Canonical section retained for the note: the validated `section_hint` on the
+    /// bypass path, the heuristic router's verdict otherwise, or the section returned by
+    /// the LLM review when that branch runs.
     pub canonical_section: String,
-    /// TF-IDF tags extracted from the content.
+    /// Tags returned by the LLM review. Empty on every other path — the TF-IDF tagger of
+    /// [`tags`] is not wired into the pipeline in 1.0.0.
     pub tags: Vec<String>,
-    /// Novelty verdict (exact match / near-duplicate / new).
+    /// Novelty verdict. Always [`novelty::NoveltyVerdict::Admitted`] in 1.0.0: the
+    /// [`novelty`] detector is provided but not wired into the pipeline.
     pub novelty: novelty::NoveltyVerdict,
-    /// Resolved wikilinks found in the body.
+    /// Resolved wikilinks found in the body. Always empty in 1.0.0: the [`wikilinks`]
+    /// resolver is provided but not wired into the pipeline.
     pub wikilinks: Vec<wikilinks::WikilinkResolution>,
-    /// Semantic deduplication verdict.
+    /// Semantic deduplication verdict. Always [`dedup::DedupVerdict::Unique`] in 1.0.0:
+    /// the [`dedup`] detector is provided but not wired into the pipeline.
     pub dedup: dedup::DedupVerdict,
 }
 
-/// Result of the curation cascade.
+/// Result of the curation pipeline.
 #[derive(Debug, Clone)]
 pub enum CurateOutcome {
     /// Note admitted — full decisions available.
     Admitted {
-        /// Cascade decisions.
+        /// Pipeline decisions.
         decisions: CuratorDecisions,
     },
     /// Note rejected (exact duplicate, etc.).
@@ -220,7 +237,53 @@ pub fn outcome_to_status(outcome: &CurateOutcome) -> Option<gradatum_core::statu
     }
 }
 
-/// Curation pipeline — offline 5-step cascade.
+/// Curator decision path that produced a [`CurateOutcome`] (metrics instrumentation).
+///
+/// Identifies **which branch** of [`CuratorPipeline::process_traced`] produced the
+/// outcome, so the emitted `gradatum_curator_decisions{path, outcome}` metric can
+/// distinguish the four decision routes without re-deriving them downstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CurationPath {
+    /// Valid `section_hint` short-circuit — admitted without scoring (step 0).
+    HintBypass,
+    /// Heuristic confidence ≥ `heuristic_admit_threshold` — direct admit (step 1).
+    FastAdmit,
+    /// Heuristic confidence in the review band, or LLM review disabled — pending (step 2).
+    PendingBand,
+    /// LLM review branch — heuristic confidence ≤ `confidence_threshold` (step 3).
+    LlmReview,
+}
+
+impl CurationPath {
+    /// Stable snake_case label for Prometheus.
+    ///
+    /// One of `hint_bypass` | `fast_admit` | `pending_band` | `llm_review`.
+    /// Stable across versions — consumed as a metric label value.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::HintBypass => "hint_bypass",
+            Self::FastAdmit => "fast_admit",
+            Self::PendingBand => "pending_band",
+            Self::LlmReview => "llm_review",
+        }
+    }
+}
+
+/// Stable snake_case label for a [`CurateOutcome`] (metrics instrumentation).
+///
+/// One of `admitted` | `pending` | `rejected`. Companion of [`outcome_to_status`]:
+/// the status is the persisted lifecycle state, this is the metric label value.
+#[must_use]
+pub fn outcome_label(outcome: &CurateOutcome) -> &'static str {
+    match outcome {
+        CurateOutcome::Admitted { .. } => "admitted",
+        CurateOutcome::Pending { .. } => "pending",
+        CurateOutcome::Rejected { .. } => "rejected",
+    }
+}
+
+/// Curation pipeline — offline heuristic section routing with an optional LLM review.
 ///
 /// ## Classification backend
 ///
@@ -241,7 +304,7 @@ pub fn outcome_to_status(outcome: &CurateOutcome) -> Option<gradatum_core::statu
 ///
 /// ## LLM gating
 ///
-/// The `process()` cascade operates in two stages:
+/// The `process()` pipeline operates in two stages:
 /// 1. `routing::heuristic_route(title, body)` → `(section, confidence)`
 ///    - `confidence >= heuristic_admit_threshold` (default 0.8) → `Admitted` directly.
 /// 2. If `llm_review_enabled = true` and `confidence < confidence_threshold` (default 0.7):
@@ -366,7 +429,7 @@ impl CuratorPipeline {
             other => {
                 tracing::warn!(
                     backend = other,
-                    "backend curator inconnu dans la config TOML — fallback heuristique"
+                    "unknown curator backend in TOML config — heuristic fallback"
                 );
                 return Self::new();
             }
@@ -408,7 +471,7 @@ impl CuratorPipeline {
         self.backend.name()
     }
 
-    /// Runs the curation cascade on a note.
+    /// Runs the curation pipeline on a note.
     ///
     /// ## Workflow
     ///
@@ -430,24 +493,41 @@ impl CuratorPipeline {
     ///
     /// # Strong hint path (valid `section_hint`)
     ///
-    /// When `note.section_hint` contains a valid canonical section (present in
-    /// `routing::SECTIONS`), the cascade is short-circuited: the note is admitted
-    /// directly with `canonical_section = hint`, without calling the heuristic or LLM.
+    /// When `note.section_hint` contains a valid canonical section — as decided by
+    /// [`routing::is_valid_hint_section`], which accepts the full canonical set and is
+    /// deliberately wider than [`routing::SECTIONS`] — the pipeline is short-circuited:
+    /// the note is admitted directly with `canonical_section = hint`, without calling the
+    /// heuristic or the LLM.
     ///
     /// **This path produces no enrichment**: `tags` = `[]`, `wikilinks` = `[]`.
     /// Tags provided in `note.tags_hint` are preserved downstream by the caller
     /// (the worker passes them directly to the frontmatter, bypassing this pipeline).
-    /// Wikilinks are extracted from the body independently via `process_wikilinks_b5`
-    /// (called by the worker outside this function, on the raw body).
+    /// Wikilinks are extracted from the raw body independently by the worker, outside
+    /// this function.
     ///
     /// An invalid `section_hint` (not in the canonical section list) is ignored with
-    /// a `warn!` and the normal cascade runs.
+    /// a `warn!` and the normal pipeline runs.
     ///
     /// # Side effects
     ///
     /// Heuristic mode: none.
     /// LLM mode: HTTP call to the configured endpoint, with timeout.
     pub async fn process(&self, note: Note) -> CurateOutcome {
+        self.process_traced(note).await.0
+    }
+
+    /// Runs the curation pipeline and also reports the [`CurationPath`] taken.
+    ///
+    /// Identical decision logic to [`Self::process`]; additionally returns which
+    /// branch produced the outcome, for metrics. The path is authoritative
+    /// only here — it cannot be re-derived downstream without duplicating the
+    /// threshold boundaries.
+    ///
+    /// # Side effects
+    ///
+    /// Heuristic mode: none.
+    /// LLM mode: HTTP call to the configured endpoint, with timeout.
+    pub async fn process_traced(&self, note: Note) -> (CurateOutcome, CurationPath) {
         // ── Étape 0 : hint fort — section_hint explicite valide (B3 piste a) ──────
         //
         // Si le créateur a fourni un `section_hint` ET que ce hint correspond à
@@ -460,20 +540,23 @@ impl CuratorPipeline {
                     section = %hint,
                     "curator section_hint fort — admission directe"
                 );
-                return CurateOutcome::Admitted {
-                    decisions: CuratorDecisions {
-                        canonical_section: hint.clone(),
-                        tags: vec![],
-                        novelty: novelty::NoveltyVerdict::Admitted,
-                        wikilinks: vec![],
-                        dedup: dedup::DedupVerdict::Unique,
+                return (
+                    CurateOutcome::Admitted {
+                        decisions: CuratorDecisions {
+                            canonical_section: hint.clone(),
+                            tags: vec![],
+                            novelty: novelty::NoveltyVerdict::Admitted,
+                            wikilinks: vec![],
+                            dedup: dedup::DedupVerdict::Unique,
+                        },
                     },
-                };
+                    CurationPath::HintBypass,
+                );
             } else {
                 tracing::warn!(
                     title = %note.title,
                     section_hint = %hint,
-                    "curator section_hint invalide (hors sections canoniques) — ignoré, chemin normal"
+                    "invalid curator section_hint (outside canonical sections) — ignored, normal path"
                 );
             }
         }
@@ -491,15 +574,18 @@ impl CuratorPipeline {
                 confidence = heuristic_confidence,
                 "curator heuristic fast-path admit"
             );
-            return CurateOutcome::Admitted {
-                decisions: CuratorDecisions {
-                    canonical_section: heuristic_section.to_string(),
-                    tags: vec![],
-                    novelty: novelty::NoveltyVerdict::Admitted,
-                    wikilinks: vec![],
-                    dedup: dedup::DedupVerdict::Unique,
+            return (
+                CurateOutcome::Admitted {
+                    decisions: CuratorDecisions {
+                        canonical_section: heuristic_section.to_string(),
+                        tags: vec![],
+                        novelty: novelty::NoveltyVerdict::Admitted,
+                        wikilinks: vec![],
+                        dedup: dedup::DedupVerdict::Unique,
+                    },
                 },
-            };
+                CurationPath::FastAdmit,
+            );
         }
 
         // ── Étape 2 : confiance faible + LLM désactivé → Pending ─────────────────
@@ -512,16 +598,19 @@ impl CuratorPipeline {
                 confidence_threshold = self.confidence_threshold,
                 "curator heuristic pending (llm disabled ou conf > threshold)"
             );
-            return CurateOutcome::Pending {
-                decisions: CuratorDecisions {
-                    canonical_section: heuristic_section.to_string(),
-                    tags: vec![],
-                    novelty: novelty::NoveltyVerdict::Admitted,
-                    wikilinks: vec![],
-                    dedup: dedup::DedupVerdict::Unique,
+            return (
+                CurateOutcome::Pending {
+                    decisions: CuratorDecisions {
+                        canonical_section: heuristic_section.to_string(),
+                        tags: vec![],
+                        novelty: novelty::NoveltyVerdict::Admitted,
+                        wikilinks: vec![],
+                        dedup: dedup::DedupVerdict::Unique,
+                    },
+                    reason: format!("low conf ({heuristic_confidence:.2}), llm disabled"),
                 },
-                reason: format!("low conf ({heuristic_confidence:.2}), llm disabled"),
-            };
+                CurationPath::PendingBand,
+            );
         }
 
         // ── Étape 3 : revue LLM ───────────────────────────────────────────────────
@@ -554,7 +643,7 @@ impl CuratorPipeline {
             "curator LLM review triggered"
         );
 
-        match self
+        let outcome = match self
             .backend
             .classify(CLASSIFIER_SYSTEM_PROMPT, &user_prompt)
             .await
@@ -601,7 +690,8 @@ impl CuratorPipeline {
                     },
                 }
             }
-        }
+        };
+        (outcome, CurationPath::LlmReview)
     }
 }
 
@@ -626,20 +716,32 @@ impl Default for CuratorPipeline {
 ///   thread in the runtime.
 #[async_trait::async_trait]
 pub trait CuratorProcess: Send + Sync {
-    /// Runs the curation cascade on the given note.
+    /// Runs the curation pipeline and reports the [`CurationPath`] taken.
+    ///
+    /// The path enables the `gradatum_curator_decisions{path, outcome}` metric at the
+    /// caller, since it cannot be re-derived downstream without duplicating the
+    /// threshold boundaries.
     ///
     /// # Side effects
     ///
     /// Heuristic mode: none.
     /// LLM mode: HTTP call to the configured endpoint, with timeout.
-    async fn process(&self, note: Note) -> CurateOutcome;
+    async fn process_traced(&self, note: Note) -> (CurateOutcome, CurationPath);
+
+    /// Runs the curation pipeline, discarding the [`CurationPath`].
+    ///
+    /// Convenience wrapper over [`Self::process_traced`] for callers that do not
+    /// instrument the decision path (e.g. the legacy `dispatch.rs` path).
+    async fn process(&self, note: Note) -> CurateOutcome {
+        self.process_traced(note).await.0
+    }
 }
 
 #[async_trait::async_trait]
 impl CuratorProcess for CuratorPipeline {
-    async fn process(&self, note: Note) -> CurateOutcome {
-        // Délègue à l'implémentation existante.
-        CuratorPipeline::process(self, note).await
+    async fn process_traced(&self, note: Note) -> (CurateOutcome, CurationPath) {
+        // Délègue à l'implémentation inhérente.
+        CuratorPipeline::process_traced(self, note).await
     }
 }
 
@@ -656,9 +758,9 @@ impl CuratorProcess for CuratorPipeline {
 ///
 /// ```
 /// use gradatum_curator::extract_h1_title;
-/// assert_eq!(extract_h1_title("# Mon Titre\n\nbody"), Some("Mon Titre".to_owned()));
-/// assert_eq!(extract_h1_title("## Pas H1\nbody"),     None);
-/// assert_eq!(extract_h1_title("pas de titre\nbody"),  None);
+/// assert_eq!(extract_h1_title("# My Title\n\nbody"), Some("My Title".to_owned()));
+/// assert_eq!(extract_h1_title("## Not an H1\nbody"), None);
+/// assert_eq!(extract_h1_title("no title here\nbody"), None);
 /// assert_eq!(extract_h1_title("# "),                  None); // empty H1 → None
 /// ```
 ///
@@ -916,5 +1018,117 @@ mod tests {
                 "section_hint='{section}' doit admettre la note dans cette section (non-régression)"
             );
         }
+    }
+
+    // ── F-66 instrumentation — CurationPath + process_traced ────────────────────
+    //
+    // Les seuils vivent dans des champs privés de `CuratorPipeline` ; ce sous-module
+    // de test y accède directement pour forcer chaque chemin de façon déterministe,
+    // sans appel réseau (backend heuristique offline).
+
+    /// Construit un pipeline aux seuils imposés (backend heuristique offline).
+    fn tuned_pipeline(
+        admit_threshold: f32,
+        confidence_threshold: f32,
+        llm_review_enabled: bool,
+    ) -> CuratorPipeline {
+        CuratorPipeline {
+            backend: std::sync::Arc::new(gradatum_chat::HeuristicBackend)
+                as std::sync::Arc<dyn gradatum_chat::LlmBackend>,
+            heuristic_admit_threshold: admit_threshold,
+            llm_review_enabled,
+            confidence_threshold,
+            fallback: FallbackStrategy::PendingReviewFallback,
+        }
+    }
+
+    /// `as_str` expose les 4 libellés stables snake_case attendus par Prometheus.
+    #[test]
+    fn curation_path_as_str_stable_labels() {
+        assert_eq!(CurationPath::HintBypass.as_str(), "hint_bypass");
+        assert_eq!(CurationPath::FastAdmit.as_str(), "fast_admit");
+        assert_eq!(CurationPath::PendingBand.as_str(), "pending_band");
+        assert_eq!(CurationPath::LlmReview.as_str(), "llm_review");
+    }
+
+    /// `outcome_label` mappe les 3 variantes vers leurs libellés stables.
+    #[test]
+    fn outcome_label_stable_labels() {
+        assert_eq!(
+            outcome_label(&CurateOutcome::Rejected {
+                reason: "x".to_string()
+            }),
+            "rejected"
+        );
+        let decisions = CuratorDecisions {
+            canonical_section: "reference".to_string(),
+            tags: vec![],
+            novelty: novelty::NoveltyVerdict::Admitted,
+            wikilinks: vec![],
+            dedup: dedup::DedupVerdict::Unique,
+        };
+        assert_eq!(
+            outcome_label(&CurateOutcome::Admitted {
+                decisions: decisions.clone()
+            }),
+            "admitted"
+        );
+        assert_eq!(
+            outcome_label(&CurateOutcome::Pending {
+                decisions,
+                reason: "low conf".to_string()
+            }),
+            "pending"
+        );
+    }
+
+    /// Un `section_hint` valide → chemin `HintBypass` (admission directe, sans scoring).
+    #[tokio::test]
+    async fn process_traced_reports_hint_bypass() {
+        let note = build_note_with_hint("Titre", "corps", Some("reference"));
+        let (outcome, path) = CuratorPipeline::new().process_traced(note).await;
+        assert_eq!(path, CurationPath::HintBypass);
+        assert_eq!(outcome_label(&outcome), "admitted");
+    }
+
+    /// Confiance ≥ seuil d'admission → chemin `FastAdmit`.
+    #[tokio::test]
+    async fn process_traced_reports_fast_admit() {
+        // admit=0.0 → toute confiance ≥ 0.0 déclenche le fast-path.
+        let note = build_note_with_hint("Titre neutre", "corps neutre sans hint", None);
+        let (outcome, path) = tuned_pipeline(0.0, 0.7, false).process_traced(note).await;
+        assert_eq!(path, CurationPath::FastAdmit);
+        assert_eq!(outcome_label(&outcome), "admitted");
+    }
+
+    /// Confiance dans la bande de revue (ou LLM désactivé) → chemin `PendingBand`.
+    #[tokio::test]
+    async fn process_traced_reports_pending_band() {
+        // admit=2.0 (inatteignable) + llm désactivé → Pending sans LLM.
+        let note = build_note_with_hint("Titre neutre", "corps neutre sans hint", None);
+        let (outcome, path) = tuned_pipeline(2.0, 0.7, false).process_traced(note).await;
+        assert_eq!(path, CurationPath::PendingBand);
+        assert_eq!(outcome_label(&outcome), "pending");
+    }
+
+    /// Confiance ≤ seuil de confiance + LLM activé → chemin `LlmReview`.
+    #[tokio::test]
+    async fn process_traced_reports_llm_review() {
+        // admit=2.0 (inatteignable), conf_thr=2.0 (toujours ≤) + llm activé → branche LLM.
+        let note = build_note_with_hint("Titre neutre", "corps neutre sans hint", None);
+        let (_outcome, path) = tuned_pipeline(2.0, 2.0, true).process_traced(note).await;
+        assert_eq!(path, CurationPath::LlmReview);
+    }
+
+    /// `process` (wrapper) et `process_traced` renvoient le même outcome.
+    #[tokio::test]
+    async fn process_wrapper_matches_process_traced_outcome() {
+        let note = build_note_with_hint("Titre", "corps", Some("reference"));
+        let (traced_outcome, _) = CuratorPipeline::new().process_traced(note.clone()).await;
+        let plain_outcome = CuratorPipeline::new().process(note).await;
+        assert_eq!(
+            outcome_label(&traced_outcome),
+            outcome_label(&plain_outcome)
+        );
     }
 }

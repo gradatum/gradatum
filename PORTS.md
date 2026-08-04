@@ -11,7 +11,7 @@ Gradatum follows the **`19090 + offset`** pattern to:
 
 - Stay outside the canonical Prometheus range (`9090–9099`) — operators routinely use `9090–9099` for `prometheus`, `alertmanager`, `pushgateway`, and node exporters. Gradatum components must not collide.
 - Cluster all Gradatum services in a single 11-port range (`19090–19100`), making firewall rules, reverse-proxy configs and observability dashboards trivial to scope.
-- Leave `19100–19200` available for project-local extensions (custom adapters, third-party integrations) without risking conflict.
+- Leave room above the core range for project-local extensions (custom adapters, third-party integrations) without risking conflict. The exact boundaries are stated once, in "Range allocation policy" below — this section does not restate them.
 
 ---
 
@@ -21,11 +21,11 @@ Gradatum follows the **`19090 + offset`** pattern to:
 |---|---|---|---|
 | `gradatum-server` (HTTP/MCP) | **19090** | 0 | Main entrypoint. SSE, JSON, MCP-over-HTTP. |
 | `gradatum-server` metrics | 19091 | 1 | Prometheus `/metrics`, separate listener bound to loopback by default (security caveat C7). |
-| Reserved (HTTP admin proxy, future) | 19092 | 2 | Reserved. Do not bind. |
-| `gradatum-gateway` (LLM gateway, optional) | **19093** | 3 | OpenAI-compatible + Anthropic mappers. **Caveat:** collides with Alertmanager default `9093` only if operator decided to use the same numeric port elsewhere. The `19090+` prefix avoids that collision. |
+| `gradatum-server` internal API | 19092 | 2 | `/internal/v1/*` (worker ↔ server). Spawned **only** when `[internal] token` is configured. Loopback-enforced at startup — a non-loopback `[internal] bind` aborts the boot. |
+| `gradatum-gateway` (LLM gateway, optional) | **8436** — `19093` reserved, unused | 3 | OpenAI-compatible + Anthropic mappers. **This service has no default in code**: `[server] listen` is mandatory, so the value below is a convention, not a fallback. `19093` was reserved here under the `19090 + offset` scheme, but every shipped example and deployment binds **8436** (`crates/gradatum-gateway/examples/spike-engine-routing.toml`, `ARCHITECTURE.md`, `README.md`, `docs/DEPLOYMENT.md`). The `19093` reservation is recorded because RFC-0003 still cites it. **Caveat:** `19093` would collide with Alertmanager's default `9093` only if an operator reused that numeric port elsewhere; the `19090+` prefix avoids it. |
 | `gradatum-vault` HTTP (read-only API, optional) | 19094 | 4 | Reserved for vault-only deployments without `gradatum-server`. |
 | Reserved | 19095 | 5 | — |
-| `gradatum-studio` (admin UI) | 19096 | 6 | Port reserved for a future standalone Studio process. In v0.7.6, Studio is served by `gradatum-server` at `/ui/*` (port 19090, no separate process). |
+| `gradatum-studio` (admin UI) | 19096 | 6 | Port reserved for a future standalone Studio process. In `1.0.0`, Studio is served by `gradatum-server` at `/ui/*` (port 19090, no separate process). |
 | Reserved | 19097–19099 | 7–9 | Future use. |
 | `gradatum-worker` healthcheck | 19100 | 10 | Worker has no public listener; this port exposes `/health` only. |
 
@@ -35,18 +35,31 @@ Gradatum follows the **`19090 + offset`** pattern to:
 
 ## Override matrix
 
-The same setting can be expressed in three ways. Precedence: **CLI > env > TOML**.
+Listeners are configured as full **socket addresses** (`ip:port`), not as bare port numbers.
+Precedence: **env > TOML > defaults** (figment layering).
 
-| Setting | TOML key (`gradatum.toml`) | Environment variable | CLI flag |
-|---|---|---|---|
-| Server HTTP port | `[server] port = 19090` | `GRADATUM_SERVER_PORT` | `--server-port 19090` |
-| Server metrics port | `[server] metrics_port = 19091` | `GRADATUM_SERVER_METRICS_PORT` | `--server-metrics-port 19091` |
-| Server bind address | `[server] bind = "127.0.0.1"` | `GRADATUM_SERVER_BIND` | `--server-bind 127.0.0.1` |
-| Gateway HTTP port | `[gateway] port = 19093` | `GRADATUM_GATEWAY_PORT` | `--gateway-port 19093` |
-| Worker health port | `[worker] health_port = 19100` | `GRADATUM_WORKER_HEALTH_PORT` | `--worker-health-port 19100` |
-| Studio port | `[studio] port = 19096` | `GRADATUM_STUDIO_PORT` | `--studio-port 19096` |
+`gradatum-server` takes exactly one CLI flag — `--config <path>`. It exposes no per-port flag.
+Environment overrides use the `GRADATUM_` prefix with a **double underscore** as the section
+separator (`Env::prefixed("GRADATUM_").split("__")`), so the variable name mirrors the TOML path.
 
-**Bind safety:** if any port is configured to bind on a non-loopback interface (`0.0.0.0`, public IP) **and** TLS is not configured for that listener, the service refuses to boot (security caveat C3, fail-closed).
+| Setting | TOML key (`server.toml`) | Environment variable |
+|---|---|---|
+| Server listener | `[server] bind = "127.0.0.1:19090"` | `GRADATUM_SERVER__BIND` |
+| Server metrics listener | `[server] metrics_bind = "127.0.0.1:19091"` | `GRADATUM_SERVER__METRICS_BIND` |
+| Storage root | `[storage] root = "/var/lib/gradatum"` | `GRADATUM_STORAGE__ROOT` |
+| Log format | `[log] format = "json"` | `GRADATUM_LOG__FORMAT` |
+
+`gradatum-gateway` and `gradatum-engine` are separate binaries with their own config files;
+`gradatum-engine` reads its config path as a **positional** argument
+(`gradatum-engine <config-path>`), and layers env under the `GRADATUM_ENGINE_` prefix.
+
+**Bind safety (`gradatum-server`):**
+
+- `[server] bind` on a non-loopback address **without** `[server.tls]` → the server refuses to
+  boot (security caveat C3, fail-closed).
+- `[server] metrics_bind` must be loopback **unconditionally** — TLS does not lift this
+  (caveat C7); a non-loopback metrics address aborts startup.
+- The other listeners in the matrix above are not covered by these guards.
 
 ---
 

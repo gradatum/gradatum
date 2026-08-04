@@ -12,11 +12,12 @@ use gradatum_cache::{CacheKey, EffectiveNoteCache, EffectiveNoteCacheConfig};
 use gradatum_core::frontmatter::Frontmatter;
 use gradatum_core::identity::{ContentHash, NoteId, NoteVersion};
 use gradatum_core::note::{EffectiveNote, NoteBody};
+use gradatum_core::scope::VaultId;
 
 // --- Helpers ---
 
 fn make_key(id: NoteId) -> CacheKey {
-    (id, 0u64)
+    (VaultId::new("main"), id, 0u64)
 }
 
 fn make_effective_note(
@@ -50,7 +51,7 @@ async fn cache_hit_with_valid_checksum() {
     let fm = common::minimal_frontmatter("main");
     let (note, hash) = make_effective_note(id, fm, "Corps pour test cache hit.");
 
-    cache.insert(key, note.clone(), hash).await;
+    cache.insert(key.clone(), note.clone(), hash).await;
     cache.run_pending_tasks().await;
 
     // Validator qui retourne le même hash → hit valide
@@ -79,14 +80,14 @@ async fn cache_invalidates_on_stale_checksum() {
     let fm = common::minimal_frontmatter("main");
     let (note, hash_a) = make_effective_note(id, fm.clone(), "Corps original — hash A.");
 
-    cache.insert(key, note.clone(), hash_a).await;
+    cache.insert(key.clone(), note.clone(), hash_a).await;
     cache.run_pending_tasks().await;
 
     // Hash B différent (note "modifiée" entre insert et get)
     let hash_b = ContentHash::compute(&fm, "Corps modifié — hash B différent de A.");
 
     let result = cache
-        .get(key, move |_note_id| async move {
+        .get(key.clone(), move |_note_id| async move {
             Ok::<_, std::convert::Infallible>(hash_b)
         })
         .await
@@ -138,7 +139,7 @@ async fn cache_eviction_after_ttl() {
     let fm = common::minimal_frontmatter("main");
     let (note, hash) = make_effective_note(id, fm, "Corps pour test TTL.");
 
-    cache.insert(key, note, hash).await;
+    cache.insert(key.clone(), note, hash).await;
     cache.run_pending_tasks().await;
 
     // Attente > TTL

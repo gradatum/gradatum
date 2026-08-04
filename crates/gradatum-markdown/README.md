@@ -2,7 +2,7 @@
 
 > Parse and serialize Markdown notes with YAML frontmatter and wikilink extraction.
 
-**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -23,7 +23,7 @@ Round-trip invariant: `parse(write_parsed(parse(x)?)) == parse(x)`.
 
 ```toml
 [dependencies]
-gradatum-markdown = "0.7.6"
+gradatum-markdown = "1.0.0"
 ```
 
 ```rust
@@ -32,7 +32,7 @@ use gradatum_markdown::{parse, wikilinks};
 let parsed = parse(src)?;
 println!("section: {}", parsed.frontmatter.section);
 
-let links = wikilinks(&parsed.body);
+let links = wikilinks(&parsed.body.markdown);
 for link in links {
     println!("links to: {}", link.target);
 }

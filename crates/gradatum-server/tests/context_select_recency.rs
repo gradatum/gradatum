@@ -227,7 +227,7 @@ async fn context_trust_age_uses_created_ms_not_anchor_ms() {
     let nid = NoteId(Ulid::from_string(&ulid).expect("ULID parse — invariant test M-1 trust"));
     env.state
         .search
-        .set_note_trust(&nid, 0.9)
+        .set_note_trust("main", &nid, 0.9)
         .await
         .expect("set_note_trust — invariant test M-1 trust");
 

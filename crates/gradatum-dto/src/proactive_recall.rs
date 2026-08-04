@@ -1,4 +1,4 @@
-//! DTOs for the proactive memory surface endpoints (F-46).
+//! DTOs for the proactive memory surface endpoints.
 //!
 //! Wire contract for:
 //! - [`ProactiveRecallRequest`] — pull the pre-computed surface or trigger contextual recall.
@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::default_main;
+use gradatum_core::scope::TenantId;
 
 /// Request to pull the proactive memory surface or trigger contextual recall.
 ///
@@ -27,9 +27,11 @@ use crate::default_main;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProactiveRecallRequest {
-    /// Tenant identifier (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Tenant (principal) — optional; when omitted the server resolves it from the
+    /// credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// Optional context text for contextual recall.
     ///
     /// When present, the server computes an on-demand RRF retrieval using this text
@@ -99,9 +101,11 @@ pub struct ProactiveRecallResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProactiveRecallFeedbackRequest {
-    /// Tenant identifier (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Tenant (principal) — optional; when omitted the server resolves it from the
+    /// credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// Recall session identifier returned by the recall endpoint.
     pub recall_id: String,
     /// ULIDs of notes accepted (acted on) by the user.
@@ -118,9 +122,12 @@ mod tests {
     // ── ProactiveRecallRequest — defaults ────────────────────────────────────
 
     #[test]
-    fn request_tenant_id_absent_defaults_to_main() {
+    fn request_tenant_id_absent_defaults_to_none() {
         let req: ProactiveRecallRequest = serde_json::from_str("{}").expect("empty object valide");
-        assert_eq!(req.tenant_id, "main", "tenant_id absent → \"main\"");
+        assert_eq!(
+            req.tenant_id, None,
+            "tenant_id absent → None (A1 : plus de défaut \"main\")"
+        );
     }
 
     #[test]
@@ -130,7 +137,7 @@ mod tests {
         assert_eq!(req.context, None, "context absent → None");
         assert_eq!(req.sections, None, "sections absent → None");
         assert_eq!(req.limit, Some(5));
-        assert_eq!(req.tenant_id, "main");
+        assert_eq!(req.tenant_id, None);
     }
 
     #[test]
@@ -164,11 +171,14 @@ mod tests {
     // ── ProactiveRecallFeedbackRequest — defaults ────────────────────────────
 
     #[test]
-    fn feedback_tenant_id_absent_defaults_to_main() {
+    fn feedback_tenant_id_absent_defaults_to_none() {
         let json = r#"{"recall_id": "01JXYZTEST", "accepted_ulids": []}"#;
         let req: ProactiveRecallFeedbackRequest =
             serde_json::from_str(json).expect("deserialize OK");
-        assert_eq!(req.tenant_id, "main", "tenant_id absent → \"main\"");
+        assert_eq!(
+            req.tenant_id, None,
+            "tenant_id absent → None (A1 : plus de défaut \"main\")"
+        );
         assert_eq!(req.recall_id, "01JXYZTEST");
         assert!(req.accepted_ulids.is_empty());
     }
@@ -188,7 +198,7 @@ mod tests {
     #[test]
     fn request_roundtrip() {
         let original = ProactiveRecallRequest {
-            tenant_id: "main".to_string(),
+            tenant_id: Some(TenantId::new("main")),
             context: Some("contexte de test".to_string()),
             sections: Some(vec!["decisions".to_string(), "lessons-learned".to_string()]),
             limit: Some(10),
@@ -220,7 +230,7 @@ mod tests {
     #[test]
     fn feedback_roundtrip() {
         let original = ProactiveRecallFeedbackRequest {
-            tenant_id: "test-tenant".to_string(),
+            tenant_id: Some(TenantId::new("test-tenant")),
             recall_id: "01JXYZ000000000000000000".to_string(),
             accepted_ulids: vec![
                 "01JABC000000000000000000".to_string(),

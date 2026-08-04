@@ -40,7 +40,11 @@ async fn write_note_upserts_content_hash_in_index() {
     let note = vault.write_note(fm, "body test".into()).await.unwrap();
 
     // L'index SQLite doit avoir le content_hash de la note
-    let stored = vault.index().get_content_hash(note.id).await.unwrap();
+    let stored = vault
+        .index()
+        .get_content_hash("main", note.id)
+        .await
+        .unwrap();
     assert_eq!(
         stored,
         Some(note.content_hash),

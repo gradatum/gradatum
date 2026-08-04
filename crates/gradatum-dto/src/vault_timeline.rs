@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::default_main;
+use gradatum_core::scope::{TenantId, VaultId};
 
 /// Request body for `vault_timeline` — paginated temporal read.
 ///
@@ -21,12 +21,15 @@ use crate::default_main;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultTimelineRequest {
-    /// Tenant (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Tenant (principal) — optional; when omitted the server resolves it from the
+    /// credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// vault to query in read mode (default = `tenant_id`). Max 128 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vault_id: Option<String>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub vault_id: Option<VaultId>,
     /// `doc_kind` filter (`"Static"` / `"Event"`). Absent = all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_kind: Option<Vec<String>>,
@@ -61,4 +64,16 @@ pub struct VaultTimelineRequest {
     /// are included — useful for reconstructing a past state).
     #[serde(default)]
     pub include_expired: bool,
+    /// If `true`, the server returns a **compact** rendering instead of the full
+    /// `VaultTimelineResponse`: an object `{ "compact": "<text>" }` listing each entry
+    /// as `<anchor_ms> | <doc_kind> | <note_id> — <title>`, dropping `anchor_src` and
+    /// the pagination `next_cursor`.
+    ///
+    /// Optimises token cost for LLM consumers. Because `next_cursor` is dropped, the
+    /// compact form is intended for single-window reads, not cursor pagination.
+    ///
+    /// Opt-in (default `false`): when absent, the response is **byte-for-byte identical**
+    /// to the historical `VaultTimelineResponse`. Existing clients are unaffected.
+    #[serde(default)]
+    pub compact: bool,
 }

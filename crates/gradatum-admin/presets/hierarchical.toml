@@ -70,7 +70,7 @@ description = "Writer sub-agent — writes only its own locus, reads briefings +
 read_patterns = ["main-agent", "${PROJECT}/briefing", "${PROJECT}/${AGENT}"]
 write_patterns = ["${PROJECT}/${AGENT}"]
 
-# ─── Sub-agent template: validators (tester, reviewer, security-auditor) ─
+# ─── Sub-agent template: validators (tester, reviewer, expert-security) ─
 [[consumer-template]]
 id = "sub-agent-validator"
 description = "Validator sub-agent — cross-reads project for audit, writes own findings"

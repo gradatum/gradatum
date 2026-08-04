@@ -6,11 +6,16 @@
 //! read hole into `main` that cancels the single-vault mitigation. Validation
 //! is performed HERE, before any index query ([`validate_code_vault_id`]).
 //!
+//! Security invariant #2 (G10-P1): code_scope reads source code indexed in `code_vault`
+//! tables that carry NO `tenant` column (migrations 0017/0018). Only privileged
+//! contexts (Studio, mTLS, main-agent) are authorized — a regular tenant token
+//! MUST NOT read cross-tenant source code. Gated by [`is_code_scope_privileged`].
+//!
 //! # Contract
 //!
 //! | Method | Path | Body | Response | Codes |
 //! |--------|------|------|----------|-------|
-//! | POST | `/api/v1/code_scope` | [`CodeScopeRequest`] | [`CodeScopeResponse`] | 200 / 400 / 401 / 404 / 500 |
+//! | POST | `/api/v1/code_scope` | [`CodeScopeRequest`] | [`CodeScopeResponse`] | 200 / 400 / 401 / 403 / 404 / 500 |
 //!
 //! - `vault`: MUST start with `code-` + anti-traversal charset → **400** otherwise.
 //! - `vault`: MUST have been ingested at least once (entry in `code_vault`) → **404** otherwise.
@@ -170,14 +175,14 @@ pub(crate) async fn code_scope_impl(
     // Validation selector.
     if !is_valid_selector_kind(&req.selector.kind) {
         return Err(GradatumError::InvalidInput(format!(
-            "selector.kind invalide : {:?}",
+            "invalid selector.kind: {:?}",
             req.selector.kind
         )));
     }
     let value = req.selector.value.trim();
     if value.is_empty() || value.len() > 512 {
         return Err(GradatumError::InvalidInput(
-            "selector.value vide ou trop long (max 512)".to_owned(),
+            "selector.value empty or too long (max 512)".to_owned(),
         ));
     }
     let selector = match req.selector.kind.as_str() {
@@ -186,7 +191,7 @@ pub(crate) async fn code_scope_impl(
         "symbol" => CodeSelector::Symbol(value.to_string()),
         _ => {
             return Err(GradatumError::InvalidInput(format!(
-                "selector.kind inconnu : {:?}",
+                "unknown selector.kind: {:?}",
                 req.selector.kind
             )));
         }
@@ -209,13 +214,13 @@ pub(crate) async fn code_scope_impl(
         .await
         .map_err(|e| {
             tracing::error!(err = %e, vault = %req.vault, "code_scope_impl: get_code_vault_repo_path failed");
-            GradatumError::Storage("lecture vault échouée".to_owned())
+            GradatumError::Storage("vault read failed".to_owned())
         })? {
         Some(_) => {}
         None => {
-            tracing::debug!(vault = %req.vault, "code_scope_impl: vault inexistant");
+            tracing::debug!(vault = %req.vault, "code_scope_impl: nonexistent vault");
             return Err(GradatumError::InvalidInput(format!(
-                "vault '{}' inconnu (jamais ingéré)",
+                "vault '{}' unknown (never ingested)",
                 req.vault
             )));
         }
@@ -227,7 +232,7 @@ pub(crate) async fn code_scope_impl(
         .await
         .map_err(|e| {
             tracing::error!(err = %e, vault = %req.vault, "code_scope_impl: code_scope_query failed");
-            GradatumError::Storage("requête code scope échouée".to_owned())
+            GradatumError::Storage("code scope query failed".to_owned())
         })?;
 
     let total_matched = raw.len() as u32;
@@ -270,7 +275,7 @@ pub(crate) async fn code_scope_impl(
                 tracing::warn!(
                     err = %err,
                     vault = %req.vault,
-                    "code_scope_impl: code_scope_reverse_deps_batch KO — callers vides"
+                    "code_scope_impl: code_scope_reverse_deps_batch failed — empty callers"
                 );
                 HashMap::new()
             }
@@ -305,6 +310,8 @@ pub(crate) async fn code_scope_impl(
 /// - `401 Unauthorized`: unauthenticated request.
 /// - `400 Bad Request`: `vault` is not `code-*` or has an invalid charset (security
 ///   invariant #1), `selector.kind` is out of vocabulary, or `value` is empty.
+/// - `403 Forbidden`: authenticated caller is not a privileged context (G10-P1,
+///   invariant #2 — not Studio, mTLS, or main-agent).
 /// - `404 Not Found`: valid `code-*` vault but never ingested (absent from the
 ///   `code_vault` table). Criterion: presence of an entry in `code_vault` (populated
 ///   by `run_ingest` via `set_code_vault_repo_path`). If derived notes exist without
@@ -312,9 +319,10 @@ pub(crate) async fn code_scope_impl(
 ///   — unsupported scenario (any CLI ingest calls both).
 /// - `500 Internal Server Error`: storage failure on the index side.
 ///
-/// No ACL 403 here — `code_scope` is a dedicated endpoint that bypasses the
-/// single-vault guard. Security relies ENTIRELY on `code-` prefix validation (invariant #1).
-/// Known vault + selector with no match → 200 `{entries:[], total_matched:0}`.
+/// G10-P1: ACL 403 enforced via [`is_code_scope_privileged`] — only Studio, mTLS,
+/// and main-agent contexts are authorized (invariant #2). The `code-` prefix validation
+/// (invariant #1) remains as defense-in-depth. Any non-privileged authenticated caller
+/// → 403 Forbidden. Known vault + selector with no match → 200 `{entries:[], total_matched:0}`.
 /// Distinction: vault-does-not-exist (404) vs vault-exists-but-no-match (200).
 pub async fn code_scope(
     State(state): State<AppState>,
@@ -324,6 +332,24 @@ pub async fn code_scope(
     if !trust.is_authenticated() {
         return Err(StatusCode::UNAUTHORIZED);
     }
+
+    // ── INVARIANT SÉCU N°2 (BLOQUANT, G10-P1) ──────────────────────────────────
+    // code_scope lit le code source indexé des projets (vaults `code-*`). Ces index
+    // n'ont PAS de colonne `tenant` dans `code_vault` (migrations 0017/0018).
+    // Seuls les contextes système (Studio) et le main-agent (propriétaire SSI)
+    // sont autorisés — un token tenant ordinaire NE DOIT PAS accéder au code source
+    // d'un projet cross-tenant. Sans cette garde, tout tenant avec un api-key + grant
+    // peut lire le code source d'un vault `code-*` via POST /api/v1/code_scope.
+    if !is_code_scope_privileged(&trust) {
+        tracing::warn!(
+            subject = ?trust.subject(),
+            tenant = ?trust.tenant_id(),
+            vault = %req.vault,
+            "code_scope: access denied — not a privileged context (G10-P1)"
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     // Télémétrie usage read-path (v0.5.3 #4) — coût ~0 (AtomicU64 Relaxed, aucun I/O).
     state
         .read_usage_accumulators
@@ -336,7 +362,7 @@ pub async fn code_scope(
     if !validate_code_vault_id(&req.vault) {
         tracing::warn!(
             vault = %req.vault,
-            "code_scope: vault refusé (invariant sécu N°1 — non `code-` ou charset invalide)"
+            "code_scope: vault rejected (security invariant #1 — not `code-` or invalid charset)"
         );
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -377,7 +403,7 @@ pub async fn code_scope(
         })? {
         Some(_) => {}
         None => {
-            tracing::debug!(vault = %req.vault, "code_scope: vault inexistant → 404");
+            tracing::debug!(vault = %req.vault, "code_scope: nonexistent vault → 404");
             return Err(StatusCode::NOT_FOUND);
         }
     }
@@ -437,7 +463,7 @@ pub async fn code_scope(
                 tracing::warn!(
                     err = %err,
                     vault = %req.vault,
-                    "code_scope: code_scope_reverse_deps_batch KO — callers vides"
+                    "code_scope: code_scope_reverse_deps_batch failed — empty callers"
                 );
                 HashMap::new()
             }
@@ -556,7 +582,7 @@ async fn read_files_single_pass(
     let repo_path = match state.search.get_code_vault_repo_path(vault).await {
         Ok(Some(p)) => p,
         Ok(None) => {
-            tracing::debug!(vault = %vault, "code_scope: repo path inconnu → drift SKIP");
+            tracing::debug!(vault = %vault, "code_scope: unknown repo path → drift SKIP");
             return result;
         }
         Err(e) => {
@@ -597,7 +623,7 @@ async fn read_files_single_pass(
         // ── S1 anti-traversal : rejeter paths absolus, contenant .., ou hors repo ──
         // include_body transforme la lecture en exfiltration si non validé.
         if path.contains("..") || Path::new(path.as_str()).is_absolute() {
-            tracing::warn!(path = %path, "code_scope: path rejeté anti-traversal (S1)");
+            tracing::warn!(path = %path, "code_scope: path rejected anti-traversal (S1)");
             result.insert(path.clone(), (true, Vec::new()));
             continue;
         }
@@ -614,7 +640,7 @@ async fn read_files_single_pass(
                 path = %path,
                 canonical = %canonical.display(),
                 repo = %repo_canonical.display(),
-                "code_scope: path hors repo rejeté (S1)"
+                "code_scope: path outside repo rejected (S1)"
             );
             result.insert(path.clone(), (true, Vec::new()));
             continue;
@@ -693,8 +719,31 @@ fn enqueue_regen(vault: &str, paths: &HashSet<String>) {
         vault = %vault,
         stale_count = paths.len(),
         stale_paths = ?paths,
-        "code_scope: fichiers stale détectés — régen requise (relancer `code update`)"
+        "code_scope: stale files detected — regen required (re-run `code update`)"
     );
+}
+
+/// Vrai si l'appelant est autorisé à interroger un vault `code-*` via
+/// `POST /api/v1/code_scope`. Lecture de code source — privilège système.
+///
+/// Callers autorisés :
+///   - session Studio (admin UI) ;
+///   - session mTLS (service interne) ;
+///   - propriétaire SSI `main-agent`.
+///
+/// G10-P1 : un token tenant ordinaire NE DOIT PAS lire le code source d'un
+/// vault `code-*` (pas de colonne `tenant` dans `code_vault` — migrations
+/// 0017/0018). Sans cette garde, tout tenant avec un api-key + grant peut
+/// lire cross-tenant via `POST /api/v1/code_scope`.
+#[must_use]
+fn is_code_scope_privileged(trust: &TrustContext) -> bool {
+    matches!(
+        trust,
+        TrustContext::Studio { .. } | TrustContext::Mtls { .. }
+    ) || trust
+        .subject()
+        .map(|a| a.as_str() == "main-agent")
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

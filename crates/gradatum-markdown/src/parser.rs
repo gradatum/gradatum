@@ -16,14 +16,15 @@
 //! The on-disk Markdown file does not contain:
 //! - `NoteId` — carried by the filename (`<ulid>.md`), assigned by `gradatum-vault`.
 //! - `NoteVersion` — monotonic counter managed by `gradatum-vault` on each write.
-//! - `IntegritySignature` — optional, provided by `gradatum-acl-auth` when enabled.
+//! - `IntegritySignature` — never produced: no signing scheme is implemented in the
+//!   workspace, so this stays `None`.
 //!
 //! The caller (typically `gradatum-vault`) assembles the complete `Note` by adding
 //! these three fields after calling [`parse`].
 
 use gradatum_core::{frontmatter::Frontmatter, identity::ContentHash, note::NoteBody};
 
-use crate::error::MarkdownError;
+use crate::error::{MarkdownError, YamlError};
 
 /// Result of parsing a Gradatum Markdown file.
 ///
@@ -63,7 +64,7 @@ pub struct ParsedNote {
 ///
 /// 1. Verifies that the content starts with `---\n`.
 /// 2. Searches for the closing `---` line starting at position 4.
-/// 3. Deserializes the YAML block between the two delimiters via `serde_yml`.
+/// 3. Deserializes the YAML block between the two delimiters.
 /// 4. Extracts the body: everything after the closing `---\n`.
 ///    Strips a leading `\n` if present (blank line between frontmatter and title).
 /// 5. Computes the `ContentHash` via JCS (RFC 8785).
@@ -104,7 +105,8 @@ pub fn parse(raw: &str) -> Result<ParsedNote, MarkdownError> {
 
     // Étape 3 : extraire et parser le bloc YAML.
     let yaml_block = &raw[4..yaml_end];
-    let frontmatter: Frontmatter = serde_yml::from_str(yaml_block).map_err(MarkdownError::Yaml)?;
+    let frontmatter: Frontmatter =
+        serde_norway::from_str(yaml_block).map_err(|e| MarkdownError::Yaml(YamlError::new(e)))?;
 
     // Étape 4 : extraire le body (après le "\n---\n" fermant).
     let body_start = yaml_end + close_marker.len();

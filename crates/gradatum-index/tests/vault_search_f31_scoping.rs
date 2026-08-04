@@ -369,6 +369,7 @@ async fn locus_filter_semantic() {
     .await
     .expect("seed council");
     idx.insert_note_embedding(
+        "main",
         &gradatum_core::identity::NoteId(id_council_ulid),
         "test-sem-locus",
         4,
@@ -388,6 +389,7 @@ async fn locus_filter_semantic() {
     .await
     .expect("seed decisions");
     idx.insert_note_embedding(
+        "main",
         &gradatum_core::identity::NoteId(id_other_ulid),
         "test-sem-locus",
         4,
@@ -399,7 +401,15 @@ async fn locus_filter_semantic() {
     // Requête sémantique avec locus "council/"
     let query_emb = vec![1.0f32, 0.0, 0.0, 0.0];
     let hits = idx
-        .search_semantic("main", "test-sem-locus", &query_emb, 10, Some("council/"))
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "test-sem-locus",
+            &query_emb,
+            10,
+            Some("council/"),
+        )
         .await
         .expect("search_semantic avec locus");
 

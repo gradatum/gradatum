@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Shared primitives: errors, IDs, types"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 async-trait.workspace = true
@@ -16,7 +19,6 @@ http.workspace        = true
 serde.workspace       = true
 serde_json.workspace  = true
 serde_jcs.workspace   = true
-serde_yml.workspace   = true
 sha2.workspace        = true
 smallvec.workspace    = true
 thiserror.workspace   = true
@@ -33,7 +35,7 @@ test-utils = []
 
 [dev-dependencies]
 proptest.workspace   = true
+serde_norway.workspace = true
 serde_test.workspace = true
-serde_yml.workspace  = true
 tempfile.workspace   = true
 tokio.workspace      = true

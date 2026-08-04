@@ -36,7 +36,6 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use gradatum_core::error::GradatumError;
-use gradatum_core::scope::VaultId;
 use gradatum_dto::VaultContextRequest;
 use gradatum_search::{ScoringWeightsWire, resolve_weights};
 
@@ -85,7 +84,7 @@ pub fn fold_score(size_tokens: u32, age_ms: i64) -> f64 {
 /// Compact assembly mode — folded view (since v0.7.2).
 ///
 /// Produit une vue foldée destinée à REMPLACER le bloc contexte côté client (1 reset cache).
-/// Contrairement à [`super::assemble_assembled`], le mode compact RE-PROMEUT les notes `sent`
+/// Contrairement à `super::assemble_assembled`, le mode compact RE-PROMEUT les notes `sent`
 /// si elles sont parmi les top-K les plus pertinentes maintenant (reset autorisé).
 ///
 /// ## Algorithme
@@ -116,14 +115,15 @@ pub async fn assemble_compact(
     // de la session courante pour choisir ce qui reste inline et ce qui est fold.
     let session_id = req.session_id.as_deref().ok_or_else(|| {
         GradatumError::InvalidInput(
-            "mode=compact exige un session_id (compact sans session n'a pas de sens)".to_owned(),
+            "mode=compact requires a session_id (compact without a session is meaningless)"
+                .to_owned(),
         )
     })?;
 
     // Validation format ULID (aligné P2-2 / assemble_assembled).
     if !super::is_session_id_valid(session_id) {
         return Err(GradatumError::InvalidInput(
-            "session_id invalide : ULID 26 chars alphanumériques (Crockford base32) attendu"
+            "invalid session_id: expected ULID of 26 alphanumeric chars (Crockford base32)"
                 .to_owned(),
         ));
     }
@@ -134,7 +134,7 @@ pub async fn assemble_compact(
         .or(req.max_tokens)
         .unwrap_or(state.context.default_budget_tokens)
         .clamp(1, 8000);
-    let vault_id = VaultId::new(tenant);
+    let vault_id = crate::api_v1::tenant_guard::own_vault_checked(tenant);
     let top_n = state.context.top_n_candidates;
     let now_ms = Utc::now().timestamp_millis();
     let estimator = HeuristicEstimator;
@@ -151,7 +151,7 @@ pub async fn assemble_compact(
                 tracing::warn!(
                     err = %e,
                     session_id = %session_id,
-                    "assemble_compact: get_sent failed — compact sans sent_map (dégradation)"
+                    "assemble_compact: get_sent failed — compact without sent_map (degradation)"
                 );
                 HashMap::new()
             }
@@ -159,7 +159,7 @@ pub async fn assemble_compact(
         None => {
             tracing::debug!(
                 session_id = %session_id,
-                "assemble_compact: session_trace absent — compact sans sent_map (P2-4)"
+                "assemble_compact: session_trace absent — compact without sent_map (P2-4)"
             );
             HashMap::new()
         }

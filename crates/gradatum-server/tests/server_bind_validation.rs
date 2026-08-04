@@ -2,8 +2,9 @@
 
 use gradatum_server::config::{
     AclConfig, AuthConfig, ConfigError, ContextConfig, CuratorConfig, EmbedConfig, EventLogConfig,
-    HttpConfig, LogConfig, RateLimitConfig, ReviewPromoteConfig, ScoringConfig, SearchConfig,
-    ServerConfig, SessionTraceConfig, StorageConfig, StudioConfig, TlsConfig,
+    HttpConfig, LogConfig, RateLimitConfig, ReviewPromoteConfig, RevocationStoreKind,
+    SalienceConfig, ScoringConfig, SearchConfig, ServerConfig, SessionTraceConfig, StorageConfig,
+    StudioConfig, TlsConfig,
 };
 use gradatum_server::proactive_recall::ProactiveRecallConfig;
 use std::path::PathBuf;
@@ -22,11 +23,9 @@ fn cfg(bind: &str, tls: Option<TlsConfig>) -> ServerConfig {
             vault_index_path_override_diverges: false,
         },
         auth: AuthConfig {
-            jwt_public_key_path: PathBuf::from("/tmp/pub"),
-            jwt_private_key_path: PathBuf::from("/tmp/priv"),
             jwt_ttl_human_secs: 3600,
             jwt_ttl_service_secs: 86400,
-            revocation_store: "memory".into(),
+            revocation_store: RevocationStoreKind::Memory,
             revocation_db_path: None,
             api_keys_db_path: None,
         },
@@ -41,13 +40,19 @@ fn cfg(bind: &str, tls: Option<TlsConfig>) -> ServerConfig {
         embed: EmbedConfig::default(),
         event_log: EventLogConfig::default(),
         session_trace: SessionTraceConfig::default(),
+        archive: gradatum_server::config::ArchiveConfig::default(),
         scoring: ScoringConfig::default(),
+        salience: SalienceConfig::default(),
         studio: StudioConfig::default(),
         internal_api: gradatum_server::config::InternalApiConfig::default(),
         search: SearchConfig::default(),
         review_promote: ReviewPromoteConfig::default(),
+        audit: gradatum_server::config::AuditConfig::default(),
+        downgrade: gradatum_server::config::DowngradeConfig::default(),
         context: ContextConfig::default(),
         proactive_recall: ProactiveRecallConfig::default(),
+        multi_tenant: gradatum_server::config::MultiTenantConfig::default(),
+        per_vault: std::collections::HashMap::new(),
     }
 }
 

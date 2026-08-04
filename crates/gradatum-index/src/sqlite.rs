@@ -6,7 +6,7 @@
 //! rusqlite `Connection` is neither `Send` nor `Sync`. The tokio `Mutex` guarantees
 //! exclusive access from any thread of the runtime.
 //!
-//! ## Mandatory PRAGMAs (C12)
+//! ## Mandatory PRAGMAs
 //!
 //! Applied at each `open()` / `open_in_memory()` call before migrations:
 //! - `journal_mode = WAL`   : concurrent reads without a global lock.
@@ -18,7 +18,7 @@
 //!
 //! The original schema named the column `extra_yaml TEXT`. This implementation uses
 //! `extra_json TEXT` and `serde_json` to serialise `ExtraFields` (`BTreeMap<String, toml::Value>`).
-//! Rationale: `serde_yml::to_string` on `toml::Value` produces ambiguous variants
+//! Rationale: YAML serialization of `toml::Value` produces ambiguous variants
 //! (notably `Datetime` → a non-portable private toml representation). `serde_json` guarantees
 //! a stable round-trip for String/Integer/Float/Boolean/Array/Table variants.
 //! `toml::Value::Datetime` is forbidden in `ExtraFields` for JCS hashing (see `identity.rs`).
@@ -39,7 +39,9 @@ use gradatum_core::index_store::{
 use gradatum_core::metric_sample::MetricSamplePoint;
 use gradatum_core::note::Note;
 use gradatum_core::scheduled_health::{ScheduledTaskHealth, TaskOutcome};
-use gradatum_core::scope::{OverrideScope, VaultId};
+use gradatum_core::scope::{
+    AgentId, AgentVaultGrant, GrantAccess, OverrideScope, TenantId, VaultGrant, VaultId,
+};
 use gradatum_core::section::{section_to_c_kind, section_to_doc_kind};
 use gradatum_core::status::NoteStatus;
 
@@ -75,7 +77,8 @@ pub struct IndexStatusSnapshot {
 /// SQLite + FTS5 implementation of the Gradatum storage traits.
 ///
 /// Created via `SqliteIndex::open(&path)` or `SqliteIndex::open_in_memory()`.
-/// One instance per process is sufficient for a single-tenant vault.
+/// One instance per process is enough: vaults share the same database and are kept apart
+/// by the `vault_id` columns, not by separate connections.
 ///
 /// ## Implemented traits
 ///
@@ -109,20 +112,21 @@ pub struct SqliteIndex {
     /// of the runtime (rusqlite `Connection` is neither `Send` nor `Sync`).
     pub(crate) conn: Arc<Mutex<Connection>>,
 
-    /// ANN path enabled at runtime (v0.5.3 ANN-5).
+    /// Whether the ANN path is enabled at runtime.
     ///
-    /// `true` = extension sqlite-vec chargée + `ann_backend = sqlite_vec` configuré.
-    /// `false` (défaut) = brute-force cosine (`search_semantic_inner`).
+    /// `true` means the sqlite-vec extension is loaded and `ann_backend = sqlite_vec` is
+    /// configured; `false` (the default) falls back to brute-force cosine similarity
+    /// (`search_semantic_inner`).
     ///
-    /// Modifiable après ouverture via `set_ann_enabled` (bin crate server, APRÈS
-    /// enregistrement de l'extension et validation de la table `note_embeddings_ann`).
-    /// Utilise `AtomicBool` pour éviter le coût d'un `Mutex` sur un hot path de lecture.
+    /// Can be changed after opening via `set_ann_enabled`, which the server binary calls
+    /// AFTER registering the extension and checking that `note_embeddings_ann` is usable.
+    /// Stored in an `AtomicBool` to avoid paying for a `Mutex` on a read hot path.
     pub(crate) ann_enabled: Arc<AtomicBool>,
 
-    /// Paramètre `ef_search` transmis à vec0 pour chaque requête ANN.
+    /// `ef_search` parameter passed to vec0 for every ANN query.
     ///
-    /// Contrôle l'oversampling (`limit × ef_search`, borné par `MAX_ANN_K`).
-    /// Défaut : 64 (configurable via `[search] ann_ef_search` dans `server.toml`).
+    /// Controls oversampling (`limit × ef_search`, clamped by `MAX_ANN_K`).
+    /// Defaults to 64, configurable through `[search] ann_ef_search` in `server.toml`.
     pub(crate) ann_ef_search: Arc<AtomicU32>,
 }
 
@@ -223,7 +227,7 @@ pub enum Freshness {
 /// (MCP, SDK). The duplication is intentional: `gradatum-index` must not depend on
 /// `gradatum-dto` (acyclic crate dependency graph).
 ///
-/// `pub(crate)` : réutilisé par `sqlite_vec.rs` (filtre locus ANN).
+/// Kept `pub(crate)`: also used by `sqlite_vec.rs` for the ANN locus filter.
 pub(crate) fn escape_like(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 4);
     for ch in value.chars() {
@@ -300,7 +304,7 @@ pub fn fts5_quote_query(query: &str) -> String {
 impl SqliteIndex {
     /// Opens a SQLite file at `path`, creating it if it does not exist.
     ///
-    /// Applies the 4 mandatory PRAGMAs (C12) then runs schema migrations.
+    /// Applies the four mandatory PRAGMAs, then runs schema migrations.
     ///
     /// # Errors
     ///
@@ -327,7 +331,7 @@ impl SqliteIndex {
         Self::init(conn).await
     }
 
-    /// Shared initialisation: 4 mandatory PRAGMAs (C12) + schema migration.
+    /// Shared initialisation: four mandatory PRAGMAs, then schema migration.
     async fn init(conn: Connection) -> Result<Self, GradatumError> {
         // PRAGMA C12 — appliqués avant tout accès aux tables.
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -355,7 +359,7 @@ impl SqliteIndex {
 
     /// Reads the value of a SQLite PRAGMA.
     ///
-    /// Used in tests to verify that C12 PRAGMAs were applied correctly.
+    /// Used in tests to verify that the mandatory PRAGMAs were applied correctly.
     /// `T` must implement `rusqlite::types::FromSql` (e.g. `String`, `i64`).
     pub async fn pragma<T: rusqlite::types::FromSql>(
         &self,
@@ -370,34 +374,35 @@ impl SqliteIndex {
 
     // ── ANN control ────────────────────────────────────────────────
 
-    /// Active ou désactive le chemin ANN sqlite-vec au runtime.
+    /// Enables or disables the sqlite-vec ANN path at runtime.
     ///
-    /// Appelé par le bin `gradatum-server` dans `main.rs`, APRÈS :
-    /// 1. Enregistrement de l'extension via `sqlite3_auto_extension` (unsafe dans vec_ext.rs).
-    /// 2. Vérification que la table `note_embeddings_ann` est accessible (requête pragma).
+    /// Called by the `gradatum-server` binary at startup, AFTER:
+    /// 1. registering the extension through `sqlite3_auto_extension`, and
+    /// 2. checking that the `note_embeddings_ann` table is reachable.
     ///
-    /// Ordre Relaxed suffisant : écriture lors du boot (séquentiel), lectures en runtime
-    /// (barrière mémoire implicite sur la transition boot→handler).
+    /// `Relaxed` ordering is sufficient here: the write happens once during sequential
+    /// startup and the reads happen afterwards, past the boot-to-handler transition.
     pub fn set_ann_enabled(&self, enabled: bool) {
         self.ann_enabled.store(enabled, Ordering::Relaxed);
     }
 
-    /// Lit l'état courant du flag ANN.
+    /// Reads the current state of the ANN flag.
     ///
-    /// `true` = chemin ANN actif, `false` = brute-force.
+    /// `true` means the ANN path is active, `false` means brute-force search.
     pub fn ann_is_enabled(&self) -> bool {
         self.ann_enabled.load(Ordering::Relaxed)
     }
 
-    /// Configure le paramètre `ef_search` pour les requêtes ANN.
+    /// Sets the `ef_search` parameter used by ANN queries.
     ///
-    /// Valeur par défaut : 64. Acceptée en `u32` borné dans la config server.
-    /// Appel séquentiel au boot — Relaxed suffisant.
+    /// Defaults to 64; the server configuration accepts a bounded `u32`. Like
+    /// `set_ann_enabled`, this is called once during sequential startup, so `Relaxed`
+    /// ordering is sufficient.
     pub fn set_ann_ef_search(&self, ef_search: u32) {
         self.ann_ef_search.store(ef_search, Ordering::Relaxed);
     }
 
-    /// Lit la valeur courante de `ef_search`.
+    /// Reads the current `ef_search` value.
     pub fn ann_ef_search(&self) -> u32 {
         self.ann_ef_search.load(Ordering::Relaxed)
     }
@@ -408,8 +413,10 @@ impl SqliteIndex {
     ///
     /// ## Primary key
     ///
-    /// `(note_id, embedder_id)` — idempotent UPSERT. A second insert with the same
-    /// pair replaces the vector, dimension, and timestamp.
+    /// `(note_id, embedder_id, vault_id)` — an idempotent UPSERT. `vault_id` joined the
+    /// key in migration 0033. A second insert with the same triple replaces the vector,
+    /// its dimension and its timestamp. Two vaults may hold the same
+    /// `(note_id, embedder_id)` without clobbering each other.
     ///
     /// ## BLOB format
     ///
@@ -430,6 +437,7 @@ impl SqliteIndex {
     /// Renamed `_inner` to avoid name collision with the trait method.
     pub(crate) async fn insert_note_embedding_inner(
         &self,
+        vault_id: &str,
         note_id: &NoteId,
         embedder_id: &str,
         dim: u16,
@@ -462,35 +470,37 @@ impl SqliteIndex {
             .unchecked_transaction()
             .map_err(|e| GradatumError::Storage(format!("insert_note_embedding begin tx: {e}")))?;
 
+        // C4-1e (Slice D2, migration 0033) : `vault_id` (colonne NOT NULL) provient du
+        // PARAMÈTRE scopé de l'appelant — jamais d'un lookup id-only sur `notes` (vecteur de
+        // fuite cross-vault sur collision d'ULID). L'unicité `ON CONFLICT` porte désormais la
+        // clé composite `(note_id, embedder_id, vault_id)` : un embedding de `main` ne peut plus
+        // être clobbé par un tenant tiers partageant le même `(note_id, embedder_id)`.
         tx.execute(
-            "INSERT INTO note_embeddings (note_id, embedder_id, vector, dim, model_version, computed_at)
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5)
-             ON CONFLICT(note_id, embedder_id) DO UPDATE SET
+            "INSERT INTO note_embeddings (note_id, embedder_id, vector, dim, model_version, computed_at, vault_id)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)
+             ON CONFLICT(note_id, embedder_id, vault_id) DO UPDATE SET
                  vector      = excluded.vector,
                  dim         = excluded.dim,
                  computed_at = excluded.computed_at",
-            rusqlite::params![note_id_str, embedder_id, blob, dim as i64, computed_at],
+            rusqlite::params![note_id_str, embedder_id, blob, dim as i64, computed_at, vault_id],
         )
         .map_err(|e| GradatumError::Storage(format!("insert_note_embedding : {e}")))?;
 
         // Mise à jour synchrone de l'index ANN (v0.5.3 ANN-1).
-        // Vault_id requis pour le PARTITION KEY vec0 — lookup depuis notes.
+        // Vault_id requis pour le PARTITION KEY vec0.
+        //
+        // C4-1e (Slice B) : le vault_id de la partition provient du PARAMÈTRE d'appel
+        // (fourni par l'appelant scopé), et non plus d'un `SELECT vault_id FROM notes
+        // WHERE id = ?1` id-only. Ce lookup était un vecteur de fuite cross-vault : sur
+        // collision d'ULID (PK composite `(vault_id, id)` depuis 0032), `query_row`
+        // renvoyait le vault_id d'une ligne arbitraire, routant l'embedding vers la
+        // mauvaise partition. Le paramètre est la source de vérité.
+        //
         // En mode dégradé (extension non chargée), upsert_ann retourne Ok(()) silencieusement :
         // la transaction commit quand même, l'INSERT note_embeddings est préservé.
-        let vault_id: Option<String> = tx
-            .query_row(
-                "SELECT vault_id FROM notes WHERE id = ?1",
-                rusqlite::params![note_id_str],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| GradatumError::Storage(format!("insert_note_embedding vault_id: {e}")))?;
-
-        if let Some(vid) = vault_id {
-            // upsert_ann utilise la même connexion sous-jacente — la transaction ouverte
-            // via unchecked_transaction() englobe également cet appel.
-            crate::sqlite_vec::upsert_ann(&tx, &note_id_str, &vid, embedder_id, vector)?;
-        }
+        // upsert_ann utilise la même connexion sous-jacente — la transaction ouverte
+        // via unchecked_transaction() englobe également cet appel.
+        crate::sqlite_vec::upsert_ann(&tx, &note_id_str, vault_id, embedder_id, vector)?;
 
         tx.commit()
             .map_err(|e| GradatumError::Storage(format!("insert_note_embedding commit tx: {e}")))?;
@@ -498,32 +508,93 @@ impl SqliteIndex {
         Ok(())
     }
 
-    /// Backfill de l'index ANN (`note_embeddings_ann`) depuis `note_embeddings`.
+    /// Backfills the ANN index (`note_embeddings_ann`) from `note_embeddings`.
     ///
-    /// Sélectionne toutes les notes non-downgraded avec un embedding de dim=1024
-    /// (bge-m3) and inserts them into `note_embeddings_ann` via `upsert_ann`.
+    /// Selects every non-downgraded note holding a 1024-dimension embedding (bge-m3) and
+    /// inserts them into `note_embeddings_ann` through `upsert_ann`.
     ///
-    /// ## Mode dégradé
+    /// ## Degraded mode
     ///
-    /// Si l'extension sqlite-vec n'est pas chargée au runtime, `upsert_ann` retourne
-    /// `Ok(())` silencieusement pour chaque note. Le compteur retourné représente le
-    /// nombre de notes sélectionnées (pas nécessairement insérées dans vec0).
+    /// If the sqlite-vec extension is not loaded at runtime, `upsert_ann` silently returns
+    /// `Ok(())` for every note. The returned counter is therefore the number of notes
+    /// selected, not necessarily the number of rows inserted into vec0.
     ///
     /// ## Idempotence
     ///
-    /// `INSERT OR REPLACE` sur la PRIMARY KEY → idempotent. Appeler plusieurs fois
-    /// n'entraîne pas de doublons.
+    /// Each write goes through the `(vault_id, embedder_id, note_id)`-scoped delete-then-insert
+    /// of `upsert_ann`, so repeated calls never create duplicates and never drop the row of
+    /// another embedder of the same note.
     ///
     /// ## Usage
     ///
-    /// À appeler explicitement après enregistrement de l'extension sqlite-vec dans
-    /// le bin crate, ou en maintenance (reindex ANN complet).
+    /// Call explicitly once the binary crate has registered the sqlite-vec extension, or
+    /// as a maintenance operation to fully reindex the ANN table.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la requête SQL de lecture échoue.
+    /// `GradatumError::Storage` if the read query fails.
     pub async fn backfill_ann_index(&self) -> Result<u64, GradatumError> {
         crate::sqlite_vec::backfill_ann_from_conn(&self.conn).await
+    }
+
+    /// Boot health gate for the derived ANN index — closes the ANN path on any doubt.
+    ///
+    /// Measures the coverage of `note_embeddings_ann` per partition `(vault_id, embedder_id)`
+    /// (see `sqlite_vec::ann_partition_deficits_from_conn`) and, when rows are missing,
+    /// **disables the ANN path** through [`Self::set_ann_enabled`] before returning the
+    /// deficits. Semantic search then goes back to exhaustive brute force: slower, exact,
+    /// complete. Callers log and report; they never have to decide.
+    ///
+    /// ## Why the gate, and not a warning
+    ///
+    /// `search_semantic` falls back to brute force on `Err`, never on `Ok(vec![])`. A partly
+    /// filled ANN partition returns fewer neighbours — or none — without any error: recall
+    /// collapses in silence. The measured incident (1972 pairs processed, 1966 rows present)
+    /// was invisible in production and only surfaced through a hand-run recall benchmark.
+    ///
+    /// ## Runs only when ANN is enabled
+    ///
+    /// Returns `Ok(Vec::new())` immediately when [`Self::ann_is_enabled`] is `false`, before
+    /// preparing any statement: a brute-force deployment pays nothing and logs nothing.
+    ///
+    /// ## An inconclusive gate is not a pass
+    ///
+    /// If the measurement itself fails, the ANN path is closed too, then the error is
+    /// propagated. A gate that could not run must never be read as a green light.
+    ///
+    /// ## Self-healing
+    ///
+    /// Nothing re-enables ANN at runtime: the next boot re-runs the backfill (which restores
+    /// the missing rows) and re-measures. A deficit costs one restart in brute force, never
+    /// silent results.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if a count fails for a reason other than a missing ANN table
+    /// or vec0 module (that case is the documented degradation and yields an empty vector).
+    pub async fn ann_health_gate(
+        &self,
+    ) -> Result<Vec<gradatum_core::index_store::AnnPartitionDeficit>, GradatumError> {
+        // Non-vacuité : ANN désactivé ⇒ sortie immédiate, aucune requête préparée, aucun log.
+        if !self.ann_is_enabled() {
+            return Ok(Vec::new());
+        }
+
+        match crate::sqlite_vec::ann_partition_deficits_from_conn(&self.conn).await {
+            Ok(deficits) => {
+                if !deficits.is_empty() {
+                    // Fail-closed : l'index dérivé ne couvre pas tout le corpus éligible.
+                    self.set_ann_enabled(false);
+                }
+                Ok(deficits)
+            }
+            Err(e) => {
+                // Mesure non concluante = pas un PASS : on ferme le chemin ANN avant de
+                // propager, sinon l'axe sémantique reste servi par un index non audité.
+                self.set_ann_enabled(false);
+                Err(e)
+            }
+        }
     }
 
     /// ANN search on `note_embeddings_ann` — for bench binaries only.
@@ -550,17 +621,23 @@ impl SqliteIndex {
         crate::sqlite_vec::search_ann_bench_inner(&self.conn, vault_id, embedder_id, query, k).await
     }
 
-    /// Reads back an embedding vector from the `note_embeddings` table.
+    /// Reads back an embedding vector from the `note_embeddings` table, scoped to `vault_id`.
     ///
-    /// Returns `None` if no embedding exists for the `(note_id, embedder_id)` pair.
-    /// Returns `Some(Vec<f32>)` after decoding the little-endian f32 BLOB.
+    /// Returns `None` if no embedding exists for the `(note_id, embedder_id, vault_id)`
+    /// triple. Returns `Some(Vec<f32>)` after decoding the little-endian f32 BLOB.
     ///
     /// Used by the embed pipeline to skip re-computation when an embedding
     /// is already present and `computed_at` is recent.
     /// Internal concrete method — called by `impl VectorStore for SqliteIndex`.
     /// Renamed `_inner` to avoid name collision with the trait method.
+    ///
+    /// The lookup key is the full `(note_id, embedder_id, vault_id)` triple, never the note
+    /// id alone: `note_embeddings` carries `vault_id` in its composite primary key since
+    /// migration 0033, and a `WHERE note_id = ? AND embedder_id = ?` clause would, on a
+    /// cross-vault ULID collision, return a vector belonging to ANOTHER vault.
     pub(crate) async fn get_note_embedding_inner(
         &self,
+        vault_id: &str,
         note_id: &NoteId,
         embedder_id: &str,
     ) -> Result<Option<Vec<f32>>, GradatumError> {
@@ -568,21 +645,24 @@ impl SqliteIndex {
         let conn = self.conn.lock().await;
 
         match conn.query_row(
-            "SELECT vector FROM note_embeddings WHERE note_id = ?1 AND embedder_id = ?2",
-            rusqlite::params![note_id_str, embedder_id],
+            "SELECT vector FROM note_embeddings WHERE note_id = ?1 AND embedder_id = ?2 AND vault_id = ?3",
+            rusqlite::params![note_id_str, embedder_id, vault_id],
             |row| row.get::<_, Vec<u8>>(0),
         ) {
             Ok(blob) => {
                 if blob.len() % 4 != 0 {
                     return Err(GradatumError::Storage(format!(
-                        "get_note_embedding: BLOB len {} non multiple de 4 pour note {note_id_str}",
+                        "get_note_embedding: BLOB len {} not a multiple of 4 for note {note_id_str}",
                         blob.len()
                     )));
                 }
                 let vec: Vec<f32> = blob
                     .chunks_exact(4)
                     .map(|b| {
-                        f32::from_le_bytes(b.try_into().expect("chunks_exact garantit 4 bytes"))
+                        f32::from_le_bytes(
+                            b.try_into()
+                                .expect("chunks_exact guarantees 4 bytes — invariant"),
+                        )
                     })
                     .collect();
                 Ok(Some(vec))
@@ -660,22 +740,32 @@ impl SqliteIndex {
     ///
     /// Idempotent: a second call updates the reason and timestamp.
     ///
+    /// ## Vault scoping
+    ///
+    /// The mutation filters `WHERE id = <note_id> AND vault_id = <vault>` on the
+    /// vault-shared `notes` table (`vault` = ACL-Write-checked target). A note owned by
+    /// another vault yields 0 rows → `NoteNotFound` (same 404 as a truly absent note —
+    /// no existence oracle). At `multi_tenant.enabled = false` the vault is always `main`,
+    /// so the predicate is transparent (byte-identical).
+    ///
     /// # Errors
     ///
-    /// - `GradatumError::NoteNotFound(note_id)` if no note matches `note_id`.
+    /// - `GradatumError::NoteNotFound(note_id)` if no note matches `note_id` in `vault`.
     /// - `GradatumError::NoteNotFound(replaced_by_id)` if `replaced_by` is provided
-    ///   but the target note does not exist in the index. Without this pre-check,
+    ///   but the target note does not exist in `vault`. Without this pre-check,
     ///   the SQLite FK constraint (`replaced_by TEXT REFERENCES notes(id)`) would
     ///   raise a constraint error mapped to HTTP 500 — this converts it to a 404.
     /// - `GradatumError::Storage` on unexpected SQLite errors.
     pub async fn downgrade_note(
         &self,
+        vault: &gradatum_core::scope::AclCheckedVaultId,
         note_id: &NoteId,
         reason: &str,
         replaced_by: Option<&NoteId>,
     ) -> Result<(), GradatumError> {
         let conn = self.conn.lock().await;
         let now = chrono::Utc::now().timestamp_millis();
+        let vault_id = vault.as_str();
         let note_id_str = note_id.to_string();
         let replaced_by_str = replaced_by.map(|id| id.to_string());
 
@@ -687,7 +777,7 @@ impl SqliteIndex {
         {
             return Err(GradatumError::Validation(
                 gradatum_core::error::ValidationError::InvalidInput(
-                    "replaced_by ne peut pas référencer la note elle-même".into(),
+                    "replaced_by cannot reference the note itself".into(),
                 ),
             ));
         }
@@ -697,10 +787,12 @@ impl SqliteIndex {
         // renvoie SQLITE_CONSTRAINT_FOREIGNKEY, mappé en GradatumError::Storage → HTTP 500.
         // On retourne NoteNotFound(replaced_by_id) → HTTP 404 côté handler (erreur client).
         if let (Some(rb_str), Some(rb_id)) = (&replaced_by_str, replaced_by) {
+            // C3a (EX-C3a P0) : le remplaçant doit exister DANS le même vault — un pointeur
+            // `replaced_by` cross-vault est aussi invalide qu'une note remplaçante absente.
             let exists: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM notes WHERE id = ?1)",
-                    rusqlite::params![rb_str],
+                    "SELECT EXISTS(SELECT 1 FROM notes WHERE id = ?1 AND vault_id = ?2)",
+                    rusqlite::params![rb_str, vault_id],
                     |row| row.get(0),
                 )
                 .map_err(|e| {
@@ -711,6 +803,9 @@ impl SqliteIndex {
             }
         }
 
+        // C3a (EX-C3a P0) : `AND vault_id = ?5` — la note ciblée par ULID doit appartenir au
+        // vault dont l'ACL Write a été vérifiée. Cross-vault → 0 ligne → `NoteNotFound`
+        // (fail-closed, pas d'oracle d'existence). À flag OFF le vault est toujours `main`.
         let rows = conn
             .execute(
                 "UPDATE notes SET
@@ -719,8 +814,8 @@ impl SqliteIndex {
                     status_changed = ?3,
                     replaced_by   = ?4,
                     updated       = ?3
-                 WHERE id = ?1",
-                rusqlite::params![note_id_str, reason, now, replaced_by_str],
+                 WHERE id = ?1 AND vault_id = ?5",
+                rusqlite::params![note_id_str, reason, now, replaced_by_str, vault_id],
             )
             .map_err(|e| GradatumError::Storage(format!("downgrade_note: {e}")))?;
 
@@ -744,22 +839,29 @@ impl SqliteIndex {
     /// # Preconditions
     /// `new_locus` must already be validated by the caller (`LocusId::parse`).
     ///
+    /// ## Vault scoping
+    ///
+    /// The mutation filters `WHERE id = <note_id> AND vault_id = <vault>` — see
+    /// [`SqliteIndex::downgrade_note`]. Cross-vault → `NoteNotFound` (fail-closed).
+    ///
     /// # Errors
-    /// - `GradatumError::NoteNotFound` if no note matches `note_id`.
+    /// - `GradatumError::NoteNotFound` if no note matches `note_id` in `vault`.
     /// - `GradatumError::Storage` on SQLite errors.
     pub async fn update_note_locus(
         &self,
+        vault: &gradatum_core::scope::AclCheckedVaultId,
         note_id: &NoteId,
         new_locus: &gradatum_core::scope::LocusId,
     ) -> Result<(), GradatumError> {
         let conn = self.conn.lock().await;
         let now = chrono::Utc::now().timestamp_millis();
+        let vault_id = vault.as_str();
         let note_id_str = note_id.to_string();
 
         let rows = conn
             .execute(
-                "UPDATE notes SET locus = ?2, updated = ?3 WHERE id = ?1",
-                rusqlite::params![note_id_str, new_locus.as_str(), now],
+                "UPDATE notes SET locus = ?2, updated = ?3 WHERE id = ?1 AND vault_id = ?4",
+                rusqlite::params![note_id_str, new_locus.as_str(), now, vault_id],
             )
             .map_err(|e| GradatumError::Storage(format!("update_note_locus: {e}")))?;
 
@@ -842,7 +944,7 @@ impl SqliteIndex {
 
         if rows == 0 {
             return Err(GradatumError::Storage(format!(
-                "restore_index_status_fields: note absente vault={vault_id} id={note_id}"
+                "restore_index_status_fields: note absent vault={vault_id} id={note_id}"
             )));
         }
         Ok(())
@@ -856,12 +958,18 @@ impl SqliteIndex {
     ///
     /// At least one field must be provided (validation is the caller's responsibility).
     ///
+    /// ## Vault scoping
+    ///
+    /// The mutation filters `WHERE id = <note_id> AND vault_id = <vault>` — see
+    /// [`SqliteIndex::downgrade_note`]. Cross-vault → `NoteNotFound` (fail-closed).
+    ///
     /// # Errors
     ///
-    /// - `GradatumError::NoteNotFound` if no note matches `note_id`.
+    /// - `GradatumError::NoteNotFound` if no note matches `note_id` in `vault`.
     /// - `GradatumError::Storage` on SQLite errors.
     pub async fn patch_note_status(
         &self,
+        vault: &gradatum_core::scope::AclCheckedVaultId,
         note_id: &NoteId,
         status: Option<&str>,
         status_reason: Option<&str>,
@@ -869,6 +977,7 @@ impl SqliteIndex {
     ) -> Result<(), GradatumError> {
         let conn = self.conn.lock().await;
         let now = chrono::Utc::now().timestamp_millis();
+        let vault_id = vault.as_str();
         let note_id_str = note_id.to_string();
         let replaced_by_str = replaced_by.map(|id| id.to_string());
 
@@ -880,8 +989,15 @@ impl SqliteIndex {
                     replaced_by    = COALESCE(?4, replaced_by),
                     status_changed = CASE WHEN ?2 IS NOT NULL THEN ?5 ELSE status_changed END,
                     updated        = ?5
-                 WHERE id = ?1",
-                rusqlite::params![note_id_str, status, status_reason, replaced_by_str, now],
+                 WHERE id = ?1 AND vault_id = ?6",
+                rusqlite::params![
+                    note_id_str,
+                    status,
+                    status_reason,
+                    replaced_by_str,
+                    now,
+                    vault_id
+                ],
             )
             .map_err(|e| GradatumError::Storage(format!("patch_note_status: {e}")))?;
 
@@ -912,6 +1028,152 @@ impl SqliteIndex {
             )
             .map_err(|e| GradatumError::Storage(format!("live_note_count: {e}")))?;
         Ok(count as u64)
+    }
+
+    /// Returns the allow-list grants of a tenant — active tenants only.
+    ///
+    /// Joins `tenant_vault_grants` with `tenants` (migration 0030): a suspended
+    /// tenant loses all grants at once. An unknown `access` value in a row is a
+    /// storage corruption → error (fail-loud, never a silent grant).
+    ///
+    /// The `section` column (migration 0040) is surfaced as stored: `NULL` becomes
+    /// [`VaultGrant::section`] `None`, meaning a grant over the whole vault. Whether a
+    /// grant covers a given section is decided downstream by
+    /// [`VaultGrant::covers_section`] — **never here**: this layer does not filter, it
+    /// reproduces the row faithfully.
+    ///
+    /// `tenant_id` is typed [`TenantId`] and bound to the statement through
+    /// `as_str()`: the SQL parameter stays the very same `TEXT` value, so the query
+    /// plan and the stored schema are untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the query fails or a row carries an
+    /// out-of-enum `access` value.
+    pub async fn tenant_grants(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<VaultGrant>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT g.tenant_id, g.vault_id, g.access, g.section
+                 FROM tenant_vault_grants g
+                 JOIN tenants t ON t.id = g.tenant_id
+                 WHERE g.tenant_id = ?1
+                   AND t.status = 'active'
+                 ORDER BY g.vault_id",
+            )
+            .map_err(|e| GradatumError::Storage(format!("tenant_grants prepare: {e}")))?;
+        let rows = stmt
+            .query_map([tenant_id.as_str()], |row| {
+                let tenant: String = row.get(0)?;
+                let vault: String = row.get(1)?;
+                let access: String = row.get(2)?;
+                let section: Option<String> = row.get(3)?;
+                Ok((tenant, vault, access, section))
+            })
+            .map_err(|e| GradatumError::Storage(format!("tenant_grants query: {e}")))?;
+
+        let mut grants = Vec::new();
+        for row in rows {
+            let (tenant, vault, access_raw, section) =
+                row.map_err(|e| GradatumError::Storage(format!("tenant_grants row: {e}")))?;
+            let access = GrantAccess::from_db_str(&access_raw).ok_or_else(|| {
+                GradatumError::Storage(format!(
+                    "tenant_grants: access {access_raw:?} out of enumeration (tenant {tenant}, vault {vault}) — corrupted row"
+                ))
+            })?;
+            grants.push(VaultGrant::new_scoped(
+                tenant,
+                VaultId::new(vault),
+                access,
+                section,
+            ));
+        }
+        Ok(grants)
+    }
+
+    /// Allow-list grants of an agent — mirror of [`Self::tenant_grants`] at the
+    /// agent level (lot B6, plan v1.0.0).
+    ///
+    /// Queries `agent_vault_grants` by `agent_id`. Absence of a row is a refusal
+    /// (fail-closed). No join on a status table — agent grants have no lifecycle
+    /// distinct from the key that carries the identity (`api_keys.revoked_at`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` on query failure. Returns
+    /// `GradatumError::Storage` with an explanatory message when a stored `access`
+    /// value is out of the `{'read','write'}` enumeration — a corrupted row must
+    /// never silently grant access.
+    pub async fn agent_grants(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<AgentVaultGrant>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, vault_id, access, section
+                 FROM agent_vault_grants
+                 WHERE agent_id = ?1
+                 ORDER BY vault_id",
+            )
+            .map_err(|e| GradatumError::Storage(format!("agent_grants prepare: {e}")))?;
+        let rows = stmt
+            .query_map([agent_id.as_str()], |row| {
+                let agent: String = row.get(0)?;
+                let vault: String = row.get(1)?;
+                let access: String = row.get(2)?;
+                let section: Option<String> = row.get(3)?;
+                Ok((agent, vault, access, section))
+            })
+            .map_err(|e| GradatumError::Storage(format!("agent_grants query: {e}")))?;
+
+        let mut grants = Vec::new();
+        for row in rows {
+            let (agent, vault, access_raw, section) =
+                row.map_err(|e| GradatumError::Storage(format!("agent_grants row: {e}")))?;
+            let access = GrantAccess::from_db_str(&access_raw).ok_or_else(|| {
+                GradatumError::Storage(format!(
+                    "agent_grants: access {access_raw:?} out of enumeration (agent {agent}, vault {vault}) — corrupted row"
+                ))
+            })?;
+            grants.push(AgentVaultGrant::new_scoped(
+                AgentId::new(agent),
+                VaultId::new(vault),
+                access,
+                section,
+            ));
+        }
+        Ok(grants)
+    }
+
+    /// Upserts a row into `agent_vault_grants` — **INSERT OR IGNORE** (lot B7, plan
+    /// v1.0.0).
+    ///
+    /// Idempotent: an existing row (same `agent_id` + `vault_id`) is silently
+    /// ignored, never overwritten. Called at boot by `reconcile_key_owners`.
+    pub async fn upsert_agent_grant(
+        &self,
+        agent_id: &AgentId,
+        vault_id: &VaultId,
+        access: GrantAccess,
+        section: Option<&str>,
+    ) -> Result<(), GradatumError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_vault_grants (agent_id, vault_id, access, section)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                agent_id.as_str(),
+                vault_id.as_str(),
+                access.as_db_str(),
+                section
+            ],
+        )
+        .map_err(|e| GradatumError::Storage(format!("upsert_agent_grant: {e}")))?;
+        Ok(())
     }
 
     /// Counts notes by status (`GROUP BY status`) — tolerant of out-of-enum values.
@@ -972,24 +1234,35 @@ impl SqliteIndex {
 
     /// Updates the `title` column of an existing note.
     ///
-    /// Idempotent. Best-effort: logs on error but does not propagate.
-    /// Used post-curation to persist the H1 title extracted from the body.
+    /// Idempotent. Used post-curation to persist the H1 title extracted from the body.
+    /// Returns the number of rows affected (`0` if no note matches `(vault_id, note_id)`,
+    /// `1` in the nominal case).
+    ///
+    /// ## Vault scoping
+    ///
+    /// The mutation filters `WHERE id = <note_id> AND vault_id = <vault_id>` (mirrors
+    /// [`Self::get_trust_and_provenance`]). Without the `vault_id` predicate a write
+    /// targeting one vault would overwrite the title of a homonymous note (same ULID)
+    /// in another vault. Byte-identical in the single-vault regime: the note is resolved
+    /// in its own vault upstream, so the predicate removes no legitimate row.
     ///
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if the SQLite query fails.
     pub async fn upsert_note_title(
         &self,
+        vault_id: &str,
         note_id: &NoteId,
         title: &str,
-    ) -> Result<(), GradatumError> {
+    ) -> Result<usize, GradatumError> {
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE notes SET title = ?2 WHERE id = ?1",
-            rusqlite::params![note_id.to_string(), title],
-        )
-        .map_err(|e| GradatumError::Storage(format!("upsert_note_title: {e}")))?;
-        Ok(())
+        let rows = conn
+            .execute(
+                "UPDATE notes SET title = ?3 WHERE id = ?1 AND vault_id = ?2",
+                rusqlite::params![note_id.to_string(), vault_id, title],
+            )
+            .map_err(|e| GradatumError::Storage(format!("upsert_note_title: {e}")))?;
+        Ok(rows)
     }
 
     /// BM25 FTS5 search with optional section filter.
@@ -1217,7 +1490,7 @@ impl SqliteIndex {
             if forgotten != 0 && forgotten_at_ms.is_none() {
                 tracing::warn!(
                     note_id = %id_str,
-                    "search_fts_scored_filtered: forgotten=1 mais forgotten_at=NULL — état incohérent"
+                    "search_fts_scored_filtered: forgotten=1 but forgotten_at=NULL — inconsistent state"
                 );
             }
             let score = if forgotten != 0 {
@@ -1330,7 +1603,7 @@ impl SqliteIndex {
     // 10 args: orthogonal search filters (downgraded/section/locus/status/from_ms/to_ms).
     #[expect(
         clippy::too_many_arguments,
-        reason = "filtres de recherche orthogonaux (F-37+F-65) — struct d'options sans gain"
+        reason = "orthogonal search filters (F-37+F-65) — options struct without benefit"
     )]
     pub async fn search_fts_with_snippet(
         &self,
@@ -1379,7 +1652,7 @@ impl SqliteIndex {
                     t.anchor_ms
              FROM notes_fts
              JOIN notes n ON notes_fts.rowid = n.rowid
-             LEFT JOIN temporal_index t ON t.note_id = n.id
+             LEFT JOIN temporal_index t ON t.note_id = n.id AND t.vault_id = n.vault_id
              WHERE notes_fts MATCH ?1
                AND n.vault_id = ?2
                {downgraded_clause}
@@ -1592,7 +1865,7 @@ impl SqliteIndex {
             if forgotten != 0 && forgotten_at_ms.is_none() {
                 tracing::warn!(
                     note_id = %id_str,
-                    "search_fts_with_snippet: forgotten=1 mais forgotten_at=NULL — état incohérent"
+                    "search_fts_with_snippet: forgotten=1 but forgotten_at=NULL — inconsistent state"
                 );
             }
             let bm25 = if forgotten != 0 {
@@ -1755,8 +2028,12 @@ impl SqliteIndex {
     ///   note tagged `deploy` matches `MATCH 'deploy'` even without the word in the body.
     /// - **Exclusion of `codified`**: applied in Rust (exact token split of `notes.tags`)
     ///   rather than SQL `LIKE '%codified%'` — prevents false positives on tags that
-    ///   contain the substring (e.g. `codified-2026`). Over-fetches `limit * 4`
-    ///   (clamped to [limit, 100]) before filtering to retain `limit` net results.
+    ///   contain the substring (e.g. `codified-2026`). Over-fetches before filtering, so
+    ///   that `limit` net results survive the exclusion. The SQL `LIMIT` is
+    ///   `max(limit, min(limit * 4, 100))`: the ×4 over-fetch is capped at 100 rows, but
+    ///   the cap never lowers the fetch below `limit` — a caller asking for more than 100
+    ///   still gets its full quota, never a silently truncated one. `limit = 0` fetches
+    ///   nothing and returns an empty vector.
     /// - **Exclusion of forgotten notes**: `AND n.forgotten = 0` — a forgotten lesson
     ///   must never be recalled. No progressive decay: recall is binary
     ///   (present or not), sorted by BM25 ASC.
@@ -1769,8 +2046,17 @@ impl SqliteIndex {
         let conn = self.conn.lock().await;
 
         // Sur-fetch : on filtre `codified` en Rust, donc on demande plus large pour
-        // ne pas perdre de résultats nets. Borné pour éviter un scan non maîtrisé.
-        let fetch_limit = (limit * 4).clamp(limit.max(1), 100) as i64;
+        // ne pas perdre de résultats nets. Le SUR-fetch (ce qui dépasse `limit`) est
+        // borné par `OVERFETCH_CAP` pour éviter un scan non maîtrisé, mais le plancher
+        // reste `limit` : au-delà du cap l'appelant reçoit son quota, jamais une
+        // troncature silencieuse.
+        //
+        // NE PAS revenir à `(limit * 4).clamp(limit.max(1), CAP)` : `usize::clamp`
+        // PANIQUE quand `min > max`, donc dès `limit > CAP`. Régression couverte par
+        // `recall_lessons_tests::recall_lessons_does_not_panic_above_overfetch_cap`.
+        const OVERFETCH_CAP: usize = 100;
+        let fetch_limit = i64::try_from(limit.max(limit.saturating_mul(4).min(OVERFETCH_CAP)))
+            .unwrap_or(i64::MAX);
 
         // FTS5 phrase : la plupart des classes du vocabulaire contiennent un tiret
         // (`ci-cd`, `crates-io`, `anti-leak`, `git-hygiene`, `auth-secrets`,
@@ -1781,6 +2067,16 @@ impl SqliteIndex {
         // à l'ancien inline mais sans duplication de l'algorithme de quoting.
         let fts_phrase = fts5_quote_query(class);
 
+        // SECURITY (load-bearing -- isolation cross-section) : le predicat
+        // `AND n.section = 'lessons-learned'` ci-dessous est un CONTROLE D'ISOLATION,
+        // pas un simple filtre de pertinence. Le chemin semantique amont
+        // (`retrieve_candidates`, crates/gradatum-server/src/context/retrieval.rs, branche
+        // ULID-direct) IGNORE son argument `sections` : sur une requete ULID il renvoie la
+        // note + ses backlinks SANS filtre section. L'isolation aval repose donc ENTIEREMENT
+        // sur ce predicat (recall BM25) et sur son jumeau dans `hydrate_lessons_by_ulids`.
+        // NE PAS retirer ni relacher sans deplacer d'abord le filtre section en amont.
+        // Regression couverte par
+        // `recall_lessons_tests::hydrate_lessons_evicts_cross_section_ulid`.
         let sql = "SELECT n.id,
                           snippet(notes_fts, 0, '»', '«', '...', 32) AS snippet,
                           n.title,
@@ -1883,6 +2179,15 @@ impl SqliteIndex {
             .collect::<Vec<_>>()
             .join(", ");
         let vault_param = ulids.len() + 1;
+        // SECURITY (load-bearing -- isolation cross-section) : le predicat
+        // `AND n.section = 'lessons-learned'` de la requete ci-dessous est le CONTROLE
+        // D'ISOLATION terminal du chemin semantique ULID-direct. `retrieve_candidates`
+        // (crates/gradatum-server/src/context/retrieval.rs) ignore son argument `sections`
+        // pour une requete ULID : la seule chose qui empeche une note d'une AUTRE section
+        // (ex. `decisions`) d'etre hydratee et servie comme "lecon" est ce predicat.
+        // NE PAS retirer ni relacher sans deplacer le filtre section en amont.
+        // Regression couverte par
+        // `recall_lessons_tests::hydrate_lessons_evicts_cross_section_ulid`.
         let sql = format!(
             "SELECT n.id, n.title, n.tags, n.created, n.body_text \
              FROM notes n \
@@ -2100,15 +2405,130 @@ impl SqliteIndex {
         Ok((records, total as u64))
     }
 
-    /// Liste paginée des notes filtrées par STATUT (métadonnées), incluant `downgraded`.
+    /// Atomically allocates the next feature number for `vault_id`.
     ///
-    /// Contrairement à [`Self::list_notes`], n'exclut PAS `status = 'downgraded'` :
-    /// c'est l'objet de cette méthode (browse archived/downgraded — fix drill-down studio).
+    /// Returns `floor + 1` where `floor = max(persistent_counter, max_derived_from_cards)`,
+    /// then persists the new value. The whole read-derive-increment runs under the single
+    /// connection mutex (`self.conn.lock().await` — every index op is already serialized by
+    /// it) inside one `unchecked_transaction`, so two concurrent calls **cannot** interleave
+    /// and always receive two distinct numbers. This closes the allocation race at the
+    /// source: no client-side `max+1`, no double-allocation.
     ///
-    /// - `statuses` : ensemble de statuts à inclure (`IN (...)`). Vide → retourne `(vec![], 0)`.
-    /// - `section` : filtre optionnel sur la section.
-    /// - `cursor` : dernier ULID reçu (exclusif). `None` ou `""` = début de liste.
-    /// - `limit` : cappé à `[1, 200]`.
+    /// ## Hard guarantee — derive on EVERY allocation
+    ///
+    /// The maximum feature number present across the vault's project-map card bodies is
+    /// recomputed on **every** call — via [`gradatum_core::project_map::max_feature_number`],
+    /// which reads the body role `[[feature:F-XX]]` / `[[supersedes:]]` / `[[parent:]]` and
+    /// **never** the note tags. This is deliberately not a one-time seed: during the
+    /// transition period, `gov-todo feature-add F-XX` still supplies an explicit client-side
+    /// number, so out-of-band cards coexist with the allocator. Deriving every time floors
+    /// the sequence **above** any such card, making the silent double-number collision
+    /// impossible. The persistent counter is kept as the memory of numbers allocated but not
+    /// yet materialised into a card; the derive only corrects the floor upwards. Neither the
+    /// counter nor an out-of-band card can make the sequence regress.
+    ///
+    /// The derive scan intentionally includes cards of **every** status (only `__sentinel__`
+    /// rows are excluded): a downgraded or garbage-pending card's number must never be
+    /// reallocated while references to it may still exist. It reconstructs the counter
+    /// automatically if the counter row is ever lost — no manual reseed.
+    ///
+    /// ## Cost
+    ///
+    /// One `SELECT body_text … WHERE section = 'project-map'` (a single page — the section is
+    /// O(hundreds) at the v1.0 horizon) plus an in-memory parse per allocation. Allocations
+    /// are rare (a handful per week), so the overhead is negligible against the value of
+    /// eliminating an entire class of silent collision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradatumError::Storage`] if any query fails or if the resulting number
+    /// overflows `u32`. On error the transaction rolls back and **no number is handed out**.
+    pub async fn allocate_feature_number(&self, vault_id: &str) -> Result<u32, GradatumError> {
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| GradatumError::Storage(format!("allocate_feature_number BEGIN: {e}")))?;
+
+        // Compteur persistant (0 si absent) — porte la mémoire des numéros alloués mais
+        // pas encore matérialisés en carte.
+        let counter: i64 = tx
+            .query_row(
+                "SELECT value FROM feature_counter WHERE vault_id = ?1",
+                [vault_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| GradatumError::Storage(format!("allocate_feature_number select: {e}")))?
+            .unwrap_or(0);
+
+        // Max dérivé des cartes — calculé à CHAQUE allocation (garantie dure, pas seulement
+        // au seed). Source de vérité = rôle du corps, jamais les tags. Corrige le plancher
+        // vers le haut si une carte créée HORS allocateur a pris de l'avance sur le compteur
+        // (période de transition : `gov-todo feature-add F-XX` fournit encore un numéro
+        // explicite côté client tant que le skill n'est pas migré — council Art.19 en attente).
+        let derived: i64 = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT body_text FROM notes
+                     WHERE vault_id = ?1
+                       AND section = 'project-map'
+                       AND id NOT LIKE '__sentinel__%'",
+                )
+                .map_err(|e| {
+                    GradatumError::Storage(format!("allocate_feature_number derive prepare: {e}"))
+                })?;
+
+            let rows = stmt
+                .query_map([vault_id], |row| row.get::<_, String>(0))
+                .map_err(|e| {
+                    GradatumError::Storage(format!("allocate_feature_number derive query: {e}"))
+                })?;
+
+            let mut max_seen: u32 = 0;
+            for body in rows {
+                let body = body.map_err(|e| {
+                    GradatumError::Storage(format!("allocate_feature_number derive row: {e}"))
+                })?;
+                if let Some(n) = gradatum_core::project_map::max_feature_number(&body)
+                    && n > max_seen
+                {
+                    max_seen = n;
+                }
+            }
+            i64::from(max_seen)
+        };
+
+        // Plancher = max(compteur, dérivé) : ni le compteur ni une carte hors-allocateur ne
+        // peut faire reculer la séquence. La collision silencieuse (deux cartes, même numéro)
+        // est impossible tant que la carte allouée est effectivement au-dessus des existantes.
+        let floor = counter.max(derived);
+        let next = floor + 1;
+
+        // Upsert : le compteur porte désormais le DERNIER numéro alloué.
+        tx.execute(
+            "INSERT INTO feature_counter (vault_id, value) VALUES (?1, ?2)
+             ON CONFLICT(vault_id) DO UPDATE SET value = excluded.value",
+            rusqlite::params![vault_id, next],
+        )
+        .map_err(|e| GradatumError::Storage(format!("allocate_feature_number upsert: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| GradatumError::Storage(format!("allocate_feature_number COMMIT: {e}")))?;
+
+        u32::try_from(next).map_err(|_| {
+            GradatumError::Storage(format!("allocate_feature_number: overflow ({next})"))
+        })
+    }
+
+    /// Paginated metadata listing of notes filtered by STATUS, `downgraded` included.
+    ///
+    /// Unlike [`Self::list_notes`], this method does NOT exclude `status = 'downgraded'`:
+    /// browsing archived and downgraded notes is precisely its purpose.
+    ///
+    /// - `statuses`: statuses to include (`IN (...)`). Empty returns `(vec![], 0)`.
+    /// - `section`: optional section filter.
+    /// - `cursor`: last ULID received, exclusive. `None` or `""` starts from the top.
+    /// - `limit`: clamped to `[1, 200]`.
     ///
     /// # Errors
     ///
@@ -2459,20 +2879,42 @@ impl SqliteIndex {
         body: &str,
         created_ms: i64,
     ) -> Result<(), GradatumError> {
+        self.seed_lesson_vault(id, "main", title, tags, body, created_ms)
+            .await
+    }
+
+    /// Vault-scoped variant of [`Self::seed_lesson`] — inserts a lesson attached to `vault_id`.
+    ///
+    /// Required to seed distinct per-vault corpora in multi-tenant tests (e.g. proving the
+    /// proactive-refresh tick writes each surface to its own tenant at flag ON, no clobber).
+    /// `seed_lesson` delegates here with `vault_id = "main"`.
+    ///
+    /// # Errors
+    ///
+    /// - `GradatumError::Storage` if either INSERT fails.
+    pub async fn seed_lesson_vault(
+        &self,
+        id: &str,
+        vault_id: &str,
+        title: &str,
+        tags: &str,
+        body: &str,
+        created_ms: i64,
+    ) -> Result<(), GradatumError> {
         let conn = self.conn.lock().await;
         let tags_opt: Option<&str> = if tags.is_empty() { None } else { Some(tags) };
         conn.execute(
             "INSERT INTO notes (id, vault_id, section, status, schema_version, created, content_hash, body_text, title, tags) \
-             VALUES (?1, 'main', 'lessons-learned', 'live', 1, ?2, X'00', ?3, ?4, ?5)",
-            rusqlite::params![id, created_ms, body, title, tags_opt],
+             VALUES (?1, ?2, 'lessons-learned', 'live', 1, ?3, X'00', ?4, ?5, ?6)",
+            rusqlite::params![id, vault_id, created_ms, body, title, tags_opt],
         )
-        .map_err(|e| GradatumError::Storage(format!("seed_lesson notes: {e}")))?;
+        .map_err(|e| GradatumError::Storage(format!("seed_lesson_vault notes: {e}")))?;
         conn.execute(
             "INSERT INTO notes_fts (rowid, body_text, tags) \
              SELECT rowid, body_text, COALESCE(tags, '') FROM notes WHERE id = ?1",
             rusqlite::params![id],
         )
-        .map_err(|e| GradatumError::Storage(format!("seed_lesson fts: {e}")))?;
+        .map_err(|e| GradatumError::Storage(format!("seed_lesson_vault fts: {e}")))?;
         Ok(())
     }
 
@@ -2523,6 +2965,204 @@ impl SqliteIndex {
         Ok(())
     }
 
+    /// **For test use only** — inserts a minimal child row, scoped `(vault_id, note_id)`,
+    /// into one of the tables covered by the `delete_note_from_index` cascade.
+    ///
+    /// # Note visibility
+    ///
+    /// This method is `pub` because integration tests in `gradatum-index/tests/` call it
+    /// from a separate crate and have no access to the private connection — the same
+    /// convention as [`Self::set_title_to_null_for_test`]. The public write APIs of the
+    /// child tables are heterogeneous (diverging scopes, not vault-scoped on read), so
+    /// this narrow helper gives cascade tests a single uniform write point.
+    ///
+    /// `table` is restricted to the allow-list of child tables the cascade covers:
+    /// `note_index`, `temporal_index`, `note_links`, `note_overrides`, plus
+    /// `note_audit_trail`, `note_embeddings` and `note_history` (which gained `vault_id`
+    /// in migration 0033). For `note_links`, `note_id` feeds `src_note_id`.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the INSERT fails (primary-key collision, constraint
+    /// violation, …) or if `table` is outside the allow-list.
+    pub async fn seed_child_row_for_test(
+        &self,
+        table: &str,
+        vault_id: &str,
+        note_id: &str,
+    ) -> Result<(), GradatumError> {
+        let conn = self.conn.lock().await;
+        let res = match table {
+            "note_index" => conn.execute(
+                "INSERT INTO note_index (note_id, vault_id, locus, bm25_tokens, last_indexed) \
+                 VALUES (?1, ?2, NULL, 0, 0)",
+                rusqlite::params![note_id, vault_id],
+            ),
+            "temporal_index" => conn.execute(
+                "INSERT INTO temporal_index (note_id, vault_id, anchor_ms, anchor_src, doc_kind, valid_until_ms) \
+                 VALUES (?1, ?2, 0, 'created', 'Static', NULL)",
+                rusqlite::params![note_id, vault_id],
+            ),
+            "note_links" => conn.execute(
+                "INSERT INTO note_links (src_note_id, dst_note_id, vault_id, created_at) \
+                 VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![note_id, format!("{note_id}-dst"), vault_id],
+            ),
+            "note_overrides" => conn.execute(
+                "INSERT INTO note_overrides (note_id, vault_id, scope_kind, scope_id, override_type, \
+                 schema_version, payload_toml, created_at, file_relative_path, file_hash) \
+                 VALUES (?1, ?2, 'vault', ?2, 'trust', 1, '', 0, ?3, X'00')",
+                rusqlite::params![note_id, vault_id, format!("{vault_id}/{note_id}.trust.toml")],
+            ),
+            // Tables migrées en Slice D2 (migration 0033) : porteuses de `vault_id`.
+            "note_audit_trail" => conn.execute(
+                "INSERT INTO note_audit_trail (note_id, vault_id, event_type, actor_kind, actor_id, occurred_at) \
+                 VALUES (?1, ?2, 'test', 'system', 'test', 0)",
+                rusqlite::params![note_id, vault_id],
+            ),
+            "note_embeddings" => conn.execute(
+                "INSERT INTO note_embeddings (note_id, embedder_id, vector, dim, model_version, computed_at, vault_id) \
+                 VALUES (?1, 'test-emb', X'00000000', 1, NULL, 0, ?2)",
+                rusqlite::params![note_id, vault_id],
+            ),
+            "note_history" => conn.execute(
+                "INSERT INTO note_history (note_id, from_version, to_version, diff_text, committed_at, vault_id) \
+                 VALUES (?1, 0, 1, '', 0, ?2)",
+                rusqlite::params![note_id, vault_id],
+            ),
+            other => {
+                return Err(GradatumError::Storage(format!(
+                    "seed_child_row_for_test: table hors liste blanche : {other}"
+                )));
+            }
+        };
+        res.map(|_| ())
+            .map_err(|e| GradatumError::Storage(format!("seed_child_row_for_test {table} : {e}")))
+    }
+
+    /// **For test use only** — counts the `(vault_id, note_id)`-scoped child rows of a
+    /// table covered by the `delete_note_from_index` cascade.
+    ///
+    /// Read-side counterpart of [`Self::seed_child_row_for_test`]: same allow-list, plus
+    /// `note_embeddings_ann` as read-only (that table is seeded through
+    /// `insert_note_embedding`, not through `seed_child_row_for_test`). For `note_links`,
+    /// the predicate matches `src_note_id`.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the query fails or if `table` is outside the allow-list.
+    pub async fn count_child_rows_for_test(
+        &self,
+        table: &str,
+        vault_id: &str,
+        note_id: &str,
+    ) -> Result<u64, GradatumError> {
+        let conn = self.conn.lock().await;
+        let sql = match table {
+            "note_index" => "SELECT COUNT(*) FROM note_index WHERE note_id = ?1 AND vault_id = ?2",
+            "temporal_index" => {
+                "SELECT COUNT(*) FROM temporal_index WHERE note_id = ?1 AND vault_id = ?2"
+            }
+            "note_overrides" => {
+                "SELECT COUNT(*) FROM note_overrides WHERE note_id = ?1 AND vault_id = ?2"
+            }
+            "note_links" => {
+                "SELECT COUNT(*) FROM note_links WHERE src_note_id = ?1 AND vault_id = ?2"
+            }
+            // Tables migrées en Slice D2 (migration 0033) : porteuses de `vault_id`.
+            "note_audit_trail" => {
+                "SELECT COUNT(*) FROM note_audit_trail WHERE note_id = ?1 AND vault_id = ?2"
+            }
+            "note_embeddings" => {
+                "SELECT COUNT(*) FROM note_embeddings WHERE note_id = ?1 AND vault_id = ?2"
+            }
+            "note_history" => {
+                "SELECT COUNT(*) FROM note_history WHERE note_id = ?1 AND vault_id = ?2"
+            }
+            // Lecture ANN (C4-1e Slice D2) : `note_embeddings_ann` (vec0) porte `vault_id`
+            // en PARTITION KEY. Hors de la liste blanche de `seed_child_row_for_test` (un
+            // INSERT ANN exige un vecteur + l'extension vec0) : semé via `insert_note_embedding`.
+            // La requête échoue (`no such table`) si l'extension vec0 n'est pas enregistrée —
+            // l'appelant (test `#[ignore]` gaté vec0) traite l'`Err` comme « ANN absente ».
+            "note_embeddings_ann" => {
+                "SELECT COUNT(*) FROM note_embeddings_ann WHERE note_id = ?1 AND vault_id = ?2"
+            }
+            other => {
+                return Err(GradatumError::Storage(format!(
+                    "count_child_rows_for_test: table hors liste blanche : {other}"
+                )));
+            }
+        };
+        let n: i64 = conn
+            .query_row(sql, rusqlite::params![note_id, vault_id], |r| r.get(0))
+            .map_err(|e| {
+                GradatumError::Storage(format!("count_child_rows_for_test {table} : {e}"))
+            })?;
+        // COUNT(*) est toujours ≥ 0 ; `try_from` blinde contre un i64 négatif impossible.
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    /// **For test use only** — seeds an ANN row `(note_id, vault_id, embedder_id)` into a
+    /// flat "shadow" `note_embeddings_ann` table, without the `vec0` extension.
+    ///
+    /// The sqlite-vec extension is registered by the binary crates only
+    /// (`sqlite3_auto_extension` in `gradatum-server`), so the real virtual table does not
+    /// exist in `gradatum-index` tests. This helper creates a flat table carrying the
+    /// columns the GC predicate touches (`note_id`, `vault_id`); the
+    /// `CREATE TABLE IF NOT EXISTS` is a no-op when the real vec0 virtual table is already
+    /// present. That makes it possible to exercise the exact `WHERE` clause of the scoped
+    /// DELETE in [`Self::gc_orphan_ann`]: the behaviour under test is purely SQL and does
+    /// not depend on vec0 specifics (its partition-key rules apply to UPDATE, not DELETE).
+    /// Fidelity against a real vec0 table is covered separately by an `#[ignore]`d test.
+    ///
+    /// Whether a vector is "orphan" or "live" is decided by the presence of a `notes` row
+    /// with the same `(id, vault_id)`. This helper inserts ONLY the ANN row; the caller
+    /// controls the note through [`Self::seed_note_with_fts`] or `upsert_note`.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if creating the shadow table or the INSERT fails.
+    pub async fn seed_orphan_ann_for_test(
+        &self,
+        note_id: &str,
+        vault_id: &str,
+        embedder_id: &str,
+    ) -> Result<(), GradatumError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            // Schéma shadow A4 (migration 0038) : identité composite
+            // `(vault_id, embedder_id, note_id)` — image plate du PARTITION KEY vec0
+            // `(vault_id, embedder_id)` + colonne ordinaire `note_id`. Le même ULID coexiste
+            // sur deux vaults ET sur deux embedders du même vault (plus de PK globale sur
+            // `note_id`, et `embedder_id` fait partie de l'identité de partition) ; seul le
+            // triplet complet reste unique — fidèle à l'upsert scopé de `upsert_ann`.
+            //
+            // ⚠️ Une PK `(vault_id, note_id)` ici rendrait la coexistence multi-embedder
+            // structurellement impossible à semer, donc le défaut d'`upsert_ann`
+            // indétectable en test (la contrainte masquerait l'écrasement par un rejet).
+            "CREATE TABLE IF NOT EXISTS note_embeddings_ann (
+                 note_id     TEXT NOT NULL,
+                 vault_id    TEXT NOT NULL,
+                 embedder_id TEXT NOT NULL,
+                 vector      BLOB,
+                 PRIMARY KEY (vault_id, embedder_id, note_id)
+             )",
+            [],
+        )
+        .map_err(|e| {
+            GradatumError::Storage(format!(
+                "seed_orphan_ann_for_test: create shadow table: {e}"
+            ))
+        })?;
+        conn.execute(
+            "INSERT INTO note_embeddings_ann (note_id, vault_id, embedder_id, vector)
+             VALUES (?1, ?2, ?3, X'00')",
+            rusqlite::params![note_id, vault_id, embedder_id],
+        )
+        .map_err(|e| GradatumError::Storage(format!("seed_orphan_ann_for_test: insert: {e}")))?;
+        Ok(())
+    }
+
     /// Inserts a note embedding row directly — for use in bench binaries and integration tests.
     ///
     /// Inserts into `note_embeddings` only (does **not** trigger the ANN upsert path
@@ -2549,10 +3189,17 @@ impl SqliteIndex {
         let blob: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
         let computed_at = chrono::Utc::now().timestamp_millis();
         let conn = self.conn.lock().await;
+        // C4-1e (Slice D2, migration 0033) : `vault_id` (colonne NOT NULL) est résolu par
+        // sous-SELECT sur `notes` — conforme au contrat documenté de ce helper (« la note doit
+        // exister au préalable, son vault est celui de la ligne `notes` »). Signature préservée
+        // pour ne pas propager `vault_id` aux ~11 sites d'appel test/bench (tous mono-vault).
+        // Le chemin d'écriture de PRODUCTION (`insert_note_embedding_inner`) prend, lui, le
+        // `vault_id` en paramètre explicite (aucun lookup id-only). Si la note est absente, le
+        // sous-SELECT renvoie NULL → violation NOT NULL → erreur (préserve la précondition).
         conn.execute(
-            "INSERT INTO note_embeddings (note_id, embedder_id, vector, dim, model_version, computed_at)
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5)
-             ON CONFLICT(note_id, embedder_id) DO UPDATE SET
+            "INSERT INTO note_embeddings (note_id, embedder_id, vector, dim, model_version, computed_at, vault_id)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, (SELECT vault_id FROM notes WHERE id = ?1))
+             ON CONFLICT(note_id, embedder_id, vault_id) DO UPDATE SET
                  vector      = excluded.vector,
                  dim         = excluded.dim,
                  computed_at = excluded.computed_at",
@@ -2573,7 +3220,8 @@ impl SqliteIndex {
     ///
     /// O(N × dim) where N = number of notes with an embedding.
     /// For N=600, dim=1024: ~600K f32 ops ≈ 1–5 ms on a modern CPU.
-    /// Beyond N=10_000, use sqlite-vec ANN (not yet implemented).
+    /// Beyond N=10_000, use the sqlite-vec ANN path (`sqlite_vec` module, feature
+    /// `sqlite-vec-ann`) rather than this exhaustive scan.
     ///
     /// ## Filters applied
     ///
@@ -2634,7 +3282,7 @@ impl SqliteIndex {
                 .prepare(
                     "SELECT ne.note_id, ne.vector, ne.dim, n.forgotten, n.forgotten_at
                      FROM note_embeddings ne
-                     JOIN notes n ON n.id = ne.note_id
+                     JOIN notes n ON n.id = ne.note_id AND ne.vault_id = n.vault_id
                      WHERE n.vault_id = ?1
                        AND ne.embedder_id = ?2
                        AND n.status != 'downgraded'
@@ -2665,7 +3313,7 @@ impl SqliteIndex {
                 .prepare(
                     "SELECT ne.note_id, ne.vector, ne.dim, n.forgotten, n.forgotten_at
                      FROM note_embeddings ne
-                     JOIN notes n ON n.id = ne.note_id
+                     JOIN notes n ON n.id = ne.note_id AND ne.vault_id = n.vault_id
                      WHERE n.vault_id = ?1
                        AND ne.embedder_id = ?2
                        AND n.status != 'downgraded'
@@ -2712,7 +3360,7 @@ impl SqliteIndex {
                 .map(|b| {
                     f32::from_le_bytes(
                         b.try_into()
-                            .expect("chunks_exact garantit 4 bytes — invariant"),
+                            .expect("chunks_exact guarantees 4 bytes — invariant"),
                     )
                 })
                 .collect();
@@ -2738,7 +3386,7 @@ impl SqliteIndex {
             if forgotten != 0 && forgotten_at_ms.is_none() {
                 tracing::warn!(
                     note_id = %id_str,
-                    "search_semantic: forgotten=1 mais forgotten_at=NULL — état incohérent"
+                    "search_semantic: forgotten=1 but forgotten_at=NULL — inconsistent state"
                 );
             }
             // P2-R4 : decay forgotten sur score cosine (valeur POSITIVE — × 0.5^d réduit le score).
@@ -2844,7 +3492,7 @@ impl SqliteIndex {
                 None
             } else {
                 Some(serde_json::to_string(&note.frontmatter.extra).map_err(|e| {
-                    GradatumError::Storage(format!("sérialisation extra_json : {e}"))
+                    GradatumError::Storage(format!("extra_json serialization: {e}"))
                 })?)
             };
 
@@ -2869,16 +3517,16 @@ impl SqliteIndex {
                 content_hash, version, body_text, integrity_signature, extra_json, tags,
                 c_kind, doc_kind, provenance, trust
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
-            ON CONFLICT(id) DO UPDATE SET
+            ON CONFLICT(vault_id, id) DO UPDATE SET
                 vault_id             = excluded.vault_id,
-                -- P1-1 (F-37 S1.4) : préserver un locus modifié via update_note_locus.
-                -- `update_note_locus` écrit notes.locus index-level SANS réécrire le .md
-                -- (le content_hash reste inchangé). Un re-upsert ultérieur depuis le .md
-                -- stale fournirait l'ancien locus (ou NULL) du frontmatter inchangé : il ne
-                -- DOIT PAS écraser le locus déplacé. Discriminant = content_hash :
-                --   hash inchangé (re-upsert même contenu) → conserver notes.locus (déplacé).
-                --   hash modifié  (vrai changement de contenu/frontmatter) → appliquer excluded.locus.
-                -- `IS NOT` gère NULL correctement (mêmes blobs → égalité).
+                -- P1-1 (F-37 S1.4): preserve a locus modified via update_note_locus.
+                -- `update_note_locus` writes notes.locus index-level WITHOUT rewriting the .md
+                -- (the content_hash stays unchanged). A later re-upsert from the stale .md
+                -- would supply the old locus (or NULL) of the unchanged frontmatter: it must
+                -- NOT overwrite the moved locus. Discriminant = content_hash:
+                --   unchanged hash (re-upsert same content) → keep notes.locus (moved).
+                --   changed hash   (real content/frontmatter change) → apply excluded.locus.
+                -- `IS NOT` handles NULL correctly (same blobs → equality).
                 locus                = CASE
                                          WHEN notes.content_hash IS NOT excluded.content_hash
                                            THEN excluded.locus
@@ -2902,15 +3550,16 @@ impl SqliteIndex {
                 c_kind               = excluded.c_kind,
                 doc_kind             = excluded.doc_kind,
                 provenance           = excluded.provenance,
-                -- P1-1 : préserver un trust dynamique posé par set_note_trust (F-22).
-                -- Le trust statique dérivé de provenance ne doit écraser l'existant QUE si
-                -- la provenance change. Provenance inchangée → conserver notes.trust courant
-                -- (qui peut être un trust distillé dynamique). `IS NOT` gère NULL correctement.
+                -- P1-1: preserve a dynamic trust set by set_note_trust (F-22).
+                -- The static trust derived from provenance must overwrite the existing one ONLY if
+                -- the provenance changes. Unchanged provenance → keep the current notes.trust
+                -- (which may be a dynamic distilled trust). `IS NOT` handles NULL correctly.
                 trust                = CASE
                                          WHEN notes.provenance IS NOT excluded.provenance
                                            THEN excluded.trust
                                          ELSE notes.trust
-                                       END",
+                                       END
+            WHERE notes.vault_id = excluded.vault_id",
             rusqlite::params![
                 id_str,
                 vault_id,
@@ -2941,28 +3590,42 @@ impl SqliteIndex {
 
         // Maintien FTS5 : INSERT OR REPLACE synchronise rowid + body_text + tags.
         // `content=notes` exige que rowid FTS = rowid de la table notes (même entier).
+        // C4-1d (P1 security review) : le rowid est résolu par `(id, vault_id)` — avec la PK
+        // composite chaque vault a sa propre ligne/rowid, donc son entrée FTS. Un `WHERE id=?`
+        // seul renverrait le rowid d'un AUTRE vault en collision d'ULID → clobber cross-vault.
         // Réutilise `tags_str` déjà calculé pour notes.tags (migration 0003) — pas de duplication.
         conn.execute(
             "INSERT OR REPLACE INTO notes_fts (rowid, body_text, tags)
-             VALUES ((SELECT rowid FROM notes WHERE id = ?1), ?2, ?3)",
-            rusqlite::params![id_str, note.body.markdown.as_str(), tags_str],
+             VALUES ((SELECT rowid FROM notes WHERE id = ?1 AND vault_id = ?4), ?2, ?3)",
+            rusqlite::params![id_str, note.body.markdown.as_str(), tags_str, vault_id],
         )
         .map_err(|e| GradatumError::Storage(format!("INSERT notes_fts : {e}")))?;
 
         Ok(())
     }
 
-    /// Reads the trust score for a note from the `notes.trust` column.
+    /// Reads the trust score for a note from the `notes.trust` column, scoped to `vault_id`.
     ///
-    /// Returns `Some(trust)` if the note exists and trust is non-NULL, `None` otherwise.
-    /// Stored but not consumed by scoring until trust-decay was wired in v0.4.1.
-    pub async fn get_trust(&self, id: &NoteId) -> Result<Option<f32>, GradatumError> {
+    /// Returns `Some(trust)` if the note exists in `vault_id` and trust is non-NULL,
+    /// `None` otherwise. The value feeds trust-decay scoring; see
+    /// [`Self::get_trust_and_provenance`] when the provenance is needed as well.
+    ///
+    /// The lookup is keyed on `(vault_id, id)`, never on the id alone: `notes` has had a
+    /// composite primary key since migration 0032, so a bare `WHERE id = ?` would return,
+    /// on an ULID collision, the trust of a row belonging to ANOTHER vault.
+    pub async fn get_trust(
+        &self,
+        vault_id: &str,
+        id: &NoteId,
+    ) -> Result<Option<f32>, GradatumError> {
         let conn = self.conn.lock().await;
         let id_str = id.to_string();
 
-        match conn.query_row("SELECT trust FROM notes WHERE id = ?1", [&id_str], |row| {
-            row.get::<_, Option<f64>>(0)
-        }) {
+        match conn.query_row(
+            "SELECT trust FROM notes WHERE id = ?1 AND vault_id = ?2",
+            rusqlite::params![id_str, vault_id],
+            |row| row.get::<_, Option<f64>>(0),
+        ) {
             Ok(Some(v)) => Ok(Some(v as f32)),
             Ok(None) => Ok(None),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -3009,40 +3672,74 @@ impl SqliteIndex {
     /// the static value after writing the synthesis note.
     ///
     /// This method is the sole write point for trust values computed outside `TRUST_SCORES`.
-    /// Idempotent — `UPDATE notes SET trust = ?2 WHERE id = ?1`.
+    /// Idempotent.
+    ///
+    /// ## Vault scoping
+    ///
+    /// The mutation filters `WHERE id = <note_id> AND vault_id = <vault_id>` (mirrors
+    /// [`Self::get_trust_and_provenance`]). Without the `vault_id` predicate a write
+    /// targeting one vault would overwrite the trust of a homonymous note (same ULID)
+    /// in another vault. Byte-identical in the single-vault regime: the note is resolved
+    /// in its own vault upstream, so the predicate removes no legitimate row.
     ///
     /// # Return value
     ///
-    /// Returns the number of rows affected (`0` if the note is absent — non-fatal
-    /// for the caller: the static value from `provenance` remains in place).
+    /// Returns the number of rows affected (`0` if no note matches `(vault_id, note_id)` —
+    /// non-fatal for the caller: the static value from `provenance` remains in place).
     ///
     /// # Errors
     ///
     /// `GradatumError::Storage` if the `UPDATE` fails.
-    #[must_use = "le nombre de lignes affectées indique si la note existait"]
-    pub async fn set_note_trust(&self, id: &NoteId, trust: f32) -> Result<usize, GradatumError> {
+    #[must_use = "the number of affected rows indicates whether the note existed"]
+    pub async fn set_note_trust(
+        &self,
+        vault_id: &str,
+        id: &NoteId,
+        trust: f32,
+    ) -> Result<usize, GradatumError> {
         let conn = self.conn.lock().await;
         let id_str = id.to_string();
         conn.execute(
-            "UPDATE notes SET trust = ?2 WHERE id = ?1",
-            rusqlite::params![id_str, f64::from(trust)],
+            "UPDATE notes SET trust = ?3 WHERE id = ?1 AND vault_id = ?2",
+            rusqlite::params![id_str, vault_id, f64::from(trust)],
         )
         .map_err(|e| GradatumError::Storage(format!("set_note_trust : {e}")))
     }
 
-    pub async fn get_content_hash(&self, id: NoteId) -> Result<Option<ContentHash>, GradatumError> {
+    /// Returns the stored `ContentHash` of a note within a vault, if present.
+    ///
+    /// ## Vault scoping
+    ///
+    /// The read filters `WHERE id = <id> AND vault_id = <vault_id>` (mirrors
+    /// [`Self::get_trust_and_provenance`]). With the composite primary key
+    /// `(vault_id, id)` (migration 0032), a homonymous note (same ULID) in another
+    /// vault also satisfies an id-only predicate; `query_row` would then return an
+    /// arbitrary row's hash. This method is the freshness source of the moka cache
+    /// validator (vault layer): an unscoped hash breaks cache invalidation. Byte-identical
+    /// in the single-vault regime — the note is resolved in its own vault, so the
+    /// predicate removes no legitimate row.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the query fails or the stored hash is shorter than
+    /// 32 bytes (corrupted row).
+    pub async fn get_content_hash(
+        &self,
+        vault_id: &str,
+        id: NoteId,
+    ) -> Result<Option<ContentHash>, GradatumError> {
         let conn = self.conn.lock().await;
         let id_str = id.to_string();
 
         match conn.query_row(
-            "SELECT content_hash FROM notes WHERE id = ?1",
-            [&id_str],
+            "SELECT content_hash FROM notes WHERE id = ?1 AND vault_id = ?2",
+            rusqlite::params![id_str, vault_id],
             |row| row.get::<_, Vec<u8>>(0),
         ) {
             Ok(bytes) => {
                 if bytes.len() < 32 {
                     return Err(GradatumError::Storage(format!(
-                        "content_hash trop court ({} bytes) pour NoteId {id_str}",
+                        "content_hash too short ({} bytes) for NoteId {id_str}",
                         bytes.len()
                     )));
                 }
@@ -3185,7 +3882,7 @@ impl SqliteIndex {
                     tracing::warn!(
                         id = %id_str,
                         err = %e,
-                        "list_review_queue: id non-ULID ignoré (ligne skippée)"
+                        "list_review_queue: non-ULID id ignored (row skipped)"
                     );
                     continue;
                 }
@@ -3271,6 +3968,420 @@ impl SqliteIndex {
         Ok(out)
     }
 
+    /// Per-vault variant of `find_promotable`: same predicate, restricted to `vault_id`.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the SQLite query fails.
+    pub async fn find_promotable_in_vault(
+        &self,
+        vault_id: &str,
+        cutoff_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, NoteStatus)>, GradatumError> {
+        let conn = self.conn.lock().await;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, status FROM notes
+                 WHERE vault_id = ?1
+                   AND status IN ('staging', 'pending-review')
+                   AND COALESCE(status_changed, created) < ?2
+                   AND id NOT LIKE '__sentinel__%'
+                 ORDER BY COALESCE(status_changed, created) ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| {
+                GradatumError::Storage(format!("prepare find_promotable_in_vault: {e}"))
+            })?;
+
+        let rows = stmt
+            .query_map(
+                rusqlite::params![vault_id, cutoff_ms, limit as i64],
+                |row| {
+                    let id: String = row.get(0)?;
+                    let status_str: String = row.get(1)?;
+                    Ok((id, status_str))
+                },
+            )
+            .map_err(|e| GradatumError::Storage(format!("query find_promotable_in_vault: {e}")))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, status_str) = r.map_err(|e| {
+                GradatumError::Storage(format!("row find_promotable_in_vault: {e}"))
+            })?;
+            let quoted = format!("\"{}\"", status_str);
+            let status: NoteStatus = serde_json::from_str(&quoted).map_err(|e| {
+                GradatumError::Storage(format!(
+                    "find_promotable_in_vault: parse NoteStatus '{status_str}': {e}"
+                ))
+            })?;
+            out.push((id, status));
+        }
+        Ok(out)
+    }
+
+    /// Lists the active vaults (`tenants.status = 'active'`, sorted by id).
+    ///
+    /// This is the iteration source for per-vault background jobs: a job runs once per
+    /// active vault and never across vault boundaries.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the SQLite query fails.
+    pub async fn list_active_vaults(&self) -> Result<Vec<String>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT id FROM tenants WHERE status = 'active' ORDER BY id")
+            .map_err(|e| GradatumError::Storage(format!("prepare list_active_vaults: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| GradatumError::Storage(format!("query list_active_vaults: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(
+                r.map_err(|e| GradatumError::Storage(format!("row list_active_vaults: {e}")))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Provisions a vault: one transaction inserting the `tenants` row and its own
+    /// self-grant with `write` access.
+    ///
+    /// Idempotent — both statements are `INSERT OR IGNORE`, so replaying the call on an
+    /// existing vault returns `Ok(false)`.
+    ///
+    /// ## Registry guard — `tenants` ∩ `code_vault` = ∅ (lot REG)
+    ///
+    /// Two vault registries coexist and carry **incompatible** lifecycles:
+    /// `tenants` governs DATA vaults (status `active`/`suspended`/`deleted`,
+    /// iterated by background jobs through [`SqliteIndex::list_active_vaults`]); `code_vault`
+    /// governs vaults DERIVED from git (regenerated on every refresh, outside the lifecycle).
+    /// Today, `code-*` notes escape distill/decay only because their vault is NOT
+    /// recorded in `tenants` — that is an **absence**, not a guard.
+    /// Provisioning a code vault would therefore make it eligible for distill by mere oversight.
+    ///
+    /// The refusal rests on TWO criteria, not one: the `code-` prefix (lexical, free) and
+    /// the actual presence of a row in `code_vault` — this second criterion covers a
+    /// legacy row without the prefix, which a lexical test alone would let through.
+    /// The in-transaction check does NOT guard against a concurrent `code ingest`
+    /// race — that race is unreachable (both lexical prefix guards contradict each
+    /// other: a vault_id would need to both start and not start with `code-`).
+    /// Its real value: legacy rows in `code_vault` created before the prefix guard
+    /// existed at the write site.
+    ///
+    /// # Errors
+    ///
+    /// - [`GradatumError::InvalidInput`] if `vault_id` belongs to the code registry
+    ///   (`code-` prefix, or a `code_vault` row already present) — fail-closed, never recorded.
+    /// - [`GradatumError::Storage`] if the transaction fails.
+    pub async fn provision_vault(&self, vault_id: &str) -> Result<bool, GradatumError> {
+        // Barreau lexical — sans I/O, refusé avant même d'ouvrir la transaction.
+        if vault_id.starts_with("code-") {
+            return Err(GradatumError::InvalidInput(format!(
+                "provision_vault: vault_id '{vault_id}' belongs to the code registry \
+                 (prefix 'code-') — code vaults are never recorded in `tenants` \
+                 (incompatible lifecycles: recording them would make them eligible \
+                 for distill/decay)"
+            )));
+        }
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| GradatumError::Storage(format!("provision_vault begin: {e}")))?;
+        // Barreau registre — couvre une ligne `code_vault` héritée sans préfixe `code-`.
+        let already_code_vault: bool = tx
+            .query_row(
+                "SELECT 1 FROM code_vault WHERE vault_id = ?1",
+                rusqlite::params![vault_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| GradatumError::Storage(format!("provision_vault code_vault: {e}")))?
+            .is_some();
+        if already_code_vault {
+            return Err(GradatumError::InvalidInput(format!(
+                "provision_vault: vault_id '{vault_id}' is already recorded in the code \
+                 registry (`code_vault`) — a vault belongs to exactly one registry"
+            )));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let tenant_rows = tx
+            .execute(
+                "INSERT OR IGNORE INTO tenants (id, status, created_at) VALUES (?1, 'active', ?2)",
+                rusqlite::params![vault_id, now],
+            )
+            .map_err(|e| GradatumError::Storage(format!("provision_vault tenants: {e}")))?;
+        let grant_rows = tx
+            .execute(
+                "INSERT OR IGNORE INTO tenant_vault_grants (tenant_id, vault_id, access)
+                 VALUES (?1, ?1, 'write')",
+                rusqlite::params![vault_id],
+            )
+            .map_err(|e| GradatumError::Storage(format!("provision_vault grants: {e}")))?;
+        tx.commit()
+            .map_err(|e| GradatumError::Storage(format!("provision_vault commit: {e}")))?;
+        Ok(tenant_rows + grant_rows > 0)
+    }
+
+    /// Changes the status of a tenant. Returns `Ok(None)` when the tenant is unknown,
+    /// `Ok(Some(false))` when the status was already the requested one.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the read or the write fails.
+    pub async fn set_tenant_status(
+        &self,
+        vault_id: &str,
+        status: gradatum_core::scope::TenantStatus,
+    ) -> Result<Option<bool>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tenants WHERE id = ?1",
+                rusqlite::params![vault_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| GradatumError::Storage(format!("set_tenant_status read: {e}")))?;
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        if current == status.as_db_str() {
+            return Ok(Some(false));
+        }
+        conn.execute(
+            "UPDATE tenants SET status = ?1 WHERE id = ?2",
+            rusqlite::params![status.as_db_str(), vault_id],
+        )
+        .map_err(|e| GradatumError::Storage(format!("set_tenant_status update: {e}")))?;
+        Ok(Some(true))
+    }
+
+    /// Reads the status of a tenant. Returns `Ok(None)` when the tenant is unknown.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the read fails, or if the row carries a status outside
+    /// the known domain — fail-closed: an unknown value is never coerced into a valid one.
+    pub async fn get_tenant_status(
+        &self,
+        vault_id: &str,
+    ) -> Result<Option<gradatum_core::scope::TenantStatus>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tenants WHERE id = ?1",
+                rusqlite::params![vault_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| GradatumError::Storage(format!("get_tenant_status: {e}")))?;
+        match raw {
+            None => Ok(None),
+            Some(s) => gradatum_core::scope::TenantStatus::from_db_str(&s)
+                .map(Some)
+                .ok_or_else(|| {
+                    GradatumError::Storage(format!(
+                        "get_tenant_status: unknown status '{s}' for tenant '{vault_id}'"
+                    ))
+                }),
+        }
+    }
+
+    /// Lists the ULIDs of every note in a vault (any status, sentinels excluded) together
+    /// with the absolute total, `limit` being clamped to `[1, 500]`.
+    ///
+    /// Used to decide whether a soft-deleted vault is eligible for purge.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if one of the queries fails.
+    pub async fn list_vault_note_ulids(
+        &self,
+        vault_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<String>, u64), GradatumError> {
+        let conn = self.conn.lock().await;
+        let limit_clamped = limit.clamp(1, 500) as i64;
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes
+                 WHERE vault_id = ?1 AND id NOT LIKE '__sentinel__%'",
+                [vault_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| GradatumError::Storage(format!("list_vault_note_ulids count: {e}")))?;
+        // Pattern E0597 : stmt dans le même bloc que le collect.
+        let ulids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM notes
+                     WHERE vault_id = ?1 AND id NOT LIKE '__sentinel__%'
+                     ORDER BY id ASC
+                     LIMIT ?2",
+                )
+                .map_err(|e| {
+                    GradatumError::Storage(format!("list_vault_note_ulids prepare: {e}"))
+                })?;
+            stmt.query_map(rusqlite::params![vault_id, limit_clamped], |row| row.get(0))
+                .map_err(|e| GradatumError::Storage(format!("list_vault_note_ulids query: {e}")))?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(|e| GradatumError::Storage(format!("list_vault_note_ulids row: {e}")))?
+        };
+        Ok((ulids, total as u64))
+    }
+
+    /// Projected note scan feeding the retrospective audit and deduplication pass.
+    ///
+    /// Returns up to `limit` non-sentinel notes of `vault_id`, **excluding** every
+    /// [`gradatum_core::section::Section::PROTECTED_DELETE`] section (the perimeter is derived from the constant,
+    /// never hardcoded, so it follows any governance change) and notes in a terminal
+    /// lifecycle state (`downgraded`, `garbage`) — the latter are already out of the
+    /// vault's active surface (garbage is pre-GC), so flagging them again adds nothing and
+    /// would only inflate the denominator. Each row carries `author_id` and its body
+    /// embedding when present (the first `note_embeddings` row for the note; in degraded
+    /// ANN mode the embedding is simply `None`).
+    ///
+    /// The embedding fetch is a single per-vault query joined in memory (no N+1), consistent
+    /// with the bounded scan size.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if any SQLite query fails.
+    pub async fn audit_scan_inner(
+        &self,
+        vault_id: &str,
+        limit: usize,
+    ) -> Result<Vec<gradatum_core::AuditScanRow>, GradatumError> {
+        use gradatum_core::section::Section;
+        use rusqlite::types::Value as SqlVal;
+        use std::collections::HashMap;
+
+        // (id, section, title, author_id, created, trust, status, body_text)
+        type AuditNoteRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<f64>,
+            String,
+            String,
+        );
+
+        let conn = self.conn.lock().await;
+
+        // 1. Notes (id, section, body + F-111 created/trust/status) — sections protégées exclues.
+        let protected_ph = Section::PROTECTED_DELETE
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let notes_sql = format!(
+            "SELECT id, section, title, author_id, created, trust, status, body_text FROM notes
+                 WHERE vault_id = ?
+                   AND status NOT IN ('downgraded', 'garbage')
+                   AND id NOT LIKE '__sentinel__%'
+                   AND section NOT IN ({protected_ph})
+                 ORDER BY id ASC
+                 LIMIT ?"
+        );
+        let notes: Vec<AuditNoteRow> = {
+            let mut binds: Vec<SqlVal> = vec![SqlVal::Text(vault_id.to_string())];
+            binds.extend(
+                Section::PROTECTED_DELETE
+                    .iter()
+                    .map(|s| SqlVal::Text(s.as_str().to_string())),
+            );
+            binds.push(SqlVal::Integer(limit as i64));
+            let mut stmt = conn
+                .prepare(&notes_sql)
+                .map_err(|e| GradatumError::Storage(format!("audit_scan prepare notes: {e}")))?;
+            stmt.query_map(rusqlite::params_from_iter(binds), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<f64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|e| GradatumError::Storage(format!("audit_scan query notes: {e}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| GradatumError::Storage(format!("audit_scan collect notes: {e}")))?
+        };
+
+        // 2. Embeddings du vault (un seul balayage, jointure en mémoire).
+        let mut emb: HashMap<String, (String, Vec<f32>)> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ne.note_id, ne.embedder_id, ne.vector
+                     FROM note_embeddings ne
+                     JOIN notes n ON n.id = ne.note_id AND ne.vault_id = n.vault_id
+                     WHERE n.vault_id = ?1",
+                )
+                .map_err(|e| GradatumError::Storage(format!("audit_scan prepare emb: {e}")))?;
+            let rows = stmt
+                .query_map(rusqlite::params![vault_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|e| GradatumError::Storage(format!("audit_scan query emb: {e}")))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| GradatumError::Storage(format!("audit_scan collect emb: {e}")))?;
+            for (note_id, embedder_id, blob) in rows {
+                if blob.len() % 4 != 0 {
+                    continue; // BLOB malformé — skip (mode dégradé toléré).
+                }
+                let vec: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|b| {
+                        f32::from_le_bytes(
+                            b.try_into()
+                                .expect("chunks_exact guarantees 4 bytes — invariant"),
+                        )
+                    })
+                    .collect();
+                emb.entry(note_id).or_insert((embedder_id, vec));
+            }
+        }
+
+        let out = notes
+            .into_iter()
+            .map(
+                |(note_id, section, title, author_id, created_ms, trust, status, body_text)| {
+                    let (embedder_id, embedding) = match emb.remove(&note_id) {
+                        Some((eid, v)) => (Some(eid), Some(v)),
+                        None => (None, None),
+                    };
+                    gradatum_core::AuditScanRow {
+                        note_id,
+                        section,
+                        title,
+                        author_id,
+                        created_ms,
+                        trust,
+                        status,
+                        body_text,
+                        embedding,
+                        embedder_id,
+                    }
+                },
+            )
+            .collect();
+        Ok(out)
+    }
+
     /// Lists `status=Garbage` notes older than the given cutoff (purge lifecycle).
     ///
     /// Returns the `NoteId` values of notes where `status_changed <= cutoff_ms` (UTC
@@ -3287,27 +4398,55 @@ impl SqliteIndex {
     ///
     /// Only notes with `status = 'garbage'` at query time are returned.
     /// The Purge handler re-checks each note's status at delete time (TOCTOU mitigation).
+    ///
+    /// ## Protected sections excluded (defence in depth)
+    ///
+    /// Notes whose section is in [`gradatum_core::section::Section::PROTECTED_DELETE`] are **never**
+    /// returned as Purge candidates: the job does not even see them. This is a
+    /// second layer behind the load-bearing cascade choke point — the perimeter
+    /// is derived from the constant (never hardcoded), so it follows any change
+    /// to the governance list.
     pub async fn list_garbage_older_than(
         &self,
         vault_id: &str,
         cutoff_ms: i64,
     ) -> Result<Vec<NoteId>, GradatumError> {
+        use gradatum_core::section::Section;
+        use rusqlite::types::Value as SqlVal;
+
         let conn = self.conn.lock().await;
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT id FROM notes
-                 WHERE vault_id = ?1
+        // Placeholders + binds dérivés de PROTECTED_DELETE (jamais de littéral).
+        let protected_ph = Section::PROTECTED_DELETE
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id FROM notes
+                 WHERE vault_id = ?
                    AND status = 'garbage'
-                   AND COALESCE(status_changed, created) <= ?2
-                 ORDER BY COALESCE(status_changed, created) ASC",
-            )
-            .map_err(|e| {
-                GradatumError::Storage(format!("prepare list_garbage_older_than : {e}"))
-            })?;
+                   AND COALESCE(status_changed, created) <= ?
+                   AND section NOT IN ({protected_ph})
+                 ORDER BY COALESCE(status_changed, created) ASC"
+        );
+        // Ordre EXACT des `?` : vault_id, cutoff_ms, puis les sections protégées.
+        let mut binds: Vec<SqlVal> = vec![
+            SqlVal::Text(vault_id.to_string()),
+            SqlVal::Integer(cutoff_ms),
+        ];
+        binds.extend(
+            Section::PROTECTED_DELETE
+                .iter()
+                .map(|s| SqlVal::Text(s.as_str().to_string())),
+        );
+
+        let mut stmt = conn.prepare(&sql).map_err(|e| {
+            GradatumError::Storage(format!("prepare list_garbage_older_than : {e}"))
+        })?;
 
         let rows = stmt
-            .query_map(rusqlite::params![vault_id, cutoff_ms], |row| {
+            .query_map(rusqlite::params_from_iter(binds), |row| {
                 row.get::<_, String>(0)
             })
             .map_err(|e| GradatumError::Storage(format!("query list_garbage_older_than : {e}")))?;
@@ -3556,7 +4695,7 @@ impl SqliteIndex {
         if query.len() > 512 {
             return Err(GradatumError::Validation(ValidationError::InvalidInput(
                 format!(
-                    "search_fts_for_forget: query trop longue ({} > 512 chars)",
+                    "search_fts_for_forget: query too long ({} > 512 chars)",
                     query.len()
                 ),
             )));
@@ -3681,14 +4820,25 @@ impl SqliteIndex {
     /// Direct read from `notes.replaced_by`. Used in integration tests to verify
     /// that the `replaced_by` field is persisted correctly after `patch_note`.
     ///
+    /// ## Vault scoping
+    ///
+    /// The query filters `WHERE id = <note_id> AND vault_id = <vault_id>` — a note owned
+    /// by another vault yields `None`, identical to a truly absent note (no cross-vault
+    /// leak of `replaced_by`). At `multi_tenant.enabled = false` the vault is always
+    /// `main`, so the predicate is transparent (byte-identical).
+    ///
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` on an unexpected SQLite error.
-    pub async fn get_replaced_by(&self, note_id: &str) -> Result<Option<String>, GradatumError> {
+    pub async fn get_replaced_by(
+        &self,
+        vault_id: &str,
+        note_id: &str,
+    ) -> Result<Option<String>, GradatumError> {
         let conn = self.conn.lock().await;
         let result = conn.query_row(
-            "SELECT replaced_by FROM notes WHERE id = ?1",
-            rusqlite::params![note_id],
+            "SELECT replaced_by FROM notes WHERE id = ?1 AND vault_id = ?2",
+            rusqlite::params![note_id, vault_id],
             |row| row.get::<_, Option<String>>(0),
         );
         match result {
@@ -3709,16 +4859,27 @@ impl SqliteIndex {
     /// - Non-fatal: orphan redirects do not block resolution
     ///   (they simply return a ULID for an absent note).
     ///
-    /// ## Parameter
+    /// ## Vault scoping
     ///
-    /// `ulid_str`: textual ULID representation (26 chars, standard format).
-    pub async fn delete_redirect_by_ulid(&self, ulid_str: &str) -> Result<usize, GradatumError> {
+    /// The `DELETE` is scoped `WHERE vault_id = ?1 AND ulid = ?2` (composite PK
+    /// `(vault_id, title_slug)`, migration 0035). Without the `vault_id` predicate, a
+    /// purge in one vault could delete a homonymous redirect (same ULID) in another.
+    ///
+    /// ## Parameters
+    ///
+    /// - `vault_id`: namespace of the purged note.
+    /// - `ulid_str`: textual ULID representation (26 chars, standard format).
+    pub async fn delete_redirect_by_ulid(
+        &self,
+        vault_id: &str,
+        ulid_str: &str,
+    ) -> Result<usize, GradatumError> {
         let conn = self.conn.lock().await;
 
         let n = conn
             .execute(
-                "DELETE FROM redirect_table WHERE ulid = ?1",
-                rusqlite::params![ulid_str],
+                "DELETE FROM redirect_table WHERE vault_id = ?1 AND ulid = ?2",
+                rusqlite::params![vault_id, ulid_str],
             )
             .map_err(|e| GradatumError::Storage(format!("delete_redirect_by_ulid : {e}")))?;
 
@@ -3727,13 +4888,35 @@ impl SqliteIndex {
 
     /// Deletes a note from the SQLite index (`notes` table + FTS `notes_fts`).
     ///
-    /// Atomic two-pass operation on the same locked connection:
+    /// This is a real row deletion, not a status change: the body text stored in `notes`
+    /// and its FTS shadow are removed. Steps, in order, on the same locked connection:
     ///
     /// 1. Fetches the SQLite `rowid` of the note (required for FTS).
     /// 2. Deletes from `notes_fts` (FTS5 `content=notes` table, no automatic trigger).
-    /// 3. Deletes from `notes` → cascades automatically to `note_audit_trail`,
-    ///    `note_index`, `note_embeddings`, `note_overrides`, `note_history`
-    ///    (`FOREIGN KEY … ON DELETE CASCADE` defined in migration 0001).
+    /// 3. Deletes from `temporal_index`, scoped `(note_id, vault_id)`.
+    /// 4. Deletes from `note_embeddings_ann` (the vec0 ANN table) — tolerated if the table
+    ///    or the extension is absent (degraded mode), propagated on any other error.
+    /// 5. MANUAL cascade, scoped by `vault_id` plus the child's own note column
+    ///    (`note_id`, except `note_links` which is keyed on `src_note_id`), over the child
+    ///    tables `note_index`, `note_overrides`, `note_links`, `note_audit_trail`,
+    ///    `note_embeddings` and `note_history`. The original
+    ///    `REFERENCES notes(id) ON DELETE CASCADE` foreign keys (migration 0001) were
+    ///    REMOVED by migration 0032, being incompatible with the composite primary key
+    ///    `(vault_id, id)`, so deleting the child rows has to be explicit here.
+    ///
+    ///    Since migration 0039, `note_audit_trail`, `note_embeddings` and `note_history`
+    ///    carry a composite foreign key `(vault_id, note_id) → notes(vault_id, id)
+    ///    ON DELETE CASCADE`. The manual cascade is nevertheless kept as defence in depth:
+    ///    it purges those children BEFORE the parent DELETE, which then cascades over zero
+    ///    remaining rows. `note_index`, `note_overrides` and `note_links` do NOT carry that
+    ///    foreign key, so their deletion remains manual only.
+    /// 6. Deletes the `notes` row itself.
+    ///
+    /// ## Atomicity
+    ///
+    /// FTS, `temporal_index`, `note_embeddings_ann` and the `notes` cascade are wrapped
+    /// in a single `unchecked_transaction` on the locked connection: either the whole
+    /// note is purged or nothing is (no partial state visible after a mid-cascade error).
     ///
     /// ## Note
     ///
@@ -3769,8 +4952,14 @@ impl SqliteIndex {
             return Ok(false);
         };
 
+        // Transaction atomique (F-100) : FTS + temporal + ANN + notes (cascade)
+        // sont indivisibles. Un échec en cours de cascade rollback l'ensemble.
+        let tx = conn.unchecked_transaction().map_err(|e| {
+            GradatumError::Storage(format!("delete_note_from_index begin tx : {e}"))
+        })?;
+
         // Supprimer de la FTS (table `content=notes` sans trigger automatique).
-        conn.execute(
+        tx.execute(
             "DELETE FROM notes_fts WHERE rowid = ?1",
             rusqlite::params![rowid],
         )
@@ -3778,23 +4967,139 @@ impl SqliteIndex {
 
         // Suppression explicite dans temporal_index (caveat C7 — PRAGMA foreign_keys
         // non garanti → pas de ON DELETE CASCADE fiable, DELETE explicite obligatoire).
-        conn.execute(
-            "DELETE FROM temporal_index WHERE note_id = ?1",
-            rusqlite::params![note_id],
+        // C4-1e (Slice D1) : scopé `(note_id, vault_id)` — `temporal_index` porte `vault_id`.
+        // Sans ce prédicat, un delete ciblant un vault effacerait l'entrée temporelle d'une
+        // note homonyme (même ULID) d'un autre vault (`temporal_index.note_id` est PK seule).
+        tx.execute(
+            "DELETE FROM temporal_index WHERE note_id = ?1 AND vault_id = ?2",
+            rusqlite::params![note_id, vault_id],
         )
         .map_err(|e| {
             GradatumError::Storage(format!("delete_note_from_index temporal_index : {e}"))
         })?;
 
-        // Supprimer de `notes` → cascade sur toutes les tables liées.
-        let deleted = conn
+        // Purger l'index ANN vec0 (F-100 1.1) — même transaction que la cascade `notes`.
+        // Mode dégradé toléré : table/extension absente = pas d'erreur (symétrique
+        // avec `upsert_ann`). Toute autre erreur SQL est propagée → rollback.
+        //
+        // C4-1e (Slice D2) : scopé `(note_id, vault_id)`. `note_embeddings_ann` porte
+        // `vault_id` et `embedder_id` en PARTITION KEY vec0 (migration 0038) ; les lectures
+        // ANN filtrent déjà `WHERE ann.vault_id = ?1`. Sans le prédicat de vault, un delete
+        // ciblant un vault détruirait le vecteur ANN d'une note homonyme (même ULID) d'un
+        // autre vault. Le prédicat de partition restreint la suppression au vault ciblé
+        // (no-op si l'ULID appartient à un autre vault) → parité avec la cascade `notes`.
+        //
+        // DÉLIBÉRÉMENT non scopé par `embedder_id` (contrairement à `upsert_ann`) : la note
+        // disparaît entièrement, donc TOUTES ses lignes ANN — une par partition d'embedder —
+        // doivent partir. Un scope par embedder laisserait ici des orphelins.
+        match tx.execute(
+            "DELETE FROM note_embeddings_ann WHERE note_id = ?1 AND vault_id = ?2",
+            rusqlite::params![note_id, vault_id],
+        ) {
+            Ok(_) => {}
+            Err(e) if crate::sqlite_vec::is_ann_absent_error(&e) => {
+                // Table `note_embeddings_ann` absente (migration 0020 non appliquée)
+                // ou module `vec0` non chargé → mode dégradé, no-op toléré.
+            }
+            Err(e) => {
+                return Err(GradatumError::Storage(format!(
+                    "delete_note_from_index ann : {e}"
+                )));
+            }
+        }
+
+        // Cascade MANUELLE des tables enfants (C4-1d, option C) : les FK `REFERENCES notes(id)`
+        // ON DELETE CASCADE ont été RETIRÉES par la migration 0032 (incompatibles avec la PK
+        // composite `(vault_id, id)`). La suppression des lignes filles est donc explicite ici.
+        //
+        // C4-1e (Slices D1 + D2) : les enfants porteurs d'une colonne `vault_id` sont
+        // supprimés scopés `(note_id, vault_id)` — sans quoi un delete ciblant un vault
+        // effacerait la ligne fille d'une note homonyme (même ULID) d'un autre vault.
+        // Détail des clés : `note_index`/`note_overrides`/`note_audit_trail`/`note_embeddings`/
+        // `note_history` sont note_id-keyed ; `note_links` a une PK
+        // `(src_note_id, dst_note_id, vault_id)`. `note_audit_trail`/`note_embeddings`/
+        // `note_history` ont reçu `vault_id` à la migration 0033 (Slice D2) → désormais
+        // scopés au même titre que les enfants D1. Parité cascade FK d'origine : `note_links`
+        // ne cascadait que sur `src_note_id`.
+        for (table, col) in [
+            ("note_index", "note_id"),
+            ("note_overrides", "note_id"),
+            ("note_links", "src_note_id"),
+            ("note_audit_trail", "note_id"),
+            ("note_embeddings", "note_id"),
+            ("note_history", "note_id"),
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE {col} = ?1 AND vault_id = ?2"),
+                rusqlite::params![note_id, vault_id],
+            )
+            .map_err(|e| GradatumError::Storage(format!("delete_note_from_index {table} : {e}")))?;
+        }
+
+        // Supprimer de `notes` (les enfants ont été purgés manuellement ci-dessus).
+        let deleted = tx
             .execute(
                 "DELETE FROM notes WHERE id = ?1 AND vault_id = ?2",
                 rusqlite::params![note_id, vault_id],
             )
             .map_err(|e| GradatumError::Storage(format!("delete_note_from_index notes : {e}")))?;
 
+        tx.commit().map_err(|e| {
+            GradatumError::Storage(format!("delete_note_from_index commit tx : {e}"))
+        })?;
+
         Ok(deleted > 0)
+    }
+
+    /// One-shot idempotent garbage-collection of orphan ANN vectors.
+    ///
+    /// Deletes every row of `note_embeddings_ann` whose `note_id` no longer exists
+    /// in `notes`. Safety net for orphans created before the atomic ANN cascade
+    /// landed (a note deleted while the vec0 extension was inactive would leave a
+    /// stale ANN row that resurfaces when the extension is later enabled).
+    ///
+    /// Idempotent: a second run deletes 0 rows. Runs at server boot right after the
+    /// ANN backfill (deploy = restart = one-shot GC).
+    ///
+    /// ## Partition-scoped predicate
+    ///
+    /// The GC is **partition-aware**: it only considers the requested `vault_id` partition,
+    /// `WHERE vault_id = ?1 AND note_id NOT IN (SELECT id FROM notes WHERE vault_id = ?1)`.
+    /// Each call cleans exactly the orphans of its own vault and never touches another
+    /// partition; the caller iterates over the active vaults.
+    ///
+    /// - **Data-loss-safe**: a live vector has its note in the same partition (the write
+    ///   path is scoped `(note_id, vault_id)`), so it is never part of the deleted set.
+    /// - **Single-vault equivalence**: when only one vault exists, every ANN row carries
+    ///   that vault id, so the deleted set is exactly the one a global GC would produce.
+    /// - **vec0 partition key**: `note_embeddings_ann` carries `vault_id` and `embedder_id` as
+    ///   its vec0 partition keys (migration 0038), and the equality predicate `vault_id = ?1`
+    ///   is the nominal vec0 filter. `note_id` is a plain column, so one ULID legitimately
+    ///   holds several rows — one per `(vault_id, embedder_id)` partition. Deliberately, the
+    ///   GC does **not** filter on `embedder_id`: an orphan note has no `notes` row at all, so
+    ///   every embedder row of that `(vault_id, note_id)` pair is orphan and must go. Scoping
+    ///   by embedder here would leave the partitions of the other embedders behind.
+    ///
+    /// ## Degraded mode
+    ///
+    /// Returns `Ok(0)` if the ANN table or the `vec0` module is absent — the GC is a pure
+    /// no-op whenever ANN is inactive.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` on any SQLite error other than a missing ANN table/module.
+    pub async fn gc_orphan_ann(&self, vault_id: &str) -> Result<u64, GradatumError> {
+        let conn = self.conn.lock().await;
+        match conn.execute(
+            "DELETE FROM note_embeddings_ann
+             WHERE vault_id = ?1
+               AND note_id NOT IN (SELECT id FROM notes WHERE vault_id = ?1)",
+            [vault_id],
+        ) {
+            Ok(n) => Ok(n as u64),
+            Err(e) if crate::sqlite_vec::is_ann_absent_error(&e) => Ok(0),
+            Err(e) => Err(GradatumError::Storage(format!("gc_orphan_ann : {e}"))),
+        }
     }
 
     // ── v0.5.2 Code-ingest index-only ────────────────────────────────────────
@@ -3842,8 +5147,8 @@ impl SqliteIndex {
         // de la méthode (pas seulement au niveau CLI) car la corruption serait silencieuse.
         if !vault_id.starts_with("code-") {
             return Err(GradatumError::Storage(format!(
-                "write_note_derived_batch : vault_id '{vault_id}' doit commencer par 'code-' \
-                 (isolation vault principal — ne jamais écrire dans 'main' ou un vault non-code)"
+                "write_note_derived_batch: vault_id '{vault_id}' must start with 'code-' \
+                 (main-vault isolation — never write into 'main' or a non-code vault)"
             )));
         }
 
@@ -3942,7 +5247,7 @@ impl SqliteIndex {
                         id, vault_id, locus, section, status, schema_version,
                         created, content_hash, body_text, tags, provenance, trust, extra_json
                     ) VALUES (?1, ?2, NULL, 'architecture', 'live', 1, ?3, ?4, ?5, ?6, 'derived:tree-sitter', 0.5, ?7)
-                    ON CONFLICT(id) DO UPDATE SET
+                    ON CONFLICT(vault_id, id) DO UPDATE SET
                         body_text = excluded.body_text,
                         tags = excluded.tags,
                         content_hash = excluded.content_hash,
@@ -3963,10 +5268,12 @@ impl SqliteIndex {
                 // INSERT OR REPLACE garantit l'idempotence : si la note existait déjà
                 // (ON CONFLICT DO UPDATE laisse le rowid intact), le REPLACE écrase l'ancienne
                 // entrée FTS plutôt que de créer un doublon (invariant §4.2 — 0 doublons FTS).
+                // C4-1d : rowid résolu par `(id, vault_id)` — parité avec la sync FTS de
+                // `write_note`, la PK composite donnant une ligne/rowid par vault.
                 conn.execute(
                     "INSERT OR REPLACE INTO notes_fts (rowid, body_text, tags)
-                     SELECT rowid, body_text, tags FROM notes WHERE id = ?1",
-                    rusqlite::params![note.id.to_string()],
+                     SELECT rowid, body_text, tags FROM notes WHERE id = ?1 AND vault_id = ?2",
+                    rusqlite::params![note.id.to_string(), vault_id],
                 )
                 .map_err(|e| {
                     GradatumError::Storage(format!(
@@ -3976,10 +5283,14 @@ impl SqliteIndex {
                 })?;
 
                 // Mettre à jour le titre si fourni.
+                // C4-1e A5 (miss C4-1d M1) : scopé `(id, vault_id)` — sans le prédicat
+                // vault_id, un batch dérivé sur un vault code-* avec un id colliding
+                // réécrivait le titre d'une note homonyme d'un autre vault (ex. "main").
+                // Mirrors `get_trust_and_provenance` (sqlite.rs:3072).
                 if let Some(title) = &note.title {
                     conn.execute(
-                        "UPDATE notes SET title = ?1 WHERE id = ?2",
-                        rusqlite::params![title, note.id.to_string()],
+                        "UPDATE notes SET title = ?1 WHERE id = ?2 AND vault_id = ?3",
+                        rusqlite::params![title, note.id.to_string(), vault_id],
                     )
                     .map_err(|e| {
                         GradatumError::Storage(format!(
@@ -4045,8 +5356,8 @@ impl SqliteIndex {
         // détruirait le vault principal en cascade (note_audit_trail, note_index, etc.).
         if !vault_id.starts_with("code-") {
             return Err(GradatumError::Storage(format!(
-                "delete_vault_from_index : vault_id '{vault_id}' doit commencer par 'code-' \
-                 (destruction du vault principal ou non-code interdite)"
+                "delete_vault_from_index: vault_id '{vault_id}' must start with 'code-' \
+                 (destroying the main or a non-code vault is forbidden)"
             )));
         }
 
@@ -4086,7 +5397,12 @@ impl SqliteIndex {
                 })?;
             }
 
-            // Supprimer les notes du vault (CASCADE supprime note_audit_trail, note_index, etc.).
+            // Supprimer les notes du vault. Depuis la migration 0039, le FK composite
+            // `ON DELETE CASCADE` purge automatiquement `note_audit_trail`, `note_embeddings`
+            // et `note_history` (les 3 tables D2 porteuses du FK). Les autres enfants
+            // (`note_index`, `note_overrides`, `note_links`, `temporal_index`) n'ont PAS de FK
+            // et ne sont PAS cascadés ici — sans importance pour ce chemin, restreint aux
+            // vaults `code-*` (garde ci-dessus) dont ces tables ne portent pas de lignes.
             let deleted = conn
                 .execute(
                     "DELETE FROM notes WHERE vault_id = ?1",
@@ -4166,7 +5482,7 @@ impl SqliteIndex {
     /// ## Errors
     ///
     /// Returns `GradatumError::Storage` on any SQLite error.
-    #[must_use = "Freshness retourné — utiliser la valeur pour décider de la régen"]
+    #[must_use = "Freshness returned — use the value to decide on regeneration"]
     pub async fn check_freshness(
         &self,
         vault_id: &str,
@@ -4346,8 +5662,8 @@ impl SqliteIndex {
         // Défense en profondeur (invariant sécu §3.3) — la garde primaire est dans le handler.
         if !vault_id.starts_with("code-") {
             return Err(GradatumError::Storage(format!(
-                "code_scope_query : vault_id '{vault_id}' doit commencer par 'code-' \
-                 (isolation — code_scope ne lit jamais 'main' ni un vault non-code)"
+                "code_scope_query: vault_id '{vault_id}' must start with 'code-' \
+                 (isolation — code_scope never reads 'main' or a non-code vault)"
             )));
         }
 
@@ -4519,8 +5835,8 @@ impl SqliteIndex {
     ) -> Result<Vec<CodeScopeEntryRaw>, GradatumError> {
         if !vault_id.starts_with("code-") {
             return Err(GradatumError::Storage(format!(
-                "code_scope_reverse_deps : vault_id '{vault_id}' doit commencer par 'code-' \
-                 (isolation — ne lit jamais 'main' ni un vault non-code)"
+                "code_scope_reverse_deps: vault_id '{vault_id}' must start with 'code-' \
+                 (isolation — never reads 'main' or a non-code vault)"
             )));
         }
 
@@ -4616,7 +5932,8 @@ impl SqliteIndex {
 
         if !vault_id.starts_with("code-") {
             return Err(GradatumError::Storage(format!(
-                "code_scope_reverse_deps_batch : vault_id '{vault_id}' doit commencer par 'code-'"
+                "code_scope_reverse_deps_batch: vault_id '{vault_id}' must start with 'code-' \
+                 (isolation — never reads 'main' or a non-code vault)"
             )));
         }
         if names.is_empty() {
@@ -4760,7 +6077,9 @@ impl SqliteIndex {
     ) -> Result<(), GradatumError> {
         if !vault_id.starts_with("code-") {
             return Err(GradatumError::Storage(format!(
-                "set_code_vault_repo_path : vault_id '{vault_id}' doit commencer par 'code-'"
+                "set_code_vault_repo_path: vault_id '{vault_id}' must start with 'code-' \
+                 (main-vault isolation — never registers a repo path for 'main' \
+                 or a non-code vault)"
             )));
         }
         let conn = self.conn.lock().await;
@@ -4900,16 +6219,23 @@ impl SqliteIndex {
 
     /// Deletes the temporal index entry for a note (`PRAGMA foreign_keys` is not guaranteed in all contexts — no implicit `ON DELETE CASCADE`).
     ///
-    /// Called explicitly in `delete_note_from_index` — do not rely on a SQLite cascade
-    /// because `PRAGMA foreign_keys` is not guaranteed in all execution contexts.
+    /// Scoped by `(vault_id, note_id)` — the composite PRIMARY KEY of `temporal_index`
+    /// since migration 0034. Without the `vault_id` predicate, an ULID collision
+    /// between two vaults would let a deletion targeting one vault destroy the homonymous
+    /// entry of another (cross-vault tampering / DoS).
     ///
-    /// Idempotent: if the note has no `temporal_index` entry, returns `Ok(false)`.
-    pub async fn delete_temporal_entry(&self, note_id: &str) -> Result<bool, GradatumError> {
+    /// Idempotent: if the given vault has no `temporal_index` entry for `note_id`,
+    /// returns `Ok(false)`.
+    pub async fn delete_temporal_entry(
+        &self,
+        vault_id: &str,
+        note_id: &str,
+    ) -> Result<bool, GradatumError> {
         let conn = self.conn.lock().await;
         let deleted = conn
             .execute(
-                "DELETE FROM temporal_index WHERE note_id = ?1",
-                rusqlite::params![note_id],
+                "DELETE FROM temporal_index WHERE note_id = ?1 AND vault_id = ?2",
+                rusqlite::params![note_id, vault_id],
             )
             .map_err(|e| GradatumError::Storage(format!("delete_temporal_entry : {e}")))?;
         Ok(deleted > 0)
@@ -4917,20 +6243,20 @@ impl SqliteIndex {
 
     // ── Santé des tâches récurrentes (v0.7.5 F-85) ──────────────────────────
 
-    /// Enregistre un tick d'une tâche récurrente dans `scheduled_task_health`.
+    /// Records one run of a scheduled task in `scheduled_task_health`.
     ///
-    /// Upsert PK `task_name` avec `run_count + 1`. Si `outcome == Error`, append
-    /// 1 ligne dans `scheduled_task_error` + purge paresseuse (DELETE WHERE
-    /// `occurred_ms < now_ms - 7j`).
+    /// Upserts on the `task_name` primary key and increments `run_count`. When
+    /// `outcome == Error`, one row is appended to `scheduled_task_error` and rows older
+    /// than seven days are lazily purged in the same call.
     ///
-    /// ## Infaillibilité appelant
+    /// ## Caller must not fail on this
     ///
-    /// L'appelant doit logger en `warn` et continuer — ne jamais propager l'erreur
-    /// dans une tâche tokio background (l'instrumentation ne doit pas faire paniquer).
+    /// Callers are expected to log at `warn` and carry on: this is instrumentation, and it
+    /// must never take down the background task that reports through it.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si le write SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite write fails.
     pub async fn record_task_run(
         &self,
         task_name: &str,
@@ -4975,7 +6301,7 @@ impl SqliteIndex {
 
         if matches!(outcome, TaskOutcome::Error) {
             // Append erreur.
-            let error_msg = error.unwrap_or("erreur sans message");
+            let error_msg = error.unwrap_or("error without message");
             conn.execute(
                 "INSERT INTO scheduled_task_error (task_name, occurred_ms, error_msg) \
                  VALUES (?1, ?2, ?3)",
@@ -4995,13 +6321,13 @@ impl SqliteIndex {
         Ok(())
     }
 
-    /// Initialise la ligne d'une tâche dans `scheduled_task_health` (seed boot).
+    /// Seeds the row of a scheduled task in `scheduled_task_health`, typically at startup.
     ///
-    /// `INSERT OR IGNORE` — n'écrase pas un enregistrement existant.
+    /// Uses `INSERT OR IGNORE`, so an existing record is never overwritten.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si le write SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite write fails.
     pub async fn seed_scheduled_task(&self, task_name: &str) -> Result<(), GradatumError> {
         let conn = self.conn.lock().await;
         conn.execute(
@@ -5014,14 +6340,14 @@ impl SqliteIndex {
         Ok(())
     }
 
-    /// Liste la santé de toutes les tâches récurrentes seedées.
+    /// Lists the health of every seeded scheduled task.
     ///
     /// `errors_24h` = COUNT(scheduled_task_error WHERE task_name = ? AND
     /// occurred_ms > now_ms - 86_400_000).
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la lecture SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite read fails.
     pub async fn list_scheduled_health(
         &self,
         now_ms: i64,
@@ -5062,15 +6388,15 @@ impl SqliteIndex {
         Ok(rows)
     }
 
-    /// Compte les lignes présentes dans `scheduled_task_error` pour un nom de tâche.
+    /// Counts the rows of `scheduled_task_error` for a task name.
     ///
-    /// `COUNT(*)` sans filtre temporel = total brut dans la table (après purge paresseuse).
-    /// Réservée aux tests d'intégration pour prouver la suppression physique des lignes
-    /// anciennes — ne pas utiliser en production.
+    /// A plain `COUNT(*)` with no time filter: the raw total left in the table once the
+    /// lazy purge has run. Meant for integration tests that need to prove old rows are
+    /// physically deleted — not for production use.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la requête SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite query fails.
     #[doc(hidden)]
     pub async fn count_task_errors_for(&self, task_name: &str) -> Result<i64, GradatumError> {
         let conn = self.conn.lock().await;
@@ -5086,15 +6412,15 @@ impl SqliteIndex {
 
     // ── Timeseries de métriques curées (v0.7.5 Slice 2a F-85) ───────────────
 
-    /// Insère un lot de samples métriques horodatés `ts_ms` (un tick d'échantillonnage).
+    /// Inserts a batch of metric samples sharing the timestamp `ts_ms` (one sampling tick).
     ///
-    /// `INSERT OR IGNORE` : la PK `(series, ts_ms)` rend l'écriture idempotente si un
-    /// tick est rejoué (jamais d'écrasement de valeur — leçon C-1 data-integrity).
-    /// Retourne le nombre de lignes effectivement insérées.
+    /// The write is an `INSERT OR IGNORE` over the `(series, ts_ms)` primary key, so
+    /// replaying a tick is idempotent and an already-recorded value is never overwritten.
+    /// Returns the number of rows actually inserted.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la transaction SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite transaction fails.
     pub async fn insert_metric_samples(
         &self,
         ts_ms: i64,
@@ -5129,15 +6455,16 @@ impl SqliteIndex {
         Ok(written)
     }
 
-    /// Requête timeseries downsamplée : moyenne par bucket de `bucket_ms` ms.
+    /// Downsampled timeseries query: one average per `bucket_ms` bucket.
     ///
-    /// Bornes **inclusives** (`ts_ms >= from_ms AND ts_ms <= to_ms`). Le `ts_ms`
-    /// d'un point downsamplé = `MIN(ts_ms)` du bucket. Trié `(series, ts_ms)`.
-    /// `bucket_ms` doit être ≥ 60_000 (calculé par l'appelant).
+    /// Bounds are **inclusive** (`ts_ms >= from_ms AND ts_ms <= to_ms`). The `ts_ms` of a
+    /// downsampled point is the `MIN(ts_ms)` of its bucket, and rows are ordered by
+    /// `(series, ts_ms)`. `bucket_ms` is computed by the caller and expected to be at
+    /// least 60_000.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la requête SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite query fails.
     pub async fn query_metric_timeseries(
         &self,
         series: &[String],
@@ -5185,11 +6512,11 @@ impl SqliteIndex {
         Ok(rows)
     }
 
-    /// Purge les samples antérieurs à `cutoff_ms`. Retourne le nombre de lignes supprimées.
+    /// Deletes the samples older than `cutoff_ms` and returns the number of rows removed.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la suppression SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite delete fails.
     pub async fn purge_metric_samples(&self, cutoff_ms: i64) -> Result<usize, GradatumError> {
         let conn = self.conn.lock().await;
         let n = conn
@@ -5201,11 +6528,11 @@ impl SqliteIndex {
         Ok(n)
     }
 
-    /// Liste les clés de série distinctes présentes dans `metric_sample` (pour le catalog).
+    /// Lists the distinct series keys present in `metric_sample`, for the series catalogue.
     ///
     /// # Errors
     ///
-    /// `GradatumError::Storage` si la requête SQLite échoue.
+    /// `GradatumError::Storage` if the SQLite query fails.
     pub async fn list_distinct_metric_series(&self) -> Result<Vec<String>, GradatumError> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
@@ -5225,7 +6552,7 @@ impl SqliteIndex {
         Ok(rows)
     }
 
-    /// Batch-reads `anchor_ms` from `temporal_index` for a list of note IDs (F-65).
+    /// Batch-reads `anchor_ms` from `temporal_index` for a list of note IDs.
     ///
     /// Used by the semantic search path to enrich `RrfHit.anchor_ms` and apply
     /// temporal bounds (`from_ms`/`to_ms`) without touching `VectorStore::search_semantic`.
@@ -5357,7 +6684,7 @@ impl SqliteIndex {
         let mut sql = format!(
             "SELECT t.note_id, t.anchor_ms, t.anchor_src, t.doc_kind, n.title \
              FROM temporal_index t \
-             JOIN notes n ON n.id = t.note_id \
+             JOIN notes n ON n.id = t.note_id AND n.vault_id = t.vault_id \
              WHERE t.vault_id = ? \
                AND n.status != 'garbage' \
                AND t.note_id NOT LIKE '__sentinel__%' \
@@ -5472,8 +6799,12 @@ impl SqliteIndex {
 
         let (scope_kind, scope_id, vault_id) = match scope {
             OverrideScope::Vault(v) => ("vault", v.to_string(), v.to_string()),
-            OverrideScope::Locus(l) => ("locus", l.to_string(), "_unset".to_string()),
-            OverrideScope::Bearer(b) => ("bearer", b.to_string(), "_unset".to_string()),
+            OverrideScope::Locus { vault, locus } => {
+                ("locus", locus.to_string(), vault.to_string())
+            }
+            OverrideScope::Bearer { vault, bearer } => {
+                ("bearer", bearer.to_string(), vault.to_string())
+            }
         };
 
         // file_hash = sha256(payload_toml) — permet de détecter un changement fichier
@@ -5489,7 +6820,7 @@ impl SqliteIndex {
                 payload_toml, priority, created_by_kind, created_by_id,
                 created_at, reason, file_relative_path, file_hash
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, NULL, ?8, NULL, ?9, ?10)
-            ON CONFLICT(note_id, scope_kind, scope_id, override_type) DO UPDATE SET
+            ON CONFLICT(vault_id, note_id, scope_kind, scope_id, override_type) DO UPDATE SET
                 schema_version     = excluded.schema_version,
                 payload_toml       = excluded.payload_toml,
                 file_hash          = excluded.file_hash",
@@ -5520,16 +6851,28 @@ impl SqliteIndex {
         let conn = self.conn.lock().await;
         let id_str = note_id.to_string();
 
-        let (scope_kind, scope_id) = match scope {
-            OverrideScope::Vault(v) => ("vault", v.to_string()),
-            OverrideScope::Locus(l) => ("locus", l.to_string()),
-            OverrideScope::Bearer(b) => ("bearer", b.to_string()),
+        // Task 15 (Groupe B) : `vault_id` dérivé À L'IDENTIQUE du write (`upsert_override_raw`)
+        // pour que la lecture matche la ligne écrite sous la PK composite 0034
+        // `(vault_id, note_id, scope_kind, scope_id, override_type)`. Chaque variante porte
+        // désormais son `vault` réel : Vault → le vault visé (≡ scope_id) ; Locus/Bearer → le
+        // `vault` embarqué dans le scope. Fin de la sentinelle `"_unset"` (bucket GLOBAL) qui
+        // faisait collisionner les overrides Locus/Bearer de deux vaults au même `note_id`
+        // (clobber write + cross-read). Migration 0036 re-clé les lignes `_unset` legacy → `'main'`.
+        let (scope_kind, scope_id, vault_id) = match scope {
+            OverrideScope::Vault(v) => ("vault", v.to_string(), v.to_string()),
+            OverrideScope::Locus { vault, locus } => {
+                ("locus", locus.to_string(), vault.to_string())
+            }
+            OverrideScope::Bearer { vault, bearer } => {
+                ("bearer", bearer.to_string(), vault.to_string())
+            }
         };
 
         match conn.query_row(
             "SELECT schema_version, payload_toml FROM note_overrides
-             WHERE note_id = ?1 AND scope_kind = ?2 AND scope_id = ?3 AND override_type = ?4",
-            rusqlite::params![id_str, scope_kind, scope_id, override_type],
+             WHERE note_id = ?1 AND scope_kind = ?2 AND scope_id = ?3 AND override_type = ?4
+               AND vault_id = ?5",
+            rusqlite::params![id_str, scope_kind, scope_id, override_type, vault_id],
             |row| {
                 let sv: u32 = row.get(0)?;
                 let pt: String = row.get(1)?;
@@ -5625,20 +6968,20 @@ impl SqliteIndex {
                 "config" => FileKind::Config,
                 other => {
                     return Err(GradatumError::Storage(format!(
-                        "file_kind inconnu : {other:?}"
+                        "unknown file_kind: {other:?}"
                     )));
                 }
             };
 
             if prefix_bytes.len() < 32 {
                 return Err(GradatumError::Storage(format!(
-                    "expected_hash_prefix_4kb trop court ({} bytes) pour {relative_path:?}",
+                    "expected_hash_prefix_4kb too short ({} bytes) for {relative_path:?}",
                     prefix_bytes.len()
                 )));
             }
             if hash_bytes.len() < 32 {
                 return Err(GradatumError::Storage(format!(
-                    "expected_hash trop court ({} bytes) pour {relative_path:?}",
+                    "expected_hash too short ({} bytes) for {relative_path:?}",
                     hash_bytes.len()
                 )));
             }
@@ -5775,6 +7118,15 @@ impl SqliteIndex {
     ///
     /// Updates `forgotten=1`, `forgotten_at=<now_ms>`, `forgotten_by=<by>`.
     ///
+    /// ## What forgetting does and does not do
+    ///
+    /// This is a flag update, not a deletion: the row stays in `notes`, `body_text` is
+    /// left untouched, and the FTS shadow keeps indexing it. Forgotten notes still appear
+    /// in full-text and semantic results, with their score multiplied by a time decay of
+    /// `0.5^elapsed_days`; lesson recall is the exception and excludes them outright
+    /// (`AND n.forgotten = 0`). To remove content, use
+    /// [`Self::delete_note_from_index`] together with the vault-side deletion.
+    ///
     /// ## Index vs. vault boundary
     ///
     /// Operates on the SQLite index only — does NOT synchronise the note's YAML
@@ -5785,6 +7137,8 @@ impl SqliteIndex {
     ///
     /// A second call on an already-forgotten note updates `forgotten_at` and
     /// `forgotten_by` (re-marking with a different actor or correcting the timestamp).
+    /// To restore the flag WITHOUT overwriting that audit trail — repairing an index that
+    /// diverged from the frontmatter — use [`Self::reassert_forgotten`] instead.
     ///
     /// # Errors
     ///
@@ -5814,6 +7168,68 @@ impl SqliteIndex {
         if affected == 0 {
             let ulid = ulid::Ulid::from_string(note_id).map_err(|e| {
                 GradatumError::Storage(format!("mark_forgotten ULID parse {note_id:?} : {e}"))
+            })?;
+            return Err(GradatumError::NoteNotFound(NoteId(ulid)));
+        }
+        Ok(())
+    }
+
+    /// Re-asserts the forgotten mark WITHOUT rewriting the audit columns.
+    ///
+    /// Sets `forgotten = 1` and leaves `forgotten_at` / `forgotten_by` exactly as they
+    /// are — including `NULL`. Repairs an index row that reports a note as live while the
+    /// vault frontmatter reports it as forgotten: until the flag is restored the note
+    /// stays searchable, which is the wrong side of the trade on a product that offers a
+    /// right to be forgotten.
+    ///
+    /// ## Why not [`Self::mark_forgotten`]
+    ///
+    /// `mark_forgotten` stamps `forgotten_at`/`forgotten_by` unconditionally. Replaying it
+    /// on an already-forgotten note therefore destroys the audit trail of the FIRST
+    /// forget — the only record of when the destructive act happened and who ordered it.
+    /// This method exists so that repairing the index costs nothing in auditability.
+    ///
+    /// ## Divergences this repairs
+    ///
+    /// Two ordinary production paths create the divergence — it is not a race window:
+    /// `vault_unforgot` clears the index mark without touching the `.md`, and the internal
+    /// `persist/forget` endpoint answers `200` best-effort when its `mark_forgotten` step
+    /// fails after the vault write succeeded.
+    ///
+    /// ## Index vs. vault boundary
+    ///
+    /// Same boundary as [`Self::mark_forgotten`]: the SQLite index only, never the YAML
+    /// frontmatter on disk.
+    ///
+    /// ## Idempotence
+    ///
+    /// Fully idempotent: replaying it on an already-forgotten note leaves every column
+    /// unchanged, `forgotten` included.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the SQLite query fails.
+    /// `GradatumError::NoteNotFound` if no row is affected (unknown ULID or `vault_id` mismatch).
+    pub async fn reassert_forgotten(
+        &self,
+        vault_id: &str,
+        note_id: &str,
+    ) -> Result<(), GradatumError> {
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE notes
+                 SET forgotten = 1
+                 WHERE id = ?1
+                   AND vault_id = ?2",
+                rusqlite::params![note_id, vault_id],
+            )
+            .map_err(|e| {
+                GradatumError::Storage(format!("reassert_forgotten UPDATE {note_id:?} : {e}"))
+            })?;
+        if affected == 0 {
+            let ulid = ulid::Ulid::from_string(note_id).map_err(|e| {
+                GradatumError::Storage(format!("reassert_forgotten ULID parse {note_id:?} : {e}"))
             })?;
             return Err(GradatumError::NoteNotFound(NoteId(ulid)));
         }
@@ -6253,6 +7669,13 @@ mod migration_tests {
 mod downgrade_tests {
     use super::*;
 
+    /// Témoin write pour le vault `main` (les notes de test sont seedées `vault_id='main'`).
+    fn checked_main() -> gradatum_core::scope::AclCheckedVaultId {
+        gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        )
+    }
+
     /// Insère une note minimale avec le statut donné et retourne son NoteId.
     async fn seed_note(idx: &SqliteIndex, status: &str) -> NoteId {
         let id = NoteId(ulid::Ulid::new());
@@ -6274,7 +7697,9 @@ mod downgrade_tests {
         let idx = SqliteIndex::open_in_memory().await.expect("idx");
         let id = seed_note(&idx, "live").await;
 
-        let result = idx.downgrade_note(&id, "superseded by canon", None).await;
+        let result = idx
+            .downgrade_note(&checked_main(), &id, "superseded by canon", None)
+            .await;
         assert!(result.is_ok(), "downgrade should succeed: {result:?}");
 
         let conn = idx.conn.lock().await;
@@ -6295,7 +7720,7 @@ mod downgrade_tests {
         let canon = seed_note(&idx, "live").await;
         let target = seed_note(&idx, "live").await;
 
-        idx.downgrade_note(&target, "superseded", Some(&canon))
+        idx.downgrade_note(&checked_main(), &target, "superseded", Some(&canon))
             .await
             .unwrap();
 
@@ -6315,8 +7740,12 @@ mod downgrade_tests {
         let idx = SqliteIndex::open_in_memory().await.expect("idx");
         let id = seed_note(&idx, "live").await;
 
-        idx.downgrade_note(&id, "first", None).await.unwrap();
-        let result = idx.downgrade_note(&id, "second", None).await;
+        idx.downgrade_note(&checked_main(), &id, "first", None)
+            .await
+            .unwrap();
+        let result = idx
+            .downgrade_note(&checked_main(), &id, "second", None)
+            .await;
         assert!(result.is_ok(), "idempotent: {result:?}");
 
         let conn = idx.conn.lock().await;
@@ -6335,7 +7764,7 @@ mod downgrade_tests {
         let idx = SqliteIndex::open_in_memory().await.expect("idx");
         let id = NoteId(ulid::Ulid::new());
 
-        let result = idx.downgrade_note(&id, "test", None).await;
+        let result = idx.downgrade_note(&checked_main(), &id, "test", None).await;
         assert!(
             matches!(result, Err(GradatumError::NoteNotFound(_))),
             "doit retourner NoteNotFound, got: {result:?}"
@@ -6355,7 +7784,12 @@ mod downgrade_tests {
         let ghost = NoteId(ulid::Ulid::new()); // ULID qui n'existe pas dans la DB
 
         let result = idx
-            .downgrade_note(&target, "remplacé par fantôme", Some(&ghost))
+            .downgrade_note(
+                &checked_main(),
+                &target,
+                "remplacé par fantôme",
+                Some(&ghost),
+            )
             .await;
         assert!(
             matches!(result, Err(GradatumError::NoteNotFound(id)) if id == ghost),
@@ -6387,7 +7821,7 @@ mod downgrade_tests {
         let target = seed_note(&idx, "live").await;
 
         let result = idx
-            .downgrade_note(&target, "remplacé par canon", Some(&canon))
+            .downgrade_note(&checked_main(), &target, "remplacé par canon", Some(&canon))
             .await;
         assert!(
             result.is_ok(),
@@ -6415,8 +7849,10 @@ mod downgrade_tests {
         let idx = SqliteIndex::open_in_memory().await.expect("idx");
         let id = seed_note(&idx, "live").await;
 
-        idx.downgrade_note(&id, "test", None).await.unwrap();
-        idx.patch_note_status(&id, Some("live"), None, None)
+        idx.downgrade_note(&checked_main(), &id, "test", None)
+            .await
+            .unwrap();
+        idx.patch_note_status(&checked_main(), &id, Some("live"), None, None)
             .await
             .unwrap();
 
@@ -6443,7 +7879,7 @@ mod downgrade_tests {
         let id = seed_note(&idx, "live").await;
 
         // Downgrade réel via le mécanisme F-39 (écrit status='downgraded').
-        idx.downgrade_note(&id, "test downgrade", None)
+        idx.downgrade_note(&checked_main(), &id, "test downgrade", None)
             .await
             .unwrap();
 
@@ -6483,6 +7919,133 @@ mod downgrade_tests {
             .await
             .expect("get_note_status live");
         assert_eq!(status, Some(NoteStatus::Live));
+    }
+
+    // ── C3a (EX-C3a P0) — isolation cross-vault des mutations par ULID ──────────
+
+    /// Témoin write pour un vault TIERS (`other`) — un tenant distinct de `main`.
+    fn checked_other() -> gradatum_core::scope::AclCheckedVaultId {
+        gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("other"),
+        )
+    }
+
+    /// `downgrade_note` avec un témoin d'un AUTRE vault ne mute PAS une note de `main`
+    /// et renvoie `NoteNotFound` — même 404 qu'un ULID totalement inexistant (pas d'oracle).
+    #[tokio::test]
+    async fn downgrade_note_cross_vault_is_not_found_and_no_mutation() {
+        let idx = SqliteIndex::open_in_memory().await.expect("idx");
+        let id = seed_note(&idx, "live").await; // note du vault 'main'
+
+        let result = idx.downgrade_note(&checked_other(), &id, "pwn", None).await;
+        assert!(
+            matches!(result, Err(GradatumError::NoteNotFound(nf)) if nf == id),
+            "cross-vault downgrade doit être NoteNotFound, got: {result:?}"
+        );
+
+        // La note 'main' doit rester intacte (statut 'live', pas de raison écrite).
+        let conn = idx.conn.lock().await;
+        let (status, reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, status_reason FROM notes WHERE id = ?",
+                rusqlite::params![id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "live", "aucune mutation cross-vault");
+        assert_eq!(reason, None, "aucune raison écrite cross-vault");
+    }
+
+    /// Oracle : un ULID inexistant et une note d'un autre vault donnent le MÊME verdict
+    /// (`NoteNotFound`) — l'appelant ne peut pas distinguer "existe ailleurs" de "n'existe pas".
+    #[tokio::test]
+    async fn downgrade_note_cross_vault_matches_nonexistent_oracle() {
+        let idx = SqliteIndex::open_in_memory().await.expect("idx");
+        let id = seed_note(&idx, "live").await; // 'main'
+        let ghost = NoteId(ulid::Ulid::new()); // n'existe nulle part
+
+        let cross = idx.downgrade_note(&checked_other(), &id, "x", None).await;
+        let absent = idx
+            .downgrade_note(&checked_other(), &ghost, "x", None)
+            .await;
+        assert!(matches!(cross, Err(GradatumError::NoteNotFound(_))));
+        assert!(matches!(absent, Err(GradatumError::NoteNotFound(_))));
+    }
+
+    /// `patch_note_status` cross-vault : aucune mutation + `NoteNotFound`.
+    #[tokio::test]
+    async fn patch_note_status_cross_vault_is_not_found_and_no_mutation() {
+        let idx = SqliteIndex::open_in_memory().await.expect("idx");
+        let id = seed_note(&idx, "live").await;
+
+        let result = idx
+            .patch_note_status(&checked_other(), &id, None, Some("pwned"), None)
+            .await;
+        assert!(
+            matches!(result, Err(GradatumError::NoteNotFound(nf)) if nf == id),
+            "cross-vault patch doit être NoteNotFound, got: {result:?}"
+        );
+
+        let conn = idx.conn.lock().await;
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT status_reason FROM notes WHERE id = ?",
+                rusqlite::params![id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, None, "aucune raison écrite cross-vault");
+    }
+
+    /// `update_note_locus` cross-vault : aucune mutation + `NoteNotFound`.
+    #[tokio::test]
+    async fn update_note_locus_cross_vault_is_not_found_and_no_mutation() {
+        let idx = SqliteIndex::open_in_memory().await.expect("idx");
+        let id = seed_note(&idx, "live").await;
+
+        let result = idx
+            .update_note_locus(
+                &checked_other(),
+                &id,
+                &gradatum_core::scope::LocusId::new("evil/locus"),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GradatumError::NoteNotFound(nf)) if nf == id),
+            "cross-vault move doit être NoteNotFound, got: {result:?}"
+        );
+
+        let conn = idx.conn.lock().await;
+        let locus: Option<String> = conn
+            .query_row(
+                "SELECT locus FROM notes WHERE id = ?",
+                rusqlite::params![id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(locus, None, "locus inchangé cross-vault");
+    }
+
+    /// Byte-identical : le témoin du vault propriétaire (`main`) mute toujours la note —
+    /// le prédicat `AND vault_id = ?` est transparent quand vault == propriétaire.
+    #[tokio::test]
+    async fn downgrade_note_same_vault_still_mutates_byte_identical() {
+        let idx = SqliteIndex::open_in_memory().await.expect("idx");
+        let id = seed_note(&idx, "live").await;
+
+        idx.downgrade_note(&checked_main(), &id, "legit", None)
+            .await
+            .expect("downgrade même vault doit réussir");
+
+        let conn = idx.conn.lock().await;
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM notes WHERE id = ?",
+                rusqlite::params![id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "downgraded");
     }
 }
 
@@ -6683,7 +8246,9 @@ mod title_tests {
         idx.seed_note(&note_id.to_string(), "decisions", "# Mon Titre\n\nbody")
             .await
             .unwrap();
-        idx.upsert_note_title(&note_id, "Mon Titre").await.unwrap();
+        idx.upsert_note_title("main", &note_id, "Mon Titre")
+            .await
+            .unwrap();
 
         let conn = idx.conn.lock().await;
         let title: Option<String> = conn
@@ -6710,8 +8275,12 @@ mod title_tests {
         idx.seed_note(&note_id.to_string(), "reference", "# Titre A\nbody")
             .await
             .unwrap();
-        idx.upsert_note_title(&note_id, "Titre A").await.unwrap();
-        idx.upsert_note_title(&note_id, "Titre B").await.unwrap();
+        idx.upsert_note_title("main", &note_id, "Titre A")
+            .await
+            .unwrap();
+        idx.upsert_note_title("main", &note_id, "Titre B")
+            .await
+            .unwrap();
 
         let conn = idx.conn.lock().await;
         let title: Option<String> = conn
@@ -7164,7 +8733,9 @@ mod snippet_fts_tests {
         )
         .await
         .unwrap();
-        idx.upsert_note_title(&note_id, "Mon Titre").await.unwrap();
+        idx.upsert_note_title("main", &note_id, "Mon Titre")
+            .await
+            .unwrap();
 
         let vault = VaultId::new("main");
         let results = idx
@@ -7295,6 +8866,148 @@ mod vault_list_tests {
         let (records, total) = idx.list_notes("main", None, 10, None).await.unwrap();
         assert_eq!(total, 0);
         assert!(records.is_empty());
+    }
+
+    // ── allocate_feature_number (allocation atomique de numéros de feature) ──────
+
+    /// Seed dérivé du max des cartes puis incrément : F-134 présent → 135, 136, …
+    #[tokio::test]
+    async fn allocate_feature_number_seeds_from_cards_then_increments() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        idx.seed_note(
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "project-map",
+            "[[feature:F-37]] [[project:gradatum]]",
+        )
+        .await
+        .unwrap();
+        idx.seed_note(
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+            "project-map",
+            "[[feature:F-134]] [[project:gradatum]]",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(idx.allocate_feature_number("main").await.unwrap(), 135);
+        assert_eq!(idx.allocate_feature_number("main").await.unwrap(), 136);
+        assert_eq!(idx.allocate_feature_number("main").await.unwrap(), 137);
+    }
+
+    /// Vault sans carte project-map → seed 0 → première allocation = 1.
+    #[tokio::test]
+    async fn allocate_feature_number_empty_vault_starts_at_one() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        assert_eq!(idx.allocate_feature_number("main").await.unwrap(), 1);
+        assert_eq!(idx.allocate_feature_number("main").await.unwrap(), 2);
+    }
+
+    /// Reconstruction : ligne compteur perdue → re-dérivée depuis les cartes (jamais recule).
+    #[tokio::test]
+    async fn allocate_feature_number_reconstructs_after_counter_loss() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        idx.seed_note(
+            "01CCCCCCCCCCCCCCCCCCCCCCCC",
+            "project-map",
+            "[[feature:F-134]] [[project:gradatum]]",
+        )
+        .await
+        .unwrap();
+        assert_eq!(idx.allocate_feature_number("main").await.unwrap(), 135);
+
+        // Simuler la perte de la ligne compteur.
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute("DELETE FROM feature_counter WHERE vault_id = 'main'", [])
+                .unwrap();
+        }
+        // Re-seed depuis les cartes (F-134 toujours présent) → 135 de nouveau.
+        assert_eq!(idx.allocate_feature_number("main").await.unwrap(), 135);
+    }
+
+    /// Garantie dure : une carte créée HORS allocateur, au-dessus du compteur, force
+    /// l'allocation suivante AU-DESSUS de cette carte — pas la valeur du compteur.
+    ///
+    /// Reproduit le cas de la période de transition : `gov-todo feature-add F-XX` pose un
+    /// numéro explicite côté client sans passer par l'allocateur. Sans le derive à chaque
+    /// appel, l'allocation rendrait `compteur + 1` (136) et entrerait en collision avec la
+    /// carte manuelle. Avec, elle plancher à `max(compteur, dérivé) + 1`.
+    #[tokio::test]
+    async fn allocate_feature_number_floors_above_out_of_band_card() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        idx.seed_note(
+            "01EEEEEEEEEEEEEEEEEEEEEEEE",
+            "project-map",
+            "[[feature:F-134]] [[project:gradatum]]",
+        )
+        .await
+        .unwrap();
+        // Le compteur monte à 135.
+        assert_eq!(idx.allocate_feature_number("main").await.unwrap(), 135);
+
+        // Carte HORS allocateur, numéro (200) BIEN au-dessus du compteur (135).
+        idx.seed_note(
+            "01FFFFFFFFFFFFFFFFFFFFFFFF",
+            "project-map",
+            "[[feature:F-200]] [[project:gradatum]]",
+        )
+        .await
+        .unwrap();
+
+        // L'allocation doit rendre 201 (au-dessus de la carte), PAS 136 (compteur + 1).
+        assert_eq!(
+            idx.allocate_feature_number("main").await.unwrap(),
+            201,
+            "le derive doit plancher au-dessus de la carte hors-allocateur F-200"
+        );
+        // La séquence ne recule jamais : suivant = 202.
+        assert_eq!(idx.allocate_feature_number("main").await.unwrap(), 202);
+    }
+
+    /// Propriété centrale : deux allocations SIMULTANÉES rendent deux numéros distincts.
+    ///
+    /// 20 tâches concurrentes sur le VRAI `SqliteIndex` (pas un mock) partageant la même
+    /// connexion : la sérialisation par le mutex async garantit l'unicité. On vérifie à la
+    /// fois la distinction (aucun doublon) et la contiguïté (135..=154).
+    #[tokio::test]
+    async fn allocate_feature_number_is_unique_under_concurrency() {
+        let idx = Arc::new(SqliteIndex::open_in_memory().await.unwrap());
+        // Floor = 134 → les allocations doivent couvrir 135..=154.
+        idx.seed_note(
+            "01DDDDDDDDDDDDDDDDDDDDDDDD",
+            "project-map",
+            "[[feature:F-134]] [[project:gradatum]]",
+        )
+        .await
+        .unwrap();
+
+        const N: u32 = 20;
+        let mut handles = Vec::with_capacity(N as usize);
+        for _ in 0..N {
+            let idx = Arc::clone(&idx);
+            handles.push(tokio::spawn(async move {
+                idx.allocate_feature_number("main").await
+            }));
+        }
+
+        let mut got: Vec<u32> = Vec::with_capacity(N as usize);
+        for h in handles {
+            got.push(h.await.unwrap().unwrap());
+        }
+        got.sort_unstable();
+
+        let mut deduped = got.clone();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            got.len(),
+            "collision détectée sous concurrence : {got:?}"
+        );
+        assert_eq!(
+            got,
+            (135..=135 + N - 1).collect::<Vec<u32>>(),
+            "les {N} allocations doivent couvrir 135..=154 sans trou ni doublon"
+        );
     }
 }
 
@@ -7709,6 +9422,11 @@ mod locus_preservation_tests {
     use gradatum_core::section::Section;
     use gradatum_core::status::NoteStatus;
 
+    /// Témoin write pour le vault `main` (les notes de test sont seedées `vault_id='main'`).
+    fn checked_main() -> gradatum_core::scope::AclCheckedVaultId {
+        gradatum_core::scope::AclCheckedVaultId::for_system_task(VaultId::new("main"))
+    }
+
     /// Construit une note minimale avec body + locus optionnel donnés.
     ///
     /// `created` est FIXE (epoch 0) pour garantir un `content_hash` reproductible :
@@ -7770,7 +9488,7 @@ mod locus_preservation_tests {
         assert_eq!(read_locus(&idx, &id).await, None, "locus initial = None");
 
         // 2. Move index-level vers "knowledge/rust" (n'altère pas le .md/content_hash).
-        idx.update_note_locus(&id, &LocusId::new("knowledge/rust"))
+        idx.update_note_locus(&checked_main(), &id, &LocusId::new("knowledge/rust"))
             .await
             .expect("update_note_locus");
         assert_eq!(
@@ -7806,7 +9524,7 @@ mod locus_preservation_tests {
         // 1. Création + move index-level.
         let note = make_note(id, None, "corps v1");
         idx.upsert_note(&note).await.expect("upsert initial");
-        idx.update_note_locus(&id, &LocusId::new("knowledge"))
+        idx.update_note_locus(&checked_main(), &id, &LocusId::new("knowledge"))
             .await
             .expect("update_note_locus");
 
@@ -8570,7 +10288,7 @@ mod temporal_index_tests {
     async fn delete_temporal_entry_nonexistent_is_idempotent() {
         let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
         let result = idx
-            .delete_temporal_entry("01NONEXISTENT000000000000")
+            .delete_temporal_entry("main", "01NONEXISTENT000000000000")
             .await
             .expect("delete_temporal_entry ne doit pas échouer");
         assert!(!result, "note inexistante → false");
@@ -9351,6 +11069,63 @@ mod temporal_index_tests {
 #[cfg(test)]
 mod recall_lessons_tests {
     use super::*;
+
+    /// Anti-regression (revue securite finding#1 / TODO 01KYAZK7YP) -- le filtre
+    /// `AND n.section = 'lessons-learned'` de `hydrate_lessons_by_ulids` est load-bearing.
+    ///
+    /// Sur le chemin semantique de recall, `retrieve_candidates` (branche ULID-direct)
+    /// IGNORE son argument `sections` : un ULID valide passe en `query` renvoie la note
+    /// + backlinks sans filtre section. L'isolation cross-section repose donc entierement
+    /// sur ce predicat aval. Ce test prouve l'eviction : un ULID d'une note `decisions`,
+    /// hydrate comme candidat "lecon", ne doit JAMAIS ressortir -- seul le vrai
+    /// `lessons-learned` (controle positif) est retourne. Si le predicat section saute,
+    /// ce test tourne au rouge (la note `decisions`, sinon 'live' et non filtree, fuiterait).
+    #[tokio::test]
+    async fn hydrate_lessons_evicts_cross_section_ulid() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let vault = VaultId::new("main");
+
+        // Controle positif : une vraie lecon (section = lessons-learned).
+        const LESSON_ULID: &str = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        idx.seed_lesson(
+            LESSON_ULID,
+            "Lecon legitime",
+            "deploy",
+            "Verifier le health check avant cutover.",
+            1_700_000_000_000,
+        )
+        .await
+        .expect("seed lesson");
+
+        // Note d'une AUTRE section (decisions), 'live' et non filtree par les autres
+        // predicats -- seul `AND n.section='lessons-learned'` doit l'evincer.
+        const DECISION_ULID: &str = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        idx.seed_note_with_fts(
+            DECISION_ULID,
+            "decisions",
+            "Decision d'architecture sensible",
+        )
+        .await
+        .expect("seed decision note");
+
+        // Hydratation des DEUX ULID (comme le ferait le chemin ULID-direct amont, qui
+        // ne filtre pas par section) sur un principal cible lessons-learned.
+        let hits = idx
+            .hydrate_lessons_by_ulids(&vault, &[DECISION_ULID, LESSON_ULID])
+            .await
+            .expect("hydrate_lessons_by_ulids");
+
+        let ids: Vec<String> = hits.iter().map(|h| h.note_id.0.to_string()).collect();
+        assert!(
+            !ids.contains(&DECISION_ULID.to_string()),
+            "l'ULID d'une note `decisions` doit etre evince par le filtre hydrate. ids={ids:?}"
+        );
+        assert_eq!(
+            ids,
+            vec![LESSON_ULID.to_string()],
+            "seule la note `lessons-learned` doit etre hydratee (controle positif). ids={ids:?}"
+        );
+    }
 
     /// Recall par classe : matche via le tag (le mot n'est pas dans le corps),
     /// retourne tags + anchor_ms, et restreint à la section `lessons-learned`.
@@ -10524,6 +12299,83 @@ mod recall_lessons_tests {
         );
     }
 
+    /// F-70 : reverse-deps trouve les callers via la forme qualifiée `Type::method`.
+    ///
+    /// Contrat consommateur : depuis F-70, le parser émet `SqliteIndex::upsert` dans les
+    /// deps d'un appelant de `self.upsert()` / `x.upsert()`. Ce test seede un caller avec
+    /// cette dep qualifiée et vérifie que le SQL exact-match (`WHERE d.value = ?`) la
+    /// retrouve, là où le terminal seul (`"upsert"`) était ambigu entre plusieurs types.
+    #[tokio::test]
+    async fn code_scope_reverse_deps_finds_qualified_method_caller() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open");
+        let vault_id = "code-test";
+        let source_path = "src/idx.rs";
+
+        // La cible : SqliteIndex::upsert (aucune dep).
+        // Le caller : run() qui appelle self.upsert() → deps qualifiées ET terminal.
+        // Un homonyme : OtherType::upsert, pour prouver la désambiguïsation par type.
+        let notes = vec![
+            make_meta_note(
+                vault_id,
+                source_path,
+                "method",
+                "SqliteIndex::upsert",
+                None,
+                vec![],
+            ),
+            make_meta_note(
+                vault_id,
+                source_path,
+                "method",
+                "SqliteIndex::run",
+                None,
+                vec!["upsert", "SqliteIndex::upsert"],
+            ),
+            make_meta_note(
+                vault_id,
+                source_path,
+                "method",
+                "OtherType::caller",
+                None,
+                vec!["upsert", "OtherType::upsert"],
+            ),
+        ];
+        idx.write_note_derived_batch(vault_id, source_path, "h", "sha", notes)
+            .await
+            .expect("write_note_derived_batch");
+
+        // reverse_deps sur la forme qualifiée → seul SqliteIndex::run (pas OtherType::caller).
+        let callers = idx
+            .code_scope_reverse_deps(vault_id, "SqliteIndex::upsert", 10)
+            .await
+            .expect("reverse_deps");
+        let qnames: Vec<&str> = callers.iter().map(|c| c.qualified_name.as_str()).collect();
+        assert!(
+            qnames.contains(&"SqliteIndex::run"),
+            "reverse_deps('SqliteIndex::upsert') doit trouver SqliteIndex::run. trouvé={qnames:?}"
+        );
+        assert!(
+            !qnames.contains(&"OtherType::caller"),
+            "reverse_deps qualifié ne doit PAS matcher OtherType::caller (désambiguïsation). \
+             trouvé={qnames:?}"
+        );
+
+        // Contraste : le terminal ambigu `upsert` matche les DEUX callers.
+        let terminal_callers = idx
+            .code_scope_reverse_deps(vault_id, "upsert", 10)
+            .await
+            .expect("reverse_deps terminal");
+        assert_eq!(
+            terminal_callers.len(),
+            2,
+            "reverse_deps('upsert') terminal matche les 2 callers (ambigu). trouvé={:?}",
+            terminal_callers
+                .iter()
+                .map(|c| c.qualified_name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// get_last_ingested_sha retourne le sha le plus fréquent.
     #[tokio::test]
     async fn c_get_last_ingested_sha() {
@@ -10715,6 +12567,91 @@ mod recall_lessons_tests {
             "beta sans deps ne doit PAS apparaître. callers={callers:?}"
         );
     }
+
+    /// Anti-régression P0 — `limit` au-delà du plafond de sur-fetch ne doit pas paniquer.
+    ///
+    /// Le sur-fetch était calculé par `(limit * 4).clamp(limit.max(1), 100)` :
+    /// `usize::clamp` panique quand `min > max`, donc dès `limit >= 101`
+    /// (`min = 101 > max = 100`). `SqliteIndex` et le trait `IndexStore` sont
+    /// réexportés publiquement (`gradatum_core::IndexStore`) ⇒ panique atteignable
+    /// depuis une API publiée. Le chemin HTTP borne à `clamp(1, 20)` et masquait le
+    /// défaut au LIVE ; un consommateur crates.io, lui, y était exposé.
+    ///
+    /// Le test vérifie AUSSI l'absence de troncature silencieuse : avec 150 leçons
+    /// seedées et `limit = 120`, le plancher de fetch doit rester `limit`, donc
+    /// 120 résultats nets — un plafond dur à 100 rendrait 100 et passerait inaperçu.
+    #[tokio::test]
+    async fn recall_lessons_does_not_panic_above_overfetch_cap() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let vault = VaultId::new("main");
+
+        for i in 0..150u32 {
+            idx.seed_lesson(
+                &format!("01KAAAAAAAAAAAAAAAAAAAA{i:03}"),
+                &format!("Leçon rollback {i}"),
+                "rollback",
+                "Basculer sur le backup avant migration.",
+                1_700_000_000_000 + i64::from(i),
+            )
+            .await
+            .expect("seed lesson");
+        }
+
+        // `limit = 101` : premier point de panique de l'ancien calcul.
+        let hits = idx
+            .recall_lessons(&vault, "rollback", 101)
+            .await
+            .expect("recall_lessons(limit=101) ne doit pas échouer");
+        assert_eq!(
+            hits.len(),
+            101,
+            "limit=101 doit rendre 101 résultats nets, sans troncature au plafond de sur-fetch"
+        );
+
+        // `limit = 120` : preuve que le plancher de fetch suit `limit` (pas 100).
+        let hits = idx
+            .recall_lessons(&vault, "rollback", 120)
+            .await
+            .expect("recall_lessons(limit=120) ne doit pas échouer");
+        assert_eq!(
+            hits.len(),
+            120,
+            "limit=120 doit rendre 120 résultats nets — un plafond dur à 100 tronquerait"
+        );
+    }
+
+    /// Cas limite `limit = 0` — `limit * 4 == 0` : ne rend aucune leçon.
+    ///
+    /// L'ancien calcul remontait le fetch à 1 (`clamp` avec `min = limit.max(1)`),
+    /// et la garde de boucle `results.len() >= limit` n'étant évaluée qu'APRÈS le
+    /// `push`, `recall_lessons(.., 0)` rendait **une** leçon pour un quota nul.
+    #[tokio::test]
+    async fn recall_lessons_returns_empty_for_zero_limit() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let vault = VaultId::new("main");
+
+        idx.seed_lesson(
+            "01KBBBBBBBBBBBBBBBBBBBBBBB",
+            "Leçon deploy",
+            "deploy",
+            "Vérifier le health check avant cutover.",
+            1_700_000_000_000,
+        )
+        .await
+        .expect("seed lesson");
+
+        let hits = idx
+            .recall_lessons(&vault, "deploy", 0)
+            .await
+            .expect("recall_lessons(limit=0) ne doit pas échouer");
+        assert!(
+            hits.is_empty(),
+            "limit=0 doit rendre 0 leçon, pas 1. hits={:?}",
+            hits.iter()
+                .map(|h| h.note_id.0.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 /// Unit tests for `apply_cap` — pure function, no database required.
@@ -10759,6 +12696,175 @@ mod apply_cap_tests {
 mod find_promotable_tests {
     use super::*;
     use gradatum_core::status::NoteStatus;
+
+    /// Variante multi-vault de `insert_note_for_promote` (tests C2 EX-C2-3).
+    async fn insert_note_for_promote_in_vault(
+        idx: &SqliteIndex,
+        id: &str,
+        vault_id: &str,
+        status: &str,
+        created: i64,
+    ) {
+        let conn = idx.conn.lock().await;
+        conn.execute(
+            "INSERT INTO notes (id, vault_id, section, status, schema_version, created, status_changed, content_hash, body_text)
+             VALUES (?1, ?2, 'reference', ?3, 1, ?4, NULL, X'00', '')",
+            rusqlite::params![id, vault_id, status, created],
+        )
+        .unwrap();
+    }
+
+    /// C2 (INV-JOB-SCOPE) : `find_promotable_in_vault` ne retourne QUE les notes du
+    /// vault demandé — jamais celles d'un autre vault, contrairement au scan global.
+    #[tokio::test]
+    async fn find_promotable_in_vault_scopes_to_vault() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let now = 1_700_000_100_000_i64;
+        let old = now - 20 * 86_400_000;
+        let cutoff = now - 14 * 86_400_000;
+
+        insert_note_for_promote_in_vault(
+            &idx,
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "main",
+            "staging",
+            old,
+        )
+        .await;
+        insert_note_for_promote_in_vault(
+            &idx,
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+            "research",
+            "staging",
+            old,
+        )
+        .await;
+
+        let main_notes = idx
+            .find_promotable_in_vault("main", cutoff, 100)
+            .await
+            .expect("find_promotable_in_vault main");
+        assert_eq!(main_notes.len(), 1, "seule la note du vault main");
+        assert_eq!(main_notes[0].0, "01AAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(main_notes[0].1, NoteStatus::Staging);
+
+        let research_notes = idx
+            .find_promotable_in_vault("research", cutoff, 100)
+            .await
+            .expect("find_promotable_in_vault research");
+        assert_eq!(research_notes.len(), 1, "seule la note du vault research");
+        assert_eq!(research_notes[0].0, "01BBBBBBBBBBBBBBBBBBBBBBBB");
+
+        // Le scan global legacy voit les DEUX (comportement OFF documenté).
+        let all = idx.find_promotable(cutoff, 100).await.expect("global");
+        assert_eq!(
+            all.len(),
+            2,
+            "le scan global reste cross-vault (legacy OFF)"
+        );
+    }
+
+    /// C2 : `list_active_vaults` retourne les tenants actifs triés — les suspendus
+    /// sont exclus (refus immédiat des jobs après suspend).
+    #[tokio::test]
+    async fn list_active_vaults_excludes_suspended() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute_batch(
+                "INSERT INTO tenants (id, status, created_at) VALUES ('research', 'active', 0);
+                 INSERT INTO tenants (id, status, created_at) VALUES ('frozen', 'suspended', 0);",
+            )
+            .unwrap();
+        }
+        let vaults = idx.list_active_vaults().await.expect("list_active_vaults");
+        // Seed migration 0030 : "main" actif + "research" actif ; "frozen" exclu.
+        assert_eq!(vaults, vec!["main".to_string(), "research".to_string()]);
+    }
+
+    /// Lot REG : un `vault_id` préfixé `code-` n'entre jamais dans `tenants` — refus
+    /// lexical, avant toute I/O. Le discriminant est l'ABSENCE de ligne après l'appel :
+    /// un simple `is_err()` passerait aussi si la garde échouait APRÈS l'insertion.
+    #[tokio::test]
+    async fn provision_vault_refuses_code_prefixed_vault() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let err = idx
+            .provision_vault("code-gradatum")
+            .await
+            .expect_err("un vault de code ne doit jamais être provisionné");
+        assert!(
+            matches!(err, GradatumError::InvalidInput(_)),
+            "le refus est une faute d'appelant (InvalidInput), pas une panne de stockage : {err:?}"
+        );
+        let conn = idx.conn.lock().await;
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tenants WHERE id = 'code-gradatum'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count tenants");
+        assert_eq!(
+            rows, 0,
+            "aucune ligne `tenants` ne doit subsister après refus"
+        );
+    }
+
+    /// Lot REG : le refus porte aussi sur la PRÉSENCE dans `code_vault`, pas seulement sur
+    /// le préfixe. Ce test est le seul qui distingue les deux barreaux — il utilise un
+    /// `vault_id` SANS préfixe `code-`, que le test lexical laisserait passer.
+    #[tokio::test]
+    async fn provision_vault_refuses_vault_present_in_code_registry() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute(
+                "INSERT INTO code_vault (vault_id, repo_abs_path, visibility)
+                 VALUES ('legacy-no-prefix', '/tmp/repo', 'pub')",
+                [],
+            )
+            .expect("seed code_vault sans préfixe");
+        }
+        let err = idx
+            .provision_vault("legacy-no-prefix")
+            .await
+            .expect_err("un vault déjà inscrit à `code_vault` n'entre pas dans `tenants`");
+        assert!(
+            matches!(err, GradatumError::InvalidInput(_)),
+            "refus de registre attendu, got {err:?}"
+        );
+        let conn = idx.conn.lock().await;
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tenants WHERE id = 'legacy-no-prefix'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count tenants");
+        assert_eq!(
+            rows, 0,
+            "l'intersection tenants ∩ code_vault doit rester vide"
+        );
+    }
+
+    /// Lot REG — contre-épreuve : la garde ne mord QUE sur le registre de code. Un vault de
+    /// données ordinaire reste provisionnable, et le second appel reste idempotent.
+    #[tokio::test]
+    async fn provision_vault_still_accepts_a_data_vault() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        assert!(
+            idx.provision_vault("research")
+                .await
+                .expect("un vault de données ordinaire reste provisionnable"),
+            "première inscription → changed=true"
+        );
+        assert!(
+            !idx.provision_vault("research")
+                .await
+                .expect("re-jeu idempotent"),
+            "seconde inscription → changed=false (INSERT OR IGNORE)"
+        );
+    }
 
     /// Insère une note directement en SQL avec `created` et `status_changed` explicites.
     /// Permet de simuler des notes âgées ou récentes sans dépendre d'un helper de haut niveau.

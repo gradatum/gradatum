@@ -29,16 +29,16 @@ use serde::Serialize;
 
 use crate::changelog_parse::ChangelogEntry;
 
-/// Payload prêt pour `POST /api/v1/vault_write`.
+/// Payload ready to be sent to `POST /api/v1/vault_write`.
 #[derive(Debug, Clone, Serialize)]
 pub struct VaultWriteCard {
-    /// Titre de la note, format `[PROJECT-MAP][gradatum] {titre} — v{ver}`.
+    /// Note title, shaped as `[PROJECT-MAP][gradatum] {title} — v{version}`.
     pub title: String,
-    /// Corps markdown contenant les wikilinks typés + marqueur source.
+    /// Markdown body carrying the typed wikilinks and the source marker.
     pub body: String,
-    /// Tags pour la recherche.
+    /// Tags, used to make the card searchable.
     pub tags: Vec<String>,
-    /// Section de destination (`"project-map"`).
+    /// Destination section, always `"project-map"`.
     pub section_hint: String,
 }
 

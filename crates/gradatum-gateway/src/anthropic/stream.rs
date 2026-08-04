@@ -43,17 +43,17 @@ use tokio::time::MissedTickBehavior;
 use crate::anthropic::translate::map_stop_reason;
 use crate::commons::provider::ChatCompletionStream;
 
-/// Alias d'item de flux SSE Anthropic : `Bytes` infaillible (compatible `Body::from_stream`).
+/// Item of an Anthropic SSE stream: infallible `Bytes`, compatible with `Body::from_stream`.
 type SseItem = Result<Bytes, std::convert::Infallible>;
 
 // ── Helpers SSE ──────────────────────────────────────────────────────────────
 
-/// Formate un event SSE Anthropic : `event: <type>\ndata: <json>\n\n`.
+/// Formats one Anthropic SSE event: `event: <type>\ndata: <json>\n\n`.
 ///
-/// La sérialisation JSON est compacte (sans indentation) conformément au format Anthropic.
+/// The JSON payload is compact (no indentation), as required by the Anthropic format.
 ///
-/// # Errors
-/// Retourne une `Bytes` vide + tracing warn si la sérialisation échoue (ne panic jamais).
+/// On a serialization failure, logs a warning and returns empty `Bytes` — the event is
+/// skipped rather than propagated. Never panics.
 fn format_sse_event(event_type: &str, data: &Value) -> Bytes {
     match serde_json::to_string(data) {
         Ok(json) => {
@@ -64,14 +64,14 @@ fn format_sse_event(event_type: &str, data: &Value) -> Bytes {
             tracing::warn!(
                 event_type = %event_type,
                 error = %e,
-                "échec sérialisation event SSE Anthropic — event ignoré"
+                "Anthropic SSE event serialization failed — event skipped"
             );
             Bytes::new()
         }
     }
 }
 
-/// Génère l'event `content_block_stop` pour l'index de bloc donné.
+/// Builds the `content_block_stop` event for the given block index.
 fn block_stop_event(index: u32) -> Bytes {
     format_sse_event(
         "content_block_stop",
@@ -79,7 +79,7 @@ fn block_stop_event(index: u32) -> Bytes {
     )
 }
 
-/// Génère l'event `message_start` Anthropic (ouverture du message).
+/// Builds the Anthropic `message_start` event that opens the message.
 fn message_start_event(model: &str, message_id: &str) -> Bytes {
     format_sse_event(
         "message_start",
@@ -99,17 +99,17 @@ fn message_start_event(model: &str, message_id: &str) -> Bytes {
     )
 }
 
-/// Génère l'event `ping` Anthropic (keep-alive).
+/// Builds the Anthropic `ping` keep-alive event.
 fn ping_event() -> Bytes {
     format_sse_event("ping", &json!({ "type": "ping" }))
 }
 
-/// Génère l'event `message_stop` Anthropic (fin du message).
+/// Builds the Anthropic `message_stop` event that ends the message.
 fn message_stop_event() -> Bytes {
     format_sse_event("message_stop", &json!({ "type": "message_stop" }))
 }
 
-/// Génère l'event `message_delta` Anthropic (stop_reason + usage output).
+/// Builds the Anthropic `message_delta` event carrying `stop_reason` and output usage.
 fn message_delta_event(stop_reason: &str, output_tokens: u32) -> Bytes {
     format_sse_event(
         "message_delta",
@@ -121,26 +121,27 @@ fn message_delta_event(stop_reason: &str, output_tokens: u32) -> Bytes {
     )
 }
 
-/// Vrai si l'item SSE est l'event terminal `message_stop`.
+/// Returns `true` when the SSE item is the terminal `message_stop` event.
 ///
-/// Utilisé par [`keepalive_anthropic_sse`] (phase `Content`) pour savoir si le flux de
-/// contenu a déjà clôturé le message Anthropic. Ce flux n'émet `message_stop` qu'au
-/// `finish_reason` du dernier chunk (ou sur erreur backend) ; une terminaison anormale
-/// (TCP FIN sans `finish_reason` — crash/restart engine mid-prefill) le laisse absent,
-/// auquel cas une clôture de sécurité doit être émise par le wrapper keep-alive.
+/// Used by [`keepalive_anthropic_sse`] during its content phase to know whether the
+/// content stream has already closed the Anthropic message. That stream only emits
+/// `message_stop` on the last chunk's `finish_reason` (or on a backend error); an abnormal
+/// termination — a TCP FIN with no `finish_reason`, for instance when the backend restarts
+/// mid-prefill — leaves it absent, in which case the keep-alive wrapper must emit a safety
+/// close itself.
 ///
-/// La détection se fait sur le préfixe d'event car le flux de contenu produit des `Bytes`
-/// opaques (un event par item) : c'est le seul signal disponible sans rearchitecturer le
-/// flux de contenu partagé avec [`chunks_to_anthropic_sse`].
+/// Detection matches on the event prefix because the content stream yields opaque `Bytes`
+/// (one event per item); that prefix is the only signal available without restructuring the
+/// content stream shared with [`chunks_to_anthropic_sse`].
 fn is_message_stop(item: &SseItem) -> bool {
     matches!(item, Ok(bytes) if bytes.starts_with(b"event: message_stop\n"))
 }
 
-/// Génère un event `error` Anthropic.
+/// Builds an Anthropic `error` event.
 ///
-/// # Sécurité (V3 — information disclosure)
-/// `message` DOIT être un libellé générique fourni par l'appelant — aucun détail interne
-/// (provider, IP, port, raison backend) ne doit y transiter.
+/// # Security — information disclosure
+/// `message` MUST be a generic label supplied by the caller. No internal detail
+/// (provider name, IP, port, backend failure reason) may travel through it.
 fn error_event(error_type: &str, message: &str) -> Bytes {
     format_sse_event(
         "error",
@@ -153,22 +154,23 @@ fn error_event(error_type: &str, message: &str) -> Bytes {
 
 // ── Machine à états ──────────────────────────────────────────────────────────
 
-/// État de la machine SSE Anthropic.
+/// State of the Anthropic SSE state machine.
 ///
-/// Suit les blocs de contenu ouverts pour émettre les `content_block_stop` au bon moment.
+/// Tracks which content blocks are open, so that `content_block_stop` is emitted at the
+/// right moment.
 struct StreamState {
-    /// Bloc texte ouvert : `Some(index_anthropic)` si un bloc texte est en cours.
+    /// Open text block: `Some(anthropic_index)` while a text block is in progress.
     text_block_index: Option<u32>,
-    /// Map `openai_tool_index → (anthropic_block_index, started: bool)`.
+    /// Map `openai_tool_index → (anthropic_block_index, started)`.
     ///
-    /// `started = false` : le `content_block_start` n'a pas encore été émis
-    ///   (on attend d'avoir `id` + `name` pour l'émettre).
+    /// `started = false` means `content_block_start` has not been emitted yet — the
+    /// machine waits until both `id` and `name` are known before opening the block.
     tool_blocks: HashMap<u32, (u32, bool)>,
-    /// Compteur de bloc Anthropic (incrémenté à chaque nouveau bloc ouvert).
+    /// Anthropic block counter, incremented for every newly opened block.
     next_block_index: u32,
-    /// `finish_reason` du dernier chunk reçu (pour `message_delta`).
+    /// `finish_reason` of the last chunk received, used to build `message_delta`.
     finish_reason: Option<String>,
-    /// Compteur de tokens de sortie (estimé depuis les chunks usage si disponible).
+    /// Output token counter, taken from the usage carried by chunks when available.
     output_tokens: u32,
 }
 
@@ -183,10 +185,10 @@ impl StreamState {
         }
     }
 
-    /// Alloue un nouvel index Anthropic et retourne-le.
+    /// Allocates and returns the next Anthropic block index.
     ///
-    /// Utilise `saturating_add` pour éviter toute panique sur overflow en debug
-    /// (flux pathologique avec ≥ 2³² blocs — théoriquement impossible mais non garanti).
+    /// Uses `saturating_add` so that a pathological stream with 2³² or more blocks
+    /// cannot panic on overflow in a debug build.
     fn alloc_block(&mut self) -> u32 {
         let idx = self.next_block_index;
         self.next_block_index = self.next_block_index.saturating_add(1);
@@ -196,19 +198,19 @@ impl StreamState {
 
 // ── Fonction principale ───────────────────────────────────────────────────────
 
-/// Convertit un `ChatCompletionStream` OpenAI en flux d'events SSE Anthropic.
+/// Converts an OpenAI `ChatCompletionStream` into a stream of Anthropic SSE events.
 ///
-/// Retourne un `Stream<Item = Result<Bytes, std::convert::Infallible>>` compatible
-/// avec `axum::body::Body::from_stream`.
+/// Returns a `Stream<Item = Result<Bytes, std::convert::Infallible>>`, directly usable
+/// with `axum::body::Body::from_stream`.
 ///
 /// # Arguments
-/// - `stream` : flux de chunks OpenAI (depuis `dispatch_stream_with_fallback`)
-/// - `model` : nom du modèle Anthropic à renvoyer dans `message_start`
-/// - `message_id` : identifiant unique du message (ex: `msg_<ulid>`)
+/// - `stream` — the stream of OpenAI chunks produced by the dispatch layer;
+/// - `model` — the Anthropic model name to echo back in `message_start`;
+/// - `message_id` — the unique message identifier (for example `msg_<ulid>`).
 ///
 /// # Errors
-/// Aucune erreur n'est propagée : les erreurs backend deviennent des events Anthropic
-/// de type `error`, le flux se termine proprement.
+/// No error is ever propagated: a backend failure becomes an Anthropic `error` event and
+/// the stream then terminates cleanly.
 pub fn chunks_to_anthropic_sse(
     stream: ChatCompletionStream,
     model: String,
@@ -222,14 +224,14 @@ pub fn chunks_to_anthropic_sse(
     prefix.chain(chunks_to_anthropic_content_sse(stream))
 }
 
-/// Convertit un `ChatCompletionStream` en events SSE Anthropic **de contenu uniquement**.
+/// Converts a `ChatCompletionStream` into **content-only** Anthropic SSE events.
 ///
-/// Émet la machine à états de contenu (`content_block_*`, `message_delta`, `message_stop`,
-/// et l'event `error` en cas d'échec backend) — **sans** le préfixe `message_start`/`ping`.
+/// Runs the content state machine (`content_block_*`, `message_delta`, `message_stop`, and
+/// the `error` event on a backend failure) **without** the `message_start` / `ping` prefix.
 ///
-/// Permet de réutiliser la conversion de contenu lorsque `message_start` a déjà été émis
-/// en amont (cf. [`keepalive_anthropic_sse`], qui ouvre le stream immédiatement puis
-/// intercale des `ping` pendant le prefill avant de raccorder ce flux de contenu).
+/// This lets the content conversion be reused when `message_start` has already been emitted
+/// upstream — see [`keepalive_anthropic_sse`], which opens the stream immediately and
+/// interleaves `ping` events during prefill before splicing in this content stream.
 fn chunks_to_anthropic_content_sse(
     stream: ChatCompletionStream,
 ) -> impl Stream<Item = SseItem> + Send {
@@ -246,88 +248,91 @@ fn chunks_to_anthropic_content_sse(
 
 // ── Ouverture immédiate + keep-alive pendant le prefill ────────────────────────
 
-/// Issue d'un dispatch streaming différé, consommée par [`keepalive_anthropic_sse`].
+/// Outcome of a deferred streaming dispatch, consumed by [`keepalive_anthropic_sse`].
 ///
-/// Découple le module SSE (purement fonctionnel) de la couche dispatch/erreur : le handler
-/// résout le dispatch, enregistre ses métriques, puis fournit ici soit le flux de chunks
-/// engine, soit un descripteur d'erreur déjà neutralisé (message générique).
+/// Decouples the purely functional SSE module from the dispatch and error layers: the
+/// handler resolves the dispatch, records its metrics, and hands over either the backend
+/// chunk stream or an already-neutralized error descriptor.
 pub enum StreamDispatch {
-    /// L'engine a renvoyé un flux de chunks — son contenu est raccordé au stream SSE.
+    /// The backend returned a chunk stream — its content is spliced into the SSE stream.
     Ready(ChatCompletionStream),
-    /// Le dispatch a échoué avant de produire un flux — un event `error` est émis.
-    ///
-    /// `message` DOIT être un libellé générique (V3 information disclosure).
+    /// The dispatch failed before producing a stream — an `error` event is emitted.
     Failed {
+        /// Anthropic error type label carried in the `error` event.
         error_type: &'static str,
+        /// Client-facing message. MUST be generic: no provider name, host, port, or
+        /// backend failure detail may travel through it (information disclosure).
         message: String,
     },
 }
 
-/// État interne de la machine à états de [`keepalive_anthropic_sse`].
+/// Internal phase of the [`keepalive_anthropic_sse`] state machine.
 enum KeepAlivePhase {
-    /// Émettre `message_start`, puis passer en attente.
+    /// Emit `message_start`, then move to the waiting phase.
     Start {
         message_start: Bytes,
         dispatch: BoxFuture<'static, StreamDispatch>,
         ticker: tokio::time::Interval,
     },
-    /// Course entre la résolution du dispatch et le prochain `ping` périodique.
+    /// Race the dispatch resolution against the next periodic `ping`.
     Waiting {
         dispatch: BoxFuture<'static, StreamDispatch>,
         ticker: tokio::time::Interval,
     },
-    /// Raccordement du flux de contenu engine (events de contenu jusqu'à `message_stop`).
+    /// Splice in the backend content stream (content events up to `message_stop`).
     ///
-    /// Le `ticker` est conservé depuis la phase `Waiting` : `provider.stream()` ne résout
-    /// que sur l'arrivée des headers ; le **premier token** (fin du prefill engine, ~70-110s)
-    /// n'arrive qu'au premier poll de ce flux. Sans ping pendant cette fenêtre
-    /// `headers→premier token`, le client idle-timeout malgré le keep-alive de la phase
-    /// `Waiting`. On race donc le contenu contre un ping périodique (un `ping` SSE Anthropic
-    /// est valide à tout moment).
+    /// The `ticker` is carried over from the `Waiting` phase: `provider.stream()` resolves
+    /// as soon as the response headers arrive, but the **first token** — the end of the
+    /// backend prefill — only lands on the first poll of this stream. Without pings during
+    /// that `headers → first token` window, the client would idle out despite the keep-alive
+    /// of the `Waiting` phase. The content stream is therefore raced against a periodic
+    /// ping; an Anthropic SSE `ping` is valid at any point in the stream.
     ///
-    /// `stop_emitted` : vrai dès que le flux de contenu a émis son `message_stop`
-    /// (via `finish_reason` ou erreur). S'il reste faux à la fin du flux (terminaison
-    /// anormale), une clôture de sécurité est émise.
+    /// `stop_emitted` becomes `true` as soon as the content stream has emitted its
+    /// `message_stop` (through `finish_reason` or an error). If it is still `false` when the
+    /// stream ends — an abnormal termination — a safety close is emitted.
     Content {
         stream: Pin<Box<dyn Stream<Item = SseItem> + Send>>,
         ticker: tokio::time::Interval,
         stop_emitted: bool,
     },
-    /// Émettre l'event `error`, puis `message_stop`.
+    /// Emit the `error` event, then `message_stop`.
     Error {
         error_type: &'static str,
         message: String,
     },
-    /// Émettre `message_stop` final (après une erreur).
+    /// Emit the final `message_stop` after an error.
     Stop,
-    /// Terminal.
+    /// Terminal phase.
     Done,
 }
 
-/// Ouvre un flux SSE Anthropic **immédiatement** et maintient la connexion active par des
-/// `ping` périodiques pendant que `dispatch` (le prefill engine) progresse en arrière-plan.
+/// Opens an Anthropic SSE stream **immediately** and keeps the connection alive with
+/// periodic `ping` events while `dispatch` — the backend prefill — proceeds in the
+/// background.
 ///
-/// # Motivation (incident b9780, 2026-06-25)
-/// llama-server n'émet ses headers HTTP / son premier token qu'après le prefill (~90-110s
-/// pour un gros contexte). Si la `Response` n'était construite qu'après la résolution du
-/// dispatch, **aucun byte** n'atteignait le client pendant le prefill → idle-timeout client
-/// (~113s) → annulation → bascule fallback cpu-curator (n_ctx réduit) → 400.
+/// # Motivation
+/// A self-hosted backend such as `llama-server` emits neither its HTTP response headers
+/// nor its first token until prefill completes, which can take well over a minute on a
+/// large context. If the `Response` were only built once the dispatch resolved, **not a
+/// single byte** would reach the client during prefill; the client would hit its idle
+/// timeout, cancel the request, and the retry would land on a degraded fallback.
 ///
-/// Ici, `message_start` part dès t=0, puis un `ping` toutes les `ping_period` jusqu'à ce que
-/// `dispatch` résolve. La décision de fallback (primary→cpu-curator), interne au dispatch,
-/// reste inchangée : elle s'appuie sur l'échec de connexion/headers et **non** sur le premier
-/// token — un prefill long n'est pas une erreur, le fallback reste intact.
+/// Here, `message_start` is sent at t=0 and a `ping` follows every `ping_period` until
+/// `dispatch` resolves. The dispatch-internal fallback decision is unchanged: it keys on
+/// connection and header failures, **not** on the first token — a long prefill is not an
+/// error.
 ///
-/// # Séquence
-/// `message_start` → `ping`* (pendant l'attente du dispatch ET pendant le prefill engine,
-/// fenêtre `headers→premier token`) → soit le contenu engine (`content_block_*` …
-/// `message_stop`), soit `error` + `message_stop` si le dispatch échoue. Si le flux engine
-/// se termine sans `finish_reason` (terminaison anormale), une clôture de sécurité
-/// (`message_delta` + `message_stop`) est émise.
+/// # Sequence
+/// `message_start` → `ping`* (both while waiting for the dispatch and during backend
+/// prefill, i.e. the `headers → first token` window) → then either the backend content
+/// (`content_block_*` … `message_stop`) or `error` + `message_stop` if the dispatch failed.
+/// If the backend stream ends without a `finish_reason` (abnormal termination), a safety
+/// close (`message_delta` + `message_stop`) is emitted.
 ///
-/// # Robustesse (ADN 1)
-/// Aucune erreur n'est propagée : un échec dispatch devient un event Anthropic `error`
-/// (message générique) suivi de `message_stop`. Jamais de panic.
+/// # Robustness
+/// No error is ever propagated: a dispatch failure becomes an Anthropic `error` event
+/// carrying a generic message, followed by `message_stop`. This function never panics.
 pub fn keepalive_anthropic_sse(
     dispatch: BoxFuture<'static, StreamDispatch>,
     model: String,
@@ -448,10 +453,10 @@ pub fn keepalive_anthropic_sse(
     })
 }
 
-/// Traite un chunk OpenAI et retourne la liste d'events Anthropic correspondants.
+/// Processes one OpenAI chunk and returns the Anthropic events it produces.
 ///
-/// Mutate `state` pour suivre les blocs ouverts.
-/// Retourne `Vec<Result<Bytes, std::convert::Infallible>>` pour être compatible avec `flat_map`.
+/// Mutates `state` to track which blocks are open. Returns a `Vec` of infallible items so
+/// the result can be fed straight into `flat_map`.
 fn process_chunk(
     state: &mut StreamState,
     chunk_result: crate::commons::error::LlmResult<crate::commons::streaming::ChatCompletionChunk>,
@@ -460,7 +465,7 @@ fn process_chunk(
         Ok(c) => c,
         Err(e) => {
             // Logguer le détail côté serveur, PAS côté client (information disclosure V3).
-            tracing::error!(error = %e, "erreur stream backend Anthropic");
+            tracing::error!(error = %e, "Anthropic backend stream error");
             // Fermer les blocs ouverts proprement.
             let mut events = close_open_blocks(state);
             // Émettre un event `error` Anthropic avec message générique —
@@ -512,7 +517,7 @@ fn process_chunk(
 
         let idx = state
             .text_block_index
-            .expect("text_block_index vient d'être initialisé — impossible d'être None");
+            .expect("text_block_index was just initialized — cannot be None");
         events.push(Ok(format_sse_event(
             "content_block_delta",
             &json!({
@@ -542,7 +547,7 @@ fn process_chunk(
             let (anthropic_idx, started) = state
                 .tool_blocks
                 .get_mut(&openai_idx)
-                .expect("tool_blocks vient d'être initialisé pour openai_idx");
+                .expect("tool_blocks was just initialized for openai_idx");
 
             // Émettre content_block_start si on a id + name (premier fragment).
             if !*started
@@ -604,9 +609,9 @@ fn process_chunk(
     events
 }
 
-/// Ferme tous les blocs de contenu ouverts (texte + tool_calls) dans l'ordre des index.
+/// Closes every open content block (text and tool calls), in index order.
 ///
-/// Retourne les events `content_block_stop` correspondants, triés par index croissant.
+/// Returns the matching `content_block_stop` events, sorted by ascending index.
 fn close_open_blocks(state: &mut StreamState) -> Vec<Result<Bytes, std::convert::Infallible>> {
     let mut to_close: Vec<u32> = Vec::new();
 

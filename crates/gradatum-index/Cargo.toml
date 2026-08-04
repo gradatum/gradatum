@@ -6,7 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "SQLite + FTS5 + drift detection Phase A — index layer Gradatum Phase 1"
+description = "SQLite + FTS5 index layer for gradatum — full-text and vector storage with drift detection"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 gradatum-core    = { workspace = true }

@@ -1,8 +1,8 @@
 //! Tests d'intégration — flush télémétrie usage (feat/usage-telemetry-19091).
 //!
 //! Couvre :
-//! - Task 5 : `flush_once` persiste les deltas (read-path + MCP) et incrémente les familles Prometheus.
-//! - Task 6 : `seed_metrics_from_db` relit la DB et seed les familles (P1-3 ordonnancement boot).
+//! - `flush_once` persiste les deltas (read-path + MCP) et incrémente les familles Prometheus.
+//! - `seed_metrics_from_db` relit la DB et seed les familles (P1-3 ordonnancement boot).
 //! - P1-2 (reviewer) : clé non routable → ignorée (warn, aucun incrément Prometheus).
 //! - T3 (v0.7.5 F-85) : `flush_once` retourne `Result` et propage les erreurs.
 
@@ -57,7 +57,7 @@ fn find_sum(sums: &[(String, u64)], endpoint: &str) -> u64 {
 
 /// `flush_once` persiste les deltas read-path + MCP et incrémente les familles Prometheus.
 ///
-/// Test normatif (plan Task 5, step 1) : les deltas read-path et MCP sont persistés en DB
+/// Test normatif (step 1) : les deltas read-path et MCP sont persistés en DB
 /// et les familles Prometheus sont incrémentées.
 #[tokio::test]
 async fn flush_once_persists_and_increments_metrics() {
@@ -132,7 +132,7 @@ async fn flush_once_accumulates_across_flushes() {
 
 /// `seed_metrics_from_db` relit la DB et seed les familles Prometheus.
 ///
-/// Test normatif (plan Task 6, step 1) : seed depuis la DB → les familles reflètent les sommes.
+/// Test normatif (step 1) : seed depuis la DB → les familles reflètent les sommes.
 #[tokio::test]
 async fn seed_reflects_db_sum() {
     let dir = TempDir::new().expect("tempdir");
@@ -181,7 +181,7 @@ async fn seed_reflects_db_sum() {
 
 /// `seed_metrics_from_db` ignore les clés non routables (fail-closed P1-2).
 ///
-/// Test normatif (plan Task 6, step 1b) : une clé legacy orpheline ne doit pas
+/// Test normatif (step 1b) : une clé legacy orpheline ne doit pas
 /// apparaître dans les familles Prometheus.
 #[tokio::test]
 async fn seed_skips_unroutable_key() {

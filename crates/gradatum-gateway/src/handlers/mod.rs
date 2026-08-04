@@ -1,4 +1,5 @@
-/// gateway HTTP handlers.
+//! gateway HTTP handlers.
+
 pub mod chat;
 pub mod embeddings;
 pub mod health;

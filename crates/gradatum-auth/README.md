@@ -1,27 +1,30 @@
 # gradatum-auth
 
-> JWT verification (Ed25519, audience-scoped, mandatory `kid`), API key exchange, and token revocation.
+> JWT verification (Ed25519, audience-scoped, mandatory `kid`), signing-key store, and `jti` revocation.
 
-**Status**: 0.x — API not yet stable. Apache-2.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
 
-`gradatum-auth` handles external identity verification. It provides:
+`gradatum-auth` handles external identity verification. Used by `gradatum-server` to provide:
 
 - **JWT verification** — Ed25519 signature validation, expiry, audience scope, and mandatory
-  `kid` claim. JWTs are signed by `gradatum-admin` at init time with a persistent Ed25519 keypair.
-- **API key exchange** — a consumer presents a `ak_xxx` API key to `POST /auth/exchange`;
-  the server verifies it against the stored argon2id hash (via `gradatum-acl-auth`) and
-  returns a short-lived JWT.
+  `kid` claim. The Ed25519 signing seed is created by `gradatum-server` at first boot
+  (`config/jwt-signing-key.secret`); `gradatum-admin token issue` loads that same seed — it
+  never creates one.
 - **Revocation store** — in-memory + SQLite-backed `jti` revocation, used to invalidate
   tokens before expiry.
+
+API key exchange (`POST /auth/exchange`) is **not** part of this crate: argon2id verification of
+`ak_xxx` keys lives in `gradatum-acl-auth`, on which this crate does not depend. `gradatum-server`
+combines the two.
 
 ## Usage
 
 ```toml
 [dependencies]
-gradatum-auth = "0.7.6"
+gradatum-auth = "1.0.0"
 ```
 
 ```rust
@@ -46,6 +49,7 @@ println!("consumer: {}, scopes: {:?}", claims.sub, claims.scopes);
 |---|---|
 | `jwt` | JWT Ed25519 verification + `Claims` struct |
 | `revocation` | `RevocationStore` — in-memory and SQLite-backed `jti` revocation |
+| `key_store` | `load` / `load_or_generate` / `signing_key_path` — Ed25519 seed on disk (mode 0600) |
 
 ## License
 

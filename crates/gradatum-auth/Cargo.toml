@@ -6,7 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "JWT (Ed25519, audience-scoped, mandatory kid) + OIDC + API-key"
+description = "JWT (Ed25519, audience-scoped, mandatory kid) verification + JTI revocation for gradatum"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 gradatum-core.workspace = true
@@ -24,6 +27,10 @@ ed25519-dalek.workspace = true
 jsonwebtoken.workspace = true
 pkcs8.workspace = true
 rand.workspace = true
+# Lecture de la seed de signature JWT via ExposeSecret (key_store.rs).
+# Déjà présente au workspace (gradatum-core, -curator, -server) : réutilisation,
+# pas une nouvelle dépendance externe.
+secrecy.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

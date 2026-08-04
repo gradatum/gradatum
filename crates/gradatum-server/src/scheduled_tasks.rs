@@ -1,4 +1,4 @@
-//! SSOT des 8 tâches récurrentes in-process du serveur gradatum.
+//! SSOT des 9 tâches récurrentes in-process du serveur gradatum.
 //!
 //! Ce module est la **source unique de vérité** (SSOT) pour :
 //! - les noms des tâches (`TASK_*` constantes)
@@ -43,10 +43,13 @@ pub const TASK_ACTIVE_RECALL_PURGE: &str = "active-recall-purge";
 /// Canonical name of the curated metrics timeseries sampling task (since v0.7.5).
 pub const TASK_METRIC_SAMPLE: &str = "metric-sample";
 
-/// Liste ordonnée des 8 tâches récurrentes in-process.
+/// F-51 — passe d'audit / déduplication rétrospective (rapport seul, Option A).
+pub const TASK_AUDIT_DEDUP: &str = "audit-dedup";
+
+/// Liste ordonnée des 9 tâches récurrentes in-process.
 ///
 /// Utilisée pour le seed au boot et par l'endpoint `/api/v1/system/scheduled`.
-pub const ALL_SCHEDULED_TASKS: [&str; 8] = [
+pub const ALL_SCHEDULED_TASKS: [&str; 9] = [
     TASK_TELEMETRY_FLUSH,
     TASK_PURGE_EVENT_LOG,
     TASK_PURGE_SESSION_TRACE,
@@ -55,6 +58,7 @@ pub const ALL_SCHEDULED_TASKS: [&str; 8] = [
     TASK_PROACTIVE_REFRESH,
     TASK_ACTIVE_RECALL_PURGE,
     TASK_METRIC_SAMPLE,
+    TASK_AUDIT_DEDUP,
 ];
 
 /// Retourne l'intervalle réel (en secondes) de la tâche `name`, tel que câblé dans `main.rs`.
@@ -91,6 +95,7 @@ pub fn task_interval_secs(name: &str, cfg: &ServerConfig) -> u64 {
         TASK_PROACTIVE_REFRESH => cfg.proactive_recall.refresh_interval_secs.max(60),
         TASK_ACTIVE_RECALL_PURGE => cfg.session_trace.purge_interval_secs.max(60),
         TASK_METRIC_SAMPLE => 60,
+        TASK_AUDIT_DEDUP => cfg.audit.interval_secs.max(60),
         _ => 60,
     }
 }

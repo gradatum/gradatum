@@ -189,7 +189,14 @@ async fn move_locus_preserves_index_only_downgraded_status() {
     // Downgrade INDEX-ONLY : UPDATE notes SET status='downgraded' ... — le .md reste live.
     vault
         .index()
-        .downgrade_note(&id, "remplacée par v2", Some(&replacement_id))
+        .downgrade_note(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            &id,
+            "remplacée par v2",
+            Some(&replacement_id),
+        )
         .await
         .expect("downgrade index-only");
 

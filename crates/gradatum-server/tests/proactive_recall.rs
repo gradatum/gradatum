@@ -1,4 +1,4 @@
-//! Tests Task 10 + 11 + 12 — orchestrateurs `proactive_recall` / `proactive_recall_feedback` (B').
+//! Tests des orchestrateurs `proactive_recall` / `proactive_recall_feedback` (B').
 //!
 //! Neuf propriétés vérifiées :
 //!
@@ -13,7 +13,7 @@
 //! 6. [`acl_deny_tenant_returns_forbidden`] — ACL Read refusée → `Forbidden`.
 //! 7. [`special_chars_context_does_not_break`] — caractères FTS spéciaux ne cassent pas.
 //!
-//! Tests Task 11 (feedback 8-13) + Task 12 (métriques 14-15) :
+//! Tests feedback (8-13) + métriques (14-15) :
 //!
 //! 14. [`recall_metrics_surfaced_counter_incremented`] — `proactive_surfaced` counter incrémenté.
 //! 15. [`feedback_metrics_accepted_counter_incremented`] — `proactive_accepted` counter incrémenté.
@@ -81,6 +81,7 @@ fn bearer_main() -> TrustContext {
         sub: TEST_IDENTITY.into(),
         scopes: vec!["read".into()],
         tenant_id: "main".into(),
+        jti: None,
     }
 }
 
@@ -98,7 +99,7 @@ fn hit(ulid: &str, section: &str) -> ProactiveHit {
 /// Requête proactive (context absent) sur le tenant `main`.
 fn req_proactive(limit: Option<u32>) -> ProactiveRecallRequest {
     ProactiveRecallRequest {
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         context: None,
         sections: None,
         limit,
@@ -265,7 +266,7 @@ write_patterns = []
     .expect("seed decisions");
 
     let req = ProactiveRecallRequest {
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         context: Some("rust async memory recall".into()),
         sections: Some(vec!["lessons-learned".into()]),
         limit: None,
@@ -363,7 +364,7 @@ write_patterns = []
 
     // Caractères réservés FTS5 : opérateurs, parenthèses, guillemets, colonnes, étoile.
     let req = ProactiveRecallRequest {
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         context: Some(r#"a:b AND (c*) OR "x y" NEAR(z)"#.into()),
         sections: None,
         limit: None,
@@ -416,7 +417,7 @@ async fn seed_session(state: &AppState, recall_id: &str, surfaced: &[String]) {
 /// Construit une requête de feedback pour le tenant `main`.
 fn req_feedback(recall_id: &str, accepted: &[&str]) -> ProactiveRecallFeedbackRequest {
     ProactiveRecallFeedbackRequest {
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         recall_id: recall_id.into(),
         accepted_ulids: accepted.iter().map(|s| (*s).to_string()).collect(),
     }
@@ -637,9 +638,10 @@ write_patterns = []
         sub: TEST_IDENTITY.into(),
         scopes: vec!["read".into()],
         tenant_id: "other".into(),
+        jti: None,
     };
     let req = ProactiveRecallFeedbackRequest {
-        tenant_id: "other".into(),
+        tenant_id: Some("other".into()),
         recall_id: "recall-xt-001".into(),
         accepted_ulids: vec![ULID_A.to_string()],
     };
@@ -679,7 +681,7 @@ async fn feedback_too_many_accepted_ulids_rejected() {
     // donc des valeurs arbitraires suffisent à exercer la borne.
     let accepted: Vec<String> = (0..65).map(|i| format!("entry-{i}")).collect();
     let req = ProactiveRecallFeedbackRequest {
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         recall_id: "recall-cap".into(),
         accepted_ulids: accepted,
     };
@@ -688,14 +690,14 @@ async fn feedback_too_many_accepted_ulids_rejected() {
         .await
         .expect_err("trop d'accepted_ulids doit échouer");
     assert!(
-        matches!(&err, GradatumError::InvalidInput(msg) if msg.contains("trop d'accepted_ulids")),
+        matches!(&err, GradatumError::InvalidInput(msg) if msg.contains("too many accepted_ulids")),
         "cap accepted_ulids → InvalidInput (message cap), got {err:?}"
     );
 }
 
 // ── Tests Task 12 : métriques câblées dans les orchestrateurs ─────────────────
 
-/// Test 14 (Task 12) : `proactive_recall` incrémente le counter `proactive_surfaced`.
+/// Test 14 : `proactive_recall` incrémente le counter `proactive_surfaced`.
 ///
 /// Surface pré-chargée avec 2 hits, ACL large (`main/*`) → les 2 hits passent le filtre.
 /// Vérifie que `state.metrics.proactive_surfaced{mode="proactive"}` = 2 après l'appel.
@@ -751,7 +753,7 @@ async fn recall_metrics_surfaced_counter_incremented() {
     );
 }
 
-/// Test 15 (Task 12) : `proactive_recall_feedback` incrémente le counter `proactive_accepted`.
+/// Test 15 : `proactive_recall_feedback` incrémente le counter `proactive_accepted`.
 ///
 /// Session seedée avec 2 ULIDs surfacés ; feedback accepte 1 ULID (`ULID_A`).
 /// Vérifie que `state.metrics.proactive_accepted` = 1 après l'appel.

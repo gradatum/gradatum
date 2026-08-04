@@ -37,29 +37,29 @@ use crate::status::NoteStatus;
 #[derive(Debug, Error)]
 pub enum GradatumError {
     /// Incoming data validation error.
-    #[error("erreur de validation : {0}")]
+    #[error("validation error: {0}")]
     Validation(#[from] ValidationError),
 
     /// Drift detected between on-disk Markdown and the SQLite index.
-    #[error("drift détecté : {0}")]
+    #[error("drift detected: {0}")]
     Drift(#[from] DriftError),
 
     /// Storage error (SQLite, OpenDAL, filesystem).
     ///
     /// Storage layers map their specific errors via `GradatumError::Storage`.
-    #[error("erreur de stockage : {0}")]
+    #[error("storage error: {0}")]
     Storage(String),
 
     /// Markdown parsing error.
-    #[error("erreur parse Markdown : {0}")]
+    #[error("markdown parse error: {0}")]
     Markdown(String),
 
     /// Note not found in the index.
-    #[error("note introuvable : {0:?}")]
+    #[error("note not found: {0:?}")]
     NoteNotFound(NoteId),
 
     /// Invalid status transition — does not respect the lifecycle state machine.
-    #[error("transition de statut invalide : {from:?} → {to:?}")]
+    #[error("invalid status transition: {from:?} → {to:?}")]
     InvalidStatusTransition {
         /// Source status (before the transition).
         from: NoteStatus,
@@ -68,7 +68,7 @@ pub enum GradatumError {
     },
 
     /// Frontmatter schema version mismatch.
-    #[error("version de schéma incorrecte : attendu {expected}, trouvé {found}")]
+    #[error("incorrect schema version: expected {expected}, found {found}")]
     SchemaVersionMismatch {
         /// Version expected by the current crate.
         expected: SchemaVersion,
@@ -77,25 +77,25 @@ pub enum GradatumError {
     },
 
     /// Vault not found in configuration.
-    #[error("vault introuvable : {0:?}")]
+    #[error("vault not found: {0:?}")]
     VaultNotFound(VaultId),
 
     /// Vault mounted on NFS — not supported.
     ///
     /// The vault must reside on a local filesystem. Detection uses
     /// `nix::sys::statfs::statfs` and compares against `NFS_SUPER_MAGIC`.
-    #[error("vault root sur NFS (NFS_SUPER_MAGIC), non supporté : {path:?}")]
+    #[error("vault root on NFS (NFS_SUPER_MAGIC), not supported: {path:?}")]
     VaultOnNfs {
         /// Vault root path whose `statfs` returned `NFS_SUPER_MAGIC`.
         path: PathBuf,
     },
 
     /// Override payload validation error against the schema registry.
-    #[error("validation schéma override : {0}")]
+    #[error("override schema validation: {0}")]
     SchemaValidation(#[from] crate::schema_registry::ValidationError),
 
     /// Override payload migration error.
-    #[error("migration schéma override : {0}")]
+    #[error("override schema migration: {0}")]
     SchemaMigration(#[from] crate::schema_registry::MigrationError),
 
     /// I/O error (file read/write, permissions, etc.).
@@ -128,69 +128,73 @@ pub enum GradatumError {
     #[error("inference : {0}")]
     Inference(String),
 
-    // ── Variants HTTP sémantiques (pour la couche serveur / logique MCP) ──────
-    /// Requête non authentifiée — token manquant ou invalide.
+    // ── Semantic HTTP variants (for the server layer / MCP logic) ────────────
+    /// Unauthenticated request — missing or invalid token.
     ///
     /// HTTP mapping: 401 Unauthorized.
-    #[error("non authentifié")]
+    #[error("not authenticated")]
     Unauthorized,
 
-    /// Accès refusé — ACL deny ou violation cross-tenant.
+    /// Access denied — an ACL denial or a cross-tenant violation.
     ///
     /// HTTP mapping: 403 Forbidden.
-    #[error("accès refusé : {0}")]
+    #[error("access denied: {0}")]
     Forbidden(String),
 
-    /// Données d'entrée invalides — validation échouée côté handler.
+    /// Invalid input data — handler-side validation failed.
     ///
     /// HTTP mapping: 400 Bad Request.
-    #[error("entrée invalide : {0}")]
+    #[error("invalid input: {0}")]
     InvalidInput(String),
 
-    /// Conflit d'écriture — optimistic lock ou contrainte unique.
+    /// Write conflict — optimistic lock or unique constraint.
     ///
     /// HTTP mapping: 409 Conflict.
-    #[error("conflit : {0}")]
+    #[error("conflict: {0}")]
     Conflict(String),
 }
 
 /// Incoming data validation error.
 ///
 /// Returned by constructors that validate the format of newtype values
-/// (e.g. `Tag::new()`, `VaultId::validate()`).
+/// (e.g. [`crate::tag::Tag::new`], [`crate::scope::VaultId::parse`]).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
     /// Malformed tag (invalid format or too long).
     ///
     /// Expected format: `^[a-z0-9][a-z0-9-]{0,63}$`
-    #[error("tag invalide : {0:?} (format attendu: ^[a-z0-9][a-z0-9-]{{0,63}}$)")]
+    #[error("invalid tag: {0:?} (expected format: ^[a-z0-9][a-z0-9-]{{0,63}}$)")]
     InvalidTag(String),
 
     /// Malformed vault ID.
-    #[error("vault_id invalide : {0:?}")]
+    #[error("invalid vault_id: {0:?}")]
     InvalidVaultId(String),
 
     /// Malformed locus ID.
-    #[error("locus_id invalide : {0:?}")]
+    #[error("invalid locus_id: {0:?}")]
     InvalidLocusId(String),
 
+    /// Malformed agent ID (credential-borne identity).
+    #[error("invalid agent_id: {0:?}")]
+    InvalidAgentId(String),
+
     /// Invalid section.
-    #[error("section invalide : {0:?}")]
+    #[error("invalid section: {0:?}")]
     InvalidSection(String),
 
     /// Invalid status.
-    #[error("statut invalide : {0:?}")]
+    #[error("invalid status: {0:?}")]
     InvalidStatus(String),
 
     /// Empty note body.
-    #[error("corps de note vide")]
+    #[error("empty note body")]
     EmptyBody,
 
     /// Business constraint violated (semantically invalid input).
     ///
     /// Used for rules beyond format validation (e.g. self-reference
     /// `replaced_by == note_id`). Distinct from the format variants above.
-    #[error("input invalide : {0}")]
+    #[error("invalid input: {0}")]
     InvalidInput(String),
 }
 
@@ -213,13 +217,13 @@ pub enum DriftError {
     },
 
     /// Markdown file absent on disk for an indexed note.
-    #[error("fichier md absent sur disque : {note_id:?}")]
+    #[error("markdown file missing on disk: {note_id:?}")]
     NoteMdMissing {
         /// Identifier of the note whose `.md` file is missing.
         note_id: NoteId,
     },
 
     /// Orphaned Markdown file (no corresponding note in the index).
-    #[error("fichier md orphelin : {0}")]
+    #[error("orphaned markdown file: {0}")]
     OrphanMd(String),
 }

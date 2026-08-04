@@ -100,3 +100,27 @@ ttl_days = 90
 # cron = "0 3 * * *"    # 03h00 UTC — DÉSACTIVÉ, exemple uniquement
 # retention_days = 0    # champ hérité ScheduleConfig — non pertinent pour distill
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cron distill CONDITIONNEL (F-112) — clé TOML top-level `[distill_cron]`
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# INTENTIONNELLEMENT DÉSACTIVÉ (`enabled = false` par défaut) — JAMAIS actif par défaut.
+#
+# Mesure la pression de consolidation par locus (notes `live` non-`processed`) et enfile
+# des `Job::Distill` scope `Locus` mode `Semantic`/`Batch` au-delà du seuil. Le cron
+# n'écrit JAMAIS le vault directement — il enfile des jobs (pipeline F-43 gaté PendingReview
+# inchangé). Activation = décision opérateur séparée (spec F-112 §6 : GO + regression-guard
+# léger + 1ʳᵉ exécution supervisée). Ne PAS décommenter sans validation explicite.
+#
+# Extraction figment SÉPARÉE de `[apalis]` (clé top-level, PAS `[apalis.distill_cron]`).
+# Validation fail-loud au boot (build_monitor) : cron parseable (format natif crate `cron`,
+# secondes + DOW 1=Sun), pressure_min ≥ 1, max_jobs_per_tick ≥ 1, loci non vide sans doublon.
+#
+# [distill_cron]
+# enabled = false                                   # défaut — cron non enregistré
+# cron = "0 0 4 * * Sun"                            # hebdomadaire, dimanche 04:00 (crate `cron`)
+# loci = ["debug", "experiments", "reference"]      # sections consolidables, ordre de priorité
+# pressure_min = 20                                 # seuil notes live non-processed / locus
+# max_jobs_per_tick = 2                             # cap strict de jobs enfilés par tick
+# ──────────────────────────────────────────────────────────────────────────────

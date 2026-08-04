@@ -221,7 +221,7 @@ async fn vault_search_fake_embedder_calls_semantic() {
     // à l'ID que le handler utilise lors de la recherche sémantique.
     state
         .search
-        .insert_note_embedding(&note_id, "fake-embedder", 8, &emb)
+        .insert_note_embedding("main", &note_id, "fake-embedder", 8, &emb)
         .await
         .expect("insert_note_embedding — invariant test");
 

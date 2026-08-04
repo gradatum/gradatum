@@ -1,17 +1,17 @@
 //! Tests TDD — santé des tâches récurrentes (T4, v0.7.5 F-85).
 //!
 //! Couvre :
-//! - `ALL_SCHEDULED_TASKS` : 8 entrées, noms corrects.
+//! - `ALL_SCHEDULED_TASKS` : 9 entrées, noms corrects.
 //! - `task_interval_secs` : retourne les intervalles attendus pour chaque tâche.
-//! - `seed_scheduled_task` via IndexStore : après seed, les 8 tâches apparaissent avec
+//! - `seed_scheduled_task` via IndexStore : après seed, les 9 tâches apparaissent avec
 //!   `last_run_ms=None` et `run_count=0`.
 
 use gradatum_index::SqliteIndex;
 use gradatum_server::config::ServerConfig;
 use gradatum_server::scheduled_tasks::{
-    ALL_SCHEDULED_TASKS, TASK_ACTIVE_RECALL_PURGE, TASK_METRIC_SAMPLE, TASK_PROACTIVE_REFRESH,
-    TASK_PURGE_EVENT_LOG, TASK_PURGE_READ_USAGE, TASK_PURGE_SESSION_TRACE, TASK_REVIEW_PROMOTE,
-    TASK_TELEMETRY_FLUSH, task_interval_secs,
+    ALL_SCHEDULED_TASKS, TASK_ACTIVE_RECALL_PURGE, TASK_AUDIT_DEDUP, TASK_METRIC_SAMPLE,
+    TASK_PROACTIVE_REFRESH, TASK_PURGE_EVENT_LOG, TASK_PURGE_READ_USAGE, TASK_PURGE_SESSION_TRACE,
+    TASK_REVIEW_PROMOTE, TASK_TELEMETRY_FLUSH, task_interval_secs,
 };
 
 // ---------------------------------------------------------------------------
@@ -26,17 +26,17 @@ fn default_cfg() -> ServerConfig {
 // ALL_SCHEDULED_TASKS
 // ---------------------------------------------------------------------------
 
-/// `ALL_SCHEDULED_TASKS` contient exactement 8 tâches.
+/// `ALL_SCHEDULED_TASKS` contient exactement 9 tâches (F-51 audit-dedup incluse).
 #[test]
-fn all_scheduled_tasks_has_8_entries() {
+fn all_scheduled_tasks_has_9_entries() {
     assert_eq!(
         ALL_SCHEDULED_TASKS.len(),
-        8,
-        "8 tâches récurrentes in-process attendues"
+        9,
+        "9 tâches récurrentes in-process attendues (F-51 audit-dedup incluse)"
     );
 }
 
-/// `ALL_SCHEDULED_TASKS` contient les 8 noms canoniques attendus.
+/// `ALL_SCHEDULED_TASKS` contient les 9 noms canoniques attendus.
 #[test]
 fn all_scheduled_tasks_contains_correct_names() {
     assert!(ALL_SCHEDULED_TASKS.contains(&TASK_TELEMETRY_FLUSH));
@@ -47,6 +47,7 @@ fn all_scheduled_tasks_contains_correct_names() {
     assert!(ALL_SCHEDULED_TASKS.contains(&TASK_PROACTIVE_REFRESH));
     assert!(ALL_SCHEDULED_TASKS.contains(&TASK_ACTIVE_RECALL_PURGE));
     assert!(ALL_SCHEDULED_TASKS.contains(&TASK_METRIC_SAMPLE));
+    assert!(ALL_SCHEDULED_TASKS.contains(&TASK_AUDIT_DEDUP));
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +171,7 @@ fn task_interval_secs_floor_60s() {
 // seed_scheduled_task via IndexStore
 // ---------------------------------------------------------------------------
 
-/// Après seed de toutes les tâches, `list_scheduled_health` retourne 8 entrées
+/// Après seed de toutes les tâches, `list_scheduled_health` retourne 9 entrées
 /// avec `last_run_ms=None` et `run_count=0`.
 #[tokio::test]
 async fn seed_all_tasks_creates_null_entries() {
@@ -186,7 +187,7 @@ async fn seed_all_tasks_creates_null_entries() {
         .list_scheduled_health(0)
         .await
         .expect("list_scheduled_health");
-    assert_eq!(rows.len(), 8, "8 entrées attendues après seed");
+    assert_eq!(rows.len(), 9, "9 entrées attendues après seed");
 
     for task_name in ALL_SCHEDULED_TASKS {
         let row = rows

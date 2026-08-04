@@ -123,9 +123,9 @@ fn curate_job_with_hash(
                 cron_expr: None,
             },
             lifecycle: JobLifecycle {
-                status: JobStatus::Running,
+                status: JobStatus::Pending,
                 created_at: now,
-                started_at: Some(now),
+                started_at: None,
                 completed_at: None,
                 lease_until: None,
                 result: None,
@@ -171,6 +171,7 @@ async fn handle_curate_conflict_on_stale_hash() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_curate v1 F-41");
@@ -199,6 +200,7 @@ async fn handle_curate_conflict_on_stale_hash() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_curate v2 F-41");
@@ -235,6 +237,7 @@ async fn handle_curate_conflict_on_stale_hash() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_curate conflict doit retourner Ok (pas d'erreur handler) F-41");
@@ -249,7 +252,7 @@ async fn handle_curate_conflict_on_stale_hash() {
         "Conflict ne doit pas modifier de note — out={out_conflict:?}"
     );
     assert!(
-        out_conflict.result_note_md.contains("conflit"),
+        out_conflict.result_note_md.contains("conflict"),
         "result_note_md doit mentionner le conflit — out={out_conflict:?}"
     );
 
@@ -344,6 +347,16 @@ async fn golden_f41_ack_complete_preserves_conflict_status() {
             .await
             .expect("enqueue job F-41 golden");
 
+        // P2-6 (v3) : le handler et l'ack simulent le cycle Apalis complet.
+        // dequeue → handler → complete. Sans le dequeue, le statut SQL reste
+        // Pending et `complete()` est rejeté par le SELECT `WHERE status = 'Running'`.
+        let dequeued = store
+            .dequeue_by_kind("Curate", None)
+            .await
+            .expect("dequeue F-41 golden")
+            .expect("le job doit être dequeuable");
+        assert_eq!(dequeued.id, job_id, "dequeue doit retourner le bon job");
+
         let out = handle_curate(
             job,
             Data::new(Arc::new(TestInternalClient::new(
@@ -354,13 +367,18 @@ async fn golden_f41_ack_complete_preserves_conflict_status() {
                 Arc::clone(curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>
             ),
             Data::new(Arc::clone(queue)),
+            Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
         )
         .await
         .expect("handle_curate F-41 golden");
 
         // Simulation FIDÈLE de l'ack apalis : le handler a retourné Ok → l'ack
-        // appelle store.complete avec un JobResult succès. C'est CE call qui, avant
-        // le fix, écrasait Conflict par Done.
+        // appelle store.complete avec un JobResult succès.
+        //
+        // P2-6 (v3) : le SELECT vérifie `status = 'Running'` — un job Conflict
+        // n'est pas Running, donc `complete()` retourne `Err(NotFound)`.
+        // C'est un comportement CORRECT : le job n'est pas en état d'être
+        // complété, et son statut Conflict est préservé au niveau SQL.
         let ack_result = JobResult {
             success: true,
             duration_ms: 0,
@@ -368,14 +386,17 @@ async fn golden_f41_ack_complete_preserves_conflict_status() {
             result_note: None,
             conflict_payload: None,
         };
-        store
-            .complete(job_id, ack_result)
-            .await
-            .expect("complete (ack apalis) F-41 golden");
+        let complete_result = store.complete(job_id, ack_result).await;
+        // P2-6 (v3) : le SELECT `WHERE status = 'Running'` ne trouve plus le job
+        // Conflict → `Err(NotFound)`. Avant P2-6, la garde F-41 BLOB rendait
+        // `Ok(())`. Les deux comportements préservent le statut Conflict.
+        // Le test accepte les deux — ce qui compte, c'est que le statut final
+        // soit bien Conflict (vérifié par l'appelant via status3).
+        let _ = complete_result;
 
         let _ = out;
         let status = store
-            .get(job_id)
+            .get(job_id, None)
             .await
             .expect("get job F-41 golden")
             .expect("job présent F-41 golden")
@@ -452,7 +473,7 @@ async fn golden_f41_ack_complete_preserves_conflict_status() {
         status3,
         JobStatus::Conflict,
         "update avec sha PÉRIMÉ doit finir Conflict (PAS Done) — \
-         la garde anti-clobber complete() est le fix F-41"
+         la garde anti-clobber (F-41 BLOB + P2-6 SQL) protège l'état terminal"
     );
 
     // Note INCHANGÉE : v3 jamais appliqué, corps reste v2.
@@ -473,7 +494,7 @@ async fn golden_f41_ack_complete_preserves_conflict_status() {
 
     // Le conflict_payload doit porter le current_sha256 (= v2) pour résolution RMW.
     let result = store
-        .get(_id3)
+        .get(_id3, None)
         .await
         .expect("get conflict job golden")
         .expect("job présent golden")
@@ -517,6 +538,7 @@ async fn handle_curate_no_expected_sha_writes_normally() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_curate sans expected_sha256 F-41");
@@ -556,6 +578,7 @@ async fn handle_curate_correct_hash_writes_normally() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_curate v1 correct-hash F-41");
@@ -582,6 +605,7 @@ async fn handle_curate_correct_hash_writes_normally() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_curate v2 avec hash correct F-41");
@@ -591,7 +615,7 @@ async fn handle_curate_correct_hash_writes_normally() {
         "hash correct doit permettre l'écriture — out={out_v2:?}"
     );
     assert!(
-        !out_v2.result_note_md.contains("conflit"),
+        !out_v2.result_note_md.contains("conflict"),
         "hash correct ne doit PAS produire un conflit — msg={:?}",
         out_v2.result_note_md
     );

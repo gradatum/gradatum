@@ -1,55 +1,57 @@
-//! `gradatum-admin project-map scope` — vue de synthèse read-only d'un projet.
+//! `gradatum-admin project-map scope` — read-only summary view of a single project.
 //!
-//! Lecture directe de l'index SQLite (rusqlite), sans appel HTTP. Interroge les
-//! cartes `section='project-map'` d'un projet donné (`[[project:<name>]]`) et
-//! calcule les compteurs par statut, les versions distinctes et la version
-//! courante.
+//! Reads the SQLite index directly, with no HTTP call involved. It selects the
+//! `project-map` cards belonging to one project — those carrying `[[project:<name>]]` —
+//! and computes the per-status counters, the distinct versions and the current version.
 //!
-//! ## Architecture
+//! ## Layout
 //!
-//! - `project_scope_from_conn`: pure SQL logic, takes an open connection.
-//!   Testable with `Connection::open_in_memory()`.
-//! - `project_scope`: async wrapper using `spawn_blocking` for CLI use.
+//! - [`crate::project_map_scope::project_scope_from_conn`] holds the pure SQL logic and
+//!   takes an open connection, so it can be tested against `Connection::open_in_memory()`.
+//! - [`crate::project_map_scope::project_scope`] is the async wrapper used by the CLI,
+//!   running the blocking work on a dedicated thread.
 //!
-//! ## Extraction wikilinks
+//! ## Wikilink extraction
 //!
-//! Pas de regex. Scan byte-safe du body pour trouver `[[key:value]]`, extraction
-//! du couple `(key, value)` par split sur `:` au premier caractère.
+//! No regular expressions: the body is scanned for `[[key:value]]` spans, and each span
+//! is split on its first `:` to yield the `(key, value)` pair.
 //!
-//! ## Version courante
+//! ## Current version
 //!
-//! Définie comme la version maximum (ordre SemVer numérique) parmi les cartes
-//! dont le statut est `DONE`.
+//! The highest version, in numeric version order, among the cards whose status is `DONE`.
 
 use anyhow::{Context, Result};
 use gradatum_core::paths::vault_index_path;
 
-/// Résumé scope d'un projet project-map.
+/// Summary of a single project's project-map cards.
 #[derive(Debug, Default)]
 pub struct ProjectScope {
-    /// Nom du projet (identifiant `[[project:<name>]]`).
+    /// Project name, as carried by the `[[project:<name>]]` link.
     pub project: String,
-    /// Version courante = max SemVer des cartes DONE.
+    /// Current version: the highest version among the `DONE` cards.
     pub current_version: Option<String>,
-    /// Nombre de cartes en statut `OPEN`.
+    /// Number of cards in status `OPEN`.
     pub open_count: usize,
-    /// Nombre de cartes en statut `IN_PROGRESS`.
+    /// Number of cards in status `IN_PROGRESS`.
     pub in_progress_count: usize,
-    /// Nombre de cartes en statut `BLOCKED`.
+    /// Number of cards in status `BLOCKED`.
     pub blocked_count: usize,
-    /// Nombre de cartes en statut `DONE`.
+    /// Number of cards in status `DONE`.
     pub done_count: usize,
-    /// Total cartes actives (hors downgraded/garbage).
+    /// Total number of active cards, excluding the `downgraded` and `garbage` states.
     pub total_count: usize,
-    /// Versions distinctes parmi les cartes, triées desc par SemVer.
+    /// Distinct versions found on the cards, sorted from newest to oldest.
     pub versions: Vec<String>,
 }
 
-/// Extrait les paires `(key, value)` de wikilinks `[[key:value]]` dans un body.
+/// Extracts the `(key, value)` pairs of every `[[key:value]]` wikilink in a body.
 ///
-/// Scan non-regex, char-safe. Retourne toutes les paires trouvées.
+/// The scan uses no regular expressions and is character-safe. Every pair found is
+/// returned, in order of appearance.
 ///
-/// Exposé `pub(crate)` pour être réutilisé par `project_map_export` (DRY — ADN 3).
+/// Visible to the whole crate, though [`project_scope_from_conn`] is currently its only
+/// caller: feature export goes through
+/// [`gradatum_core::project_map::project_map_feature_entries`] instead.
 pub(crate) fn extract_typed_links(body: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut rest = body;
@@ -68,10 +70,11 @@ pub(crate) fn extract_typed_links(body: &str) -> Vec<(String, String)> {
     pairs
 }
 
-/// Compare deux versions SemVer (`x.y.z`) numériquement.
+/// Turns an `x.y.z` version into a numeric triple, so versions can be ordered
+/// numerically rather than lexicographically.
 ///
-/// Retourne `Ordering` pour le tri. Versions non parsables sont traitées comme
-/// zéro.
+/// Each component is parsed independently; a component that is missing or unparsable
+/// counts as `0`, and any pre-release suffix such as `-rc.1` is dropped before parsing.
 fn semver_tuple(v: &str) -> (u64, u64, u64) {
     let parts: Vec<&str> = v.split('.').collect();
     let n = |i: usize| -> u64 {
@@ -83,12 +86,13 @@ fn semver_tuple(v: &str) -> (u64, u64, u64) {
     (n(0), n(1), n(2))
 }
 
-/// Logique SQL pure — prend une connexion existante, testable avec `open_in_memory()`.
+/// Pure SQL logic: takes an already-open connection, which makes it testable against
+/// `Connection::open_in_memory()`.
 ///
 /// # Errors
 ///
-/// - Si la requête SQL échoue.
-/// - Si une ligne ne peut pas être lue.
+/// - The SQL query fails.
+/// - A row cannot be read.
 pub fn project_scope_from_conn(
     conn: &rusqlite::Connection,
     vault: &str,
@@ -109,16 +113,16 @@ pub fn project_scope_from_conn(
 
     let mut stmt = conn
         .prepare(sql)
-        .context("préparation requête project-map scope")?;
+        .context("preparing project-map scope query")?;
 
     // Collecte : (body_text, status)
     let rows: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![vault, project], |row| {
             Ok((row.get::<_, String>(1)?, row.get::<_, String>(3)?))
         })
-        .context("exécution requête project-map scope")?
+        .context("executing project-map scope query")?
         .collect::<std::result::Result<Vec<_>, _>>()
-        .context("lecture lignes project-map scope")?;
+        .context("reading project-map scope rows")?;
 
     let mut scope = ProjectScope {
         project: project.to_string(),
@@ -180,15 +184,15 @@ pub fn project_scope_from_conn(
     Ok(scope)
 }
 
-/// Async version: opens the SQLite index and delegates to `project_scope_from_conn`.
+/// Async version: opens the SQLite index and delegates to [`project_scope_from_conn`].
 ///
-/// `root` est le répertoire racine Gradatum (ex. `/var/lib/gradatum`).
+/// `root` is the Gradatum root directory, for example `/var/lib/gradatum`.
 ///
 /// # Errors
 ///
-/// - Si `index.db` est introuvable.
-/// - Si la connexion SQLite échoue.
-/// - Si la requête SQL échoue.
+/// - `index.db` cannot be found, meaning the server has never started on this root.
+/// - The SQLite connection cannot be opened.
+/// - The SQL query fails.
 pub async fn project_scope(
     root: &std::path::Path,
     vault: &str,
@@ -197,7 +201,7 @@ pub async fn project_scope(
     let db_path = vault_index_path(root);
     if !db_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le serveur doit avoir démarré au moins une fois",
+            "index.db not found: {} — the server must have started at least once",
             db_path.display()
         );
     }

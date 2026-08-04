@@ -2,13 +2,17 @@
 
 > Web-based operator UI for Gradatum — React + TypeScript, served by `gradatum-server` at `/ui/*`.
 
-**Status**: v0.7.6 — `publish = false` (not published to crates.io). Internal UI crate.
+**Status**: v1.0.0 — public, `Apache-2.0 AND OFL-1.1 AND MIT AND ISC`. Bundle-only crate: no
+public Rust API. The crate's own code is Apache-2.0; the shipped `dist/` bundle embeds font
+assets under OFL-1.1 and npm dependencies under MIT and ISC — full notices in
+[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md).
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
 
 `gradatum-studio` is the admin Studio shipped as a React + TypeScript + Vite bundle,
-built at compile time and served by `gradatum-server` via `tower-http` `ServeDir` at `/ui/*`.
+built in CI, committed to the repository, and served by `gradatum-server` via `tower-http`
+`ServeDir` at `/ui/*`.
 A SPA fallback (`index.html`) handles client-side routing; deep-links and browser refreshes
 work correctly.
 
@@ -16,8 +20,12 @@ Key properties:
 
 - **Authentication** — login screen accepts an API key (`ak_…`); the key is exchanged for a
   JWT (`POST /auth/exchange`) and stored in `localStorage` (`gradatum_studio_jwt_persist`,
-  24 h TTL with client-side expiry check). The original API key is never persisted after
-  exchange. Requires `admin` scope.
+  1 h TTL — the server default `jwt_ttl_human_secs = 3600` — with client-side expiry check). The original API key is never persisted after
+  exchange. **Any valid, non-revoked key is accepted**: `/auth/exchange` checks the Argon2id
+  hash and the tenant allow-list, never the key's scopes — the `scope: "human"` the client
+  sends only selects the TTL. Scopes are enforced on write paths alone, and only under
+  `multi_tenant.enabled = true` (`write`, `admin` or `service`); `admin` is therefore a
+  recommended convention, not a login requirement.
 - **Security headers** — strict CSP, `X-Content-Type-Options: nosniff`,
   `Referrer-Policy: no-referrer`, `Permissions-Policy` on all static assets.
 - **No telemetry** — the Studio never contacts external services.
@@ -66,17 +74,36 @@ Dependency: `uplot@^1.6.32` (MIT, ~15 KB gzip).
 
 ## Build
 
-The Studio is built as part of the workspace via a `build.rs` script in `gradatum-server`
-that runs `npm run build` inside this crate's directory. The resulting `dist/` bundle is
-served at runtime from the directory configured by `[studio] ui_dir`. A pre-built `dist/`
-is checked in for convenience.
+The bundle is produced by the `studio-build` CI job (`npm ci` → `npm audit` → `npm run build`
+→ `npm test`), which runs Vite inside this crate's directory. There is **no** `build.rs`
+integration: no Cargo build script invokes npm, and `gradatum-server` does not depend on this
+crate — the two are linked only at runtime, by a filesystem path.
+
+The resulting `dist/` bundle is committed to the repository and shipped inside the published
+`.crate`, so a fresh checkout carries a ready-to-serve bundle. At runtime `gradatum-server`
+serves it with `tower-http`'s `ServeDir`, from the directory given by the `[studio] ui_dir`
+configuration key.
 
 ```bash
 # Build the studio manually (from the crate directory)
-npm install
+npm ci
 npm run build
 ```
 
+Note: the bundle is a build artifact under version control. After changing anything under
+`src/`, rebuild and commit the regenerated `dist/`, otherwise the shipped bundle no longer
+matches the sources it claims to be built from.
+
 ## License
 
-Apache-2.0
+The crate's own code (Rust and TypeScript sources) is licensed under **Apache-2.0**.
+
+The distributed `dist/` bundle additionally incorporates third-party material:
+
+- **Fonts** — IBM Plex Sans, JetBrains Mono, Spectral, under **OFL-1.1**.
+- **npm dependencies** — 68 packages under **MIT**, 1 package under **ISC**.
+
+Full copyright notices and license texts, reproduced verbatim from the packages actually
+embedded in the bundle: [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md).
+
+SPDX: `Apache-2.0 AND OFL-1.1 AND MIT AND ISC`

@@ -75,7 +75,7 @@ impl InternalClient for ChainedJobsClient {
 
         let frontmatter = Frontmatter {
             schema_version: 1,
-            vault_id: VaultId::new(&req.tenant_id),
+            vault_id: VaultId::new(req.tenant_id.as_str()),
             locus: None,
             section,
             status,
@@ -134,23 +134,36 @@ impl InternalClient for ChainedJobsClient {
         unimplemented!()
     }
 
-    async fn delete_note(&self, _ulid: &str) -> Result<(), InternalClientError> {
+    async fn delete_note(&self, _vault_id: &str, _ulid: &str) -> Result<(), InternalClientError> {
         unimplemented!()
     }
 
-    async fn get_note(&self, _ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+    async fn get_note(
+        &self,
+        _vault_id: &str,
+        _ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError> {
+        unimplemented!()
+    }
+
+    async fn get_note_status(
+        &self,
+        _vault_id: &str,
+        _ulid: &str,
+    ) -> Result<Option<String>, InternalClientError> {
         unimplemented!()
     }
 
     async fn get_note_embedding(
         &self,
+        _vault_id: &str,
         _ulid: &str,
         _embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
         unimplemented!()
     }
 
-    async fn get_trust(&self, _ulid: &str) -> Result<f32, InternalClientError> {
+    async fn get_trust(&self, _vault_id: &str, _ulid: &str) -> Result<f32, InternalClientError> {
         unimplemented!()
     }
 
@@ -255,7 +268,7 @@ async fn curate_chains_embed_note_with_correct_payload() {
         author: None,
         tags: vec![],
         section_hint: None,
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         expected_sha256: None,
         note_id: None,
         occurred_at: None,

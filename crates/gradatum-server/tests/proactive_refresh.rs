@@ -1,4 +1,4 @@
-//! Tests Task 8 — `proactive_refresh_once` compute in-process (B').
+//! Tests `proactive_refresh_once` compute in-process (B').
 //!
 //! Quatre propriétés vérifiées :
 //!
@@ -7,7 +7,7 @@
 //! 2. [`empty_corpus_returns_zero_no_error`] — corpus vide → `Ok(0)`, surface vide, aucune erreur.
 //! 3. [`noop_embed_bm25_only_surface_non_empty`] — embedder Noop (`embed_fallback=true`) →
 //!    BM25-only → surface non vide (dégradation gracieuse, pas d'erreur fatale).
-//! 4. [`refresh_metrics_counter_incremented_on_success`] — Task 12 : `proactive_refresh`
+//! 4. [`refresh_metrics_counter_incremented_on_success`] — `proactive_refresh`
 //!    counter est incrémenté à chaque sortie `Ok(…)` de `proactive_refresh_once`.
 //!
 //! ## Setup
@@ -215,7 +215,7 @@ async fn empty_corpus_returns_zero_no_error() {
     );
 }
 
-/// Test 4 (Task 12) : `proactive_refresh_once` incrémente le compteur de métriques.
+/// Test 4 : `proactive_refresh_once` incrémente le compteur de métriques.
 ///
 /// Vérifie que `state.metrics.proactive_refresh` est incrémenté d'exactement 1
 /// après un refresh réussi sur corpus vide (chemin le plus simple — Ok(0) garanti).

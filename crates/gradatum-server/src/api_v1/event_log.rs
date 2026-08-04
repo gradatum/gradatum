@@ -113,7 +113,9 @@ pub async fn post_event_log(
     //    "__unknown__" pour ne pas falsifier le tenant réel). Bearer non-main est
     //    déjà refusé en amont par le middleware (Lot 2).
     let tenant_id = match trust.tenant_id() {
-        Some(t) => t.to_owned(),
+        // Frontière `Option<&TenantId>` (Task 3) → `.as_str()`, `tenant_id: String` local
+        // inchangé (byte-identical ; typage aval).
+        Some(t) => t.as_str().to_owned(),
         None => {
             emit_audit_failure(&state, &trust, "__unknown__", &request_id, "no_tenant").await;
             return Err(StatusCode::FORBIDDEN);
@@ -126,13 +128,18 @@ pub async fn post_event_log(
         emit_audit_failure(&state, &trust, &tenant_id, &request_id, "acl_deny").await;
         return Err(StatusCode::FORBIDDEN);
     }
+    // C3a (EX-C3a-1) : à ON, l'append d'événements est une écriture — scope write exigé.
+    if !crate::api_v1::tenant_guard::write_scope_allowed(&state, &trust) {
+        emit_audit_failure(&state, &trust, &tenant_id, &request_id, "scope_deny").await;
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // 4. Protection taille batch.
     if events.len() > MAX_BATCH_SIZE {
         tracing::warn!(
             count = events.len(),
             max = MAX_BATCH_SIZE,
-            "event_log batch trop grand — 413"
+            "event_log batch too large — 413"
         );
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -160,7 +167,7 @@ pub async fn post_event_log(
                     field = name,
                     len = value.len(),
                     max = limit,
-                    "event_log champ trop long — 422"
+                    "event_log field too long — 422"
                 );
                 return Err(StatusCode::UNPROCESSABLE_ENTITY);
             }
@@ -178,7 +185,7 @@ pub async fn post_event_log(
                     field = name,
                     len = v.len(),
                     max = MAX_FIELD_LEN,
-                    "event_log champ optionnel trop long — 422"
+                    "event_log optional field too long — 422"
                 );
                 return Err(StatusCode::UNPROCESSABLE_ENTITY);
             }
@@ -189,7 +196,7 @@ pub async fn post_event_log(
     let event_log = match &state.event_log {
         Some(store) => store,
         None => {
-            tracing::error!("event_log non câblé dans AppState — vérifier with_event_log_path");
+            tracing::error!("event_log not wired in AppState — check with_event_log_path");
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
@@ -207,11 +214,11 @@ pub async fn post_event_log(
             .await
             .map_err(|e| match e {
                 EventLogError::BadTimestamp(ref ts) => {
-                    tracing::warn!(timestamp = %ts, "event_log timestamp invalide — 400");
+                    tracing::warn!(timestamp = %ts, "invalid event_log timestamp — 400");
                     StatusCode::BAD_REQUEST
                 }
                 _ => {
-                    tracing::error!(error = %e, "event_log insert_batch échoué");
+                    tracing::error!(error = %e, "event_log insert_batch failed");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             })?;
@@ -255,25 +262,35 @@ fn extract_request_id(headers: &HeaderMap) -> String {
 /// Builds an `HttpAuditActor` from the `TrustContext`.
 fn actor_from_trust(trust: &TrustContext) -> HttpAuditActor {
     match trust {
-        TrustContext::BearerToken { kid, sub, aud, .. } => HttpAuditActor {
+        TrustContext::BearerToken {
+            kid, sub, aud, jti, ..
+        } => HttpAuditActor {
             kid: kid.clone(),
-            sub: sub.clone(),
+            // Frontière DTO (`HttpAuditActor.sub: String`) : `as_str` est
+            // byte-identical, la ligne d'audit émise est inchangée.
+            sub: sub.as_str().to_owned(),
             aud: aud.clone(),
+            jti: jti.clone(),
         },
         TrustContext::Mtls { cn, .. } => HttpAuditActor {
             kid: format!("mtls:{cn}"),
             sub: cn.clone(),
             aud: "gradatum".into(),
+            jti: None,
         },
         TrustContext::Studio { user, .. } => HttpAuditActor {
             kid: "studio".into(),
             sub: user.clone(),
             aud: "gradatum-studio".into(),
+            jti: None,
         },
-        TrustContext::Unauthenticated => HttpAuditActor {
+        // Unauthenticated — et, TrustContext étant #[non_exhaustive] (A3), toute
+        // variante future : tracée comme identité vide (jamais une identité forgée).
+        _ => HttpAuditActor {
             kid: String::new(),
             sub: String::new(),
             aud: String::new(),
+            jti: None,
         },
     }
 }
@@ -299,7 +316,7 @@ async fn emit_audit_failure(
         request_id: request_id.into(),
     };
     if let Err(e) = state.audit.record(evt).await {
-        tracing::warn!(error = %e, reason = reason, "audit event_log auth_failure échoué");
+        tracing::warn!(error = %e, reason = reason, "audit event_log auth_failure failed");
     }
 }
 
@@ -325,7 +342,7 @@ async fn emit_audit_success(
         request_id: request_id.into(),
     };
     if let Err(e) = state.audit.record(evt).await {
-        tracing::warn!(error = %e, "audit event_log_ingest échoué — non fatal");
+        tracing::warn!(error = %e, "audit event_log_ingest failed — non fatal");
     }
 }
 
@@ -369,9 +386,10 @@ mod tests {
         TrustContext::BearerToken {
             kid: "test-kid".to_owned(),
             aud: "gradatum".to_owned(),
-            sub: "gateway".to_owned(),
+            sub: "gateway".into(),
             scopes: vec!["service".to_owned()],
-            tenant_id: "main".to_owned(),
+            tenant_id: "main".into(),
+            jti: None,
         }
     }
 

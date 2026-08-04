@@ -104,8 +104,8 @@ pub fn sha256_for_history(note: &Note) -> [u8; 32] {
     // JCS RFC 8785: sorted keys + canonical IEEE 754 floats.
     // Same canonicaliser as ContentHash → reproducible across tools.
     let canon = serde_jcs::to_string(&filtered).expect(
-        "Frontmatter filtré est toujours sérialisable en JCS : \
-         pas de f64::NAN/INFINITY possible (TOML RFC 3.3 garantit des floats finis)",
+        "Filtered frontmatter is always JCS-serializable: \
+         no f64::NAN/INFINITY possible (TOML RFC 3.3 guarantees finite floats)",
     );
 
     let mut h = Sha256::new();

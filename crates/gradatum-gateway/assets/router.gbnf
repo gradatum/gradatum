@@ -1,0 +1,8 @@
+# Grammaire GBNF — routeur curator THINK/NO_THINK (llama.cpp)
+# Sortie strictement contrainte à un des 2 labels, rien d'autre.
+# Espace de tête optionnel toléré en défense contre un artefact BPE (le chat template
+# du curator peut émettre un token " THINK" avec espace initial selon tokenizer) —
+# aucun autre caractère, aucune ponctuation, aucun préambule n'est permis dans les deux cas.
+
+root  ::= " "? label
+label ::= "THINK" | "NO_THINK"

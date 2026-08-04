@@ -184,6 +184,14 @@ pub mod http {
         pub sub: String,
         /// JWT token audience (`aud` claim).
         pub aud: String,
+        /// Token instance identifier (`jti` claim).
+        ///
+        /// `Some` for a JWT bearer (a revocable token instance), `None` for the other
+        /// contexts — on the direct api-key path the stable key ULID already lives in
+        /// `kid`. Omitted from the JSONL line when `None`, so that lines written before
+        /// the field existed stay readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub jti: Option<String>,
     }
 
     /// Flat audit event for the gradatum-server HTTP service.

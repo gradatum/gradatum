@@ -33,8 +33,14 @@
 //!
 //! ## Reconnect
 //!
-//! Exponential backoff 100 ms → 5 s, up to 10 retries (network errors / 5xx).
-//! On the 11th failure → MCP error `McpError::internal_error("server unavailable")`.
+//! Exponential backoff 100 ms → 5 s: one initial attempt followed by up to `MAX_RETRIES`
+//! retries (timeouts, connection errors, 5xx). Other 4xx responses are not retried.
+//! Once the retries are exhausted → MCP `internal_error`, message
+//! `"gradatum server unreachable after {MAX_RETRIES} attempts (endpoint=…)"`.
+//!
+//! Note that `MAX_RETRIES` counts *retries*, not attempts: the loop runs `0..=MAX_RETRIES`,
+//! so the total number of requests issued is `MAX_RETRIES + 1`. The terminal message
+//! interpolates the constant and therefore under-reports that total by one.
 
 use std::{
     sync::Arc,
@@ -189,25 +195,25 @@ impl StubHandler {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .context("échec construction client HTTP")?;
+            .context("HTTP client construction failed")?;
 
         // Mode 1 : API key file → auto-refresh.
         if let Ok(key_file) = std::env::var(API_KEY_FILE_ENV) {
             let api_key = std::fs::read_to_string(&key_file)
-                .with_context(|| format!("lecture GRADATUM_API_KEY_FILE '{key_file}' échouée"))?
+                .with_context(|| format!("reading GRADATUM_API_KEY_FILE '{key_file}' failed"))?
                 .trim()
                 .to_string();
             if api_key.is_empty() {
-                anyhow::bail!("GRADATUM_API_KEY_FILE '{key_file}' est vide");
+                anyhow::bail!("GRADATUM_API_KEY_FILE '{key_file}' is empty");
             }
             if !api_key.starts_with("ak_") {
                 anyhow::bail!(
-                    "GRADATUM_API_KEY_FILE '{key_file}' : format invalide (attendu: ak_...)"
+                    "GRADATUM_API_KEY_FILE '{key_file}': invalid format (expected: ak_...)"
                 );
             }
             info!(
                 key_file = %key_file,
-                "mode auto-refresh JWT activé via GRADATUM_API_KEY_FILE"
+                "JWT auto-refresh mode enabled via GRADATUM_API_KEY_FILE"
             );
             return Ok(Self {
                 client,
@@ -220,11 +226,11 @@ impl StubHandler {
         // Mode 2 : bearer statique (legacy).
         if let Ok(bearer) = std::env::var(BEARER_ENV) {
             if bearer.is_empty() {
-                anyhow::bail!("GRADATUM_BEARER_TOKEN ne peut pas être vide");
+                anyhow::bail!("GRADATUM_BEARER_TOKEN cannot be empty");
             }
             warn!(
-                "mode bearer statique — JWT expirera sans refresh automatique. \
-                 Utiliser GRADATUM_API_KEY_FILE pour l'auto-refresh."
+                "static bearer mode — JWT will expire without automatic refresh. \
+                 Use GRADATUM_API_KEY_FILE for auto-refresh."
             );
             return Ok(Self {
                 client,
@@ -235,8 +241,8 @@ impl StubHandler {
         }
 
         anyhow::bail!(
-            "authentification manquante — définir GRADATUM_API_KEY_FILE (recommandé) \
-             ou GRADATUM_BEARER_TOKEN"
+            "missing authentication — set GRADATUM_API_KEY_FILE (recommended) \
+             or GRADATUM_BEARER_TOKEN"
         )
     }
 
@@ -248,7 +254,7 @@ impl StubHandler {
         if let AuthMode::ApiKey(ref api_key) = self.auth {
             let state = self.exchange_token(api_key).await?;
             *self.token_state.lock().await = Some(state);
-            info!("JWT initialisé avec succès");
+            info!("JWT initialized successfully");
         }
         Ok(())
     }
@@ -262,21 +268,18 @@ impl StubHandler {
             .header("Authorization", format!("Bearer {api_key}"))
             .send()
             .await
-            .context("POST /auth/exchange : erreur réseau")?;
+            .context("POST /auth/exchange: network error")?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "POST /auth/exchange a retourné {} : {body}",
-                status.as_u16()
-            );
+            anyhow::bail!("POST /auth/exchange returned {} : {body}", status.as_u16());
         }
 
         let exchange: ExchangeResponse = resp
             .json()
             .await
-            .context("POST /auth/exchange : désérialisation réponse échouée")?;
+            .context("POST /auth/exchange: response deserialization failed")?;
 
         Ok(TokenState::new(exchange.token, exchange.ttl_secs))
     }
@@ -300,10 +303,10 @@ impl StubHandler {
                 };
 
                 if needs_refresh {
-                    debug!("refresh JWT proactif (TTL < 30% ou expiré)");
+                    debug!("proactive JWT refresh (TTL < 30% or expired)");
                     match self.exchange_token(api_key).await {
                         Ok(new_state) => {
-                            info!("JWT renouvelé avec succès");
+                            info!("JWT renewed successfully");
                             *guard = Some(new_state);
                         }
                         Err(e) => {
@@ -313,16 +316,16 @@ impl StubHandler {
                             {
                                 warn!(
                                     error = %e,
-                                    "refresh JWT proactif échoué — fallback JWT actuel"
+                                    "proactive JWT refresh failed — falling back to current JWT"
                                 );
                                 return Ok(state.token.clone());
                             }
                             error!(
                                 error = %e,
-                                "refresh JWT échoué et aucun token valide disponible"
+                                "JWT refresh failed and no valid token available"
                             );
                             return Err(ErrorData::internal_error(
-                                format!("authentification impossible : {e}"),
+                                format!("authentication failed: {e}"),
                                 None,
                             ));
                         }
@@ -330,7 +333,7 @@ impl StubHandler {
                 }
 
                 guard.as_ref().map(|s| s.token.clone()).ok_or_else(|| {
-                    ErrorData::internal_error("état token incohérent — aucun JWT disponible", None)
+                    ErrorData::internal_error("inconsistent token state — no JWT available", None)
                 })
             }
         }
@@ -343,23 +346,23 @@ impl StubHandler {
     async fn force_refresh(&self) -> Result<String, ErrorData> {
         match &self.auth {
             AuthMode::StaticBearer(_) => Err(ErrorData::internal_error(
-                "JWT expiré et mode statique actif — définir GRADATUM_API_KEY_FILE \
-                 pour l'auto-refresh",
+                "JWT expired and static mode active — set GRADATUM_API_KEY_FILE \
+                 for auto-refresh",
                 None,
             )),
             AuthMode::ApiKey(api_key) => {
-                debug!("force refresh JWT après 401");
+                debug!("force JWT refresh after 401");
                 match self.exchange_token(api_key).await {
                     Ok(new_state) => {
                         let token = new_state.token.clone();
                         *self.token_state.lock().await = Some(new_state);
-                        info!("JWT renouvelé après 401");
+                        info!("JWT renewed after 401");
                         Ok(token)
                     }
                     Err(e) => {
-                        error!(error = %e, "force refresh JWT échoué après 401");
+                        error!(error = %e, "force JWT refresh failed after 401");
                         Err(ErrorData::internal_error(
-                            format!("re-authentification après 401 échouée : {e}"),
+                            format!("re-authentication after 401 failed: {e}"),
                             None,
                         ))
                     }
@@ -370,7 +373,7 @@ impl StubHandler {
 
     /// Issues a POST to `{server_url}/api/v1/{endpoint}` with the given JSON body.
     ///
-    /// Reconnect logic: exponential backoff 100 ms → 5 s, up to [`MAX_RETRIES`].
+    /// Reconnect logic: exponential backoff 100 ms → 5 s, up to `MAX_RETRIES`.
     /// Retry conditions: timeout, connection error, 5xx response.
     /// 401 exception: re-exchange from the API key + one-shot retry (auto-refresh mode).
     /// No-retry conditions: other 4xx responses.
@@ -387,7 +390,7 @@ impl StubHandler {
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 && !refreshed_after_401 {
-                debug!(endpoint, attempt, delay_ms, "retry HTTP après échec");
+                debug!(endpoint, attempt, delay_ms, "HTTP retry after failure");
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 delay_ms = (delay_ms * 2).min(BACKOFF_MAX_MS);
             }
@@ -410,14 +413,14 @@ impl StubHandler {
                     if status.is_success() {
                         return resp.json::<serde_json::Value>().await.map_err(|e| {
                             ErrorData::internal_error(
-                                format!("désérialisation réponse JSON échouée : {e}"),
+                                format!("JSON response deserialization failed: {e}"),
                                 None,
                             )
                         });
                     } else if status.as_u16() == 401 {
                         // 401 → re-exchange one-shot (premier attempt uniquement).
                         if attempt == 0 {
-                            warn!(endpoint, "401 reçu — tentative re-exchange JWT");
+                            warn!(endpoint, "401 received — attempting JWT re-exchange");
                             match self.force_refresh().await {
                                 Ok(_) => {
                                     // Retry immédiat sans sleep (refreshed_after_401 = true).
@@ -429,7 +432,7 @@ impl StubHandler {
                         }
                         // Deuxième 401 → erreur définitive.
                         return Err(ErrorData::internal_error(
-                            format!("401 persistant sur {endpoint} — credentials invalides"),
+                            format!("persistent 401 on {endpoint} — invalid credentials"),
                             None,
                         ));
                     } else if status.is_server_error() {
@@ -437,11 +440,11 @@ impl StubHandler {
                             endpoint,
                             status = status.as_u16(),
                             attempt,
-                            "5xx du serveur — retry"
+                            "server 5xx error — retry"
                         );
                         continue;
                     } else {
-                        let msg = format!("erreur HTTP {} sur {endpoint}", status.as_u16());
+                        let msg = format!("HTTP error {} on {endpoint}", status.as_u16());
                         return Err(ErrorData::internal_error(msg, None));
                     }
                 }
@@ -450,13 +453,13 @@ impl StubHandler {
                         endpoint,
                         attempt,
                         err = %e,
-                        "erreur connexion/timeout — retry"
+                        "connection/timeout error — retry"
                     );
                     continue;
                 }
                 Err(e) => {
                     return Err(ErrorData::internal_error(
-                        format!("erreur HTTP inattendue sur {endpoint} : {e}"),
+                        format!("unexpected HTTP error on {endpoint}: {e}"),
                         None,
                     ));
                 }
@@ -465,11 +468,11 @@ impl StubHandler {
 
         error!(
             endpoint,
-            MAX_RETRIES, "serveur inaccessible après max tentatives"
+            MAX_RETRIES, "server unreachable after max attempts"
         );
         Err(ErrorData::internal_error(
             format!(
-                "serveur gradatum inaccessible après {MAX_RETRIES} tentatives \
+                "gradatum server unreachable after {MAX_RETRIES} attempts \
                  (endpoint={endpoint})"
             ),
             None,
@@ -486,7 +489,7 @@ impl StubHandler {
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 && !refreshed_after_401 {
-                debug!(endpoint, attempt, delay_ms, "retry GET après échec");
+                debug!(endpoint, attempt, delay_ms, "GET retry after failure");
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 delay_ms = (delay_ms * 2).min(BACKOFF_MAX_MS);
             }
@@ -507,13 +510,13 @@ impl StubHandler {
                     if status.is_success() {
                         return resp.json::<serde_json::Value>().await.map_err(|e| {
                             ErrorData::internal_error(
-                                format!("désérialisation réponse JSON échouée : {e}"),
+                                format!("JSON response deserialization failed: {e}"),
                                 None,
                             )
                         });
                     } else if status.as_u16() == 401 {
                         if attempt == 0 {
-                            warn!(endpoint, "401 reçu (GET) — tentative re-exchange JWT");
+                            warn!(endpoint, "401 received (GET) — attempting JWT re-exchange");
                             match self.force_refresh().await {
                                 Ok(_) => {
                                     refreshed_after_401 = true;
@@ -523,26 +526,31 @@ impl StubHandler {
                             }
                         }
                         return Err(ErrorData::internal_error(
-                            format!("401 persistant (GET) sur {endpoint} — credentials invalides"),
+                            format!("persistent 401 (GET) on {endpoint} — invalid credentials"),
                             None,
                         ));
                     } else if status.is_server_error() {
-                        warn!(endpoint, status = status.as_u16(), attempt, "5xx → retry");
+                        warn!(
+                            endpoint,
+                            status = status.as_u16(),
+                            attempt,
+                            "server 5xx error — retry"
+                        );
                         continue;
                     } else {
                         return Err(ErrorData::internal_error(
-                            format!("erreur HTTP {} sur {endpoint}", status.as_u16()),
+                            format!("HTTP error {} on {endpoint}", status.as_u16()),
                             None,
                         ));
                     }
                 }
                 Err(e) if e.is_connect() || e.is_timeout() => {
-                    warn!(endpoint, attempt, err = %e, "connexion/timeout → retry");
+                    warn!(endpoint, attempt, err = %e, "connection/timeout error — retry");
                     continue;
                 }
                 Err(e) => {
                     return Err(ErrorData::internal_error(
-                        format!("erreur HTTP inattendue sur {endpoint} : {e}"),
+                        format!("unexpected HTTP error on {endpoint}: {e}"),
                         None,
                     ));
                 }
@@ -551,11 +559,11 @@ impl StubHandler {
 
         error!(
             endpoint,
-            MAX_RETRIES, "serveur inaccessible après max tentatives GET"
+            MAX_RETRIES, "server unreachable after max GET attempts"
         );
         Err(ErrorData::internal_error(
             format!(
-                "serveur gradatum inaccessible après {MAX_RETRIES} tentatives GET \
+                "gradatum server unreachable after {MAX_RETRIES} GET attempts \
                  (endpoint={endpoint})"
             ),
             None,
@@ -583,158 +591,18 @@ impl ServerHandler for StubHandler {
             .with_protocol_version(ProtocolVersion::default())
     }
 
-    /// Lists the 23 exposed MCP tools (11 read + 3 write + 4 history + 1 forget + 1 lesson recall + 1 code scope + 2 proactive recall — matches the REST server API).
+    /// Lists the MCP tools exposed by the stub, mirroring the REST server API.
+    ///
+    /// L'effectif n'est pas écrit ici : il est porté par [`tool_catalogue`], dont le test
+    /// `catalogue_expose_exactement_les_outils_canoniques` compare la sortie à la liste
+    /// canonique. Un nombre gravé dans cette docstring ne serait vérifié par rien.
     fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        use gradatum_dto::{
-            CodeScopeRequest, LessonsRecallRequest, ProactiveRecallFeedbackRequest,
-            ProactiveRecallRequest, VaultClassifyRequest, VaultContextRequest, VaultDiffRequest,
-            VaultDowngradeRequest, VaultForgetRequest, VaultGraphRequest, VaultHistoryGetRequest,
-            VaultHistoryRequest, VaultLinksRequest, VaultListRequest, VaultReadRequest,
-            VaultRestoreRequest, VaultSearchRequest, VaultTimelineRequest, VaultTraceRequest,
-            VaultWriteRequest,
-        };
-
-        let tools = vec![
-            // ── Read tools (10) ────────────────────────────────────────────────
-            tool_def::<VaultSearchRequest>("vault_search", "Recherche plein-texte dans le vault"),
-            tool_def::<VaultReadRequest>("vault_read", "Lit le contenu d'une note par chemin"),
-            tool_def::<VaultListRequest>("vault_list", "Liste les notes du vault"),
-            tool_def_no_params("vault_status", "État courant du vault"),
-            tool_def::<VaultGraphRequest>("vault_graph", "Graphe de liens depuis une note racine"),
-            tool_def::<VaultLinksRequest>(
-                "vault_links",
-                "Liens directs d'une note (alias vault_graph depth=1)",
-            ),
-            tool_def::<VaultTraceRequest>(
-                "vault_trace",
-                "Trace les notes par tags, sections ou pattern",
-            ),
-            tool_def::<VaultContextRequest>(
-                "vault_context",
-                "Construit un contexte LLM depuis les notes",
-            ),
-            tool_def::<VaultTimelineRequest>(
-                "vault_timeline",
-                "Liste chronologique des notes par ancrage temporel (récent d'abord), \
-                 filtrable par doc_kind et fenêtre anchor_ms. Pagination cursor. Pour replay / récence.",
-            ),
-            tool_def_no_params("vault_authors", "Liste les auteurs du vault"),
-            tool_def_no_params("vault_tags", "Liste les tags du vault avec fréquences"),
-            // ── Write tools (3) — queue async 202 Accepted ────────────────────
-            tool_def::<VaultWriteRequest>(
-                "vault_write",
-                "Crée une nouvelle note dans le vault (queue async). \
-                 Champs : title (req), body (req), author, tags[], section_hint, tenant_id. \
-                 Retourne 202 Accepted + job_id (poll via GET /api/v1/jobs/:id).",
-            ),
-            tool_def::<VaultClassifyRequest>(
-                "vault_classify",
-                "Re-classifie une note existante via le pipeline curator (async). \
-                 Champs : note_id (req), tenant_id. \
-                 Retourne 202 Accepted + job_id.",
-            ),
-            tool_def::<VaultDowngradeRequest>(
-                "vault_downgrade",
-                "Rétrograde une note (status live → downgraded) — la retire des résultats par défaut. \
-                 Champs : note_id (req), reason (req), replaced_by, tenant_id. \
-                 Retourne 202 Accepted + job_id.",
-            ),
-            // ── History tools F-40 (4) — synchrones 200 OK ───────────────────
-            tool_def::<VaultHistoryRequest>(
-                "vault_history",
-                "Liste les snapshots CoW (Copy-on-Write) d'une note. \
-                 Champs : note_id (req), tenant_id. \
-                 Retourne la liste des timestamps ms Unix des snapshots disponibles.",
-            ),
-            tool_def::<VaultHistoryGetRequest>(
-                "vault_history_get",
-                "Lit le contenu d'un snapshot historique précis. \
-                 Champs : note_id (req), ts_ms (req — timestamp issu de vault_history), tenant_id. \
-                 Retourne le corps Markdown de la note à ce moment.",
-            ),
-            tool_def::<VaultRestoreRequest>(
-                "vault_restore",
-                "Restaure une note depuis un snapshot historique (déclenche un CoW). \
-                 Champs : note_id (req), ts_ms (req), tenant_id. \
-                 Retourne le hash SHA-256 hex de la version restaurée.",
-            ),
-            tool_def::<VaultDiffRequest>(
-                "vault_diff",
-                "Diff brut ligne-à-ligne entre deux versions d'une note. \
-                 Champs : note_id (req), a (req — timestamp ms ou 'current'), \
-                 b (req — timestamp ms ou 'current'), tenant_id. \
-                 Retourne une liste de lignes préfixées ' ' / '-' / '+'.",
-            ),
-            // ── Forget tools F-44 (1) — double confirmation ───────────────────
-            tool_def::<VaultForgetRequest>(
-                "vault_forget",
-                "Oubli sémantique d'un lot de notes (F-44). \
-                 Workflow double confirmation : \
-                 (1) dry_run=true (défaut) → preview 200 {ulids, count, excluded} ; \
-                 (2) dry_run=false + confirm_ulids=[...ulids_de_la_preview] → 202 job_id. \
-                 Scope : {type='topic', query, limit} | {type='locus', vault, locus} | {type='agent', agent_id, vaults[]}. \
-                 Sections agent-issues et council exclues automatiquement. \
-                 Mutation frontmatter exécutée par le worker (non-destructif).",
-            ),
-            // ── Lesson Recall tool F-60 (1) — GET BM25-only, aucun LLM ────────
-            tool_def::<LessonsRecallRequest>(
-                "vault_lessons_recall",
-                "Rappelle les leçons apprises d'une CLASSE donnée (F-60). \
-                 Recherche lexicale BM25 (aucun LLM) dans la section lessons-learned, \
-                 excluant les leçons déjà codifiées (tag 'codified'). \
-                 Usage : avant un acte à risque (release, deploy, migration, publish), \
-                 récupérer les leçons pertinentes pour ne pas répéter une erreur passée. \
-                 Champs : class (req — l'une de : deploy, release, migration, crates-io, \
-                 anti-leak, api-external, archi, git-hygiene, ci-cd, auth-secrets, \
-                 data-integrity, process-discipline), limit (opt, défaut 5, max 20). \
-                 Retourne {items:[{ulid, title, snippet, tags, anchor_ms}]}.",
-            ),
-            // ── Code Scope tool F-61 (1) — POST BM25-only, endpoint dédié code-map ─
-            tool_def::<CodeScopeRequest>(
-                "code_scope",
-                "Récupère les symboles de code pertinents d'un vault code-map (F-61). \
-                 Remplace la relecture O(repo) (Read/Glob/grep) par une requête index dérivé \
-                 (tree-sitter, aucun LLM). Champs : vault (req — DOIT commencer par 'code-', \
-                 ex. 'code-gradatum'), selector {kind: 'query'|'path'|'symbol', value}, \
-                 budget_tokens (opt, défaut 800). \
-                 selector.kind : 'query' = recherche BM25 plein-texte ; 'path' = tous les \
-                 symboles d'un fichier/dossier ; 'symbol' = par nom qualifié (substring). \
-                 Retourne {entries:[{note_id, source_path, kind, qualified_name, signature, \
-                 deps, stale}], truncated, total_matched}. Une entrée stale=true est PÉRIMÉE \
-                 (fichier modifié depuis l'ingest) — NE PAS l'utiliser comme vérité.",
-            ),
-            // ── Proactive Recall tools F-46 (2) — POST, surface in-process B' ───
-            tool_def::<ProactiveRecallRequest>(
-                "vault_proactive_recall",
-                "Rappel proactif de mémoire (F-46, Active Recall). \
-                 Deux modes selon la présence de 'context' : \
-                 (1) context absent → mode 'proactive' : lit la surface pré-calculée \
-                 (calcul en arrière-plan toutes les 15 min). Surface absente → items vides. \
-                 (2) context présent → mode 'contextual' : retrieval RRF à la demande \
-                 sur les sections fournies ou toutes les sections. \
-                 Champs : tenant_id (opt, défaut 'main'), context (opt), sections (opt), \
-                 limit (opt, défaut 10, max 20). \
-                 Retourne {recall_id, mode, items:[{ulid, title, section, snippet, score}]}. \
-                 recall_id sert de corrélateur pour vault_proactive_recall_feedback.",
-            ),
-            tool_def::<ProactiveRecallFeedbackRequest>(
-                "vault_proactive_recall_feedback",
-                "Feedback d'acceptation pour une session de rappel proactif (F-46). \
-                 Corrèle les notes effectivement utilisées avec la surface présentée. \
-                 Idempotent : 2× le même feedback = 1 enregistrement. \
-                 Validation : accepted_ulids ⊆ surfaced (sur-ensemble → 400). \
-                 Champs : recall_id (req — retourné par vault_proactive_recall), \
-                 accepted_ulids (req — liste ULIDs acceptés, peut être vide), \
-                 tenant_id (opt, défaut 'main'). \
-                 Retourne 200 sur succès.",
-            ),
-        ];
         std::future::ready(Ok(ListToolsResult {
-            tools,
+            tools: tool_catalogue(),
             ..Default::default()
         }))
     }
@@ -769,6 +637,11 @@ impl ServerHandler for StubHandler {
                 "vault_tags" => self.forward_get("vault_tags").await?,
                 // Write endpoints — POST async 202 Accepted
                 "vault_write" => self.forward_post("vault_write", body).await?,
+                // Création de carte-feature — POST, numéro attribué par le serveur
+                "create_feature_card" => {
+                    self.forward_post("project-map/create-feature", body)
+                        .await?
+                }
                 "vault_classify" => self.forward_post("vault_classify", body).await?,
                 "vault_downgrade" => self.forward_post("vault_downgrade", body).await?,
                 // History endpoints F-40 — POST synchrones 200 OK
@@ -778,6 +651,8 @@ impl ServerHandler for StubHandler {
                 "vault_diff" => self.forward_post("vault_diff", body).await?,
                 // Forget endpoint F-44 — POST dry-run 200 | mode réel 202
                 "vault_forget" => self.forward_post("vault_forget", body).await?,
+                // Archives listing F-100 1.6 — POST lecture seule (registre paginé)
+                "vault_archives_list" => self.forward_post("vault_archives_list", body).await?,
                 // Lesson Recall F-60 — GET avec query params (class, limit)
                 "vault_lessons_recall" => {
                     let endpoint = build_lessons_recall_endpoint(&body)?;
@@ -792,7 +667,7 @@ impl ServerHandler for StubHandler {
                 }
                 unknown => {
                     return Err(ErrorData::invalid_params(
-                        format!("outil inconnu : {unknown}"),
+                        format!("unknown tool: {unknown}"),
                         None,
                     ));
                 }
@@ -816,24 +691,27 @@ impl ServerHandler for StubHandler {
 /// `semantic`, when present, must be a boolean.
 /// `query`, when present, must be a string — percent-encoded before insertion.
 ///
-/// ## Rétro-compat
+/// ## Backward compatibility
 ///
-/// `rank`, `semantic`, `query` sont des champs opt-in : leur absence ne change pas
-/// le comportement du serveur (BM25 order inchangé, hook LIVE `lesson-recall.sh` préservé).
+/// `rank`, `semantic` and `query` are opt-in fields: leaving them out does not change the
+/// server's behaviour — the BM25 ordering is unchanged and existing callers keep working.
 fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, ErrorData> {
     let class = body
         .get("class")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .ok_or_else(|| {
-            ErrorData::invalid_params("vault_lessons_recall : champ 'class' requis (string)", None)
+            ErrorData::invalid_params(
+                "vault_lessons_recall: 'class' field required (string)",
+                None,
+            )
         })?;
 
     if !gradatum_dto::is_valid_lesson_class(class) {
         return Err(ErrorData::invalid_params(
             format!(
-                "vault_lessons_recall : classe '{class}' invalide. \
-                 Valeurs admises : {}",
+                "vault_lessons_recall: invalid class '{class}'. \
+                 Allowed values: {}",
                 gradatum_dto::LESSON_CLASSES.join(", ")
             ),
             None,
@@ -848,7 +726,7 @@ fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, Err
         if !limit_val.is_null() {
             let limit = limit_val.as_u64().ok_or_else(|| {
                 ErrorData::invalid_params(
-                    "vault_lessons_recall : 'limit' doit être un entier positif",
+                    "vault_lessons_recall: 'limit' must be a positive integer",
                     None,
                 )
             })?;
@@ -862,7 +740,7 @@ fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, Err
         && !rank_val.is_null()
     {
         let rank = rank_val.as_str().ok_or_else(|| {
-            ErrorData::invalid_params("vault_lessons_recall : 'rank' doit être une string", None)
+            ErrorData::invalid_params("vault_lessons_recall: 'rank' must be a string", None)
         })?;
         // Valeurs admises identiques à RankMode (serde rename_all kebab-case).
         // Le serveur valide et retourne 400 sur valeur inconnue — percent-encodé
@@ -877,10 +755,7 @@ fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, Err
         && !sem_val.is_null()
     {
         let semantic = sem_val.as_bool().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "vault_lessons_recall : 'semantic' doit être un booléen",
-                None,
-            )
+            ErrorData::invalid_params("vault_lessons_recall: 'semantic' must be a boolean", None)
         })?;
         endpoint.push_str(if semantic {
             "&semantic=true"
@@ -895,7 +770,7 @@ fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, Err
         && !query_val.is_null()
     {
         let query = query_val.as_str().ok_or_else(|| {
-            ErrorData::invalid_params("vault_lessons_recall : 'query' doit être une string", None)
+            ErrorData::invalid_params("vault_lessons_recall: 'query' must be a string", None)
         })?;
         endpoint.push_str("&query=");
         endpoint.push_str(&percent_encode_value(query));
@@ -904,15 +779,15 @@ fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, Err
     Ok(endpoint)
 }
 
-/// URL-encode une valeur de query string selon RFC 3986 percent-encoding.
+/// URL-encodes a query-string value using RFC 3986 percent-encoding.
 ///
-/// Encode tout octet non classé « unreserved » (ALPHA / DIGIT / `-` / `.` / `_` / `~`).
-/// Les caractères UTF-8 multi-octet sont encodés octet par octet (`é` → `%C3%A9`).
+/// Every byte outside the "unreserved" class (ALPHA / DIGIT / `-` / `.` / `_` / `~`) is
+/// encoded. Multi-byte UTF-8 characters are encoded byte by byte (`é` becomes `%C3%A9`).
 ///
-/// ## Sécurité
+/// ## Security
 ///
-/// Garantit qu'aucun caractère de contrôle URL (`&`, `=`, `+`, `?`, `#`, `%`, `/`, …)
-/// ne peut perturber la query string construite dans [`build_lessons_recall_endpoint`].
+/// Guarantees that no URL control character (`&`, `=`, `+`, `?`, `#`, `%`, `/`, …) can
+/// disturb the query string built by [`build_lessons_recall_endpoint`].
 fn percent_encode_value(s: &str) -> String {
     let mut encoded = String::with_capacity(s.len());
     for byte in s.bytes() {
@@ -930,20 +805,186 @@ fn percent_encode_value(s: &str) -> String {
     encoded
 }
 
-/// Construit un [`Tool`] MCP avec schéma JSON dérivé du type `T`.
+/// Catalogue des outils MCP exposés par le stub — **source unique** de l'effectif.
 ///
-/// Délègue à [`gradatum_dto::mcp_tool_schema`] — SSOT unique (DT-MCP-SCHEMA-1).
-/// Fail-loud : panique si schemars produit un non-objet (impossible en pratique),
-/// jamais de dégradé silencieux vers un Map vide (anti-34e70eb).
+/// Extrait de [`StubHandler::list_tools`] pour être mesurable hors d'un
+/// `RequestContext` : tant que le catalogue n'existait qu'à l'intérieur de la méthode,
+/// le seul test disponible comparait une constante à un littéral et ne prouvait rien de
+/// ce qui est réellement servi.
+fn tool_catalogue() -> Vec<Tool> {
+    use gradatum_dto::{
+        CodeScopeRequest, CreateFeatureCardRequest, LessonsRecallRequest,
+        ProactiveRecallFeedbackRequest, ProactiveRecallRequest, VaultArchivesListRequest,
+        VaultClassifyRequest, VaultContextRequest, VaultDiffRequest, VaultDowngradeRequest,
+        VaultForgetRequest, VaultGraphRequest, VaultHistoryGetRequest, VaultHistoryRequest,
+        VaultLinksRequest, VaultListRequest, VaultReadRequest, VaultRestoreRequest,
+        VaultSearchRequest, VaultTimelineRequest, VaultTraceRequest, VaultWriteRequest,
+    };
+
+    vec![
+        // ── Read tools ────────────────────────────────────────────────
+        tool_def::<VaultSearchRequest>("vault_search", "Full-text search in the vault"),
+        tool_def::<VaultReadRequest>("vault_read", "Read a note's content by path"),
+        tool_def::<VaultListRequest>("vault_list", "List the vault's notes"),
+        tool_def_no_params("vault_status", "Current vault status"),
+        tool_def::<VaultGraphRequest>("vault_graph", "Link graph from a root note"),
+        tool_def::<VaultLinksRequest>(
+            "vault_links",
+            "Direct links of a note (alias for vault_graph depth=1)",
+        ),
+        tool_def::<VaultTraceRequest>("vault_trace", "Trace notes by tags, sections or pattern"),
+        tool_def::<VaultContextRequest>("vault_context", "Build an LLM context from notes"),
+        tool_def::<VaultTimelineRequest>(
+            "vault_timeline",
+            "Chronological list of notes by temporal anchor (most recent first), \
+             filterable by doc_kind and anchor_ms window. Cursor pagination. For replay / recency.",
+        ),
+        tool_def_no_params("vault_authors", "List the vault's authors"),
+        tool_def_no_params("vault_tags", "List the vault's tags with frequencies"),
+        // ── Write tools — queue async 202 Accepted ────────────────────
+        tool_def::<VaultWriteRequest>(
+            "vault_write",
+            "Create a new note in the vault (async queue). \
+             Fields: title (req), body (req), author, tags[], section_hint, tenant_id. \
+             Returns 202 Accepted + job_id (poll via GET /api/v1/jobs/:id).",
+        ),
+        tool_def::<CreateFeatureCardRequest>(
+            "create_feature_card",
+            "Create a project-map feature card with a server-assigned F-XX number. \
+             Fields: title (req), body (req — the 5 non-feature roles, NO [[feature:…]]), \
+             author, tags[], tenant_id, occurred_at. Async: returns \
+             { feature, number, job_id, note_id, poll_url } — poll job_status.",
+        ),
+        tool_def::<VaultClassifyRequest>(
+            "vault_classify",
+            "Re-classify an existing note via the curator pipeline (async). \
+             Fields: note_id (req), tenant_id. \
+             Returns 202 Accepted + job_id.",
+        ),
+        tool_def::<VaultDowngradeRequest>(
+            "vault_downgrade",
+            "Downgrade a note (status live → downgraded) — removes it from default results. \
+             Fields: note_id (req), reason (req), replaced_by, tenant_id. \
+             Returns 202 Accepted + job_id.",
+        ),
+        // ── History tools F-40 — synchrones 200 OK ───────────────────
+        tool_def::<VaultHistoryRequest>(
+            "vault_history",
+            "List the CoW (Copy-on-Write) snapshots of a note. \
+             Fields: note_id (req), tenant_id. \
+             Returns the list of Unix-ms timestamps of available snapshots.",
+        ),
+        tool_def::<VaultHistoryGetRequest>(
+            "vault_history_get",
+            "Read the content of a specific historical snapshot. \
+             Fields: note_id (req), ts_ms (req — timestamp from vault_history), tenant_id. \
+             Returns the note's Markdown body at that point in time.",
+        ),
+        tool_def::<VaultRestoreRequest>(
+            "vault_restore",
+            "Restore a note from a historical snapshot (triggers a CoW). \
+             Fields: note_id (req), ts_ms (req), tenant_id. \
+             Returns the hex SHA-256 hash of the restored version.",
+        ),
+        tool_def::<VaultDiffRequest>(
+            "vault_diff",
+            "Raw line-by-line diff between two versions of a note. \
+             Fields: note_id (req), a (req — timestamp ms or 'current'), \
+             b (req — timestamp ms or 'current'), tenant_id. \
+             Returns a list of lines prefixed with ' ' / '-' / '+'.",
+        ),
+        // ── Forget tools F-44 — double confirmation ───────────────────
+        tool_def::<VaultForgetRequest>(
+            "vault_forget",
+            "Semantic forget of a batch of notes (F-44). \
+             Double-confirmation workflow: \
+             (1) dry_run=true (default) → preview 200 {ulids, count, excluded} ; \
+             (2) dry_run=false + confirm_ulids=[...ulids_from_preview] → 202 job_id. \
+             Scope: {type='topic', query, limit} | {type='locus', vault, locus} | {type='agent', agent_id, vaults[]}. \
+             agent-issues and council sections are excluded automatically. \
+             Frontmatter mutation performed by the worker (non-destructive).",
+        ),
+        // ── Archives listing F-100 1.6 — LECTURE SEULE stricte ────────
+        tool_def::<VaultArchivesListRequest>(
+            "vault_archives_list",
+            "Lists (READ-ONLY) the notes archived by the on-demand delete (F-100 1.6). \
+             No mutation, no action parameter: delete/restore/purge are NOT \
+             exposed over MCP (operator CLI `gradatum-admin` only). \
+             Used to VIEW archives and PREPARE the CLI commands. \
+             Fields (all opt): section, since_ms, until_ms, include_gc, include_restored, \
+             limit (default 50, max 500), offset, tenant_id. \
+             Returns {entries:[{note_id, section, title, archive_path, archived_at, gc_due, …}], count}.",
+        ),
+        // ── Lesson Recall tool F-60 — GET BM25-only, aucun LLM ────────
+        tool_def::<LessonsRecallRequest>(
+            "vault_lessons_recall",
+            "Recall the lessons learned for a given CLASS (F-60). \
+             BM25 lexical search (no LLM) in the lessons-learned section, \
+             excluding already-codified lessons (tag 'codified'). \
+             Usage: before a risky action (release, deploy, migration, publish), \
+             retrieve the relevant lessons to avoid repeating a past mistake. \
+             Fields: class (req — one of: deploy, release, migration, crates-io, \
+             anti-leak, api-external, archi, git-hygiene, ci-cd, auth-secrets, \
+             data-integrity, process-discipline), limit (opt, default 5, max 20). \
+             Returns {items:[{ulid, title, snippet, tags, anchor_ms}]}.",
+        ),
+        // ── Code Scope tool F-61 — POST BM25-only, endpoint dédié code-map ─
+        tool_def::<CodeScopeRequest>(
+            "code_scope",
+            "Retrieve the relevant code symbols from a code-map vault (F-61). \
+             Replaces O(repo) re-reading (Read/Glob/grep) with a derived-index query \
+             (tree-sitter, no LLM). Fields: vault (req — MUST start with 'code-', \
+             e.g. 'code-gradatum'), selector {kind: 'query'|'path'|'symbol', value}, \
+             budget_tokens (opt, default 800). \
+             selector.kind: 'query' = full-text BM25 search ; 'path' = all \
+             symbols of a file/folder ; 'symbol' = by qualified name (substring). \
+             Retourne {entries:[{note_id, source_path, kind, qualified_name, signature, \
+             deps, stale}], truncated, total_matched}. A stale=true entry is STALE \
+             (file modified since ingest) — DO NOT use it as truth.",
+        ),
+        // ── Proactive Recall tools F-46 — POST, surface in-process B' ───
+        tool_def::<ProactiveRecallRequest>(
+            "vault_proactive_recall",
+            "Proactive memory recall (F-46, Active Recall). \
+             Two modes depending on whether 'context' is present: \
+             (1) context absent → 'proactive' mode: reads the pre-computed surface \
+             (computed in the background every 15 min). Surface absent → empty items. \
+             (2) context present → 'contextual' mode: on-demand RRF retrieval \
+             over the provided sections or all sections. \
+             Fields: tenant_id (opt, default 'main'), context (opt), sections (opt), \
+             limit (opt, default 10, max 20). \
+             Returns {recall_id, mode, items:[{ulid, title, section, snippet, score}]}. \
+             recall_id serves as a correlator for vault_proactive_recall_feedback.",
+        ),
+        tool_def::<ProactiveRecallFeedbackRequest>(
+            "vault_proactive_recall_feedback",
+            "Acceptance feedback for a proactive-recall session (F-46). \
+             Correlates the notes actually used with the surface presented. \
+             Idempotent: same feedback 2× = 1 record. \
+             Validation: accepted_ulids ⊆ surfaced (superset → 400). \
+             Fields: recall_id (req — returned by vault_proactive_recall), \
+             accepted_ulids (req — list of accepted ULIDs, may be empty), \
+             tenant_id (opt, default 'main'). \
+             Returns 200 on success.",
+        ),
+    ]
+}
+
+/// Builds an MCP [`Tool`] whose JSON schema is derived from the type `T`.
+///
+/// Delegates to [`gradatum_dto::mcp_tool_schema`], the single source of truth for schema
+/// generation. Fail-loud: it panics if schemars yields a non-object (not reachable in
+/// practice) rather than silently degrading to an empty map.
 fn tool_def<T: schemars::JsonSchema>(name: &'static str, description: &'static str) -> Tool {
     Tool::new(name, description, gradatum_dto::mcp_tool_schema::<T>())
 }
 
-/// Construit un [`Tool`] MCP sans paramètres.
+/// Builds a parameterless MCP [`Tool`].
 ///
-/// Délègue à [`gradatum_dto::mcp_empty_params_schema`] — SSOT unique (DT-MCP-SCHEMA-1).
-/// Émet `{"type":"object","properties":{}}` — un Map vide `{}` est rejeté par zod
-/// et invalide toute la liste d'outils (régression 34e70eb).
+/// Delegates to [`gradatum_dto::mcp_empty_params_schema`], the single source of truth for
+/// schema generation. It emits `{"type":"object","properties":{}}`: an empty map `{}`
+/// would be rejected by the client-side validator and would invalidate the whole tool
+/// list.
 fn tool_def_no_params(name: &'static str, description: &'static str) -> Tool {
     Tool::new(name, description, gradatum_dto::mcp_empty_params_schema())
 }
@@ -961,7 +1002,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let handler = StubHandler::from_env().context("initialisation StubHandler depuis env")?;
+    let handler = StubHandler::from_env().context("StubHandler initialization from env")?;
 
     // En mode auto-refresh : obtenir le JWT initial avant d'accepter des connexions MCP.
     handler
@@ -974,16 +1015,16 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         server_url = %handler.server_url,
-        "gradatum-mcp-stub démarrage (stdio transport)"
+        "gradatum-mcp-stub starting (stdio transport)"
     );
 
     // serve_server gère l'initialisation MCP, le dispatch et le shutdown propre.
     rmcp::service::serve_server(handler, (stdin, stdout))
         .await
-        .map_err(|e| anyhow::anyhow!("erreur serve_server : {e}"))?
+        .map_err(|e| anyhow::anyhow!("serve_server error: {e}"))?
         .waiting()
         .await
-        .map_err(|e| anyhow::anyhow!("erreur waiting : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("waiting error: {e}"))?;
 
     Ok(())
 }
@@ -992,6 +1033,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -1083,12 +1126,26 @@ mod tests {
         );
     }
 
+    /// Le catalogue réellement servi doit être exactement la liste canonique.
+    ///
+    /// Ce test comparait auparavant `EXPECTED_TOOL_NAMES.len()` à un littéral : une
+    /// constante confrontée à un nombre écrit deux lignes plus haut, sans jamais toucher
+    /// [`tool_catalogue`]. Il est resté vert pendant que la production passait à 25 outils,
+    /// que `create_feature_card` et `vault_archives_list` y apparaissaient sans figurer
+    /// dans la liste, et que `vault_delete` y figurait sans exister nulle part.
+    ///
+    /// La comparaison porte désormais sur des ENSEMBLES dans les deux sens : un outil
+    /// ajouté en production sans mise à jour de la liste échoue, et un nom fantôme dans la
+    /// liste échoue aussi. L'effectif n'est écrit nulle part — il se lit sur la liste.
     #[test]
-    fn list_tools_count_matches_expected() {
-        // Liste canonique des 23 tools (11 read + 3 write + 4 history F-40 + 1 forget
-        // F-44 + 1 lesson recall F-60 + 1 code scope F-61 + 2 proactive recall F-46).
-        // Cette constante est la source de vérité pour le compte : si on ajoute un tool
-        // en production sans MAJ cette liste, le test échoue explicitement.
+    fn catalogue_expose_exactement_les_outils_canoniques() {
+        /// Noms canoniques des outils du stub.
+        ///
+        /// ⚠️ Sous-ensemble strict de la surface du serveur : `job_status`, exposé par
+        /// `gradatum-server`, n'a pas d'équivalent ici — il est le seul outil du catalogue
+        /// serveur sans jumeau REST, donc non proxifiable en l'état (mesuré le 2026-08-01).
+        /// Cet écart est désormais gaté : `scripts/mcp-catalog-parity.sh` le compare aux
+        /// deux catalogues servis et rougit si l'écart change dans un sens ou dans l'autre.
         const EXPECTED_TOOL_NAMES: &[&str] = &[
             // read
             "vault_search",
@@ -1106,6 +1163,8 @@ mod tests {
             "vault_write",
             "vault_classify",
             "vault_downgrade",
+            // allocation de numéro de feature
+            "create_feature_card",
             // history F-40
             "vault_history",
             "vault_history_get",
@@ -1113,6 +1172,8 @@ mod tests {
             "vault_diff",
             // forget F-44
             "vault_forget",
+            // archives listing F-100 (lecture seule)
+            "vault_archives_list",
             // lesson recall F-60
             "vault_lessons_recall",
             // code scope F-61
@@ -1122,10 +1183,105 @@ mod tests {
             "vault_proactive_recall_feedback",
         ];
 
+        let catalogue = tool_catalogue();
+        let servis: BTreeSet<&str> = catalogue.iter().map(|t| t.name.as_ref()).collect();
+        let attendus: BTreeSet<&str> = EXPECTED_TOOL_NAMES.iter().copied().collect();
+
         assert_eq!(
+            servis,
+            attendus,
+            "le catalogue servi diverge de la liste canonique — \
+             en trop : {:?}, manquants : {:?}",
+            servis.difference(&attendus).collect::<Vec<_>>(),
+            attendus.difference(&servis).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            catalogue.len(),
             EXPECTED_TOOL_NAMES.len(),
-            23,
-            "liste canonique doit contenir 23 tools (11 read + 3 write + 4 history F-40 + 1 forget F-44 + 1 lesson recall F-60 + 1 code scope F-61 + 2 proactive recall F-46)"
+            "un nom est servi deux fois : la comparaison d'ensembles ne le verrait pas"
+        );
+    }
+
+    /// Extrait les noms d'outils cités dans la table « MCP Tools Exposed » du README.
+    ///
+    /// L'extraction est bornée à cette section : le reste du README cite `vault_status`,
+    /// `gradatum-server` ou `tools/list` entre backticks sans que ce soient des entrées de
+    /// la table. Un scan du fichier entier ramasserait ces jetons et rendrait le gate
+    /// ininterprétable — la portée est donc une propriété de correction, pas une commodité.
+    ///
+    /// Dans la section, seules les lignes de tableau (`|`) sont lues, et seuls leurs
+    /// segments entre backticks sont retenus : la ligne d'en-tête et le séparateur `|---|`
+    /// n'en contiennent aucun et sont écartés sans cas particulier.
+    ///
+    /// # Panics
+    ///
+    /// Panique si le titre de section est absent — c'est un README restructuré, donc un
+    /// gate qui ne mesure plus ce qu'il croit mesurer. Échouer bruyamment vaut mieux que
+    /// rendre un ensemble vide, qui passerait pour un simple désaccord de contenu.
+    fn tool_names_cited_in_readme(readme: &str) -> Vec<String> {
+        const SECTION: &str = "## MCP Tools Exposed";
+
+        let after = readme
+            .split_once(SECTION)
+            .map(|(_, rest)| rest)
+            .expect("section « ## MCP Tools Exposed » absente du README du stub");
+        // La section s'arrête au titre suivant de même niveau.
+        let section = after.split_once("\n## ").map_or(after, |(head, _)| head);
+
+        let mut noms = Vec::new();
+        for ligne in section.lines().filter(|l| l.trim_start().starts_with('|')) {
+            // Segments d'index impair = intérieur des backticks.
+            for (i, seg) in ligne.split('`').enumerate() {
+                if i % 2 == 1 {
+                    noms.push(seg.to_string());
+                }
+            }
+        }
+        noms
+    }
+
+    /// Le README du stub et le catalogue réellement servi ne peuvent pas diverger.
+    ///
+    /// `gradatum-mcp-stub` est publié sans baseline `public-api` : l'outil refuse un crate
+    /// sans cible `lib` (`no library targets found in package`, mesuré le 2026-08-01), et
+    /// la propriété à protéger n'est de toute façon pas une surface Rust — aucun
+    /// consommateur ne fait `use` d'un binaire. La surface publique de ce crate, c'est son
+    /// catalogue MCP. C'est donc elle qui est gatée, ici et par
+    /// `scripts/mcp-catalog-parity.sh` pour la parité avec le serveur.
+    ///
+    /// Aucun cardinal n'est écrit : les deux côtés se lisent. Le README a déjà gravé
+    /// « 24 tools » pendant qu'il en servait 25 — un compte recopié à la main se périme en
+    /// silence et, pire, se transmet.
+    #[test]
+    fn readme_cite_exactement_les_outils_servis() {
+        let cites = tool_names_cited_in_readme(include_str!("../README.md"));
+
+        // Anti-vacuité : sans cette garde, un README dont la table serait vidée ferait
+        // comparer deux ensembles vides côté « cités » et n'accuserait qu'un delta —
+        // mais une extraction muette (backticks disparus, table convertie en liste)
+        // doit être un échec de MESURE, distinct d'un désaccord de contenu.
+        assert!(
+            !cites.is_empty(),
+            "aucun nom d'outil extrait de la table du README — l'extraction ne mesure plus rien"
+        );
+
+        let catalogue = tool_catalogue();
+        let servis: BTreeSet<&str> = catalogue.iter().map(|t| t.name.as_ref()).collect();
+        let documentes: BTreeSet<&str> = cites.iter().map(String::as_str).collect();
+
+        assert_eq!(
+            documentes,
+            servis,
+            "le README diverge du catalogue servi — documentés non servis : {:?}, \
+             servis non documentés : {:?}",
+            documentes.difference(&servis).collect::<Vec<_>>(),
+            servis.difference(&documentes).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cites.len(),
+            documentes.len(),
+            "un outil est cité deux fois dans la table du README : {:?}",
+            cites
         );
     }
 
@@ -1270,13 +1426,18 @@ mod tests {
         assert_eq!(percent_encode_value("a&b"), "a%26b");
     }
 
-    #[test]
-    fn from_env_fails_without_credentials() {
-        // Aucune credential → erreur attendue.
-        // Vérification logique sans modifier l'env global (parallélisme de tests).
-        let empty = "";
-        assert!(empty.is_empty(), "bearer vide → erreur d'init attendue");
-    }
+    // NOTE — `from_env()` sans credentials n'est PAS couvert ici, volontairement.
+    // Un test `from_env_fails_without_credentials` a existé à cet endroit ; il
+    // assertait `"".is_empty()`, c'est-à-dire rien : couverture réelle nulle sous
+    // un nom qui en promettait une. Le supprimer ne retire aucune couverture, il
+    // retire une fausse garantie.
+    // L'exercer réellement demanderait `unsafe { std::env::remove_var(…) }`
+    // (edition 2024) sur les trois variables lues par `from_env`, donc une
+    // mutation d'état global partagée avec les tests exécutés en parallèle dans
+    // ce même binaire — data race formelle et flakiness selon l'environnement CI,
+    // pour couvrir un `bail!` sans logique. Voie propre si le besoin se confirme :
+    // extraire la résolution en `fn resolve_auth(key_file: Option<String>,
+    // bearer: Option<String>) -> Result<AuthMode>` et tester CELLE-LÀ, sans env.
 
     // ── Tests TokenState ──────────────────────────────────────────────────────
 

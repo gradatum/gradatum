@@ -37,7 +37,6 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use gradatum_core::error::GradatumError;
-use gradatum_core::scope::VaultId;
 use gradatum_dto::{ContextMode, VaultContextRequest};
 use gradatum_search::{ResolvedWeights, ScoringWeightsWire, resolve_weights};
 use ulid::Ulid;
@@ -54,8 +53,8 @@ use crate::state::AppState;
 ///
 /// # Dispatch
 ///
-/// - `Raw` → [`assemble_raw`] (parité bit-pour-bit legacy).
-/// - `Assembled` → [`assemble_assembled`] (pipeline complet v0.7.0 : retrieval RRF +
+/// - `Raw` → `assemble_raw` (parité bit-pour-bit legacy).
+/// - `Assembled` → `assemble_assembled` (pipeline complet v0.7.0 : retrieval RRF +
 ///   scoring composite pondéré + sélection budget-aware + rendu Markdown structuré).
 ///
 /// # Telemetry
@@ -81,7 +80,7 @@ use crate::state::AppState;
 /// # Identity guard
 ///
 /// `identity_privileged` est résolu en amont (`vault_context_impl`, accès à `trust`)
-/// via [`crate::api_v1::logic::is_identity_privileged`]. Quand il vaut `false`, les
+/// via `crate::api_v1::logic::is_identity_privileged`. Quand il vaut `false`, les
 /// notes de section `identity` (âmes d'agents) sont exclues des candidats AVANT toute
 /// hydratation de corps — parité avec le guard `vault_search_impl` (surface RAG
 /// générique, exclusion simple sans matching par-agent).
@@ -166,7 +165,7 @@ pub async fn assemble_context(
 /// | Troncature | `char_indices().nth(char_limit).map(|(i, _)| i).unwrap_or(len)` | identique |
 /// | Jointure | `context_parts.join("\n\n---\n\n")` | `render_raw(parts)` |
 /// | Budget total | `(context.chars().count() / 3) as u32` | identique |
-/// | Score sources | non calculé (Vec<String>) | `0.0` (IncludedNote) |
+/// | Score sources | non calculé (`Vec<String>`) | `0.0` (IncludedNote) |
 ///
 /// ## Mapping vers la nouvelle réponse
 ///
@@ -174,7 +173,7 @@ pub async fn assemble_context(
 /// |---|---|
 /// | `context` | `assembled_text` |
 /// | `estimated_tokens` | `budget_used` |
-/// | `sources` (Vec<String>) | `included` (Vec<IncludedNote>, score=0.0) |
+/// | `sources` (`Vec<String>`) | `included` (`Vec<IncludedNote>`, score=0.0) |
 async fn assemble_raw(
     state: &AppState,
     tenant: &str,
@@ -219,7 +218,7 @@ async fn assemble_raw(
                 cache_breakpoint_hint: false,
             });
         }
-        let vault_id = VaultId::new(tenant);
+        let vault_id = crate::api_v1::tenant_guard::own_vault_checked(tenant);
         match state
             .search
             .search_fts_with_snippet(
@@ -251,6 +250,9 @@ async fn assemble_raw(
         if used_tokens >= max_tokens {
             break;
         }
+        // Task 14 (W3, iso-audit) : `get_note` scopé par argument sur le vault own (`tenant`),
+        // pas le singleton — aucun split-brain read-back. `vault_context` est own-vault (pas de
+        // `vault_id` requête), donc `tenant` EST le namespace cible. Rien à router ici.
         match state.search.get_note(tenant, note_id).await {
             Ok(Some(record)) => {
                 // Guard identity F-34 : ne jamais hydrater le corps d'une âme dans le
@@ -297,7 +299,7 @@ async fn assemble_raw(
             Ok(None) => {
                 tracing::debug!(
                     note_id = %note_id,
-                    "assemble_raw: note absente, ignorée"
+                    "assemble_raw: note missing, skipped"
                 );
             }
             Err(e) => {
@@ -396,7 +398,7 @@ async fn assemble_assembled(
         && !is_session_id_valid(sid)
     {
         return Err(GradatumError::InvalidInput(
-            "session_id invalide : ULID 26 chars alphanumériques (Crockford base32) attendu"
+            "invalid session_id: expected ULID of 26 alphanumeric chars (Crockford base32)"
                 .to_owned(),
         ));
     }
@@ -407,7 +409,7 @@ async fn assemble_assembled(
         .or(req.max_tokens)
         .unwrap_or(state.context.default_budget_tokens)
         .clamp(1, 8000);
-    let vault_id = VaultId::new(tenant);
+    let vault_id = crate::api_v1::tenant_guard::own_vault_checked(tenant);
 
     // top_n élargi pour que le scoring/sélection ait suffisamment de candidats à trier.
     // La sélection budget-aware borne la liste finale — top_n est un plafond de retrieval.
@@ -489,7 +491,7 @@ async fn assemble_assembled(
                     tracing::warn!(
                         err = %e,
                         session_id = %sid,
-                        "get_sent failed — dégradation F-29-pur (filtre session skippé)"
+                        "get_sent failed — F-29-pure degradation (session filter skipped)"
                     );
                     None
                 }
@@ -497,7 +499,7 @@ async fn assemble_assembled(
             None => {
                 tracing::debug!(
                     session_id = %sid,
-                    "session_trace absent — dégradation F-29-pur (P2-4)"
+                    "session_trace absent — F-29-pure degradation (P2-4)"
                 );
                 None
             }
@@ -632,7 +634,7 @@ async fn assemble_assembled(
                 tracing::warn!(
                     err = %e,
                     note_id = %sel.note_id,
-                    "mark_sent failed — non-critique, contexte retourné"
+                    "mark_sent failed — non-critical, context returned"
                 );
             }
         }
@@ -710,7 +712,7 @@ async fn assemble_assembled(
         } else {
             // Pas d'embedding disponible (Noop / timeout / fallback) → skip silencieux.
             tracing::debug!(
-                "inject_skills=true mais query_embedding=None (embed fallback) — injection skippée"
+                "inject_skills=true but query_embedding=None (embed fallback) — injection skipped"
             );
         }
     }

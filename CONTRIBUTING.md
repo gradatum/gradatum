@@ -49,8 +49,10 @@ contributor — newcomer or veteran — is not tolerated.
 1. **Open an issue first** for substantive changes (architecture, new
    features) so we can align scope before you invest time.
 2. **Fork** the repo, create a topic branch (`fix/X`, `feat/Y`, `docs/Z`).
-3. **Follow the existing code style** — `cargo fmt` + `cargo clippy
-   --workspace -- -D warnings` must pass.
+3. **Follow the existing code style** — `cargo fmt --all -- --check` +
+   `cargo clippy --workspace --all-targets -- -D warnings` must pass. These are the exact
+   commands the `lint` CI job runs; omitting `--all-targets` skips tests and benches
+   locally and lets CI fail on lints you never saw.
 4. **Add tests** for behavior changes.
 5. **Sign the CLA** when prompted by the bot.
 6. **Open a PR** with a clear description of intent and impact.
@@ -68,7 +70,7 @@ For feature work and bug fixes, the standard flow is:
 
 1. **Open an issue** to discuss scope and design before writing code.
 2. **Fork** the repository and create a topic branch (`fix/X`, `feat/Y`, `docs/Z`).
-3. Implement your change. Keep commits focused; `cargo fmt` + `cargo clippy --workspace -- -D warnings` must pass locally.
+3. Implement your change. Keep commits focused; `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings` must pass locally.
 4. **Open a PR** against `main`. Reference the issue in the PR description.
 5. A maintainer will review. Substantial changes (new crates, breaking API changes, schema migrations) require an RFC first — see [`RFC-TEMPLATE.md`](RFC-TEMPLATE.md).
 6. Once approved, a maintainer merges.
@@ -160,25 +162,52 @@ The same discipline applies, with adapted templates, to:
 
 ### Current `[advisories.ignore]` entries (state of the tree)
 
-As of this writing, `deny.toml` contains two active ignore entries:
+`deny.toml` evaluates the **resolved** dependency graph, and currently
+carries **one** active ignore entry:
 
 - **`RUSTSEC-2025-0141`** — `bincode` v2 unmaintained (team ceased
   development). No security vulnerability, classification is "unmaintained"
   only. Used transitively by `gradatum-queue` and `gradatum-server`. Migration
   to an alternative (`postcard`, `bitcode`, or `rkyv`) is deferred to
   Phase 2.1+, when the queue data format is stabilised.
-- **`RUSTSEC-2025-0068`** — `serde_yml` 0.0.12 unsound (emitter segfault).
-  Only the `Deserializer` is used (config reading), so the unsafe emitter
-  code path is never executed. Upstream repo is archived; migration to
-  `serde-yaml-ng` is planned in a future supply-chain hardening PR.
 
-Both entries follow the policy above (reason field present; multi-line
-comment header documenting (a)/(b)/(c) and the migration target).
+Two previous entries were removed once their advisory stopped applying to the
+resolved graph:
 
-A previous entry, `RUSTSEC-2024-0436` (`paste` crate, transitive via
-`fastembed`), was removed from the active list after the HTTP-stack bump made
-`paste` no longer transitively reachable. The entry is kept as a comment in
-`deny.toml` for historical traceability.
+- `RUSTSEC-2024-0436` (`paste` crate, transitive via `fastembed`) — removed
+  after an HTTP-stack bump made `paste` no longer reachable there. Kept as a
+  comment in `deny.toml` for historical traceability.
+- `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` (`quick-xml`, two DoS vectors:
+  quadratic attribute-duplicate check; unbounded namespace allocation in
+  `NsReader`) — resolved outright, not merely judged unreachable: bumping
+  `opendal` 0.51.0 → 0.58.1 pulls `quick-xml` ≥ 0.41.0, the version that
+  fixes both. Neither advisory ID needs an ignore entry any more.
+
+**`deny.toml` carries no exception for `RUSTSEC-2023-0071` (`rsa`, Marvin
+Attack), and that is deliberate — not an oversight.** `rsa` never enters the
+resolved graph (`cargo tree -i rsa --target all` prints nothing): the only
+paths to it run through the `mysql` feature of `sqlx` and the cloud backends
+of `opendal`, and no workspace crate enables either. An ignore entry for an
+advisory the tool never sees would be dead, and would silently disarm the
+gate the day one of those features is turned on. The exemption for this
+advisory instead lives in `.cargo/audit.toml`, scoped to `cargo audit` —
+which reads `Cargo.lock` flat, unconditioned by feature selection, and does
+see `rsa`. This is a deliberate divergence between the two tools, not a
+redundant pair of exceptions: `cargo deny` stays armed on the resolved
+graph, `cargo audit` is silenced only on the one advisory it can raise that
+`cargo deny` structurally cannot.
+
+`RUSTSEC-2025-0068` (`serde_yml` unsound emitter) was likewise removed, but by
+fixing the cause rather than the reachability: the YAML backend was migrated to
+`serde_norway`, so `serde_yml` and its `libyml` backend both left the resolved
+graph. That exemption's stated rationale had been wrong on two counts — it
+claimed only the `Deserializer` was used, while the note **write** path called
+`to_string` (the very emitter the advisory targets); and it covered only
+`serde_yml`, leaving `RUSTSEC-2025-0067` on the `libyml` backend uncovered by
+any entry. Both advisories are now resolved rather than silenced. Note that
+`serde-yaml-ng`, named here previously as the migration target, was rejected on
+measurement: its `unsafe-libyaml` backend has been archived since March 2024,
+which would have reproduced the situation being escaped.
 
 ### What if the advisory is not yet documented?
 
@@ -204,6 +233,6 @@ gradatum targets **Linux exclusively** as of 2026-06-05. Windows/cross-platform 
 deferred indefinitely. See [RFC-0002](docs/RFC/RFC-0002-cross-platform-support.md) (superseded)
 for historical context on the prior tiered-support model.
 
-PRs are validated on Linux x86_64 and Linux aarch64 only. No Windows cross-compile job
-runs in CI. The portability rules from RFC-0002 §5 (R1–R13) are archived; they are no
-longer required in the PR checklist.
+PRs are validated on Linux x86_64 only — no aarch64 and no Windows cross-compile job runs
+in CI. The portability rules from RFC-0002 §5 (R1–R13) are archived; they are no longer
+required in the PR checklist.

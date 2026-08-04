@@ -100,7 +100,7 @@ async fn seed_embedded(state: &AppState, idx: &SqliteIndex, id: &str, section: &
     emb[0] = 1.0;
     state
         .search
-        .insert_note_embedding(&note_id, "test-embedder", 8, &emb)
+        .insert_note_embedding("main", &note_id, "test-embedder", 8, &emb)
         .await
         .expect("insert embedding");
 }

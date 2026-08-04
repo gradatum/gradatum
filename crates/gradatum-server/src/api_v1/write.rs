@@ -49,7 +49,7 @@ use crate::api_v1::dto::{
     EnqueuedResponse, EnqueuedResponseUlid, VaultClassifyRequest, VaultDowngradeRequest,
     VaultWriteRequest,
 };
-use crate::api_v1::tenant_guard::effective_tenant;
+use crate::api_v1::tenant_guard::effective_write_vault;
 use crate::state::AppState;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -187,25 +187,35 @@ fn extract_request_id(headers: &HeaderMap) -> String {
 /// `Unauthenticated` returns empty fields (401 `auth_failure` case).
 pub(crate) fn actor_from_trust(trust: &TrustContext) -> HttpAuditActor {
     match trust {
-        TrustContext::BearerToken { kid, sub, aud, .. } => HttpAuditActor {
+        TrustContext::BearerToken {
+            kid, sub, aud, jti, ..
+        } => HttpAuditActor {
             kid: kid.clone(),
-            sub: sub.clone(),
+            // Frontière DTO (`HttpAuditActor.sub: String`) : `as_str` est
+            // byte-identical, la ligne d'audit émise est inchangée.
+            sub: sub.as_str().to_owned(),
             aud: aud.clone(),
+            jti: jti.clone(),
         },
         TrustContext::Mtls { cn, .. } => HttpAuditActor {
             kid: format!("mtls:{cn}"),
             sub: cn.clone(),
             aud: "gradatum".into(),
+            jti: None,
         },
         TrustContext::Studio { user, .. } => HttpAuditActor {
             kid: "studio".into(),
             sub: user.clone(),
             aud: "gradatum-studio".into(),
+            jti: None,
         },
-        TrustContext::Unauthenticated => HttpAuditActor {
+        // Unauthenticated — et, TrustContext étant #[non_exhaustive] (A3), toute
+        // variante future : tracée comme identité vide (jamais une identité forgée).
+        _ => HttpAuditActor {
             kid: String::new(),
             sub: String::new(),
             aud: String::new(),
+            jti: None,
         },
     }
 }
@@ -236,7 +246,7 @@ pub(crate) async fn emit_auth_failure_audit(
     };
     // Erreur I/O audit non fatale — loguée sans propager.
     if let Err(e) = state.audit.record(evt).await {
-        tracing::warn!(error = %e, error_msg = error_msg, "audit emit auth_failure échoué");
+        tracing::warn!(error = %e, error_msg = error_msg, "audit emit auth_failure failed");
     }
 }
 
@@ -274,7 +284,7 @@ pub(crate) async fn emit_write_rejection_audit(
         request_id: request_id.into(),
     };
     if let Err(e) = state.audit.record(evt).await {
-        tracing::warn!(error = %e, outcome = outcome, "audit emit vault_write_rejected échoué");
+        tracing::warn!(error = %e, outcome = outcome, "audit emit vault_write_rejected failed");
     }
 }
 
@@ -316,7 +326,7 @@ pub(crate) async fn emit_drift_audit(
         tracing::warn!(
             error = %e,
             rule = warning.rule,
-            "audit emit write_check_drift échoué — non fatal"
+            "audit emit write_check_drift failed — non fatal"
         );
     }
 }
@@ -355,7 +365,7 @@ pub(crate) async fn emit_read_rejection_audit(
         request_id: Ulid::new().to_string(),
     };
     if let Err(e) = state.audit.record(evt).await {
-        tracing::warn!(error = %e, outcome = outcome, "audit emit vault_read_rejected échoué");
+        tracing::warn!(error = %e, outcome = outcome, "audit emit vault_read_rejected failed");
     }
 }
 
@@ -386,10 +396,16 @@ pub async fn vault_write(
 ) -> Result<(StatusCode, Json<EnqueuedResponseUlid>), StatusCode> {
     let request_id = extract_request_id(&headers);
 
-    crate::api_v1::logic::vault_write_impl(&state, &trust, req, &request_id)
-        .await
-        .map(|resp| (StatusCode::ACCEPTED, Json(resp)))
-        .map_err(|e| crate::api_v1::logic::err_to_status(&e))
+    crate::api_v1::logic::vault_write_impl(
+        &state,
+        &trust,
+        req,
+        &request_id,
+        crate::api_v1::logic::FeatureWriteAuthority::External,
+    )
+    .await
+    .map(|resp| (StatusCode::ACCEPTED, Json(resp)))
+    .map_err(|e| crate::api_v1::logic::err_to_status(&e))
 }
 
 // ── vault_classify ────────────────────────────────────────────────────────────
@@ -443,7 +459,7 @@ pub async fn vault_downgrade(
     State(state): State<AppState>,
     Extension(trust): Extension<TrustContext>,
     headers: HeaderMap,
-    Json(req): Json<VaultDowngradeRequest>,
+    Json(mut req): Json<VaultDowngradeRequest>,
 ) -> Result<(StatusCode, Json<EnqueuedResponse>), StatusCode> {
     let start = Instant::now();
     let request_id = extract_request_id(&headers);
@@ -452,7 +468,7 @@ pub async fn vault_downgrade(
         emit_auth_failure_audit(
             &state,
             &trust,
-            &req.tenant_id,
+            req.tenant_id.as_ref().map_or("", |t| t.as_str()),
             &request_id,
             "unauthenticated",
         )
@@ -460,13 +476,21 @@ pub async fn vault_downgrade(
         return Err(StatusCode::UNAUTHORIZED);
     }
     // P0 cross-tenant (Lot 3) : tenant dérivé du JWT, refuse body divergent.
-    let tenant = effective_tenant(&trust, &req.tenant_id)?.to_owned();
+    // C1 (F-63, EX-C1-1/2) : + grant write exigé à flag ON (l'enqueue est une écriture).
+    let tenant = effective_write_vault(&state, &trust, req.tenant_id.as_ref())
+        .await
+        .map_err(|r| r.status())?;
     let locus = format!("{}/main", tenant);
     if state.acl.evaluate(&trust, AclOp::Write, &locus) != AclDecision::Allow {
         emit_auth_failure_audit(&state, &trust, &tenant, &request_id, "acl_deny").await;
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // Lot A1 : le payload enqueué doit porter le tenant EFFECTIF (résolu du JWT), jamais le
+    // `tenant_id` optionnel du client. On l'injecte avant l'encode bincode — le champ est
+    // ainsi toujours `Some(_)` sur le fil (pas de `skip_serializing_if` déclenché → décodage
+    // positionnel bincode aligné avec le miroir `dispatch.rs`).
+    req.tenant_id = Some(gradatum_core::scope::TenantId::new(&tenant));
     let payload = bincode::serde::encode_to_vec(&req, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -495,7 +519,7 @@ pub async fn vault_downgrade(
         request_id,
     };
     if let Err(e) = state.audit.record(audit_evt).await {
-        tracing::warn!(error = %e, "audit emit vault_downgrade échoué — non fatal");
+        tracing::warn!(error = %e, "audit emit vault_downgrade failed — non fatal");
     }
 
     Ok((
@@ -522,7 +546,7 @@ mod build_record_tests {
             author: None,
             tags: vec![],
             section_hint: Some("decisions".into()),
-            tenant_id: "main".into(),
+            tenant_id: Some("main".into()),
             expected_sha256: None,
             note_id,
             occurred_at: None,

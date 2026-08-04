@@ -134,7 +134,6 @@ See [`KNOWN_ISSUES-WINDOWS.md`](KNOWN_ISSUES-WINDOWS.md) (created upon first rep
 
 - [`RFC/RFC-0002-cross-platform-support.md`](RFC/RFC-0002-cross-platform-support.md) — full tiered support model and portability rules.
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — cross-platform PR checklist.
-- [`superpowers/specs/2026-05-04-cross-platform-design.md`](superpowers/specs/2026-05-04-cross-platform-design.md) — internal design spec v2 (post-council).
 
 ---
 

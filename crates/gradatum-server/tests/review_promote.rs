@@ -28,14 +28,15 @@ use gradatum_core::identity::{ContentHash, NoteId};
 use gradatum_core::index::{FileChecksumEntry, Index, NoteRecord};
 use gradatum_core::index_store::{AuthorRow, LessonHitRaw, Lineage, SearchHitRaw};
 use gradatum_core::note::Note;
-use gradatum_core::scope::{LocusId, OverrideScope, VaultId};
+use gradatum_core::scope::{AclCheckedVaultId, LocusId, OverrideScope, VaultId};
 use gradatum_core::section::Section;
 use gradatum_core::status::NoteStatus;
 use gradatum_core::{DocumentStore, IndexStore, VectorStore};
 use gradatum_server::{
-    config::ReviewPromoteConfig,
+    config::{ReviewPromoteConfig, ServerConfig},
     metrics::AppMetrics,
-    review_promote::{PromoteStats, promote_once},
+    review_promote::{PromoteStats, promote_once, promote_tick},
+    state::VaultRegistry,
 };
 use gradatum_vault::{Registry, Vault};
 use tempfile::TempDir;
@@ -57,7 +58,11 @@ impl DocumentStore for FailFindPromotableIndex {
     async fn write_note(&self, _note: &Note) -> Result<(), GradatumError> {
         Ok(())
     }
-    async fn get_content_hash(&self, _id: NoteId) -> Result<Option<ContentHash>, GradatumError> {
+    async fn get_content_hash(
+        &self,
+        _vault_id: &str,
+        _id: NoteId,
+    ) -> Result<Option<ContentHash>, GradatumError> {
         Ok(None)
     }
     async fn get_note(
@@ -76,6 +81,7 @@ impl DocumentStore for FailFindPromotableIndex {
     }
     async fn downgrade_note(
         &self,
+        _vault: &gradatum_core::scope::AclCheckedVaultId,
         _note_id: &NoteId,
         _reason: &str,
         _replaced_by: Option<&NoteId>,
@@ -84,6 +90,7 @@ impl DocumentStore for FailFindPromotableIndex {
     }
     async fn patch_note_status(
         &self,
+        _vault: &gradatum_core::scope::AclCheckedVaultId,
         _note_id: &NoteId,
         _status: Option<&str>,
         _status_reason: Option<&str>,
@@ -93,13 +100,15 @@ impl DocumentStore for FailFindPromotableIndex {
     }
     async fn upsert_note_title(
         &self,
+        _vault_id: &str,
         _note_id: &NoteId,
         _title: &str,
-    ) -> Result<(), GradatumError> {
-        Ok(())
+    ) -> Result<usize, GradatumError> {
+        Ok(0)
     }
     async fn update_note_locus(
         &self,
+        _vault: &gradatum_core::scope::AclCheckedVaultId,
         _note_id: &NoteId,
         _new_locus: &LocusId,
     ) -> Result<(), GradatumError> {
@@ -110,6 +119,13 @@ impl DocumentStore for FailFindPromotableIndex {
         _vault_id: &str,
         _note_id: &str,
         _by: Option<&str>,
+    ) -> Result<(), GradatumError> {
+        Ok(())
+    }
+    async fn reassert_forgotten(
+        &self,
+        _vault_id: &str,
+        _note_id: &str,
     ) -> Result<(), GradatumError> {
         Ok(())
     }
@@ -187,7 +203,7 @@ impl IndexStore for FailFindPromotableIndex {
     }
     async fn search_fts_with_snippet(
         &self,
-        _vault_id: &VaultId,
+        _vault_id: &AclCheckedVaultId,
         _query: &str,
         _limit: usize,
         _include_downgraded: bool,
@@ -302,28 +318,33 @@ impl IndexStore for FailFindPromotableIndex {
     }
     async fn get_titles_sections(
         &self,
-        _vault_id: &str,
+        _vault_id: &AclCheckedVaultId,
         _ids: &[String],
     ) -> Result<HashMap<String, (Option<String>, String)>, GradatumError> {
         Ok(HashMap::new())
     }
-    async fn get_trust(&self, _id: &NoteId) -> Result<Option<f32>, GradatumError> {
+    async fn get_trust(&self, _vault_id: &str, _id: &NoteId) -> Result<Option<f32>, GradatumError> {
         Ok(None)
     }
     async fn upsert_redirect(
         &self,
+        _vault_id: &str,
         _slug: &str,
         _ulid: &Ulid,
         _renamed_at_ms: i64,
     ) -> Result<(), GradatumError> {
         Ok(())
     }
-    async fn resolve_redirect(&self, _slug: &str) -> Result<Option<Ulid>, GradatumError> {
+    async fn resolve_redirect(
+        &self,
+        _vault_id: &str,
+        _slug: &str,
+    ) -> Result<Option<Ulid>, GradatumError> {
         Ok(None)
     }
     async fn search_fts_for_forget(
         &self,
-        _vault_id: &str,
+        _vault_id: &VaultId,
         _query: &str,
         _limit: usize,
     ) -> Result<Vec<(String, String)>, GradatumError> {
@@ -345,7 +366,7 @@ impl IndexStore for FailFindPromotableIndex {
     }
     async fn timeline(
         &self,
-        _vault_id: &VaultId,
+        _vault_id: &AclCheckedVaultId,
         _filter: &gradatum_core::temporal_query::TimelineFilter,
     ) -> Result<Vec<gradatum_core::temporal_query::TimelineRow>, GradatumError> {
         Ok(vec![])
@@ -356,6 +377,7 @@ impl IndexStore for FailFindPromotableIndex {
 impl VectorStore for FailFindPromotableIndex {
     async fn insert_note_embedding(
         &self,
+        _vault_id: &str,
         _note_id: &NoteId,
         _embedder_id: &str,
         _dim: u16,
@@ -365,6 +387,7 @@ impl VectorStore for FailFindPromotableIndex {
     }
     async fn get_note_embedding(
         &self,
+        _vault_id: &str,
         _note_id: &NoteId,
         _embedder_id: &str,
     ) -> Result<Option<Vec<f32>>, GradatumError> {
@@ -372,7 +395,7 @@ impl VectorStore for FailFindPromotableIndex {
     }
     async fn search_semantic(
         &self,
-        _vault_id: &str,
+        _vault_id: &AclCheckedVaultId,
         _embedder_id: &str,
         _query_emb: &[f32],
         _limit: usize,
@@ -488,6 +511,16 @@ fn default_cfg() -> ReviewPromoteConfig {
         age_days: 14,
         interval_secs: 3600,
         max_per_tick: 200,
+    }
+}
+
+/// Emballe une `ReviewPromoteConfig` dans une `ServerConfig` par défaut (L6 : `promote_tick`
+/// prend désormais la config complète pour résoudre `review_promote_for` par vault ; `per_vault`
+/// vide par défaut ⇒ tout vault retombe sur cette config globale).
+fn server_cfg(rp: ReviewPromoteConfig) -> ServerConfig {
+    ServerConfig {
+        review_promote: rp,
+        ..Default::default()
     }
 }
 
@@ -666,4 +699,148 @@ async fn promote_once_db_error_reflected_in_stats() {
         "aucune promotion possible si find_promotable échoue"
     );
     assert_eq!(stats.pending_review, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Tests C2 (EX-C2-3) — promote_tick : OFF = legacy, ON = per-vault
+// ---------------------------------------------------------------------------
+
+/// OFF : `promote_tick` délègue strictement à `promote_once` — une note âgée est
+/// promue exactement comme avant (plan de tick identique, A6).
+#[tokio::test]
+async fn promote_tick_off_delegates_to_legacy_scan() {
+    let (vault, _dir) = build_vault().await;
+    let metrics = AppMetrics::new();
+    let cfg = default_cfg();
+    let (note_id_str, _) = seed_vault_note_at_status(&vault, NoteStatus::Staging).await;
+    let now_ms = now_plus_20_days();
+
+    let index_arc = Arc::clone(vault.index()) as Arc<dyn Index>;
+    let vault_arc = Arc::clone(&vault) as Arc<dyn Registry>;
+    // OFF : le registre n'est pas consulté (délégation `promote_once`), mais le paramètre
+    // est requis — singleton `main` cohérent avec le handle legacy.
+    let vaults = Arc::new(VaultRegistry::singleton(Arc::clone(&vault)));
+
+    let stats = promote_tick(
+        &index_arc,
+        &vault_arc,
+        &vaults,
+        &metrics,
+        &server_cfg(cfg),
+        now_ms,
+        false,
+    )
+    .await;
+    assert_eq!(stats.staging, 1, "OFF : promotion identique au legacy");
+    assert_eq!(stats.errors, 0);
+    let note = vault
+        .read_note_by_id(&note_id_str)
+        .await
+        .expect("read_note_by_id");
+    assert_eq!(note.frontmatter.status, NoteStatus::Live);
+}
+
+/// OFF : le chemin legacy n'appelle JAMAIS `list_active_vaults` — prouvé avec un
+/// index dont `find_promotable` échoue (le tick échoue via le scan global, pas via
+/// le listing per-vault).
+#[tokio::test]
+async fn promote_tick_off_uses_global_scan_error_path() {
+    let metrics = AppMetrics::new();
+    let cfg = default_cfg();
+    let index_arc: Arc<dyn Index> = Arc::new(FailFindPromotableIndex);
+    let (vault, _dir) = build_vault().await;
+    let vault_arc = Arc::clone(&vault) as Arc<dyn Registry>;
+    let vaults = Arc::new(VaultRegistry::singleton(Arc::clone(&vault)));
+
+    let stats = promote_tick(
+        &index_arc,
+        &vault_arc,
+        &vaults,
+        &metrics,
+        &server_cfg(cfg),
+        now_plus_20_days(),
+        false,
+    )
+    .await;
+    assert_eq!(
+        stats.errors, 1,
+        "OFF : échec du scan GLOBAL (find_promotable)"
+    );
+}
+
+/// ON : itération PAR vault actif — la note âgée du vault "main" (tenant actif du
+/// seed 0030) est promue via `find_promotable_in_vault` ; une note âgée insérée
+/// dans un vault SANS tenant actif n'est PAS touchée (INV-JOB-SCOPE : le tick ne
+/// traite que les vaults actifs, jamais un scan cross-vault).
+#[tokio::test]
+async fn promote_tick_on_iterates_active_vaults_only() {
+    let (vault, _dir) = build_vault().await;
+    let metrics = AppMetrics::new();
+    let cfg = default_cfg();
+    let (note_id_str, _) = seed_vault_note_at_status(&vault, NoteStatus::Staging).await;
+
+    // Note âgée dans un vault "orphan" SANS ligne tenants → hors périmètre à ON.
+    let orphan_id = "01ZZZZZZZZZZZZZZZZZZZZZZZZ";
+    {
+        let idx = vault.index();
+        idx.seed_note_with_fts_vault(orphan_id, "orphan", "reference", None, "corps orphan")
+            .await
+            .expect("seed note orphan");
+        idx.patch_note_status(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("orphan"),
+            ),
+            &NoteId(Ulid::from_string(orphan_id).expect("ulid orphan valide — littéral test")),
+            Some("staging"),
+            None,
+            None,
+        )
+        .await
+        .expect("patch staging orphan");
+    }
+
+    let now_ms = now_plus_20_days();
+    let index_arc = Arc::clone(vault.index()) as Arc<dyn Index>;
+    let vault_arc = Arc::clone(&vault) as Arc<dyn Registry>;
+    // ON : seul `main` est actif (seed 0030) → le registre doit résoudre `main`. Le vault
+    // `orphan` n'a pas de ligne tenants → jamais listé, jamais résolu.
+    let vaults = Arc::new(VaultRegistry::singleton(Arc::clone(&vault)));
+
+    let stats = promote_tick(
+        &index_arc,
+        &vault_arc,
+        &vaults,
+        &metrics,
+        &server_cfg(cfg),
+        now_ms,
+        true,
+    )
+    .await;
+
+    assert_eq!(
+        stats.staging, 1,
+        "ON : la note du vault actif main est promue"
+    );
+    assert_eq!(
+        stats.errors, 0,
+        "ON : la note du vault orphan n'est jamais tentée (aucune erreur NoteNotFound)"
+    );
+    let note = vault
+        .read_note_by_id(&note_id_str)
+        .await
+        .expect("read_note_by_id");
+    assert_eq!(note.frontmatter.status, NoteStatus::Live);
+
+    // La note du vault orphan reste staging (jamais touchée) : toujours promotable.
+    let cutoff = now_ms - 14 * 86_400_000;
+    let still_promotable = vault
+        .index()
+        .find_promotable_in_vault("orphan", cutoff, 100)
+        .await
+        .expect("find_promotable_in_vault orphan");
+    assert_eq!(
+        still_promotable.len(),
+        1,
+        "vault inactif : note intouchée à ON (toujours staging/promotable)"
+    );
 }

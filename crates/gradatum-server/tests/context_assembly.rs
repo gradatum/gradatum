@@ -1,4 +1,4 @@
-//! Tests E2E Task 5 — Retrieval RRF (`retrieve_candidates`).
+//! Tests E2E — Retrieval RRF (`retrieve_candidates`).
 //!
 //! Vérifie cinq propriétés du pipeline retrieval :
 //!
@@ -10,7 +10,7 @@
 //!    de la note cible via le chemin de récupération directe (pas de RRF/embed).
 //! 4. **Filtre section sémantique (C1 fix)** : le canal sémantique n'inclut PAS de
 //!    notes d'autres sections quand `section` est spécifié.
-//! 5. **Multi-sections (Task 1 v0.7.1)** : `sections=Some(&["A","B"])` exclut les notes
+//! 5. **Multi-sections (v0.7.1)** : `sections=Some(&["A","B"])` exclut les notes
 //!    de section C (BM25 ET sémantique), `sections=None` retourne toutes sections (parité).
 //!
 //! ## Dépendances helpers
@@ -200,9 +200,9 @@ async fn select_stops_at_budget_and_orders_by_score() {
     }
 }
 
-/// Mode Assembled e2e : `assembled_text` contient les marqueurs structurés (spec §2.3).
+/// Mode Assembled e2e : `assembled_text` contient les marqueurs structurés (format d'assemblage spécifié).
 ///
-/// Vérifie que `render_assembled` est câblé dans la branche Assembled (Task 7) :
+/// Vérifie que `render_assembled` est câblé dans la branche Assembled :
 /// - `assembled_text` contient `"score="` (marqueurs score Markdown structuré).
 /// - Au moins 1 note incluse dans `included`.
 /// - Budget respecté : `budget_used ≤ budget_tokens + marge`.
@@ -254,7 +254,7 @@ async fn assembled_mode_returns_structured_context() {
     );
 }
 
-/// Task 8 — les métriques vault_context sont incrémentées après un appel Assembled.
+/// Les métriques vault_context sont incrémentées après un appel Assembled.
 ///
 /// Effectue un appel en mode `"assembled"` avec 5 notes FTS seedées, puis encode le
 /// registry Prometheus et vérifie la présence des noms de série :
@@ -345,7 +345,7 @@ async fn retrieval_semantic_section_filter_excludes_other_sections() {
     .expect("seed decisions note — invariant test");
     let nid_decisions =
         NoteId(Ulid::from_string(&ulid_decisions).expect("ULID parse decisions — invariant"));
-    idx.upsert_note_title(&nid_decisions, "Décision filtre section")
+    idx.upsert_note_title("main", &nid_decisions, "Décision filtre section")
         .await
         .expect("upsert_note_title decisions — invariant test");
 
@@ -360,7 +360,7 @@ async fn retrieval_semantic_section_filter_excludes_other_sections() {
     .expect("seed reasoning note — invariant test");
     let nid_reasoning =
         NoteId(Ulid::from_string(&ulid_reasoning).expect("ULID parse reasoning — invariant"));
-    idx.upsert_note_title(&nid_reasoning, "Reasoning filtre section")
+    idx.upsert_note_title("main", &nid_reasoning, "Reasoning filtre section")
         .await
         .expect("upsert_note_title reasoning — invariant test");
 
@@ -374,12 +374,12 @@ async fn retrieval_semantic_section_filter_excludes_other_sections() {
     };
     env.state
         .search
-        .insert_note_embedding(&nid_decisions, "fake-embedder", 8, &emb)
+        .insert_note_embedding("main", &nid_decisions, "fake-embedder", 8, &emb)
         .await
         .expect("insert_note_embedding decisions — invariant test");
     env.state
         .search
-        .insert_note_embedding(&nid_reasoning, "fake-embedder", 8, &emb)
+        .insert_note_embedding("main", &nid_reasoning, "fake-embedder", 8, &emb)
         .await
         .expect("insert_note_embedding reasoning — invariant test");
 
@@ -507,7 +507,7 @@ async fn budget_used_assembled_includes_scaffolding() {
 
 // ── Tests Task 1 v0.7.1 — retrieve_candidates multi-sections ────────────────
 
-/// Task 1 v0.7.1 — multi-sections exclut les notes hors du set.
+/// v0.7.1 — multi-sections exclut les notes hors du set.
 ///
 /// Vérifie que `retrieve_candidates` avec `sections=Some(&["sec-alpha","sec-beta"])` :
 /// - Exclut toute note de section `"sec-gamma"` (BM25 ET sémantique).
@@ -545,7 +545,7 @@ async fn retrieval_multi_section_excludes_out_of_set() {
         .await
         .expect("seed sec-alpha — invariant test");
     let nid_a = NoteId(Ulid::from_string(&ulid_a).expect("ULID sec-alpha"));
-    idx.upsert_note_title(&nid_a, "Note sec-alpha")
+    idx.upsert_note_title("main", &nid_a, "Note sec-alpha")
         .await
         .expect("title sec-alpha");
 
@@ -555,7 +555,7 @@ async fn retrieval_multi_section_excludes_out_of_set() {
         .await
         .expect("seed sec-beta — invariant test");
     let nid_b = NoteId(Ulid::from_string(&ulid_b).expect("ULID sec-beta"));
-    idx.upsert_note_title(&nid_b, "Note sec-beta")
+    idx.upsert_note_title("main", &nid_b, "Note sec-beta")
         .await
         .expect("title sec-beta");
 
@@ -565,7 +565,7 @@ async fn retrieval_multi_section_excludes_out_of_set() {
         .await
         .expect("seed sec-gamma — invariant test");
     let nid_c = NoteId(Ulid::from_string(&ulid_c).expect("ULID sec-gamma"));
-    idx.upsert_note_title(&nid_c, "Note sec-gamma")
+    idx.upsert_note_title("main", &nid_c, "Note sec-gamma")
         .await
         .expect("title sec-gamma");
 
@@ -579,12 +579,12 @@ async fn retrieval_multi_section_excludes_out_of_set() {
     for nid in [&nid_a, &nid_b, &nid_c] {
         env.state
             .search
-            .insert_note_embedding(nid, "fake-embedder", 8, &emb)
+            .insert_note_embedding("main", nid, "fake-embedder", 8, &emb)
             .await
             .expect("insert_note_embedding — invariant test");
     }
 
-    let vault_id = VaultId::new("main");
+    let vault_id = gradatum_core::scope::AclCheckedVaultId::for_system_task(VaultId::new("main"));
     let outcome = retrieve_candidates(
         &env.state,
         &vault_id,
@@ -626,7 +626,7 @@ async fn retrieval_multi_section_excludes_out_of_set() {
 
 // ── Tests Task 2 v0.7.2 — split inline/stub/drop + tiebreaker ULID ──────────
 
-/// Task 2 v0.7.2 — `select_budget_aware` : budget serré → top-K inline, reste stubs, queue drop.
+/// v0.7.2 — `select_budget_aware` : budget serré → top-K inline, reste stubs, queue drop.
 ///
 /// Vérifie le split inline/stub/drop de `select_budget_aware` (F-29) :
 /// - Budget inline très serré (25 tokens) → 0-1 note inline seulement.
@@ -645,7 +645,7 @@ async fn retrieval_multi_section_excludes_out_of_set() {
 ///
 /// Ce test appelle `select_budget_aware` directement (pas via HTTP) pour pouvoir
 /// contrôler précisément `budget` et `stub_budget` (indépendants de la config).
-/// Les stubs ne sont pas encore exposés dans la réponse HTTP (Task 4).
+/// Les stubs ne sont pas encore exposés dans la réponse HTTP (exposition différée).
 #[tokio::test]
 async fn select_split_inline_then_stub_then_drop() {
     use chrono::Utc;
@@ -670,12 +670,12 @@ async fn select_split_inline_then_stub_then_drop() {
             .await
             .expect("seed note — invariant test");
         let nid = NoteId(Ulid::from_string(&ulid).expect("ULID parse — invariant test"));
-        idx.upsert_note_title(&nid, &format!("Note split {i}"))
+        idx.upsert_note_title("main", &nid, &format!("Note split {i}"))
             .await
             .expect("upsert_note_title — invariant test");
     }
 
-    let vault_id = VaultId::new("main");
+    let vault_id = gradatum_core::scope::AclCheckedVaultId::for_system_task(VaultId::new("main"));
     let now_ms = Utc::now().timestamp_millis();
     let weights = resolve_weights(None);
     let estimator = HeuristicEstimator;
@@ -733,7 +733,7 @@ async fn select_split_inline_then_stub_then_drop() {
     );
 }
 
-/// Task 2 v0.7.2 — `stub_budget=0` → aucun stub produit (parité comportement F-35).
+/// v0.7.2 — `stub_budget=0` → aucun stub produit (parité comportement F-35).
 ///
 /// Vérifie que `select_budget_aware` avec `stub_budget=0` ne produit aucun stub,
 /// et que les notes inline sont identiques au comportement F-35 (budget inline large,
@@ -742,7 +742,7 @@ async fn select_split_inline_then_stub_then_drop() {
 /// # Contrat
 ///
 /// `stub_budget=0` OU `budget_inline` très grand → `stubs.is_empty()` → comportement
-/// identique à l'ancien `select_budget_aware` (avant Task 2) qui ne produisait que
+/// identique à l'ancien `select_budget_aware` (comportement antérieur) qui ne produisait que
 /// `Vec<Selected>`.
 #[tokio::test]
 async fn select_reference_mode_off_parity() {
@@ -766,12 +766,12 @@ async fn select_reference_mode_off_parity() {
             .await
             .expect("seed note — invariant test");
         let nid = NoteId(Ulid::from_string(&ulid).expect("ULID parse — invariant test"));
-        idx.upsert_note_title(&nid, &format!("Note parité {i}"))
+        idx.upsert_note_title("main", &nid, &format!("Note parité {i}"))
             .await
             .expect("upsert_note_title — invariant test");
     }
 
-    let vault_id = VaultId::new("main");
+    let vault_id = gradatum_core::scope::AclCheckedVaultId::for_system_task(VaultId::new("main"));
     let now_ms = Utc::now().timestamp_millis();
     let weights = resolve_weights(None);
     let estimator = HeuristicEstimator;
@@ -820,7 +820,7 @@ async fn select_reference_mode_off_parity() {
 
 // ── Tests Task 4 v0.7.2 — reference_mode + references réponse ───────────────
 
-/// Task 4 v0.7.2 — `reference_mode` absent → `references` vide (parité F-35).
+/// v0.7.2 — `reference_mode` absent → `references` vide (parité F-35).
 ///
 /// Garantit la rétro-compat : un client existant qui ne passe pas `reference_mode`
 /// reçoit `references: []` et un comportement assemblé strictement identique à F-35.
@@ -884,7 +884,7 @@ async fn context_reference_mode_off_response_parity() {
     );
 }
 
-/// Task 4 v0.7.2 — `reference_mode=true` + budget serré → `references` non vide.
+/// v0.7.2 — `reference_mode=true` + budget serré → `references` non vide.
 ///
 /// Avec 15 notes seedées et un budget inline très serré (25 tokens), le pipeline
 /// doit produire au moins 1 stub dans `references` (F-29).
@@ -960,7 +960,7 @@ async fn context_reference_mode_on_emits_references() {
     );
 }
 
-/// Task 1 v0.7.1 — `sections=None` préserve la parité (toutes sections retournées).
+/// v0.7.1 — `sections=None` préserve la parité (toutes sections retournées).
 ///
 /// Vérifie que `retrieve_candidates` avec `sections=None` retourne bien les notes
 /// de toutes les sections — comportement identique à l'actuel `section: None`.
@@ -989,13 +989,13 @@ async fn retrieval_sections_none_parity() {
             .await
             .expect("seed note — invariant test");
         let nid = NoteId(Ulid::from_string(&ulid).expect("ULID parse"));
-        idx.upsert_note_title(&nid, &format!("Note {section}"))
+        idx.upsert_note_title("main", &nid, &format!("Note {section}"))
             .await
             .expect("title — invariant test");
         expected_ulids.push(ulid);
     }
 
-    let vault_id = VaultId::new("main");
+    let vault_id = gradatum_core::scope::AclCheckedVaultId::for_system_task(VaultId::new("main"));
     let outcome = retrieve_candidates(
         &env.state,
         &vault_id,
@@ -1157,7 +1157,7 @@ async fn session_new_note_inline_and_marked() {
 
 /// **no_session_id_is_f29_only** — T6-3 comportement F-29 pur sans session_id.
 ///
-/// Sans `session_id`, le filtre session est inactif : comportement Task 4 inchangé.
+/// Sans `session_id`, le filtre session est inactif : comportement de référence inchangé.
 /// Les notes disponibles sont inline normalement.
 /// Pas d'erreur, pas de filtre, pas d'appel `get_sent`/`mark_sent`.
 #[tokio::test]
@@ -1257,9 +1257,9 @@ async fn session_id_invalid_rejected() {
 ///
 /// # Preuve TDD (rouge → vert)
 ///
-/// - **AVANT Task 7** : les stubs BM25 déjà-sent ne sont pas vérifiés contre sent_map →
+/// - **AVANT le correctif** : les stubs BM25 déjà-sent ne sont pas vérifiés contre sent_map →
 ///   leur snippet vient de `stub_from_selected` (body courant) = début du body.
-/// - **APRÈS Task 7** : pour chaque stub BM25, si ULID dans sent_map → snippet remplacé par
+/// - **APRÈS le correctif** : pour chaque stub BM25, si ULID dans sent_map → snippet remplacé par
 ///   le snippet figé du 1er mark_sent = "snippet-figé-t1-custom" (distinct du body).
 ///
 /// # Invariants
@@ -1453,9 +1453,9 @@ async fn two_calls_same_session_byte_identical_stub() {
 ///
 /// # Preuve TDD (rouge → vert)
 ///
-/// - **AVANT Task 7** : stubs BM25 déjà-sent non vérifiés contre sent_map → snippet
+/// - **AVANT le correctif** : stubs BM25 déjà-sent non vérifiés contre sent_map → snippet
 ///   ré-extrait (body courant, pas "snippet-dedup-unique").
-/// - **APRÈS Task 7** : `sent_map.get(&s.ulid)` → snippet remplacé par figé ✓, dedup ✓.
+/// - **APRÈS le correctif** : `sent_map.get(&s.ulid)` → snippet remplacé par figé ✓, dedup ✓.
 #[tokio::test]
 async fn sent_note_also_in_bm25_appears_once() {
     use chrono::Utc;

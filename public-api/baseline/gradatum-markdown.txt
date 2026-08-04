@@ -1,0 +1,21 @@
+pub mod gradatum_markdown
+pub enum gradatum_markdown::MarkdownError
+pub gradatum_markdown::MarkdownError::MissingFrontmatter
+pub gradatum_markdown::MarkdownError::UnterminatedFrontmatter
+pub gradatum_markdown::MarkdownError::Yaml(gradatum_markdown::YamlError)
+pub struct gradatum_markdown::ParsedNote
+pub gradatum_markdown::ParsedNote::body: gradatum_core::note::NoteBody
+pub gradatum_markdown::ParsedNote::content_hash: gradatum_core::identity::ContentHash
+pub gradatum_markdown::ParsedNote::frontmatter: gradatum_core::frontmatter::Frontmatter
+pub struct gradatum_markdown::Wikilink
+pub gradatum_markdown::Wikilink::alias: core::option::Option<alloc::string::String>
+pub gradatum_markdown::Wikilink::target: alloc::string::String
+pub struct gradatum_markdown::YamlError(_)
+impl core::error::Error for gradatum_markdown::YamlError
+impl core::fmt::Display for gradatum_markdown::YamlError
+pub fn gradatum_markdown::YamlError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const gradatum_markdown::VERSION: &str
+pub fn gradatum_markdown::parse(&str) -> core::result::Result<gradatum_markdown::ParsedNote, gradatum_markdown::MarkdownError>
+pub fn gradatum_markdown::wikilinks(&str) -> alloc::vec::Vec<gradatum_markdown::Wikilink>
+pub fn gradatum_markdown::write(&gradatum_core::note::Note) -> core::result::Result<alloc::string::String, gradatum_markdown::MarkdownError>
+pub fn gradatum_markdown::write_parsed(&gradatum_markdown::ParsedNote) -> core::result::Result<alloc::string::String, gradatum_markdown::MarkdownError>

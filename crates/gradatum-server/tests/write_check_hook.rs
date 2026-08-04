@@ -56,9 +56,10 @@ async fn trust_stub(
         .map(|t| TrustContext::BearerToken {
             kid: "k".into(),
             aud: "gradatum".into(),
-            sub: t.to_string(),
+            sub: t.into(),
             scopes: vec!["read".into(), "write".into()],
             tenant_id: "main".into(),
+            jti: None,
         })
         .unwrap_or(TrustContext::Unauthenticated);
     req.extensions_mut().insert(trust);

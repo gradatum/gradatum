@@ -241,7 +241,7 @@ fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         // The system clock cannot be before UNIX_EPOCH in a standard production environment.
-        .expect("horloge système antérieure à UNIX_EPOCH — environnement invalide")
+        .expect("system clock earlier than UNIX_EPOCH — invalid environment")
         .as_millis() as i64
 }
 

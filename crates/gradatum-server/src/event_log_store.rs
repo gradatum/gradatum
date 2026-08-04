@@ -21,6 +21,15 @@
 //! `rusqlite::Connection` is neither `Send` nor `Sync`. It is wrapped in
 //! `Arc<Mutex<Connection>>` (Tokio mutex) — the same pattern as `SqliteIndex`.
 //! Locks are held for the minimum scope (dropped before any `.await`).
+//!
+//! ## Dimension de scope — per-PRINCIPAL (`TenantId`)
+//!
+//! `event_log` attribue coût/télémétrie **par principal** : `tenant_id` provient du JWT
+//! (`TrustContext::BearerToken`), jamais du body. La dimension est le **principal**
+//! ([`gradatum_core::scope::TenantId`]), PAS le namespace vault → ce store n'est **pas** une
+//! surface d'isolation vault (elle est globale, par conception).
+//! [`EventLogStore::fetch_pending`] est typé `&TenantId`. [`EventLogStore::insert_batch`]
+//! reste `&str`-facing (appelé par le handler `api_v1/event_log.rs`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -31,6 +40,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use gradatum_core::scope::TenantId;
 use gradatum_dto::QaEventDto;
 
 /// Error type for the `event_log` store.
@@ -40,10 +50,10 @@ pub enum EventLogError {
     #[error("event_log SQLite : {0}")]
     Sqlite(#[from] rusqlite::Error),
     /// RFC 3339 timestamp from a `QaEvent` could not be parsed.
-    #[error("event_log timestamp invalide : {0}")]
+    #[error("invalid event_log timestamp: {0}")]
     BadTimestamp(String),
     /// Mutex poisoned — cannot happen with a Tokio mutex.
-    #[error("event_log mutex poisonné")]
+    #[error("event_log mutex poisoned")]
     Poisoned,
 }
 
@@ -365,14 +375,15 @@ impl EventLogStore {
     #[allow(dead_code)]
     pub async fn fetch_pending(
         &self,
-        tenant_id: &str,
+        tenant_id: &TenantId,
         limit: u32,
     ) -> Result<Vec<PendingEvent>, EventLogError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let conn = Arc::clone(&self.conn);
-        let tenant_id = tenant_id.to_owned();
+        // Byte-identical : `tenant_id` (principal) lie la colonne SQL `tenant_id`.
+        let tenant_id = tenant_id.as_str().to_owned();
 
         let rows = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -465,7 +476,7 @@ impl EventLogStore {
 fn system_now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("horloge système avant epoch UNIX — invariant système")
+        .expect("system clock before UNIX epoch — system invariant")
         .as_millis() as i64
 }
 
@@ -766,7 +777,7 @@ mod tests {
             .expect("insert");
 
         let pending = store
-            .fetch_pending("main", 100)
+            .fetch_pending(&TenantId::new("main"), 100)
             .await
             .expect("fetch_pending");
         assert_eq!(pending.len(), 3);
@@ -786,14 +797,20 @@ mod tests {
         let batch = vec![make_dto("/v1/chat", false), make_dto("/v1/embed", false)];
         store.insert_batch("main", &batch).await.expect("insert");
 
-        let pending = store.fetch_pending("main", 10).await.expect("fetch");
+        let pending = store
+            .fetch_pending(&TenantId::new("main"), 10)
+            .await
+            .expect("fetch");
         assert_eq!(pending.len(), 2, "2 events pending au départ");
 
         // Marquer le premier comme traité.
         let marked = store.mark_processed(&[pending[0].id]).await.expect("mark");
         assert_eq!(marked, 1, "1 row marquée");
 
-        let after = store.fetch_pending("main", 10).await.expect("fetch 2");
+        let after = store
+            .fetch_pending(&TenantId::new("main"), 10)
+            .await
+            .expect("fetch 2");
         assert_eq!(after.len(), 1, "1 event pending restant après marquage");
         assert_eq!(after[0].id, pending[1].id, "le restant est le 2e event");
     }
@@ -821,16 +838,25 @@ mod tests {
             .expect("insert other");
 
         // limit=2 sur 'main' → 2 rows max.
-        let limited = store.fetch_pending("main", 2).await.expect("fetch limit");
+        let limited = store
+            .fetch_pending(&TenantId::new("main"), 2)
+            .await
+            .expect("fetch limit");
         assert_eq!(limited.len(), 2, "limit respecté");
 
         // tenant 'other' isolé → 1 row, jamais les events de 'main'.
-        let other = store.fetch_pending("other", 10).await.expect("fetch other");
+        let other = store
+            .fetch_pending(&TenantId::new("other"), 10)
+            .await
+            .expect("fetch other");
         assert_eq!(other.len(), 1, "isolation tenant");
         assert_eq!(other[0].route, "/x");
 
         // limit=0 → vec vide sans requête.
-        let zero = store.fetch_pending("main", 0).await.expect("fetch 0");
+        let zero = store
+            .fetch_pending(&TenantId::new("main"), 0)
+            .await
+            .expect("fetch 0");
         assert!(zero.is_empty(), "limit=0 retourne vide");
     }
 
@@ -843,7 +869,10 @@ mod tests {
             .insert_batch("main", &[make_dto("/a", false), make_dto("/b", false)])
             .await
             .expect("insert");
-        let pending = store.fetch_pending("main", 10).await.expect("fetch");
+        let pending = store
+            .fetch_pending(&TenantId::new("main"), 10)
+            .await
+            .expect("fetch");
         let ids: Vec<i64> = pending.iter().map(|e| e.id).collect();
 
         // Premier marquage : 2 rows.

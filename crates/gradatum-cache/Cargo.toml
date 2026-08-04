@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Moka LRU in-process EffectiveNote cache, key=(NoteId, scope_hash)"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 gradatum-core.workspace = true

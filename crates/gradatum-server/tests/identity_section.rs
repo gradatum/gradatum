@@ -1,6 +1,6 @@
 //! Tests E2E section `identity` — F-34 v0.7.3.
 //!
-//! Couvre Task 3 + Task 4 du plan `2026-06-27-v0.7.3-identity-f50-deport.md`.
+//! Couvre le déport identity F-50 (v0.7.3).
 //!
 //! # Cas de test
 //!
@@ -89,9 +89,10 @@ async fn inject_main_agent(
     req.extensions_mut().insert(TrustContext::BearerToken {
         kid: "test-kid".to_string(),
         aud: "gradatum".to_string(),
-        sub: "main-agent".to_string(),
+        sub: "main-agent".into(),
         scopes: vec!["read".to_string(), "write".to_string()],
-        tenant_id: "main".to_string(),
+        tenant_id: "main".into(),
+        jti: None,
     });
     next.run(req).await
 }
@@ -105,9 +106,10 @@ async fn inject_frontend(
     req.extensions_mut().insert(TrustContext::BearerToken {
         kid: "test-kid".to_string(),
         aud: "gradatum".to_string(),
-        sub: "frontend".to_string(),
+        sub: "frontend".into(),
         scopes: vec!["read".to_string(), "write".to_string()],
-        tenant_id: "main".to_string(),
+        tenant_id: "main".into(),
+        jti: None,
     });
     next.run(req).await
 }
@@ -121,9 +123,10 @@ async fn inject_test_identity(
     req.extensions_mut().insert(TrustContext::BearerToken {
         kid: "test-kid".to_string(),
         aud: "gradatum".to_string(),
-        sub: "test-identity".to_string(),
+        sub: "test-identity".into(),
         scopes: vec!["read".to_string(), "write".to_string()],
-        tenant_id: "main".to_string(),
+        tenant_id: "main".into(),
+        jti: None,
     });
     next.run(req).await
 }
@@ -325,7 +328,7 @@ async fn identity_write_no_section_hint_with_identity_title_rejected() {
 
 /// Note identity dans l'index → présente dans `excluded` lors d'un forget dry-run.
 ///
-/// Prouve que `Section::PROTECTED_FORGET` inclut `Identity` (Task 1) et que
+/// Prouve que `Section::PROTECTED_FORGET` inclut `Identity` et que
 /// `vault_forget` exclut silencieusement les sections protégées (non-régression).
 ///
 /// Note : `vault_forget` exclut les notes protégées dans le champ `excluded` de la
@@ -489,7 +492,7 @@ async fn seed_soul(env: &ReadEnv, agent: &str) -> String {
         .expect("vault.write_note seed_soul");
     env.state
         .search
-        .upsert_note_title(&note.id, &title)
+        .upsert_note_title(note.frontmatter.vault_id.as_str(), &note.id, &title)
         .await
         .expect("upsert_note_title seed_soul");
     note.id.to_string()
@@ -1113,7 +1116,7 @@ async fn seed_soul_with_history(env: &ReadEnv, agent: &str) -> (String, i64) {
         .expect("write_note_with_id v2 seed_soul_with_history");
     env.state
         .search
-        .upsert_note_title(&id, &title)
+        .upsert_note_title("main", &id, &title)
         .await
         .expect("upsert_note_title seed_soul_with_history");
 
@@ -1978,7 +1981,7 @@ async fn seed_soul_index(idx: &Arc<SqliteIndex>, state: &AppState, agent: &str) 
         .expect("seed identity F-1");
     state
         .search
-        .upsert_note_title(&note_id, &format!("identity/{agent}"))
+        .upsert_note_title("main", &note_id, &format!("identity/{agent}"))
         .await
         .expect("upsert_note_title F-1");
     ulid

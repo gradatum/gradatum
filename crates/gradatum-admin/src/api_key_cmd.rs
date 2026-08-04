@@ -3,7 +3,8 @@
 //! ## Sub-commands
 //!
 //! ```text
-//! gradatum-admin api-key create --root /var/lib/gradatum --owner mcp-stub [--scopes vault_read] [--tenant main] [--description "desc"]
+//! gradatum-admin api-key create --root /var/lib/gradatum --owner mcp-stub --scopes write [--tenant main] [--description "desc"]
+//! gradatum-admin api-key create --root /var/lib/gradatum --owner reader --scopes vault_read --read-only
 //! gradatum-admin api-key list   --root /var/lib/gradatum [--all]
 //! gradatum-admin api-key revoke --root /var/lib/gradatum --prefix ak_abcdef01
 //! gradatum-admin api-key rotate --root /var/lib/gradatum --prefix ak_abcdef01
@@ -13,12 +14,22 @@
 //! - The secret is printed to stdout ONCE on `create` and `rotate`
 //! - The argon2id hash is never displayed
 //! - The SQLite path is derived from `--root` (`<root>/db/api_keys.sqlite`)
+//! - `create` refuses a scope set that grants no write access unless `--read-only`
+//!   is passed, so it never mints a key whose scopes promise a capability the key
+//!   does not have. The check runs on `create` AND `rotate` (A1-bis, trou ferme le
+//!   2026-07-27). Keys already in the store are not revalidated at rest
+//! - `create` likewise refuses an `--owner` that no `[[consumer]]` of the ACL preset
+//!   declares, unless `--allow-unknown-identity` is passed. Same shape as the scope
+//!   guard, same restriction to `create` — the boot-time reconciliation of
+//!   `gradatum-server` covers the keys already persisted
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use gradatum_acl_auth::{ApiKeyStore, SqliteApiKeyStore};
+use gradatum_acl_auth::{ApiKey, ApiKeyStore, SqliteApiKeyStore, WRITE_SCOPES, has_write_scope};
+use gradatum_acl_policy::AclEngine;
+use gradatum_core::scope::AgentId;
 
 /// Sub-commands of `api-key`.
 #[derive(Debug, Subcommand)]
@@ -40,21 +51,62 @@ pub struct ApiKeyCreateArgs {
     #[arg(long)]
     pub root: PathBuf,
 
-    /// Key owner (e.g. `mcp-stub`, `curator-worker`).
+    /// Key owner — the agent identity the key will carry (e.g. `mcp-stub`, `engine`).
+    ///
+    /// Parsed as an [`AgentId`] (charset `[a-z0-9-]`, non-empty, ≤ 64 bytes, no leading or
+    /// trailing hyphen) and checked against the identities declared in the ACL preset,
+    /// unless `--allow-unknown-identity` is passed.
     #[arg(long)]
     pub owner: String,
 
-    /// Granted scopes, comma-separated (e.g. `vault_read,vault_search`).
-    #[arg(long, default_value = "vault_read")]
+    /// Granted scopes, comma-separated. Required — a key's capabilities are always
+    /// stated explicitly.
+    ///
+    /// Write access is granted only by one of `write`, `admin` or `service`. Any
+    /// other value yields a key that cannot write, which is refused unless
+    /// `--read-only` is also passed.
+    ///
+    /// This argument has no default on purpose: the only value a default could carry
+    /// is a read scope, which `create` refuses on its own, so a default would advertise
+    /// a value that cannot mint a key unless `--read-only` is also passed.
+    #[arg(long)]
     pub scopes: String,
 
+    /// Confirms that the key is meant to be read-only.
+    ///
+    /// Required whenever `--scopes` carries no write scope, so that a key without
+    /// write access is always a deliberate choice rather than an oversight.
+    #[arg(long, default_value_t = false)]
+    pub read_only: bool,
+
     /// Target tenant.
-    #[arg(long, default_value = "main")]
+    #[arg(long)]
     pub tenant: String,
 
     /// Optional description for the key.
     #[arg(long)]
     pub description: Option<String>,
+
+    /// Allows a `--tenant` other than `main`, explicitly lifting the single-vault guard.
+    ///
+    /// The tenant must already be provisioned in the `tenant_vault_grants` allow-list
+    /// for the key to be exchangeable for a JWT; otherwise `/auth/exchange` answers
+    /// `403`.
+    #[arg(long, default_value_t = false)]
+    pub allow_non_main_tenant: bool,
+
+    /// Mints the key even though `--owner` is not declared in the ACL preset.
+    ///
+    /// The escape hatch for the one legitimate ordering — provisioning a credential before
+    /// its `[[consumer]]` block exists. It is deliberately explicit: without it, the guard
+    /// would be bypassable only by disabling the check altogether, and an operator in a
+    /// hurry would disable it permanently.
+    ///
+    /// A key created this way authenticates but is denied on every locus until the identity
+    /// is declared. That is stated on stderr at creation time, and the boot reconciliation
+    /// keeps reporting it until the preset catches up.
+    #[arg(long, default_value_t = false)]
+    pub allow_unknown_identity: bool,
 }
 
 /// Arguments for `api-key list`.
@@ -110,18 +162,160 @@ fn resolve_db_path(root: &std::path::Path) -> PathBuf {
     root.join("db/api_keys.sqlite")
 }
 
+/// Resolves the ACL preset path as `{root}/config/bearer.toml`.
+///
+/// Same derivation contract as [`resolve_db_path`]: `init` materialises the preset at that
+/// exact path and writes it back into the server config as `acl.preset_path`, so `--root`
+/// alone identifies both halves of the relation this guard checks.
+fn resolve_preset_path(root: &std::path::Path) -> PathBuf {
+    root.join("config/bearer.toml")
+}
+
+/// Parses `--owner` and refuses an identity that the ACL preset does not declare.
+///
+/// Two barriers, in order:
+///
+/// 1. **Parse-don't-validate** — `--owner` is untrusted CLI input, so it crosses into
+///    [`AgentId`] here or not at all. This is the call site [`AgentId::parse`] was typed
+///    for; before it existed, any byte sequence reached the `api_keys.owner` column.
+/// 2. **Referential integrity** — `api_keys.owner` and `consumer.identity` are joined by
+///    nothing but string equality. A key minted for an undeclared identity authenticates
+///    (200 on `/auth/exchange`) and is then denied on every locus, silently — the exact
+///    shape of the `engine` incident, which cost a day of investigation because the refusal
+///    was indistinguishable from an outage. Catching it here costs one lookup, at the only
+///    moment where the operator can still fix the typo.
+///
+/// The check runs on `create` only, mirroring [`validate_create_scopes`]: `rotate` carries
+/// the source key's owner over unchanged, and keys already in the store are not revalidated.
+/// Those are covered by the boot-time reconciliation instead.
+///
+/// An unreadable or absent preset is a refusal, not a pass: the server falls back to
+/// DENY-ALL in that situation, so a key minted against an unknown preset is a key that
+/// cannot work. `--allow-unknown-identity` lifts both the lookup and this case.
+///
+/// # Errors
+/// Returns an error when `--owner` is not a well-formed [`AgentId`], when the preset cannot
+/// be read or parsed, or when the identity is absent from it.
+fn validate_create_owner(
+    root: &std::path::Path,
+    raw_owner: &str,
+    allow_unknown_identity: bool,
+) -> Result<AgentId> {
+    let owner = AgentId::parse(raw_owner).map_err(|e| {
+        anyhow::anyhow!(
+            "invalid --owner: {e}\n\
+             \n\
+             An agent identity is lowercase `[a-z0-9-]`, non-empty, at most 64 bytes, and \
+             carries no leading or trailing hyphen. It must match a `[[consumer]] identity` \
+             of the ACL preset byte for byte."
+        )
+    })?;
+
+    if allow_unknown_identity {
+        eprintln!(
+            "WARNING: --allow-unknown-identity — key minted for '{owner}', an identity the \
+             preset does not declare.\n\
+             It will authenticate and then be denied on every locus until a `[[consumer]] \
+             identity = \"{owner}\"` block exists."
+        );
+        return Ok(owner);
+    }
+
+    let preset_path = resolve_preset_path(root);
+    let preset = std::fs::read_to_string(&preset_path).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read the ACL preset {}: {e}\n\
+             \n\
+             Without it the identity of '{owner}' cannot be checked, and the server itself \
+             falls back to DENY-ALL — the key would authenticate and be refused everywhere.\n\
+             Run `gradatum-admin init` to materialise the preset, or pass \
+             `--allow-unknown-identity` to mint the key anyway.",
+            preset_path.display()
+        )
+    })?;
+    let engine = AclEngine::from_preset_str(&preset).map_err(|e| {
+        anyhow::anyhow!(
+            "the ACL preset {} does not parse: {e}\n\
+             \n\
+             Fix the preset, or pass `--allow-unknown-identity` to mint the key anyway.",
+            preset_path.display()
+        )
+    })?;
+
+    if !engine.has_identity(&owner) {
+        bail!(
+            "refusing to create a key for an undeclared identity: '{owner}' has no \
+             `[[consumer]]` block in {}\n\
+             \n\
+             Such a key authenticates and is then denied on every locus, which is \
+             indistinguishable from an outage.\n\
+             Declare `identity = \"{owner}\"` in the preset first, or pass \
+             `--allow-unknown-identity` if the credential is meant to precede its ACL entry.",
+            preset_path.display()
+        );
+    }
+
+    Ok(owner)
+}
+
 /// Opens the SQLite API key store.
 async fn open_store(root: &std::path::Path) -> Result<SqliteApiKeyStore> {
     let db_path = resolve_db_path(root);
     SqliteApiKeyStore::init(&db_path)
         .await
-        .with_context(|| format!("ouverture du store api_keys : {}", db_path.display()))
+        .with_context(|| format!("opening the api_keys store: {}", db_path.display()))
+}
+
+/// Renders a scope set for display in an error message.
+fn render_scopes(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "(none)".to_owned()
+    } else {
+        scopes.join(", ")
+    }
+}
+
+/// Rejects a scope set whose write capability does not match the caller's intent.
+///
+/// A key is refused when it carries no write scope and `--read-only` was not passed,
+/// so that `create` never mints a key claiming a write capability it does not have.
+/// The mirror case is refused too: `--read-only` combined with a write scope would
+/// produce a writable key under a read-only label.
+///
+/// This guards creation AND rotation. [`run_rotate`] validates the source key's
+/// scopes before the atomic rotate — same guard, same message, same fail-closed.
+/// Keys already persisted are never revalidated at rest.
+///
+/// # Errors
+/// Returns an error describing the mismatch and the command to run instead.
+fn validate_create_scopes(scopes: &[String], read_only: bool) -> Result<()> {
+    let writable = has_write_scope(scopes);
+    let allowed = WRITE_SCOPES.join(", ");
+
+    match (read_only, writable) {
+        (false, false) => bail!(
+            "refusing to create a key that cannot write: scopes [{}] grant no write access\n\
+             \n\
+             Write access is granted only by these exact scopes: {}.\n\
+             Re-run with `--scopes write` for a writable key, or add `--read-only` to \
+             confirm a read-only key is intended.",
+            render_scopes(scopes),
+            allowed
+        ),
+        (true, true) => bail!(
+            "--read-only contradicts the requested scopes: [{}] grants write access\n\
+             \n\
+             Drop `--read-only` to create a writable key, or remove the write scopes \
+             ({}) from `--scopes`.",
+            render_scopes(scopes),
+            allowed
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// `api-key create` — generates a new key and prints the secret exactly once.
 async fn run_create(args: ApiKeyCreateArgs) -> Result<()> {
-    let store = open_store(&args.root).await?;
-
     let scopes: Vec<String> = args
         .scopes
         .split(',')
@@ -129,15 +323,25 @@ async fn run_create(args: ApiKeyCreateArgs) -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Validated before the store is opened: a refused invocation must not create
+    // the database file as a side effect.
+    validate_create_scopes(&scopes, args.read_only)?;
+    let owner = validate_create_owner(&args.root, &args.owner, args.allow_unknown_identity)?;
+
+    let mut store = open_store(&args.root).await?;
+    if args.allow_non_main_tenant {
+        store = store.with_non_main_tenants();
+    }
+
     let material = store
-        .create(&args.owner, scopes, args.tenant, args.description)
+        .create(&owner, scopes, args.tenant, args.description)
         .await
-        .map_err(|e| anyhow::anyhow!("création API key échouée: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("API key creation failed: {e}"))?;
 
     // Print the secret ONCE to stdout.
     // Two separate lines: pipe-friendly and human-readable.
-    eprintln!("API key créée (secret affiché UNE SEULE FOIS) :");
-    eprintln!("  préfixe : {}", material.prefix);
+    eprintln!("API key created (secret shown ONCE ONLY):");
+    eprintln!("  prefix: {}", material.prefix);
     println!("{}", material.secret);
 
     Ok(())
@@ -148,25 +352,25 @@ async fn run_list(args: ApiKeyListArgs) -> Result<()> {
     let store = open_store(&args.root).await?;
 
     let keys = store
-        .list(args.all)
+        .list(args.all, None)
         .await
-        .map_err(|e| anyhow::anyhow!("listage API keys échoué: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("API keys listing failed: {e}"))?;
 
     if keys.is_empty() {
-        eprintln!("Aucune clé{}.", if args.all { "" } else { " active" });
+        eprintln!("No key{}.", if args.all { "" } else { " active" });
         return Ok(());
     }
 
     // Table header.
     println!(
-        "{:<12}  {:<24}  {:<12}  {:<16}  état",
-        "préfixe", "owner", "tenant", "scopes"
+        "{:<12}  {:<24}  {:<12}  {:<16}  state",
+        "prefix", "owner", "tenant", "scopes"
     );
     println!("{}", "-".repeat(80));
 
     for key in &keys {
         let etat = if key.is_revoked() {
-            "révoquée"
+            "revoked"
         } else {
             "active"
         };
@@ -177,7 +381,40 @@ async fn run_list(args: ApiKeyListArgs) -> Result<()> {
         );
     }
 
-    eprintln!("\n{} clé(s) listée(s).", keys.len());
+    // A1-bis (trou 2 — detection cles LIVE menteuses, 2026-07-27).
+    // Une cle est "menteuse" si ses scopes contiennent un nom qui evoque
+    // l'ecriture (contient "write" ou "admin") mais has_write_scope
+    // retourne false — la cle ne peut pas ecrire malgre ses scopes.
+    let menteuses: Vec<&ApiKey> = keys
+        .iter()
+        .filter(|k| {
+            !k.is_revoked()
+                && k.scopes
+                    .iter()
+                    .any(|s| s.contains("write") || s.contains("admin"))
+                && !has_write_scope(&k.scopes)
+        })
+        .collect();
+    if !menteuses.is_empty() {
+        eprintln!();
+        for k in &menteuses {
+            eprintln!(
+                "⚠ INCONSISTENT — key {} (owner={}) carries scopes [{}] \
+                 that suggest write intent but no effective write scope. \
+                 Fix by key rotation or SQLite UPDATE.",
+                k.prefix,
+                k.owner,
+                k.scopes.join(",")
+            );
+        }
+        eprintln!(
+            "  → {} inconsistent key(s) detected. See \
+             memory/gradatum-modele-droits-2026-07-27.md §1 (gap 2).",
+            menteuses.len()
+        );
+    }
+
+    eprintln!("\n{} key(s) listed.", keys.len());
 
     Ok(())
 }
@@ -189,29 +426,46 @@ async fn run_revoke(args: ApiKeyRevokeArgs) -> Result<()> {
     store
         .revoke(&args.prefix)
         .await
-        .map_err(|e| anyhow::anyhow!("révocation échouée pour '{}': {e}", args.prefix))?;
+        .map_err(|e| anyhow::anyhow!("revocation failed for '{}': {e}", args.prefix))?;
 
-    eprintln!("Clé '{}' révoquée avec succès.", args.prefix);
+    eprintln!("Key '{}' revoked successfully.", args.prefix);
 
     Ok(())
 }
 
 /// `api-key rotate` — revokes the existing key and atomically generates a replacement.
+///
+/// Validates the source key scopes before rotation (A1-bis — trou rotate ferme le
+/// 2026-07-27). `rotate` copies the source key's scopes verbatim: if the source is
+/// "menteuse" (pretend ecrire sans scope write effectif), the rotation perpetuates
+/// the lie. The guard re-runs [`validate_create_scopes`] on the source scopes before
+/// the atomic rotate — same check as `create`.
 async fn run_rotate(args: ApiKeyRotateArgs) -> Result<()> {
     let store = open_store(&args.root).await?;
+
+    // A1-bis : valider les scopes de la source avant rotation.
+    // rotate copie les scopes tels quels — si la source est menteuse,
+    // la rotation perpetue le mensonge. Ferme le trou signale le 2026-07-27.
+    let keys = store
+        .list(false, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to list keys for rotation validation: {e}"))?;
+    if let Some(source) = keys.iter().find(|k| k.prefix == args.prefix) {
+        // read_only = !has_write_scope(...) : si la cle source n'a pas de scope
+        // write, on la valide en read-only. Si elle en a, en writable.
+        let read_only = !has_write_scope(&source.scopes);
+        validate_create_scopes(&source.scopes, read_only)?;
+    }
 
     let material = store
         .rotate(&args.prefix)
         .await
-        .map_err(|e| anyhow::anyhow!("rotation échouée pour '{}': {e}", args.prefix))?;
+        .map_err(|e| anyhow::anyhow!("rotation failed for '{}': {e}", args.prefix))?;
 
     // New secret printed ONCE to stdout.
-    eprintln!(
-        "Rotation réussie (ancien préfixe révoqué : {}).",
-        args.prefix
-    );
-    eprintln!("Nouveau secret (affiché UNE SEULE FOIS) :");
-    eprintln!("  préfixe : {}", material.prefix);
+    eprintln!("Rotation succeeded (old prefix revoked: {}).", args.prefix);
+    eprintln!("New secret (shown ONCE ONLY):");
+    eprintln!("  prefix: {}", material.prefix);
     println!("{}", material.secret);
 
     Ok(())

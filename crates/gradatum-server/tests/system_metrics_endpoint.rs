@@ -39,6 +39,7 @@ static AUTHED_TOKEN: LazyLock<String> = LazyLock::new(|| {
         TEST_SEED,
         "metrics-test-kid".to_string(),
         "gradatum".to_string(),
+        "gradatum".to_string(),
         3600,
         86_400,
     )
@@ -100,6 +101,7 @@ async fn build_app() -> axum::Router {
     let jwt = JwtService::from_signing_bytes(
         TEST_SEED,
         "metrics-test-kid".to_string(),
+        "gradatum".to_string(),
         "gradatum".to_string(),
         3600,
         86_400,
@@ -195,7 +197,8 @@ async fn timeseries_from_ge_to_is_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// Catalog → 200, stubs curator/llm présents et marqués instrumented=false.
+/// Catalog → 200 : `llm.calls` reste un stub `instrumented=false` ; `curator.decisions`
+/// est désormais instrumenté (F-66) et n'apparaît plus comme stub non instrumenté.
 #[tokio::test]
 async fn catalog_lists_stub_families_marked_uninstrumented() {
     let app = build_app().await;
@@ -207,12 +210,19 @@ async fn catalog_lists_stub_families_marked_uninstrumented() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let entries = json["series"].as_array().unwrap();
-    // Les stubs curator/llm sont toujours présents, instrumented=false.
+    // llm.calls reste un stub non instrumenté.
     assert!(
         entries
             .iter()
+            .any(|e| e["key"] == "llm.calls" && e["instrumented"] == false),
+        "llm.calls stub absent ou instrumented=true"
+    );
+    // curator.decisions ne doit plus figurer comme stub non instrumenté (F-66).
+    assert!(
+        !entries
+            .iter()
             .any(|e| e["key"] == "curator.decisions" && e["instrumented"] == false),
-        "curator.decisions stub absent ou instrumented=true"
+        "curator.decisions ne doit plus apparaître comme stub non instrumenté (F-66)"
     );
 }
 

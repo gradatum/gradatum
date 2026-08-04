@@ -71,7 +71,7 @@ pub(crate) fn parse_with_language_parser(
     let tree = match parser.parse(content, None) {
         Some(t) => t,
         None => {
-            tracing::warn!(path = %source_path, "tree-sitter parse returned None (fichier ignoré)");
+            tracing::warn!(path = %source_path, "tree-sitter parse returned None (file skipped)");
             return Ok(Vec::new());
         }
     };

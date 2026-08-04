@@ -21,10 +21,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain with rustfmt + clippy
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install pinned toolchain (rust-toolchain.toml, rustfmt + clippy)
+        # Ni action tierce, ni canal écrit ici : `rustup toolchain install` sans
+        # argument lit rust-toolchain.toml (rustup est préinstallé sur les runners
+        # GitHub-hosted), et rustfmt + clippy viennent du champ `components` du
+        # même fichier. `dtolnay/rust-toolchain@stable` installait explicitement
+        # `stable` — une 2e écriture de la version, qui dérive du pin en silence.
+        # Invariant toolchain, council Art.19 2026-07-24.
+        run: |
+          rustup toolchain install --no-self-update
+          rustc --version
 
       - name: Cache cargo registry + build
         uses: actions/cache@v4
@@ -54,8 +60,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        # Voir job `lint` : version lue depuis rust-toolchain.toml, jamais écrite ici.
+        run: |
+          rustup toolchain install --no-self-update
+          rustc --version
 
       - name: Install SQLite dev headers
         run: sudo apt-get update -qq && sudo apt-get install -y libsqlite3-dev
@@ -89,6 +98,61 @@ jobs:
             cargo test --workspace
           fi
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # test-engine — cargo nextest gradatum-engine (feature `serve`)
+  # Runner: self-hosted (ÉPINGLÉ — parité avec .forgejo/workflows/ci.yml).
+  # POURQUOI l'épinglage : plusieurs tests de gradatum-engine valident le binaire
+  # llama-server réel présent sur disque (canonicalisation + garde des préfixes
+  # privilégiés SP-P0-4). Ce binaire n'existe que sur ce runner ; un runner qui ne
+  # l'a pas (dont GitHub-hosted ubuntu-latest) fait échouer ces tests. Les hermétiser
+  # exigerait une couture de test dans un garde de sécurité — refusé (décision
+  # Général 2026-07-05). On épingle honnêtement là où le binaire existe.
+  # ─────────────────────────────────────────────────────────────────────────
+  test-engine:
+    name: test-engine
+    runs-on: [self-hosted, lxc-500]
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        # Voir job `lint` : version lue depuis rust-toolchain.toml, jamais écrite ici.
+        run: |
+          rustup toolchain install --no-self-update
+          rustc --version
+
+      - name: Install SQLite dev headers
+        run: sudo apt-get update -qq && sudo apt-get install -y libsqlite3-dev
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: cargo-test-engine-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-test-engine-${{ runner.os }}-
+
+      - name: Install cargo-nextest
+        run: |
+          cargo install cargo-nextest --locked 2>/dev/null \
+            || cargo install cargo-nextest 2>/dev/null \
+            || true
+
+      - name: cargo nextest run -p gradatum-engine --features serve
+        # gradatum-engine gate ses modules (config, supervisor) derrière la feature `serve`.
+        # Couvre spec decoding, superviseur, validation config — dont plusieurs tests
+        # couplés au binaire llama-server on-disk (voir en-tête du job).
+        run: |
+          if command -v cargo-nextest &>/dev/null || cargo nextest --version &>/dev/null 2>&1; then
+            cargo nextest run -p gradatum-engine --features serve
+          else
+            cargo test -p gradatum-engine --features serve
+          fi
+
   # index-backends — suite de parité backend-agnostique du trait Index (W2 v0.4.5).
   # Job splitté + matrix. Ajouter un backend = 1 entrée matrix + 1 bras factory
   # make_index (crates/index-parity-tests/tests/common/mod.rs).
@@ -102,8 +166,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        # Voir job `lint` : version lue depuis rust-toolchain.toml, jamais écrite ici.
+        run: |
+          rustup toolchain install --no-self-update
+          rustc --version
 
       - name: Install SQLite dev headers
         run: sudo apt-get update -qq && sudo apt-get install -y libsqlite3-dev
@@ -156,3 +223,108 @@ jobs:
 
       - name: npm test
         run: npm test
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # toolchain-pin-lint — gate d'enforcement de l'invariant toolchain
+  # Règle (council Art.15bis + Art.19, 2026-07-24) : la version de Rust du
+  # projet n'est écrite QUE dans rust-toolchain.toml. Toute duplication dans un
+  # workflow / Dockerfile / script dérive en silence du pin et fait livrer des
+  # artefacts compilés par un autre compilateur que celui qui les valide.
+  # Pendant du job homonyme de .forgejo/workflows/ci.yml : c'est CETTE surface
+  # qui porte la release publique, et c'est ici que se trouvaient les
+  # `dtolnay/rust-toolchain@stable` qui ignoraient le pin. Un invariant tenu sur
+  # une seule des deux surfaces ne tient nulle part.
+  # Runner : GitHub-hosted. Le lint est du bash + python3 stdlib (os/re/sys),
+  # tous deux présents dans l'image ubuntu-latest ; aucune toolchain Rust,
+  # aucun cache, quelques secondes. (Le pendant Forgejo est épinglé sur le runner auto-hébergé
+  # parce que python3 n'est pas garanti sur les runners d'offload VPS —
+  # contrainte propre à ce parc, sans objet ici.)
+  # ─────────────────────────────────────────────────────────────────────────
+  toolchain-pin-lint:
+    name: toolchain-pin-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint duplication de version Rust
+        run: |
+          python3 --version
+          bash scripts/ci-lint-toolchain-pin.sh
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # i18n-lint — gate anti-régression français (F-102) sur la surface distribuée
+  # Voir le pendant Forgejo pour le raisonnement complet. En résumé : ce gate
+  # n'était appelé nulle part, « non exécuté » n'est pas un PASS. Surface
+  # `strings` bloquante ici ; surface `docs` (doc-comments docs.rs) enforced au
+  # niveau release par G5 de scripts/release-readiness-scan.sh, à basculer ici
+  # (`--surface both`) une fois le polish rustdoc v1.0.0 atterri.
+  # ─────────────────────────────────────────────────────────────────────────
+  i18n-lint:
+    name: i18n-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint français résiduel (littéraux de chaîne)
+        run: |
+          python3 --version
+          bash scripts/scan-fr-strings.sh --surface strings --scope all -v
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # mcp-catalog-parity — parité des catalogues MCP serveur ↔ stub
+  # Voir le pendant Forgejo pour le raisonnement complet. En résumé : le script
+  # existait, red-proofé, mais n'était appelé nulle part — « non exécuté » n'est
+  # pas un PASS. Gate lexical pur (bash/awk/grep), aucune toolchain Rust, aucun
+  # secret : il est donc portable et câblé sur les deux surfaces, comme
+  # i18n-lint et toolchain-pin-lint.
+  #
+  # Le script sort 2 pour « gate NON EXÉCUTÉ » (source introuvable, extraction
+  # sous le seuil d'anti-vacuité). Ce cas DOIT échouer : la commande est appelée
+  # nue, sans `continue-on-error` ni pipe, donc tout code non nul échoue le step.
+  # Ne jamais rediriger ce `run` dans un `tee` — le code observé deviendrait
+  # celui du dernier maillon du pipe, et le gate rendrait un vert silencieux.
+  # ─────────────────────────────────────────────────────────────────────────
+  mcp-catalog-parity:
+    name: mcp-catalog-parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parité des catalogues MCP (serveur ↔ stub)
+        # BLOCKING — no continue-on-error, commande nue.
+        run: bash scripts/mcp-catalog-parity.sh
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # docs-consistency — la prose confrontée au CODE, jamais à elle-même
+  # Voir le pendant Forgejo pour le raisonnement complet. En résumé : 5 `.md` et
+  # 2 READMEs de crates-stub se citent mutuellement, maintenus à la main, et rien
+  # ne les comparait au code — trois rounds de correction ont tenu un ratio stable
+  # de 2 faussetés neuves pour 6 corrections. Gate lexical pur (bash/awk/grep/git),
+  # aucune toolchain Rust, aucun secret : portable, câblé sur les deux surfaces.
+  #
+  # ⚠️ ROUGE AU CÂBLAGE : 34 divergences mesurées à `c5c3909a`. Ce n'est pas une
+  # panne du job. Ne pas le désarmer, ne pas ajouter `continue-on-error` — le
+  # rouge est l'état réel de la documentation, résorbé par le lot suivant.
+  #
+  # Le script sort 2 pour « gate NON EXÉCUTÉ ». Ce cas DOIT échouer : commande
+  # nue, sans `continue-on-error` ni pipe. Ne jamais rediriger dans un `tee` —
+  # le code observé deviendrait celui du dernier maillon du pipe.
+  #
+  # `fetch-depth: 0` est LOAD-BEARING : C3 confronte les versions aux tags, C5
+  # confronte une ancre à `git log <sha>..HEAD -- <fichier>`. Vérifié le
+  # 2026-08-01 : sur un clone `--depth 1 --no-tags`, le script sort en 2 sur sa
+  # précondition anti-shallow (il refuse de mesurer plutôt que de rendre un faux
+  # vert, mais le job serait rouge pour la mauvaise raison).
+  # ─────────────────────────────────────────────────────────────────────────
+  docs-consistency:
+    name: docs-consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Historique complet + tags : requis par C3 et C5. Voir l'en-tête.
+          fetch-depth: 0
+
+      - name: Cohérence documentaire (prose ↔ code)
+        # BLOCKING — no continue-on-error, commande nue.
+        run: bash scripts/docs-consistency-gate.sh

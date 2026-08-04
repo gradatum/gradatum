@@ -69,7 +69,12 @@ scripts/mcp.json.sample
 .gradatum-meta
 .worktrees/
 docs/internal/
-RELEASE-MANIFEST.yaml
 
 # Agent runtime state (Claude Code worktrees, caches) — never published
 .claude/
+
+# insta pending/rejected snapshots (transient, never committed)
+*.snap.new
+
+# Artefacts SBOM CycloneDX (job sbom, generes au tag)
+*.cdx.json

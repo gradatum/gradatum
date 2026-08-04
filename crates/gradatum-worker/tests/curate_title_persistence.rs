@@ -178,6 +178,7 @@ async fn curate_persists_title_in_index() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue_dyn)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -270,6 +271,7 @@ async fn search_fts_returns_title_after_curate() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue_dyn)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -361,6 +363,7 @@ async fn curate_rejects_non_main_tenant() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue_dyn)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -390,6 +393,7 @@ async fn curate_accepts_main_tenant() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue_dyn)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 

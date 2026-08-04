@@ -11,16 +11,16 @@ const REQUIRED_SECTIONS: [&str; 3] = ["INVARIANTS", "GATES", "NARRATIVE"];
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SoulSchemaError {
     /// A required `## SECTION` header is absent.
-    #[error("soul: section ## {0} manquante")]
+    #[error("soul: section ## {0} missing")]
     MissingSection(&'static str),
     /// A required section is present but empty.
-    #[error("soul: section ## {0} vide")]
+    #[error("soul: section ## {0} empty")]
     EmptySection(&'static str),
     /// The `INVARIANTS` section lacks the mandatory `INV-CANARY` line.
-    #[error("soul: INV-CANARY absent de ## INVARIANTS")]
+    #[error("soul: INV-CANARY absent from ## INVARIANTS")]
     MissingCanaryInvariant,
     /// A forbidden dynamic field was found in the body (breaks byte-stability).
-    #[error("soul: champ dynamique interdit dans le body: {0}")]
+    #[error("soul: dynamic field forbidden in body: {0}")]
     DynamicFieldInBody(String),
 }
 
@@ -91,14 +91,14 @@ fn has_dynamic_field(body: &str) -> Option<String> {
 /// for future evolutions (alternative serialisation, testing a corpus without prior
 /// stripping).
 ///
-/// # Exemples
+/// # Examples
 ///
 /// ```rust
 /// # use gradatum_core::soul::soul_extends;
 /// let body = "# identity/backend\nextends: identity/main\n\n## NARRATIVE\nTu es Backend.\n";
 /// assert_eq!(soul_extends(body), Some("identity/main".to_string()));
 ///
-/// // extends: en NARRATIVE → ignoré (pas en 1ère ligne non-vide post-H1)
+/// // `extends:` inside NARRATIVE → ignored (not the first non-empty line after the H1)
 /// let prose = "# identity/x\n## INVARIANTS\nINV-CANARY | x\n## NARRATIVE\nextends: notre approche.\n";
 /// assert_eq!(soul_extends(prose), None);
 /// ```
@@ -188,7 +188,7 @@ pub fn parse_soul(body: &str) -> Result<SoulDoc, SoulSchemaError> {
     // "# no INV-CANARY present" or a comment referencing the token — false positive.
     if !is_child {
         let invariants = extract_section(body, "INVARIANTS")
-            .expect("INVARIANTS existe : vérifiée dans la boucle required ci-dessus");
+            .expect("INVARIANTS present: checked in the required loop above");
         if !invariants
             .lines()
             .any(|l| l.trim_start().starts_with("INV-CANARY"))

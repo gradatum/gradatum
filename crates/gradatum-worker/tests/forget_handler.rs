@@ -96,6 +96,128 @@ async fn make_fixture() -> ForgetFixture {
     }
 }
 
+/// Client interne de test adossé au `Vault` + `SqliteIndex` de la fixture.
+///
+/// Un client neuf par job : les handlers en prennent un `Arc` par appel.
+fn client_for(
+    fixture: &ForgetFixture,
+) -> Arc<dyn gradatum_worker::internal_client::InternalClient> {
+    Arc::new(test_internal_client::TestInternalClient::new(
+        Arc::clone(&fixture.vault),
+        Arc::clone(&fixture.index),
+    ))
+}
+
+/// Spec de forget réel ciblant le locus `inbox/old`, confirmée sur `ulid`.
+fn forget_spec(ulid: &str, by: &str) -> ForgetSpec {
+    ForgetSpec {
+        scope: ForgetScope::Locus {
+            vault: "main".to_string(),
+            locus: "inbox/old".to_string(),
+        },
+        dry_run: false,
+        forgotten_by: Some(by.to_string()),
+        confirm_ulids: vec![ulid.to_string()],
+    }
+}
+
+/// Sème une note, l'oublie une première fois (`alice`), puis désynchronise l'index.
+///
+/// État rendu : index `forgotten = 0`, frontmatter `forgotten: true` + `forgotten_at` /
+/// `forgotten_by` du premier oubli. Ce n'est pas une fenêtre de course artificielle : deux
+/// chemins de production ordinaires produisent exactement cet état — `vault_unforgot`
+/// (route publique) efface la marque d'index sans toucher au `.md`, et `persist_forget`
+/// rend 200 best-effort quand son `mark_forgotten` échoue après un write vault réussi.
+/// `unmark_forgotten` (index seul) le recrée fidèlement.
+///
+/// Les trois listings de scope filtrent `forgotten = 0` : c'est justement dans cet état
+/// qu'un second job re-résout la note et atteint la branche du skip idempotent.
+///
+/// Rend `(note_id, ulid, forgotten_at du PREMIER oubli)`.
+async fn seed_forgotten_note_then_desync_index(
+    fixture: &ForgetFixture,
+) -> (
+    gradatum_core::identity::NoteId,
+    String,
+    chrono::DateTime<Utc>,
+) {
+    use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
+    use gradatum_core::identity::NoteId;
+    use gradatum_core::scope::LocusId;
+    use gradatum_core::section::Section;
+    use gradatum_core::status::NoteStatus;
+    use gradatum_worker::apalis_handlers::handle_forget;
+
+    // Note réelle (`.md` + ligne d'index), section non protégée, sous un locus ciblable.
+    let note_id = NoteId::new();
+    let ulid = note_id.0.to_string();
+    let now = Utc::now();
+    let fm = Frontmatter {
+        schema_version: 1,
+        vault_id: VaultId::new("main"),
+        locus: Some(LocusId::new("inbox/old")),
+        section: Section::Decisions,
+        status: NoteStatus::Live,
+        status_reason: None,
+        status_changed: Some(now),
+        tags: Default::default(),
+        author: None,
+        created: now,
+        updated: None,
+        extra: ExtraFields::empty(),
+        provenance: None,
+        forgotten: None,
+        forgotten_at: None,
+        forgotten_by: None,
+    };
+    fixture
+        .vault
+        .write_note_with_id(fm, format!("# note {ulid}\n\ncorps oubliable"), note_id)
+        .await
+        .expect("write_note_with_id — note du double forget");
+
+    // Sanity : la note est résolue par le scope AVANT tout oubli.
+    let listed = fixture
+        .index
+        .list_notes_by_locus_prefix("main", "inbox/old")
+        .await
+        .expect("list_notes_by_locus_prefix");
+    assert!(
+        listed.iter().any(|(id, _)| id == &ulid),
+        "prérequis du test : la note doit être résolue par le scope Locus, obtenu {listed:?}"
+    );
+
+    // ── Oubli #1 — l'acte à tracer.
+    handle_forget(
+        make_forget_job(forget_spec(&ulid, "alice"), JobMode::Batch),
+        Data::new(client_for(fixture)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await
+    .expect("premier forget doit réussir");
+
+    let first = fixture
+        .vault
+        .read_note(note_id)
+        .await
+        .expect("relecture après oubli #1");
+    assert_eq!(first.frontmatter.forgotten, Some(true));
+    let first_at = first
+        .frontmatter
+        .forgotten_at
+        .expect("l'oubli #1 doit horodater");
+    assert_eq!(first.frontmatter.forgotten_by.as_deref(), Some("alice"));
+
+    // ── Désynchronisation index → le second job re-résout la note.
+    fixture
+        .index
+        .unmark_forgotten("main", &ulid)
+        .await
+        .expect("unmark_forgotten — index seul, le frontmatter reste oublié");
+
+    (note_id, ulid, first_at)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,6 +280,7 @@ async fn fail_closed_note_not_in_index_excluded() {
             Arc::clone(&fixture.index),
         ))
             as Arc<dyn gradatum_worker::internal_client::InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_forget dry-run locus vide doit réussir");
@@ -195,6 +318,7 @@ async fn fail_closed_note_not_in_index_excluded() {
             Arc::clone(&fixture.index),
         ))
             as Arc<dyn gradatum_worker::internal_client::InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_forget dry-run topic doit réussir");
@@ -238,6 +362,7 @@ async fn confirm_ulids_both_empty_is_legal() {
             Arc::clone(&fixture.index),
         ))
             as Arc<dyn gradatum_worker::internal_client::InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -281,11 +406,130 @@ async fn confirm_ulids_mismatch_returns_error() {
             Arc::clone(&fixture.index),
         ))
             as Arc<dyn gradatum_worker::internal_client::InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
     assert!(
         result.is_err(),
         "confirm_ulids mismatch doit retourner une erreur Business: {result:?}"
+    );
+}
+
+/// A7 — un second forget PRÉSERVE `forgotten_at`/`forgotten_by` du premier.
+///
+/// C'est la propriété qui compte : la piste d'audit du **premier** oubli (quand, par
+/// qui) est la seule trace de l'acte destructif. Le skip idempotent existe pour ça.
+///
+/// **Discriminance** — avant le fix, la re-vérification TOCTOU comparait
+/// `dto.status == "forgotten"`. `NoteStatus` n'a aucune variante `Forgotten`
+/// (`draft|staging|pending-review|live|deprecated|garbage`) : la comparaison était
+/// TOUJOURS fausse, le skip ne s'exécutait jamais, et le second `persist_forget`
+/// écrasait `forgotten_at` **et** `forgotten_by`. Le flag vit dans le champ booléen
+/// `NoteReadDto.forgotten` (frontmatter), celui-là même que lit le chemin distill.
+///
+/// **Fenêtre reproduite** — les trois listings de scope filtrent `forgotten = 0`, donc
+/// un second job ne re-résout la note que si l'index la croit vivante alors que le
+/// frontmatter la sait oubliée. `unmark_forgotten` (index seul, ne touche pas le `.md`)
+/// recrée exactement cette désynchronisation, qui est le cas que la garde protège.
+#[tokio::test]
+async fn second_forget_preserves_the_first_forget_audit_trail() {
+    use gradatum_worker::apalis_handlers::handle_forget;
+
+    let fixture = make_fixture().await;
+    let (note_id, ulid, first_at) = seed_forgotten_note_then_desync_index(&fixture).await;
+
+    // ── Oubli #2 — doit être un no-op idempotent, PAS une réécriture.
+    handle_forget(
+        make_forget_job(forget_spec(&ulid, "bob"), JobMode::Batch),
+        Data::new(client_for(&fixture)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await
+    .expect("second forget doit réussir (skip idempotent)");
+
+    let second = fixture
+        .vault
+        .read_note(note_id)
+        .await
+        .expect("relecture après oubli #2");
+    assert_eq!(
+        second.frontmatter.forgotten_by.as_deref(),
+        Some("alice"),
+        "le second forget ne doit PAS réattribuer l'oubli à son propre acteur"
+    );
+    assert_eq!(
+        second.frontmatter.forgotten_at,
+        Some(first_at),
+        "le second forget ne doit PAS réhorodater l'oubli initial"
+    );
+}
+
+/// A7-bis — le skip idempotent RÉPARE l'index, sans rien sacrifier de la piste d'audit.
+///
+/// A7 avait ressuscité le skip (mort tant qu'il comparait `dto.status == "forgotten"`), ce
+/// qui a troqué une propriété contre une autre : la piste d'audit du premier oubli était
+/// enfin préservée, mais le `continue` laissait l'index désynchronisé **définitivement** —
+/// la note restait indexée vivante, donc cherchable, alors que le vault la dit oubliée, et
+/// elle était malgré tout comptée dans la liste `forgotten` du job. Avant A7 le second
+/// forget réparait l'index, au prix de l'audit. Sur un produit qui invoque le droit à
+/// l'oubli, c'est le mauvais côté de l'échange.
+///
+/// **Discriminance** — ce test échoue sur A7 (`58010454`) : l'index reste `forgotten = 0`
+/// après le second forget. Il échouerait tout autant sur une « correction » qui rappellerait
+/// `persist_forget` dans la branche du skip : l'index redeviendrait cohérent mais
+/// `forgotten_at`/`forgotten_by` seraient ré-estampés à l'acteur du second oubli. Les deux
+/// assertions doivent donc passer ENSEMBLE — c'est tout l'objet du lot.
+#[tokio::test]
+async fn second_forget_resynchronises_the_index_and_keeps_the_audit_trail() {
+    use gradatum_worker::apalis_handlers::handle_forget;
+
+    let fixture = make_fixture().await;
+    let (note_id, ulid, first_at) = seed_forgotten_note_then_desync_index(&fixture).await;
+
+    // Prérequis explicite : l'index est bien désynchronisé AVANT le second forget.
+    assert!(
+        !fixture
+            .index
+            .is_note_forgotten("main", &ulid)
+            .await
+            .expect("is_note_forgotten — état désynchronisé"),
+        "prérequis du test : l'index doit croire la note vivante avant le second forget"
+    );
+
+    // ── Oubli #2 — skip idempotent + re-synchronisation de l'index.
+    handle_forget(
+        make_forget_job(forget_spec(&ulid, "bob"), JobMode::Batch),
+        Data::new(client_for(&fixture)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await
+    .expect("second forget doit réussir (skip idempotent)");
+
+    // Propriété 1 — l'index est réparé : la note n'est plus cherchable comme vivante.
+    assert!(
+        fixture
+            .index
+            .is_note_forgotten("main", &ulid)
+            .await
+            .expect("is_note_forgotten — après le second forget"),
+        "le second forget doit ré-affirmer la marque d'oubli dans l'index"
+    );
+
+    // Propriété 2 — la piste d'audit du PREMIER oubli est intacte.
+    let second = fixture
+        .vault
+        .read_note(note_id)
+        .await
+        .expect("relecture après oubli #2");
+    assert_eq!(
+        second.frontmatter.forgotten_by.as_deref(),
+        Some("alice"),
+        "la re-synchronisation ne doit PAS réattribuer l'oubli à l'acteur du second job"
+    );
+    assert_eq!(
+        second.frontmatter.forgotten_at,
+        Some(first_at),
+        "la re-synchronisation ne doit PAS réhorodater l'oubli initial"
     );
 }

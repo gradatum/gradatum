@@ -1,6 +1,6 @@
-//! Serveur MCP natif in-process — `gradatum-server` v0.7.1.
+//! Serveur MCP natif in-process de `gradatum-server`.
 //!
-//! Expose les 23 outils gradatum via le protocole MCP (Streamable HTTP),
+//! Expose les outils gradatum via le protocole MCP (Streamable HTTP), en
 //! réutilisant les `*_impl` de [`super::logic`] et les helpers métier existants.
 //!
 //! # Traversée TrustContext
@@ -17,15 +17,30 @@
 //!     .get::<TrustContext>()           // Parts HTTP → TrustContext Axum
 //! ```
 //!
-//! # Outils exposés (23)
+//! # Outils exposés
 //!
-//! Identiques au stub `gradatum-mcp-stub` (parité contractuelle) :
-//! `vault_search`, `vault_read`, `vault_list`, `vault_status`, `vault_graph`,
-//! `vault_links`, `vault_trace`, `vault_context`, `vault_timeline`,
-//! `vault_authors`, `vault_tags`, `vault_write`, `vault_classify`,
-//! `vault_downgrade`, `vault_history`, `vault_history_get`, `vault_restore`,
-//! `vault_diff`, `vault_forget`, `vault_lessons_recall`, `code_scope`,
-//! `vault_proactive_recall`, `vault_proactive_recall_feedback`.
+//! `tool_catalog` est l'autorité unique : c'est la déclaration réellement servie
+//! par `list_tools`, et le `match` de `dispatch_tool` en est le miroir exact
+//! (invariant tenu par le test `tool_catalog_declares_the_expected_tool_names`).
+//! Ni la liste des noms ni leur nombre ne sont recopiés ici — un cardinal ou une
+//! énumération écrits à la main se périment en silence à l'outil suivant, et une
+//! doc qui ment est pire qu'une doc absente.
+//!
+//! La relation avec le catalogue du stub `gradatum-mcp-stub` est désormais une propriété
+//! mesurée, et non plus une intention : `scripts/mcp-catalog-parity.sh` compare les deux
+//! catalogues servis et échoue sur toute divergence, dans les deux sens.
+//!
+//! Cette relation n'est PAS l'égalité. `job_status` est déclaré ici et absent du stub,
+//! parce qu'il est le seul outil de ce catalogue sans jumeau REST : il est servi
+//! in-process par [`crate::api_v1::jobs_v2::job_status_mcp`], dont le `JobStatusView` — et son champ
+//! décisif `terminal` — n'est sérialisé par aucune route HTTP. Un proxy stdio→REST n'a
+//! donc rien à appeler. L'écart est énuméré dans ce gate, avec une garde de péremption qui
+//! rougit sur trois signaux : une registration de route dont le chemin OU le handler nomme
+//! `job_status`, et l'apparition d'un second producteur de `JobStatusView` dans ce crate.
+//! Ce troisième signal est celui qui compte : toutes les routes de jobs étant namespacées
+//! `/jobs/{id}/…`, un jumeau REST peut parfaitement ne nommer `job_status` nulle part.
+//! La garde ne couvre PAS un jumeau qui servirait la même information sous un autre type —
+//! cet angle mort est écrit dans `scripts/mcp-catalog-parity.sh` et relève de la revue.
 //!
 //! # Sécurité
 //!
@@ -57,7 +72,8 @@ use tracing::instrument;
 
 use gradatum_core::{error::GradatumError, trust::TrustContext};
 use gradatum_dto::{
-    CodeScopeRequest, LessonsRecallRequest, ProactiveRecallFeedbackRequest, ProactiveRecallRequest,
+    CodeScopeRequest, CreateFeatureCardRequest, JobStatusRequest, LessonsRecallRequest,
+    ProactiveRecallFeedbackRequest, ProactiveRecallRequest, VaultArchivesListRequest,
     VaultClassifyRequest, VaultDiffRequest, VaultDowngradeRequest, VaultForgetRequest,
     VaultHistoryGetRequest, VaultHistoryRequest, VaultRestoreRequest,
 };
@@ -65,6 +81,7 @@ use gradatum_dto::{
 use crate::{
     api_v1::{
         code_scope::{code_scope_impl, validate_code_vault_id},
+        compact::{self, CompactBody},
         dto::{
             VaultContextRequest, VaultGraphRequest, VaultLinksRequest, VaultListRequest,
             VaultReadRequest, VaultSearchRequest, VaultTimelineRequest, VaultTraceRequest,
@@ -78,7 +95,7 @@ use crate::{
 
 // ── Type public du service MCP ────────────────────────────────────────────────
 
-/// Service MCP Streamable HTTP exposant les 23 outils gradatum.
+/// Service MCP Streamable HTTP exposant les outils gradatum (cf. `tool_catalog`).
 ///
 /// Construit via [`build_mcp_service`] et monté sous `/mcp` dans `main.rs`.
 ///
@@ -108,7 +125,7 @@ pub const MCP_BODY_LIMIT: usize = 512 * 1024;
 
 // ── Handler MCP ───────────────────────────────────────────────────────────────
 
-/// Handler MCP — implémente [`ServerHandler`] pour les 23 outils gradatum.
+/// Handler MCP — implémente [`ServerHandler`] pour les outils gradatum.
 ///
 /// Clone par session : `AppState` est `Arc`-backed, le clone est O(1).
 #[derive(Clone)]
@@ -148,8 +165,8 @@ impl GradatumMcpHandler {
         let args = args.unwrap_or(Value::Object(serde_json::Map::new()));
 
         // P1-1 (reviewer) : call site UNIQUE, AVANT le match.
-        // La map fermée de 23 clés filtre les noms inconnus (no-op) — pas besoin
-        // de 23 sites séparés dans les arms. Cardinalité bornée garantie par McpToolCounters.
+        // La map fermée de `McpToolCounters` filtre les noms inconnus (no-op) — pas
+        // besoin d'un site séparé par arm. Cardinalité bornée garantie par cette map.
         self.state.mcp_tool_counters.record(name);
 
         match name {
@@ -175,17 +192,31 @@ impl GradatumMcpHandler {
             // ── Outils read avec paramètres ───────────────────────────────────
             "vault_search" => {
                 let req: VaultSearchRequest = deserialize_args(args)?;
+                let want_compact = req.compact;
                 let res = logic::vault_search_impl(&self.state, &trust, req)
                     .await
                     .map_err(gradatum_error_to_mcp)?;
-                to_mcp_content(res)
+                if want_compact {
+                    to_mcp_content(CompactBody {
+                        compact: compact::render_search(&res),
+                    })
+                } else {
+                    to_mcp_content(res)
+                }
             }
             "vault_read" => {
                 let req: VaultReadRequest = deserialize_args(args)?;
+                let want_compact = req.compact;
                 let res = logic::vault_read_impl(&self.state, &trust, req)
                     .await
                     .map_err(gradatum_error_to_mcp)?;
-                to_mcp_content(res)
+                if want_compact {
+                    to_mcp_content(CompactBody {
+                        compact: compact::render_read(&res),
+                    })
+                } else {
+                    to_mcp_content(res)
+                }
             }
             "vault_list" => {
                 let req: VaultListRequest = deserialize_args(args)?;
@@ -224,23 +255,52 @@ impl GradatumMcpHandler {
             }
             "vault_timeline" => {
                 let req: VaultTimelineRequest = deserialize_args(args)?;
+                let want_compact = req.compact;
                 let res = logic::vault_timeline_impl(&self.state, &trust, req)
                     .await
                     .map_err(gradatum_error_to_mcp)?;
-                to_mcp_content(res)
+                if want_compact {
+                    to_mcp_content(CompactBody {
+                        compact: compact::render_timeline(&res),
+                    })
+                } else {
+                    to_mcp_content(res)
+                }
             }
             "vault_lessons_recall" => {
                 let req: LessonsRecallRequest = deserialize_args(args)?;
+                let want_compact = req.compact;
+                let class = req.class.clone();
                 let res = logic::lessons_recall_impl(&self.state, &trust, req)
                     .await
                     .map_err(gradatum_error_to_mcp)?;
-                to_mcp_content(res)
+                if want_compact {
+                    to_mcp_content(CompactBody {
+                        compact: compact::render_recall(&res, &class),
+                    })
+                } else {
+                    to_mcp_content(res)
+                }
             }
             // ── Outils write ──────────────────────────────────────────────────
             "vault_write" => {
                 let req: VaultWriteRequest = deserialize_args(args)?;
                 let request_id = ulid::Ulid::new().to_string();
-                let res = logic::vault_write_impl(&self.state, &trust, req, &request_id)
+                let res = logic::vault_write_impl(
+                    &self.state,
+                    &trust,
+                    req,
+                    &request_id,
+                    logic::FeatureWriteAuthority::External,
+                )
+                .await
+                .map_err(gradatum_error_to_mcp)?;
+                to_mcp_content(res)
+            }
+            "create_feature_card" => {
+                let req: CreateFeatureCardRequest = deserialize_args(args)?;
+                let request_id = ulid::Ulid::new().to_string();
+                let res = logic::create_feature_card_impl(&self.state, &trust, req, &request_id)
                     .await
                     .map_err(gradatum_error_to_mcp)?;
                 to_mcp_content(res)
@@ -296,6 +356,18 @@ impl GradatumMcpHandler {
                     .map_err(gradatum_error_to_mcp)?;
                 to_mcp_content(res)
             }
+            // ── Listing archives (F-100 1.6 — LECTURE SEULE) ──────────────────
+            //
+            // Seul l'accès en lecture au cycle delete/archive est exposé en MCP :
+            // l'agent PRÉPARE les commandes CLI opérateur. delete/restore/purge
+            // (mutations) ne sont JAMAIS ici (invariant fondateur F-100).
+            "vault_archives_list" => {
+                let req: VaultArchivesListRequest = deserialize_args(args)?;
+                let res = logic::vault_archives_list_impl(&self.state, &trust, req)
+                    .await
+                    .map_err(gradatum_error_to_mcp)?;
+                to_mcp_content(res)
+            }
             // ── Code scope (invariant sécurité N°1) ───────────────────────────
             "code_scope" => {
                 let req: CodeScopeRequest = deserialize_args(args)?;
@@ -304,7 +376,7 @@ impl GradatumMcpHandler {
                 if !validate_code_vault_id(&req.vault) {
                     return Err(ErrorData::invalid_params(
                         format!(
-                            "vault '{}' invalide pour code_scope : doit commencer par 'code-'",
+                            "vault '{}' invalid for code_scope: must start with 'code-'",
                             req.vault
                         ),
                         None,
@@ -331,9 +403,20 @@ impl GradatumMcpHandler {
                 // Feedback retourne Ok(()) — on émet un objet JSON vide (pattern 204→MCP).
                 Ok(CallToolResult::success(vec![Content::text("{}")]))
             }
+            // ── Job introspection (F-63 « tout MCP natif ») ───────────────────
+            // Expose l'état terminal réel d'un job async (`vault_write` rend 202 =
+            // enqueué, PAS écrit) — dernier maillon manquant pour confirmer une
+            // écriture sans retomber sur du curl. Lecture seule, instant T.
+            "job_status" => {
+                let req: JobStatusRequest = deserialize_args(args)?;
+                let view = crate::api_v1::jobs_v2::job_status_mcp(&self.state, &trust, &req.job_id)
+                    .await
+                    .map_err(job_status_error_to_mcp)?;
+                to_mcp_content(view)
+            }
             _ => Err(ErrorData::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
-                format!("outil inconnu : {name}"),
+                format!("unknown tool: {name}"),
                 None,
             )),
         }
@@ -386,30 +469,34 @@ impl GradatumMcpHandler {
         if !trust.is_authenticated() {
             return None;
         }
-        let caller_sub = trust.subject().unwrap_or("");
+        let caller_sub = trust
+            .subject()
+            .map(gradatum_core::scope::AgentId::as_str)
+            .unwrap_or("");
         let authorized = caller_sub == logic::SOUL_PRIVILEGED_WRITER || caller_sub == agent;
         if !authorized {
             tracing::debug!(
                 caller = %caller_sub,
                 agent  = %agent,
-                "mcp::initialize: soul non autorisée — sub ne correspond pas à l'agent cible"
+                "mcp::initialize: soul not authorized — sub does not match target agent"
             );
             return None;
         }
         let req = VaultReadRequest {
             path: format!("identity/{agent}"),
             section: Some("identity".to_string()),
-            tenant_id: "main".to_string(),
+            tenant_id: Some(gradatum_core::scope::TenantId::new("main")),
+            compact: false,
         };
         match logic::vault_read_impl(&self.state, trust, req).await {
             Ok(resp) if !resp.content.is_empty() => {
-                tracing::debug!(agent = %agent, "mcp::initialize: soul chargée");
+                tracing::debug!(agent = %agent, "mcp::initialize: soul loaded");
                 Some(resp.content)
             }
             Ok(_) => {
                 tracing::debug!(
                     agent = %agent,
-                    "mcp::initialize: note soul vide — dégradé bootstrap"
+                    "mcp::initialize: empty soul note — degraded bootstrap"
                 );
                 None
             }
@@ -417,10 +504,45 @@ impl GradatumMcpHandler {
                 tracing::debug!(
                     agent = %agent,
                     error = %e,
-                    "mcp::initialize: vault_read soul KO — dégradé bootstrap"
+                    "mcp::initialize: vault_read soul read failed — degraded bootstrap"
                 );
                 None
             }
+        }
+    }
+
+    /// Négocie la version de protocole MCP à renvoyer au client (spec MCP « Lifecycle /
+    /// Version Negotiation »).
+    ///
+    /// - Version demandée **servable** par le SDK ([`ProtocolVersion::KNOWN_VERSIONS`]) →
+    ///   renvoyée à l'identique : client et serveur s'accordent sur cette version.
+    /// - Version **inconnue / non servable** → repli sur [`ProtocolVersion::LATEST`], la
+    ///   version la plus récente que le serveur sait servir (la spec impose de répondre
+    ///   « another protocol version it supports », « SHOULD be the latest »). Le repli est
+    ///   tracé en `WARN` — observable, jamais silencieux — puis le client décide de
+    ///   poursuivre ou de se déconnecter. Le handshake n'est **jamais** cassé (ADN 1).
+    ///
+    /// # Pourquoi cette négociation vit ici, et pas dans `rmcp`
+    ///
+    /// Le transport **Streamable HTTP** (celui exposé par gradatum sous `/mcp`) renvoie la
+    /// `protocol_version` du handler **verbatim** — il ne renégocie pas (contrairement au
+    /// transport stdio `serve_server`, qui, lui, ajuste la version après coup). Comme
+    /// [`Self::get_info`] annonce inconditionnellement `LATEST`, sans cette négociation tout
+    /// client parlant une version supportée mais **antérieure** à `LATEST` (ex. Claude
+    /// Desktop en `2025-06-18`) était rejeté définitivement. C'est donc ici l'unique point
+    /// de négociation côté serveur HTTP.
+    #[must_use]
+    fn negotiate_protocol_version(requested: &ProtocolVersion) -> ProtocolVersion {
+        if ProtocolVersion::KNOWN_VERSIONS.contains(requested) {
+            requested.clone()
+        } else {
+            tracing::warn!(
+                requested = %requested,
+                served = %ProtocolVersion::LATEST,
+                "mcp::initialize: unsupported protocol version — falling back to the latest \
+                 version served (the client may disconnect, MCP Version Negotiation spec)"
+            );
+            ProtocolVersion::LATEST
         }
     }
 }
@@ -456,6 +578,13 @@ impl ServerHandler for GradatumMcpHandler {
         // 1. Construire l'info de base (statique, toujours valide).
         let mut info = self.get_info();
 
+        // 1bis. Négocier la version de protocole avec le client (spec MCP Lifecycle).
+        // `get_info()` annonce inconditionnellement `LATEST` ; le transport Streamable HTTP
+        // renvoie cette version verbatim (aucune renégociation côté rmcp), donc sans cet
+        // ajustement un client sur une version supportée mais antérieure serait rejeté.
+        info =
+            info.with_protocol_version(Self::negotiate_protocol_version(&request.protocol_version));
+
         // 2. Résoudre l'agent depuis le header `X-Gradatum-Agent` (défaut "main").
         let agent = Self::requested_agent(&context);
         tracing::Span::current().record("agent", agent.as_str());
@@ -474,77 +603,36 @@ impl ServerHandler for GradatumMcpHandler {
         Ok(info)
     }
 
-    #[instrument(skip(self, ctx), fields(tool_count = 23))]
+    // `tool_count` est déclaré vide puis RENSEIGNÉ depuis le catalogue réellement
+    // servi. Il portait un `26` écrit en dur : un compte gravé dans un champ de
+    // trace ment au premier outil ajouté, en silence, dans les logs — et un champ
+    // de trace qui ment est pire qu'un champ absent. Le dériver ne coûte rien ici :
+    // `tool_catalog()` est de toute façon appelé dans le corps.
+    // Non renseigné sur le chemin non-authentifié : aucun catalogue n'y est
+    // construit, donc rien à compter — un champ absent y est la mesure honnête.
+    #[instrument(skip(self, ctx), fields(tool_count))]
     async fn list_tools(
         &self,
         _params: Option<rmcp::model::PaginatedRequestParams>,
         ctx: RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        // F-01 : `list_tools` divulguerait sinon le catalogue des 23 outils (noms +
+        // F-01 : `list_tools` divulguerait sinon le catalogue complet (noms +
         // schémas JSON) à tout client LAN non authentifié. Même garde que `call_tool`.
         let trust = Self::trust_from_ctx(&ctx);
         if !trust.is_authenticated() {
             return Err(ErrorData::new(
                 rmcp::model::ErrorCode::INVALID_REQUEST,
-                "non authentifié",
+                "not authenticated",
                 None,
             ));
         }
 
+        let tools = tool_catalog();
+        tracing::Span::current().record("tool_count", tools.len());
+
         Ok(ListToolsResult {
             meta: None,
-            tools: vec![
-                tool_def::<VaultSearchRequest>(
-                    "vault_search",
-                    "Recherche sémantique et BM25 dans le vault",
-                ),
-                tool_def::<VaultReadRequest>("vault_read", "Lit une note par ID ou locus"),
-                tool_def::<VaultListRequest>(
-                    "vault_list",
-                    "Liste les notes avec filtres et pagination",
-                ),
-                tool_def_no_params("vault_status", "Statut du vault (health, counters)"),
-                tool_def::<VaultGraphRequest>("vault_graph", "Graphe de liens entre notes"),
-                tool_def::<VaultLinksRequest>("vault_links", "Liens entrants/sortants d'une note"),
-                tool_def::<VaultTraceRequest>("vault_trace", "Trace de propagation d'une note"),
-                tool_def::<VaultContextRequest>("vault_context", "Contexte étendu d'une note"),
-                tool_def::<VaultTimelineRequest>("vault_timeline", "Timeline des notes"),
-                tool_def_no_params("vault_authors", "Liste des auteurs du vault"),
-                tool_def_no_params("vault_tags", "Liste des tags du vault"),
-                tool_def::<VaultWriteRequest>(
-                    "vault_write",
-                    "Écrit ou met à jour une note (async 202)",
-                ),
-                tool_def::<VaultClassifyRequest>(
-                    "vault_classify",
-                    "Classifie une note (heuristique)",
-                ),
-                tool_def::<VaultDowngradeRequest>(
-                    "vault_downgrade",
-                    "Rétrograde le statut d'une note",
-                ),
-                tool_def::<VaultHistoryRequest>("vault_history", "Historique CoW d'une note"),
-                tool_def::<VaultHistoryGetRequest>(
-                    "vault_history_get",
-                    "Récupère une version historique",
-                ),
-                tool_def::<VaultRestoreRequest>("vault_restore", "Restaure une version historique"),
-                tool_def::<VaultDiffRequest>("vault_diff", "Diff entre deux versions d'une note"),
-                tool_def::<VaultForgetRequest>(
-                    "vault_forget",
-                    "Oubli sémantique (dry-run + confirm)",
-                ),
-                tool_def::<LessonsRecallRequest>("vault_lessons_recall", "Rappel de leçons BM25"),
-                tool_def::<CodeScopeRequest>("code_scope", "Scope sélectif de code source"),
-                tool_def::<ProactiveRecallRequest>(
-                    "vault_proactive_recall",
-                    "Rappel proactif de mémoire (F-46)",
-                ),
-                tool_def::<ProactiveRecallFeedbackRequest>(
-                    "vault_proactive_recall_feedback",
-                    "Feedback rappel proactif (F-46)",
-                ),
-            ],
+            tools,
             next_cursor: None,
         })
     }
@@ -561,7 +649,7 @@ impl ServerHandler for GradatumMcpHandler {
         if !trust.is_authenticated() {
             return Err(ErrorData::new(
                 rmcp::model::ErrorCode::INVALID_REQUEST,
-                "non authentifié",
+                "not authenticated",
                 None,
             ));
         }
@@ -576,6 +664,63 @@ impl ServerHandler for GradatumMcpHandler {
 // définies dans le trait ServerHandler via la macro server_handler_methods!().
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Catalogue des outils MCP déclarés par `list_tools` — SSOT de la surface exposée.
+///
+/// Extrait de `list_tools` pour être appelable depuis un test : la déclaration est
+/// entièrement statique, seule la garde d'authentification qui la précède ne l'est pas.
+/// Sans cette extraction, toute assertion sur la liste d'outils exige un `AppState` et un
+/// `RequestContext` complets — c'est ce coût qui avait fait dériver le test de parité vers
+/// une tautologie (un tableau écrit à la main, comparé à lui-même, vert quoi que le serveur
+/// expose).
+fn tool_catalog() -> Vec<Tool> {
+    vec![
+        tool_def::<VaultSearchRequest>("vault_search", "Semantic and BM25 search in the vault"),
+        tool_def::<VaultReadRequest>("vault_read", "Read a note by ID or locus"),
+        tool_def::<VaultListRequest>("vault_list", "List notes with filters and pagination"),
+        tool_def_no_params("vault_status", "Vault status (health, counters)"),
+        tool_def::<VaultGraphRequest>("vault_graph", "Link graph between notes"),
+        tool_def::<VaultLinksRequest>("vault_links", "Inbound/outbound links of a note"),
+        tool_def::<VaultTraceRequest>("vault_trace", "Propagation trace of a note"),
+        tool_def::<VaultContextRequest>("vault_context", "Extended context of a note"),
+        tool_def::<VaultTimelineRequest>("vault_timeline", "Notes timeline"),
+        tool_def_no_params("vault_authors", "List vault authors"),
+        tool_def_no_params("vault_tags", "List vault tags"),
+        tool_def::<VaultWriteRequest>("vault_write", "Write or update a note (async 202)"),
+        tool_def::<CreateFeatureCardRequest>(
+            "create_feature_card",
+            "Create a project-map feature card whose F-XX number is assigned by the \
+             server. Body carries the 5 non-feature roles (project/status/kind/release/\
+             version) and must NOT contain a [[feature:…]] link. Async: returns \
+             { feature, number, job_id, note_id, poll_url } — poll job_status.",
+        ),
+        tool_def::<VaultClassifyRequest>("vault_classify", "Classify a note (heuristic)"),
+        tool_def::<VaultDowngradeRequest>("vault_downgrade", "Downgrade a note's status"),
+        tool_def::<VaultHistoryRequest>("vault_history", "CoW history of a note"),
+        tool_def::<VaultHistoryGetRequest>("vault_history_get", "Retrieve a historical version"),
+        tool_def::<VaultRestoreRequest>("vault_restore", "Restore a historical version"),
+        tool_def::<VaultDiffRequest>("vault_diff", "Diff between two versions of a note"),
+        tool_def::<VaultForgetRequest>("vault_forget", "Semantic forget (dry-run + confirm)"),
+        tool_def::<VaultArchivesListRequest>(
+            "vault_archives_list",
+            "List archived notes (READ-ONLY) — filters + pagination, to prepare operator CLI commands",
+        ),
+        tool_def::<LessonsRecallRequest>("vault_lessons_recall", "BM25 lessons recall"),
+        tool_def::<CodeScopeRequest>("code_scope", "Selective source-code scope"),
+        tool_def::<ProactiveRecallRequest>(
+            "vault_proactive_recall",
+            "Proactive memory recall (F-46)",
+        ),
+        tool_def::<ProactiveRecallFeedbackRequest>(
+            "vault_proactive_recall_feedback",
+            "Proactive recall feedback (F-46)",
+        ),
+        tool_def::<JobStatusRequest>(
+            "job_status",
+            "State of an async job by job_id. Returns { status, terminal, error, conflict, result_note }: `terminal=true` (Done/DLQ/Cancelled/Conflict) → conclude, `terminal=false` (Pending/Running/Waiting/Failed) → keep polling. Snapshot at instant T — the caller re-polls, no server-side wait.",
+        ),
+    ]
+}
 
 /// Construit un [`Tool`] avec schéma JSON dérivé du type `T`.
 ///
@@ -602,7 +747,7 @@ fn tool_def_no_params(name: &'static str, description: &'static str) -> Tool {
 /// Retourne [`ErrorData::invalid_params`] si la désérialisation échoue.
 fn deserialize_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, ErrorData> {
     serde_json::from_value(args)
-        .map_err(|e| ErrorData::invalid_params(format!("arguments invalides : {e}"), None))
+        .map_err(|e| ErrorData::invalid_params(format!("invalid arguments: {e}"), None))
 }
 
 /// Sérialise un résultat en [`CallToolResult`] avec un unique contenu texte JSON.
@@ -612,8 +757,8 @@ fn deserialize_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Er
 /// Retourne [`ErrorData::internal_error`] si la sérialisation échoue.
 fn to_mcp_content<T: Serialize>(val: T) -> Result<CallToolResult, ErrorData> {
     let json = serde_json::to_string(&val).map_err(|e| {
-        tracing::error!(error = %e, "mcp: sérialisation réponse échouée");
-        ErrorData::internal_error("erreur interne", None)
+        tracing::error!(error = %e, "mcp: response serialization failed");
+        ErrorData::internal_error("internal error", None)
     })?;
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
@@ -626,33 +771,33 @@ fn gradatum_error_to_mcp(err: GradatumError) -> ErrorData {
     match err {
         GradatumError::Unauthorized => ErrorData::new(
             rmcp::model::ErrorCode::INVALID_REQUEST,
-            "non authentifié",
+            "not authenticated",
             None,
         ),
         GradatumError::Forbidden(msg) => ErrorData::new(
             rmcp::model::ErrorCode::INVALID_REQUEST,
-            format!("accès refusé : {msg}"),
+            format!("access denied: {msg}"),
             None,
         ),
         GradatumError::InvalidInput(msg) => ErrorData::invalid_params(msg, None),
         GradatumError::Validation(e) => ErrorData::invalid_params(e.to_string(), None),
         GradatumError::NoteNotFound(_) => ErrorData::new(
             rmcp::model::ErrorCode::INVALID_PARAMS,
-            "note introuvable",
+            "note not found",
             None,
         ),
         GradatumError::VaultNotFound(_) => ErrorData::new(
             rmcp::model::ErrorCode::INVALID_PARAMS,
-            "vault introuvable",
+            "vault not found",
             None,
         ),
         GradatumError::Conflict(msg) => ErrorData::new(
             rmcp::model::ErrorCode::INVALID_REQUEST,
-            format!("conflit : {msg}"),
+            format!("conflict: {msg}"),
             None,
         ),
         GradatumError::InvalidStatusTransition { from, to } => ErrorData::invalid_params(
-            format!("transition de statut invalide : {from:?} → {to:?}"),
+            format!("invalid status transition: {from:?} → {to:?}"),
             None,
         ),
         // Erreurs internes — message générique (anti-fuite chemin/stockage).
@@ -668,9 +813,40 @@ fn gradatum_error_to_mcp(err: GradatumError) -> ErrorData {
         | GradatumError::Config(_)
         | GradatumError::VaultOnNfs { .. }
         | GradatumError::Inference(_) => {
-            tracing::error!(error = %err, "mcp: erreur interne");
-            ErrorData::internal_error("erreur interne", None)
+            tracing::error!(error = %err, "mcp: internal error");
+            ErrorData::internal_error("internal error", None)
         }
+    }
+}
+
+/// Maps the [`StatusCode`](http::StatusCode) returned by [`jobs_v2::job_status_mcp`] to an
+/// MCP [`ErrorData`].
+///
+/// `job_status_mcp` reuses the HTTP handler's `StatusCode` contract verbatim (zero auth
+/// drift with `get_job_v2`); this bridge translates it to MCP error codes without leaking
+/// internal detail — `500` and any unexpected code collapse to a generic `"internal error"`.
+fn job_status_error_to_mcp(status: http::StatusCode) -> ErrorData {
+    match status {
+        http::StatusCode::BAD_REQUEST => {
+            ErrorData::invalid_params("invalid job_id: not a valid ULID", None)
+        }
+        http::StatusCode::NOT_FOUND => ErrorData::new(
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "job not found",
+            None,
+        ),
+        http::StatusCode::FORBIDDEN => ErrorData::new(
+            rmcp::model::ErrorCode::INVALID_REQUEST,
+            "access denied",
+            None,
+        ),
+        http::StatusCode::UNAUTHORIZED => ErrorData::new(
+            rmcp::model::ErrorCode::INVALID_REQUEST,
+            "not authenticated",
+            None,
+        ),
+        // 500 + tout code inattendu → message générique (anti-fuite, parité gradatum_error_to_mcp).
+        _ => ErrorData::internal_error("internal error", None),
     }
 }
 
@@ -692,7 +868,7 @@ fn gradatum_error_to_mcp(err: GradatumError) -> ErrorData {
 ///   jamais sollicité par rmcp en mode stateless (zéro changement de type, pas
 ///   de piège générique).
 ///
-/// Ce mode élimine le décrochage des 23 outils MCP côté Claude Code : les sessions
+/// Ce mode élimine le décrochage des outils MCP côté Claude Code : les sessions
 /// in-memory étaient perdues à chaque redémarrage du serveur, forçant une
 /// reconnexion manuelle (`/mcp → Reconnect`). En stateless, chaque POST est
 /// indépendant — aucune session n'est maintenue, aucune n'est perdue.
@@ -732,47 +908,82 @@ pub fn build_mcp_service(state: AppState) -> (GradatumMcpService, CancellationTo
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
-    /// Le nombre d'outils déclarés dans `list_tools` doit correspondre au stub.
+    /// `tool_catalog` — la déclaration réellement servie par `list_tools` — expose
+    /// exactement l'ensemble de noms attendu.
     ///
-    /// Régression R2 : parité contractuelle stub ↔ serveur natif.
+    /// Compare des **ENSEMBLES**, jamais un cardinal. Un compte gravé ne dit pas QUEL
+    /// outil a bougé et se périme à chaque évolution (24 → 25 → 26 en une semaine) ;
+    /// pire, il reste vert sur un renommage à effectif constant. Ici un ajout, un
+    /// retrait ET un renommage font rougir, et le message nomme le delta des deux côtés.
     ///
-    /// Marqué ignore car nécessite AppState de test complet.
-    /// Ce test peut être exécuté en isolation via `--ignored` une fois l'infra test disponible.
+    /// Ce test appelle la fonction de production. Le prédécesseur
+    /// (`list_tools_count_is_25`) n'appelait rien : il vérifiait qu'un tableau de 25
+    /// éléments écrit à la main en contenait 25 — vert quoi que le serveur expose.
     #[test]
-    fn list_tools_count_is_23() {
-        // Vérification statique : le vecteur `list_tools` dans le code retourne 23 outils.
-        // Test de compilation uniquement — pas d'AppState requis.
-        // La vérification runtime est couverte par list_tools_names_match_stub_runtime.
-        const EXPECTED: usize = 23;
-        // Les 23 noms d'outils attendus.
-        let expected_names = [
-            "vault_search",
-            "vault_read",
-            "vault_list",
-            "vault_status",
-            "vault_graph",
-            "vault_links",
-            "vault_trace",
-            "vault_context",
-            "vault_timeline",
+    fn tool_catalog_declares_the_expected_tool_names() {
+        let declared: BTreeSet<String> =
+            tool_catalog().iter().map(|t| t.name.to_string()).collect();
+
+        let expected: BTreeSet<String> = [
+            "code_scope",
+            "create_feature_card",
+            "job_status",
+            "vault_archives_list",
             "vault_authors",
-            "vault_tags",
-            "vault_write",
             "vault_classify",
+            "vault_context",
+            "vault_diff",
             "vault_downgrade",
+            "vault_forget",
+            "vault_graph",
             "vault_history",
             "vault_history_get",
-            "vault_restore",
-            "vault_diff",
-            "vault_forget",
             "vault_lessons_recall",
-            "code_scope",
+            "vault_links",
+            "vault_list",
             "vault_proactive_recall",
             "vault_proactive_recall_feedback",
-        ];
-        assert_eq!(expected_names.len(), EXPECTED);
+            "vault_read",
+            "vault_restore",
+            "vault_search",
+            "vault_status",
+            "vault_tags",
+            "vault_timeline",
+            "vault_trace",
+            "vault_write",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let missing: Vec<&String> = expected.difference(&declared).collect();
+        let extra: Vec<&String> = declared.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "surface d'outils MCP divergente — manquants (attendus, non déclarés) : {missing:?} ; \
+             en trop (déclarés, non attendus) : {extra:?}. Tout ajout/retrait/renommage d'outil \
+             doit être répercuté ici ET dans la parité du stub."
+        );
+    }
+
+    /// Aucun nom d'outil n'est déclaré deux fois.
+    ///
+    /// Le test d'ensemble ci-dessus dédoublonne par construction : un doublon y serait
+    /// invisible. Cette assertion sur le cardinal du `Vec` brut ferme cet angle mort —
+    /// c'est le seul endroit où un compte est légitime, car il est **dérivé**, jamais gravé.
+    #[test]
+    fn tool_catalog_has_no_duplicate_names() {
+        let catalog = tool_catalog();
+        let unique: BTreeSet<String> = catalog.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(
+            unique.len(),
+            catalog.len(),
+            "au moins un nom d'outil est déclaré plusieurs fois dans tool_catalog"
+        );
     }
 
     /// Les erreurs Storage ne fuient pas de détails (anti-fuite chemin/stockage).
@@ -785,7 +996,7 @@ mod tests {
             "message d'erreur Storage ne doit pas exposer les détails : {:?}",
             mcp_err.message
         );
-        assert_eq!(mcp_err.message, "erreur interne");
+        assert_eq!(mcp_err.message, "internal error");
     }
 
     /// Les erreurs Io ne fuient pas de détails.
@@ -796,14 +1007,14 @@ mod tests {
             "/etc/shadow",
         ));
         let mcp_err = gradatum_error_to_mcp(err);
-        assert_eq!(mcp_err.message, "erreur interne");
+        assert_eq!(mcp_err.message, "internal error");
     }
 
     /// Les erreurs Unauthorized mappent vers le bon message.
     #[test]
     fn error_mapping_unauthorized() {
         let mcp_err = gradatum_error_to_mcp(GradatumError::Unauthorized);
-        assert_eq!(mcp_err.message, "non authentifié");
+        assert_eq!(mcp_err.message, "not authenticated");
     }
 
     /// Les erreurs InvalidInput exposent le message utilisateur.
@@ -854,9 +1065,10 @@ mod tests {
         TrustContext::BearerToken {
             kid: "test-kid".to_string(),
             aud: "gradatum".to_string(),
-            sub: "test-agent".to_string(),
+            sub: "test-agent".into(),
             scopes: vec!["read".to_string(), "write".to_string()],
-            tenant_id: "main".to_string(),
+            tenant_id: "main".into(),
+            jti: None,
         }
     }
 
@@ -970,7 +1182,7 @@ mod tests {
         let result = handler.soul_instructions("main", &trust).await;
         assert!(
             result.is_none(),
-            "non authentifié → soul_instructions doit retourner None"
+            "not authenticated → soul_instructions doit retourner None"
         );
     }
 
@@ -986,9 +1198,10 @@ mod tests {
         let trust = TrustContext::BearerToken {
             kid: "test-kid".to_string(),
             aud: "gradatum".to_string(),
-            sub: "frontend".to_string(),
+            sub: "frontend".into(),
             scopes: vec!["read".to_string()],
-            tenant_id: "main".to_string(),
+            tenant_id: "main".into(),
+            jti: None,
         };
         // frontend ne peut lire que identity/frontend, pas identity/main.
         let result = handler.soul_instructions("main", &trust).await;
@@ -1010,9 +1223,10 @@ mod tests {
         let trust = TrustContext::BearerToken {
             kid: "test-kid".to_string(),
             aud: "gradatum".to_string(),
-            sub: "main-agent".to_string(),
+            sub: "main-agent".into(),
             scopes: vec!["read".to_string()],
-            tenant_id: "main".to_string(),
+            tenant_id: "main".into(),
+            jti: None,
         };
         // main-agent autorisé mais vault vide → KO → None.
         let result = handler.soul_instructions("main", &trust).await;
@@ -1034,9 +1248,10 @@ mod tests {
         let trust = TrustContext::BearerToken {
             kid: "test-kid".to_string(),
             aud: "gradatum".to_string(),
-            sub: "backend".to_string(),
+            sub: "backend".into(),
             scopes: vec!["read".to_string()],
-            tenant_id: "main".to_string(),
+            tenant_id: "main".into(),
+            jti: None,
         };
         // backend lit identity/backend (sub == agent), autorisé, mais note absente → None.
         let result = handler.soul_instructions("backend", &trust).await;
@@ -1133,7 +1348,7 @@ Tu es le Général en Chef. Ton: direct, FR.
         // upsert_note_title aligne la colonne `title` avec le chemin identity/<agent>.
         state
             .search
-            .upsert_note_title(&note.id, title)
+            .upsert_note_title(note.frontmatter.vault_id.as_str(), &note.id, title)
             .await
             .expect("upsert_note_title — soul_instructions_with_h1_present_returns_some");
 
@@ -1141,9 +1356,10 @@ Tu es le Général en Chef. Ton: direct, FR.
         let trust = TrustContext::BearerToken {
             kid: "test-kid".to_string(),
             aud: "gradatum".to_string(),
-            sub: "main-agent".to_string(),
+            sub: "main-agent".into(),
             scopes: vec!["read".to_string()],
-            tenant_id: "main".to_string(),
+            tenant_id: "main".into(),
+            jti: None,
         };
 
         let result = handler.soul_instructions("main", &trust).await;

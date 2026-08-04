@@ -1,14 +1,15 @@
-//! SSOT helpers pour les chemins canoniques du layout Gradatum.
+//! Single source of truth for the canonical paths of the Gradatum on-disk layout.
 //!
-//! Toute dérivation de chemin à partir de `storage.root` ou `vault_dir` DOIT passer
-//! par ces helpers. Un `root.join(...)` manuel dans `main.rs`, worker, vault ou admin
-//! est interdit — ce module est la source unique de vérité du layout disque.
+//! Every path derived from `storage.root` or from a `vault/` directory MUST go through
+//! these helpers. Hand-written `root.join(...)` expressions in the server, the worker,
+//! the vault or the admin CLI are forbidden — this module is the only place where the
+//! on-disk layout is spelled out.
 //!
 //! ## Layout
 //!
 //! ```text
-//! {storage_root}/                    ← argument de vault_index_path / queue_db_path
-//!   vault/                           ← argument de vault_dir_index_path
+//! {storage_root}/                    ← argument of vault_index_path / queue_db_path
+//!   vault/                           ← argument of vault_dir_index_path
 //!     .gradatum/
 //!       index.db          ← vault_index_path(storage_root)
 //!                            vault_dir_index_path(storage_root/vault)
@@ -16,15 +17,15 @@
 //!     queue.sqlite        ← queue_db_path(storage_root)
 //! ```
 //!
-//! ## Quelle fonction utiliser ?
+//! ## Which helper to call
 //!
-//! | Contexte                                     | Fonction                        |
-//! |----------------------------------------------|---------------------------------|
-//! | server, worker, admin avec `storage.root`    | `vault_index_path(root)`        |
-//! | registry, worker index_marker avec `vault/`  | `vault_dir_index_path(vault_dir)` |
-//! | server, worker, admin avec `storage.root`    | `queue_db_path(root)`           |
+//! | Context                                        | Helper                            |
+//! |------------------------------------------------|-----------------------------------|
+//! | server, worker, admin holding `storage.root`   | `vault_index_path(root)`          |
+//! | registry, worker index marker holding `vault/` | `vault_dir_index_path(vault_dir)` |
+//! | server, worker, admin holding `storage.root`   | `queue_db_path(root)`             |
 //!
-//! ## Invariants garantis par les tests golden
+//! ## Invariants pinned by the golden tests
 //!
 //! `vault_index_path(Path::new("/var/lib/gradatum"))
 //!   == PathBuf::from("/var/lib/gradatum/vault/.gradatum/index.db")`
@@ -37,15 +38,15 @@
 
 use std::path::{Path, PathBuf};
 
-/// Chemin canonique de l'index SQLite FTS5, depuis `storage.root`.
+/// Canonical path of the FTS5 SQLite index, derived from `storage.root`.
 ///
-/// Doit être utilisé partout où un composant a besoin de localiser
-/// `index.db` à partir de `storage.root`. Jamais de `root.join(...)` manuel.
+/// Use it wherever a component has to locate `index.db` from `storage.root`;
+/// never write `root.join(...)` by hand.
 ///
-/// Pour les composants qui reçoivent directement le répertoire `vault/`
-/// (registry, index_marker worker), voir [`vault_dir_index_path`].
+/// Components that already hold the `vault/` directory (the registry, the worker
+/// index marker) should call [`vault_dir_index_path`] instead.
 ///
-/// # Exemple
+/// # Example
 ///
 /// ```
 /// use std::path::{Path, PathBuf};
@@ -59,15 +60,15 @@ pub fn vault_index_path(root: &Path) -> PathBuf {
     root.join("vault").join(".gradatum").join("index.db")
 }
 
-/// Chemin canonique de l'index SQLite FTS5, depuis le répertoire `vault/`.
+/// Canonical path of the FTS5 SQLite index, derived from the `vault/` directory.
 ///
-/// À utiliser quand le contexte dispose du répertoire `vault/` directement
-/// (ex: `Vault::create`/`Vault::open` dans `gradatum-vault`, ou l'index_marker
-/// du worker qui reçoit `--vault`). Équivalent à `vault_dir.join(".gradatum/index.db")`.
+/// Use it when the caller already holds the `vault/` directory (for instance
+/// `Vault::create`/`Vault::open` in `gradatum-vault`, or the worker index marker
+/// fed by `--vault`). Equivalent to `vault_dir.join(".gradatum/index.db")`.
 ///
-/// Jamais de `.join(".gradatum").join("index.db")` manuel — utiliser ce helper.
+/// Never write `.join(".gradatum").join("index.db")` by hand — call this helper.
 ///
-/// # Exemple
+/// # Example
 ///
 /// ```
 /// use std::path::{Path, PathBuf};
@@ -81,12 +82,12 @@ pub fn vault_dir_index_path(vault_dir: &Path) -> PathBuf {
     vault_dir.join(".gradatum").join("index.db")
 }
 
-/// Chemin canonique de la queue SQLite.
+/// Canonical path of the SQLite job queue.
 ///
-/// Doit être utilisé partout où un composant a besoin de localiser
-/// `queue.sqlite` à partir de `storage.root`. Jamais de `root.join(...)` manuel.
+/// Use it wherever a component has to locate `queue.sqlite` from `storage.root`;
+/// never write `root.join(...)` by hand.
 ///
-/// # Exemple
+/// # Example
 ///
 /// ```
 /// use std::path::{Path, PathBuf};
@@ -98,6 +99,30 @@ pub fn vault_dir_index_path(vault_dir: &Path) -> PathBuf {
 #[must_use]
 pub fn queue_db_path(root: &Path) -> PathBuf {
     root.join("db").join("queue.sqlite")
+}
+
+/// Canonical configuration directory, derived from `storage.root`.
+///
+/// It holds, among others, `jwt-signing-key.secret` (the JWT signing key),
+/// `admin.bearer.txt`, `bearer.toml` and `server.toml`.
+///
+/// The server and `gradatum-admin` MUST both derive that directory through this
+/// helper: if they disagree, the CLI signs tokens with a key the server does not
+/// hold, and the server answers `401` on an operator path that the documentation
+/// says should work.
+///
+/// # Example
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+/// use gradatum_core::paths::config_dir;
+///
+/// let p = config_dir(Path::new("/var/lib/gradatum"));
+/// assert_eq!(p, PathBuf::from("/var/lib/gradatum/config"));
+/// ```
+#[must_use]
+pub fn config_dir(root: &Path) -> PathBuf {
+    root.join("config")
 }
 
 #[cfg(test)]
@@ -172,6 +197,20 @@ mod tests {
         assert_eq!(
             queue_db_path(Path::new("/tmp/test-vault")),
             PathBuf::from("/tmp/test-vault/db/queue.sqlite"),
+        );
+    }
+
+    /// Test golden — invariant du répertoire de config (clé JWT partagée server/admin).
+    ///
+    /// Si ce test échoue, la clé de signature JWT change de place : le serveur et
+    /// `gradatum-admin token issue` se désynchronisent et tous les jetons émis par
+    /// la CLI sont rejetés en 401.
+    #[test]
+    fn config_dir_golden() {
+        assert_eq!(
+            config_dir(Path::new("/var/lib/gradatum")),
+            PathBuf::from("/var/lib/gradatum/config"),
+            "invariant layout config/ — toute dérive = split-brain clé JWT"
         );
     }
 }

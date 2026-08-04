@@ -9,22 +9,46 @@
 //! - Timeout: real `elapsed_secs` in `LlmError::Timeout`
 //! - SmartRouter: alias default parameters + `AgentAware` overrides
 //! - VaultAware hook: `QaEvent` fire-and-forget
+//!
+//! These modules — and the crate-root plumbing (`AppState`, `KNOWN_ROUTES`,
+//! `build_router`) — are internal service plumbing, exposed only for this crate's
+//! own integration tests. They are hidden from the rendered documentation and
+//! are **not** a stable public API (this crate is a service binary, not a
+//! reusable library).
 
+#[doc(hidden)]
 pub mod anthropic;
+#[doc(hidden)]
 pub mod auth;
+#[doc(hidden)]
 pub mod commons;
+#[doc(hidden)]
 pub mod config;
+#[doc(hidden)]
 pub mod cors;
+#[doc(hidden)]
 pub mod error;
+#[doc(hidden)]
 pub mod handlers;
+#[doc(hidden)]
 pub mod metrics;
+#[doc(hidden)]
 pub mod provider_pool;
+#[doc(hidden)]
 pub mod providers;
+#[doc(hidden)]
 pub mod rate_limit;
+#[doc(hidden)]
 pub mod registry;
+#[doc(hidden)]
+pub mod router;
+#[doc(hidden)]
 pub mod slot_passthrough;
+#[doc(hidden)]
 pub mod smart_router;
+#[doc(hidden)]
 pub mod token_counter;
+#[doc(hidden)]
 pub mod vault_aware;
 
 use std::path::Path;
@@ -47,6 +71,7 @@ use vault_aware::VaultAwareSender;
 /// preventing divergence between the two code paths.
 ///
 /// Update this list whenever a route is added or removed in `build_router`.
+#[doc(hidden)]
 pub const KNOWN_ROUTES: [&str; 8] = [
     "/v1/chat/completions",
     "/v1/embeddings",
@@ -65,6 +90,7 @@ pub const KNOWN_ROUTES: [&str; 8] = [
 /// - `local_embed_alias` : alias that activates local embedding mode (`None` = never)
 /// - `reranker`          : `Reranker` trait from gradatum-search (`None` = `/v1/rerank` disabled)
 /// - `vault_aware`       : fire-and-forget `QaEvent` sender (disabled if endpoint absent)
+#[doc(hidden)]
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -91,8 +117,12 @@ pub struct AppState {
     pub reranker: Option<Arc<dyn Reranker>>,
     /// VaultAware sender — no-op if the endpoint is not configured.
     pub vault_aware: VaultAwareSender,
+    /// Reasoning router — `Some` only when `[router].enabled = true`. `None` → the
+    /// gateway uses the no-think default (current behavior). Crate-internal detail.
+    pub(crate) router: Option<Arc<router::RouterClient>>,
 }
 
+#[doc(hidden)]
 impl AppState {
     /// Builds the shared state from a config — production path.
     ///
@@ -107,21 +137,21 @@ impl AppState {
                 Ok(token) if !token.is_empty() => {
                     tracing::info!(
                         env_var = %env_name,
-                        "authentification Bearer inbound activée"
+                        "inbound Bearer authentication enabled"
                     );
                     Some(Arc::new(SecretString::from(token)))
                 }
                 Ok(_) => {
                     tracing::warn!(
                         env_var = %env_name,
-                        "bearer_token_env présent mais vide — auth désactivée"
+                        "bearer_token_env present but empty — auth disabled"
                     );
                     None
                 }
                 Err(_) => {
                     tracing::warn!(
                         env_var = %env_name,
-                        "bearer_token_env non défini — auth désactivée"
+                        "bearer_token_env not set — auth disabled"
                     );
                     None
                 }
@@ -138,9 +168,9 @@ impl AppState {
             tracing::warn!(
                 path = %db_path.display(),
                 error = %e,
-                "impossible d'ouvrir le registre SQLite — utilisation d'un db en mémoire"
+                "cannot open SQLite registry — using an in-memory db"
             );
-            Registry::new(Path::new(":memory:")).expect("Registry en mémoire impossible")
+            Registry::new(Path::new(":memory:")).expect("cannot create in-memory Registry")
         });
 
         // Metrics allowlists — bound label cardinality to prevent unbounded memory growth.
@@ -163,14 +193,23 @@ impl AppState {
         let trust_localhost = config.server.trust_localhost;
 
         let vault_aware_cfg = Arc::new(config.vault_aware.clone());
-        let vault_aware = vault_aware::start_vault_aware_task(vault_aware_cfg)
-            .unwrap_or_else(|e| {
+        let vault_aware =
+            vault_aware::start_vault_aware_task(vault_aware_cfg).unwrap_or_else(|e| {
                 tracing::warn!(
                     error = %e,
-                    "construction client HTTP vault_aware impossible — hook désactivé (TLS absent ?)"
+                    "cannot build vault_aware HTTP client — hook disabled (TLS missing?)"
                 );
                 vault_aware::VaultAwareSender::disabled()
             });
+
+        // Reasoning router — built only when `[router].enabled = true`.
+        let router = router::RouterClient::from_config(&config.router).map(Arc::new);
+        if router.is_some() {
+            tracing::info!(
+                endpoint = %config.router.endpoint,
+                "reasoning router enabled (curator + pre-classifier)"
+            );
+        }
 
         Self {
             config: Arc::new(config),
@@ -184,6 +223,7 @@ impl AppState {
             local_embed_alias: None,
             reranker: None,
             vault_aware,
+            router,
         }
     }
 
@@ -192,7 +232,7 @@ impl AppState {
         let providers = ProviderPool::from_config(&config);
         let providers_count = providers.len();
         let registry = Registry::new(Path::new(":memory:"))
-            .expect("Registry en mémoire pour tests impossible");
+            .expect("cannot create in-memory Registry for tests");
         let known_aliases: std::collections::HashSet<String> =
             config.aliases.keys().cloned().collect();
         // KNOWN_ROUTES — single source of truth (see const above).
@@ -209,6 +249,15 @@ impl AppState {
         let rate_limiter = Arc::new(RateLimiter::new(config.server.rate_limit_per_minute));
         let trust_localhost = config.server.trust_localhost;
 
+        // Reasoning router — built only when `[router].enabled = true`.
+        let router = router::RouterClient::from_config(&config.router).map(Arc::new);
+        if router.is_some() {
+            tracing::info!(
+                endpoint = %config.router.endpoint,
+                "reasoning router enabled (curator + pre-classifier)"
+            );
+        }
+
         Self {
             config: Arc::new(config),
             providers,
@@ -221,6 +270,7 @@ impl AppState {
             local_embed_alias: None,
             reranker: None,
             vault_aware: VaultAwareSender::disabled(),
+            router,
         }
     }
 
@@ -241,6 +291,7 @@ impl AppState {
 /// Builds the Axum router — shared between `main.rs` and integration tests.
 ///
 /// CORS is configured via `config.server.allowed_origins` (origin allowlist).
+#[doc(hidden)]
 pub fn build_router(state: AppState) -> axum::Router {
     use axum::extract::DefaultBodyLimit;
     use axum::middleware;

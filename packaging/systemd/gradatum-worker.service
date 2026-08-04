@@ -13,7 +13,11 @@ RuntimeDirectory=gradatum
 ConfigurationDirectory=gradatum
 LogsDirectory=gradatum
 ExecStartPre=/usr/local/bin/gradatum-pre-migration-backup
-ExecStart=/usr/bin/gradatum-worker --db /var/lib/gradatum/db/queue.sqlite --config /var/lib/gradatum/config/server.toml
+# --db est volontairement absent : le chemin de la queue est dérivé de
+# storage.root (GRADATUM_STORAGE__ROOT > [storage] root du --config > défaut) via
+# le même helper que gradatum-server. Le passer en dur ne peut que diverger le
+# jour où storage.root change — le worker refuserait alors de démarrer.
+ExecStart=/usr/bin/gradatum-worker --config /var/lib/gradatum/config/server.toml
 # Fichier d'environnement optionnel — absent = ignoré (EnvironmentFile=- préfixe).
 # Créer /etc/gradatum/env avec le contenu suivant :
 #   # URL de l'API interne server (requis pour worker-flip v0.5.3)

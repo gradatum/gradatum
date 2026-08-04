@@ -4,7 +4,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum WardenError {
     /// Invalid rate limit configuration: `per_minute` or `burst` is zero.
-    #[error("rate limit invalide: per_minute={0} burst={1} (les deux doivent être > 0)")]
+    #[error("invalid rate limit: per_minute={0} burst={1} (both must be > 0)")]
     InvalidRateLimit(u32, u32),
 }
 

@@ -6,9 +6,13 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "DTOs partagés contrats wire HTTP gradatum (single source of truth Vault*Request structs)"
+description = "Shared HTTP wire-contract DTOs for gradatum (single source of truth for the Vault* request structs)"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
+gradatum-core = { workspace = true }
 serde      = { workspace = true, features = ["derive"] }
 schemars   = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -23,3 +27,4 @@ schemars = ["dep:schemars", "dep:serde_json"]
 
 [dev-dependencies]
 serde_json.workspace = true
+bincode.workspace = true

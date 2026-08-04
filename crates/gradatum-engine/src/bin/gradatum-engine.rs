@@ -25,6 +25,65 @@
 //!   (`/usr/local/bin/`, `/opt/gradatum/bin/`).
 //! - `model_path` canonicalized and validated under `/opt/gradatum/models/`.
 
+/// String rendered by `--version`: the binary name, semantic version, and the build
+/// commit SHA.
+///
+/// Format stable, guaranteed to stay script-extractable:
+/// `gradatum-engine <semver> (build_sha <sha>)`
+///
+/// `<sha>` is injected at compile time by `build.rs` (`cargo:rustc-env=BUILD_SHA`)
+/// and reads `unknown` when the SHA could not be resolved at build time — no `.git`
+/// directory or a tarball build — a fallback carried by `build.rs`, which never fails.
+/// `env!` is therefore always resolvable here, since `build.rs` emits the variable
+/// unconditionally.
+#[cfg(feature = "serve")]
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    " ",
+    env!("CARGO_PKG_VERSION"),
+    " (build_sha ",
+    env!("BUILD_SHA"),
+    ")"
+);
+
+/// Help text rendered by `--help` / `-h`, without loading any configuration.
+#[cfg(feature = "serve")]
+const HELP: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    " — llama-server supervisor (OpenAI-compatible managed runtime)\n\n",
+    "Usage: ",
+    env!("CARGO_PKG_NAME"),
+    " <CONFIG>\n\n",
+    "Arguments:\n",
+    "  <CONFIG>  Path to the TOML configuration file\n\n",
+    "Options:\n",
+    "  -h, --help     Print help\n",
+    "  -V, --version  Print version\n"
+);
+
+/// Handles `--version`/`-V` and `--help`/`-h` before any configuration is loaded.
+///
+/// The minimal executable contract: these must answer from any directory, with no
+/// config file in scope. Returns `Some(exit_code)` when a flag was consumed, `None`
+/// otherwise.
+#[cfg(feature = "serve")]
+fn handle_early_flags() -> Option<i32> {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("{VERSION}");
+                return Some(0);
+            }
+            "--help" | "-h" => {
+                print!("{HELP}");
+                return Some(0);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(not(feature = "serve"))]
 fn main() {
     eprintln!("gradatum-engine: compiled without the 'serve' feature. Nothing to do.");
@@ -49,6 +108,12 @@ async fn main() -> anyhow::Result<()> {
         path::Path,
         sync::Arc,
     };
+
+    // `--version`/`-V` and `--help`/`-h` must answer without any configuration file,
+    // from any directory — handled before config loading (see `handle_early_flags`).
+    if let Some(code) = handle_early_flags() {
+        std::process::exit(code);
+    }
 
     // --- Initialize tracing ---
     tracing_subscriber::fmt()
@@ -88,6 +153,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // --- Build metrics (shared: event sink + AppState) ---
+    // Constructed before the sink so the HttpEventSink can count non-2xx
+    // event-log POSTs (F-120 observability).
+    let metrics = Arc::new(EngineMetrics::new());
+
     // --- Build the event sink (HttpEventSink if gradatum_url is set, otherwise InMemorySink) ---
     //
     // gradatum_url = None  → InMemorySink (dev/test — no event-log POST)
@@ -100,13 +170,16 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref gradatum_url) = config.gradatum_url {
             // Validate that the URL is loopback (anti-SSRF)
             validate_loopback_url(gradatum_url)?;
-            // Read api-key — only when event-log is enabled
+            // Read api-key — only when event-log is enabled. Kept by the sink to
+            // re-exchange a fresh JWT on 401 (F-120 lazy refresh).
             let api_key = read_api_key()?;
-            match exchange_api_key_for_jwt(&api_key, gradatum_url).await {
+            match gradatum_engine::sink::exchange_api_key_for_jwt(&api_key, gradatum_url).await {
                 Ok(jwt) => Arc::new(HttpEventSink::new(
                     gradatum_url.clone(),
                     jwt,
+                    api_key,
                     config.agent_id.clone(),
+                    metrics.clone(),
                 )),
                 Err(e) => {
                     // Best-effort fallback — no crash on JWT failure
@@ -140,7 +213,6 @@ async fn main() -> anyhow::Result<()> {
     let model_name = config.model_alias();
     let provider = config.provider_alias();
     let health = Arc::new(HealthState::new(&model_name));
-    let metrics = Arc::new(EngineMetrics::new());
 
     // --- Build the supervisor ---
     let supervisor = LlamaServerSupervisor::new(config.clone())
@@ -165,7 +237,15 @@ async fn main() -> anyhow::Result<()> {
                  The fallback gateway takes over."
             );
             health.set_unhealthy();
-            None // no seed: supervise_loop does not start on a dead child
+            // M1 fix (A1b, was misleading): supervise_loop() IS still launched below
+            // regardless of this branch — it is never skipped. `None` here only means
+            // it starts with no `last_ready_at` seed, so the very first crash it
+            // observes (this dead child) is classified as flapping (no budget/backoff
+            // reset) rather than as a post-stable-uptime crash. See
+            // `LlamaServerSupervisor::supervise_loop`'s "Initial seed" + "Escalation to
+            // systemd" doc sections for what happens next (R1 fix: budget is consumed
+            // with backoff, then the process exits for systemd to escalate).
+            None
         } else {
             Some(std::time::Instant::now())
         }
@@ -242,37 +322,8 @@ fn read_api_key() -> anyhow::Result<zeroize::Zeroizing<String>> {
     }
     let path = "/etc/gradatum/engine.api-key";
     let key = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("FATAL: api-key introuvable ({path}): {e}"))?;
+        .map_err(|e| anyhow::anyhow!("FATAL: api-key not found ({path}): {e}"))?;
     Ok(zeroize::Zeroizing::new(key.trim().to_string()))
-}
-
-/// Exchanges an api-key for a 24-hour JWT via `POST /auth/exchange`.
-///
-/// The route is mounted outside `/api/v1` (`unauthed.merge(auth_exchange)` in
-/// `gradatum-server` — no `/api/v1` prefix).
-#[cfg(feature = "serve")]
-async fn exchange_api_key_for_jwt(
-    api_key: &zeroize::Zeroizing<String>,
-    base_url: &str,
-) -> anyhow::Result<zeroize::Zeroizing<String>> {
-    let url = format!("{base_url}/auth/exchange");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(api_key.as_str())
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("api-key→JWT exchange failed ({url}): {e}"))?;
-    if !resp.status().is_success() {
-        anyhow::bail!("api-key→JWT exchange → HTTP {} ({url})", resp.status());
-    }
-    let body: serde_json::Value = resp.json().await?;
-    let token = body["token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("exchange response missing 'token' field"))?;
-    Ok(zeroize::Zeroizing::new(token.to_string()))
 }
 
 /// Validates that the URL resolves to a loopback address (anti-SSRF).

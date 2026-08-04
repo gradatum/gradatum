@@ -31,14 +31,14 @@ async fn appstate_sqlite_revocation_store_persists() {
     let exp = SystemTime::now() + Duration::from_secs(3600);
     state
         .revocation
-        .revoke(jti, exp)
+        .revoke(jti, "main", exp)
         .await
         .expect("revoke doit réussir");
 
     // Le jti révoqué doit être reconnu comme tel.
     let is_revoked = state
         .revocation
-        .is_revoked(jti)
+        .is_revoked(jti, "main")
         .await
         .expect("is_revoked doit réussir");
     assert!(
@@ -49,7 +49,7 @@ async fn appstate_sqlite_revocation_store_persists() {
     // Un jti non révoqué ne doit pas être bloqué.
     let is_other_revoked = state
         .revocation
-        .is_revoked("autre-jti-non-revoque")
+        .is_revoked("autre-jti-non-revoque", "main")
         .await
         .expect("is_revoked non-révoqué doit réussir");
     assert!(
@@ -74,14 +74,14 @@ async fn appstate_revocation_expired_not_blocked() {
     let exp_passe = SystemTime::now() - Duration::from_secs(1);
     state
         .revocation
-        .revoke(jti, exp_passe)
+        .revoke(jti, "main", exp_passe)
         .await
         .expect("revoke avec exp passé doit réussir");
 
     // Un token expiré ne doit pas être considéré comme révoqué (il n'est plus actif de toute façon).
     let is_revoked = state
         .revocation
-        .is_revoked(jti)
+        .is_revoked(jti, "main")
         .await
         .expect("is_revoked doit réussir");
     assert!(

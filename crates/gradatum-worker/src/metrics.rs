@@ -1,6 +1,7 @@
 //! Prometheus metrics for the Gradatum worker.
 //!
-//! Exposes 4 metrics on port `:19091` (TOML config `[apalis.metrics]`):
+//! Served on the port configured by `[apalis.metrics]` (default `19091`; the deployed
+//! configuration uses `19093`, since `19091` is held by `gradatum-server`).
 //!
 //! | Metric | Type | Labels | Description |
 //! |---|---|---|---|
@@ -8,6 +9,11 @@
 //! | `gradatum_jobs_duration_seconds` | Histogram | `kind` | Execution duration by kind |
 //! | `gradatum_jobs_dlq_total` | Counter | `kind` | Jobs sent to DLQ by kind |
 //! | `gradatum_workers_active` | Gauge | `kind` | Active workers by kind |
+//! | `gradatum_distill_cron_enqueued_total` | Counter | — | Distill jobs enqueued by the F-112 cron |
+//! | `gradatum_config_degraded` | Gauge | `section`, `cause` | Config section on defaults (`0`/`1`) |
+//!
+//! The table is the reference; no count is stated in prose, so adding a metric cannot
+//! turn this documentation into a false statement.
 //!
 //! # HTTP endpoint
 //!
@@ -16,7 +22,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry};
+use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, IntCounter, Opts, Registry};
 use tracing::warn;
 
 /// Prometheus registry shared across workers.
@@ -37,15 +43,29 @@ pub struct WorkerMetrics {
     pub jobs_dlq_total: CounterVec,
     /// Active workers gauge `{kind}`.
     pub workers_active: GaugeVec,
+    /// Distill jobs enqueued by the conditional distill cron (total).
+    pub distill_cron_enqueued: IntCounter,
+    /// Configuration fallback state per section `{section, cause}` — `0` healthy, `1`
+    /// running on defaults.
+    ///
+    /// Populated once at boot by
+    /// [`ConfigHealth::publish`](crate::config_health::ConfigHealth::publish). Every
+    /// consulted section yields exactly one series, so that a healthy configuration is
+    /// distinguishable from a worker that never started.
+    pub config_degraded: GaugeVec,
 }
 
 impl WorkerMetrics {
-    /// Creates and registers the 4 metrics in a new registry.
+    /// Creates and registers every metric of the module table in a new registry.
     ///
     /// # Panics
     ///
-    /// Does not panic — registration errors are logged and
-    /// failing metrics fall back to no-ops.
+    /// Panics if a metric **definition** is invalid (one `expect` per metric
+    /// construction). Those are static, compile-time-constant descriptors, so a panic
+    /// here means a bug in this function, never a runtime condition.
+    ///
+    /// **Registration**, by contrast, never panics: a `registry.register` error is logged
+    /// as a warning and that metric silently stays unregistered.
     #[must_use]
     pub fn new() -> Self {
         let registry = Arc::new(Registry::new());
@@ -53,41 +73,57 @@ impl WorkerMetrics {
         let jobs_total = CounterVec::new(
             Opts::new(
                 "gradatum_jobs_total",
-                "Nombre total de jobs traités par kind et statut",
+                "Total number of jobs processed by kind and status",
             ),
             &["kind", "status"],
         )
-        .expect("métrique gradatum_jobs_total invalide — bug statique");
+        .expect("gradatum_jobs_total metric invalid — static bug");
 
         let jobs_duration = HistogramVec::new(
             HistogramOpts::new(
                 "gradatum_jobs_duration_seconds",
-                "Durée d'exécution des jobs en secondes par kind",
+                "Job execution duration in seconds by kind",
             )
             .buckets(vec![
                 0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 300.0, 600.0, 1800.0,
             ]),
             &["kind"],
         )
-        .expect("métrique gradatum_jobs_duration_seconds invalide — bug statique");
+        .expect("gradatum_jobs_duration_seconds metric invalid — static bug");
 
         let jobs_dlq_total = CounterVec::new(
             Opts::new(
                 "gradatum_jobs_dlq_total",
-                "Nombre total de jobs envoyés en DLQ par kind",
+                "Total number of jobs sent to DLQ by kind",
             ),
             &["kind"],
         )
-        .expect("métrique gradatum_jobs_dlq_total invalide — bug statique");
+        .expect("gradatum_jobs_dlq_total metric invalid — static bug");
 
         let workers_active = GaugeVec::new(
             Opts::new(
                 "gradatum_workers_active",
-                "Nombre de workers actifs (slots occupés) par kind",
+                "Number of active workers (occupied slots) by kind",
             ),
             &["kind"],
         )
-        .expect("métrique gradatum_workers_active invalide — bug statique");
+        .expect("gradatum_workers_active metric invalid — static bug");
+
+        let distill_cron_enqueued = IntCounter::new(
+            "gradatum_distill_cron_enqueued_total",
+            "Total Distill jobs enqueued by the F-112 conditional distill cron",
+        )
+        .expect("gradatum_distill_cron_enqueued_total metric invalid — static bug");
+
+        let config_degraded = GaugeVec::new(
+            Opts::new(
+                "gradatum_config_degraded",
+                "Configuration section running on default values (0 healthy, 1 fallback) \
+                 by section and cause",
+            ),
+            &["section", "cause"],
+        )
+        .expect("gradatum_config_degraded metric invalid — static bug");
 
         // Registration — errors logged without panicking
         for (name, result) in [
@@ -107,9 +143,17 @@ impl WorkerMetrics {
                 "workers_active",
                 registry.register(Box::new(workers_active.clone())),
             ),
+            (
+                "distill_cron_enqueued",
+                registry.register(Box::new(distill_cron_enqueued.clone())),
+            ),
+            (
+                "config_degraded",
+                registry.register(Box::new(config_degraded.clone())),
+            ),
         ] {
             if let Err(e) = result {
-                warn!(metric = name, error = %e, "enregistrement métrique Prometheus échoué");
+                warn!(metric = name, error = %e, "Prometheus metric registration failed");
             }
         }
 
@@ -119,6 +163,8 @@ impl WorkerMetrics {
             jobs_duration,
             jobs_dlq_total,
             workers_active,
+            distill_cron_enqueued,
+            config_degraded,
         }
     }
 
@@ -151,6 +197,24 @@ impl WorkerMetrics {
         self.workers_active.with_label_values(&[kind]).dec();
     }
 
+    /// Increments `gradatum_distill_cron_enqueued_total` (one per Distill job the
+    /// distill cron successfully enqueues).
+    pub fn inc_distill_cron_enqueued(&self) {
+        self.distill_cron_enqueued.inc();
+    }
+
+    /// Sets `gradatum_config_degraded{section, cause}`.
+    ///
+    /// `value` is `0.0` for a section loaded as written and `1.0` for one running on
+    /// default values. Both `section` and `cause` come from a finite, code-defined set,
+    /// so the label cardinality stays bounded by the number of configuration sections —
+    /// never by operator input.
+    pub fn set_config_degraded(&self, section: &str, cause: &str, value: f64) {
+        self.config_degraded
+            .with_label_values(&[section, cause])
+            .set(value);
+    }
+
     /// Serialises all metrics to Prometheus text format.
     ///
     /// Returns an empty string if rendering fails (logged).
@@ -162,7 +226,7 @@ impl WorkerMetrics {
         match encoder.encode(&self.registry.gather(), &mut buf) {
             Ok(()) => String::from_utf8(buf).unwrap_or_default(),
             Err(e) => {
-                warn!(error = %e, "rendu métriques Prometheus échoué");
+                warn!(error = %e, "Prometheus metrics rendering failed");
                 String::new()
             }
         }
@@ -244,7 +308,7 @@ pub async fn spawn_metrics_server(
 
     let addr: SocketAddr = format!("{}:{}", config.bind, config.port)
         .parse()
-        .map_err(|e| anyhow::anyhow!("adresse métriques invalide: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("invalid metrics address: {e}"))?;
 
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
@@ -252,17 +316,17 @@ pub async fn spawn_metrics_server(
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| anyhow::anyhow!("bind métriques :{}  échec: {e}", config.port))?;
+        .map_err(|e| anyhow::anyhow!("metrics bind :{}  failed: {e}", config.port))?;
 
     tracing::info!(
         bind = %config.bind,
         port = config.port,
-        "serveur métriques Prometheus démarré"
+        "Prometheus metrics server started"
     );
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!(error = %e, "erreur serveur métriques Prometheus");
+            tracing::error!(error = %e, "Prometheus metrics server error");
         }
     });
 

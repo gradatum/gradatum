@@ -13,7 +13,7 @@
 //!
 //! ## Security — path traversal guard
 //!
-//! OpenDAL Fs 0.51 does not natively reject `..` components. Each operation
+//! OpenDAL Fs 0.58 does not natively reject `..` components. Each operation
 //! calls `validate_relative_path()` on entry — a mandatory defense-in-depth layer
 //! enforcing the "confined Storage abstraction" contract (networked S3/GCS backends
 //! are not yet implemented).
@@ -43,7 +43,7 @@ pub struct FileStorage {
 
 /// Validates that a relative path contains no `..` components and is not absolute.
 ///
-/// OpenDAL Fs 0.51 does not natively reject `..` components — this guard
+/// OpenDAL Fs 0.58 does not natively reject `..` components — this guard
 /// is the sole barrier against path traversal outside the configured root.
 ///
 /// # Errors
@@ -87,9 +87,10 @@ impl FileStorage {
             .ok_or_else(|| StorageError::InvalidPath(root.to_path_buf()))?;
 
         let builder = services::Fs::default().root(root_str);
-        let op = Operator::new(builder)
-            .map_err(|e| StorageError::OpenDal(e.to_string()))?
-            .finish();
+        // OpenDAL 0.58 : `Operator::new(builder)` rend `Result<Operator>` directement
+        // (plus d'intermédiaire `OperatorBuilder`/`.finish()` comme en <= 0.57). Aucune
+        // couche (`.layer(...)`) n'est ajoutée ici, donc le `.finish()` disparaît sans perte.
+        let op = Operator::new(builder).map_err(|e| StorageError::OpenDal(e.to_string()))?;
 
         Ok(Self {
             op,
@@ -139,9 +140,12 @@ impl Storage for FileStorage {
     #[instrument(skip(self, content), fields(path, bytes = content.len()))]
     async fn write(&self, path: &str, content: &[u8]) -> Result<(), StorageError> {
         validate_relative_path(path)?;
+        // OpenDAL >= 0.56 renvoie la `Metadata` de l'objet écrit ; le contrat
+        // `Storage::write` reste `()` — la métadonnée est délibérément ignorée.
         self.op
             .write(path, content.to_vec())
             .await
+            .map(|_meta| ())
             .map_err(|e| StorageError::OpenDal(e.to_string()))
     }
 
@@ -188,7 +192,12 @@ impl Storage for FileStorage {
                 let meta = e.metadata();
                 let is_dir = matches!(meta.mode(), EntryMode::DIR);
                 let size = if is_dir { 0 } else { meta.content_length() };
-                let last_modified = meta.last_modified().map(|dt| dt.timestamp_millis());
+                // OpenDAL >= 0.56 : `last_modified()` rend un newtype jiff
+                // `opendal::raw::Timestamp` ; `.into_inner()` donne le `jiff::Timestamp`
+                // sous-jacent, puis `.as_millisecond()` l'epoch en millisecondes.
+                let last_modified = meta
+                    .last_modified()
+                    .map(|ts| ts.into_inner().as_millisecond());
                 StorageEntry {
                     path: e.path().to_owned(),
                     size,
@@ -219,7 +228,10 @@ impl Storage for FileStorage {
 
         let is_dir = matches!(meta.mode(), EntryMode::DIR);
         let size = if is_dir { 0 } else { meta.content_length() };
-        let last_modified = meta.last_modified().map(|dt| dt.timestamp_millis());
+        // OpenDAL >= 0.56 : newtype jiff `opendal::raw::Timestamp` — cf. `list`.
+        let last_modified = meta
+            .last_modified()
+            .map(|ts| ts.into_inner().as_millisecond());
 
         Ok(StorageEntry {
             path: path.to_owned(),

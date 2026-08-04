@@ -2,7 +2,7 @@
 
 > Argon2id bearer credential verification and scope enforcement per vault.
 
-**Status**: 0.x — API not yet stable. Apache-2.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -31,19 +31,20 @@ Consumer: POST /auth/exchange
 
 ```toml
 [dependencies]
-gradatum-acl-auth = "0.7.6"
+gradatum-acl-auth = "1.0.0"
 ```
 
 ```rust
 use std::path::Path;
 use gradatum_acl_auth::{SqliteApiKeyStore, ApiKeyStore, ApiKeyMaterial};
+use gradatum_core::scope::AgentId;
 
 // Initialize the credential store (applies migrations, WAL mode).
 let store = SqliteApiKeyStore::init(Path::new("/var/lib/gradatum/api_keys.sqlite")).await?;
 
 // Create a new API key (secret displayed ONCE ONLY).
 let material: ApiKeyMaterial = store
-    .create("owner-name", vec!["read".into()], "main".into(), None)
+    .create(&AgentId::new("owner-name"), vec!["read".into()], "main".into(), None)
     .await?;
 println!("key: {}", material.secret); // ak_<64 hex chars>
 

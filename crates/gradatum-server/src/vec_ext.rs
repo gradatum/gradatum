@@ -63,8 +63,8 @@ pub fn register_sqlite_vec() -> Result<(), String> {
     // garantie par l'extension elle-même (pas de mutation globale non thread-safe).
     #[expect(
         clippy::missing_transmute_annotations,
-        reason = "type cible dépend de l'ABI rusqlite/libsqlite3-sys interne — \
-                  annoter introduirait une dépendance fragile sur les types privés rusqlite"
+        reason = "target type depends on the internal rusqlite/libsqlite3-sys ABI — \
+                  annotating would introduce a fragile dependency on private rusqlite types"
     )]
     let rc = unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
@@ -76,8 +76,8 @@ pub fn register_sqlite_vec() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "sqlite3_auto_extension(vec0) a retourné le code d'erreur {rc} — \
-             extension sqlite-vec non chargée"
+            "sqlite3_auto_extension(vec0) returned error code {rc} — \
+             sqlite-vec extension not loaded"
         ))
     }
 }

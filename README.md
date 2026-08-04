@@ -3,7 +3,7 @@
 > **Memory backbone for AI agents — graduated.**
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status: Alpha](https://img.shields.io/badge/Status-Alpha-orange.svg)](CHANGELOG.md)
+[![Status: Stable](https://img.shields.io/badge/Status-Stable-brightgreen.svg)](CHANGELOG.md)
 [![Website](https://img.shields.io/badge/Website-gradatum.org-brightgreen)](https://gradatum.org)
 
 A self-hosted, embedded memory backbone for multi-agent AI systems. Rust + SQLite. Zero external services required.
@@ -25,8 +25,8 @@ Website: **[gradatum.org](https://gradatum.org)**
 | **Embedded** | One Rust binary. No PostgreSQL. No Redis. No external services. |
 | **Self-hosted** | Your memory, your machine. No telemetry. No vendor lock-in. |
 | **LLM-agnostic** | Plug any OpenAI-compatible backend (Ollama, vLLM, llama.cpp, OpenRouter, Anthropic) — or run heuristic-only with no LLM at all. |
-| **Multi-vault** | Separate `main` from `staging` and `bench-*` vaults for testing, migration, A/B prompts (read-side today; full multi-vault management planned v1.0). |
-| **Hierarchical ACL** | Bearer-scoped access to memory loci. Configure from presets (`flat`, `hierarchical`, `multi-project`, `team`) or write your own. |
+| **Multi-vault** | Separate `main` from `staging` and `bench-*` vaults for testing, migration, A/B prompts. Vault lifecycle management (provision, suspend, soft-delete, purge) ships in `1.0.0`, gated behind `multi_tenant.enabled`. |
+| **Hierarchical ACL** | Bearer-scoped access to memory loci, fail-closed by default. Configure from a shipped preset (`hierarchical`, `flat`) or write your own. |
 | **Markdown truth** | Notes are Markdown files with YAML frontmatter. Readable by humans, by any text editor, by `cat`. The database is an index, not the source of truth. |
 | **Hybrid search** | BM25 (SQLite FTS5) + semantic similarity + PageRank graph + optional cross-encoder rerank. Multi-signal fusion via RRF (Reciprocal Rank Fusion). |
 
@@ -46,10 +46,10 @@ Gradatum is built on these open-source foundations:
 | [**Tokio**](https://github.com/tokio-rs/tokio) | Async runtime — all I/O, timers, and task scheduling |
 | [**Axum**](https://github.com/tokio-rs/axum) | HTTP server (REST endpoints + studio `ServeDir`) |
 | [**Tower**](https://github.com/tower-rs/tower) / **tower-http** | Middleware stack — rate-limiting, CORS, auth, body limits |
-| [**rmcp**](https://github.com/modelcontextprotocol/rust-sdk) | Native MCP server over Streamable HTTP (23 tools at `/mcp`) |
+| [**rmcp**](https://github.com/modelcontextprotocol/rust-sdk) | Native MCP server over Streamable HTTP — tool surface at `/mcp` |
 | [**SQLx**](https://github.com/launchbadge/sqlx) | Async SQLite driver — vault index, job queue, sessions |
 | [**Apalis**](https://github.com/geofmureithi/apalis) | Background job queue (SQLite-backed, DLQ, per-kind routing, monitoring) |
-| [**OpenDAL**](https://github.com/apache/opendal) | Storage abstraction — local FS today, S3/GCS/Azure via feature flags |
+| [**OpenDAL**](https://github.com/apache/opendal) | Storage abstraction — local FS today; S3/GCS/Azure planned (feature flags reserved, no backend implemented yet) |
 | [**tree-sitter**](https://github.com/tree-sitter/tree-sitter) | Deterministic code parsing for the code index (Rust, Python, Bash, TS, TSX) — zero LLM |
 | [**rustls**](https://github.com/rustls/rustls) + **axum-server** | Native TLS termination (TLS 1.2+/1.3, fail-closed) |
 | [**Moka**](https://github.com/moka-rs/moka) | In-process LRU cache (EffectiveNote, TTL-based invalidation) |
@@ -76,8 +76,8 @@ The core vault stack — notes are Markdown files, the database is an index.
 | **Curator** | `gradatum-curator` | LLM-assisted classification and metadata tagging |
 | **Embedder** | `gradatum-embed` | Dense vector embeddings (bge-m3 1024d or configurable) |
 | **Hybrid search** | `gradatum-search`, `gradatum-index` | BM25 (FTS5) + semantic cosine + PageRank + optional ONNX reranker, fused via RRF |
-| **Vault + storage** | `gradatum-vault`, `gradatum-storage` | Markdown source of truth + OpenDAL multi-backend |
-| **Lifecycle** | `gradatum-warden` | Downgrade, expiry, distillation policies |
+| **Vault + storage** | `gradatum-vault`, `gradatum-storage` | Markdown source of truth + OpenDAL storage abstraction (local FS backend; S3/GCS/Azure planned) |
+| **Lifecycle** | `gradatum-warden` | IP CIDR allowlist + per-IP rate limiting + loopback bypass |
 | **ACL / auth** | `gradatum-auth`, `gradatum-acl-auth`, `gradatum-acl-policy` | Bearer-scoped access, JWT signing, hierarchical policies |
 | **Queue** | `gradatum-queue` | Apalis SQLite-backed job queue, DLQ, per-kind routing |
 | **MCP stub** | `gradatum-mcp-stub` | stdio MCP server for Claude Code / Claude Desktop |
@@ -166,52 +166,88 @@ engine instances on `app-host`. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for
 full configuration reference (systemd units, TOML fields, allow-listed flags, security
 properties).
 
+---
+
+## Real Live Setup feedback
+
+Field notes from running gradatum's gateway + engine layer on an AMD AI HX 395 MAX 128 Go mini-PC — 128 GB unified memory, 8060S iGPU, Vulkan backend. Highlights: a default `llama-server` cache setting caused ~27× slower turns under concurrent sessions until tuned; non-zero sampling penalties can silently fall off the GPU path and cost ~34% decode throughput; speculative decoding (MTP) is a net loss on some model architectures and a clear win on others.
+
+Full write-up, numbers, and fixes: **[REALFEEDBACK.md](REALFEEDBACK.md)**.
 
 ---
 
 ## Roadmap
 
-**Current public release**: `v0.7.6` · Apache-2.0 · 3038 tests PASS · Rust 1.88+
+**On crates.io**: [crates.io/crates/gradatum](https://crates.io/crates/gradatum) · Apache-2.0 · Rust 1.91+
 
 Gradatum is built in three chapters: **memory first, then agents, then the sovereign terminal**.
 
 | Version | Status | What it brings |
 |---|---|---|
-| **v0.1.0 – v0.4.3** | ✅ shipped | Working knowledge store: write, search, trust-scored sources, version history, stable links, lifecycle (forget, compact, distil). |
-| **v0.5.2** | ✅ shipped | Code awareness: index any codebase from source, search by symbol or file. Encrypted connections, chronological browsing, agent tracing. |
-| **v0.5.5** | ✅ shipped | Health endpoint with version proof, Rust 2024 edition, hardened API surface. |
-| **v0.6.0** | ✅ shipped | Native MCP server — any MCP client connects directly over HTTP. |
-| **v0.6.4** | ✅ shipped | Security baseline, 5-language code-map, 12 correctness fixes. 2337 tests PASS. |
-| **v0.7.6** | ✅ **current public** | Memory intelligence layer: assembled context pipeline (BM25 + semantic + RRF + composite scoring), proactive recall (server-initiated + pull surface), session-window context efficiency, temporal search filters and decay scoring, agent identity injection via MCP, scheduled-task health observability, curated metrics timeseries with Studio charts, and deterministic distill validation gate. 3038 tests PASS. |
-| **v0.8.0** | ⬜ planned | Enrichment: groundwork for richer note sources (document ingestion / OCR evaluation). |
-| **v0.9.0** | ⬜ planned | Memory optimization: deterministic retrieval and lifecycle improvements. |
-| **v1.0.0** | ⬜ planned | Complete vault: full multi-vault management, local sovereignty (gateway + engine). |
+| **0.1.0-alpha – v0.4.3** | ✅ shipped | Working knowledge store: write, search, trust-scored sources, version history, stable links, lifecycle (forget, compact, distil). |
+| **v0.5.2** | ✅ shipped | Code awareness: index any codebase from source, search by symbol or file. Optional native TLS termination, chronological browsing, agent tracing. |
+| **v0.6.4** | ✅ shipped | Native MCP server — any MCP client connects directly over HTTP. Security baseline, 5-language code-map, 12 correctness fixes. Health endpoint with version proof, hardened API surface. 2337 tests PASS. |
+| **v0.7.6** | ✅ shipped | Memory intelligence layer: assembled context pipeline (BM25 + semantic + RRF + composite scoring), proactive recall (server-initiated + pull surface), session-window context efficiency, temporal search filters and decay scoring, agent identity injection via MCP, scheduled-task health observability, curated metrics timeseries with Studio charts, and deterministic distill validation gate. |
+| **v0.8.0** | 🔶 in repo | Reversible delete: an on-demand delete archives the note instead of destroying it, with registry-driven retention GC and operator-only restore. |
+| **v1.0.0** | 🔶 in repo | First stable release. Multi-tenant / multi-vault isolation foundation, multi-user identity, per-note usage salience, FR→EN **user-facing** string migration complete (runtime literals, CLI, HTTP API) — internal rustdoc migration deferred to a `1.x` minor, SemVer strict from here. |
 | **v2.0.0** | ⬜ planned | Agent runtime — terminal agent that reasons over the codebase using the vault as its memory. |
 
-> **Current release**: **v0.7.6**. Full roadmap: **[gradatum.org](https://gradatum.org)**.
+> **What the Status column means.** ✅ *shipped* = the milestone is complete in this repository
+> and carries a git tag. A git tag and a crates.io release are independent facts: a tagged
+> milestone is not necessarily on the registry. 🔶 *in repo* = the work is merged and its
+> changelog entry is written.
+>
+> For what is on the registry at any given moment,
+> **[crates.io/crates/gradatum](https://crates.io/crates/gradatum)** is authoritative — this
+> document does not mirror it.
+
+> Full roadmap: **[gradatum.org](https://gradatum.org)**.
 
 ---
 
-## What's shipped (v0.1.0 → v0.7.6)
+## What's shipped (0.1.0-alpha → v1.0.0)
 
 A condensed view — the authoritative log lives in [CHANGELOG.md](CHANGELOG.md).
 
 | Milestone | What it delivered |
 |---|---|
-| **v0.1.0** | First working knowledge store: write, search, and retrieve notes over HTTP and MCP. Background job queue, hybrid search, bearer auth. |
+| **0.1.0-alpha** | First working knowledge store: write, search, and retrieve notes over HTTP and MCP. Background job queue, hybrid search, bearer auth. |
 | **v0.2.0 – v0.3.7** | Background jobs that survive restarts and never silently drop failures. Pluggable storage (swap the database without rewriting the app). Built-in LLM proxy and cost attribution. First public OSS release on GitHub + crates.io. |
 | **v0.4.0 – v0.4.3** | Durable memory: full version history for every note, safe concurrent writes, stable internal links, trust-scored sources, automatic compaction, and semantic forget. |
-| **v0.5.2** | Code awareness: index any Rust codebase from source (no LLM needed), search by symbol or file, updates in milliseconds. Encrypted connections, chronological note browsing, agent action tracing. |
-| **v0.5.5** | Foundation polish before the MCP pivot: real-time health endpoint with version proof, Rust 2024 edition, API surface hardened. |
-| **v0.6.0** | Native MCP server — any MCP-compatible client (Claude Code, IDEs, custom agents) connects directly over standard HTTP. Notes validated and auto-repaired on write. |
-| **v0.6.4** | Security baseline + code-map for 5 languages + correctness audit. Studio sessions expire in 1h, strict browser security policy, request size limits. Code index understands Rust, Bash, TypeScript, React, and Python. 12 correctness fixes from a deep audit round. 2337 tests PASS. |
-| **v0.7.6 ✅ current** | Memory intelligence layer: assembled context pipeline, proactive recall, session-window context efficiency, temporal search and decay, agent identity injection via MCP, scheduled-task health observability, curated metrics timeseries with Studio charts, and deterministic distill validation gate. 3038 tests PASS. |
+| **v0.5.2** | Code awareness: index any Rust codebase from source (no LLM needed), search by symbol or file, updates in milliseconds. Optional native TLS termination, chronological note browsing, agent action tracing. |
+| **v0.6.4** | The MCP pivot, shipped in one release: native MCP server — any MCP-compatible client (Claude Code, IDEs, custom agents) connects directly over standard HTTP; notes validated and auto-repaired on write; real-time health endpoint with version proof and a hardened API surface. Plus the security baseline + code-map for 5 languages + correctness audit: Studio sessions expire in 1h, strict browser security policy, request size limits. Code index understands Rust, Bash, TypeScript, React, and Python. 12 correctness fixes from a deep audit round. 2337 tests PASS. |
+| **v0.7.6** | Memory intelligence layer: assembled context pipeline, proactive recall, session-window context efficiency, temporal search and decay, agent identity injection via MCP, scheduled-task health observability, curated metrics timeseries with Studio charts, and deterministic distill validation gate. |
+| **v0.8.0** | Reversible delete: an on-demand delete archives the note (`.md` + `.history/` moved under `.archive/`) instead of destroying it. Registry-driven retention GC, restore-to-quarantine, operator-only CLI surface, read-only archive listing over MCP. |
+| **v1.0.0 🔶 in repo** | First stable release. Multi-tenant / multi-vault isolation foundation, multi-user identity with `jti` audit attribution, per-note usage salience, retrospective audit/dedup job, `build_sha` in `--version`. FR→EN **user-facing** string migration complete (runtime literals, CLI, HTTP API); internal rustdoc migration is deferred to a `1.x` minor. The workspace suite is run with `cargo nextest run --workspace --release --no-fail-fast`; that run is the authoritative count, not any figure written here. |
 
 ---
 
-## What's new in v0.7.6
+## What's new in v1.0.0
 
-All features below are available in the v0.7.6 release. See [CHANGELOG.md](CHANGELOG.md) `[0.7.6]` and [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical detail.
+`1.0.0` is the first stable release. SemVer strict starts at `1.0.0`, and
+public APIs on `1.x` will follow the LTS promise in [RELEASE-POLICY.md](RELEASE-POLICY.md). See [CHANGELOG.md](CHANGELOG.md) `[1.0.0]` for the full list, including **breaking changes** and **deprecations**.
+
+**Multi-tenant vault isolation foundation**
+
+A `VaultGrant` substrate backs a per-vault handle registry with full vault lifecycle management (provision, suspend, soft-delete, purge). Every read/write path — notes, search, ANN, archive, temporal index, cache, jobs, config — is scoped through an ACL-checked vault handle instead of a single implicit vault. Gated behind `multi_tenant.enabled` (default `false`): single-vault deployments behave identically to `0.x`.
+
+**Multi-user identity**
+
+JWT identity issuance is governed by a configurable allow-list of keys, and the JWT `jti` is propagated into the audit trail for per-identity attribution. Per-key **write**-scope enforcement is active only under `multi_tenant.enabled`, and requires the key to carry one of `write`, `admin`, `service`. Read access is never governed by key scopes — see [SECURITY.md](SECURITY.md) *Known limitations*.
+
+**Per-note usage salience**
+
+An opt-in, default-off usage-weighted salience factor (reads, search hits, top-3 surfacing, recall acceptance) can be folded into `vault_search` ranking. A companion audit path detects notes that have become irrelevant and can auto-downgrade them.
+
+**Operational proof**
+
+`build_sha` is reported by `--version` for `gradatum-server` and `gradatum-worker`, with deploy-time verification — making "what's actually running" a checkable fact.
+
+---
+
+## Memory intelligence layer (shipped in v0.7.6)
+
+See [CHANGELOG.md](CHANGELOG.md) `[0.7.6]` and [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical detail.
 
 **Assembled context pipeline**
 
@@ -241,11 +277,9 @@ The server collects a curated set of ~60 operational metrics every 60 seconds, s
 
 Synthesized notes produced by the distillation job now pass through a deterministic quality-scoring gate before being stored. The scorer computes a composite of embedding-grounding, source trust, source recency, numeric coherence, and orphan-entity checks — all without an LLM call. Notes scoring below the threshold are stored with a degraded trust value and a `quality-low` tag rather than being discarded.
 
-**MCP: 23 tools**
+**MCP tools**
 
-Two additional MCP tools — `vault_proactive_recall` and `vault_proactive_recall_feedback` — bring the total MCP surface to **23 tools**.
-
-**Status**: **3038 tests PASS** (optimized build), clippy 0, fmt clean, `cargo deny` GREEN.
+Two tools are new in the upcoming `1.0.0`: `create_feature_card`, which has the server assign a project-map feature number rather than the caller, and `job_status`, which resolves an asynchronous write by polling a job until it reports `terminal = true`. For the exact set a given build exposes, call `tools/list` on the running server — that response is authoritative, not any count written here.
 
 ---
 
@@ -257,7 +291,7 @@ Two additional MCP tools — `vault_proactive_recall` and `vault_proactive_recal
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Technical design — planes, ACL hierarchy, source-of-truth model, search pipeline, concurrency, storage layout. |
 | [DEPENDENCIES.md](DEPENDENCIES.md) | Workspace dependency tree, level invariants, version pinning policy. |
-| [PORTS.md](PORTS.md) | Default port matrix (`19090 + offset`) and override conventions (CLI > env > TOML). |
+| [PORTS.md](PORTS.md) | Default port matrix (`19090 + offset`) and TOML/env override conventions. |
 | [docs/BENCH.md](docs/BENCH.md) | Benchmark results (curator F1w, search relevance). |
 | [CHANGELOG.md](CHANGELOG.md) | Version history and notable changes per release. |
 
@@ -279,8 +313,15 @@ Two additional MCP tools — `vault_proactive_recall` and `vault_proactive_recal
 | Document | Purpose |
 |---|---|
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Engine multi-instance deployment guide — systemd, config, security, gateway wiring. |
+| [packaging/systemd/README.md](packaging/systemd/README.md) | Systemd unit reference — server, worker, engine template, gateway service, smoke tests. |
 
-> **Security note**: the default ACL is a permissive single-tenant policy (allow-all) in v0.x. Configure a stricter AclPolicy before exposing gradatum on a network.
+> **Security note**: the default ACL is fail-closed — with no preset file present, every locus is denied. Configure an ACL preset (`[acl] preset_path`, a TOML of `[[consumer]]` blocks — from a shipped preset or your own) to grant access. See [SECURITY.md](SECURITY.md) for the hardening defaults and their known limitations.
+
+### Agent skills
+
+Gradatum ships an optional companion plugin, **[gradatum-skills](https://github.com/gradatum/gradatum-skills)** (Apache-2.0, separate repository). It packages **10 skills** that teach an agent harness *when* to reach for the vault and *which* MCP tool to call — a search-before-write discipline, section routing, just-in-time lesson recall, and a code-navigation path over the derived code index.
+
+The skills contain no script, no binary and no local dependency: each one names an MCP tool of the `gradatum` server and the harness performs the call. Transport, authentication and response format belong to the server, not to the plugin. See that repository's `README.md` and `ARCHITECTURE.md` for the skill catalogue and the L1 → L0 composition model.
 
 ### Platform-specific guides (archived)
 
@@ -293,27 +334,28 @@ Two additional MCP tools — `vault_proactive_recall` and `vault_proactive_recal
 
 ## Installation
 
-Gradatum is in **alpha (v0.7.6)**. Three installation paths are available depending on your use case.
+Gradatum is at **v1.0.0**. Three installation paths are available depending on your use case.
 
-> APIs are not stable before v1.0.0. Breaking changes will be documented in [CHANGELOG.md](CHANGELOG.md).
+> Public APIs follow SemVer strict from `1.0.0`. Breaking changes are documented in [CHANGELOG.md](CHANGELOG.md).
 
 ### Option A — Pre-built binaries (recommended for deployment)
 
-**Platform: Linux x86_64.** Each [GitHub Release](https://github.com/gradatum/gradatum/releases) ships three archives:
+**Platform: Linux x86_64.** Each [GitHub Release](https://github.com/gradatum/gradatum/releases) ships the archives below:
 
-| Archive | Binaries | Use case |
+| Archive | Contents | Use case |
 |---|---|---|
 | `gradatum-server-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `gradatum-server`, `gradatum-worker`, `gradatum-admin` | Vault backbone — run on your application host |
 | `gradatum-llm-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `gradatum-gateway`, `gradatum-engine` | LLM routing and inference supervision — run on your GPU host (or alongside the backbone) |
 | `gradatum-mcp-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `gradatum-mcp-stub` | MCP bridge for Claude Code / Claude Desktop |
+| `gradatum-sbom-vX.Y.Z.tar.gz` | One CycloneDX SBOM (`.cdx.json`) per publishable crate | Supply-chain review — dependency inventory of the released source |
 
-A `SHA256SUMS` file covering all three archives is also attached to each release. Every archive ships with a **SLSA provenance attestation**.
+A `SHA256SUMS` file covering every archive above is also attached to each release. Every archive ships with a **SLSA provenance attestation**.
 
 **Example — deploying the vault backbone:**
 
 ```bash
-# Replace vX.Y.Z with the release tag, e.g. v0.7.6
-VERSION=v0.7.6
+# Replace vX.Y.Z with the release tag, e.g. v1.0.0
+VERSION=v1.0.0
 ARCH=x86_64-unknown-linux-gnu
 
 # Download the server archive and the checksum file
@@ -340,22 +382,24 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for configuration and runtime requi
 
 ### Option B — crates.io
 
-The full gradatum workspace (**27 crates**) is published on crates.io at `v0.7.6`. These are **source releases** — the crate API is not stable before v1.0.0 and breaking changes will occur.
+The gradatum workspace has **31 members**, of which **27 are publishable** to crates.io (4 carry `publish = false`). These are **source releases**; from `1.0.0` their public APIs will follow SemVer strict.
 
-```toml
-# Cargo.toml — add individual crates as needed
-gradatum-core = "0.7"     # core types, note model, ACL
-gradatum-vault = "0.7"    # vault read/write/lifecycle
-gradatum-search = "0.7"   # hybrid search (BM25 + semantic)
-gradatum-embed = "0.7"    # dense embeddings
-gradatum-ingest = "0.7"   # code index (tree-sitter)
+```bash
+# Add individual crates as needed — cargo resolves the current version from the registry
+cargo add gradatum-core     # core types, note model, ACL
+cargo add gradatum-vault    # vault read/write/lifecycle
+cargo add gradatum-search   # hybrid search (BM25 + semantic)
+cargo add gradatum-embed    # dense embeddings
+cargo add gradatum-ingest   # code index (tree-sitter)
 ```
 
-> **APIs are not stable before v1.0.0.** `cargo add gradatum` gives you the meta-crate (re-exports). Individual crates (`gradatum-core`, `gradatum-vault`, …) are the intended entry points. See [crates.io/crates/gradatum](https://crates.io/crates/gradatum) for the full list.
+> `cargo add gradatum` gives you the meta-crate (re-exports). Individual crates (`gradatum-core`, `gradatum-vault`, …) are the intended entry points. See [crates.io/crates/gradatum](https://crates.io/crates/gradatum) for the full list.
+>
+> **`gradatum-cli` is not part of the `1.0.0` release.** It is a placeholder that was published once at `0.7.6`; that version remains on crates.io and is installable, but it is not republished at `1.0.0` and has no implementation. A real CLI is expected with the agent runtime at `2.0.0`.
 
 ### Option C — Build from source
 
-**Prerequisites:** Rust stable (MSRV 1.88), a C linker (`gcc` / `clang`), and SQLite 3.x development headers (e.g. `libsqlite3-dev` on Debian/Ubuntu).
+**Prerequisites:** Rust stable (MSRV 1.91), a C linker (`gcc` / `clang`), and SQLite 3.x development headers (e.g. `libsqlite3-dev` on Debian/Ubuntu).
 
 ```bash
 git clone https://github.com/gradatum/gradatum.git
@@ -371,6 +415,41 @@ cargo test --workspace
 The release binaries are written to `target/release/`. Note: `gradatum-engine` requires the `serve` feature when building individually (`cargo build -p gradatum-engine --features serve --release`); building with `--workspace` enables it automatically.
 
 arm64, macOS, and Windows are not supported by the pre-built binaries — build from source on those platforms.
+
+**Automated install.** The repo ships an idempotent install script that handles systemd units, the `gradatum` system user (UID 985), and service startup:
+
+```bash
+# Vault backbone (server + worker + admin)
+sudo bash scripts/install-gradatum-services.sh --build
+
+# With engine (supervisor for llama-server) — adds the systemd template and example configs
+sudo bash scripts/install-gradatum-services.sh --build --with-engine
+
+# With gateway (LLM router) in addition to engine
+sudo bash scripts/install-gradatum-services.sh --build --with-engine --with-gateway
+```
+
+For subsequent deploys (binary update without re-init), use the deploy script:
+
+```bash
+# Server + worker only
+bash scripts/deploy-gradatum-local.sh --build
+
+# Server + worker + engine (restarts active gradatum-engine@* instances)
+bash scripts/deploy-gradatum-local.sh --build --engine
+```
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full engine configuration reference, and [packaging/systemd/README.md](packaging/systemd/README.md) for the systemd unit reference.
+
+### Agent skills (optional)
+
+The three paths above install Gradatum itself. The agent-facing skills are distributed separately, as the **[gradatum-skills](https://github.com/gradatum/gradatum-skills)** plugin (Apache-2.0) — see [Agent skills](#agent-skills) under Documentation for what they do.
+
+**Server requirement.** The skills name MCP tools by their exact names, including `job_status`, which the write path polls to resolve an asynchronous write. A server older than **v1.0.0** does not expose it: `0.7.6` predates the tool, and a skill naming a tool the server does not expose fails at call time rather than at install time. Install the skills against a `v1.0.0` or later server.
+
+**Install by syncing from a committed reference — never by symlinking the clone.** A symlink turns every edit in the repository into an immediate production change, removing the window in which a commit or a review can happen. The canonical procedure is the `SYNC-INSTALL` block under *Installation* in the [gradatum-skills `README.md`](https://github.com/gradatum/gradatum-skills); it is executed verbatim by that repository's test suite, which is why it lives there and is not duplicated here. It needs only `git` and `tar`, is idempotent, and removes skills that left the product while leaving unrelated skills untouched.
+
+**Verify that the installation is operational, not merely present.** The plugin ships two independent checks — one asserting that every installed skill matches the committed reference, the other asserting that every MCP tool named by a skill actually exists in the list the server exposes. The second catches the failure the first cannot see: a correctly installed skill that names a tool your server does not have. Both are documented under *Vérifier que l'installation est opérationnelle* in the plugin's `README.md`.
 
 ---
 
@@ -388,20 +467,24 @@ gradatum write --locus=projecta/backend --section=decisions \
 gradatum search "ULID identity" --locus="projecta/*"
 
 # List vaults
-gradatum-admin vault list
+gradatum-admin vault create <vault-id>
 ```
 
 ### MCP integration (Claude Code / Claude Desktop)
 
-Gradatum exposes its 23-tool memory surface over MCP. First, create an API key — long-lived and revocable — with the scopes the tools need:
+Gradatum exposes its memory surface over MCP. First, create an API key — long-lived, and revocable for future token issuance — carrying a scope that permits writes:
 
 ```bash
 gradatum-admin api-key create \
   --root /var/lib/gradatum \
   --owner claude-code \
-  --scopes vault_read,vault_search,vault_write
+  --scopes write
 # Prints the secret once (ak_...). Store it with mode 600, e.g. ~/.config/gradatum/api-key
 ```
+
+> **The write scopes are a closed set: `write`, `admin`, `service`.** With `multi_tenant.enabled = true`, every write path requires the key to carry at least one of those three, matched by exact string equality (`WRITE_SCOPES`, `gradatum-acl-auth`). Any other value — including `vault_write` — yields a read-only key that takes `403 write scope required (read-only token)` on every write. With `multi_tenant.enabled = false` (the default) scopes are not checked at all, so the same key writes fine until multi-tenant mode is turned on. `api-key create` enforces the same set at creation time: a scope set that grants no write access is **refused**, unless you pass `--read-only` to confirm a read-only key is intended. The check covers creation only — `api-key rotate` carries the source key's scopes over unchanged, and keys minted before this release are not revalidated, so an existing key may still name a scope that grants nothing.
+>
+> Read access is not governed by key scopes in either mode — it is governed by vault grants and the locus ACL.
 
 Two transports are available.
 
@@ -422,7 +505,7 @@ Two transports are available.
 }
 ```
 
-**Option 2 — native HTTP endpoint.** `gradatum-server` serves MCP directly over Streamable HTTP at `/mcp` — no separate bridge process. Point an HTTP MCP client at it with the API key as a Bearer credential (no token-refresh needed; the key is long-lived and revocable):
+**Option 2 — native HTTP endpoint.** `gradatum-server` serves MCP directly over Streamable HTTP at `/mcp` — no separate bridge process. Point an HTTP MCP client at it with the API key as a Bearer credential (no token-refresh needed; the key is long-lived):
 
 ```json
 {
@@ -442,16 +525,25 @@ Two transports are available.
 
 ### Studio login & API-key lifecycle
 
-Gradatum ships a web-based Studio UI at the root path (`/`). Authentication uses an **API key** (`ak_…`).
+Gradatum ships a web-based Studio UI at `/ui/` (`http://<host>:19090/ui/`). Authentication uses an **API key** (`ak_…`).
 
 **Login flow**
 
 1. Enter the API key on the Studio login screen.
 2. The browser posts it to `POST /auth/exchange` and receives a **JWT** stored in `localStorage`. The original key is not retained after the exchange.
 3. Sessions expire after **1 hour**; a new login (key → JWT exchange) is required after expiry.
-4. The Studio requires a key with scope **`admin`**.
+4. **Any valid (non-revoked) API key logs in.** `POST /auth/exchange` verifies the key's
+   Argon2id hash and the tenant allow-list — it does **not** inspect the key's scopes. The
+   `scope: "human"` the Studio sends selects the **token TTL** (1 h), not a permission level.
 
-**Create an admin key**
+> **`admin` is a recommended convention, not an enforced requirement.** The key's scopes are
+> copied into the JWT and checked only on **write** paths, and only when
+> `multi_tenant.enabled = true` — where any of `write`, `admin` or `service` is accepted
+> (`WRITE_SCOPES`). With `multi_tenant.enabled = false` (the default), no scope is checked at
+> all: a key with an empty or arbitrary scope list has the same access as an `admin` key.
+> Grant `admin` so that access stays correct if you later enable multi-tenancy.
+
+**Create a key for the Studio**
 
 ```bash
 gradatum-admin api-key create \
@@ -471,13 +563,15 @@ gradatum-admin api-key create \
 gradatum-admin api-key list --root /var/lib/gradatum
 
 # Rotate a key — revokes the current one and prints a new secret once
-gradatum-admin api-key rotate <prefix> --root /var/lib/gradatum
+gradatum-admin api-key rotate --prefix <prefix> --root /var/lib/gradatum
 
-# Revoke a key immediately
-gradatum-admin api-key revoke <prefix> --root /var/lib/gradatum
+# Revoke a key — blocks new token issuance from it
+gradatum-admin api-key revoke --prefix <prefix> --root /var/lib/gradatum
 ```
 
-**Lost your key?** Run `list` to find the prefix, then `rotate <prefix>` to get a new secret.
+**Lost your key?** Run `list` to find the prefix, then `rotate --prefix <prefix>` to get a new secret.
+
+> **Revocation is not immediate for tokens already issued.** `revoke` and `rotate` stop a key being exchanged for new JWTs, but a JWT minted before the revocation stays valid until it expires (1 h for `human` scope, 24 h for service scope). To cut every outstanding token at once, rotate the signing seed as described in [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -485,7 +579,7 @@ gradatum-admin api-key revoke <prefix> --root /var/lib/gradatum
 
 | Term | Meaning |
 |---|---|
-| **Vault** | The technical backing store (SQLite + FTS5 + Markdown). Separate vaults (main, staging, bench-*) readable side-by-side today; full multi-vault management lands at v1.0. |
+| **Vault** | The technical backing store (SQLite + FTS5 + Markdown). Separate vaults (main, staging, bench-*) are readable side-by-side; vault lifecycle management ships in `1.0.0` behind `multi_tenant.enabled`. |
 | **Locus** | A logical subdivision of a vault, isolated by ACL. From Cicero's *ars memoriae*. |
 | **Section** | One of the cognitive categories: `decisions`, `architecture`, `debug`, `reasoning`, `feedback`, `lessons-learned`, `retrospectives`, `experiments`, `agent-issues`, `reference`, `council`, `project-map`, `identity` |
 | **Note** | Atomic Markdown file with YAML frontmatter |
@@ -496,7 +590,7 @@ gradatum-admin api-key revoke <prefix> --root /var/lib/gradatum
 
 ## Contributing
 
-Gradatum is in alpha, built openly on lessons learned from a prior private system. Issues and PRs are welcome while the project is in alpha; expect fast-moving internals before v1.0. See [CONTRIBUTING.md](CONTRIBUTING.md) and [GOVERNANCE.md](GOVERNANCE.md) for the process.
+Gradatum is built openly on lessons learned from a prior private system. Issues and PRs are welcome. Public APIs are stable from `1.0.0`; internals may still move between minor releases. See [CONTRIBUTING.md](CONTRIBUTING.md) and [GOVERNANCE.md](GOVERNANCE.md) for the process.
 
 ---
 

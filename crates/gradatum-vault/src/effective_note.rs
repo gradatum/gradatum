@@ -2,10 +2,25 @@
 //!
 //! ## Design
 //!
-//! - `get_effective_note(id, scope)`: composite key `(NoteId, scope_hash_u64)`.
+//! - `get_effective_note(id, scope)`: composite key `(VaultId, NoteId, scope_hash_u64)` —
+//!   `vault_id` partitions the key, which is fail-safe across vaults.
 //! - Cache hit: validator calls `Index::get_content_hash(id)` to verify freshness.
 //!   Match → return cached value. Mismatch → invalidate + cache miss path.
-//! - Cache miss: reads from SQLite index + disk, applies overrides, inserts into cache.
+//! - Cache miss: reads from SQLite index + disk, inserts into cache. **No override is
+//!   applied** — see the note on `scope` below.
+//!
+//! ## `scope` is a cache-key discriminant only (no override resolution)
+//!
+//! Despite the type name, this module resolves **no** override. On a cache miss the
+//! frontmatter returned is the one parsed from the `.md` file, verbatim. `scope` only
+//! partitions the cache key, so two distinct scopes yield **identical content** for the
+//! same note — they merely occupy separate cache slots.
+//!
+//! The machinery exists but is not wired: `NoteMetadataOverride::resolve`
+//! (`gradatum-vault::overrides`) has no production caller (its only callers are that
+//! module's own unit tests), and no read path queries the `note_overrides` table (its
+//! only `SELECT` lives in `SqliteIndex::count_child_rows_for_test`).
+//! `lifecycle::effective_note_to_note` states the same thing.
 //!
 //! ## Validator adapter
 //!
@@ -36,12 +51,21 @@ impl Vault {
     /// - **Valid cache hit**: validator confirms the SQLite `ContentHash` matches.
     ///   Returns `Arc<EffectiveNote>` from cache without disk access.
     /// - **Stale cache hit**: SQLite hash differs → invalidate + cache miss path.
-    /// - **Cache miss**: reads from SQLite index + disk, applies overrides, inserts into cache.
+    /// - **Cache miss**: reads from SQLite index + disk, inserts into cache. The
+    ///   frontmatter returned is the one parsed from the `.md` file, verbatim.
+    ///
+    /// ## `scope` does not select an override
+    ///
+    /// **No override is applied on any path.** `scope` only partitions the cache key:
+    /// calling this method with two different scopes returns the **same content**, from
+    /// two distinct cache slots. Do not rely on `scope` to obtain a scope-specific view
+    /// of a note — that resolution is not wired (see the module documentation).
     ///
     /// ## Cache key
     ///
-    /// `(NoteId, scope_hash_u64)` — the scope hash is computed via `DefaultHasher`
-    /// from a stable string representation (e.g. `"vault:main"`).
+    /// `(VaultId, NoteId, scope_hash_u64)` — `vault_id` partitions the key, a `NoteId`
+    /// being unique only within a vault. The scope hash is computed with `DefaultHasher`
+    /// over a stable string representation such as `"vault:main"`.
     ///
     /// ## Errors
     ///
@@ -52,21 +76,27 @@ impl Vault {
         id: NoteId,
         scope: &OverrideScope,
     ) -> Result<Arc<EffectiveNote>, GradatumError> {
-        // Calcul du scope hash pour la clé composite (NoteId, u64)
+        // Calcul du scope hash pour la clé composite (VaultId, NoteId, u64).
+        // Le vault_id partitionne la clé : un NoteId n'est unique qu'au sein d'un
+        // vault, la clé DOIT le porter sinon collision cross-vault (C4 — fail-safe).
         let scope_key = scope_to_hash(scope);
-        let key = (id, scope_key);
+        let key = (self.vault_id.clone(), id, scope_key);
 
         // Clone Arc<SqliteIndex> pour le validator closure ('static bound de moka)
         let index = Arc::clone(&self.index);
+        // Copie owned du vault_id : la closure moka est 'static, elle ne peut pas
+        // emprunter `self`. Le validator DOIT être scopé au vault de l'instance (C4-1e,
+        // C2) sinon une note homonyme d'un autre vault fausse la fraîcheur du cache.
+        let vault_id = self.vault_id.as_str().to_owned();
 
         // Cache hit path : validator vérifie la fraîcheur du ContentHash depuis SQLite
         let cached = self
             .cache
-            .get(key, move |note_id| async move {
+            .get(key.clone(), move |note_id| async move {
                 // Adapter : Option<ContentHash> → Result<ContentHash, GradatumError>
                 // None = note absente de l'index → NoteNotFound (stale cache entry)
                 index
-                    .get_content_hash(note_id)
+                    .get_content_hash(&vault_id, note_id)
                     .await?
                     .ok_or(GradatumError::NoteNotFound(note_id))
             })
@@ -77,7 +107,7 @@ impl Vault {
         }
 
         // Cache miss — T4 P2.0c : fetch depuis index + storage + insert cache.
-        let vault_id = self.tenant_id.as_str();
+        let vault_id = self.vault_id.as_str();
         let id_str = id.to_string();
 
         // Récupérer le record depuis l'index SQLite.
@@ -136,8 +166,14 @@ impl Vault {
 fn scope_to_hash(scope: &OverrideScope) -> u64 {
     let repr = match scope {
         OverrideScope::Vault(v) => format!("vault:{}", v.as_str()),
-        OverrideScope::Locus(l) => format!("locus:{}", l.as_str()),
-        OverrideScope::Bearer(b) => format!("bearer:{}", b.as_str()),
+        // Le `vault` entre dans la clé de hash : deux vaults distincts au même locus/bearer
+        // doivent produire des hashes distincts (isolation de cache, miroir de la PK composite).
+        OverrideScope::Locus { vault, locus } => {
+            format!("locus:{}:{}", vault.as_str(), locus.as_str())
+        }
+        OverrideScope::Bearer { vault, bearer } => {
+            format!("bearer:{}:{}", vault.as_str(), bearer.as_str())
+        }
     };
     let mut hasher = DefaultHasher::new();
     repr.hash(&mut hasher);
@@ -162,7 +198,10 @@ mod tests {
     #[test]
     fn scope_hash_vault_vs_locus_differ() {
         let vault = scope_to_hash(&OverrideScope::Vault(VaultId::new("main")));
-        let locus = scope_to_hash(&OverrideScope::Locus(LocusId::new("main")));
+        let locus = scope_to_hash(&OverrideScope::Locus {
+            vault: VaultId::new("main"),
+            locus: LocusId::new("main"),
+        });
         assert_ne!(
             vault, locus,
             "vault et locus avec même id doivent avoir des hashes distincts"

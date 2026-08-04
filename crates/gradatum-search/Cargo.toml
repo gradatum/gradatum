@@ -6,7 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Multi-mode reader (BM25 + semantic + graph) + RRF fusion"
+description = "Multi-mode reader (BM25 + semantic) + RRF fusion"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
@@ -14,18 +17,35 @@ default = []
 # ATTENTION : ort = "=2.0.0-rc.9" STRICT (cf. spec rev2 §10.1, RC fragile).
 # ndarray volontairement retiré : ort rc.9 Tensor::from_array attend `(shape, Vec<T>)`,
 # pas `Array2` directement. Cf. amend §10.1 dans le commit message.
-onnx-reranker = ["dep:ort", "dep:tokenizers"]
+onnx-reranker = ["dep:ort", "dep:ort-sys", "dep:tokenizers"]
+
+# `ort-sys` est un pin de résolution, jamais un `use` — sans cette exemption le job CI
+# `dead-deps` (cargo machete, nightly) le rapporterait en dépendance inutilisée à chaque
+# passe : un gate rouge en permanence cesse d'être lu.
+[package.metadata.cargo-machete]
+ignored = ["ort-sys"]
 
 [dependencies]
 gradatum-core.workspace = true
 gradatum-index.workspace = true
-gradatum-cache.workspace = true
 tracing.workspace = true
 
 # Optionnels — feature `onnx-reranker` (Task 14)
 ort = { version = "=2.0.0-rc.9", optional = true, default-features = false, features = [
     "download-binaries",
 ] }
+# PIN TRANSITIF OBLIGATOIRE — jamais utilisé dans le code, uniquement pour figer la
+# résolution. `ort` rc.9 déclare `ort-sys = "2.0.0-rc.9"` (caret, pas `=`) : chez un
+# consommateur externe, qui résout son propre lock, cela remonte jusqu'à `ort-sys`
+# rc.12. Or rc.12 a introduit un `compile_error!` — « When using `download-binaries`,
+# a TLS feature must be configured » — et une API `ureq` 3.x incompatible avec le
+# build script attendu par `ort` rc.9. Résultat mesuré sur un consommateur hors
+# workspace : 3 erreurs de compilation du build script d'`ort-sys` (EXIT 101), alors
+# que le build interne passait — notre `Cargo.lock` épingle rc.9, mais un `Cargo.lock`
+# de bibliothèque n'est PAS transmis aux consommateurs. Le pin `=` sur `ort` seul ne
+# protège donc rien : il doit être répliqué sur le sys-crate.
+# À retirer quand `ort` quittera les release candidates (pin `=` sur `ort` levé).
+ort-sys = { version = "=2.0.0-rc.9", optional = true, default-features = false }
 tokenizers = { version = "0.21", optional = true, default-features = false, features = [
     "onig",
 ] }

@@ -21,7 +21,7 @@ use gradatum_core::identity::{ContentHash, NoteId};
 use gradatum_core::index::{FileChecksumEntry, NoteRecord, TemporalEntry};
 use gradatum_core::index_store::{AuthorRow, LessonHitRaw, Lineage, SearchHitRaw};
 use gradatum_core::note::Note;
-use gradatum_core::scope::OverrideScope;
+use gradatum_core::scope::{AclCheckedVaultId, OverrideScope};
 use gradatum_core::{
     GradatumJob, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority, JobRecord,
     JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, PurgeMode, PurgeSpec, TriggerSource,
@@ -146,7 +146,7 @@ async fn purge_dry_run_via_job_mode_does_not_delete() {
     let note = fixture
         .vault
         .write_note(
-            make_frontmatter(Section::Decisions, NoteStatus::Live),
+            make_frontmatter(Section::Feedback, NoteStatus::Live),
             "body test dry-run".to_string(),
         )
         .await
@@ -176,6 +176,7 @@ async fn purge_dry_run_via_job_mode_does_not_delete() {
             Arc::clone(&fixture.vault),
             Arc::clone(&fixture.index),
         )) as Arc<dyn InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_purge dry-run ne doit pas échouer");
@@ -216,7 +217,7 @@ async fn purge_dry_run_via_spec_flag_does_not_delete() {
     let note = fixture
         .vault
         .write_note(
-            make_frontmatter(Section::Decisions, NoteStatus::Live),
+            make_frontmatter(Section::Feedback, NoteStatus::Live),
             "body test spec dry-run".to_string(),
         )
         .await
@@ -238,6 +239,7 @@ async fn purge_dry_run_via_spec_flag_does_not_delete() {
             Arc::clone(&fixture.vault),
             Arc::clone(&fixture.index),
         )) as Arc<dyn InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_purge spec.dry_run ne doit pas échouer");
@@ -270,7 +272,7 @@ async fn purge_real_deletes_garbage_note() {
     let note = fixture
         .vault
         .write_note(
-            make_frontmatter(Section::Decisions, NoteStatus::Live),
+            make_frontmatter(Section::Feedback, NoteStatus::Live),
             "body à supprimer".to_string(),
         )
         .await
@@ -299,13 +301,14 @@ async fn purge_real_deletes_garbage_note() {
             Arc::clone(&fixture.vault),
             Arc::clone(&fixture.index),
         )) as Arc<dyn InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_purge réel ne doit pas échouer");
 
     // Le résultat doit indiquer 1 suppression.
     assert!(
-        result.result_note_md.contains("1 note(s) supprimée(s)"),
+        result.result_note_md.contains("1 note(s) deleted"),
         "résultat doit indiquer 1 suppression : {}",
         result.result_note_md
     );
@@ -334,7 +337,7 @@ async fn purge_spares_recent_garbage_within_grace() {
     let note = fixture
         .vault
         .write_note(
-            make_frontmatter(Section::Decisions, NoteStatus::Live),
+            make_frontmatter(Section::Feedback, NoteStatus::Live),
             "body récent".to_string(),
         )
         .await
@@ -364,13 +367,14 @@ async fn purge_spares_recent_garbage_within_grace() {
             Arc::clone(&fixture.vault),
             Arc::clone(&fixture.index),
         )) as Arc<dyn InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_purge grace ne doit pas échouer");
 
     // Aucune suppression — la note est dans la grace period.
     assert!(
-        result.result_note_md.contains("0 note(s) supprimée(s)"),
+        result.result_note_md.contains("0 note(s) deleted"),
         "note récente doit être épargnée (grace_days=30) : {}",
         result.result_note_md
     );
@@ -398,7 +402,7 @@ async fn purge_never_touches_non_garbage_note() {
     let note = fixture
         .vault
         .write_note(
-            make_frontmatter(Section::Decisions, NoteStatus::Live),
+            make_frontmatter(Section::Feedback, NoteStatus::Live),
             "note Live — ne doit pas être supprimée".to_string(),
         )
         .await
@@ -421,13 +425,14 @@ async fn purge_never_touches_non_garbage_note() {
             Arc::clone(&fixture.vault),
             Arc::clone(&fixture.index),
         )) as Arc<dyn InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_purge note Live ne doit pas échouer");
 
     // Aucune suppression.
     assert!(
-        result.result_note_md.contains("0 note(s) supprimée(s)"),
+        result.result_note_md.contains("0 note(s) deleted"),
         "aucune note Garbage → 0 suppression : {}",
         result.result_note_md
     );
@@ -455,8 +460,12 @@ impl gradatum_core::DocumentStore for FaultStatusIndex {
     async fn write_note(&self, note: &Note) -> Result<(), GradatumError> {
         self.inner.write_note(note).await
     }
-    async fn get_content_hash(&self, id: NoteId) -> Result<Option<ContentHash>, GradatumError> {
-        self.inner.get_content_hash(id).await
+    async fn get_content_hash(
+        &self,
+        vault_id: &str,
+        id: NoteId,
+    ) -> Result<Option<ContentHash>, GradatumError> {
+        self.inner.get_content_hash(vault_id, id).await
     }
     async fn get_note(
         &self,
@@ -474,34 +483,44 @@ impl gradatum_core::DocumentStore for FaultStatusIndex {
     }
     async fn downgrade_note(
         &self,
+        vault: &gradatum_core::scope::AclCheckedVaultId,
         note_id: &NoteId,
         reason: &str,
         replaced_by: Option<&NoteId>,
     ) -> Result<(), GradatumError> {
         self.inner
-            .downgrade_note(note_id, reason, replaced_by)
+            .downgrade_note(vault, note_id, reason, replaced_by)
             .await
     }
     async fn patch_note_status(
         &self,
+        vault: &gradatum_core::scope::AclCheckedVaultId,
         note_id: &NoteId,
         status: Option<&str>,
         status_reason: Option<&str>,
         replaced_by: Option<&NoteId>,
     ) -> Result<(), GradatumError> {
         self.inner
-            .patch_note_status(note_id, status, status_reason, replaced_by)
+            .patch_note_status(vault, note_id, status, status_reason, replaced_by)
             .await
     }
-    async fn upsert_note_title(&self, note_id: &NoteId, title: &str) -> Result<(), GradatumError> {
-        self.inner.upsert_note_title(note_id, title).await
+    async fn upsert_note_title(
+        &self,
+        vault_id: &str,
+        note_id: &NoteId,
+        title: &str,
+    ) -> Result<usize, GradatumError> {
+        self.inner.upsert_note_title(vault_id, note_id, title).await
     }
     async fn update_note_locus(
         &self,
+        vault: &gradatum_core::scope::AclCheckedVaultId,
         note_id: &NoteId,
         new_locus: &gradatum_core::scope::LocusId,
     ) -> Result<(), GradatumError> {
-        self.inner.update_note_locus(note_id, new_locus).await
+        self.inner
+            .update_note_locus(vault, note_id, new_locus)
+            .await
     }
     async fn mark_forgotten(
         &self,
@@ -510,6 +529,9 @@ impl gradatum_core::DocumentStore for FaultStatusIndex {
         by: Option<&str>,
     ) -> Result<(), GradatumError> {
         self.inner.mark_forgotten(vault_id, note_id, by).await
+    }
+    async fn reassert_forgotten(&self, vault_id: &str, note_id: &str) -> Result<(), GradatumError> {
+        self.inner.reassert_forgotten(vault_id, note_id).await
     }
     async fn unmark_forgotten(&self, vault_id: &str, note_id: &str) -> Result<(), GradatumError> {
         self.inner.unmark_forgotten(vault_id, note_id).await
@@ -595,7 +617,7 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
     #[allow(clippy::too_many_arguments)]
     async fn search_fts_with_snippet(
         &self,
-        vault_id: &VaultId,
+        vault_id: &AclCheckedVaultId,
         query: &str,
         limit: usize,
         include_downgraded: bool,
@@ -607,7 +629,7 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
     ) -> Result<Vec<SearchHitRaw>, GradatumError> {
         self.inner
             .search_fts_with_snippet(
-                vault_id,
+                vault_id.vault_id(),
                 query,
                 limit,
                 include_downgraded,
@@ -715,13 +737,13 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
     }
     async fn get_titles_sections(
         &self,
-        vault_id: &str,
+        vault_id: &AclCheckedVaultId,
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, (Option<String>, String)>, GradatumError> {
-        self.inner.get_titles_sections(vault_id, ids).await
+        self.inner.get_titles_sections(vault_id.as_str(), ids).await
     }
-    async fn get_trust(&self, id: &NoteId) -> Result<Option<f32>, GradatumError> {
-        self.inner.get_trust(id).await
+    async fn get_trust(&self, vault_id: &str, id: &NoteId) -> Result<Option<f32>, GradatumError> {
+        self.inner.get_trust(vault_id, id).await
     }
     async fn get_trust_and_provenance(
         &self,
@@ -732,23 +754,32 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
     }
     async fn upsert_redirect(
         &self,
+        vault_id: &str,
         slug: &str,
         ulid: &Ulid,
         renamed_at_ms: i64,
     ) -> Result<(), GradatumError> {
-        self.inner.upsert_redirect(slug, ulid, renamed_at_ms).await
+        self.inner
+            .upsert_redirect(vault_id, slug, ulid, renamed_at_ms)
+            .await
     }
-    async fn resolve_redirect(&self, slug: &str) -> Result<Option<Ulid>, GradatumError> {
-        self.inner.resolve_redirect(slug).await
+    async fn resolve_redirect(
+        &self,
+        vault_id: &str,
+        slug: &str,
+    ) -> Result<Option<Ulid>, GradatumError> {
+        self.inner.resolve_redirect(vault_id, slug).await
     }
     async fn search_fts_for_forget(
         &self,
-        vault_id: &str,
+        vault_id: &VaultId,
         query: &str,
         limit: usize,
     ) -> Result<Vec<(String, String)>, GradatumError> {
+        // `inner` est un `SqliteIndex` concret : la méthode inhérente `&str` masque
+        // celle du trait par résolution de méthode → passer `vault_id.as_str()`.
         self.inner
-            .search_fts_for_forget(vault_id, query, limit)
+            .search_fts_for_forget(vault_id.as_str(), query, limit)
             .await
     }
     async fn list_notes_by_locus_prefix(
@@ -767,21 +798,30 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
     ) -> Result<Vec<(String, String)>, GradatumError> {
         self.inner.list_notes_by_agent(agent_id, vaults).await
     }
-    async fn set_note_trust(&self, id: &NoteId, trust: f32) -> Result<usize, GradatumError> {
-        self.inner.set_note_trust(id, trust).await
+    async fn set_note_trust(
+        &self,
+        vault_id: &str,
+        id: &NoteId,
+        trust: f32,
+    ) -> Result<usize, GradatumError> {
+        self.inner.set_note_trust(vault_id, id, trust).await
     }
     async fn write_temporal_entry(&self, entry: &TemporalEntry) -> Result<(), GradatumError> {
         self.inner.write_temporal_entry(entry).await
     }
     async fn timeline(
         &self,
-        vault_id: &VaultId,
+        vault_id: &AclCheckedVaultId,
         filter: &gradatum_core::temporal_query::TimelineFilter,
     ) -> Result<Vec<gradatum_core::temporal_query::TimelineRow>, GradatumError> {
-        self.inner.timeline(vault_id, filter).await
+        self.inner.timeline(vault_id.vault_id(), filter).await
     }
-    async fn delete_redirect_by_ulid(&self, ulid_str: &str) -> Result<usize, GradatumError> {
-        self.inner.delete_redirect_by_ulid(ulid_str).await
+    async fn delete_redirect_by_ulid(
+        &self,
+        vault_id: &str,
+        ulid_str: &str,
+    ) -> Result<usize, GradatumError> {
+        self.inner.delete_redirect_by_ulid(vault_id, ulid_str).await
     }
     async fn delete_note_from_index(
         &self,
@@ -841,25 +881,29 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
 impl gradatum_core::VectorStore for FaultStatusIndex {
     async fn insert_note_embedding(
         &self,
+        vault_id: &str,
         note_id: &NoteId,
         embedder_id: &str,
         dim: u16,
         vector: &[f32],
     ) -> Result<(), GradatumError> {
         self.inner
-            .insert_note_embedding(note_id, embedder_id, dim, vector)
+            .insert_note_embedding(vault_id, note_id, embedder_id, dim, vector)
             .await
     }
     async fn get_note_embedding(
         &self,
+        vault_id: &str,
         note_id: &NoteId,
         embedder_id: &str,
     ) -> Result<Option<Vec<f32>>, GradatumError> {
-        self.inner.get_note_embedding(note_id, embedder_id).await
+        self.inner
+            .get_note_embedding(vault_id, note_id, embedder_id)
+            .await
     }
     async fn search_semantic(
         &self,
-        vault_id: &str,
+        vault_id: &AclCheckedVaultId,
         embedder_id: &str,
         query_emb: &[f32],
         limit: usize,
@@ -921,10 +965,25 @@ async fn purge_tolerates_unparseable_status_and_continues_batch() {
         ) -> Result<PersistOkResponse, InternalClientError> {
             self.inner.persist_distill(req).await
         }
-        async fn delete_note(&self, ulid: &str) -> Result<(), InternalClientError> {
-            self.inner.delete_note(ulid).await
+        async fn delete_note(&self, vault_id: &str, ulid: &str) -> Result<(), InternalClientError> {
+            self.inner.delete_note(vault_id, ulid).await
         }
-        async fn get_note(&self, ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+        async fn get_note(
+            &self,
+            vault_id: &str,
+            ulid: &str,
+        ) -> Result<NoteReadDto, InternalClientError> {
+            self.inner.get_note(vault_id, ulid).await
+        }
+        async fn get_note_status(
+            &self,
+            vault_id: &str,
+            ulid: &str,
+        ) -> Result<Option<String>, InternalClientError> {
+            // C4-1e (W3) : le re-check TOCTOU de la purge appelle désormais
+            // `get_note_status` (index scopé) au lieu de `get_note` (.md). La faute
+            // « statut illisible » est donc injectée ICI pour préserver l'intention du
+            // test (re-check illisible → note skip, batch continue).
             if ulid == self.fault_id {
                 return Err(InternalClientError::ServerError {
                     status: 500,
@@ -933,17 +992,20 @@ async fn purge_tolerates_unparseable_status_and_continues_batch() {
                     ),
                 });
             }
-            self.inner.get_note(ulid).await
+            self.inner.get_note_status(vault_id, ulid).await
         }
         async fn get_note_embedding(
             &self,
+            vault_id: &str,
             ulid: &str,
             embedder_id: &str,
         ) -> Result<EmbeddingReadDto, InternalClientError> {
-            self.inner.get_note_embedding(ulid, embedder_id).await
+            self.inner
+                .get_note_embedding(vault_id, ulid, embedder_id)
+                .await
         }
-        async fn get_trust(&self, ulid: &str) -> Result<f32, InternalClientError> {
-            self.inner.get_trust(ulid).await
+        async fn get_trust(&self, vault_id: &str, ulid: &str) -> Result<f32, InternalClientError> {
+            self.inner.get_trust(vault_id, ulid).await
         }
         async fn title_lookup(
             &self,
@@ -1004,7 +1066,7 @@ async fn purge_tolerates_unparseable_status_and_continues_batch() {
     let bad = fixture
         .vault
         .write_note(
-            make_frontmatter(Section::Decisions, NoteStatus::Live),
+            make_frontmatter(Section::Feedback, NoteStatus::Live),
             "note au statut illisible".to_string(),
         )
         .await
@@ -1012,7 +1074,7 @@ async fn purge_tolerates_unparseable_status_and_continues_batch() {
     let good = fixture
         .vault
         .write_note(
-            make_frontmatter(Section::Decisions, NoteStatus::Live),
+            make_frontmatter(Section::Feedback, NoteStatus::Live),
             "note purgeable normale".to_string(),
         )
         .await
@@ -1025,7 +1087,8 @@ async fn purge_tolerates_unparseable_status_and_continues_batch() {
             .expect("update_status Live→Garbage");
     }
 
-    // Client décoré : get_note erre pour `bad.id` (simule statut illisible TOCTOU).
+    // Client décoré : get_note_status erre pour `bad.id` (simule statut illisible TOCTOU
+    // au re-check scopé C4-1e W3).
     let faulty_client = Arc::new(FaultGetNoteClient {
         inner: TestInternalClient::new(Arc::clone(&fixture.vault), Arc::clone(&fixture.index)),
         fault_id: bad.id.to_string(),
@@ -1040,18 +1103,22 @@ async fn purge_tolerates_unparseable_status_and_continues_batch() {
         JobMode::Batch,
     );
 
-    let result = handle_purge(job, Data::new(faulty_client))
-        .await
-        .expect("le batch NE DOIT PAS avorter sur un statut illisible");
+    let result = handle_purge(
+        job,
+        Data::new(faulty_client),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await
+    .expect("le batch NE DOIT PAS avorter sur un statut illisible");
 
     // 1 supprimée (good), 1 ignorée (bad) — batch complété malgré l'erreur.
     assert!(
-        result.result_note_md.contains("1 note(s) supprimée(s)"),
+        result.result_note_md.contains("1 note(s) deleted"),
         "1 suppression attendue (good) : {}",
         result.result_note_md
     );
     assert!(
-        result.result_note_md.contains("1 ignorée(s)"),
+        result.result_note_md.contains("1 skipped"),
         "1 note ignorée attendue (bad, statut illisible) : {}",
         result.result_note_md
     );
@@ -1074,5 +1141,90 @@ async fn purge_tolerates_unparseable_status_and_continues_batch() {
             .expect("get_note_status bad"),
         Some(NoteStatus::Garbage),
         "la note bad (ignorée) reste en Garbage"
+    );
+}
+
+/// F-100 P1-1 — scénario exact de l'audit : une note `council` passée en garbage
+/// n'est JAMAIS purgée (exclue du listing des candidats, garde system-wide), tandis
+/// qu'une note non protégée en garbage l'est. Le batch se termine sans erreur.
+#[tokio::test]
+async fn purge_never_deletes_protected_garbage_note() {
+    use gradatum_worker::apalis_handlers::handle_purge;
+
+    let fixture = make_fixture().await;
+
+    // Note council (PROTECTED_DELETE) → garbage : doit rester présente.
+    let council = fixture
+        .vault
+        .write_note(
+            make_frontmatter(Section::Council, NoteStatus::Live),
+            "verdict council à préserver".to_string(),
+        )
+        .await
+        .expect("write_note council");
+    // Note feedback (non protégée) → garbage : doit être purgée (non-régression GC).
+    let feedback = fixture
+        .vault
+        .write_note(
+            make_frontmatter(Section::Feedback, NoteStatus::Live),
+            "note feedback jetable".to_string(),
+        )
+        .await
+        .expect("write_note feedback");
+    for id in [council.id, feedback.id] {
+        fixture
+            .vault
+            .update_status(id, NoteStatus::Garbage, None)
+            .await
+            .expect("update_status Live→Garbage");
+    }
+
+    // Mode réel, grace_days=None (purge tout le garbage éligible).
+    let job = make_purge_job(
+        PurgeSpec {
+            mode: PurgeMode::Lifecycle,
+            dry_run: false,
+            grace_days: None,
+        },
+        JobMode::Batch,
+    );
+
+    let result = handle_purge(
+        job,
+        Data::new(Arc::new(TestInternalClient::new(
+            Arc::clone(&fixture.vault),
+            Arc::clone(&fixture.index),
+        )) as Arc<dyn InternalClient>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await
+    .expect("handle_purge ne doit pas échouer");
+
+    // Batch OK : exactement 1 suppression (feedback), le council n'est jamais candidat.
+    assert!(
+        result.result_note_md.contains("1 note(s) deleted"),
+        "seule la note feedback doit être supprimée : {}",
+        result.result_note_md
+    );
+
+    // La note council est TOUJOURS présente (index).
+    assert_eq!(
+        fixture
+            .index
+            .get_note_status("main", &council.id.to_string())
+            .await
+            .expect("get_note_status council"),
+        Some(NoteStatus::Garbage),
+        "la note council protégée doit rester en garbage, jamais purgée"
+    );
+    // La note feedback a bien été purgée.
+    assert!(
+        fixture
+            .index
+            .get_note_status("main", &feedback.id.to_string())
+            .await
+            .expect("get_note_status feedback")
+            .is_none(),
+        "la note feedback non protégée doit avoir été purgée"
     );
 }

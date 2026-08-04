@@ -16,14 +16,15 @@
 //! - `GET  /api/v1/vault_authors` → [`VaultAuthorsResponse`]
 //! - `GET  /api/v1/vault_tags`    → [`VaultTagsResponse`]
 
+use gradatum_core::scope::VaultId;
 use serde::Serialize;
 
 // ── Re-exports depuis gradatum-dto (single source of truth) ───────────────────
 pub use gradatum_dto::{
-    SessionTraceRequest, SessionTraceResponse, VaultClassifyRequest, VaultClassifyResponse,
-    VaultContextRequest, VaultDowngradeRequest, VaultGraphRequest, VaultLinksRequest,
-    VaultListRequest, VaultReadRequest, VaultSearchRequest, VaultTimelineRequest,
-    VaultTraceRequest, VaultWriteRequest,
+    CreateFeatureCardRequest, CreateFeatureCardResponse, SessionTraceRequest, SessionTraceResponse,
+    VaultClassifyRequest, VaultClassifyResponse, VaultContextRequest, VaultDowngradeRequest,
+    VaultGraphRequest, VaultLinksRequest, VaultListRequest, VaultReadRequest, VaultSearchRequest,
+    VaultTimelineRequest, VaultTraceRequest, VaultWriteRequest,
 };
 
 // ── vault_search ─────────────────────────────────────────────────────────────
@@ -64,13 +65,41 @@ pub struct ScoreBreakdown {
     /// Zero-based rank in the semantic signal, `None` if the note is absent from it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sem_rank: Option<u32>,
+    /// Weighted usage sum `Σ w_kind·count`, `None` when salience is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salience_weighted_sum: Option<f64>,
+    /// Normalised salience `s/(s+k_norm)` ∈ `[0,1)`, `None` when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salience_factor: Option<f64>,
 }
 
 /// Individual search result, enriched with the H1 title extracted after curation.
 ///
 /// Allows clients to know the human-readable title without reading the full note.
+///
+/// `vault_id` + `path` together form the full address of the note: `path` is only
+/// unique within a vault, so a hit is only unambiguous once both are read.
+///
+/// `#[non_exhaustive]`: this is a response type, produced by the server and never
+/// constructed by a consumer, so further fields can be added within the `1.x` line
+/// without a major bump. Downstream code reads it — including through
+/// `serde_json` — which the attribute leaves untouched; only literal construction
+/// and exhaustive destructuring from another crate are forbidden.
 #[derive(Debug, Serialize)]
+#[non_exhaustive]
 pub struct SearchHit {
+    /// Vault the result was read from.
+    ///
+    /// Always present, on every result, whether or not the request carried a
+    /// `vault_id`. It states the origin of the content instead of leaving the
+    /// caller to infer it from the request it sent — an inference that breaks as
+    /// soon as a single hit is quoted, cached or merged away from its response.
+    ///
+    /// Together with `path` it forms the full address of the note (`path` alone is
+    /// only unique within a vault).
+    ///
+    /// Serialised as a plain JSON string, e.g. `"main"`.
+    pub vault_id: VaultId,
     /// Path of the note (e.g. `"decisions/my-note"`).
     pub path: String,
     /// Relevance score — RRF (Reciprocal Rank Fusion): `Σ 1/(k + rank_i)` with k=60.
@@ -96,7 +125,7 @@ pub struct SearchHit {
     /// on the wire). Final removal is planned for a future major version.
     #[deprecated(
         since = "0.4.8",
-        note = "valeur legacy hardcodée 0.5 ; utiliser scores.trust_raw (v0.4.4+)"
+        note = "hardcoded legacy value 0.5; use scores.trust_raw (v0.4.4+)"
     )]
     pub trust: f32,
     /// Raw SQL status of the note — kebab-case (`"live"`, `"pending-review"`,

@@ -1,9 +1,9 @@
 //! `gradatum-admin backfill-note-links` sub-command.
 //!
-//! Itère les notes `status='live'` contenant au moins un wikilink `[[` mais
-//! sans arête sortante dans `note_links`, résout les liens via
-//! [`gradatum_curator::wikilinks_sync::resolve_wikilinks_sync`] et insère
-//! les arêtes manquantes.
+//! Iterates over notes with `status = 'live'` that contain at least one `[[` wikilink but
+//! have no outgoing edge in `note_links`, resolves their links through
+//! [`gradatum_curator::wikilinks_sync::resolve_wikilinks_sync`], and inserts the missing
+//! edges.
 //!
 //! ## Usage
 //! ```text
@@ -13,29 +13,28 @@
 //!
 //! ## Idempotence
 //!
-//! `INSERT OR IGNORE` garantit qu'une ré-exécution sur une base déjà traitée
-//! est sans effet. `notes_needing_backfill` filtre les notes qui ont déjà au
-//! moins une arête sortante → scan ne retourne rien si tout est déjà traité.
+//! Edges are written with `INSERT OR IGNORE`, so re-running against an already processed
+//! database changes nothing. The scan itself skips any note that already has at least one
+//! outgoing edge, and therefore returns nothing once every note has been processed.
 //!
-//! ## Dettes techniques
+//! ## Known limitations
 //!
-//! - **DT-BACKFILL-3** : scan = scope "0 arête sortante" → outil one-shot historique,
-//!   pas réconciliation incrémentale. Les notes re-éditées après un premier backfill
-//!   ne sont pas re-scannées (LEFT JOIN = 0 arête dès qu'une existe).
-//! - **DT-BACKFILL-4** : `--tenant` est transmis tel quel mais le serveur LIVE
-//!   n'admet qu'un seul tenant `main` (DT-INTERNAL-1). Ce flag est conservé pour
-//!   cohérence avec les autres commandes admin, mais tout run en prod utilisera
-//!   toujours `--tenant main`.
+//! - The scan selects notes with **zero** outgoing edges. This is a one-shot repair tool,
+//!   not an incremental reconciler: a note edited after a first back-fill is not picked up
+//!   again, because it already has edges and the scan's `LEFT JOIN` filters it out.
+//! - `--tenant` selects the vault the back-fill runs against. On a deployment where
+//!   multi-tenancy is disabled, the only meaningful value is `main`; the flag is kept for
+//!   consistency with the other admin sub-commands.
 
 use anyhow::{Context, Result};
 use gradatum_core::paths::vault_index_path;
 use std::path::PathBuf;
 
-/// Échappe les caractères spéciaux SQLite LIKE (`%`, `_`, `\`) pour éviter
-/// les faux positifs lors d'une recherche LIKE avec `ESCAPE '\\'`.
+/// Escapes the SQLite `LIKE` metacharacters `%`, `_` and `\`, so a title containing them
+/// cannot produce false positives in a `LIKE … ESCAPE '\\'` lookup.
 ///
-/// Parité exacte avec `gradatum_index::queries::escape_like_pattern` —
-/// dupliquée ici car non exportée publiquement par `gradatum-index`.
+/// Behaviour matches `gradatum_index::queries::escape_like_pattern` exactly; it is
+/// duplicated here because `gradatum-index` does not export it publicly.
 ///
 /// ```text
 /// escape_like_pattern("User%")   → "User\\%"
@@ -57,41 +56,44 @@ fn escape_like_pattern(s: &str) -> String {
     out
 }
 
-/// Arguments pour la sous-commande `backfill-note-links`.
+/// Arguments for the `backfill-note-links` sub-command.
 #[derive(Debug, Clone)]
 pub struct BackfillNoteLinksArgs {
-    /// Répertoire racine Gradatum (ex. `/var/lib/gradatum`).
+    /// Gradatum root directory (e.g. `/var/lib/gradatum`).
     pub root: PathBuf,
-    /// Tenant cible (défaut : `"main"`).
+    /// Target tenant (default: `"main"`).
     pub tenant: String,
-    /// Mode dry-run : parcourt sans écrire.
+    /// Dry-run mode: walks the candidate notes without writing anything.
     pub dry_run: bool,
-    /// Nombre maximum de notes à traiter (illimité si absent).
+    /// Maximum number of notes to process; unlimited when absent.
     pub limit: Option<usize>,
 }
 
-/// Rapport d'un run de backfill `note_links`.
+/// Report of a `note_links` back-fill run.
 #[derive(Debug, Default, Clone)]
 #[must_use]
 pub struct BackfillNoteLinksReport {
-    /// Nombre de notes candidates scannées.
+    /// Number of candidate notes scanned.
     pub notes_scanned: usize,
-    /// Nombre total d'arêtes passées à `INSERT OR IGNORE`.
+    /// Total number of edges submitted to `INSERT OR IGNORE`.
+    ///
+    /// This counts attempts, not rows actually inserted: an edge that already existed is
+    /// ignored by SQLite yet still counted here.
     pub edges_written: usize,
-    /// Nombre de notes pour lesquelles au moins une arête a été traitée.
+    /// Number of notes for which at least one edge was submitted.
     pub notes_touched: usize,
-    /// `true` si le run était en mode dry-run.
+    /// `true` when the run was a dry-run.
     pub dry_run: bool,
 }
 
-/// Retourne les notes `status='live'` avec au moins un wikilink `[[` et
-/// AUCUNE arête sortante dans `note_links` pour ce vault.
+/// Returns the notes of this vault that have `status = 'live'`, contain at least one `[[`
+/// wikilink, and have no outgoing edge at all in `note_links`.
 ///
-/// Idempotent : si toutes les arêtes existent déjà → retourne `Vec` vide.
+/// Idempotent: once every edge exists, the result is an empty `Vec`.
 ///
 /// # Errors
 ///
-/// Retourne une erreur si la DB est inaccessible ou si la requête échoue.
+/// The database is unreachable, or the query fails.
 fn notes_needing_backfill(
     conn: &rusqlite::Connection,
     vault_id: &str,
@@ -113,33 +115,32 @@ fn notes_needing_backfill(
 
     let mut stmt = conn
         .prepare(&query)
-        .context("préparation SELECT notes sans note_links")?;
+        .context("preparing SELECT notes without note_links")?;
 
     let rows: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![vault_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
-        .context("exécution SELECT notes sans note_links")?
+        .context("executing SELECT notes without note_links")?
         .collect::<std::result::Result<_, _>>()
-        .context("collecte notes sans note_links")?;
+        .context("collecting notes without note_links")?;
 
     drop(stmt);
     Ok(rows)
 }
 
-/// Résout et insère les arêtes manquantes pour une note donnée.
+/// Resolves the wikilinks of one note and inserts the edges that are missing.
 ///
-/// Idempotent : `INSERT OR IGNORE` → 0 erreur si l'arête existe déjà.
+/// Idempotent: edges are written with `INSERT OR IGNORE`, so an edge that already exists
+/// is silently ignored rather than raising an error.
 ///
-/// # Retour
-///
-/// Nombre d'arêtes passées à `INSERT OR IGNORE` (y compris celles déjà
-/// existantes ignorées — `conn.changes()` retourne le nombre effectivement inséré,
-/// mais on compte ici les tentatives pour le rapport).
+/// Returns the number of edges submitted to `INSERT OR IGNORE`. That is a count of
+/// attempts, not of rows actually inserted: already-existing edges are included, because
+/// the figure is meant for the run report.
 ///
 /// # Errors
 ///
-/// Retourne une erreur si la DB est inaccessible ou si l'insertion échoue.
+/// The database is unreachable, or an insert fails.
 fn backfill_one(
     conn: &rusqlite::Connection,
     vault_id: &str,
@@ -203,20 +204,20 @@ fn backfill_one(
     Ok(count)
 }
 
-/// Lance le backfill complet des `note_links` manquants pour un tenant donné.
+/// Runs the full back-fill of missing `note_links` edges for one tenant.
 ///
-/// En mode `dry_run`, parcourt les notes candidates mais n'écrit rien.
+/// In `dry_run` mode the candidate notes are walked but nothing is written.
 ///
 /// # Errors
 ///
-/// Retourne une erreur si la DB est inaccessible, la résolution des wikilinks
-/// échoue de façon fatale, ou une insertion DB lève une erreur non-ignorable.
+/// The database is unreachable, wikilink resolution fails fatally, or an insert raises a
+/// non-ignorable error.
 pub async fn run(args: BackfillNoteLinksArgs) -> Result<BackfillNoteLinksReport> {
     let db_path = vault_index_path(&args.root);
 
     if !db_path.exists() {
         anyhow::bail!(
-            "index.db introuvable : {} — le serveur doit avoir démarré au moins une fois",
+            "index.db not found: {} — the server must have started at least once",
             db_path.display()
         );
     }
@@ -228,15 +229,15 @@ pub async fn run(args: BackfillNoteLinksArgs) -> Result<BackfillNoteLinksReport>
     .context("spawn_blocking backfill_note_links")?
 }
 
-/// Implémentation synchrone du backfill ; appelée depuis `spawn_blocking`.
+/// Synchronous back-fill implementation; called from `spawn_blocking`.
 fn run_backfill_sync(
     db_path: &std::path::Path,
     tenant: &str,
     dry_run: bool,
     limit: Option<usize>,
 ) -> Result<BackfillNoteLinksReport> {
-    let conn = rusqlite::Connection::open(db_path)
-        .context("ouverture index.db pour backfill-note-links")?;
+    let conn =
+        rusqlite::Connection::open(db_path).context("opening index.db for backfill-note-links")?;
 
     // WAL pragma : lecture/écriture concurrente avec gradatum-server.
     conn.execute_batch("PRAGMA journal_mode=WAL;")
@@ -300,7 +301,7 @@ fn run_backfill_sync(
             notes_scanned,
             edges_written,
             notes_touched,
-            "backfill-note-links DRY-RUN terminé"
+            "backfill-note-links DRY-RUN complete"
         );
         return Ok(BackfillNoteLinksReport {
             notes_scanned,
@@ -324,7 +325,7 @@ fn run_backfill_sync(
         notes_scanned,
         edges_written,
         notes_touched,
-        "backfill-note-links terminé"
+        "backfill-note-links complete"
     );
 
     Ok(BackfillNoteLinksReport {

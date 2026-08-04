@@ -79,42 +79,15 @@ pub trait ToolUseBridge: Send + Sync {
 
 **`cargo semver-checks`**: Enforces SemVer 2.0.0 rules. Traits marked `#[stability::stable]` **must** pass `cargo semver-checks` — adding a method without default impl is a major bump. `unstable` and `experimental` traits are exempt (marked `--allow-unstable` in `Cargo.toml`).
 
-**Conformance testkit** (AM2): `gradatum-core` ships a `testkit` Cargo feature with parameterized trait tests. Example:
+**Conformance testkit** (AM2) — **planned, not shipped in `1.0.0`**. `gradatum-core` does not
+expose a `testkit` feature: its only feature is `test-utils` (which exposes `InMemorySink`, not a
+conformance macro). No `gradatum_core::testkit` module exists, and `features = ["testkit"]` does
+not resolve. Until the feature ships, downstream impls are validated against the trait signatures
+only, and nothing in CI blocks a non-conformant impl from publishing.
 
-```rust
-#[cfg(test)]
-mod conformance {
-    use gradatum_core::testkit::*;
-
-    struct MockChat;
-    
-    #[async_trait::async_trait]
-    impl Chat for MockChat {
-        async fn generate(&self, params: &GenerationParams) 
-            -> Result<Generation, ChatError> 
-        {
-            Ok(Generation {
-                text: "mock response".into(),
-                stop_reason: StopReason::EndTurn,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn mock_passes_conformance() {
-        chat_conformance!(MockChat);
-    }
-}
-```
-
-Any downstream impl must run these tests (enabled in their `Cargo.toml` dev-dependency):
-
-```toml
-[dev-dependencies]
-gradatum-core = { version = "1.0", features = ["testkit"] }
-```
-
-Failing conformance blocks `cargo publish`.
+When the feature ships, this section will describe the macro signatures, the conformance scope per
+trait, and the CI wiring. Both are deliberately left unspecified here rather than documented ahead
+of the code.
 
 ### 3.3 Deprecation cycles for stable traits
 

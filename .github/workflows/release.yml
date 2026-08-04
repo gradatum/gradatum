@@ -36,10 +36,17 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # ───────────────────────────────────────────────────────────────────
-      # 2. Toolchain Rust stable
+      # 2. Toolchain Rust épinglée (rust-toolchain.toml)
       # ───────────────────────────────────────────────────────────────────
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        # L'action était référencée par SHA : elle ne pouvait plus dériver de canal
+        # depuis son @rev, et la release PUBLIQUE partait donc sur une toolchain
+        # indéterminée. `rustup toolchain install` sans argument lit
+        # rust-toolchain.toml — une seule source, et une dépendance tierce de moins
+        # sur le chemin de publication. Invariant toolchain, council Art.19 2026-07-24.
+        run: |
+          rustup toolchain install --no-self-update
+          rustc --version
 
       # ───────────────────────────────────────────────────────────────────
       # 3. Cache cargo (registry + build artefacts release)
@@ -103,12 +110,128 @@ jobs:
           echo "name=${TAG}" >> "$GITHUB_OUTPUT"
 
       # ───────────────────────────────────────────────────────────────────
-      # 7. Packaging — 3 tarballs par rôle + SHA256SUMS commun
+      # 6bis. SBOM CycloneDX — livrable de release, périmètre publiable-only,
+      #    reproductible (SOURCE_DATE_EPOCH = date du commit taggé).
+      #
+      #    Périmètre : crates publiables UNIQUEMENT, déterminé via `cargo
+      #    metadata` (jamais `grep publish` — une crate publiable par défaut
+      #    n'a pas de ligne `publish` dans son Cargo.toml). Exclut
+      #    gradatum-bench / gradatum-cli / index-parity-tests / v1-parity-tests
+      #    (publish=false, harnais de test + scaffold interne) : leur seule
+      #    PRÉSENCE dans l'artefact révélerait l'existence de ce harnais par
+      #    les noms de fichiers, même si le contenu JSON de chaque SBOM ne
+      #    fuit rien par ailleurs (name/version/purl/licenses/scope/description
+      #    /externalReferences — aucun chemin filesystem après sanitisation
+      #    ci-dessous).
+      #
+      #    Reproductible : SOURCE_DATE_EPOCH = date du commit taggé (jamais
+      #    l'heure du build CI) — quiconque checkout le même tag et relance la
+      #    commande obtient un JSON bit-identique. --spec-version 1.5 choisi
+      #    pour l'alignement avec l'écosystème de consommation SBOM courant
+      #    (Dependency-Track/Grype/Trivy) — vérifié empiriquement (cargo-
+      #    cyclonedx 0.5.9) que 1.3 et 1.5 produisent le même jeu de champs
+      #    pour ce projet (aucun champ 1.4/1.5-only peuplé) ; le gain n'est
+      #    donc pas fonctionnel ici, seulement la fraîcheur du schéma déclaré.
+      #    Le vrai levier de reproductibilité est SOURCE_DATE_EPOCH : sans lui,
+      #    l'outil assigne un `serialNumber` UUID aléatoire à CHAQUE run (les
+      #    deux spec versions), cassant la reproductibilité par nature.
+      #
+      #    Sanitisation obligatoire : le `bom-ref` de chaque composant embarque
+      #    nativement le chemin ABSOLU du workspace de build
+      #    (`path+file:///home/<user>/projects/gradatum/crates/...`) — fuite du
+      #    nom d'utilisateur / layout de la machine de build, ET obstacle direct
+      #    à la reproductibilité tierce (un consommateur qui régénère depuis un
+      #    autre chemin sur sa propre machine obtiendrait un bom-ref différent,
+      #    donc un JSON différent). Neutralisé par substitution du préfixe
+      #    absolu vers un préfixe relatif fixe (`path+file://.`), appliquée
+      #    uniformément à chaque fichier — le graphe de dépendances interne
+      #    (section `dependencies`, qui référence les composants PAR bom-ref)
+      #    reste cohérent car la même substitution s'applique à toutes ses
+      #    occurrences dans un même fichier.
+      # ───────────────────────────────────────────────────────────────────
+      - name: Generate SBOM (CycloneDX, publishable-only, reproducible)
+        id: sbom
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          DIST="${GITHUB_WORKSPACE}/dist"
+          mkdir -p "${DIST}/sbom"
+
+          cargo install cargo-cyclonedx --locked --quiet
+
+          WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 | jq -r .workspace_root)"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+
+          # Périmètre publiable — jamais grep (cf. bandeau ci-dessus).
+          mapfile -t PUBLISHABLE < <(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish == null or (.publish | length > 0)) | .name')
+
+          cargo cyclonedx --format json --spec-version 1.5
+
+          for f in $(find crates -maxdepth 2 -name '*.cdx.json'); do
+            NAME="$(basename "${f}" .cdx.json)"
+            KEEP=0
+            for p in "${PUBLISHABLE[@]}"; do
+              [ "${p}" = "${NAME}" ] && KEEP=1 && break
+            done
+            if [ "${KEEP}" -eq 1 ]; then
+              # Neutralise le chemin absolu du workspace de build (privacy + repro tierce)
+              sed -i "s|path+file://${WORKSPACE_ROOT}|path+file://.|g" "${f}"
+              cp "${f}" "${DIST}/sbom/${NAME}.cdx.json"
+            fi
+          done
+
+          COUNT=$(find "${DIST}/sbom" -name '*.cdx.json' | wc -l)
+          echo "SBOM publiables générés : ${COUNT} (attendu : ${#PUBLISHABLE[@]})"
+          if [ "${COUNT}" -ne "${#PUBLISHABLE[@]}" ]; then
+            echo "::error::Nombre de SBOM (${COUNT}) != crates publiables (${#PUBLISHABLE[@]}) — périmètre désaligné"
+            exit 1
+          fi
+          # Filet anti-fuite : aucun nom de crate non-publiable dans l'artefact final.
+          for p in gradatum-bench gradatum-cli index-parity-tests v1-parity-tests; do
+            if [ -f "${DIST}/sbom/${p}.cdx.json" ]; then
+              echo "::error::Crate non-publiable ${p} présente dans l'artefact SBOM"
+              exit 1
+            fi
+          done
+
+          # Assertion post-sanitisation (BLOQUANT) — vérifie la CLASSE, pas une
+          # instance littérale. Le sed ci-dessus ne matche que le préfixe exact
+          # ${WORKSPACE_ROOT} observé sur CETTE machine à CET instant : un
+          # runner qui checkout sous un autre chemin/utilisateur, ou une future
+          # version de cargo-cyclonedx qui change le format de bom-ref, fait
+          # échouer le sed EN SILENCE (0 match = 0 remplacement, exit 0 quand
+          # même) et le chemin absolu original repart tel quel dans l'artefact
+          # public. Un sed silencieux qui ne matche rien est indiscernable d'un
+          # sed qui a réussi — donc on ne fait plus confiance à son succès, on
+          # revérifie le résultat. Forme relative attendue : "path+file://."
+          # suivi de "/", "#" ou fin de chaîne. Toute autre valeur "path+file://"
+          # (notamment un chemin commençant par "/", donc absolu) fait échouer
+          # le step — y compris un format qu'aucun motif littéral connu (préfixe
+          # de workspace ou nom d'utilisateur du runner) n'aurait anticipé.
+          LEAKED_PATH_REFS=$(grep -ohE 'path\+file://[^"]*' "${DIST}"/sbom/*.cdx.json \
+            | grep -vE '^path\+file://\.($|[/#])' || true)
+          if [ -n "${LEAKED_PATH_REFS}" ]; then
+            echo "::error::Sanitisation SBOM incomplète — path+file:// non-relatif détecté après le sed (préfixe workspace différent de celui attendu, ou format bom-ref changé) :"
+            printf '%s\n' "${LEAKED_PATH_REFS}" | sort -u | head -20
+            exit 1
+          fi
+          echo "Sanitisation vérifiée : 0 path+file:// non-relatif dans les ${COUNT} SBOM publiables."
+
+          (cd "${DIST}" && tar -czf "gradatum-sbom-${TAG}.tar.gz" sbom/)
+          rm -rf "${DIST}/sbom"
+
+      # ───────────────────────────────────────────────────────────────────
+      # 7. Packaging — 3 tarballs par rôle + SBOM + SHA256SUMS commun
       #
       #    gradatum-server-<TAG>-x86_64 : server + worker + admin
       #    gradatum-llm-<TAG>-x86_64    : gateway + engine
       #    gradatum-mcp-<TAG>-x86_64    : mcp-stub
-      #    SHA256SUMS                   : couvre les 3 tarballs
+      #    gradatum-sbom-<TAG>          : SBOM CycloneDX (crates publiables)
+      #    SHA256SUMS                   : couvre les 4 tarballs
       # ───────────────────────────────────────────────────────────────────
       - name: Package binaries
         id: package
@@ -143,17 +266,20 @@ jobs:
           cp "target/release/gradatum-mcp-stub" "/tmp/${GROUP_MCP}/"
           (cd /tmp && tar -czf "${DIST}/${GROUP_MCP}.tar.gz" "${GROUP_MCP}/")
 
-          # ── SHA256SUMS couvrant les 3 tarballs ──
+          # ── SHA256SUMS couvrant les 3 tarballs binaires + le tarball SBOM ──
+          # (gradatum-sbom-${TAG}.tar.gz produit par le step "Generate SBOM" ci-dessus)
           (cd "${DIST}" && sha256sum \
             "${GROUP_SERVER}.tar.gz" \
             "${GROUP_LLM}.tar.gz"    \
             "${GROUP_MCP}.tar.gz"    \
+            "gradatum-sbom-${TAG}.tar.gz" \
             > SHA256SUMS)
 
           echo "dist=${DIST}" >> "$GITHUB_OUTPUT"
 
       # ───────────────────────────────────────────────────────────────────
-      # 8. Attestation SLSA (provenance cryptographique) — 3 tarballs
+      # 8. Attestation SLSA (provenance cryptographique) — 4 tarballs (3
+      #    binaires + SBOM), couverts par le glob sans modification de ce step
       #    subject-path accepte un glob (actions/attest-build-provenance v2)
       # ───────────────────────────────────────────────────────────────────
       - name: Attest build provenance

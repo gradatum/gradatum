@@ -12,12 +12,12 @@
 //! | Nom | Type | Notes |
 //! |---|---|---|
 //! | `gradatum_http_requests_total` | Counter | method, path (template), status |
-//! | `gradatum_http_request_duration_seconds` | Histogram | method, path (template) |
+//! | `gradatum_http_request_duration_seconds` | Histogram | method, path (template) — no status |
 //! | `gradatum_queue_depth` | Gauge | tenant |
 //! | `gradatum_queue_lag_seconds` | Gauge | tenant |
 //! | `gradatum_auth_failures_total` | Counter | reason |
 //! | `gradatum_revocation_store_size` | Gauge | (sans label) |
-//! | `gradatum_curator_decisions_total` | Counter | action — stub (not yet instrumented) |
+//! | `gradatum_curator_decisions_total` | Counter | path, outcome — F-66 |
 //! | `gradatum_llm_backend_calls_total` | Counter | backend, outcome — stub (not yet instrumented) |
 //! | `gradatum_vault_context_duration_seconds` | Histogram | mode — since v0.7.0 |
 //! | `gradatum_vault_context_embed_fallback_total` | Counter | mode — since v0.7.0 |
@@ -33,6 +33,9 @@
 //! | `gradatum_context_dropped_total` | Counter | mode (assembled\|compact) — since v0.7.2 |
 //! | `gradatum_context_compaction_total` | Counter | (no label) — since v0.7.2 |
 //! | `gradatum_context_tokens_saved` | Histogram | (no label) — since v0.7.2 |
+//! | `gradatum_vault_orphan_dirs` | Gauge | (sans label) — réconciliation registre↔disque au boot (L7 volet 2) |
+//! | `gradatum_ann_deficit_partitions` | Gauge | (sans label) — gate de santé ANN au boot |
+//! | `gradatum_api_key_orphan_owners` | Gauge | (sans label) — clés actives dont l'owner n'est déclaré par aucun consumer du preset (B6′b) |
 
 use std::sync::{
     Arc,
@@ -55,15 +58,33 @@ use prometheus_client::{
 // Label sets
 // ---------------------------------------------------------------------------
 
-/// Labels for HTTP requests — sanitized paths (templates, never concrete URIs).
+/// Labels for the HTTP request counter — sanitized paths (templates, never concrete URIs).
+///
+/// Populated by `crate::middleware::http_metrics_middleware` from the axum `MatchedPath`
+/// extension. `path` is a `String` because the route pattern is owned by the router at
+/// runtime, not a compile-time constant; its domain stays bounded by the route table
+/// (see the middleware's `# Cardinality` section).
 #[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
 pub struct HttpReqLabels {
     /// HTTP method (GET, POST, …).
     pub method: String,
-    /// Route template (e.g., `/api/v1/vault_search`).
-    pub path: &'static str,
+    /// Route template (e.g., `/api/v1/vault_search`), never a concrete URI.
+    pub path: String,
     /// HTTP response status code (200, 400, 500, …).
     pub status: u16,
+}
+
+/// Labels for the HTTP duration histogram — same as [`HttpReqLabels`] **without** `status`.
+///
+/// Deliberately distinct: a latency distribution is read per route, not per status code,
+/// and folding `status` in would multiply the number of histograms (10 buckets + sum +
+/// count each) by the number of observed status codes for no operational gain.
+#[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
+pub struct HttpDurLabels {
+    /// HTTP method (GET, POST, …).
+    pub method: String,
+    /// Route template (e.g., `/api/v1/vault_search`), never a concrete URI.
+    pub path: String,
 }
 
 /// tenant label — controlled by cardinality cap.
@@ -86,10 +107,23 @@ pub struct FromStatusLabel {
     pub from_status: &'static str,
 }
 
-/// Label for curator action (stub metric, not yet instrumented).
+/// Label for F-51 audit candidates by dedup category.
 #[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
-pub struct CuratorActionLabel {
-    pub action: &'static str,
+pub struct AuditCategoryLabel {
+    /// Dedup category (`"exact-duplicate"`, `"structural-junk"`, ...).
+    pub category: String,
+}
+
+/// Labels for curator decisions (F-66 instrumentation): decision path × outcome.
+///
+/// Populated by `handle_persist_curated` from the `curator_decision` field of the
+/// internal persist request. The worker owns the decision; the server owns the registry.
+#[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
+pub struct CuratorDecisionLabel {
+    /// Decision path: `hint_bypass` | `fast_admit` | `pending_band` | `llm_review`.
+    pub path: String,
+    /// Outcome: `admitted` | `pending` | `rejected`.
+    pub outcome: String,
 }
 
 /// Labels for LLM backend calls (stub metric, not yet instrumented).
@@ -117,6 +151,19 @@ pub struct UsageEndpointLabel {
 pub struct McpToolLabel {
     /// Nom de l'outil MCP (ex. `vault_list`, `vault_search`).
     pub tool: String,
+}
+
+/// Label de `kind` d'usage per-note (salience per note).
+///
+/// Cardinalité bornée à **5 valeurs** (vocabulaire fermé `note_usage_store::KIND_*`) :
+/// `read`, `search-hit`, `search-hit-top3`, `recall-surfaced`, `recall-accepted`.
+/// Sert de preuve de vie et de volumétrie globale (pas par note).
+#[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
+pub struct NoteUsageKindLabel {
+    /// `kind` d'usage (borné, cf. `note_usage_store::KIND_*`). `String` par parité avec
+    /// [`UsageEndpointLabel`] : les valeurs proviennent du vocabulaire fermé KIND_* →
+    /// cardinalité 5 malgré le type ouvert.
+    pub kind: String,
 }
 
 /// Labels pour l'assemblage de contexte vault_context (F-35 Context Assembly, v0.7.0).
@@ -195,9 +242,15 @@ pub struct AppMetrics {
 
     // -- Métriques HTTP -------------------------------------------------------
     /// Total HTTP requests (method, path template, status).
+    ///
+    /// Fed by `crate::middleware::http_metrics_middleware`, mounted as the outermost
+    /// layer of the router — every route is counted, 5xx included.
     pub http_requests: Family<HttpReqLabels, Counter>,
-    /// HTTP request duration in seconds (method, path template).
-    pub http_duration: Family<HttpReqLabels, Histogram>,
+    /// HTTP request duration in seconds (method, path template — no status).
+    ///
+    /// Same source as [`Self::http_requests`]; measures everything downstream of the
+    /// metrics layer (auth, rate limiting, handler, serialisation).
+    pub http_duration: Family<HttpDurLabels, Histogram>,
 
     // -- File d'attente -------------------------------------------------------
     /// Write queue depth per tenant (label controlled by cap).
@@ -211,10 +264,10 @@ pub struct AppMetrics {
     /// Revocation store size (number of entries).
     pub revocation_size: Gauge,
 
-    // -- Curator / LLM (stubs T11 — impl effective P2.0b) --------------------
-    /// curator decisions by action — intentional stub.
-    pub curator_decisions: Family<CuratorActionLabel, Counter>,
-    /// LLM backend calls by backend+outcome — intentional stub.
+    // -- Curator / LLM -------------------------------------------------------
+    /// Curator decisions by path × outcome (F-66 instrumentation).
+    pub curator_decisions: Family<CuratorDecisionLabel, Counter>,
+    /// LLM backend calls by backend+outcome — intentional stub (F-66 point ouvert).
     pub llm_calls: Family<LlmBackendLabel, Counter>,
 
     // -- Télémétrie usage (feat/usage-telemetry-19091) -------------------------
@@ -228,6 +281,13 @@ pub struct AppMetrics {
     /// Série : `gradatum_mcp_tool_calls_total{tool}`.
     /// Alimentée au boot (seed depuis DB) et à chaque flush 60s (delta).
     pub mcp_tool_calls: Family<McpToolLabel, Counter>,
+
+    /// Usage per-note agrégé par `kind` (salience per note).
+    ///
+    /// Série : `gradatum_note_usage_total{kind}`. Cardinalité 5. Alimentée au flush
+    /// 60s (somme des deltas du batch par kind). Process-lifetime (pas de seed DB —
+    /// preuve de vie/volumétrie, la donnée durable vit dans `note_usage`).
+    pub note_usage_total: Family<NoteUsageKindLabel, Counter>,
 
     // -- Event-log (B1 tranche v0.3.0) ----------------------------------------
     /// Current row count in the `event_log` table.
@@ -245,6 +305,20 @@ pub struct AppMetrics {
     /// Errors during review auto-promotion (e.g. NoteNotFound TOCTOU).
     /// Series: `gradatum_review_promote_errors_total`.
     pub review_promote_errors: Counter,
+
+    // -- F-51 audit / dedup pass (detection-only, Option A) --------------------
+    /// Candidates found in the last audit pass, by dedup category.
+    /// Series: `gradatum_audit_candidates{category}`. Set (not incremented) each pass.
+    pub audit_candidates: Family<AuditCategoryLabel, Gauge>,
+    /// Timestamp (epoch ms) of the last successful audit pass.
+    /// Series: `gradatum_audit_last_run_timestamp_ms`.
+    pub audit_last_run_ms: Gauge,
+    /// Cumulative audit pass errors (scan/report write failures).
+    /// Series: `gradatum_audit_errors_total`.
+    pub audit_errors: Counter,
+    /// Cumulative F-111 auto-downgrades performed by the audit executor.
+    /// Series: `gradatum_audit_downgraded_total`.
+    pub audit_downgraded: Counter,
 
     // -- vault_context télémétrie (F-35 Context Assembly, v0.7.0) ------------
     /// Durée d'assemblage vault_context par mode (secondes).
@@ -308,7 +382,7 @@ pub struct AppMetrics {
     /// Incrémenté à chaque appel nominal à `assemble_compact` (pas les early-returns vides).
     /// Série : `gradatum_context_compaction_total`.
     pub context_compaction_total: Counter,
-    /// Tokens économisés estimés par les stubs produits (stub_count × [`AVG_STUB_TOKENS_SAVED`]).
+    /// Tokens économisés estimés par les stubs produits (stub_count × `AVG_STUB_TOKENS_SAVED`).
     ///
     /// Histogramme sans label : agrège les deux modes (assembled + compact).
     /// Buckets : 0–3200 tokens (0 à ~16 stubs × 200 tokens/stub).
@@ -321,6 +395,53 @@ pub struct AppMetrics {
     /// Incrémenté dans `vault_write_impl` après l'ACL, avant l'enqueue.
     /// Série : `gradatum_write_check_total{rule}`.
     pub write_check: Family<DriftRuleLabel, Counter>,
+
+    // -- Réconciliation registre↔disque au boot (L7 volet 2) -------------------
+    /// Répertoires de vault présents sur disque mais **absents du registre** (aucune ligne
+    /// `tenants`, quel que soit le statut) — détectés à chaque boot à flag `multi_tenant` ON.
+    ///
+    /// Série : `gradatum_vault_orphan_dirs`. **Gauge** (état, pas flux) : la valeur est
+    /// (re)positionnée à chaque boot — un orphelin nettoyé fait retomber la jauge sans
+    /// redémarrage du compteur. Volet 2 est **non bloquant** : la jauge et un `warn` sont
+    /// l'unique effet, le boot continue.
+    ///
+    /// À flag OFF (défaut LIVE) la réconciliation n'est jamais exécutée : la jauge reste à
+    /// `0` (valeur d'initialisation), aucune I/O disque n'est faite.
+    pub vault_orphan_dirs: Gauge,
+
+    // -- Gate de santé ANN au boot --------------------------------------------
+    /// Partitions ANN `(vault_id, embedder_id)` dont l'index dérivé est **incomplet**
+    /// (`note_embeddings_ann` compte moins de lignes que les paires éligibles de
+    /// `note_embeddings`) — mesuré à chaque boot, après backfill et GC.
+    ///
+    /// Série : `gradatum_ann_deficit_partitions`. **Gauge** (état, pas flux) : la valeur est
+    /// (re)positionnée à chaque boot. Une valeur `> 0` signifie que le gate a **fermé le
+    /// chemin ANN** : la recherche sémantique est servie en brute-force (exacte, plus lente)
+    /// jusqu'à ce qu'un redémarrage reconstruise l'index et remesure.
+    ///
+    /// Sans label : le nom des partitions fautives vit dans les `error!` du boot, pas dans
+    /// une série Prometheus — `(vault × embedder)` est une cardinalité non bornée.
+    ///
+    /// À ANN OFF (défaut LIVE) le gate n'est jamais exécuté : la jauge reste à `0` (valeur
+    /// d'initialisation) et aucune requête n'est émise.
+    pub ann_deficit_partitions: Gauge,
+
+    // -- Intégrité référentielle owner ↔ identité ACL au boot (B6′b) ----------
+    /// Clés API **actives** dont l'`owner` n'est déclaré par aucun `[[consumer]]` du preset
+    /// ACL chargé — mesuré à chaque boot.
+    ///
+    /// Série : `gradatum_api_key_orphan_owners`. **Gauge** (état, pas flux) : la valeur est
+    /// (re)positionnée à chaque boot — déclarer l'identité manquante, ou révoquer la clé,
+    /// fait retomber la jauge au démarrage suivant.
+    ///
+    /// Une telle clé s'authentifie puis se fait refuser sur tous les locus : le symptôme
+    /// observé est une panne, la cause est une donnée. C'est le seul état que cette jauge
+    /// nomme, et **jamais** un motif de refuser le démarrage — un service qui ne démarre pas
+    /// sur une donnée héritée est un incident pire que celui qu'il signale.
+    ///
+    /// Sans label : le nom des owners fautifs vit dans les `error!` du boot, pas dans une
+    /// série Prometheus — `owner` est une cardinalité non bornée.
+    pub api_key_orphan_owners: Gauge,
 
     // -- Cardinality cap (tenant) --------------------------------------------
     /// Number of distinct tenant labels registered so far.
@@ -338,19 +459,24 @@ impl AppMetrics {
     pub fn new() -> Self {
         // Les familles doivent être clonées AVANT register (register prend ownership d'une copie).
         let http_requests: Family<HttpReqLabels, Counter> = Family::default();
-        let http_duration: Family<HttpReqLabels, Histogram> =
+        let http_duration: Family<HttpDurLabels, Histogram> =
             Family::new_with_constructor(|| Histogram::new(exponential_buckets(0.001, 2.0, 10)));
         let queue_depth: Family<TenantLabel, Gauge> = Family::default();
         let queue_lag: Family<TenantLabel, Gauge> = Family::default();
         let auth_failures: Family<AuthFailLabel, Counter> = Family::default();
         let revocation_size: Gauge = Gauge::default();
-        let curator_decisions: Family<CuratorActionLabel, Counter> = Family::default();
+        let curator_decisions: Family<CuratorDecisionLabel, Counter> = Family::default();
         let llm_calls: Family<LlmBackendLabel, Counter> = Family::default();
         let read_usage: Family<UsageEndpointLabel, Counter> = Family::default();
         let mcp_tool_calls: Family<McpToolLabel, Counter> = Family::default();
+        let note_usage_total: Family<NoteUsageKindLabel, Counter> = Family::default();
         let event_log_rows: Gauge = Gauge::default();
         let review_promoted: Family<FromStatusLabel, Counter> = Family::default();
         let review_promote_errors: Counter = Counter::default();
+        let audit_candidates: Family<AuditCategoryLabel, Gauge> = Family::default();
+        let audit_last_run_ms: Gauge = Gauge::default();
+        let audit_errors: Counter = Counter::default();
+        let audit_downgraded: Counter = Counter::default();
         let vault_context_duration: Family<ContextAssemblyLabel, Histogram> =
             Family::new_with_constructor(|| Histogram::new(exponential_buckets(0.001, 2.0, 10)));
         let vault_context_embed_fallback: Family<ContextAssemblyLabel, Counter> = Family::default();
@@ -388,150 +514,211 @@ impl AppMetrics {
         // -- Write drift detection (F-36, v0.7.3) ----------------------------
         let write_check: Family<DriftRuleLabel, Counter> = Family::default();
 
+        // -- Réconciliation registre↔disque au boot (L7 volet 2) -------------
+        let vault_orphan_dirs: Gauge = Gauge::default();
+
+        // -- Gate de santé ANN au boot ---------------------------------------
+        let ann_deficit_partitions: Gauge = Gauge::default();
+
+        // -- Intégrité référentielle owner ↔ identité ACL au boot (B6′b) ------
+        let api_key_orphan_owners: Gauge = Gauge::default();
+
         let mut registry = Registry::default();
 
         registry.register(
             "gradatum_http_requests",
-            "Nombre total de requêtes HTTP reçues",
+            "Total number of HTTP requests received",
             http_requests.clone(),
         );
         registry.register(
             "gradatum_http_request_duration_seconds",
-            "Durée des requêtes HTTP en secondes",
+            "HTTP request duration in seconds",
             http_duration.clone(),
         );
         registry.register(
             "gradatum_queue_depth",
-            "Profondeur de la file d'écriture par tenant",
+            "Write queue depth per tenant",
             queue_depth.clone(),
         );
         registry.register(
             "gradatum_queue_lag_seconds",
-            "Décalage de la file d'écriture en secondes par tenant",
+            "Write queue lag in seconds per tenant",
             queue_lag.clone(),
         );
         registry.register(
             "gradatum_auth_failures",
-            "Nombre d'échecs d'authentification par raison",
+            "Number of authentication failures by reason",
             auth_failures.clone(),
         );
         registry.register(
             "gradatum_revocation_store_size",
-            "Nombre d'entrées dans le store de révocation",
+            "Number of entries in the revocation store",
             revocation_size.clone(),
         );
         registry.register(
             "gradatum_curator_decisions",
-            "Décisions curator par action (stub T11)",
+            "Curator decisions by decision path and outcome (F-66)",
             curator_decisions.clone(),
         );
         registry.register(
             "gradatum_llm_backend_calls",
-            "Appels LLM backend par backend+outcome (stub T11)",
+            "LLM backend calls by backend+outcome (stub T11)",
             llm_calls.clone(),
         );
         registry.register(
             "gradatum_event_log_rows",
-            "Nombre de lignes courantes dans event_log (mis à jour par la tâche de rétention)",
+            "Current number of rows in event_log (updated by the retention task)",
             event_log_rows.clone(),
         );
         registry.register(
             "gradatum_read_usage",
-            "Nombre total d'invocations par endpoint read-path (durable — seeded depuis DB au boot)",
+            "Total number of invocations per read-path endpoint (durable — seeded from DB at boot)",
             read_usage.clone(),
         );
         registry.register(
             "gradatum_mcp_tool_calls",
-            "Nombre total d'appels outils MCP par outil (durable — seeded depuis DB au boot)",
+            "Total number of MCP tool calls per tool (durable — seeded from DB at boot)",
             mcp_tool_calls.clone(),
         );
         registry.register(
+            "gradatum_note_usage",
+            "Per-note usage events aggregated by kind (F-110 salience, process-lifetime)",
+            note_usage_total.clone(),
+        );
+        registry.register(
             "gradatum_review_promoted",
-            "Notes auto-promues depuis la file de review (par from_status)",
+            "Notes auto-promoted from the review queue (by from_status)",
             review_promoted.clone(),
         );
         registry.register(
             "gradatum_review_promote_errors",
-            "Erreurs lors de l'auto-promotion review (ex: NoteNotFound TOCTOU)",
+            "Errors during review auto-promotion (e.g. NoteNotFound TOCTOU)",
             review_promote_errors.clone(),
         );
         registry.register(
+            "gradatum_audit_candidates",
+            "F-51 audit candidates found in the last pass, by dedup category",
+            audit_candidates.clone(),
+        );
+        registry.register(
+            "gradatum_audit_last_run_timestamp_ms",
+            "Epoch-ms timestamp of the last successful F-51 audit pass",
+            audit_last_run_ms.clone(),
+        );
+        registry.register(
+            "gradatum_audit_errors",
+            "Cumulative F-51 audit pass errors (scan or report-write failures)",
+            audit_errors.clone(),
+        );
+        registry.register(
+            "gradatum_audit_downgraded",
+            "Cumulative F-111 auto-downgrades performed by the audit executor",
+            audit_downgraded.clone(),
+        );
+        registry.register(
             "gradatum_vault_context_duration_seconds",
-            "Durée vault_context par mode (squelette F-35, v0.7.0)",
+            "vault_context duration by mode (skeleton F-35, v0.7.0)",
             vault_context_duration.clone(),
         );
         registry.register(
             "gradatum_vault_context_embed_fallback",
-            "Fallback BM25 sur échec embed dans vault_context par mode (squelette F-35, v0.7.0)",
+            "BM25 fallback on embed failure in vault_context by mode (skeleton F-35, v0.7.0)",
             vault_context_embed_fallback.clone(),
         );
         registry.register(
             "gradatum_vault_context_candidates",
-            "Candidats considérés par vault_context avant filtrage par mode (squelette F-35, v0.7.0)",
+            "Candidates considered by vault_context before filtering, by mode (skeleton F-35, v0.7.0)",
             vault_context_candidates.clone(),
         );
         registry.register(
             "gradatum_vault_context_included",
-            "Notes incluses dans le contexte assemblé par mode (squelette F-35, v0.7.0)",
+            "Notes included in the assembled context by mode (skeleton F-35, v0.7.0)",
             vault_context_included.clone(),
         );
         // -- Proactive Recall (F-46 Active Recall, v0.7.1) -------------------
         registry.register(
             "gradatum_vault_proactive_recall_surfaced",
-            "Hits surfacés par pull proactif par mode (F-46 Active Recall, v0.7.1)",
+            "Hits surfaced by proactive pull by mode (F-46 Active Recall, v0.7.1)",
             proactive_surfaced.clone(),
         );
         registry.register(
             "gradatum_vault_proactive_recall_accepted",
-            "Hits acceptés par feedback utilisateur (F-46 Active Recall, v0.7.1)",
+            "Hits accepted via user feedback (F-46 Active Recall, v0.7.1)",
             proactive_accepted.clone(),
         );
         registry.register(
             "gradatum_vault_proactive_refresh",
-            "Refreshs de surface proactive réussis (F-46 Active Recall, v0.7.1)",
+            "Successful proactive surface refreshes (F-46 Active Recall, v0.7.1)",
             proactive_refresh.clone(),
         );
         registry.register(
             "gradatum_vault_proactive_recall_duration_seconds",
-            "Durée d'un pull proactif par mode en secondes (F-46 Active Recall, v0.7.1)",
+            "Proactive pull duration by mode in seconds (F-46 Active Recall, v0.7.1)",
             proactive_recall_duration.clone(),
         );
         registry.register(
             "gradatum_vault_proactive_refresh_duration_seconds",
-            "Durée d'un refresh de surface proactive en secondes (F-46 Active Recall, v0.7.1)",
+            "Proactive surface refresh duration in seconds (F-46 Active Recall, v0.7.1)",
             proactive_refresh_duration.clone(),
         );
         // -- Context Efficiency (F-29/F-30, v0.7.2) --------------------------
         registry.register(
             "gradatum_context_inline",
-            "Notes retournées inline (corps complet) par mode context (F-29/F-30, v0.7.2)",
+            "Notes returned inline (full body) by context mode (F-29/F-30, v0.7.2)",
             context_inline_total.clone(),
         );
         registry.register(
             "gradatum_context_stub",
-            "Stubs produits dans la réponse context par mode (F-29/F-30, v0.7.2)",
+            "Stubs produced in the context response by mode (F-29/F-30, v0.7.2)",
             context_stub_total.clone(),
         );
         registry.register(
             "gradatum_context_dropped",
-            "Notes droppées hors budget context par mode (F-29/F-30, v0.7.2)",
+            "Notes dropped over budget in context by mode (F-29/F-30, v0.7.2)",
             context_dropped_total.clone(),
         );
         registry.register(
             "gradatum_context_compaction",
-            "Appels mode compact (vues foldées F-30, v0.7.2)",
+            "Compact-mode calls (folded views F-30, v0.7.2)",
             context_compaction_total.clone(),
         );
         registry.register(
             "gradatum_context_tokens_saved",
-            "Tokens économisés estimés par les stubs context (stub_count × 200, F-29/F-30, v0.7.2)",
+            "Estimated tokens saved by context stubs (stub_count × 200, F-29/F-30, v0.7.2)",
             context_tokens_saved.clone(),
         );
         // -- Write drift detection (F-36, v0.7.3) ----------------------------
         registry.register(
             "gradatum_write_check",
-            "Détections de dérive d'écriture par règle (F-36 warn-only, v0.7.3)",
+            "Write-drift detections by rule (F-36 warn-only, v0.7.3)",
             write_check.clone(),
+        );
+        // -- Réconciliation registre↔disque au boot (L7 volet 2) -------------
+        // Enregistrée INCONDITIONNELLEMENT (comme toutes les autres familles) : la série
+        // existe donc dès le boot, à `0`, même à flag OFF. Une jauge qui n'apparaîtrait
+        // qu'à flag ON serait indistinguable de « scrape cassé » côté Prometheus.
+        registry.register(
+            "gradatum_vault_orphan_dirs",
+            "Vault directories present on disk but absent from the tenants registry (boot reconciliation, L7)",
+            vault_orphan_dirs.clone(),
+        );
+        // -- Gate de santé ANN au boot ---------------------------------------
+        // Enregistrée INCONDITIONNELLEMENT, comme les autres : la série existe dès le boot,
+        // à `0`, même à ANN OFF. Une jauge qui n'apparaîtrait qu'à ANN ON serait
+        // indistinguable d'un scrape cassé côté Prometheus.
+        registry.register(
+            "gradatum_ann_deficit_partitions",
+            "ANN partitions (vault, embedder) whose derived index is incomplete — > 0 means the boot gate closed the ANN path (brute-force in effect)",
+            ann_deficit_partitions.clone(),
+        );
+        // -- Intégrité référentielle owner ↔ identité ACL au boot (B6′b) ------
+        // Enregistrée INCONDITIONNELLEMENT : la série existe dès le boot, à `0`. C'est ce
+        // qui rend « 0 orphelin » lisible — sans elle, l'absence de série et l'absence
+        // d'orphelin auraient la même apparence côté Prometheus.
+        registry.register(
+            "gradatum_api_key_orphan_owners",
+            "Active API keys whose owner is declared by no consumer of the loaded ACL preset (boot reconciliation) — such keys authenticate then get denied everywhere",
+            api_key_orphan_owners.clone(),
         );
 
         Self {
@@ -546,9 +733,14 @@ impl AppMetrics {
             llm_calls,
             read_usage,
             mcp_tool_calls,
+            note_usage_total,
             event_log_rows,
             review_promoted,
             review_promote_errors,
+            audit_candidates,
+            audit_last_run_ms,
+            audit_errors,
+            audit_downgraded,
             vault_context_duration,
             vault_context_embed_fallback,
             vault_context_candidates,
@@ -564,6 +756,9 @@ impl AppMetrics {
             context_compaction_total,
             context_tokens_saved,
             write_check,
+            vault_orphan_dirs,
+            ann_deficit_partitions,
+            api_key_orphan_owners,
             tenant_count: Arc::new(AtomicUsize::new(0)),
             cap: 100,
         }
@@ -589,7 +784,7 @@ impl AppMetrics {
             tracing::warn!(
                 tenant = %label.tenant,
                 cap = self.cap,
-                "cardinality cap atteint, label tenant ignoré"
+                "cardinality cap reached, tenant label ignored"
             );
             return None;
         }
@@ -618,7 +813,7 @@ impl Default for AppMetrics {
 pub async fn metrics_handler(State(m): State<AppMetrics>) -> Result<Response, StatusCode> {
     let mut buf = String::new();
     encode(&mut buf, &m.registry).map_err(|e| {
-        tracing::error!(error = %e, "échec encodage métriques Prometheus");
+        tracing::error!(error = %e, "Prometheus metrics encoding failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     Response::builder()
@@ -628,7 +823,7 @@ pub async fn metrics_handler(State(m): State<AppMetrics>) -> Result<Response, St
         )
         .body(Body::from(buf))
         .map_err(|e| {
-            tracing::error!(error = %e, "échec construction réponse /metrics");
+            tracing::error!(error = %e, "/metrics response construction failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }
@@ -652,7 +847,7 @@ pub async fn spawn_metrics_listener(
 
     if !bind.ip().is_loopback() {
         anyhow::bail!(
-            "metrics listener doit être loopback (caveat C7) : adresse refusée = {}",
+            "metrics listener must be loopback (caveat C7): address rejected = {}",
             bind
         );
     }
@@ -662,7 +857,7 @@ pub async fn spawn_metrics_listener(
         .with_state(m);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!(addr = %bind, "metrics listener en écoute");
+    tracing::info!(addr = %bind, "metrics listener listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -736,6 +931,51 @@ mod tests {
         assert!(
             buf.contains("gradatum_review_promote_errors_total"),
             "gradatum_review_promote_errors_total doit apparaître dans l'encodage"
+        );
+    }
+
+    /// F-66 : `gradatum_curator_decisions_total{path, outcome}` s'encode par
+    /// (path, outcome) distinct, chaque paire étant une série indépendante.
+    #[test]
+    fn metrics_expose_curator_decisions_by_path_outcome() {
+        let m = AppMetrics::new();
+        m.curator_decisions
+            .get_or_create(&CuratorDecisionLabel {
+                path: "fast_admit".to_string(),
+                outcome: "admitted".to_string(),
+            })
+            .inc();
+        m.curator_decisions
+            .get_or_create(&CuratorDecisionLabel {
+                path: "pending_band".to_string(),
+                outcome: "pending".to_string(),
+            })
+            .inc();
+        // Même paire deux fois → une seule série à 2 (pas de double-série).
+        m.curator_decisions
+            .get_or_create(&CuratorDecisionLabel {
+                path: "fast_admit".to_string(),
+                outcome: "admitted".to_string(),
+            })
+            .inc();
+
+        let mut buf = String::new();
+        encode(&mut buf, &m.registry).unwrap();
+        assert!(
+            buf.contains("gradatum_curator_decisions_total"),
+            "série curator_decisions absente de l'encodage"
+        );
+        assert!(
+            buf.contains("path=\"fast_admit\"") && buf.contains("outcome=\"admitted\""),
+            "labels fast_admit/admitted absents"
+        );
+        assert!(
+            buf.contains("path=\"pending_band\"") && buf.contains("outcome=\"pending\""),
+            "labels pending_band/pending absents"
+        );
+        assert!(
+            buf.contains("path=\"fast_admit\",outcome=\"admitted\"} 2"),
+            "la paire répétée doit s'agréger à 2 (pas de double-comptage de série) — buf:\n{buf}"
         );
     }
 }

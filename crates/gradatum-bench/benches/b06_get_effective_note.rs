@@ -15,6 +15,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use gradatum_bench::build_note;
 use gradatum_cache::{CacheKey, EffectiveNoteCache, EffectiveNoteCacheConfig};
 use gradatum_core::note::EffectiveNote;
+use gradatum_core::scope::VaultId;
 
 /// Convertit une `Note` en `EffectiveNote`.
 fn to_effective(note: gradatum_core::note::Note) -> EffectiveNote {
@@ -42,7 +43,7 @@ fn bench_effective_note_cache(c: &mut Criterion) {
     let note = build_note(512);
     let note_id = note.id;
     let content_hash = note.content_hash;
-    let key: CacheKey = (note_id, 0u64);
+    let key: CacheKey = (VaultId::new("main"), note_id, 0u64);
     let effective = Arc::new(to_effective(note));
 
     let mut group = c.benchmark_group("B6-get-effective-note");
@@ -54,7 +55,7 @@ fn bench_effective_note_cache(c: &mut Criterion) {
             rt.block_on(async {
                 cache
                     .insert(
-                        black_box(key),
+                        black_box(key.clone()),
                         Arc::clone(&effective),
                         black_box(content_hash),
                     )
@@ -68,7 +69,7 @@ fn bench_effective_note_cache(c: &mut Criterion) {
     let hot_cache = EffectiveNoteCache::new(cfg.clone());
     rt.block_on(async {
         hot_cache
-            .insert(key, Arc::clone(&effective), content_hash)
+            .insert(key.clone(), Arc::clone(&effective), content_hash)
             .await;
     });
 
@@ -76,7 +77,7 @@ fn bench_effective_note_cache(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let result = hot_cache
-                    .get::<_, _, ()>(black_box(key), |_id| {
+                    .get::<_, _, ()>(black_box(key.clone()), |_id| {
                         let h = content_hash;
                         async move { Ok(h) }
                     })

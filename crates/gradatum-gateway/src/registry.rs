@@ -21,15 +21,15 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum RegistryError {
     /// rusqlite error (connection, query, migration).
-    #[error("erreur SQLite: {0}")]
+    #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
     /// `Mutex` poisoned by a panic in a previous thread.
-    #[error("verrou du registre empoisonné")]
+    #[error("registry lock poisoned")]
     PoisonedLock,
 
     /// tokio `spawn_blocking` join error.
-    #[error("erreur join spawn_blocking: {0}")]
+    #[error("spawn_blocking join error: {0}")]
     JoinError(#[from] tokio::task::JoinError),
 }
 

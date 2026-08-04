@@ -28,9 +28,14 @@ async fn seed_downgraded(idx: &SqliteIndex, vault_id: &str, body: &str) {
     let note = make_note(vault_id, Section::Decisions, NoteStatus::Live, body);
     let id = note.id;
     idx.upsert_note(&note).await.unwrap();
-    idx.downgrade_note(&id, "test-downgrade", None)
-        .await
-        .unwrap();
+    idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(VaultId::new(vault_id)),
+        &id,
+        "test-downgrade",
+        None,
+    )
+    .await
+    .unwrap();
 }
 
 // ─── Golden tests ──────────────────────────────────────────────────────────────
@@ -225,9 +230,16 @@ async fn scope_locus_and_downgraded_excluded() {
     // Downgrader via NoteId::from (ulid parsé)
     let ulid_down = ulid::Ulid::from_string(&id_downgraded_str).unwrap();
     let note_id_down = gradatum_core::identity::NoteId(ulid_down);
-    idx.downgrade_note(&note_id_down, "test-downgrade", None)
-        .await
-        .unwrap();
+    idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        ),
+        &note_id_down,
+        "test-downgrade",
+        None,
+    )
+    .await
+    .unwrap();
 
     // Sans filtre : 2 notes live (downgraded exclue par défaut)
     let (count_no_filter, _) = idx
@@ -458,6 +470,9 @@ async fn parity_count_equals_nonsemantic_results() {
     .unwrap();
     let ulid_down = ulid::Ulid::from_string(&id_down).unwrap();
     idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        ),
         &gradatum_core::identity::NoteId(ulid_down),
         "test-parity-downgrade",
         None,

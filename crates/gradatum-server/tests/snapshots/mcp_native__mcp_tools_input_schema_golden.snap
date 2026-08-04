@@ -27,7 +27,7 @@ expression: schema_map
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Request body for `POST /api/v1/code_scope` (frozen wire contract).\n\n## Additive `include_body` fields (fully backward-compatible)\n\n- `include_body` (default `false`): if `true`, each entry receives a `body` field\n  containing the exact source span of the symbol. `false` = strictly unchanged\n  behavior, byte-for-byte identical JSON.\n- `body_budget_tokens` (default 4000, clamped to \\[1, 32000\\]): body budget independent\n  of `budget_tokens` (orthogonal). Cuts at whole-body boundaries; never truncates\n  mid-body. Entries without a body (stale or span absent): `body=null` omitted from\n  JSON (`skip_serializing_if`).\n\n## Additive `include_callers` field (fully backward-compatible, v0.6.3)\n\n- `include_callers` (default `false`): if `true`, each entry receives a `callers` field\n  listing the qualified names of symbols that declare this symbol in their outgoing `deps`\n  (i.e., reverse-dependency lookup). `false` = strictly unchanged behavior.\n- Results are limited by the same `budget_tokens` cap. The `callers` list is bounded\n  to [`MAX_CALLERS_PER_ENTRY`] entries to prevent payload explosion on widely-used symbols.\n- No lexical scoring: callers are returned in `qualified_name` ASC order (deterministic).\n\n## Mandatory two-pass pattern\n\n**Pass 1**: `include_body=false` (default) → rank the N relevant symbols by signature.\n**Pass 2**: `include_body=true` on the selected symbols only, with a targeted `selector`.\nUsing `include_body=true` on a broad query negates the token savings.",
+    "description": "Request body for `POST /api/v1/code_scope` (frozen wire contract).\n\n## Additive `include_body` fields (fully backward-compatible)\n\n- `include_body` (default `false`): if `true`, each entry receives a `body` field\n  containing the exact source span of the symbol. `false` = strictly unchanged\n  behavior, byte-for-byte identical JSON.\n- `body_budget_tokens` (default 4000, clamped to \\[1, 32000\\]): body budget independent\n  of `budget_tokens` (orthogonal). Cuts at whole-body boundaries; never truncates\n  mid-body. Entries without a body (stale or span absent): `body=null` omitted from\n  JSON (`skip_serializing_if`).\n\n## Additive `include_callers` field (fully backward-compatible)\n\n- `include_callers` (default `false`): if `true`, each entry receives a `callers` field\n  listing the qualified names of symbols that declare this symbol in their outgoing `deps`\n  (i.e., reverse-dependency lookup). `false` = strictly unchanged behavior.\n- Results are limited by the same `budget_tokens` cap. The `callers` list is bounded\n  to [`MAX_CALLERS_PER_ENTRY`] entries to prevent payload explosion on widely-used symbols.\n- No lexical scoring: callers are returned in `qualified_name` ASC order (deterministic).\n\n## Mandatory two-pass pattern\n\n**Pass 1**: `include_body=false` (default) → rank the N relevant symbols by signature.\n**Pass 2**: `include_body=true` on the selected symbols only, with a targeted `selector`.\nUsing `include_body=true` on a broad query negates the token savings.",
     "properties": {
       "body_budget_tokens": {
         "description": "Token budget reserved for bodies (default [`DEFAULT_BODY_BUDGET_TOKENS`], clamped to \\[1, 32000\\]).\n\nIndependent of `budget_tokens`. Cuts at whole-body boundaries.\nIgnored if `include_body=false`.",
@@ -73,6 +73,137 @@ expression: schema_map
     "title": "CodeScopeRequest",
     "type": "object"
   },
+  "create_feature_card": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request body for `create_feature_card` — creates a project-map **feature card** whose\n`F-XX` number is chosen **by the server**, never by the client.\n\nThe body carries the five other typed roles of a feature card\n(`[[project:…]]` · `[[status:…]]` · `[[kind:…]]` · `[[release:…]]` · `[[version:…]]`)\nbut **must not** carry a `[[feature:…]]` role: the server allocates the number\natomically and injects the `[[feature:F-XX]]` link itself. A body that already contains\na `[[feature:…]]` link is rejected — the client cannot pick the number.\n\nThe write is asynchronous (same queue path as `vault_write`): the response returns the\nallocated number together with a `job_id`, and the card materialises once the worker\nprocesses the job. Confirm via `job_status`.\n\nThe **LIVE queue path** serializes the derived `VaultWriteRequest` (not this struct) via\n`serde_json`; this struct is only the create-operation wire contract.",
+    "properties": {
+      "author": {
+        "default": null,
+        "description": "Author (optional).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "body": {
+        "description": "Markdown body carrying the five non-feature roles. Must **not** contain a\n`[[feature:…]]` link — the server injects it after allocating the number.",
+        "type": "string"
+      },
+      "occurred_at": {
+        "default": null,
+        "description": "Temporal anchor — event date of the card (ISO 8601 UTC or `YYYY-MM-DD`), optional.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tags": {
+        "default": [],
+        "description": "Initial tags (optional).",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "tenant_id": {
+        "description": "Target tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
+        "type": "string"
+      },
+      "title": {
+        "description": "H1 title of the feature card.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "title",
+      "body"
+    ],
+    "title": "CreateFeatureCardRequest",
+    "type": "object"
+  },
+  "job_status": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request for the `job_status` MCP tool.\n\nCarries the ULID of a job previously enqueued by an async endpoint (e.g. `vault_write`,\nwhich replies `202 { job_id, poll_url }`). The server validates that `job_id` is a\nwell-formed ULID (invalid → 400) before any lookup — parse-don't-validate at the\nboundary.",
+    "properties": {
+      "job_id": {
+        "description": "ULID of the job to inspect — the `job_id` returned by the enqueuing endpoint.\n\nCrockford base32, 26 chars (e.g. `01KYX5FBTXQSG37BQEYP0RF47B`).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "job_id"
+    ],
+    "title": "JobStatusRequest",
+    "type": "object"
+  },
+  "vault_archives_list": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_archives_list` — read-only, filterable, paginated.\n\nEvery field is optional. With no filter, the default lists the **active** archives\n(neither garbage-collected nor restored), most recent first.",
+    "properties": {
+      "include_gc": {
+        "default": false,
+        "description": "Include archives already physically destroyed by the GC (`gc_at IS NOT NULL`).",
+        "type": "boolean"
+      },
+      "include_restored": {
+        "default": false,
+        "description": "Include archives already restored (`restored_at IS NOT NULL`).",
+        "type": "boolean"
+      },
+      "limit": {
+        "default": 50,
+        "description": "Maximum number of rows (server-capped at 500). Default 50.",
+        "format": "uint",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "offset": {
+        "default": 0,
+        "description": "Pagination offset. Default 0.",
+        "format": "uint",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "section": {
+        "description": "Filter by canonical section (kebab-case). `None` = all sections.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "since_ms": {
+        "description": "Lower bound on the archival instant (`archived_at >= since_ms`, epoch ms UTC).",
+        "format": "int64",
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "tenant_id": {
+        "description": "Target tenant (principal) — optional; when omitted the server resolves it\nfrom the credential identity (JWT/API-key), never `\"main\"` by default.",
+        "type": "string"
+      },
+      "until_ms": {
+        "description": "Upper bound on the archival instant (`archived_at <= until_ms`, epoch ms UTC).",
+        "format": "int64",
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "vault_filter": {
+        "description": "Filter by owning vault. `None` = no vault restriction (all vaults are listed).",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "title": "VaultArchivesListRequest",
+    "type": "object"
+  },
   "vault_authors": {
     "properties": {},
     "type": "object"
@@ -87,8 +218,7 @@ expression: schema_map
         "type": "string"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Target tenant (default `\"main\"`).",
+        "description": "Target tenant (principal) — optional; when omitted the server resolves it\nfrom the credential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -226,8 +356,7 @@ expression: schema_map
         ]
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -255,8 +384,7 @@ expression: schema_map
         "type": "string"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -289,8 +417,7 @@ expression: schema_map
         ]
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Target tenant (default `\"main\"`).",
+        "description": "Target tenant (principal) — optional; when omitted the server resolves it\nfrom the credential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -423,8 +550,7 @@ expression: schema_map
         "description": "Resolution scope — determines the target notes."
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Target tenant (default `\"main\"`).",
+        "description": "Target tenant (principal) — optional; when omitted the server resolves it\nfrom the credential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -460,8 +586,7 @@ expression: schema_map
         "type": "string"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -481,8 +606,7 @@ expression: schema_map
         "type": "string"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -502,8 +626,7 @@ expression: schema_map
         "type": "string"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       },
       "ts_ms": {
@@ -522,11 +645,11 @@ expression: schema_map
   "vault_lessons_recall": {
     "$defs": {
       "RankMode": {
-        "description": "Ranking mode for [`LessonsRecallRequest`].\n\nControls the final ordering of BM25 results after `recall_lessons`.\nWhen absent or `Relevance`, the legacy BM25 order is preserved (rétro-compat).\n\n# Wire encoding\n`\"relevance\"` or `\"recency-boosted\"` (kebab-case, serde `rename_all`).\n\n# Comportement par défaut\n`None` / absent → BM25 order inchangé (hook LIVE `lesson-recall.sh` en dépend).",
+        "description": "Ranking mode for [`LessonsRecallRequest`].\n\nControls the final ordering of BM25 results after `recall_lessons`.\nWhen absent or `Relevance`, the legacy BM25 order is preserved (backward-compat).\n\n# Wire encoding\n`\"relevance\"` or `\"recency-boosted\"` (kebab-case, serde `rename_all`).\n\n# Default behaviour\n`None` / absent → BM25 order unchanged (LIVE hook `lesson-recall.sh` depends on it).",
         "oneOf": [
           {
             "const": "relevance",
-            "description": "Legacy BM25 order — default when the field is absent.\n\nA `rank=relevance` request is a no-op: it produces the same result as omitting\nthe field entirely. This preserves the rétro-compat invariant bit-for-bit.",
+            "description": "Legacy BM25 order — default when the field is absent.\n\nA `rank=relevance` request is a no-op: it produces the same result as omitting\nthe field entirely. This preserves the backward-compat invariant bit-for-bit.",
             "type": "string"
           },
           {
@@ -545,6 +668,11 @@ expression: schema_map
         "description": "Controlled vocabulary class (one of [`LESSON_CLASSES`]):\n`deploy`, `release`, `migration`, `crates-io`, `anti-leak`, `api-external`,\n`archi`, `git-hygiene`, `ci-cd`, `auth-secrets`, `data-integrity`,\n`process-discipline`. Any other value is rejected (400).",
         "type": "string"
       },
+      "compact": {
+        "default": false,
+        "description": "If `true`, the server returns a **compact** rendering instead of the full\n[`LessonsRecallResponse`]: an object `{ \"compact\": \"<text>\" }` listing each\nlesson as `<ulid> — <title> :: <snippet>` (snippet truncated to 120 chars,\nnewlines flattened), dropping `tags` and `anchor_ms`.\n\nOptimises token cost for LLM consumers (the compaction is a product feature).\n\nOpt-in (default `false`): when absent, the response is **byte-for-byte identical**\nto the historical [`LessonsRecallResponse`]. Existing callers (LIVE hook\n`lesson-recall.sh`, agents, MCP) are unaffected.",
+        "type": "boolean"
+      },
       "limit": {
         "description": "Maximum number of lessons (server default 5, clamped to `[1, 20]`).",
         "format": "uint32",
@@ -555,7 +683,7 @@ expression: schema_map
         ]
       },
       "query": {
-        "description": "Requête textuelle pour la recherche sémantique (opt-in, `semantic = true`).\n\nSi absent quand `semantic = true`, la classe (`class`) est utilisée comme requête\npar défaut. Ignoré si `semantic = false` / absent.",
+        "description": "Text query for semantic search (opt-in, `semantic = true`).\n\nIf absent when `semantic = true`, the class (`class`) is used as the default\nquery. Ignored if `semantic = false` / absent.",
         "type": [
           "string",
           "null"
@@ -570,10 +698,10 @@ expression: schema_map
             "type": "null"
           }
         ],
-        "description": "Optional ranking mode.\n\n- absent / `\"relevance\"` → BM25 order (legacy behaviour, hook LIVE en dépend).\n- `\"recency-boosted\"` → rank-proxy × `recency_factor`, then sort descending.\n\nThe field is optional and `deny_unknown_fields` is already set on this struct,\nso the addition is rétro-compat: existing callers that omit the field continue\nto receive BM25-ordered results without any change."
+        "description": "Optional ranking mode.\n\n- absent / `\"relevance\"` → BM25 order (legacy behaviour, LIVE hook depends on it).\n- `\"recency-boosted\"` → rank-proxy × `recency_factor`, then sort descending.\n\nThe field is optional and `deny_unknown_fields` is already set on this struct,\nso the addition is backward-compat: existing callers that omit the field continue\nto receive BM25-ordered results without any change."
       },
       "semantic": {
-        "description": "Opt-in semantic (embedding) recall mode.\n\n- absent / `false` → chemin BM25 `recall_lessons` INCHANGÉ (rétro-compat absolue).\n  Les callers LIVE (hook `lesson-recall.sh`, agents, MCP) qui n'envoient pas ce champ\n  continuent à recevoir les résultats BM25 sans modification.\n- `true` → retrieval hybride RRF (`retrieve_candidates`) + hydratation ULID +\n  filtres `codified` / `class` en Rust. Si embed KO → fallback silencieux BM25.",
+        "description": "Opt-in semantic (embedding) recall mode.\n\n- absent / `false` → BM25 `recall_lessons` path UNCHANGED (absolute backward-compat).\n  LIVE callers (hook `lesson-recall.sh`, agents, MCP) that do not send this field\n  keep receiving BM25 results without any change.\n- `true` → hybrid RRF retrieval, then ULID hydration, then the `codified` and\n  `class` filters applied in Rust. If embedding fails, silently falls back to BM25.",
         "type": [
           "boolean",
           "null"
@@ -603,8 +731,7 @@ expression: schema_map
         "type": "string"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -627,7 +754,7 @@ expression: schema_map
         ]
       },
       "limit": {
-        "description": "Maximum number of entries (default 100, max 1000).",
+        "description": "Maximum number of entries. Default 20, clamped to the range 1..=200 — a larger\nvalue is silently lowered to 200, not rejected.",
         "format": "uint32",
         "minimum": 0,
         "type": [
@@ -636,7 +763,7 @@ expression: schema_map
         ]
       },
       "pattern": {
-        "description": "Optional glob filter pattern (e.g. `\"decisions/*\"`).",
+        "description": "NOT IMPLEMENTED — the server reads this field and discards it, silently. Setting\nit filters nothing: the response is exactly the one you would get without it. Do\nnot use it to narrow a listing; filter on `section`, or filter client-side.",
         "type": [
           "string",
           "null"
@@ -650,8 +777,7 @@ expression: schema_map
         ]
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -690,8 +816,7 @@ expression: schema_map
         ]
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -715,8 +840,7 @@ expression: schema_map
         "type": "string"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -732,6 +856,11 @@ expression: schema_map
     "additionalProperties": false,
     "description": "Request body for `vault_read` — legacy vault v1.6.2 `VaultReadArgs` parity.",
     "properties": {
+      "compact": {
+        "default": false,
+        "description": "If `true`, the server returns a **compact** rendering instead of the full\n`VaultReadResponse`: an object `{ \"compact\": \"<text>\" }` bearing `path`,\n`section` (if any), `title` (if any), `sha256` and the note `content`, dropping\nonly the `metadata` object and `size_bytes`.\n\n`vault_read` is **content-bound**: the note body dominates the payload, so the\ncompaction saves a near-constant amount (JSON scaffolding + `metadata` +\n`size_bytes`) that is negligible next to a large note. The `sha256` needed for a\nlater in-place update is preserved.\n\nOpt-in (default `false`): when absent, the response is **byte-for-byte identical**\nto the historical `VaultReadResponse`. Existing clients are unaffected.",
+        "type": "boolean"
+      },
       "path": {
         "description": "Path of the note to read (e.g. `\"decisions/my-note\"`).",
         "type": "string"
@@ -744,8 +873,7 @@ expression: schema_map
         ]
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -765,8 +893,7 @@ expression: schema_map
         "type": "string"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       },
       "ts_ms": {
@@ -787,6 +914,11 @@ expression: schema_map
     "additionalProperties": false,
     "description": "Request body for `vault_search`.\n\n## Optional fields (backward-compatible)\n\n- `locus`: filter by physical path prefix (e.g. `\"council/\"` restricts to notes\n  whose `locus` starts with `council/`). Applied to both FTS and semantic paths.\n  The prefix is escaped against LIKE injection (metacharacters `%`, `_`, `\\`).\n- `vault_id`: cross-vault read — allows querying a vault other than `tenant_id`.\n  Writes remain unchanged (single-tenant). Validation: non-empty, max 128 chars.",
     "properties": {
+      "compact": {
+        "default": false,
+        "description": "If `true`, the server returns a **compact** rendering instead of the full\n`VaultSearchResponse`: an object `{ \"compact\": \"<text>\" }` where the text lists\neach hit as `<ulid> [<score>]` plus the `corpus_match_count` absence-proof hint.\n\nOptimises token cost for LLM consumers (the compaction is a product feature,\nnot transport). Preserves the lexical-absence reasoning: when\n`corpus_match_count == 0`, the rendering states the results are semantic\nneighbours only (absence proven).\n\nOpt-in (default `false`): when absent, the response is **byte-for-byte identical**\nto the historical `VaultSearchResponse`. Existing clients are unaffected.",
+        "type": "boolean"
+      },
       "from_ms": {
         "default": null,
         "description": "Earliest temporal anchor (inclusive), Unix epoch milliseconds.\n\nIf provided, restricts results to notes whose `temporal_index.anchor_ms >= from_ms`.\nApplied as an AND filter after all other filters (ACL, section, locus, status).\nNotes without a `temporal_index` entry are excluded when this bound is set.\n\nAbsent or `null`: no lower bound (unchanged behavior).",
@@ -846,8 +978,7 @@ expression: schema_map
         ]
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       },
       "to_ms": {
@@ -894,6 +1025,11 @@ expression: schema_map
           "null"
         ]
       },
+      "compact": {
+        "default": false,
+        "description": "If `true`, the server returns a **compact** rendering instead of the full\n`VaultTimelineResponse`: an object `{ \"compact\": \"<text>\" }` listing each entry\nas `<anchor_ms> | <doc_kind> | <note_id> — <title>`, dropping `anchor_src` and\nthe pagination `next_cursor`.\n\nOptimises token cost for LLM consumers. Because `next_cursor` is dropped, the\ncompact form is intended for single-window reads, not cursor pagination.\n\nOpt-in (default `false`): when absent, the response is **byte-for-byte identical**\nto the historical `VaultTimelineResponse`. Existing clients are unaffected.",
+        "type": "boolean"
+      },
       "cursor": {
         "description": "Opaque pagination cursor (obtained from `next_cursor`).",
         "type": [
@@ -934,8 +1070,7 @@ expression: schema_map
         ]
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       },
       "to_ms": {
@@ -976,8 +1111,7 @@ expression: schema_map
         "type": "string"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Tenant identifier (default `\"main\"`).",
+        "description": "Tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       }
     },
@@ -1005,7 +1139,7 @@ expression: schema_map
       },
       "expected_sha256": {
         "default": null,
-        "description": "Expected SHA-256 hash for optimistic locking (optional, hexadecimal).\n\nWhen present, the worker checks that the current hash of the note matches\nbefore writing. On mismatch: terminal job `Conflict` (note not overwritten).\n`None` = unconditional write (backward-compatible).\n\nFormat: 64 lowercase hexadecimal characters (SHA-256 = 32 bytes).\nExample: `\"a3f1c2d4...\"`",
+        "description": "Expected SHA-256 of the note being overwritten (optional, hexadecimal).\n\n**Both the presence AND the value are load-bearing** — but only when `note_id` is\nsupplied. Front-gate checks, applied synchronously before the job is enqueued:\n\n- `note_id` absent → the write creates a new note; this field is ignored.\n- `note_id` points at a **live** note → the field is **required**. Omitting it is\n  rejected with **409** (`overwrite without expected_sha256`).\n- `note_id` points at a **ghost** note (indexed, `.md` missing) → supplying the\n  field is rejected with **409** (the hash cannot be checked against any content).\n- `note_id` points at a **never-indexed** ULID → this is a creation: it proceeds\n  **unconditionally**, since there is no current content to compare against.\n- a syntactically invalid value is rejected with **400**, before the checks above.\n\nOn the **live-note** path a genuine **compare-and-swap** follows. The write is\nasynchronous: the request answers **202**, and the hash is matched against the stored\nnote inside the curate worker (`write_if_match`). A *stale* hash aborts the write and\ndrives the job to terminal `JobStatus::Conflict`, leaving the concurrent winner\nintact; the conflict payload carries the winning `current_sha256`.\n\nWhat this does **not** give you. There is no synchronous **409** on a hash mismatch —\npoll `job_status` until `terminal = true`, or the conflict goes unnoticed. The\ncompare-and-swap is not atomic in the store either: `write_if_match` reads, compares,\nthen writes, and no storage-layer lock holds that sequence together.\n\nIts protection is also **scoped to one write path**, and it is **directional**. The\nhash is consulted by the curate handler only, so it guards a live note against a\ncompeting *curate* writer — not against every writer. `forget` carries no\n`expected_sha256` at all, and `distill` ignores the one it carries; both write\nunconditionally, from workers that run alongside `curate`. Which direction that\nleaves open matters, and it is not the intuitive one:\n\n- **A read-modify-write cannot undo a `forget`.** Not because `forget` checks a hash\n  — it checks none — but because it rewrites the note, which invalidates the hash a\n  racing write is carrying; that write then lands in `Conflict`. Content that was\n  forgotten stays forgotten, even under a concurrent update.\n- **The reverse is not guarded.** `forget` and `distill` can overwrite a concurrent\n  read-modify-write without consulting its hash. For `forget` that is the intent. For\n  `distill` it is a real gap, bounded only by that pipeline's reach: the distill cron\n  is disabled unless an operator turns it on, runs on a weekly schedule by default,\n  and enqueues nothing below a per-section pressure threshold (`distill_cron`).\n\nRead this field as a guard against a competing read-modify-write of the same note,\nnever as a lock on the note: no deployment shape makes it one.\n\nFormat: 64 lowercase hexadecimal characters (SHA-256 = 32 bytes).\nExample: `\"a3f1c2d4...\"`",
         "type": [
           "string",
           "null"
@@ -1021,7 +1155,7 @@ expression: schema_map
       },
       "occurred_at": {
         "default": null,
-        "description": "Temporal anchor — event date of the note (ISO 8601 UTC or YYYY-MM-DD).\n\nWhen present and parseable, the worker sets `anchor_src = occurred_at` and\n`anchor_ms` to this date's epoch milliseconds, instead of the creation time.\n\nAbsent or `null` → `anchor_src = created` (backward-compatible behaviour).\n\n## Accepted formats\n\n- ISO 8601 / RFC 3339 with time: `\"2026-01-15T10:00:00Z\"`\n- Date-only YYYY-MM-DD → start of day UTC: `\"2026-01-15\"`\n\nAn unparseable value is rejected by the server with **400 InvalidInput**.\n\nDates arbitraires (passé/futur) acceptées by-design — pas de borne sémantique.",
+        "description": "Temporal anchor — event date of the note (ISO 8601 UTC or YYYY-MM-DD).\n\nWhen present and parseable, the worker sets `anchor_src = occurred_at` and\n`anchor_ms` to this date's epoch milliseconds, instead of the creation time.\n\nAbsent or `null` → `anchor_src = created` (backward-compatible behaviour).\n\n## Accepted formats\n\n- ISO 8601 / RFC 3339 with time: `\"2026-01-15T10:00:00Z\"`\n- Date-only YYYY-MM-DD → start of day UTC: `\"2026-01-15\"`\n\nAn unparseable value is rejected by the server with **400 InvalidInput**.\n\nArbitrary dates (past/future) accepted by-design — no semantic bound.",
         "type": [
           "string",
           "null"
@@ -1044,8 +1178,7 @@ expression: schema_map
         "type": "array"
       },
       "tenant_id": {
-        "default": "main",
-        "description": "Target tenant (default `\"main\"`).",
+        "description": "Target tenant (principal) — optional; when omitted the server resolves it\nfrom the credential identity (JWT/API-key), never `\"main\"` by default.",
         "type": "string"
       },
       "title": {

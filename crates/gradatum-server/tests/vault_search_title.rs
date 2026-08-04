@@ -132,7 +132,7 @@ async fn vault_search_response_includes_title_when_db_has_title() {
     let nid = NoteId(Ulid::from_string(&note_id).unwrap());
     state
         .search
-        .upsert_note_title(&nid, "Titre alpha11 patch1")
+        .upsert_note_title("main", &nid, "Titre alpha11 patch1")
         .await
         .expect("upsert_note_title");
 
@@ -228,7 +228,7 @@ async fn vault_search_response_preserves_snippet_alongside_title() {
     let nid = NoteId(Ulid::from_string(&note_id).unwrap());
     state
         .search
-        .upsert_note_title(&nid, "Coexist title and snippet")
+        .upsert_note_title("main", &nid, "Coexist title and snippet")
         .await
         .expect("upsert_note_title");
 
@@ -289,7 +289,7 @@ async fn vault_search_empty_title_in_db_becomes_null() {
     let nid = NoteId(Ulid::from_string(&note_id).unwrap());
     state
         .search
-        .upsert_note_title(&nid, "")
+        .upsert_note_title("main", &nid, "")
         .await
         .expect("upsert_note_title avec chaine vide");
 
@@ -342,7 +342,7 @@ async fn vault_search_whitespace_title_in_db_becomes_null() {
     let nid = NoteId(Ulid::from_string(&note_id).unwrap());
     state
         .search
-        .upsert_note_title(&nid, "   ")
+        .upsert_note_title("main", &nid, "   ")
         .await
         .expect("upsert_note_title whitespace");
 

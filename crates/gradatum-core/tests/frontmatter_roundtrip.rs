@@ -9,7 +9,7 @@ use gradatum_core::frontmatter::Frontmatter;
 #[test]
 fn frontmatter_yaml_round_trip_canonical_fields() {
     let raw = include_str!("fixtures/frontmatter-with-extras.yaml");
-    let fm: Frontmatter = serde_yml::from_str(raw).expect("parse frontmatter fixture");
+    let fm: Frontmatter = serde_norway::from_str(raw).expect("parse frontmatter fixture");
 
     // Vérifications de base.
     assert_eq!(fm.schema_version, 1);
@@ -21,8 +21,8 @@ fn frontmatter_yaml_round_trip_canonical_fields() {
     assert_eq!(fm.tags[1].as_str(), "recovery-skills");
 
     // Round-trip : sérialise puis re-parse.
-    let written = serde_yml::to_string(&fm).expect("sérialise frontmatter");
-    let reparsed: Frontmatter = serde_yml::from_str(&written).expect("re-parse frontmatter");
+    let written = serde_norway::to_string(&fm).expect("sérialise frontmatter");
+    let reparsed: Frontmatter = serde_norway::from_str(&written).expect("re-parse frontmatter");
 
     assert_eq!(
         fm, reparsed,
@@ -59,7 +59,7 @@ fn extra_fields_empty_omitted_in_serialization() {
         forgotten_by: None,
     };
 
-    let yaml = serde_yml::to_string(&fm).expect("sérialise");
+    let yaml = serde_norway::to_string(&fm).expect("sérialise");
     assert!(
         !yaml.contains("extra"),
         "extra vide ne doit pas apparaître dans le YAML : {yaml}"
@@ -122,7 +122,7 @@ fn tags_inline_smallvec_up_to_4() {
     use gradatum_core::tag::Tag;
 
     let raw = include_str!("fixtures/frontmatter-with-extras.yaml");
-    let fm: Frontmatter = serde_yml::from_str(raw).expect("parse fixture");
+    let fm: Frontmatter = serde_norway::from_str(raw).expect("parse fixture");
 
     // Vérification indirecte : SmallVec<[Tag; 4]> est inline jusqu'à 4.
     // On vérifie juste que les tags sont bien là.

@@ -42,7 +42,7 @@ pub(crate) async fn internal_auth_middleware(
     let token = match &state.internal_api_token {
         Some(t) => t.clone(),
         None => {
-            warn!("API interne : token non configuré — rejet fail-closed");
+            warn!("internal API: token not configured — fail-closed rejection");
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
@@ -54,7 +54,7 @@ pub(crate) async fn internal_auth_middleware(
     };
 
     if !is_loopback {
-        warn!(ip = %addr.ip(), "API interne : rejet adresse non-loopback");
+        warn!(ip = %addr.ip(), "internal API: rejecting non-loopback address");
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -62,7 +62,7 @@ pub(crate) async fn internal_auth_middleware(
     let provided = match extract_bearer_token(req.headers()) {
         Some(t) => t.to_string(), // clone nécessaire avant move de req
         None => {
-            warn!("API interne : header X-Gradatum-Internal absent ou malformé");
+            warn!("internal API: X-Gradatum-Internal header absent or malformed");
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
@@ -89,7 +89,7 @@ pub(crate) async fn internal_auth_middleware(
     };
 
     if !bytes_match {
-        warn!("API interne : token invalide");
+        warn!("internal API: invalid token");
         return StatusCode::UNAUTHORIZED.into_response();
     }
 

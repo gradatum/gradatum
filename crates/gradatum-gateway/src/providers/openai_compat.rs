@@ -61,7 +61,7 @@ impl OpenAiCompatProvider {
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
-            .map_err(|e| anyhow::anyhow!("erreur construction client HTTP: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("HTTP client construction error: {}", e))?;
 
         let api_key = api_key_env.and_then(|env_name| std::env::var(env_name).ok());
 

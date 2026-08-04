@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::default_main;
+use gradatum_core::scope::TenantId;
 
 /// Assembly mode for the context produced by `vault_context`.
 ///
@@ -43,9 +43,11 @@ pub struct ScoringWeights {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultContextRequest {
-    /// Tenant identifier (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Tenant (principal) — optional; when omitted the server resolves it from the
+    /// credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// Query for which to build the LLM context.
     pub query: String,
     /// Maximum number of context tokens (legacy — see `budget_tokens` for v0.7.0+).
@@ -105,7 +107,7 @@ mod tests {
         assert!(req.budget_tokens.is_none());
         assert!(req.scoring.is_none());
         assert!(req.skill_query.is_none());
-        assert_eq!(req.tenant_id, "main");
+        assert_eq!(req.tenant_id, None);
     }
 
     /// An absent `reference_mode` field defaults to `false` (backward-compatible).

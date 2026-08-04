@@ -239,7 +239,7 @@ pub async fn build_skill_index(
                 err = %e,
                 tenant,
                 skills_count = texts.len(),
-                "skills: embed_batch error — dégradation gracieuse, index vide"
+                "skills: embed_batch error — graceful degradation, empty index"
             );
             return Ok(SkillIndex { entries: vec![] });
         }
@@ -248,7 +248,7 @@ pub async fn build_skill_index(
                 embed_timeout_ms,
                 tenant,
                 skills_count = texts.len(),
-                "skills: embed_batch timeout — dégradation gracieuse, index vide"
+                "skills: embed_batch timeout — graceful degradation, empty index"
             );
             return Ok(SkillIndex { entries: vec![] });
         }
@@ -259,7 +259,7 @@ pub async fn build_skill_index(
         .zip(embeddings)
         .map(|(r, emb)| SkillEntry {
             ulid: r.id,
-            title: r.title.unwrap_or_else(|| "(sans titre)".to_string()),
+            title: r.title.unwrap_or_else(|| "(untitled)".to_string()),
             body: r.body_text,
             embedding: emb,
         })

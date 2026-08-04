@@ -51,8 +51,8 @@ Active `--features fastembed-cpu` pour B2a uniquement.
 
 | # | Bench | Target | Status |
 |---|---|---|---|
-| B9 | posix_fallocate NFS | EOPNOTSUPP détecté sur NFS | DEFERRED — script `scripts/b09_posix_fallocate_nfs.sh`, gated `GRADATUM_TEST_NFS_PATH` |
-| B10 | Binary size workspace release | feature gates effectives | DEFERRED — script `scripts/b10_binary_size.sh` + `cargo-bloat` |
+| B9 | posix_fallocate NFS | EOPNOTSUPP détecté sur NFS | DEFERRED — script `crates/gradatum-bench/scripts/b09_posix_fallocate_nfs.sh`, gated `GRADATUM_TEST_NFS_PATH` |
+| B10 | Binary size workspace release | feature gates effectives | DEFERRED — script `crates/gradatum-bench/scripts/b10_binary_size.sh` + `cargo-bloat` |
 
 ## Reproduction
 

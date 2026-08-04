@@ -7,9 +7,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Rust SDK client for gradatum-server HTTP API — placeholder, not yet implemented"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-gradatum-core.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

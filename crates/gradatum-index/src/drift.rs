@@ -107,7 +107,9 @@ pub async fn scan_phase_a(
         let on_disk_size = meta.size;
 
         if on_disk_size == entry.expected_size {
-            // Niveau 2 : prefix-4KB hash — lire uniquement les 4096 premiers bytes.
+            // Niveau 2 : prefix-4KB hash. ⚠️ `Storage::read` lit le fichier ENTIER —
+            // seul le HASH porte sur les 4096 premiers bytes, pas la lecture. Le gain
+            // du niveau 2 est donc le coût du hash, pas celui de l'I/O.
             let bytes = storage
                 .read(rel)
                 .await

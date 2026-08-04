@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::default_main;
+use gradatum_core::scope::TenantId;
 
 /// Request body for `POST /api/v1/session-log/trace` (append-only session trace insert).
 ///
@@ -17,8 +17,9 @@ pub struct SessionTraceRequest {
     /// Tenant (default `"main"`). For explicitness only: ACL identity ALWAYS uses
     /// the `tenant_id` from the JWT. If provided AND different from the JWT → 422
     /// in the handler (no silent client/server divergence).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
     /// Session ULID. Omitted = server-generated. Provided = validated ULID format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,

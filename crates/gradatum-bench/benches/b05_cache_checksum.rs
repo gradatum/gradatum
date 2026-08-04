@@ -16,6 +16,7 @@ use gradatum_bench::build_note;
 use gradatum_cache::{CacheKey, EffectiveNoteCache, EffectiveNoteCacheConfig};
 use gradatum_core::identity::{ContentHash, NoteId};
 use gradatum_core::note::EffectiveNote;
+use gradatum_core::scope::VaultId;
 
 /// Convertit une `Note` en `EffectiveNote`.
 fn to_effective(note: gradatum_core::note::Note) -> EffectiveNote {
@@ -49,9 +50,9 @@ fn bench_cache_checksum(c: &mut Criterion) {
             let note = build_note(256);
             let id = note.id;
             let hash = note.content_hash;
-            let key: CacheKey = (id, 0u64);
+            let key: CacheKey = (VaultId::new("main"), id, 0u64);
             let effective = Arc::new(to_effective(note));
-            cache.insert(key, effective, hash).await;
+            cache.insert(key.clone(), effective, hash).await;
             keys.push((key, hash));
         }
     });
@@ -65,7 +66,7 @@ fn bench_cache_checksum(c: &mut Criterion) {
                 let mut hits = 0u32;
                 for (key, expected_hash) in &keys {
                     let result = cache
-                        .get::<_, _, ()>(*key, |_note_id| {
+                        .get::<_, _, ()>(key.clone(), |_note_id| {
                             let h = *expected_hash;
                             async move { Ok(h) }
                         })
@@ -81,12 +82,12 @@ fn bench_cache_checksum(c: &mut Criterion) {
     });
 
     // Cold path : cache miss (clé inconnue).
-    let unknown_key: CacheKey = (NoteId::new(), 999u64);
+    let unknown_key: CacheKey = (VaultId::new("main"), NoteId::new(), 999u64);
     group.bench_function("cold-miss", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let result = cache
-                    .get::<_, _, ()>(black_box(unknown_key), |_id| async {
+                    .get::<_, _, ()>(black_box(unknown_key.clone()), |_id| async {
                         Ok(ContentHash([0u8; 32]))
                     })
                     .await

@@ -70,13 +70,13 @@ async fn search_semantic_returns_top_k_by_cosine() {
         .await
         .unwrap();
 
-    idx.insert_note_embedding(&note_a, "test-embedder", 1024, &emb_a)
+    idx.insert_note_embedding("main", &note_a, "test-embedder", 1024, &emb_a)
         .await
         .unwrap();
-    idx.insert_note_embedding(&note_b, "test-embedder", 1024, &emb_b)
+    idx.insert_note_embedding("main", &note_b, "test-embedder", 1024, &emb_b)
         .await
         .unwrap();
-    idx.insert_note_embedding(&note_c, "test-embedder", 1024, &emb_c)
+    idx.insert_note_embedding("main", &note_c, "test-embedder", 1024, &emb_c)
         .await
         .unwrap();
 
@@ -88,7 +88,15 @@ async fn search_semantic_returns_top_k_by_cosine() {
     };
 
     let results = idx
-        .search_semantic("main", "test-embedder", &query_emb, 3, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "test-embedder",
+            &query_emb,
+            3,
+            None,
+        )
         .await
         .unwrap();
 
@@ -139,14 +147,22 @@ async fn search_semantic_query_zero_norm_returns_empty() {
         .await
         .unwrap();
     let emb: Vec<f32> = vec![1.0f32; 1024];
-    idx.insert_note_embedding(&note_id, "test-embedder", 1024, &emb)
+    idx.insert_note_embedding("main", &note_id, "test-embedder", 1024, &emb)
         .await
         .unwrap();
 
     // Query avec vecteur nul → résultats vides (norme = 0)
     let zero_query: Vec<f32> = vec![0.0f32; 1024];
     let results = idx
-        .search_semantic("main", "test-embedder", &zero_query, 10, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "test-embedder",
+            &zero_query,
+            10,
+            None,
+        )
         .await
         .unwrap();
 
@@ -173,7 +189,7 @@ async fn search_semantic_ignores_other_embedder_id() {
         v
     };
     // Inséré sous "embedder-A"
-    idx.insert_note_embedding(&note_id, "embedder-A", 1024, &emb)
+    idx.insert_note_embedding("main", &note_id, "embedder-A", 1024, &emb)
         .await
         .unwrap();
 
@@ -184,7 +200,15 @@ async fn search_semantic_ignores_other_embedder_id() {
         v
     };
     let results = idx
-        .search_semantic("main", "embedder-B", &query, 10, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "embedder-B",
+            &query,
+            10,
+            None,
+        )
         .await
         .unwrap();
 
@@ -214,17 +238,24 @@ async fn search_semantic_excludes_downgraded_notes() {
         v[0] = 1.0;
         v
     };
-    idx.insert_note_embedding(&live_id, "test-embedder", 1024, &emb)
+    idx.insert_note_embedding("main", &live_id, "test-embedder", 1024, &emb)
         .await
         .unwrap();
-    idx.insert_note_embedding(&down_id, "test-embedder", 1024, &emb)
+    idx.insert_note_embedding("main", &down_id, "test-embedder", 1024, &emb)
         .await
         .unwrap();
 
     // Downgrader la 2ème note
-    idx.downgrade_note(&down_id, "test-reason", None)
-        .await
-        .unwrap();
+    idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        ),
+        &down_id,
+        "test-reason",
+        None,
+    )
+    .await
+    .unwrap();
 
     let query: Vec<f32> = {
         let mut v = vec![0.0f32; 1024];
@@ -232,7 +263,15 @@ async fn search_semantic_excludes_downgraded_notes() {
         v
     };
     let results = idx
-        .search_semantic("main", "test-embedder", &query, 10, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "test-embedder",
+            &query,
+            10,
+            None,
+        )
         .await
         .unwrap();
 
@@ -258,7 +297,7 @@ async fn search_semantic_limit_truncates_results() {
             v[0] = 1.0 - (i as f32 * 0.1); // scores décroissants
             v
         };
-        idx.insert_note_embedding(&note_id, "test-embedder", 1024, &emb)
+        idx.insert_note_embedding("main", &note_id, "test-embedder", 1024, &emb)
             .await
             .unwrap();
         ids.push(note_id);
@@ -271,7 +310,15 @@ async fn search_semantic_limit_truncates_results() {
     };
     // limit=3 → doit retourner exactement 3 résultats
     let results = idx
-        .search_semantic("main", "test-embedder", &query, 3, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "test-embedder",
+            &query,
+            3,
+            None,
+        )
         .await
         .unwrap();
 
@@ -311,7 +358,7 @@ async fn search_semantic_perf_n1500_p95_under_200ms() {
         let emb: Vec<f32> = (0..dim)
             .map(|d| (i as f32 * 0.001 + d as f32 * 0.0001).sin())
             .collect();
-        idx.insert_note_embedding(&note_id, embedder_id, dim as u16, &emb)
+        idx.insert_note_embedding("main", &note_id, embedder_id, dim as u16, &emb)
             .await
             .unwrap();
         ids.push(note_id);
@@ -330,7 +377,15 @@ async fn search_semantic_perf_n1500_p95_under_200ms() {
     for _ in 0..runs {
         let t0 = Instant::now();
         let results = idx
-            .search_semantic("main", embedder_id, &query_emb, 10, None)
+            .search_semantic(
+                &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                    gradatum_core::scope::VaultId::new("main"),
+                ),
+                embedder_id,
+                &query_emb,
+                10,
+                None,
+            )
             .await
             .unwrap();
         let elapsed_ms = t0.elapsed().as_millis() as u64;

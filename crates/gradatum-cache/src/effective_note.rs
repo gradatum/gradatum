@@ -2,8 +2,11 @@
 //!
 //! ## Design
 //!
-//! - Composite key `(NoteId, u64)`: `NoteId` identifies the note; `u64` is the hash
-//!   of the `OverrideScope` computed by the caller (avoids importing the full type into the key).
+//! - Composite key `(VaultId, NoteId, u64)`: `VaultId` partitions the key per vault
+//!   (fail-safe — a `NoteId` is only unique within a vault, so the key MUST carry the
+//!   vault to avoid cross-vault collisions if a cache is ever shared); `NoteId` identifies
+//!   the note; `u64` is the hash of the `OverrideScope` computed by the caller (avoids
+//!   importing the full type into the key).
 //! - Stored value: `Entry { value: Arc<EffectiveNote>, content_hash: ContentHash }`.
 //! - On **cache hit**: the caller provides an async `validator` closure that returns the
 //!   current hash from SQLite. Match → returns cached value. Mismatch → invalidates entry + returns `None`.
@@ -29,13 +32,18 @@ use moka::future::Cache;
 
 use gradatum_core::identity::{ContentHash, NoteId};
 use gradatum_core::note::EffectiveNote;
+use gradatum_core::scope::VaultId;
 
-/// Composite cache key: `(note_id, scope_hash)`.
+/// Composite cache key: `(vault_id, note_id, scope_hash)`.
 ///
-/// `scope_hash` is a `u64` computed by the caller from an `OverrideScope`
-/// (e.g. via `std::hash::Hasher`). This design avoids importing `OverrideScope`
-/// into the cache key and keeps the key size small.
-pub type CacheKey = (NoteId, u64);
+/// - `vault_id` partitions entries per vault. A `NoteId` is only unique *within* a
+///   vault, so the vault MUST be part of the key: without it, two vaults sharing a
+///   cache would collide on the same `(note_id, scope_hash)` and leak entries across
+///   vaults (C4 — fail-safe, closed structurally before any cache sharing).
+/// - `scope_hash` is a `u64` computed by the caller from an `OverrideScope`
+///   (e.g. via `std::hash::Hasher`). This design avoids importing `OverrideScope`
+///   into the cache key and keeps the key size small.
+pub type CacheKey = (VaultId, NoteId, u64);
 
 /// Configuration for `EffectiveNoteCache`.
 #[derive(Debug, Clone)]
@@ -67,9 +75,10 @@ struct Entry {
 
 /// Moka LRU cache for `EffectiveNote` with checksum validation on hit.
 ///
-/// Thread-safe and `Clone` (moka `future::Cache` is internally an `Arc` wrapper).
-/// Freely shareable across Axum handlers via `Arc<EffectiveNoteCache>`
-/// or by cloning directly — both share the same underlying state.
+/// Thread-safe. Share it across Axum handlers via `Arc<EffectiveNoteCache>`.
+///
+/// The type does **not** implement `Clone` — only the inner moka `future::Cache` is an
+/// `Arc` wrapper, and that is not re-exposed. `Arc` is the only sharing route.
 pub struct EffectiveNoteCache {
     inner: Cache<CacheKey, Entry>,
 }
@@ -143,7 +152,8 @@ impl EffectiveNoteCache {
             return Ok(None);
         };
 
-        let live_hash = validator(key.0).await?;
+        // key.1 = NoteId (key.0 = VaultId partition). Le validator reçoit le NoteId.
+        let live_hash = validator(key.1).await?;
 
         if live_hash == entry.content_hash {
             return Ok(Some(entry.value));

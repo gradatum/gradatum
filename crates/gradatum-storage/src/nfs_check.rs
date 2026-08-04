@@ -97,7 +97,7 @@ pub fn ensure_local_filesystem(path: &Path) -> Result<(), StorageError> {
         // Non-Linux: NFS check not implemented — explicit log for traceability.
         tracing::warn!(
             path = %path.display(),
-            "ensure_local_filesystem: plateforme non-Linux, NFS check ignoré"
+            "ensure_local_filesystem: non-Linux platform, NFS check skipped"
         );
         Ok(())
     }

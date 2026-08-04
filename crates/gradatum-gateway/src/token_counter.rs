@@ -22,16 +22,6 @@ const CHARS_PER_TOKEN: u64 = 4;
 /// images (anyres / dynamic tiling).
 const TOKENS_PER_IMAGE: u64 = 1100;
 
-/// Estimates the total token count for a chat request (chars/4 heuristic).
-///
-/// Total = Σ(tokens_per_message) + requested `max_tokens`
-#[must_use]
-pub fn estimate_total_tokens(request: &ChatCompletionRequest) -> u64 {
-    let input_tokens = estimate_input_tokens(request);
-    let output_tokens = request.max_tokens.map(|n| n as u64).unwrap_or(0);
-    input_tokens.saturating_add(output_tokens)
-}
-
 /// Estimates input tokens only (excluding `max_tokens`).
 ///
 /// For multimodal messages (`Parts`):
@@ -67,6 +57,9 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
             stop: None,
             tools: None,
             tool_choice: None,
@@ -92,21 +85,11 @@ mod tests {
     }
 
     #[test]
-    fn test_max_tokens_ajouté_au_total() {
-        let content = "a".repeat(40);
-        let req = make_request(vec![Message::user(&content)], Some(100));
-        assert_eq!(
-            estimate_total_tokens(&req),
-            114,
-            "14 input + 100 max_tokens = 114"
-        );
-    }
-
-    #[test]
     fn test_saturation_pas_de_panique() {
         let content = "x".repeat(1_000_000);
         let req = make_request(vec![Message::user(&content)], Some(u32::MAX));
-        let _ = estimate_total_tokens(&req);
+        // saturating_add interne : un corpus géant ne doit jamais paniquer.
+        let _ = estimate_input_tokens(&req);
     }
 
     /// Parts multimodales : texte seul → même calcul que Text.

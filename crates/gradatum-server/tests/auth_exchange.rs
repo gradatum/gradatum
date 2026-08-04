@@ -10,6 +10,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use gradatum_core::scope::AgentId;
 use gradatum_server::auth_routes::ExchangeResponse;
 use gradatum_server::state::AppState;
 use tempfile::TempDir;
@@ -54,7 +55,12 @@ async fn exchange_valid_key_returns_jwt() {
     // Créer une clé API dans le store.
     let material = state
         .api_keys
-        .create("mcp-stub", vec!["vault_read".into()], "main".into(), None)
+        .create(
+            &AgentId::new("mcp-stub"),
+            vec!["vault_read".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create api key");
 
@@ -94,7 +100,12 @@ async fn exchange_accepts_bare_ak_prefix() {
 
     let material = state
         .api_keys
-        .create("agent-1", vec!["vault_read".into()], "main".into(), None)
+        .create(
+            &AgentId::new("agent-1"),
+            vec!["vault_read".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create api key");
 
@@ -167,7 +178,12 @@ async fn exchange_wrong_secret_returns_401() {
     // Créer une clé mais passer un mauvais secret.
     state
         .api_keys
-        .create("owner-x", vec!["vault_read".into()], "main".into(), None)
+        .create(
+            &AgentId::new("owner-x"),
+            vec!["vault_read".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create");
 
@@ -195,7 +211,12 @@ async fn exchange_revoked_key_returns_401() {
 
     let material = state
         .api_keys
-        .create("owner-y", vec!["vault_read".into()], "main".into(), None)
+        .create(
+            &AgentId::new("owner-y"),
+            vec!["vault_read".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create");
 
@@ -242,7 +263,7 @@ async fn exchange_non_main_tenant_key_returns_403() {
     let material = state
         .api_keys
         .create(
-            "legacy-evil",
+            &AgentId::new("legacy-evil"),
             vec!["vault_read".into()],
             "main".into(),
             None,
@@ -286,7 +307,12 @@ async fn exchange_does_not_require_jwt_in_auth_header() {
 
     let material = state
         .api_keys
-        .create("owner-z", vec!["vault_read".into()], "main".into(), None)
+        .create(
+            &AgentId::new("owner-z"),
+            vec!["vault_read".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create");
 
@@ -321,7 +347,12 @@ async fn exchange_without_scope_field_uses_service_ttl_24h() {
 
     let material = state
         .api_keys
-        .create("engine", vec!["vault_read".into()], "main".into(), None)
+        .create(
+            &AgentId::new("engine"),
+            vec!["vault_read".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create api key");
 
@@ -366,7 +397,7 @@ async fn exchange_with_scope_human_uses_human_ttl_1h() {
     let material = state
         .api_keys
         .create(
-            "studio-user",
+            &AgentId::new("studio-user"),
             vec!["vault_read".into()],
             "main".into(),
             None,
@@ -404,4 +435,153 @@ async fn exchange_with_scope_human_uses_human_ttl_1h() {
         "TTL Human attendu ≈ 3600 s, obtenu delta = {delta}"
     );
     assert_eq!(parsed.ttl_secs, jwt_service.ttl_human_secs());
+}
+
+// ── C3a (F-45) — levée du verrou tenant sous `multi_tenant.enabled = true` ─────
+
+/// Fixture ON : state avec index SQLite réel (tables `tenants`/`tenant_vault_grants`,
+/// seed `main`↔`main`), store api_keys réel, flag `multi_tenant` activé.
+async fn build_multi_tenant_state() -> (AppState, std::path::PathBuf, TempDir) {
+    use gradatum_server::config::{MultiTenantConfig, ServerConfig};
+
+    let dir = TempDir::new().expect("tempdir");
+    let api_keys_path = dir.path().join("api_keys.sqlite");
+    let index_path = dir.path().join("index.db");
+    let state = AppState::new()
+        .with_api_keys_path(&api_keys_path)
+        .await
+        .expect("api_keys store init")
+        .with_search_path(&index_path)
+        .await
+        .expect("SqliteIndex::open — migrations")
+        .with_server_config(ServerConfig {
+            multi_tenant: MultiTenantConfig { enabled: true },
+            ..ServerConfig::default()
+        });
+    (state, index_path, dir)
+}
+
+/// Crée une clé API puis mute son tenant en SQL direct (la création non-main est
+/// gardée par un opt-in opérateur — hors sujet ici, on teste l'ÉMISSION du JWT).
+async fn create_key_with_tenant(state: &AppState, dir: &TempDir, tenant: &str) -> String {
+    let material = state
+        .api_keys
+        .create(
+            &AgentId::new("c3a-owner"),
+            vec!["read".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("create api key");
+    let api_keys_path = dir.path().join("api_keys.sqlite");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect(&format!("sqlite://{}", api_keys_path.display()))
+        .await
+        .expect("open api_keys sqlite");
+    sqlx::query("UPDATE api_keys SET tenant_id = ? WHERE prefix = ?")
+        .bind(tenant)
+        .bind(&material.prefix)
+        .execute(&pool)
+        .await
+        .expect("mutate tenant");
+    pool.close().await;
+    material.secret
+}
+
+/// Provisionne le tenant `research` (statut paramétrable) + self-grant write.
+fn seed_tenant(index_path: &std::path::Path, tenant: &str, status: &str) {
+    let conn = rusqlite::Connection::open(index_path).expect("open index.db");
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT INTO tenants (id, status, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![tenant, status, now],
+    )
+    .expect("seed tenant");
+    conn.execute(
+        "INSERT INTO tenant_vault_grants (tenant_id, vault_id, access) VALUES (?1, ?1, 'write')",
+        rusqlite::params![tenant],
+    )
+    .expect("seed self-grant");
+}
+
+async fn post_exchange(router: axum::Router, secret: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/auth/exchange")
+        .header("Authorization", format!("Bearer {secret}"))
+        .body(Body::empty())
+        .expect("build request");
+    let resp = router.oneshot(req).await.expect("service call");
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+        .await
+        .expect("body read")
+        .to_vec();
+    (status, body)
+}
+
+/// ON : une clé d'un tenant provisionné (actif + grant) obtient un JWT portant
+/// SON tenant — l'émission est gouvernée par la même allow-list que le middleware.
+#[tokio::test]
+async fn exchange_on_provisioned_tenant_mints_scoped_jwt() {
+    let (state, index_path, dir) = build_multi_tenant_state().await;
+    seed_tenant(&index_path, "research", "active");
+    let secret = create_key_with_tenant(&state, &dir, "research").await;
+    let jwt_service = state.jwt.clone();
+
+    let (status, body) = post_exchange(build_test_router(state), &secret).await;
+    assert_eq!(status, StatusCode::OK, "tenant provisionné → 200");
+    let parsed: ExchangeResponse = serde_json::from_slice(&body).expect("parse JSON");
+    assert_eq!(parsed.tenant_id, "research");
+    let claims = jwt_service.verify(&parsed.token).expect("JWT vérifiable");
+    assert_eq!(
+        claims.tenant_id, "research",
+        "le JWT porte le tenant de la clé"
+    );
+}
+
+/// ON : tenant jamais provisionné → 403 fail-closed (aucun mint).
+#[tokio::test]
+async fn exchange_on_unprovisioned_tenant_returns_403() {
+    let (state, _index_path, dir) = build_multi_tenant_state().await;
+    let secret = create_key_with_tenant(&state, &dir, "ghost").await;
+
+    let (status, _body) = post_exchange(build_test_router(state), &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "tenant non provisionné → 403"
+    );
+}
+
+/// ON : tenant soft-deleted → 403 (le JOIN `tenants.status = 'active'` de
+/// l'allow-list gouverne aussi l'émission).
+#[tokio::test]
+async fn exchange_on_deleted_tenant_returns_403() {
+    let (state, index_path, dir) = build_multi_tenant_state().await;
+    seed_tenant(&index_path, "research", "deleted");
+    let secret = create_key_with_tenant(&state, &dir, "research").await;
+
+    let (status, _body) = post_exchange(build_test_router(state), &secret).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "tenant soft-deleted → 403");
+}
+
+/// ON : les clés `main` continuent d'échanger normalement (seed migration 0030).
+#[tokio::test]
+async fn exchange_on_main_key_still_works() {
+    let (state, _index_path, _dir) = build_multi_tenant_state().await;
+    let material = state
+        .api_keys
+        .create(
+            &AgentId::new("mcp-stub"),
+            vec!["service".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("create api key");
+
+    let (status, _body) = post_exchange(build_test_router(state), &material.secret).await;
+    assert_eq!(status, StatusCode::OK, "clé main à ON → 200 (seed 0030)");
 }

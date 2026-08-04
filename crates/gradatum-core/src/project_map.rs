@@ -21,18 +21,21 @@
 //! | kind | `[[kind:FIX]]` | [`ProjectMapLink::Kind`] |
 //! | version | `[[version:gradatum/0.6.1]]` | [`ProjectMapLink::Version`] |
 //! | annex | `[[spec:…]]` `[[plan:…]]` `[[context:…]]` | [`ProjectMapLink::Annex`] |
+// scan-fr-strings: allow-jargon F-37 — exemple de SYNTAXE du wikilink `feature:`, pas un renvoi à un ticket
 //! | feature | `[[feature:F-37]]` | [`ProjectMapLink::Feature`] |
 //! | release | `[[release:planned]]` | [`ProjectMapLink::Release`] |
+// scan-fr-strings: allow-jargon F-12 — exemple de SYNTAXE du wikilink `supersedes:`, pas un renvoi à un ticket
 //! | supersedes | `[[supersedes:F-12]]` | [`ProjectMapLink::Supersedes`] |
+// scan-fr-strings: allow-jargon F-31 — exemple de SYNTAXE du wikilink `parent:`, pas un renvoi à un ticket
 //! | parent | `[[parent:F-31]]` | [`ProjectMapLink::Parent`] |
 //! | dependency | `[[decisions:01K…]]` | [`ProjectMapLink::Dep`] |
 //!
-//! ## Carte-feature
+//! ## Feature cards
 //!
-//! La présence d'au moins un `[[feature:F-XX]]` désigne une **carte-feature** :
-//! [`validate_links`] exige alors exactement 1 `feature` et 1 `release`. Les
-//! cartes sans `feature` (changelog) conservent la validation historique sans
-//! régression (et n'autorisent aucun `[[release:]]`).
+//! The presence of at least one `[[feature:F-XX]]` marks the note as a **feature
+//! card**: [`validate_links`] then requires exactly one `feature` and one `release`.
+//! Notes without a `feature` link (changelog entries) keep the original validation
+//! rules unchanged, and are not allowed to carry a `[[release:]]` link at all.
 //!
 //! ## Case sensitivity
 //!
@@ -57,17 +60,17 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum StatusKind {
-    /// Réflexion amont, pas encore engagée.
+    /// Upstream ideation, not yet committed to.
     Brainstorming,
-    /// Engagée, pas démarrée.
+    /// Committed to, not started.
     Open,
-    /// En cours.
+    /// Under way.
     InProgress,
-    /// Bloquée par une dépendance.
+    /// Blocked by a dependency.
     Blocked,
-    /// Terminée (≡ RESOLVED gov-todo).
+    /// Completed.
     Done,
-    /// Abandonnée / périmée.
+    /// Abandoned or superseded.
     Obsolete,
 }
 
@@ -109,22 +112,22 @@ impl StatusKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KindKind {
-    /// Nouvelle capacité (→ CHANGELOG « Added »).
+    /// New capability (CHANGELOG "Added").
     Feature,
-    /// Amélioration d'existant (→ « Changed »).
+    /// Improvement to something that already exists (CHANGELOG "Changed").
     Enhancement,
-    /// Correction de bug (→ « Fixed »).
+    /// Bug fix (CHANGELOG "Fixed").
     Fix,
-    /// Maintenance / outillage (→ hors changelog public usuel).
+    /// Maintenance or tooling — usually kept out of the public changelog.
     Chore,
-    /// Exploration / prototype borné.
+    /// Bounded exploration or prototype.
     Spike,
-    /// Tâche générique (fourre-tout assumé).
+    /// Generic task — the deliberate catch-all.
     Task,
 }
 
 impl KindKind {
-    /// Parse la valeur wire SCREAMING_SNAKE d'un `[[kind:…]]`.
+    /// Parses the SCREAMING_SNAKE wire value of a `[[kind:…]]` wikilink.
     fn from_wire(value: &str) -> Option<Self> {
         match value {
             "FEATURE" => Some(Self::Feature),
@@ -137,7 +140,7 @@ impl KindKind {
         }
     }
 
-    /// Représentation wire SCREAMING_SNAKE.
+    /// Returns the SCREAMING_SNAKE wire representation.
     #[must_use]
     pub const fn as_wire(&self) -> &'static str {
         match self {
@@ -151,31 +154,31 @@ impl KindKind {
     }
 }
 
-/// Statut de livraison (release) d'une carte-feature project-map.
+/// Delivery (release) status of a project-map feature card.
 ///
-/// Axe **orthogonal** au [`StatusKind`] de cycle de vie : `StatusKind` décrit
-/// l'avancement du travail, `ReleaseKind` décrit la position sur la roadmap de
-/// version. Contrairement à [`StatusKind`]/[`KindKind`] (SCREAMING_SNAKE), les
-/// valeurs wire de `ReleaseKind` sont **en minuscules** — elles miroir
-/// exactement l'énumération du site (`released`/`planned`/`roadmap`).
+/// This axis is **orthogonal** to the [`StatusKind`] lifecycle: `StatusKind` describes
+/// how far the work has progressed, `ReleaseKind` describes where it sits on the
+/// version roadmap. Unlike [`StatusKind`] and [`KindKind`], which are SCREAMING_SNAKE,
+/// the wire values of `ReleaseKind` are **lowercase**, mirroring the public website
+/// enumeration exactly (`released` / `planned` / `roadmap`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReleaseKind {
-    /// Envisagée à long terme, sans version cible engagée.
+    /// Considered for the long term, with no target version committed to.
     Roadmap,
-    /// Planifiée pour une version cible.
+    /// Planned for a target version.
     Planned,
-    /// Livrée dans une version publiée.
+    /// Delivered in a published version.
     Released,
-    /// Écartée (remplacée ou annulée).
+    /// Dropped — replaced or cancelled.
     Dropped,
 }
 
 impl ReleaseKind {
-    /// Parse la valeur wire **minuscule** d'un `[[release:…]]`.
+    /// Parses the **lowercase** wire value of a `[[release:…]]` wikilink.
     ///
-    /// Matching sensible à la casse : `"planned"` est accepté ; `"PLANNED"` est
-    /// rejeté (cohérence avec l'énumération du site).
+    /// Matching is case-sensitive: `"planned"` is accepted, `"PLANNED"` is rejected,
+    /// which keeps the values aligned with the public website enumeration.
     fn from_wire(value: &str) -> Option<Self> {
         match value {
             "roadmap" => Some(Self::Roadmap),
@@ -186,7 +189,7 @@ impl ReleaseKind {
         }
     }
 
-    /// Représentation wire **minuscule** (inverse de `from_wire`).
+    /// Returns the **lowercase** wire representation (inverse of `from_wire`).
     #[must_use]
     pub const fn as_wire(&self) -> &'static str {
         match self {
@@ -202,16 +205,16 @@ impl ReleaseKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AnnexRole {
-    /// Spécification de design (`[[spec:…]]`).
+    /// Design specification (`[[spec:…]]`).
     Spec,
-    /// Plan d'implémentation (`[[plan:…]]`).
+    /// Implementation plan (`[[plan:…]]`).
     Plan,
-    /// Contexte / discussion (`[[context:…]]`).
+    /// Context or discussion (`[[context:…]]`).
     Context,
 }
 
 impl AnnexRole {
-    /// Préfixe réservé associé au rôle annexe.
+    /// Reserved prefix associated with this annex role.
     #[must_use]
     pub const fn prefix(&self) -> &'static str {
         match self {
@@ -222,57 +225,58 @@ impl AnnexRole {
     }
 }
 
-/// Un lien typé d'une carte project-map, issu d'un wikilink `[[role:valeur]]`.
+/// A typed link of a project-map card, parsed from a `[[role:value]]` wikilink.
 ///
-/// Produit par [`parse_link`]. La cardinalité (1 `Project`, 1 `Status`, 1 `Kind`,
-/// ≤1 `Version`, N `Annex`, N `Dep`) est vérifiée par [`validate_links`].
+/// Produced by [`parse_link`]. Cardinality — 1 `Project`, 1 `Status`, 1 `Kind`,
+/// at most 1 `Version`, any number of `Annex` and `Dep` — is checked by
+/// [`validate_links`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProjectMapLink {
-    /// `[[project:<nom>]]` — projet rattaché (1 obligatoire).
+    /// `[[project:<name>]]` — the owning project (exactly 1 required).
     Project(String),
-    /// `[[status:<STATUS>]]` — statut de cycle de vie (1 obligatoire).
+    /// `[[status:<STATUS>]]` — lifecycle status (exactly 1 required).
     Status(StatusKind),
-    /// `[[kind:<KIND>]]` — nature de l'unité (1 obligatoire).
+    /// `[[kind:<KIND>]]` — nature of the work unit (exactly 1 required).
     Kind(KindKind),
-    /// `[[version:<projet>/<x.y.z>]]` — version cible (0 ou 1).
+    /// `[[version:<project>/<x.y.z>]]` — target version (0 or 1).
     Version {
-        /// Projet namespacé (partie avant le `/`).
+        /// Namespaced project (the part before the `/`).
         project: String,
-        /// Numéro de version (partie après le `/`).
+        /// Version number (the part after the `/`).
         version: String,
     },
-    /// `[[spec|plan|context:<cible>]]` — annexe référencée (0..N).
+    /// `[[spec|plan|context:<target>]]` — referenced annex (0..N).
     Annex {
-        /// Rôle de l'annexe.
+        /// Role of the annex.
         role: AnnexRole,
-        /// Cible brute (ULID ou chemin).
+        /// Raw target (a ULID or a path).
         target: String,
     },
-    /// `[[<section>:<ULID>]]` — dépendance de contenu existante (0..N).
+    /// `[[<section>:<ULID>]]` — plain content dependency (0..N).
     Dep {
-        /// Section de la note cible.
+        /// Section of the target note.
         section: String,
-        /// ULID de la note cible.
+        /// ULID of the target note.
         ulid: String,
     },
-    /// `[[feature:F-XX]]` — identité de la carte-feature (exactement 1, discriminant).
+    /// `[[feature:F-XX]]` — identity of a feature card (exactly 1; also the discriminant).
     ///
-    /// La présence d'au moins un `Feature` fait basculer [`validate_links`] en
-    /// mode carte-feature (release obligatoire).
+    /// The presence of at least one `Feature` switches [`validate_links`] into
+    /// feature-card mode, where a `release` link becomes mandatory.
     Feature(String),
-    /// `[[release:<r>]]` — statut de livraison (1 sur carte-feature, 0 sinon).
+    /// `[[release:<r>]]` — delivery status (1 on a feature card, 0 otherwise).
     Release(ReleaseKind),
-    /// `[[supersedes:F-YY]]` — feature remplacée (0..N).
+    /// `[[supersedes:F-YY]]` — a feature this card replaces (0..N).
     ///
-    /// Distinct de [`ProjectMapLink::Feature`] : ne participe **pas** au compte
-    /// de cardinalité feature.
+    /// Distinct from [`ProjectMapLink::Feature`]: it does **not** count towards the
+    /// feature cardinality.
     Supersedes(String),
-    /// `[[parent:F-YY]]` — feature d'origine dont cette carte est une continuation (0..N).
+    /// `[[parent:F-YY]]` — the original feature this card continues (0..N).
     ///
-    /// Rôle structurel Règle B (NOMENCLATURE §10e) : une carte de continuation
-    /// référence la feature d'origine par ce lien. Ne participe **pas** au compte
-    /// de cardinalité feature. Cardinalité 0..N (multi-parent autorisé).
+    /// A continuation card points back at the feature it grew out of through this link.
+    /// It does **not** count towards the feature cardinality, and several parents are
+    /// allowed.
     Parent(String),
 }
 
@@ -283,79 +287,78 @@ pub enum ProjectMapLink {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SchemaError {
-    /// Lien sans préfixe `role:` et non reconnu comme dépendance `section:ULID`.
-    #[error("lien sans préfixe typé ni format section:ULID : {0:?}")]
+    /// A link with no `role:` prefix that is not a `section:ULID` dependency either.
+    #[error("link without typed prefix nor section:ULID format: {0:?}")]
     MissingPrefix(String),
 
-    /// Valeur de statut hors taxonomie (`[[status:…]]`).
+    /// A `[[status:…]]` value outside the taxonomy.
     #[error(
-        "statut invalide {0:?} (attendu SCREAMING_SNAKE ∈ BRAINSTORMING/OPEN/IN_PROGRESS/BLOCKED/DONE/OBSOLETE)"
+        "invalid status {0:?} (expected SCREAMING_SNAKE ∈ BRAINSTORMING/OPEN/IN_PROGRESS/BLOCKED/DONE/OBSOLETE)"
     )]
     InvalidStatus(String),
 
-    /// Valeur de kind hors taxonomie (`[[kind:…]]`).
+    /// A `[[kind:…]]` value outside the taxonomy.
     #[error(
-        "kind invalide {0:?} (attendu SCREAMING_SNAKE ∈ FEATURE/ENHANCEMENT/FIX/CHORE/SPIKE/TASK)"
+        "invalid kind {0:?} (expected SCREAMING_SNAKE ∈ FEATURE/ENHANCEMENT/FIX/CHORE/SPIKE/TASK)"
     )]
     InvalidKind(String),
 
-    /// `[[version:…]]` mal formé (attendu `projet/x.y.z`).
-    #[error("version mal formée {0:?} (attendu projet/x.y.z)")]
+    /// A malformed `[[version:…]]` link (expected `project/x.y.z`).
+    #[error("malformed version {0:?} (expected project/x.y.z)")]
     MalformedVersion(String),
 
-    /// Valeur vide après le préfixe (ex. `[[project:]]`).
-    #[error("valeur vide pour le préfixe {0:?}")]
+    /// Empty value after the prefix (e.g. `[[project:]]`).
+    #[error("empty value for prefix {0:?}")]
     EmptyValue(String),
 
-    /// Valeur project/version dépasse 64 caractères.
-    #[error("valeur {1:?} trop longue pour le préfixe {0:?} (max 64 chars, reçu {2})")]
+    /// A project or version value longer than 64 characters.
+    #[error("value {1:?} too long for prefix {0:?} (max 64 chars, got {2})")]
     ValueTooLong(String, String, usize),
 
-    /// Valeur project/version contient des caractères non autorisés (`[a-z0-9._-]`).
-    #[error(
-        "valeur {1:?} contient des caractères interdits pour le préfixe {0:?} (autorisé : a-z 0-9 . _ -)"
-    )]
+    /// A project or version value with characters outside `[a-z0-9._-]`.
+    #[error("value {1:?} contains forbidden characters for prefix {0:?} (allowed: a-z 0-9 . _ -)")]
     InvalidChars(String, String),
 
-    /// `project:` manquant ou multiple (exactement 1 requis).
-    #[error("exactement 1 lien project: requis, trouvé {0}")]
+    /// `project:` missing or repeated (exactly 1 required).
+    #[error("exactly 1 project: link required, found {0}")]
     ProjectCardinality(usize),
 
-    /// `status:` manquant ou multiple (exactement 1 requis).
-    #[error("exactement 1 lien status: requis, trouvé {0}")]
+    /// `status:` missing or repeated (exactly 1 required).
+    #[error("exactly 1 status: link required, found {0}")]
     StatusCardinality(usize),
 
-    /// `kind:` manquant ou multiple (exactement 1 requis).
-    #[error("exactement 1 lien kind: requis, trouvé {0}")]
+    /// `kind:` missing or repeated (exactly 1 required).
+    #[error("exactly 1 kind: link required, found {0}")]
     KindCardinality(usize),
 
-    /// `version:` multiple (au plus 1).
-    #[error("au plus 1 lien version: autorisé, trouvé {0}")]
+    /// `version:` repeated (at most 1 allowed).
+    #[error("at most 1 version: link allowed, found {0}")]
     VersionCardinality(usize),
 
-    /// Incohérence : `version:<projet>/…` ≠ `project:<projet>`.
-    #[error("version namespacée {version_project:?} ≠ project {project:?}")]
+    /// Inconsistency: the project in `version:<project>/…` differs from `project:<project>`.
+    #[error("namespaced version {version_project:?} ≠ project {project:?}")]
     VersionProjectMismatch {
-        /// Projet déclaré par `[[project:…]]`.
+        /// Project declared by `[[project:…]]`.
         project: String,
-        /// Projet namespacé dans `[[version:…]]`.
+        /// Project namespaced inside `[[version:…]]`.
         version_project: String,
     },
 
-    /// Identifiant `feature:`/`supersedes:` hors format `F-\d{2,3}` (ex. `f-37`, `F-1`).
-    #[error("identifiant feature invalide {0:?} (attendu F-NN ou F-NNN, ex. F-37, F-061)")]
+    /// A `feature:`/`supersedes:` identifier outside the `F-\d{2,3}` format
+    /// (e.g. `f-37`, `F-1`).
+    #[error("invalid feature identifier {0:?} (expected F-NN or F-NNN, e.g. F-37, F-061)")]
     FeatureIdentInvalid(String),
 
-    /// Valeur de release hors taxonomie (`[[release:…]]`).
-    #[error("release invalide {0:?} (attendu minuscule ∈ roadmap/planned/released/dropped)")]
+    /// A `[[release:…]]` value outside the taxonomy.
+    #[error("invalid release {0:?} (expected lowercase ∈ roadmap/planned/released/dropped)")]
     InvalidRelease(String),
 
-    /// `feature:` multiple sur une carte-feature (exactement 1 requis).
-    #[error("exactement 1 lien feature: requis sur une carte-feature, trouvé {0}")]
+    /// `feature:` repeated on a feature card (exactly 1 required).
+    #[error("exactly 1 feature: link required on a feature card, found {0}")]
     FeatureCardinality(usize),
 
-    /// `release:` en nombre incorrect (1 si carte-feature, 0 sinon).
-    #[error("nombre de liens release: incorrect (1 si carte-feature, 0 sinon), trouvé {0}")]
+    /// Wrong number of `release:` links (1 on a feature card, 0 otherwise).
+    #[error("incorrect number of release: links (1 if feature card, 0 otherwise), found {0}")]
     ReleaseCardinality(usize),
 
     /// `version:` link absent or appears more than once on a feature card (exactly 1 required).
@@ -364,23 +367,23 @@ pub enum SchemaError {
     /// Use the sentinel `[[version:<project>/backlog]]` when no concrete version is yet
     /// known.
     #[error(
-        "carte-feature: exactement 1 [[version:]] requis (ou sentinel projet/backlog), trouvé {0}"
+        "feature card: exactly 1 [[version:]] required (or sentinel project/backlog), found {0}"
     )]
     FeatureVersionCardinality(usize),
 }
 
-/// Longueur maximale pour un identifiant `project:` ou composant de `version:`.
+/// Maximum length of a `project:` identifier or of a `version:` component.
 ///
-/// Cohérent avec `Tag::normalize` (64 chars). Safety cap DoS (ADN 5).
+/// Consistent with `Tag::normalize` (64 characters). Acts as a DoS safety cap.
 const MAX_IDENT_LEN: usize = 64;
 
-/// Valide qu'un identifiant project-map respecte le charset `[a-z0-9._-]` et
-/// la longueur maximale [`MAX_IDENT_LEN`].
+/// Checks that a project-map identifier respects the `[a-z0-9._-]` charset and the
+/// [`MAX_IDENT_LEN`] length cap.
 ///
 /// # Errors
 ///
-/// - [`SchemaError::ValueTooLong`] si `value.len() > MAX_IDENT_LEN`.
-/// - [`SchemaError::InvalidChars`] si un caractère n'est pas dans `[a-z0-9._-]`.
+/// - [`SchemaError::ValueTooLong`] if `value.len() > MAX_IDENT_LEN`.
+/// - [`SchemaError::InvalidChars`] if any character falls outside `[a-z0-9._-]`.
 fn validate_ident(prefix: &str, value: &str) -> Result<(), SchemaError> {
     if value.len() > MAX_IDENT_LEN {
         return Err(SchemaError::ValueTooLong(
@@ -401,17 +404,19 @@ fn validate_ident(prefix: &str, value: &str) -> Result<(), SchemaError> {
     Ok(())
 }
 
-/// Valide qu'un identifiant `feature:`/`supersedes:` respecte le format `F-\d{2,3}`.
+/// Checks that a `feature:`/`supersedes:`/`parent:` identifier respects the `F-\d{2,3}` format.
 ///
-/// Format exact (parser dédié, **pas** [`validate_ident`] qui refuserait le `F`
-/// majuscule) : un `F` majuscule, un tiret, puis 2 ou 3 chiffres ASCII. Exemples
-/// valides : `F-37`, `F-061`. Invalides : `f-37`, `F-1`, `F-1234`, `feature37`.
+/// The format is exact — an uppercase `F`, a hyphen, then 2 or 3 ASCII digits — and
+/// needs a dedicated parser rather than [`validate_ident`], which would reject the
+// scan-fr-strings: allow-jargon F-37 — valeur d'exemple du contrat de `validate_feature_ident`
+// scan-fr-strings: allow-jargon F-061 — valeur d'exemple du contrat de `validate_feature_ident`
+/// uppercase `F`. Valid: `F-37`, `F-061`. Invalid: `f-37`, `F-1`, `F-1234`, `feature37`.
 ///
-/// Check manuel par caractères (aucune dépendance `regex`).
+/// The check is done character by character, so the crate needs no `regex` dependency.
 ///
 /// # Errors
 ///
-/// [`SchemaError::FeatureIdentInvalid`] si `value` ne respecte pas le format.
+/// [`SchemaError::FeatureIdentInvalid`] if `value` does not match the format.
 fn validate_feature_ident(value: &str) -> Result<(), SchemaError> {
     let invalid = || SchemaError::FeatureIdentInvalid(value.to_string());
     // `F-` + 2..=3 chiffres → longueur totale 4 ou 5.
@@ -424,10 +429,10 @@ fn validate_feature_ident(value: &str) -> Result<(), SchemaError> {
     Ok(())
 }
 
-/// Découpe une cible brute `role:valeur` au **premier** `:`.
+/// Splits a raw `role:value` target at the **first** `:`.
 ///
-/// Retourne `(prefix, value)`. Si aucun `:`, `prefix` vaut la chaîne entière et
-/// `value` est vide — le caller décide.
+/// Returns `(prefix, value)`. When there is no `:` at all, `prefix` is the whole
+/// string and `value` is empty — it is up to the caller to decide what that means.
 fn split_prefix(target: &str) -> (&str, &str) {
     match target.split_once(':') {
         Some((p, v)) => (p, v),
@@ -443,19 +448,21 @@ fn split_prefix(target: &str) -> (&str, &str) {
 /// ## Disambiguation rule
 ///
 /// - A **reserved prefix** (`project`/`status`/`kind`/`version`/`spec`/`plan`/
-///   `context`/`feature`/`release`/`supersedes`) → typed structural or annex link.
+///   `context`/`feature`/`release`/`supersedes`/`parent`) → typed structural or
+///   annex link.
 /// - Any other prefix in `<section>:<ULID>` form → [`ProjectMapLink::Dep`].
 ///
 /// # Errors
 ///
-/// - [`SchemaError::EmptyValue`] si la valeur après un préfixe réservé est vide.
+/// - [`SchemaError::EmptyValue`] if the value after a reserved prefix is empty.
 /// - [`SchemaError::InvalidStatus`] / [`SchemaError::InvalidKind`] /
-///   [`SchemaError::InvalidRelease`] hors taxonomie.
-/// - [`SchemaError::MalformedVersion`] si `version:` n'est pas `projet/x.y.z`.
-/// - [`SchemaError::FeatureIdentInvalid`] si `feature:`/`supersedes:` n'est pas `F-\d{2,3}`.
-/// - [`SchemaError::MissingPrefix`] si la cible n'a pas de préfixe `role:` et
-///   n'est pas un `section:ULID` valide.
-#[must_use = "le résultat de parsing doit être inspecté"]
+///   [`SchemaError::InvalidRelease`] for values outside their taxonomy.
+/// - [`SchemaError::MalformedVersion`] if `version:` is not `project/x.y.z`.
+/// - [`SchemaError::FeatureIdentInvalid`] if `feature:`/`supersedes:`/`parent:` is not
+///   `F-\d{2,3}`.
+/// - [`SchemaError::MissingPrefix`] if the target has no `role:` prefix and is not a
+///   valid `section:ULID` either.
+#[must_use = "the parse result must be inspected"]
 pub fn parse_link(raw: &str) -> Result<ProjectMapLink, SchemaError> {
     let raw = raw.trim();
     let (prefix, value) = split_prefix(raw);
@@ -542,9 +549,9 @@ fn parse_version(value: &str) -> Result<ProjectMapLink, SchemaError> {
     }
 }
 
-/// Parse une dépendance `section:ULID` (préfixe non réservé).
+/// Parses a `section:ULID` content dependency (any non-reserved prefix).
 ///
-/// `raw` sert au message d'erreur si la cible n'a pas de préfixe du tout.
+/// `raw` is only used for the error message when the target has no prefix at all.
 fn parse_dep(section: &str, ulid: &str, raw: &str) -> Result<ProjectMapLink, SchemaError> {
     if ulid.is_empty() {
         // Pas de `:` dans la cible (ou rien après) → ni typé, ni section:ULID.
@@ -562,18 +569,19 @@ fn parse_dep(section: &str, ulid: &str, raw: &str) -> Result<ProjectMapLink, Sch
 /// any number of `Annex`, `Dep`, `Supersedes` and `Parent`. If a `Version` is present, its
 /// namespaced project must match the `Project` link.
 ///
-/// **Carte-feature** : si au moins un `Feature` est présent, exactement 1
-/// `Feature`, 1 `Release`, 1 `Version` et un `kind ∈ KindKind` sont exigés.
-/// Tout kind de l'enum est accepté — seul `kind:FEATURE` est exporté vers le
-/// site (export T2) ; les autres kinds (FIX/CHORE/SPIKE/TASK/ENHANCEMENT) sont
-/// vault-only. En l'absence de `Feature` (carte changelog), aucun `Release`
-/// n'est autorisé et `Kind` reste libre — la validation historique est inchangée.
+/// **Feature cards**: as soon as one `Feature` link is present, exactly 1 `Feature`,
+/// 1 `Release`, 1 `Version` and one `kind` are required. Every [`KindKind`] value is
+/// accepted; only `kind:FEATURE` is exported to the public website, the other kinds
+/// (`FIX`/`CHORE`/`SPIKE`/`TASK`/`ENHANCEMENT`) stay vault-only. Without a `Feature`
+/// link (a plain changelog card), no `Release` link is allowed and `Kind` is
+/// unconstrained — the original validation rules are unchanged.
 ///
 /// # Errors
 ///
-/// Une [`SchemaError`] de cardinalité ou de cohérence au premier écart constaté
-/// (ordre : project → status → kind → version → mismatch → feature → release).
-#[must_use = "le résultat de validation doit être inspecté avant d'accepter l'écriture"]
+/// A cardinality or consistency [`SchemaError`], raised at the first deviation found,
+/// in this order: project → status → kind → version → project/version mismatch →
+/// feature → release.
+#[must_use = "the validation result must be inspected before accepting the write"]
 pub fn validate_links(links: &[ProjectMapLink]) -> Result<(), SchemaError> {
     let mut projects: Vec<&str> = Vec::new();
     let mut status_count = 0usize;
@@ -654,59 +662,89 @@ pub fn validate_links(links: &[ProjectMapLink]) -> Result<(), SchemaError> {
     Ok(())
 }
 
-/// Valide le schéma project-map à partir des cibles de wikilinks **déjà extraites**.
+/// Validates the project-map schema from **already-extracted** wikilink targets.
 ///
-/// Conçu pour le write-path : le serveur extrait les cibles `[[…]]` du body (via
-/// `gradatum_curator::wikilinks::extract_wikilinks`, hors de cette crate pour
-/// éviter un cycle de dépendances) puis délègue ici la validation.
+/// Designed for the write path: the server extracts the `[[…]]` targets from the body
+/// (via `gradatum_curator::wikilinks::extract_wikilinks`, which lives outside this
+/// crate to avoid a dependency cycle) and then delegates validation here.
 ///
-/// # Sémantique
+/// # Semantics
 ///
-/// Chaque cible est passée à [`parse_link`]. Les cibles qui **échouent** au parse
-/// (titre humain nu, prose `[[Voir aussi]]`…) sont **ignorées** : ce ne sont pas
-/// des liens structurels project-map. Les cibles qui parsent sont collectées puis
-/// soumises à [`validate_links`] (cardinalité 1 project + 1 status + 1 kind, ≤1
-/// version, cohérence version.project).
+/// Each target is handed to [`parse_link`]. Targets that **fail** to parse — a bare
+/// human title, prose such as `[[see also]]` — are **ignored**: they are not project-map
+/// structural links. The targets that do parse are collected and submitted to
+/// [`validate_links`] (1 project + 1 status + 1 kind, at most 1 version, and a matching
+/// `version.project`).
 ///
-/// Une valeur **réservée mal formée** (`[[status:nope]]`, `[[version:x]]`) parse
-/// en `Err` et serait donc ignorée ici ; le triple-obligatoire la rattrape
-/// néanmoins (un `status:` invalide ne fournit pas le `Status` requis → rejet par
-/// cardinalité). Voir tests.
+/// A **malformed reserved value** (`[[status:nope]]`, `[[version:x]]`) parses to `Err`
+/// and is therefore ignored here — but the three mandatory links still catch it, since
+/// an invalid `status:` never yields the required `Status` and the card is rejected on
+/// cardinality.
 ///
 /// # Errors
 ///
-/// Une [`SchemaError`] de cardinalité/cohérence si le schéma obligatoire n'est
-/// pas satisfait par les liens typés présents.
-#[must_use = "le résultat de validation gate l'écriture project-map"]
+/// A cardinality or consistency [`SchemaError`] when the mandatory schema is not
+/// satisfied by the typed links present.
+#[must_use = "the validation result gates the project-map write"]
 pub fn validate_links_from_targets(targets: &[String]) -> Result<(), SchemaError> {
     let links: Vec<ProjectMapLink> = targets.iter().filter_map(|t| parse_link(t).ok()).collect();
     validate_links(&links)
 }
 
-/// Identifiant canonique d'un **nœud-cible réservé** synthétique pour le graphe.
+/// Feature **identity** role(s) among already-extracted wikilink targets.
 ///
-/// Les liens typés `project:` / `status:` / `kind:` / `version:` ne pointent PAS
-/// vers une note existante (pas d'ULID à résoudre) : ils référencent un **nœud
-/// réservé** (hub) du graphe `note_links`. Cette fonction normalise la cible
-/// brute d'un wikilink en l'identifiant `dst_note_id` canonique de ce nœud, que
-/// le resolver worker insère directement sans lookup réseau.
+/// Returns the sorted `F-XX` identifiers carried by `[[feature:…]]` roles — the **identity**
+/// of a project-map card. `supersedes:` / `parent:` are deliberately excluded: they
+/// *reference* other features, they are not the card's own identity, and counting them would
+/// make two distinct cards compare equal.
 ///
-/// `note_links.dst_note_id` est un `TEXT` libre (pas de FK, cf. migration 0002),
-/// ce qui autorise un `dst` synthétique navigable par `vault_graph`/`vault_trace`.
+/// A well-formed feature card yields exactly one identifier; a changelog card yields none.
+/// Sorting makes the result usable for **order-independent equality** — the basis of the
+/// identity-immutability contract enforced on the write path: an external creation may not
+/// supply an identity (only the server allocates one), and an external update must preserve
+/// the existing identity exactly.
 ///
-/// # Différence avec les annexes
+/// Mirrors [`validate_links_from_targets`]: the caller extracts the `[[…]]` targets once
+/// (via `gradatum_curator::wikilinks::extract_wikilinks`) and hands them here — a single
+/// extraction source, no divergence with the schema validator.
+#[must_use = "the extracted identity must be compared before accepting the write"]
+pub fn feature_identity_from_targets(targets: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> = targets
+        .iter()
+        .filter_map(|t| match parse_link(t).ok()? {
+            ProjectMapLink::Feature(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Canonical identifier of a synthetic **reserved target node** in the link graph.
 ///
-/// `spec:` / `plan:` / `context:` sont des préfixes réservés MAIS pointent vers
-/// de **vraies notes** (ULID/chemin) — ils restent résolus par le flux ULID
-/// existant et ne sont donc PAS des nœuds réservés ici → `None`.
+/// The typed links `project:` / `status:` / `kind:` / `version:` do **not** point at an
+/// existing note — there is no ULID to resolve. They reference a **reserved node** (a
+/// hub) of the `note_links` graph. This function normalises the raw wikilink target into
+/// the canonical `dst_note_id` of that node, which the worker resolver can insert
+/// directly without any lookup.
 ///
-/// # Retour
+/// `note_links.dst_note_id` is a free-form `TEXT` column with no foreign key, which is
+/// what makes a synthetic `dst` possible and navigable through `vault_graph` and
+/// `vault_trace`.
 ///
-/// - `Some(dst)` pour `project`/`status`/`kind`/`version`/`feature`/`release`/
-///   `supersedes`/`parent` bien formés, où `dst` est l'identifiant canonique du
-///   nœud (statut/kind normalisés en wire via [`parse_link`]).
-/// - `None` pour tout autre lien (annexe, dépendance `section:ULID`, titre nu,
-///   ou valeur réservée mal formée) → le caller applique son flux normal.
+/// # How annexes differ
+///
+/// `spec:` / `plan:` / `context:` are reserved prefixes too, but they point at **real
+/// notes** (a ULID or a path). They keep going through the normal ULID resolution and
+/// are therefore not reserved nodes here — this function returns `None` for them.
+///
+/// # Returns
+///
+/// - `Some(dst)` for well-formed `project`/`status`/`kind`/`version`/`feature`/
+///   `release`/`supersedes`/`parent` links, where `dst` is the canonical node
+///   identifier (status and kind normalised to their wire form by [`parse_link`]).
+/// - `None` for anything else — an annex, a `section:ULID` dependency, a bare title, or
+///   a malformed reserved value — leaving the caller on its normal path.
 #[must_use]
 pub fn reserved_node_target(raw: &str) -> Option<String> {
     match parse_link(raw).ok()? {
@@ -743,51 +781,94 @@ pub fn reserved_node_target(raw: &str) -> Option<String> {
 // - `map_version_raw` et `feature_sort_key` sont réutilisés par les deux
 //   consommateurs.
 
-/// Projection d'une carte-feature pour l'export JSON miroir-site.
+/// Projection of a feature card for the public-website JSON export.
 ///
-/// Produit par [`project_map_feature_entries`] depuis les notes brutes
-/// section `project-map`. Utilisé par l'admin CLI et le handler HTTP
+/// Produced by [`project_map_feature_entries`] from the raw notes of the
+/// `project-map` section. Used by the admin CLI and by the HTTP handler
 /// `GET /api/v1/project-map/export-features`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureEntry {
-    /// Identifiant de la carte-feature (ex. `"F-37"`).
+    // scan-fr-strings: allow-jargon F-37 — valeur d'exemple du champ `feature`, pas un renvoi à un ticket
+    /// Identifier of the feature card (e.g. `"F-37"`).
     pub feature: String,
-    /// Statut de livraison wire lowercase (`"roadmap"` | `"planned"` | `"released"` | `"dropped"`).
+    /// Lowercase wire delivery status (`"roadmap"` | `"planned"` | `"released"` | `"dropped"`).
     pub release: String,
-    /// Version cible au format site (`"vX.Y.Z"` réel), ou `"vX.Y.Z"` littéral
-    /// pour les cartes backlog (Règle A NOMENCLATURE §10e — jamais `null`).
+    /// Target version in website format (a real `"v0.6.4"`), or the literal `"vX.Y.Z"`
+    /// for backlog cards, so that they remain visible instead of being filtered out.
     pub version: Option<String>,
-    /// Titre H1 de la carte.
+    /// H1 title of the card.
     pub title: String,
 }
 
-/// Options de filtrage pour [`project_map_feature_entries`].
+/// Filtering options for [`project_map_feature_entries`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExportOptions {
-    /// Si `true`, inclut les cartes `release:dropped` (audit complet).
-    /// Défaut (`false`) : miroir-site, exclut uniquement `dropped`.
-    /// Les cartes `version:*/backlog` sont toujours incluses (Règle A).
+    /// Switches the export into **full-audit** mode.
+    ///
+    /// - `false` (default) — public-website mirror: `release:dropped` cards are
+    ///   excluded, **and** only `kind:FEATURE` cards are kept.
+    /// - `true` — every feature card is exported, whatever its release status and
+    ///   whatever its kind.
+    ///
+    /// Despite its name, this flag lifts **both** filters at once; there is no way to
+    /// lift one without the other. `version:*/backlog` cards are included in both modes.
     pub include_dropped: bool,
 }
 
-/// Trie deux identifiants F-XX numériquement sur la partie `\d{2,3}`.
+/// Sort key ordering `F-XX` identifiers numerically on their `\d{2,3}` part.
 ///
-/// `"F-37"` → 37, `"F-061"` → 61. Identifiants invalides → 0 (ordre stable).
+// scan-fr-strings: allow-jargon F-37 — valeur d'exemple illustrant la clé de tri
+// scan-fr-strings: allow-jargon F-061 — valeur d'exemple illustrant la clé de tri (zéro non significatif)
+/// `"F-37"` → 37, `"F-061"` → 61. Invalid identifiers map to 0, which keeps the sort
+/// stable rather than panicking.
 fn feature_sort_key(id: &str) -> u32 {
     id.strip_prefix("F-")
         .and_then(|digits| digits.parse().ok())
         .unwrap_or(0)
 }
 
-/// Mappe la valeur brute `version:` vers la chaîne d'affichage du miroir-site.
+/// Highest feature number **referenced** in a single project-map card body.
 ///
-/// - `"gradatum/0.6.4"` → `Some("v0.6.4")` (version concrète préfixée `v`).
-/// - `"gradatum/backlog"` → `Some("vX.Y.Z")` (Règle A NOMENCLATURE §10e :
-///   les cartes backlog sont visibles sur le miroir-site avec ce sentinel
-///   littéral, afin de ne pas être filtrées côté CI).
+/// This is the reliable source of truth for feature-number allocation: it reads the
+/// **body role** wikilinks (`[[feature:F-XX]]`, `[[supersedes:F-YY]]`, `[[parent:F-ZZ]]`),
+/// parsed by [`parse_link`] — **never the note tags**. Tags are known to be incomplete
+/// (some cards carry none) and inconsistent (`f-01` vs `f-1` coexist), so a max computed
+/// over tags would be unsafe; the body role is validated against `F-\d{2,3}` when the card
+/// is parsed, and is present on every feature card by construction.
 ///
-/// Le namespace projet (partie avant `/`) est ignoré : validé par le triple
-/// `[[project:]]`/`[[version:]]` du schéma project-map.
+/// All three feature-shaped roles are considered, not just `feature:`. Counting
+/// `supersedes:`/`parent:` raises the floor so an allocation can **never** hand back a
+/// number that is still referenced by a live card whose target feature card was removed —
+/// a strictly safer, monotone floor at negligible cost.
+///
+// scan-fr-strings: allow-jargon F-37 — valeur d'exemple illustrant l'extraction du numéro
+// scan-fr-strings: allow-jargon F-061 — valeur d'exemple (zéro non significatif), pas un renvoi à un ticket
+/// `F-37` → 37, `F-061` → 61. Returns `None` when the body references no feature number.
+///
+/// The scan is char-safe and allocation-free beyond the parse; no `regex` dependency.
+#[must_use]
+pub fn max_feature_number(body: &str) -> Option<u32> {
+    extract_wikilink_targets(body)
+        .iter()
+        .filter_map(|target| match parse_link(target).ok()? {
+            ProjectMapLink::Feature(id)
+            | ProjectMapLink::Supersedes(id)
+            | ProjectMapLink::Parent(id) => {
+                id.strip_prefix("F-").and_then(|digits| digits.parse().ok())
+            }
+            _ => None,
+        })
+        .max()
+}
+
+/// Maps a raw `version:` value to the string displayed on the public website.
+///
+/// - `"gradatum/0.6.4"` → `Some("v0.6.4")` — a concrete version, prefixed with `v`.
+/// - `"gradatum/backlog"` → `Some("vX.Y.Z")` — backlog cards stay visible on the
+///   website behind this literal sentinel instead of being filtered out.
+///
+/// The project namespace (the part before `/`) is ignored here: the schema already
+/// checks it against the card's `[[project:]]` link.
 pub fn map_version_raw(raw: &str) -> Option<String> {
     let ver = raw.split_once('/').map(|(_, v)| v).unwrap_or(raw);
     if ver == "backlog" {
@@ -797,22 +878,23 @@ pub fn map_version_raw(raw: &str) -> Option<String> {
     }
 }
 
-/// Projection pure notes project-map → `Vec<FeatureEntry>`.
+/// Pure projection from project-map notes to `Vec<FeatureEntry>`.
 ///
-/// Entrées : slice de tuples `(body_text, title)` représentant les notes brutes
-/// de la section `project-map` (déjà filtrées `status != 'downgraded'/'garbage'`
-/// par la couche de stockage amont).
+/// Input: a slice of `(body_text, title)` tuples holding the raw notes of the
+/// `project-map` section, already filtered on `status != 'downgraded'/'garbage'` by the
+/// storage layer upstream.
 ///
-/// Traitement :
-/// 1. Parse les wikilinks via [`parse_link`] — les liens invalides sont ignorés.
-/// 2. Ne garde que les cartes avec `[[feature:F-XX]]`.
-/// 3. Filtre `release:dropped` si `opts.include_dropped == false`.
-/// 4. Mappe `[[version:…]]` via [`map_version_raw`] (Règle A : backlog → `"vX.Y.Z"`).
-/// 5. Trie par identifiant F-XX croissant numérique.
+/// Processing:
+/// 1. Parse the wikilinks with [`parse_link`]; unparseable targets are skipped.
+/// 2. Keep only the cards carrying a `[[feature:F-XX]]` link.
+/// 3. Skip cards without a `[[release:…]]` link — a feature card without one is invalid.
+/// 4. When `opts.include_dropped == false`, drop `release:dropped` cards **and** every
+///    card whose kind is not `FEATURE`.
+/// 5. Map `[[version:…]]` through [`map_version_raw`] (backlog → `"vX.Y.Z"`).
+/// 6. Sort by ascending numeric `F-XX` identifier.
 ///
-/// Cette fonction est **pure** (pas d'I/O, pas de `Result`) — les erreurs de
-/// parsing de wikilinks individuels sont ignorées défensivement (carte ignorée
-/// si les rôles obligatoires sont absents).
+/// The function is **pure**: no I/O, no `Result`. Individual wikilink parse failures are
+/// swallowed defensively, and a card missing a mandatory role is simply skipped.
 #[must_use]
 pub fn project_map_feature_entries(
     notes: &[(String, String)],
@@ -884,12 +966,12 @@ pub fn project_map_feature_entries(
     entries
 }
 
-/// Extrait les cibles brutes de wikilinks `[[target]]` d'un body.
+/// Extracts the raw `[[target]]` wikilink targets from a body.
 ///
-/// Scan non-regex, char-safe. Retourne les contenus entre `[[` et `]]`
-/// (la cible brute, y compris le préfixe `role:` — prête pour `parse_link`).
+/// A char-safe scan with no `regex` dependency. Returns whatever sits between `[[` and
+/// `]]` — the raw target, `role:` prefix included, ready for `parse_link`.
 ///
-/// Usage interne : factorisation pour [`project_map_feature_entries`].
+/// Internal helper, factored out of [`project_map_feature_entries`].
 fn extract_wikilink_targets(body: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut rest = body;
@@ -1122,6 +1204,52 @@ mod feature_entries_tests {
 }
 
 #[cfg(test)]
+mod max_feature_number_tests {
+    use super::*;
+
+    /// The highest `[[feature:F-XX]]` role in the body wins, 2- and 3-digit forms mixed.
+    #[test]
+    fn returns_max_over_feature_roles() {
+        let body = "[[feature:F-37]] [[project:gradatum]] see also [[feature:F-134]]";
+        assert_eq!(max_feature_number(body), Some(134));
+    }
+
+    /// `supersedes:` and `parent:` raise the floor beyond the `feature:` role.
+    #[test]
+    fn supersedes_and_parent_raise_the_floor() {
+        let body = "[[feature:F-40]] [[supersedes:F-131]] [[parent:F-98]]";
+        assert_eq!(
+            max_feature_number(body),
+            Some(131),
+            "supersedes:F-131 must be counted so the number is never reallocated"
+        );
+    }
+
+    /// A body with no feature-shaped role yields `None`.
+    #[test]
+    fn returns_none_when_no_feature_role() {
+        let body = "[[project:gradatum]] [[status:DONE]] [[kind:FIX]] plain prose";
+        assert_eq!(max_feature_number(body), None);
+    }
+
+    /// Tags are NOT the source: an `f-999` in prose (not a `[[feature:]]` wikilink)
+    /// is ignored — only well-formed body roles count.
+    #[test]
+    fn ignores_non_wikilink_text_and_malformed_ids() {
+        // `f-999` lowercase is not a valid feature ident; `[[feature:F-1]]` is malformed
+        // (1 digit) and rejected by parse_link → ignored. Only F-50 counts.
+        let body = "f-999 tag noise [[feature:F-1]] [[feature:F-50]]";
+        assert_eq!(max_feature_number(body), Some(50));
+    }
+
+    /// Empty body → `None`.
+    #[test]
+    fn empty_body_returns_none() {
+        assert_eq!(max_feature_number(""), None);
+    }
+}
+
+#[cfg(test)]
 mod validate_from_targets_tests {
     use super::*;
 
@@ -1166,6 +1294,72 @@ mod validate_from_targets_tests {
             validate_links_from_targets(&[]),
             Err(SchemaError::ProjectCardinality(0))
         );
+    }
+}
+
+#[cfg(test)]
+mod feature_identity_tests {
+    use super::*;
+
+    fn t(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn feature_card_yields_its_single_identity() {
+        let targets = t(&[
+            "project:gradatum",
+            "status:OPEN",
+            "feature:F-42",
+            "release:planned",
+        ]);
+        assert_eq!(
+            feature_identity_from_targets(&targets),
+            vec!["F-42".to_string()]
+        );
+    }
+
+    #[test]
+    fn changelog_card_yields_no_identity() {
+        let targets = t(&[
+            "project:gradatum",
+            "status:DONE",
+            "kind:FIX",
+            "version:gradatum/0.5.2",
+        ]);
+        assert!(feature_identity_from_targets(&targets).is_empty());
+    }
+
+    #[test]
+    fn supersedes_and_parent_are_not_identity() {
+        // supersedes/parent référencent d'AUTRES features — ils ne sont pas l'identité
+        // de la carte. Seul `feature:` compte, sinon deux cartes distinctes compareraient égales.
+        let targets = t(&["feature:F-40", "supersedes:F-131", "parent:F-98"]);
+        assert_eq!(
+            feature_identity_from_targets(&targets),
+            vec!["F-40".to_string()]
+        );
+    }
+
+    #[test]
+    fn malformed_and_prose_targets_are_ignored() {
+        // `feature:F-1` (1 chiffre) est rejeté par parse_link ; la prose n'a pas de préfixe.
+        let targets = t(&["feature:F-1", "Mon Titre Humain", "feature:F-07"]);
+        assert_eq!(
+            feature_identity_from_targets(&targets),
+            vec!["F-07".to_string()]
+        );
+    }
+
+    #[test]
+    fn result_is_sorted_for_order_independent_equality() {
+        let a = feature_identity_from_targets(&t(&["feature:F-40", "feature:F-12"]));
+        let b = feature_identity_from_targets(&t(&["feature:F-12", "feature:F-40"]));
+        assert_eq!(
+            a, b,
+            "l'égalité d'identité ne doit pas dépendre de l'ordre des cibles"
+        );
+        assert_eq!(a, vec!["F-12".to_string(), "F-40".to_string()]);
     }
 }
 

@@ -29,7 +29,7 @@ use gradatum_core::identity::{ContentHash, NoteId};
 use gradatum_core::index::{FileChecksumEntry, FileKind, NoteRecord};
 use gradatum_core::index_store::{AuthorRow, LessonHitRaw, Lineage, SearchHitRaw};
 use gradatum_core::note::Note;
-use gradatum_core::scope::{OverrideScope, VaultId};
+use gradatum_core::scope::{AclCheckedVaultId, OverrideScope, VaultId};
 use gradatum_core::status::NoteStatus;
 use gradatum_core::{DocumentStore, IndexStore, VectorStore};
 use ulid::Ulid;
@@ -55,7 +55,11 @@ impl DocumentStore for MockIndex {
         Ok(())
     }
 
-    async fn get_content_hash(&self, _id: NoteId) -> Result<Option<ContentHash>, GradatumError> {
+    async fn get_content_hash(
+        &self,
+        _vault_id: &str,
+        _id: NoteId,
+    ) -> Result<Option<ContentHash>, GradatumError> {
         Ok(None)
     }
 
@@ -77,6 +81,7 @@ impl DocumentStore for MockIndex {
 
     async fn downgrade_note(
         &self,
+        _vault: &AclCheckedVaultId,
         _note_id: &NoteId,
         _reason: &str,
         _replaced_by: Option<&NoteId>,
@@ -86,6 +91,7 @@ impl DocumentStore for MockIndex {
 
     async fn patch_note_status(
         &self,
+        _vault: &AclCheckedVaultId,
         _note_id: &NoteId,
         _status: Option<&str>,
         _status_reason: Option<&str>,
@@ -96,14 +102,16 @@ impl DocumentStore for MockIndex {
 
     async fn upsert_note_title(
         &self,
+        _vault_id: &str,
         _note_id: &NoteId,
         _title: &str,
-    ) -> Result<(), GradatumError> {
-        Ok(())
+    ) -> Result<usize, GradatumError> {
+        Ok(0)
     }
 
     async fn update_note_locus(
         &self,
+        _vault: &AclCheckedVaultId,
         _note_id: &NoteId,
         _new_locus: &gradatum_core::scope::LocusId,
     ) -> Result<(), GradatumError> {
@@ -117,6 +125,14 @@ impl DocumentStore for MockIndex {
         _vault_id: &str,
         _note_id: &str,
         _by: Option<&str>,
+    ) -> Result<(), GradatumError> {
+        Ok(())
+    }
+
+    async fn reassert_forgotten(
+        &self,
+        _vault_id: &str,
+        _note_id: &str,
     ) -> Result<(), GradatumError> {
         Ok(())
     }
@@ -205,7 +221,7 @@ impl IndexStore for MockIndex {
 
     async fn search_fts_with_snippet(
         &self,
-        _vault_id: &VaultId,
+        _vault_id: &AclCheckedVaultId,
         _query: &str,
         _limit: usize,
         _include_downgraded: bool,
@@ -334,20 +350,21 @@ impl IndexStore for MockIndex {
 
     async fn get_titles_sections(
         &self,
-        _vault_id: &str,
+        _vault_id: &AclCheckedVaultId,
         _ids: &[String],
     ) -> Result<std::collections::HashMap<String, (Option<String>, String)>, GradatumError> {
         Ok(std::collections::HashMap::new())
     }
 
     /// F-47 — trust toujours None sur le mock (pas de storage réel).
-    async fn get_trust(&self, _id: &NoteId) -> Result<Option<f32>, GradatumError> {
+    async fn get_trust(&self, _vault_id: &str, _id: &NoteId) -> Result<Option<f32>, GradatumError> {
         Ok(None)
     }
 
     /// F-39 — upsert redirect : no-op dans le mock.
     async fn upsert_redirect(
         &self,
+        _vault_id: &str,
         _slug: &str,
         _ulid: &Ulid,
         _renamed_at_ms: i64,
@@ -356,7 +373,11 @@ impl IndexStore for MockIndex {
     }
 
     /// F-39 — aucun redirect dans le mock.
-    async fn resolve_redirect(&self, _slug: &str) -> Result<Option<Ulid>, GradatumError> {
+    async fn resolve_redirect(
+        &self,
+        _vault_id: &str,
+        _slug: &str,
+    ) -> Result<Option<Ulid>, GradatumError> {
         Ok(None)
     }
 
@@ -364,7 +385,7 @@ impl IndexStore for MockIndex {
 
     async fn search_fts_for_forget(
         &self,
-        _vault_id: &str,
+        _vault_id: &VaultId,
         _query: &str,
         _limit: usize,
     ) -> Result<Vec<(String, String)>, GradatumError> {
@@ -389,7 +410,7 @@ impl IndexStore for MockIndex {
 
     async fn timeline(
         &self,
-        _vault_id: &VaultId,
+        _vault_id: &AclCheckedVaultId,
         _filter: &gradatum_core::temporal_query::TimelineFilter,
     ) -> Result<Vec<gradatum_core::temporal_query::TimelineRow>, GradatumError> {
         // Mock de compilation — non exercé par la parity (qui cible SqliteIndex).
@@ -401,6 +422,7 @@ impl IndexStore for MockIndex {
 impl VectorStore for MockIndex {
     async fn insert_note_embedding(
         &self,
+        _vault_id: &str,
         _note_id: &NoteId,
         _embedder_id: &str,
         _dim: u16,
@@ -411,6 +433,7 @@ impl VectorStore for MockIndex {
 
     async fn get_note_embedding(
         &self,
+        _vault_id: &str,
         _note_id: &NoteId,
         _embedder_id: &str,
     ) -> Result<Option<Vec<f32>>, GradatumError> {
@@ -419,7 +442,7 @@ impl VectorStore for MockIndex {
 
     async fn search_semantic(
         &self,
-        _vault_id: &str,
+        _vault_id: &AclCheckedVaultId,
         _embedder_id: &str,
         _query_emb: &[f32],
         _limit: usize,
@@ -495,7 +518,13 @@ fn file_kind_serde_kebab_case() {
 async fn mock_index_search_semantic_returns_empty() {
     let mock = MockIndex::new();
     let results = mock
-        .search_semantic("main", "test-embedder", &[1.0f32, 0.0, 0.0], 5, None)
+        .search_semantic(
+            &AclCheckedVaultId::for_system_task(VaultId::new("main")),
+            "test-embedder",
+            &[1.0f32, 0.0, 0.0],
+            5,
+            None,
+        )
         .await
         .unwrap();
     assert!(results.is_empty());

@@ -46,9 +46,9 @@ fn jobs_locus() -> String {
 /// Prevents information disclosure (absolute FS paths, reflected invalid ULIDs,
 /// internal state) to callers.
 fn sanitize_job_error(raw: &str) -> &'static str {
-    if raw.contains("ULID invalide") || raw.contains("invalid character") {
+    if raw.contains("invalid ULID") || raw.contains("invalid character") {
         "invalid_input"
-    } else if raw.contains("Vault::") || raw.contains("vault non configuré") {
+    } else if raw.contains("Vault::") || raw.contains("vault not configured") {
         "vault_error"
     } else if raw.contains("Storage") || raw.contains("sqlx") || raw.contains("SQLite") {
         "storage_error"

@@ -13,7 +13,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{Extension, Json, extract::State, http::StatusCode};
-use gradatum_acl_policy::{AclDecision, AclOp};
+use gradatum_core::scope::{TenantId, VaultId};
 use gradatum_core::trust::TrustContext;
 use serde::Serialize;
 
@@ -53,8 +53,16 @@ fn sanitize_last_error(msg: &str) -> String {
     }
 }
 
-/// Tenant système unique (identique au dashboard).
-const TENANT: &str = "main";
+/// Vault namespace ciblé par ces handlers (dimension NAMESPACE, distincte du
+/// principal `TenantId` porté par le JWT).
+///
+/// Déploiement single-vault : toujours `main`, identique au dashboard. Point de
+/// résolution **typé** remplaçant l'ancien `const TENANT: &str` — en multi-vault
+/// (Groupe B) il deviendra un routage par registre.
+#[must_use]
+pub fn target_vault() -> VaultId {
+    VaultId::new("main")
+}
 
 /// DTO d'une tâche récurrente dans la réponse JSON.
 #[derive(Debug, Serialize)]
@@ -101,10 +109,11 @@ pub async fn get_scheduled(
     if !trust.is_authenticated() {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let acl_locus = format!("{TENANT}/dashboard");
-    if state.acl.evaluate(&trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    // T9 (A3-handlers) : OFF = ACL Read legacy sur `main/dashboard` (byte-identical) ; ON =
+    // ACL cible + grant read + statut actif du vault propre. Métriques globales / traces
+    // scopées par principal (JWT) : le vault résolu enforce l'ACL/grant, données inchangées.
+    crate::api_v1::tenant_guard::resolve_read_vault(&state, &trust, target_vault(), "dashboard")
+        .await?;
 
     // ── Lecture santé tâches ──────────────────────────────────────────────────
     let now_ms = SystemTime::now()
@@ -282,10 +291,11 @@ pub async fn get_metrics_catalog(
     if !trust.is_authenticated() {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let acl_locus = format!("{TENANT}/dashboard");
-    if state.acl.evaluate(&trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    // T9 (A3-handlers) : OFF = ACL Read legacy sur `main/dashboard` (byte-identical) ; ON =
+    // ACL cible + grant read + statut actif du vault propre. Métriques globales / traces
+    // scopées par principal (JWT) : le vault résolu enforce l'ACL/grant, données inchangées.
+    crate::api_v1::tenant_guard::resolve_read_vault(&state, &trust, target_vault(), "dashboard")
+        .await?;
 
     // ── Séries distinctes présentes en base ───────────────────────────────────
     let distinct = state
@@ -350,10 +360,11 @@ pub async fn get_metrics_timeseries(
     if !trust.is_authenticated() {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let acl_locus = format!("{TENANT}/dashboard");
-    if state.acl.evaluate(&trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    // T9 (A3-handlers) : OFF = ACL Read legacy sur `main/dashboard` (byte-identical) ; ON =
+    // ACL cible + grant read + statut actif du vault propre. Métriques globales / traces
+    // scopées par principal (JWT) : le vault résolu enforce l'ACL/grant, données inchangées.
+    crate::api_v1::tenant_guard::resolve_read_vault(&state, &trust, target_vault(), "dashboard")
+        .await?;
 
     // ── Validation de la plage ────────────────────────────────────────────────
     if q.from_ms >= q.to_ms {
@@ -531,10 +542,11 @@ pub async fn get_traces(
     if !trust.is_authenticated() {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let acl_locus = format!("{TENANT}/dashboard");
-    if state.acl.evaluate(&trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    // T9 (A3-handlers) : OFF = ACL Read legacy sur `main/dashboard` (byte-identical) ; ON =
+    // ACL cible + grant read + statut actif du vault propre. Métriques globales / traces
+    // scopées par principal (JWT) : le vault résolu enforce l'ACL/grant, données inchangées.
+    crate::api_v1::tenant_guard::resolve_read_vault(&state, &trust, target_vault(), "dashboard")
+        .await?;
 
     // ── Validation de la plage temporelle ────────────────────────────────────
     if let (Some(f), Some(t)) = (q.from_ms, q.to_ms)
@@ -564,15 +576,18 @@ pub async fn get_traces(
     // ── Tenant depuis le JWT (jamais du body/query) ───────────────────────────
     // SINGLE-TENANT: fallback acceptable, voir roadmap multi-tenant.
     let tenant_id = match trust.tenant_id() {
-        Some(t) => t.to_owned(),
+        // Frontière : `tenant_id()` typé `Option<&TenantId>` (Groupe B Task 3) ;
+        // `.as_str()` conserve `tenant_id: String` local, byte-identical (typage
+        // complet de ce handler réservé Task 5).
+        Some(t) => t.as_str().to_owned(),
         None => {
             // JWT authentifié sans claim tenant_id — ne devrait pas arriver en prod
             // (le studio émet toujours tenant="main"). Logué pour détection anomalie.
             tracing::warn!(
                 sub = ?trust.subject(),
-                "get_traces: JWT authentifié sans tenant_id — fallback sur TENANT"
+                "get_traces: JWT authenticated without tenant_id — falling back to TENANT"
             );
-            TENANT.to_owned()
+            TenantId::new("main").as_str().to_owned()
         }
     };
 
@@ -736,10 +751,11 @@ pub async fn get_notes_by_status(
     }
 
     // ── ACL Read sur main/dashboard (miroir exact de get_traces) ─────────────
-    let acl_locus = format!("{TENANT}/dashboard");
-    if state.acl.evaluate(&trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    // T9 (A3-handlers) : OFF = ACL Read legacy sur `main/dashboard` (byte-identical) ; ON =
+    // ACL cible + grant read + statut actif du vault propre. Métriques globales / traces
+    // scopées par principal (JWT) : le vault résolu enforce l'ACL/grant, données inchangées.
+    crate::api_v1::tenant_guard::resolve_read_vault(&state, &trust, target_vault(), "dashboard")
+        .await?;
 
     // ── Validation + parse du CSV de statuts ──────────────────────────────────
     let statuses = parse_status_csv(&q.status).ok_or(StatusCode::BAD_REQUEST)?;
@@ -753,13 +769,14 @@ pub async fn get_notes_by_status(
     // ── Tenant depuis le JWT (jamais du body/query) ───────────────────────────
     // SINGLE-TENANT: fallback acceptable, voir roadmap multi-tenant.
     let tenant_id = match trust.tenant_id() {
-        Some(t) => t.to_owned(),
+        // Frontière `Option<&TenantId>` (Task 3) → `.as_str()` byte-identical (Task 5).
+        Some(t) => t.as_str().to_owned(),
         None => {
             tracing::warn!(
                 sub = ?trust.subject(),
-                "get_notes_by_status: JWT authentifié sans tenant_id — fallback sur TENANT"
+                "get_notes_by_status: JWT authenticated without tenant_id — falling back to TENANT"
             );
-            TENANT.to_owned()
+            TenantId::new("main").as_str().to_owned()
         }
     };
 

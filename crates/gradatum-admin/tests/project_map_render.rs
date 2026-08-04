@@ -26,7 +26,11 @@ async fn seed_card(
         .await
         .expect("seed note carte");
     index
-        .upsert_note_title(&NoteId(Ulid::from_string(id).expect("ulid valide")), title)
+        .upsert_note_title(
+            "main",
+            &NoteId(Ulid::from_string(id).expect("ulid valide")),
+            title,
+        )
         .await
         .expect("titre carte");
 
@@ -106,7 +110,7 @@ async fn render_from_graph_produces_correct_todo() {
     // Groupement par version + section non attribuée.
     assert!(md.contains("## gradatum/0.6.1"), "groupe versionné:\n{md}");
     assert!(md.contains("- [IN_PROGRESS] Feature versionnée"));
-    assert!(md.contains("## Non attribué"), "groupe non attribué:\n{md}");
+    assert!(md.contains("## Unassigned"), "groupe non attribué:\n{md}");
     assert!(md.contains("- [OPEN] Tâche non attribuée"));
 }
 
@@ -120,10 +124,7 @@ async fn render_empty_project_is_marked_empty() {
         .await
         .expect("render vide");
     assert!(md.starts_with(GENERATED_MARKER));
-    assert!(
-        md.contains("_Aucun item ouvert._"),
-        "TODO vide marqué:\n{md}"
-    );
+    assert!(md.contains("_No open item._"), "TODO vide marqué:\n{md}");
 }
 
 /// Une carte d'un AUTRE projet n'apparaît pas dans le TODO du projet demandé
@@ -142,6 +143,7 @@ async fn render_isolates_by_project_node() {
         .unwrap();
     index
         .upsert_note_title(
+            "main",
             &NoteId(Ulid::from_string(card).unwrap()),
             "Carte example-project",
         )
@@ -163,5 +165,5 @@ async fn render_isolates_by_project_node() {
         !md.contains("Carte example-project"),
         "carte d'un autre projet ne doit pas fuiter:\n{md}"
     );
-    assert!(md.contains("_Aucun item ouvert._"));
+    assert!(md.contains("_No open item._"));
 }

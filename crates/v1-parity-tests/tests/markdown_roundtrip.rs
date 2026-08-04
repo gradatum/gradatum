@@ -12,7 +12,7 @@ use gradatum_markdown::{parse, write_parsed};
 /// Parse un fichier .md, re-sérialise, re-parse → les deux ParsedNote doivent être
 /// sémantiquement équivalents (même frontmatter + même body + même ContentHash).
 ///
-/// Note B8 documentée : serde_yml peut réordonner les clés YAML sur aller/retour.
+/// Note B8 documentée : le backend YAML peut réordonner les clés sur aller/retour.
 /// Le test compare les valeurs sémantiques, pas la représentation textuelle exacte.
 #[tokio::test]
 async fn parse_then_write_idempotent() {
@@ -98,7 +98,7 @@ async fn wikilinks_extracted_from_body() {
 /// Ignoré : `ExtraFields` est un champ nommé explicite dans le YAML
 /// (`extra: {key: value}`), pas un catchall automatique pour les champs inconnus
 /// au top-level. Les champs inconnus (ex. `source_tool`) sont ignorés silencieusement
-/// par serde_yml (pas de `deny_unknown_fields`). L'implémentation complète (B8)
+/// par le backend YAML (pas de `deny_unknown_fields`). L'implémentation complète (B8)
 /// nécessite un `#[serde(flatten)]` custom ou un parser YAML two-pass.
 #[tokio::test]
 #[ignore = "Phase 2+ : blocked by ExtraFields design (top-level unknown fields not captured — B8 deferred)"]

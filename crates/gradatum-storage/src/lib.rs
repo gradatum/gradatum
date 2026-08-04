@@ -1,6 +1,7 @@
 //! # gradatum-storage
 //!
-//! Storage trait abstraction with OpenDAL backends (filesystem, S3, Azure Blob).
+//! Storage trait abstraction over OpenDAL. **One backend ships in `1.0.0`: filesystem.**
+//! S3 / GCS / Azure Blob are feature stubs — see *Implementations* below.
 //!
 //! ## Core trait
 //!
@@ -20,7 +21,8 @@
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee. See
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible
+//! additions only within `1.x`. See
 //! [`RELEASE-POLICY.md`](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 
 #![forbid(unsafe_code)]

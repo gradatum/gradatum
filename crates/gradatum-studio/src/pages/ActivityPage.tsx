@@ -3,7 +3,7 @@
  * GET /api/v1/system/traces → table session_trace filtrée + expand ligne + auto-refresh
  * v0.7.5 Slice 3 — pattern plage/tick copié de SystemPage MetricsSection (Slice 2b).
  *
- * Garde P2-B (Auditeur) : afficher `error` AVANT le check `entries.length === 0`.
+ * Afficher `error` AVANT le check `entries.length === 0` : un état d'erreur ne doit pas être masqué par l'état vide.
  */
 
 import { Fragment, useEffect, useMemo, useState } from 'react';

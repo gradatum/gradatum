@@ -260,7 +260,7 @@ fn extract_function(
 
     let signature = extract_fn_signature(node, source);
     let doc_comment = extract_doc_comment(node, source);
-    let deps = extract_deps(node, source);
+    let deps = extract_deps(node, source, impl_type);
     let span = extract_node_span(node, source);
 
     Some(DerivedSymbol {
@@ -532,22 +532,45 @@ fn extract_mod(node: Node<'_>, source: &[u8], source_path: &str) -> Option<Deriv
     })
 }
 
+/// Resolution context threaded through call-dep collection.
+///
+/// Groups the two pieces of syntactic type information available intra-function:
+/// - `impl_type`: the base type of the enclosing `impl` block (for `self.method()`),
+///   `None` for free functions.
+/// - `locals`: intra-function symbol table `variable → explicit type` built from typed
+///   parameters and `let x: T` bindings (for `x.method()`). Only syntactically explicit
+///   types are present (inference / chaining are absent → terminal-only fallback).
+///
+/// Copy: both fields are shared references, so passing by value is free.
+#[derive(Clone, Copy)]
+struct ResolveCtx<'a> {
+    impl_type: Option<&'a str>,
+    locals: &'a std::collections::HashMap<String, String>,
+}
+
 /// Extracts the dependencies of a node (function/method): a combination of intra-body
 /// `use` items and actual callees (call-graph edges).
 ///
 /// ## Entry format
 ///
-/// Each entry is the **terminal segment of the call path** (simple callee name).
-/// Examples: `helper` for `helper()`, `new` for `Token::new()`, `parse` for `self.parse()`.
+/// Free functions and scoped calls (`A::b()`) store the **terminal** (`b`) and, when a
+/// qualified path is available, the **fully qualified** form (`A::b`).
 ///
-/// This format is consistent with the `qualified_name` of **free functions** (whose
-/// qualified_name is already the simple name). For **methods**, however, the
-/// qualified_name stored in the vault is `Type::method` — the terminal segment `method`
-/// therefore only partially matches the qualified_name. As a result,
-/// `code_scope_reverse_deps` (filter `WHERE d.value = ?`) works correctly for free
-/// functions but produces **partial** results for methods (multiple types may share a
-/// method name). A complete fix would require type resolution at ingest time (known
-/// limitation, deferred).
+/// Method calls whose receiver type is **syntactically resolvable** also store the
+/// qualified form `Type::method` in addition to the terminal:
+/// - `self.method()` → `<ImplType>::method` (the impl block type is known — [`ResolveCtx::impl_type`]).
+/// - `x.method()` where `let x: T` / a typed parameter `x: T` is in scope → `T::method`
+///   (intra-function symbol table — [`ResolveCtx::locals`]).
+///
+/// This lets `code_scope_reverse_deps` (filter `WHERE d.value = ?`) match callers of
+/// `Type::method`, not only free functions.
+///
+/// ## Precision > recall (out of scope)
+///
+/// Only syntactically explicit receivers are resolved. The following remain
+/// terminal-only (no qualified form → never a false positive in the reverse graph):
+/// type inference (`let x = f()`), method chaining (`a.b().c()`), trait dispatch,
+/// generic type parameters, macro-generated calls, and closures.
 ///
 /// ## Deduplication and cap
 ///
@@ -558,9 +581,16 @@ fn extract_mod(node: Node<'_>, source: &[u8], source_path: &str) -> Option<Deriv
 /// Highly generic stdlib methods (`clone`, `to_string`, `len`, `iter`, etc.) are
 /// excluded: they carry no structural information for the call graph and add noise
 /// to reverse-deps results.
-fn extract_deps(node: Node<'_>, source: &[u8]) -> Vec<String> {
+fn extract_deps(node: Node<'_>, source: &[u8], impl_type: Option<&str>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut deps = Vec::new();
+
+    // Table de symboles intra-fonction (F-70 tâche 4.2) : params typés + `let x: T`.
+    let locals = build_local_types(node, source);
+    let ctx = ResolveCtx {
+        impl_type,
+        locals: &locals,
+    };
 
     // 1. Use-deps (imports dans le corps).
     let mut cursor = node.walk();
@@ -575,12 +605,172 @@ fn extract_deps(node: Node<'_>, source: &[u8]) -> Vec<String> {
 
     // 2. Call-deps : arêtes d'appel réelles (DFS sur le corps de la fonction).
     if let Some(body) = find_block(node) {
-        collect_call_deps(body, source, &mut seen, &mut deps);
+        collect_call_deps(body, source, &mut seen, &mut deps, ctx);
     }
 
     // Cap global à 20 (accuracy > coverage).
     deps.truncate(20);
     deps
+}
+
+/// Extracts the binding name from a simple pattern (`identifier`, `mut x`, `ref x`).
+///
+/// Returns `None` for composite patterns (tuple, struct, slice) — those are not
+/// resolvable to a single typed variable.
+fn binding_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(node_text(node, source).to_string()),
+        "mut_pattern" | "ref_pattern" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .find(|ch| ch.kind() == "identifier")
+                .map(|id| node_text(id, source).to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Resolves a type node to a simple type name, when syntactically explicit.
+///
+/// - `type_identifier` (`Foo`) / `scoped_type_identifier` (`a::Foo`) → the text as-is.
+/// - `generic_type` (`Vec<T>`, `MyType<T>`) → the base type (generics stripped),
+///   matching how `extract_impl` computes the base type of an impl block.
+/// - `reference_type` (`&T`, `&mut T`) → the inner type.
+/// - Anything else (inference, `impl Trait`, `dyn Trait`, tuples, arrays, fn pointers)
+///   → `None` (not resolvable syntactically → terminal-only fallback).
+fn resolve_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "scoped_type_identifier" => Some(node_text(node, source).to_string()),
+        "generic_type" | "reference_type" => {
+            // Unwrap to the base/inner type: the first child that itself resolves.
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(t) = resolve_type_name(child, source) {
+                    return Some(t);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Builds the intra-function symbol table `variable → explicit type`.
+///
+/// Records **every** binding site of a name — typed parameters (`x: T`), typed `let x: T`
+/// AND type-inferred `let x = …` bindings anywhere in the body. A name resolves to a type
+/// only when it has **exactly one** binding site and that site is syntactically typed.
+///
+/// Any name bound ≥2 times (rebind / shadowing, whatever the inferred-vs-typed mix) is
+/// dropped: precision over recall. This is what makes a later explicit→inferred rebind
+/// (`fn f(x: Foo){ let x = make_bar(); x.method() }`) correctly UNresolvable — the real
+/// type at the call site is the inferred one, not `Foo` (audit C1).
+///
+/// A **composite** pattern (tuple / struct / tuple-struct / slice destructuring) binds each
+/// of its identifiers to a *component* of the value — a per-name type cannot be attributed
+/// syntactically. Every such identifier is recorded as an untyped ("poison") site, so a name
+/// shadowed by destructuring (`let (x, _) = pair()`) also reaches ≥2 sites and is dropped
+/// (audit C1-bis — destructuring shadow was a proven false positive, not a recall-only gap).
+fn build_local_types(node: Node<'_>, source: &[u8]) -> std::collections::HashMap<String, String> {
+    // name → liste des sites de binding ; chaque site = Some(type) si typé, None sinon.
+    let mut sites: std::collections::HashMap<String, Vec<Option<String>>> =
+        std::collections::HashMap::new();
+
+    // Paramètres (`fn f(x: T)`).
+    if let Some(params) = child_of_kind(node, "parameters") {
+        let mut cursor = params.walk();
+        for p in params.children(&mut cursor) {
+            if p.kind() == "parameter"
+                && let Some(pat) = p.child_by_field_name("pattern")
+            {
+                register_pattern_sites(pat, p.child_by_field_name("type"), source, &mut sites);
+            }
+        }
+    }
+
+    // Bindings `let` (typés OU inférés) — DFS sur le corps.
+    if let Some(body) = find_block(node) {
+        collect_let_sites(body, source, &mut sites);
+    }
+
+    // Résolu ⟺ un unique site de binding ET ce site est typé.
+    sites
+        .into_iter()
+        .filter_map(|(name, mut binds)| {
+            if binds.len() == 1 {
+                binds.pop().flatten().map(|ty| (name, ty))
+            } else {
+                None // rebind (≥2 sites) → drop (précision > rappel).
+            }
+        })
+        .collect()
+}
+
+/// Finds the first direct child of `node` with the given kind.
+fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).find(|ch| ch.kind() == kind)
+}
+
+/// Records the binding site(s) of a `let`/parameter pattern.
+///
+/// - Simple single-identifier pattern (`x`, `mut x`, `ref x`) → one site, typed with the
+///   resolved annotation (`Some(type)`) or `None` if inferred/unresolvable.
+/// - Composite pattern (tuple / struct / tuple-struct / slice) → one **untyped** site
+///   (`None`) per bound identifier: the per-component type is not attributable, and any
+///   name shadowed this way must reach ≥2 sites to be dropped (audit C1-bis).
+fn register_pattern_sites(
+    pattern: Node<'_>,
+    type_node: Option<Node<'_>>,
+    source: &[u8],
+    sites: &mut std::collections::HashMap<String, Vec<Option<String>>>,
+) {
+    if let Some(name) = binding_name(pattern, source) {
+        let ty = type_node.and_then(|t| resolve_type_name(t, source));
+        sites.entry(name).or_default().push(ty);
+    } else {
+        let mut names = Vec::new();
+        collect_pattern_idents(pattern, source, &mut names);
+        for name in names {
+            sites.entry(name).or_default().push(None);
+        }
+    }
+}
+
+/// Collects every identifier bound by a composite pattern (DFS).
+///
+/// Over-collection is precision-safe: an extra poisoned name only drops resolution, never
+/// creates a qualified edge. Matches `identifier` (tuple / tuple-struct binds, and the
+/// tuple-struct constructor path, harmlessly) and `shorthand_field_identifier` (struct binds).
+fn collect_pattern_idents(node: Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "shorthand_field_identifier" => {
+            out.push(node_text(node, source).to_string());
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_pattern_idents(child, source, out);
+            }
+        }
+    }
+}
+
+/// Recursively records every `let` binding site into the symbol-table accumulator.
+fn collect_let_sites(
+    node: Node<'_>,
+    source: &[u8],
+    sites: &mut std::collections::HashMap<String, Vec<Option<String>>>,
+) {
+    if node.kind() == "let_declaration"
+        && let Some(pat) = node.child_by_field_name("pattern")
+    {
+        register_pattern_sites(pat, node.child_by_field_name("type"), source, sites);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_let_sites(child, source, sites);
+    }
 }
 
 /// Highly generic stdlib method names excluded from the call graph (noise filter).
@@ -693,6 +883,19 @@ const STDLIB_NOISE_METHODS: &[&str] = &[
 /// `std` → filter at the source to avoid indexing stdlib functions.
 const STDLIB_PREFIXES: &[&str] = &["std", "core", "alloc", "tokio", "futures", "serde"];
 
+/// stdlib container / smart-pointer / wrapper type names excluded from method
+/// qualification.
+///
+/// A receiver typed with one of these produces only noise (`Vec::sort_by`,
+/// `Option::is_some`) or, worse, a **mis-qualification through `Deref`**: a method
+/// called on `Arc<Foo>` / `Box<Foo>` belongs to `Foo`, not to the wrapper. Qualifying
+/// to `Arc::method` would be a false edge in the reverse graph. Matched on the base
+/// type name (generics already stripped by [`resolve_type_name`]).
+const STDLIB_TYPE_DENYLIST: &[&str] = &[
+    "Vec", "VecDeque", "Option", "Result", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "String",
+    "Box", "Rc", "Arc", "Cow", "Cell", "RefCell", "Mutex", "RwLock",
+];
+
 /// Finds the `block` node (function body).
 fn find_block(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
@@ -709,12 +912,13 @@ fn find_block(node: Node<'_>) -> Option<Node<'_>> {
 ///   the terminal. This lets `code_scope_reverse_deps_batch` (which passes the exact
 ///   `qualified_name`) match callers of `A::b()` by searching for `"A::b"`.
 /// - `call_expression` with `field_expression` (`self.x()`, `s.parse()`, `store.method()`) →
-///   stores the **terminal** (`x`, `parse`, `method`) from the `field_identifier`.
+///   stores the **terminal** (`x`, `parse`, `method`) from the `field_identifier`, plus
+///   the **qualified** form `Type::x` when the receiver type is syntactically resolvable
+///   via [`ResolveCtx`] (`self` → impl type; typed local or parameter → its type).
 ///   tree-sitter-rust 0.24+ represents all method calls this way (there is NO distinct
 ///   `method_call_expression` node in this version of the grammar).
-///   The receiver type is not resolvable syntactically (avoids false-positives);
-///   `reverse_deps("Type::x")` will NOT find these callers (documented trade-off).
-///   Only the terminal (`x`) enables partial matching.
+///   Non-resolvable receivers (inference, chaining, trait dispatch) keep the terminal
+///   only — never a false positive in the reverse graph.
 ///
 /// Callees matching `STDLIB_NOISE_METHODS` or whose path starts with a known
 /// `STDLIB_PREFIXES` entry are ignored.
@@ -723,6 +927,7 @@ fn collect_call_deps(
     source: &[u8],
     seen: &mut std::collections::HashSet<String>,
     deps: &mut Vec<String>,
+    ctx: ResolveCtx<'_>,
 ) {
     match node.kind() {
         "call_expression" => {
@@ -730,7 +935,7 @@ fn collect_call_deps(
             // Axe C hybride : pour les scoped_identifiers (`Token::new`), on stocke BOTH :
             // - le terminal (`new`) — pour la compatibilité ascendante,
             // - le path qualifié (`Token::new`) — pour le matching exact dans reverse_deps.
-            if let Some((terminal, maybe_qualified)) = extract_call_callee_both(node, source)
+            if let Some((terminal, maybe_qualified)) = extract_call_callee_both(node, source, ctx)
                 && !STDLIB_NOISE_METHODS.contains(&terminal.as_str())
             {
                 if seen.insert(terminal.clone()) {
@@ -748,7 +953,7 @@ fn collect_call_deps(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "arguments" {
-                    collect_call_deps(child, source, seen, deps);
+                    collect_call_deps(child, source, seen, deps, ctx);
                 }
             }
         }
@@ -767,14 +972,14 @@ fn collect_call_deps(
             // DFS dans receiver et arguments.
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                collect_call_deps(child, source, seen, deps);
+                collect_call_deps(child, source, seen, deps, ctx);
             }
         }
         _ => {
             // DFS récursif dans tous les enfants.
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                collect_call_deps(child, source, seen, deps);
+                collect_call_deps(child, source, seen, deps, ctx);
             }
         }
     }
@@ -786,25 +991,31 @@ fn collect_call_deps(
 /// - Direct `identifier` → `(name, None)` (no qualified path, no `::`)
 /// - `scoped_identifier` (`A::b::c`) → `(c, Some("A::b::c"))` if non-stdlib
 ///   and the terminal differs from the full path (avoids a redundant duplicate for `b`).
-/// - `field_expression` (`self.parse`, `store.method`) → `(field_identifier, None)`.
+/// - `field_expression` (`self.parse`, `store.method`) → `(field_identifier, maybe_qualified)`.
 ///   tree-sitter-rust 0.24.2 represents `self.parse()` as a `call_expression` whose
-///   callee is a `field_expression`, NOT a `method_call_expression`. The receiver type
-///   is not syntactically resolvable → `maybe_qualified = None` (avoids false-positives).
+///   callee is a `field_expression`, NOT a `method_call_expression`. The
+///   qualified form `Type::method` is produced when the receiver type is syntactically
+///   resolvable via [`ResolveCtx`] (receiver `self` → impl type; receiver identifier
+///   bound to a typed `let`/parameter → its type). Otherwise `maybe_qualified = None`.
 /// - Any other node kind (`generic_function`, etc.) → `None`.
 ///
 /// # Stdlib filter
 ///
 /// If the first path segment is a known stdlib prefix (`std`, `core`, `alloc`, …),
-/// returns `None` — neither the terminal nor the path is indexed.
+/// returns `None` — neither the terminal nor the path is indexed. Applied to scoped
+/// calls, and to resolved method receivers (a receiver typed `std::…` is not qualified).
 ///
-/// # Partial coverage / false-positive trade-off
+/// # Precision > recall (out of scope)
 ///
-/// For method calls (`self.method()`, `store.call()`), the receiver type is not known
-/// without semantic analysis.
-/// `reverse_deps("SlowJobStore::set_pending")` will **not** find these callers —
-/// only terminal-based matching (`"set_pending"`) is possible.
-/// Partial coverage is unavoidable without full type inference.
-fn extract_call_callee_both(node: Node<'_>, source: &[u8]) -> Option<(String, Option<String>)> {
+/// Method receivers that are not syntactically resolvable — inference, chaining
+/// (`a.b().c()`), trait dispatch, generics, macros, closures — keep the terminal only.
+/// `reverse_deps("Type::method")` will not find those callers, but the reverse graph
+/// never gains a false edge.
+fn extract_call_callee_both(
+    node: Node<'_>,
+    source: &[u8],
+    ctx: ResolveCtx<'_>,
+) -> Option<(String, Option<String>)> {
     // Le champ `function` est le premier enfant significatif (identifier, scoped_identifier
     // ou field_expression pour les appels de méthode obj.method()).
     let mut cursor = node.walk();
@@ -841,28 +1052,74 @@ fn extract_call_callee_both(node: Node<'_>, source: &[u8]) -> Option<(String, Op
                 return Some((terminal, maybe_qualified));
             }
             "field_expression" => {
-                // Fix P2-1 : `receiver.method` — tree-sitter-rust 0.24.2 utilise
-                // `field_expression` (pas `method_call_expression`) pour les appels
-                // de méthode `obj.method()` et `self.method()`.
-                // On extrait le `field_identifier` (nom de la méthode) comme terminal.
-                // `maybe_qualified = None` : le type du receiver est inconnu syntaxiquement.
-                let mut fe_cursor = child.walk();
-                for fe_child in child.children(&mut fe_cursor) {
-                    if fe_child.kind() == "field_identifier" {
-                        let method_name = node_text(fe_child, source).to_string();
-                        if STDLIB_NOISE_METHODS.contains(&method_name.as_str()) {
-                            return None;
-                        }
-                        return Some((method_name, None));
-                    }
+                // `receiver.method` — tree-sitter-rust 0.24.2 utilise `field_expression`
+                // (pas `method_call_expression`) pour `obj.method()` et `self.method()`.
+                // Terminal = `field_identifier` (nom de méthode). Qualifié (F-70) = résolu
+                // depuis le type du receiver quand il est syntaxiquement explicite.
+                let Some(method_node) = child.child_by_field_name("field") else {
+                    // Pas de champ `field` (cas imprévu) → ignorer, robustesse.
+                    return None;
+                };
+                if method_node.kind() != "field_identifier" {
+                    // Accès de tuple (`t.0`) ou autre → pas un appel de méthode nommée.
+                    return None;
                 }
-                // Pas de field_identifier trouvé → ignorer (cas imprévu, robustesse).
+                let method_name = node_text(method_node, source).to_string();
+                if STDLIB_NOISE_METHODS.contains(&method_name.as_str()) {
+                    return None;
+                }
+                let maybe_qualified = child
+                    .child_by_field_name("value")
+                    .and_then(|recv| qualify_receiver(recv, &method_name, ctx, source));
+                return Some((method_name, maybe_qualified));
             }
             // generic_function, etc. → ignorer.
             _ => {}
         }
     }
     None
+}
+
+/// Resolves a method-call receiver to a qualified callee `Type::method`.
+///
+/// Returns `Some("Type::method")` only when the receiver type is syntactically explicit:
+/// - receiver `self` → the enclosing impl type ([`ResolveCtx::impl_type`]),
+/// - receiver a bare `identifier` bound to a typed `let`/parameter ([`ResolveCtx::locals`]).
+///
+/// Returns `None` for any non-resolvable receiver (chained call, field access, literal,
+/// unknown variable), when the resolved type is a stdlib crate prefix, or when it is a
+/// stdlib container/wrapper ([`STDLIB_TYPE_DENYLIST`] — noise + `Deref` mis-qualification).
+/// Never a false positive.
+fn qualify_receiver(
+    receiver: Node<'_>,
+    method: &str,
+    ctx: ResolveCtx<'_>,
+    source: &[u8],
+) -> Option<String> {
+    let ty: String = match receiver.kind() {
+        "self" => ctx.impl_type?.to_string(),
+        "identifier" => {
+            let name = node_text(receiver, source);
+            if name == "self" {
+                // Défensif : certains dialectes exposent `self` en `identifier`.
+                ctx.impl_type?.to_string()
+            } else {
+                ctx.locals.get(name)?.clone()
+            }
+        }
+        _ => return None,
+    };
+
+    // Garde stdlib (préfixe de crate) : un receiver typé `std::…` n'est pas qualifié.
+    if STDLIB_PREFIXES.contains(&ty.split("::").next().unwrap_or("")) {
+        return None;
+    }
+    // Garde conteneurs/wrappers (R1) : Vec/Option/Arc/… → bruit ou mis-qualification Deref.
+    let base = ty.rsplit("::").next().unwrap_or(&ty);
+    if STDLIB_TYPE_DENYLIST.contains(&base) {
+        return None;
+    }
+    Some(format!("{ty}::{method}"))
 }
 
 /// Extracts the method name from a `method_call_expression`.

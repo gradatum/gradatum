@@ -6,7 +6,14 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Stateless HTTP/MCP façade :19090 — handles read/search + enqueues writes"
+description = "Stateless HTTP/MCP facade for gradatum — handles read/search + enqueues writes"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Ne jamais empaqueter les tests d'intégration : ils ne compilent pas chez le
+# consommateur, alourdissent le package et sont un vecteur récurrent de fuite
+# (marqueurs PII/fixtures). Cf. bloquant publish v1.0.0.
+exclude = ["tests/**"]
 
 [[bin]]
 name = "gradatum-server"
@@ -22,16 +29,13 @@ gradatum-dto = { workspace = true, features = ["schemars"] }
 rusqlite.workspace = true
 gradatum-embed.workspace = true
 gradatum-vault.workspace = true
-gradatum-storage.workspace = true
 gradatum-index = { workspace = true, features = ["sqlite-vec-ann"] }
 gradatum-search.workspace = true
 gradatum-queue.workspace = true
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "0.7.0" }
-gradatum-cache.workspace = true
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "1.0.0" }
 gradatum-acl-policy.workspace = true
 gradatum-acl-auth.workspace = true
 gradatum-auth.workspace = true
-gradatum-chat.workspace = true
 gradatum-curator.workspace = true
 axum.workspace = true
 axum-server.workspace = true

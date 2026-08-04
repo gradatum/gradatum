@@ -13,7 +13,7 @@
 //!
 //! 1. Spawn `gradatum-server` sur un port aléatoire.
 //! 2. Spawn `gradatum-mcp-stub` en subprocess (stdin/stdout pipes).
-//! 3. Envoie les 10 requêtes MCP via JSON-RPC stdio.
+//! 3. Envoie une série de requêtes MCP via JSON-RPC stdio.
 //! 4. Assert que chaque réponse MCP est cohérente avec un appel REST direct.
 //!
 //! ## Limitations connues
@@ -24,6 +24,7 @@
 //! - L'auth est basée sur un JwtService éphémère. Le bearer token est signé par
 //!   le serveur de test via `JwtService::sign` et passé au stub via env var.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -110,9 +111,27 @@ async fn rpc_call(
         .unwrap_or_else(|e| panic!("réponse MCP non-JSON : {:?} — erreur: {}", response_line, e))
 }
 
+/// Parcours E2E stdio → HTTP du stub : handshake, catalogue d'outils, dispatch.
+///
+/// ## Pourquoi `#[ignore]` est conservé
+///
+/// Le test lance `target/debug/gradatum-server` et `target/debug/gradatum-mcp-stub` en
+/// sous-processus. Aucun harnais ne construit ces binaires : `cargo nextest run` compile
+/// des exécutables de test, pas les binaires du workspace, et le gate CI tourne en
+/// `--release`, où `target/debug/` peut être entièrement absent. Le test lie de plus un
+/// port TCP réel par un `bind(:0)` suivi d'un `drop` — une course tolérée en local,
+/// inacceptable sur un runner partagé. C'est donc un E2E **opt-in**, à lancer après un
+/// `cargo build -p gradatum-server -p gradatum-mcp-stub` :
+///
+/// ```bash
+/// cargo test -p gradatum-mcp-stub --test stub_e2e -- --ignored
+/// ```
+///
+/// L'invariant de catalogue qu'il vérifiait au rabais est, lui, gardé en permanence par
+/// `catalogue_expose_exactement_les_outils_canoniques` (`src/main.rs`, `mod tests`).
 #[tokio::test]
-#[ignore = "requires gradatum-server and gradatum-mcp-stub binaries in target/debug/"]
-async fn stub_e2e_10_methods() {
+#[ignore = "E2E opt-in : exige `cargo build -p gradatum-server -p gradatum-mcp-stub` (binaires target/debug/) et un port TCP libre — voir la docstring"]
+async fn stub_e2e_handshake_catalogue_et_dispatch_des_outils() {
     // 1. Lance le serveur de test.
     let (_server, port) = spawn_test_server().await;
     let server_url = format!("http://127.0.0.1:{}", port);
@@ -194,7 +213,7 @@ async fn stub_e2e_10_methods() {
     stdin.write_all(line.as_bytes()).await.unwrap();
     stdin.flush().await.unwrap();
 
-    // 4. Liste les outils — doit retourner 13 outils (10 read + 3 write).
+    // 4. Liste les outils.
     let tools_resp = rpc_call(
         &mut stdin,
         &mut stdout,
@@ -205,20 +224,13 @@ async fn stub_e2e_10_methods() {
     .await;
     let tools = &tools_resp["result"]["tools"];
     assert!(tools.is_array(), "tools doit être un tableau");
-    assert_eq!(
-        tools.as_array().unwrap().len(),
-        13,
-        "doit exposer exactement 13 outils (10 read + 3 write)"
-    );
 
-    // Vérifie les noms des 13 outils.
-    let tool_names: Vec<&str> = tools
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
-    for expected in &[
+    // Le catalogue servi sur le fil doit être exactement la liste ci-dessous.
+    //
+    // Aucun effectif n'est écrit : la population grandit avec le produit. L'assertion
+    // portait « exactement 13 outils (10 read + 3 write) » alors que le stub en exposait
+    // 25 — sans jamais rougir, ce fichier étant intégralement `#[ignore]`.
+    const OUTILS_ATTENDUS: &[&str] = &[
         // read
         "vault_search",
         "vault_read",
@@ -228,19 +240,47 @@ async fn stub_e2e_10_methods() {
         "vault_links",
         "vault_trace",
         "vault_context",
+        "vault_timeline",
         "vault_authors",
         "vault_tags",
         // write
         "vault_write",
         "vault_classify",
         "vault_downgrade",
-    ] {
-        assert!(
-            tool_names.contains(expected),
-            "outil manquant : {}",
-            expected
-        );
-    }
+        // allocation de numéro de feature
+        "create_feature_card",
+        // history F-40
+        "vault_history",
+        "vault_history_get",
+        "vault_restore",
+        "vault_diff",
+        // forget F-44
+        "vault_forget",
+        // archives listing F-100 (lecture seule)
+        "vault_archives_list",
+        // lesson recall F-60
+        "vault_lessons_recall",
+        // code scope F-61
+        "code_scope",
+        // proactive recall F-46
+        "vault_proactive_recall",
+        "vault_proactive_recall_feedback",
+    ];
+
+    let servis: BTreeSet<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    let attendus: BTreeSet<&str> = OUTILS_ATTENDUS.iter().copied().collect();
+    assert_eq!(
+        servis,
+        attendus,
+        "catalogue servi divergent — en trop : {:?}, manquants : {:?}",
+        servis.difference(&attendus).collect::<Vec<_>>(),
+        attendus.difference(&servis).collect::<Vec<_>>()
+    );
 
     // 5. Appelle vault_status (GET sans body — l'erreur 401 est attendue car bearer invalide).
     let status_resp = rpc_call(
@@ -263,7 +303,7 @@ async fn stub_e2e_10_methods() {
         status_resp
     );
 
-    // 6. Pareil pour les 9 autres outils — vérifie que le dispatch fonctionne.
+    // 6. Pareil pour un échantillon d'autres outils — vérifie que le dispatch fonctionne.
     let other_tools = vec![
         (
             "vault_search",

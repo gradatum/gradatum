@@ -15,8 +15,10 @@
 //!
 //! 2. **R3 — Équivalence `list_tools` (golden runtime)** : construit un vrai
 //!    `GradatumMcpHandler`, appelle la chaîne HTTP `tools/list` et vérifie :
-//!    (a) 21 outils, (b) noms identiques à ceux du stub, (c) inputSchema présent
-//!    pour tous les outils paramétrés.
+//!    (a) autant d'outils que de noms canoniques, (b) noms identiques à
+//!    [`CANONICAL_TOOL_NAMES`], (c) inputSchema présent pour tous les outils paramétrés.
+//!    Aucun effectif n'est écrit en dur : la population grandit avec le produit, et un
+//!    nombre gravé se contente de mentir un release plus tard.
 //!
 //! 3. **R2 — Protection DNS-rebinding** : un POST `/mcp` avec un `Host` non autorisé
 //!    (`evil.example.com`) est rejeté par rmcp AVANT que la requête n'atteigne
@@ -59,14 +61,19 @@ use gradatum_auth::jwt::TokenScope;
 use gradatum_server::{api_v1, middleware::auth_middleware, state::AppState};
 use reqwest::StatusCode;
 
-// ── Liste canonique des 23 outils (parité avec gradatum-mcp-stub) ─────────────
+// ── Liste canonique des outils MCP servis par gradatum-server ─────────────────
 
-/// Noms canoniques des 23 outils MCP gradatum.
+/// Noms canoniques des outils MCP exposés par **le serveur**.
 ///
-/// Cette liste est la référence unique pour le test d'équivalence (R3).
-/// Elle doit être maintenue en sync avec :
-/// - `gradatum-mcp-stub/src/main.rs::EXPECTED_TOOL_NAMES`
-/// - `gradatum-server/src/api_v1/mcp.rs::list_tools`
+/// Cette liste est la référence unique du test d'équivalence (R3), et le seul effectif
+/// auquel les tests se comparent — d'où l'absence de cardinal écrit en dur ailleurs.
+///
+/// Elle doit être maintenue en sync avec `gradatum-server/src/api_v1/mcp.rs::list_tools`.
+///
+/// ⚠️ Elle n'est **pas** en parité avec `gradatum-mcp-stub/src/main.rs` : le stub n'expose
+/// pas `job_status`. Cette liste ne mesure donc que la surface serveur ; aucun test ne
+/// compare aujourd'hui les deux surfaces, et prétendre le contraire ferait passer un écart
+/// réel pour une propriété vérifiée.
 const CANONICAL_TOOL_NAMES: &[&str] = &[
     // read — 11
     "vault_search",
@@ -84,6 +91,8 @@ const CANONICAL_TOOL_NAMES: &[&str] = &[
     "vault_write",
     "vault_classify",
     "vault_downgrade",
+    // feature card creation — 1 (numéro F-XX attribué serveur)
+    "create_feature_card",
     // history F-40 — 4
     "vault_history",
     "vault_history_get",
@@ -91,6 +100,8 @@ const CANONICAL_TOOL_NAMES: &[&str] = &[
     "vault_diff",
     // forget F-44 — 1
     "vault_forget",
+    // archives listing F-100 1.6 — 1 (LECTURE SEULE ; delete/restore/purge = interne uniquement)
+    "vault_archives_list",
     // lesson recall F-60 — 1
     "vault_lessons_recall",
     // code scope F-61 — 1
@@ -98,6 +109,8 @@ const CANONICAL_TOOL_NAMES: &[&str] = &[
     // proactive recall F-46 — 2
     "vault_proactive_recall",
     "vault_proactive_recall_feedback",
+    // job introspection F-63 — 1 (état terminal d'un job async, « tout MCP natif »)
+    "job_status",
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -323,16 +336,16 @@ fn parse_sse_json(text: &str) -> serde_json::Value {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// **STATELESS — Test pivot : POST direct sans initialize ni Mcp-Session-Id → 23 outils.**
+/// **STATELESS — Test pivot : POST direct sans initialize ni Mcp-Session-Id.**
 ///
 /// Encode la correction du bug de décrochage MCP (session in-memory perdue après
 /// redémarrage serveur). En mode stateless, chaque POST `tools/list` est autonome :
 /// aucun handshake `initialize` préalable n'est requis.
 ///
-/// Invariant : avec un Bearer valide, `tools/list` en POST direct retourne les 23 outils
-/// sans aucun `Mcp-Session-Id` dans la requête ni dans la réponse.
+/// Invariant : avec un Bearer valide, `tools/list` en POST direct retourne le catalogue
+/// complet sans aucun `Mcp-Session-Id` dans la requête ni dans la réponse.
 #[tokio::test]
-async fn stateless_tools_list_without_initialize_returns_23_tools() {
+async fn stateless_tools_list_sans_initialize_retourne_le_catalogue_complet() {
     let (addr, valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
@@ -372,8 +385,8 @@ async fn stateless_tools_list_without_initialize_returns_23_tools() {
 
     assert_eq!(
         tools.len(),
-        23,
-        "POST direct tools/list doit retourner exactement 23 outils, got: {}",
+        CANONICAL_TOOL_NAMES.len(),
+        "POST direct tools/list doit retourner tout le catalogue canonique, got: {}",
         tools.len()
     );
 
@@ -385,6 +398,60 @@ async fn stateless_tools_list_without_initialize_returns_23_tools() {
             "outil '{expected}' manquant. Reçus: {tool_names:?}"
         );
     }
+}
+
+/// **Invariant fondateur F-100 (`decisions/01KXAP7Z61`) — surface MCP.**
+///
+/// Test structurel de la contrainte #3 (arbitrage Tech Lead) : les mutations du cycle
+/// delete/archive (`delete`, `restore`, `purge`) ne sont JAMAIS exposées en MCP. Seul le
+/// listing **lecture seule** `vault_archives_list` est présent. Prouve mécaniquement que la
+/// « main des agents » (canal MCP) ne peut ni supprimer, ni restaurer, ni détruire une
+/// archive — uniquement les VOIR.
+#[tokio::test]
+async fn mcp_surface_excludes_archive_mutations() {
+    let (addr, valid_token) = start_mcp_test_server().await;
+    let client = http_client();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
+
+    let resp = post_mcp(
+        &client,
+        &mcp_url,
+        &list_tools_body(),
+        Some(valid_token.as_str()),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "tools/list doit répondre 200"
+    );
+    let body_text = resp.text().await.expect("body tools/list");
+    let json = parse_sse_json(&body_text);
+    let tools = json["result"]["tools"]
+        .as_array()
+        .expect("result.tools tableau");
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+
+    // Aucune mutation du cycle delete/archive n'est exposée (assertion par nom exact —
+    // `vault_restore` = history CoW légitime, `vault_archives_list` = lecture seule légitime,
+    // ne pas les confondre avec les mutations d'archive interdites ci-dessous).
+    for forbidden in [
+        "vault_delete",
+        "vault_archives_delete",
+        "vault_archives_restore",
+        "vault_archives_purge",
+    ] {
+        assert!(
+            !tool_names.contains(&forbidden),
+            "outil interdit '{forbidden}' NE DOIT PAS apparaître en MCP. Reçus: {tool_names:?}"
+        );
+    }
+
+    // Le listing lecture seule reste présent (les agents VOIENT les archives).
+    assert!(
+        tool_names.contains(&"vault_archives_list"),
+        "le listing lecture seule vault_archives_list doit rester exposé. Reçus: {tool_names:?}"
+    );
 }
 
 /// **R1 — Test pivot : SANS Bearer → TrustContext::Unauthenticated → erreur auth MCP.**
@@ -428,8 +495,8 @@ async fn r1_sans_bearer_trustcontext_unauthenticated_call_tool_refuses() {
     );
     let error_msg = json["error"]["message"].as_str().unwrap_or("");
     assert_eq!(
-        error_msg, "non authentifié",
-        "message d'erreur MCP doit être 'non authentifié', got: {error_msg}"
+        error_msg, "not authenticated",
+        "message d'erreur MCP doit être 'not authenticated', got: {error_msg}"
     );
 }
 
@@ -473,8 +540,8 @@ async fn r1_avec_bearer_valide_trustcontext_authentifie_traverse_call_tool() {
     if let Some(error) = json.get("error") {
         let msg = error["message"].as_str().unwrap_or("");
         assert_ne!(
-            msg, "non authentifié",
-            "avec Bearer valide, call_tool NE DOIT PAS retourner 'non authentifié'. \
+            msg, "not authenticated",
+            "avec Bearer valide, call_tool NE DOIT PAS retourner 'not authenticated'. \
              Erreur reçue : {msg}"
         );
     }
@@ -485,12 +552,14 @@ async fn r1_avec_bearer_valide_trustcontext_authentifie_traverse_call_tool() {
 ///
 /// Construit un vrai serveur MCP (avec `build_mcp_service`), envoie `tools/list`
 /// en POST direct (mode stateless) et vérifie :
-/// (a) 23 outils retournés.
-/// (b) Les noms correspondent exactement à `CANONICAL_TOOL_NAMES` (== stub).
+/// (a) Autant d'outils que `CANONICAL_TOOL_NAMES` en contient.
+/// (b) Les noms correspondent exactement à `CANONICAL_TOOL_NAMES` (double inclusion).
 /// (c) Chaque outil a un `inputSchema` (objet JSON, éventuellement vide pour
 ///     les outils sans paramètres).
+///
+/// Ce test ne dit **rien** de `gradatum-mcp-stub` : il ne mesure que la surface serveur.
 #[tokio::test]
-async fn r3_list_tools_golden_runtime_23_outils_parité_stub() {
+async fn r3_list_tools_golden_runtime_egale_la_liste_canonique() {
     let (addr, valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
@@ -522,15 +591,16 @@ async fn r3_list_tools_golden_runtime_23_outils_parité_stub() {
         .as_array()
         .expect("result.tools doit être un tableau");
 
-    // (a) 23 outils.
+    // (a) Effectif == celui de la liste canonique (attrape aussi un doublon de nom, qu'une
+    // simple double inclusion laisserait passer).
     assert_eq!(
         tools.len(),
-        23,
-        "list_tools doit retourner exactement 23 outils, got: {}",
+        CANONICAL_TOOL_NAMES.len(),
+        "list_tools doit retourner exactement la liste canonique, got: {}",
         tools.len()
     );
 
-    // (b) Noms identiques à CANONICAL_TOOL_NAMES (parité avec le stub).
+    // (b) Noms identiques à CANONICAL_TOOL_NAMES (double inclusion, surface serveur seule).
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     for expected in CANONICAL_TOOL_NAMES {
         assert!(
@@ -592,20 +662,22 @@ async fn r2_host_non_autorise_rejete_403() {
     );
 }
 
-/// **R3-snapshot — Golden inputSchema des 23 outils MCP (DT-MCP-SCHEMA-1 + durcissement R3).**
+/// **R3-snapshot — Golden inputSchema de chaque outil MCP exposé (DT-MCP-SCHEMA-1 + durcissement R3).**
 ///
-/// Fige la sérialisation COMPLÈTE des 23 `inputSchema` via `insta::assert_json_snapshot!`.
+/// Fige la sérialisation COMPLÈTE de tous les `inputSchema` via `insta::assert_json_snapshot!`.
 ///
 /// Cette garde résout la faiblesse de R3 existant (`inputSchema.is_object()` faible :
 /// un Map vide `{}` passait au vert et aurait laissé passer la régression `34e70eb`).
 ///
 /// Le snapshot acté est la preuve de **parité wire octet-pour-octet** avant et après
 /// le refactor DT-MCP-SCHEMA-1. Toute divergence de schéma (ajout/retrait de propriété,
-/// changement de type) fait échouer ce test.
+/// changement de type) fait échouer ce test. L'ensemble des clés du snapshot étant
+/// l'ensemble des noms d'outils, l'ajout ou le retrait d'un outil le fait rougir aussi :
+/// c'est le snapshot qui porte l'effectif, jamais le nom de ce test.
 ///
 /// La map est triée par nom d'outil (`BTreeMap`) pour déterminisme entre runs.
 #[tokio::test]
-async fn r3_snapshot_input_schema_23_outils_golden() {
+async fn r3_snapshot_input_schema_de_chaque_outil_expose_golden() {
     let (addr, valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
@@ -632,8 +704,8 @@ async fn r3_snapshot_input_schema_23_outils_golden() {
 
     assert_eq!(
         tools.len(),
-        23,
-        "snapshot golden attend exactement 23 outils"
+        CANONICAL_TOOL_NAMES.len(),
+        "snapshot golden attend le catalogue canonique complet"
     );
 
     // Construire la map nom->inputSchema triée par nom (BTreeMap = déterminisme).
@@ -649,7 +721,7 @@ async fn r3_snapshot_input_schema_23_outils_golden() {
         })
         .collect();
 
-    // Snapshot golden - fige les 23 inputSchema octet-pour-octet.
+    // Snapshot golden - fige tous les inputSchema octet-pour-octet.
     // Pour regénérer : INSTA_UPDATE=always cargo nextest run -p gradatum-server r3_snapshot
     insta::assert_json_snapshot!("mcp_tools_input_schema_golden", schema_map);
 }
@@ -659,7 +731,7 @@ async fn r3_snapshot_input_schema_23_outils_golden() {
 /// **F-01 — `tools/list` SANS Bearer → erreur "non authentifié".**
 ///
 /// Avant le fix, `list_tools` ignorait le `RequestContext` et divulguait le catalogue
-/// des 21 outils (noms + schémas JSON complets) à tout client LAN non authentifié.
+/// complet des outils (noms + schémas JSON complets) à tout client LAN non authentifié.
 ///
 /// Après le fix, `list_tools` applique la même garde que `call_tool` :
 /// `TrustContext::Unauthenticated` → `ErrorData(INVALID_REQUEST, "non authentifié")`.
@@ -696,8 +768,8 @@ async fn f01_list_tools_sans_bearer_refuse_non_authentifie() {
     );
     let error_msg = json["error"]["message"].as_str().unwrap_or("");
     assert_eq!(
-        error_msg, "non authentifié",
-        "message d'erreur MCP doit être 'non authentifié', got: {error_msg}"
+        error_msg, "not authenticated",
+        "message d'erreur MCP doit être 'not authenticated', got: {error_msg}"
     );
     // Le catalogue ne doit PAS avoir fuité.
     assert!(
@@ -706,12 +778,13 @@ async fn f01_list_tools_sans_bearer_refuse_non_authentifie() {
     );
 }
 
-/// **F-01 — `tools/list` AVEC Bearer valide → 23 outils (non-régression client).**
+/// **F-01 — `tools/list` AVEC Bearer valide → catalogue complet (non-régression client).**
 ///
 /// Le client légitime (Claude Code) envoie l'api-key Bearer sur chaque requête.
-/// Le gating F-01 ne casse donc PAS la découverte authentifiée : 23 outils renvoyés.
+/// Le gating F-01 ne casse donc PAS la découverte authentifiée : le catalogue entier est
+/// renvoyé.
 #[tokio::test]
-async fn f01_list_tools_avec_bearer_retourne_23_outils() {
+async fn f01_list_tools_avec_bearer_retourne_le_catalogue_complet() {
     let (addr, valid_token) = start_mcp_test_server().await;
     let client = http_client();
     let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
@@ -741,8 +814,8 @@ async fn f01_list_tools_avec_bearer_retourne_23_outils() {
         .expect("result.tools doit être un tableau");
     assert_eq!(
         tools.len(),
-        23,
-        "tools/list authentifié doit retourner exactement 23 outils, got: {}",
+        CANONICAL_TOOL_NAMES.len(),
+        "tools/list authentifié doit retourner tout le catalogue canonique, got: {}",
         tools.len()
     );
 }
@@ -1166,4 +1239,91 @@ async fn vault_context_e2e_reference_mode_champs_presents() {
             "T12-e2e-3 : counts.{field} doit être présent, got counts: {counts}"
         );
     }
+}
+
+// ── Négociation de version de protocole MCP (handshake `initialize`) ───────────
+
+/// Corps JSON-RPC MCP `initialize` demandant une `protocolVersion` précise.
+///
+/// Les trois champs `protocolVersion` / `capabilities` / `clientInfo` sont requis par
+/// `InitializeRequestParams` (rmcp). `capabilities` vide et un `clientInfo` minimal
+/// suffisent à désérialiser une requête valide.
+fn initialize_body(protocol_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": {},
+            "clientInfo": { "name": "negotiation-test-client", "version": "1.0.0" }
+        }
+    })
+}
+
+/// Extrait `result.protocolVersion` d'une réponse `initialize` (SSE ou JSON direct).
+async fn negotiated_version(resp: reqwest::Response) -> String {
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "initialize doit retourner 200 (handshake jamais cassé)"
+    );
+    let body_text = resp.text().await.expect("body initialize");
+    let json = parse_sse_json(&body_text);
+    assert!(
+        json.get("error").is_none(),
+        "initialize ne doit pas retourner d'erreur, got: {json}"
+    );
+    json["result"]["protocolVersion"]
+        .as_str()
+        .unwrap_or_else(|| panic!("result.protocolVersion absent de la réponse, got: {json}"))
+        .to_owned()
+}
+
+/// **Négociation de version — vrai handshake `initialize` par le chemin de production.**
+///
+/// Passe par la CHAÎNE RÉELLE : POST `/mcp` → `auth_middleware` →
+/// `StreamableHttpService` (mode stateless, `build_mcp_service`) →
+/// `GradatumMcpHandler::initialize`. Le transport Streamable HTTP renvoie la
+/// `protocolVersion` du handler **verbatim** — il ne renégocie pas (à la différence du
+/// transport stdio `serve_server` de rmcp, qui ajusterait la version après coup et
+/// **masquerait** le bug). Ce test exerce donc bien la négociation du handler, pas un double.
+///
+/// Red-proof : avant le correctif, `initialize` renvoyait inconditionnellement
+/// `ProtocolVersion::default()` = `LATEST` (2025-11-25) ; ce test échouait pour toute
+/// version demandée différente.
+///
+/// - **C1 (non-régression)** : chaque version supportée demandée est renvoyée à l'identique —
+///   en particulier `2025-11-25`, celle que parlent les consommateurs actuels.
+/// - **C2 (échec bruyant)** : une version inconnue/future produit un repli **observable**
+///   (log `WARN` côté serveur) sur `LATEST`, conforme à la spec MCP « Version Negotiation »
+///   (« the server MUST respond with another protocol version it supports … SHOULD be the
+///   latest »). Le handshake n'est jamais cassé.
+///
+/// `initialize` ne requiert pas d'authentification (l'injection d'âme est optionnelle et
+/// dégradée sans Bearer) — on teste ici uniquement la version négociée, indépendante de l'auth.
+#[tokio::test]
+async fn initialize_negocie_versions_supportees_et_repli_sur_inconnue() {
+    let (addr, _token) = start_mcp_test_server().await;
+    let client = http_client();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
+
+    // C1 — toute version servable par le SDK est renvoyée à l'identique.
+    // `2025-11-25` en tête : c'est la non-régression stricte des consommateurs actuels.
+    for requested in ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"] {
+        let resp = post_mcp(&client, &mcp_url, &initialize_body(requested), None).await;
+        let got = negotiated_version(resp).await;
+        assert_eq!(
+            got, requested,
+            "version supportée '{requested}' demandée doit être renvoyée à l'identique (négociation)"
+        );
+    }
+
+    // C2 — version inconnue/future : repli sur LATEST (2025-11-25), observable via WARN serveur.
+    let resp = post_mcp(&client, &mcp_url, &initialize_body("2099-01-01"), None).await;
+    let got = negotiated_version(resp).await;
+    assert_eq!(
+        got, "2025-11-25",
+        "version inconnue doit produire un repli sur la dernière version servie (LATEST), spec MCP"
+    );
 }

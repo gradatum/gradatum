@@ -1,118 +1,187 @@
-//! DTOs pour l'API interne server-to-worker (Wave 2, v0.5.3).
+//! DTOs for the internal server-to-worker API.
 //!
-//! Ces types ne sont JAMAIS exposés dans le MCP stub ni dans l'OpenAPI public.
-//! Ils sont uniquement consommés par le listener interne sur `127.0.0.1:19092`.
+//! These types are NEVER exposed through the MCP stub or the public OpenAPI surface.
+//! They are consumed only by the internal listener, which binds to loopback
+//! (`127.0.0.1:19092` by default).
 //!
 //! ## Isolation
 //!
-//! Les routes `/internal/v1/*` sont montées sur un binding séparé (loopback uniquement)
-//! et ne sont JAMAIS fusionnées avec le router public (`/api/v1/*`).
+//! The `/internal/v1/*` routes are mounted on a separate, loopback-only listener and are
+//! NEVER merged into the public router that serves `/api/v1/*`.
 
+use gradatum_core::scope::{TenantId, VaultId};
 use serde::{Deserialize, Serialize};
 
-/// Requête `POST /internal/v1/persist/curated` — pipeline 5 writes séquentiels.
+/// Request body for `POST /internal/v1/persist/curated` — a two-phase persist pipeline.
 ///
-/// ## Limite transactionnelle
+/// ## Phases
 ///
-/// Les writes sont séquentiels, non atomiques (`Arc<dyn Index>` utilise rusqlite
-/// via Mutex, sans pool sqlx). Un échec intermédiaire laisse l'état partiellement
-/// écrit — chaque write non-bloquant est loggué WARN mais ne bloque pas la réponse.
-/// Le vault (write_note_with_id) est toujours le premier write — si il échoue,
-/// la requête retourne 409 (Conflict) ou 500 (Storage), sans tenter les writes suivants.
+/// 1. **Vault write** — writes the Markdown note to disk. Blocking: on failure the request
+///    returns **500** (storage), and phase 2 is not attempted. When `expected_sha256` is
+///    supplied (RMW), the write is guarded by a compare-and-swap and a stale hash returns
+///    **409** without touching the note; otherwise (CREATE) the write is unconditional. See
+///    [`PersistCuratedRequest::expected_sha256`].
+/// 2. **Index mutations** — note title, temporal entry, links and trust are applied inside
+///    a **single SQLite transaction**. Blocking as well: if any of them fails, all are
+///    rolled back and the request returns **500**.
+///
+/// ## Atomicity boundary
+///
+/// The two phases are not part of one transaction — they target two distinct storage
+/// systems. An intermediate state (vault written, index rolled back) is therefore possible
+/// and is left deliberately recoverable: the vault write is idempotent, so the caller
+/// re-runs the job and converges.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PersistCuratedRequest {
-    /// ULID de la note (string, 26 chars uppercase).
+    /// Note ULID (26 uppercase characters).
     pub note_id: String,
-    /// Identifiant du tenant (ex: `"main"`).
-    pub tenant_id: String,
-    /// Titre de la note (utilisé pour `upsert_note_title`).
+    /// Tenant identifier (for example `"main"`).
+    pub tenant_id: TenantId,
+    /// Note title, used to upsert the indexed title.
     pub title: String,
-    /// Corps Markdown complet.
+    /// Full Markdown body.
     pub body: String,
-    /// Section canonique (ex: `"decisions"`, `"lessons-learned"`).
+    /// Canonical section (for example `"decisions"`, `"lessons-learned"`).
     pub section: String,
-    /// Tags de la note.
+    /// Note tags.
     pub tags: Vec<String>,
-    /// Auteur de la note (ex: `"main-agent"`).
+    /// Note author (for example `"main-agent"`).
     pub author: Option<String>,
-    /// Statut de la note (ex: `"live"`, `"draft"`).
+    /// Note status (for example `"live"`, `"draft"`).
     pub status: String,
-    /// Score de confiance [0.0, 1.0] (optionnel — omis si non défini).
+    /// Trust score in `[0.0, 1.0]` — optional, omitted when undefined.
     pub trust: Option<f32>,
-    /// SHA-256 hex (64 chars) pour la garde optimistic-lock (Fix-B).
+    /// Expected SHA-256 of the note being replaced, 64 hex characters.
     ///
-    /// Si présent : `write_note_with_id` applique la garde CAS.
-    /// Si absent : création pure (pas de vérification hash).
+    /// **Honoured.** This field both carries the compare-and-swap hash AND
+    /// discriminates the two write modes of the `/internal/v1/persist/curated` handler:
+    ///
+    /// - `None` → **CREATE**: a fresh pre-allocated ULID is written **unconditionally**.
+    /// - `Some(hash)` → **RMW** in-place under an **optimistic lock**. The handler compares
+    ///   `hash` against the note's current content:
+    ///   - match → the note is rewritten;
+    ///   - mismatch → **409**, the write is aborted and the note is left **intact** (the
+    ///     worker then moves the job to terminal `JobStatus::Conflict`);
+    ///   - malformed hex → **400**, before any write.
+    ///
+    /// A populated `expected_sha256` is therefore genuine protection against a lost update:
+    /// a *stale* hash no longer silently overwrites the concurrent winner. The primitive is
+    /// `gradatum_vault::Vault::write_if_match`, reached in production through
+    /// `gradatum_vault::Registry::write_if_match_internal`.
     pub expected_sha256: Option<String>,
-    /// Entrée temporelle inline (optionnelle).
+    /// Inline temporal entry (optional).
     pub temporal: Option<TemporalEntryDto>,
-    /// Liens à upsert (src → dst dans le même vault).
+    /// Links to upsert (source → destination, within the same vault).
     pub links: Vec<LinkDto>,
-    /// Provenance de la note (ex: `"distilled"`, `"human-decision"`).
+    /// Note provenance (for example `"distilled"`, `"human-decision"`).
     pub provenance: Option<String>,
+    /// Curator decision that produced this note, used for metrics instrumentation.
+    ///
+    /// Backward-compatible additive field (`#[serde(default)]`): `None` for callers that
+    /// are not instrumented. When present, the server increments the
+    /// `gradatum_curator_decisions{path, outcome}` counter at persist time.
+    #[serde(default)]
+    pub curator_decision: Option<CuratorDecisionDto>,
+    /// TARGET vault of the write, decoupled from `tenant_id` (the principal).
+    ///
+    /// Absent (default) → the namespace is `tenant_id`, byte-identical to the historical
+    /// behaviour. A writable `target_vault` differing from `tenant_id` remains FORBIDDEN:
+    /// the persist guard rejects it. Cross-vault writes are not an open capability.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` is required:
+    /// `default` lets already-persisted jobs that predate the field deserialize, and
+    /// `skip_serializing_if` omits the key when `None`, keeping the wire JSON
+    /// byte-identical to the earlier schema (same treatment as
+    /// [`PersistEmbeddingRequest::vault_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_vault: Option<VaultId>,
 }
 
-/// Requête `POST /internal/v1/persist/embedding` — stockage d'un vecteur.
+/// A curator decision — its path and its outcome — carried for metrics instrumentation.
+///
+/// Ferries the two label values of the `gradatum_curator_decisions` metric from the worker,
+/// where the decision is made, to the server, which owns the Prometheus registry. Both
+/// fields are always populated together.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CuratorDecisionDto {
+    /// Decision path: `hint_bypass` | `fast_admit` | `pending_band` | `llm_review`.
+    pub path: String,
+    /// Outcome: `admitted` | `pending` | `rejected`.
+    pub outcome: String,
+}
+
+/// Request body for `POST /internal/v1/persist/embedding` — stores one vector.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PersistEmbeddingRequest {
-    /// ULID de la note cible.
+    /// ULID of the target note.
     pub note_id: String,
-    /// Identifiant du modèle embedder (ex: `"bge-m3"`).
+    /// Embedder model identifier (for example `"bge-m3"`).
     pub embedder_id: String,
-    /// Dimension du vecteur.
+    /// Vector dimension.
     pub dim: u16,
-    /// Vecteur d'embedding.
+    /// Embedding vector.
     pub vector: Vec<f32>,
+    /// Vault partition of the ANN index. Optional: an older worker does not emit this
+    /// field, in which case the handler defaults to `"main"`. Omitted from the payload
+    /// when `None` (`skip_serializing_if`), keeping the wire byte-identical to the
+    /// earlier schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_id: Option<VaultId>,
 }
 
-/// Requête `POST /internal/v1/persist/forget` — marquage oubli sémantique.
+/// Request body for `POST /internal/v1/persist/forget` — marks a note as semantically forgotten.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PersistForgetRequest {
-    /// ULID de la note à oublier.
+    /// ULID of the note to forget.
     pub note_id: String,
-    /// Identifiant du tenant.
-    pub tenant_id: String,
-    /// Corps Markdown avec frontmatter `forget=true`.
+    /// Tenant identifier.
+    pub tenant_id: TenantId,
+    /// Markdown body carrying the `forget = true` frontmatter.
     pub body: String,
-    /// Section de la note.
+    /// Section of the note.
     pub section: String,
-    /// Agent ayant déclenché l'oubli (loggé dans le frontmatter `forgotten_by`).
+    /// Actor that triggered the forget, recorded in the `forgotten_by` frontmatter field.
     pub forgotten_by: Option<String>,
 }
 
-/// Requête `POST /internal/v1/persist/distill` — mise à jour d'une note distillée.
+/// Request body for `POST /internal/v1/persist/distill` — updates a distilled note.
 ///
-/// Utilisé par le pipeline de distillation pour mettre à jour le contenu
-/// d'une note existante avec un trust réévalué.
+/// Used by the distillation pipeline to rewrite the content of an existing note with a
+/// re-evaluated trust score.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PersistDistillRequest {
-    /// ULID de la note à mettre à jour.
+    /// ULID of the note to update.
     pub note_id: String,
-    /// Identifiant du tenant.
-    pub tenant_id: String,
-    /// Nouveau titre.
+    /// Tenant identifier.
+    pub tenant_id: TenantId,
+    /// New title.
     pub title: String,
-    /// Nouveau corps Markdown.
+    /// New Markdown body.
     pub body: String,
-    /// Section (conservée ou mise à jour).
+    /// Section, either preserved or updated.
     pub section: String,
-    /// Nouveau score de confiance.
+    /// New trust score.
     pub trust: Option<f32>,
-    /// SHA-256 hex (64 chars) pour la garde optimistic-lock.
-    pub expected_sha256: Option<String>,
-    /// Si `true`, ajoute `processed = true` dans les ExtraFields (marquage source distillée).
+    /// Expected SHA-256 of the note being replaced, 64 hex characters.
     ///
-    /// Utilisé par `mark_source_processed` pour marquer une source après distillation.
+    /// **Inert on the distill path** — unlike [`PersistCuratedRequest::expected_sha256`],
+    /// which is honoured. The `/internal/v1/persist/distill` handler never reads
+    /// this field and its vault write is unconditional: it is not a compare-and-swap guard
+    /// and offers no protection against a concurrent write. Wiring the optimistic lock into
+    /// the distill path (as done for curated) is a separate, deliberately unscoped change.
+    pub expected_sha256: Option<String>,
+    /// When `true`, sets `processed = true` in the note's extra frontmatter fields,
+    /// flagging the note as a source that has already been distilled.
     #[serde(default)]
     pub mark_processed: bool,
-    /// Si présent, insère `derived-into = <ulid>` dans les ExtraFields.
+    /// When present, inserts `derived-into = <ulid>` in the extra frontmatter fields.
     ///
-    /// Référence vers la note de synthèse produite depuis cette source.
+    /// Points at the synthesis note produced from this source.
     pub derived_into: Option<String>,
-    /// ULIDs sources ayant produit cette note de synthèse (utilisé pour `derived-from`).
+    /// Source ULIDs that produced this synthesis note, written as `derived-from`.
     ///
-    /// Présent uniquement lors de la création de la note de synthèse (premier appel,
-    /// `mark_processed = false`). Inséré dans les ExtraFields de la note.
+    /// Only supplied when the synthesis note is created (the first call, with
+    /// `mark_processed = false`). Inserted into the note's extra frontmatter fields.
     #[serde(default)]
     pub derived_from: Vec<String>,
     /// Tags to apply to the note frontmatter on creation (e.g. `["quality-low"]`).
@@ -124,46 +193,46 @@ pub struct PersistDistillRequest {
     pub tags: Vec<String>,
 }
 
-/// Entrée temporelle inline — évite l'import de `TemporalEntry` core dans le DTO.
+/// Inline temporal entry — avoids importing the core `TemporalEntry` type into the DTO layer.
 ///
-/// Sérialisée en snake_case pour cohérence avec les autres DTOs publics.
+/// Serialized in snake_case, consistently with the other public DTOs.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TemporalEntryDto {
-    /// Timestamp de l'ancre en millisecondes Unix.
+    /// Anchor timestamp, Unix epoch milliseconds.
     pub anchor_ms: i64,
-    /// Source de l'ancre : `"occurred_at"` | `"event-date"` | `"valid_from"` | `"created"`.
+    /// Anchor source: `"occurred_at"` | `"event-date"` | `"valid_from"` | `"created"`.
     pub anchor_src: String,
-    /// Type de document CoALA (ex: `"Event"`, `"Static"`).
+    /// Document kind (for example `"Event"`, `"Static"`).
     pub doc_kind: String,
-    /// Timestamp de fin de validité (optionnel, `None` = valide indéfiniment).
+    /// End of the validity window, Unix epoch milliseconds. `None` = valid indefinitely.
     pub valid_until_ms: Option<i64>,
 }
 
-/// Lien à upsert (wikilink src → dst dans le même vault).
+/// A link to upsert (wikilink from source to destination, within the same vault).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LinkDto {
-    /// ULID source du lien.
+    /// Source ULID of the link.
     pub src: String,
-    /// ULID destination du lien.
+    /// Destination ULID of the link.
     pub dst: String,
 }
 
-/// Réponse succès pour les handlers `persist/*`.
+/// Success response shared by the `persist/*` handlers.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PersistOkResponse {
-    /// ULID de la note créée ou mise à jour.
+    /// ULID of the created or updated note.
     pub note_id: String,
-    /// Toujours `"ok"` en cas de succès.
+    /// Always `"ok"` on success.
     pub status: String,
 }
 
-/// Réponse succès pour `persist/embedding`.
+/// Success response for `persist/embedding`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EmbeddingOkResponse {
-    /// ULID de la note cible.
+    /// ULID of the target note.
     pub note_id: String,
-    /// Identifiant du modèle embedder.
+    /// Embedder model identifier.
     pub embedder_id: String,
-    /// Dimension du vecteur stocké.
+    /// Dimension of the stored vector.
     pub dim: usize,
 }

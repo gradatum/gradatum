@@ -12,7 +12,7 @@
 //! ```text
 //! gradatum-admin init --preset hierarchical --root /var/lib/gradatum
 //! gradatum-admin token issue --root /var/lib/gradatum --sub mcp-stub --scopes vault_read
-//! gradatum-admin api-key create --root /var/lib/gradatum --owner mcp-stub
+//! gradatum-admin api-key create --root /var/lib/gradatum --owner mcp-stub --scopes write
 //! gradatum-admin api-key list   --root /var/lib/gradatum
 //! gradatum-admin api-key revoke --root /var/lib/gradatum --prefix ak_abcdef01
 //! gradatum-admin api-key rotate --root /var/lib/gradatum --prefix ak_abcdef01
@@ -40,14 +40,14 @@ fn parse_ingest_visibility(s: &str) -> Result<code_cmd::IngestVisibility, String
         "pub" => Ok(code_cmd::IngestVisibility::Pub),
         "all" => Ok(code_cmd::IngestVisibility::All),
         other => Err(format!(
-            "valeur invalide '{other}' — valeurs acceptées : pub, all"
+            "invalid value '{other}' — accepted values: pub, all"
         )),
     }
 }
 
 /// Gradatum operator CLI.
 #[derive(Debug, Parser)]
-#[command(version, about = "gradatum-admin — CLI opérateur Gradatum")]
+#[command(version, about = "gradatum-admin — Gradatum operator CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -94,8 +94,8 @@ enum Cmd {
         /// Gradatum root directory.
         #[arg(long, default_value = "/var/lib/gradatum")]
         root: std::path::PathBuf,
-        /// Tenant to process (default: `"main"`).
-        #[arg(long, default_value = "main")]
+        /// Tenant to process.
+        #[arg(long)]
         tenant: String,
         /// Preview actions without writing to the database.
         #[arg(long)]
@@ -114,8 +114,8 @@ enum Cmd {
         /// Gradatum root directory.
         #[arg(long, default_value = "/var/lib/gradatum")]
         root: std::path::PathBuf,
-        /// Tenant to process (default: `"main"`).
-        #[arg(long, default_value = "main")]
+        /// Tenant to process.
+        #[arg(long)]
         tenant: String,
         /// Preview actions without writing to the database.
         #[arg(long)]
@@ -166,6 +166,123 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProjectMapCmd,
     },
+    /// On-demand deletion, which archives the note rather than destroying it, through the
+    /// internal loopback admin API.
+    ///
+    /// Dry-run by default; `--execute` performs the archival, which stays reversible via
+    /// `archives restore` until the retention garbage collector destroys the archive.
+    /// Governance sections are refused server-side with a 403.
+    Delete {
+        /// ULID of the note to archive.
+        id: String,
+        /// Target tenant — `None` = derived from the bearer token (A1).
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Internal admin API URL (default: loopback `127.0.0.1:19092`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Admin token file (default: `/etc/gradatum/admin.token`). The token is never
+        /// passed on the command line.
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
+        /// Perform the deletion for real (default: dry-run preview).
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Archive operations: list, purge and restore.
+    Archives {
+        #[command(subcommand)]
+        cmd: ArchivesCmd,
+    },
+}
+
+/// Sub-commands of `archives`.
+#[derive(Debug, Subcommand)]
+enum ArchivesCmd {
+    /// Lists the archive registry (read-only).
+    List {
+        /// Filter on the owning vault (default: every vault).
+        #[arg(long)]
+        vault: Option<String>,
+        /// Filter on a section (kebab-case).
+        #[arg(long)]
+        section: Option<String>,
+        /// Lower bound `archived_at >= since_ms` (epoch milliseconds).
+        #[arg(long)]
+        since_ms: Option<i64>,
+        /// Upper bound `archived_at <= until_ms` (epoch milliseconds).
+        #[arg(long)]
+        until_ms: Option<i64>,
+        /// Include archives that have already been destroyed.
+        #[arg(long)]
+        include_gc: bool,
+        /// Include archives that have already been restored.
+        #[arg(long)]
+        include_restored: bool,
+        /// Maximum number of rows (default 50, clamped to 500 by the server).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Target tenant — `None` = derived from the bearer token (A1).
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Internal admin API URL (default: loopback `127.0.0.1:19092`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Admin token file (default: `/etc/gradatum/admin.token`).
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
+    },
+    /// Destroys an archive ahead of its retention deadline (dry-run, then confirmation).
+    Purge {
+        /// ULID of the archived note to destroy.
+        id: String,
+        /// Target tenant — `None` = derived from the bearer token (A1).
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Internal admin API URL (default: loopback `127.0.0.1:19092`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Admin token file (default: `/etc/gradatum/admin.token`).
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
+        /// Perform the purge for real (default: dry-run). This cannot be undone.
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Restores an archive into the `pending-review` quarantine (dry-run, then confirmation).
+    ///
+    /// Two mutually exclusive modes: a single ULID (`<id>`), or a range
+    /// (`--from`/`--to` with an optional `--section`) that lists the active archives and
+    /// restores each of them.
+    Restore {
+        /// ULID of the archived note to restore, in single mode. Mutually exclusive with
+        /// `--from`/`--to`.
+        id: Option<String>,
+        /// Lower bound `archived_at >= from`, in range mode (epoch milliseconds).
+        #[arg(long)]
+        from: Option<i64>,
+        /// Upper bound `archived_at <= to`, in range mode (epoch milliseconds).
+        #[arg(long)]
+        to: Option<i64>,
+        /// Filter on a section, in range mode (kebab-case).
+        #[arg(long)]
+        section: Option<String>,
+        /// Target tenant — `None` = derived from the bearer token (A1).
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Internal admin API URL (default: loopback `127.0.0.1:19092`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Admin token file (default: `/etc/gradatum/admin.token`).
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
+        /// Perform the restore for real (default: dry-run preview).
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 /// Sub-commands of `project-map`.
@@ -182,11 +299,11 @@ enum ProjectMapCmd {
         /// Gradatum root directory.
         #[arg(long, default_value = "/var/lib/gradatum")]
         root: std::path::PathBuf,
-        /// Vault / tenant to read (default: `"main"`).
-        #[arg(long, default_value = "main")]
+        /// Vault / tenant to read.
+        #[arg(long)]
         vault: String,
     },
-    /// Backfills project-map cards from CHANGELOG.md entries (stage2, idempotent).
+    /// Backfills project-map cards from `CHANGELOG.md` entries (idempotent).
     ///
     /// Parses `[from..to]` version range from CHANGELOG.md, generates one card per
     /// bullet entry, and posts to `POST /api/v1/vault_write`. Idempotent: entries
@@ -218,12 +335,12 @@ enum ProjectMapCmd {
         #[arg(long, default_value_t = false)]
         include_meta: bool,
     },
-    /// Rapporte l'état courant d'un projet (version, comptages par statut, timeline).
+    /// Reports the current state of a project: version, per-status counters, versions seen.
     ///
-    /// Lit les cartes project-map depuis l'index de notes (`notes.body_text` + `notes.status`),
-    /// filtrées par le wikilink `[[project:<name>]]` — jamais de recherche sémantique (invariant B4).
-    /// Les comptages dérivent du schéma de liens forcés (`[[status:…]]`, `[[version:…]]`).
-    /// Lecture directe SQLite (rusqlite, sans appel HTTP).
+    /// Reads the project-map cards from the note index (`notes.body_text` and
+    /// `notes.status`), filtered on the `[[project:<name>]]` wikilink. Semantic search is
+    /// never involved: the counters derive from the typed link schema (`[[status:…]]`,
+    /// `[[version:…]]`), which is deterministic. Reads SQLite directly, with no HTTP call.
     #[command(name = "scope")]
     Scope {
         /// Project name (matches `[[project:<name>]]`).
@@ -231,51 +348,52 @@ enum ProjectMapCmd {
         /// Gradatum root directory.
         #[arg(long, default_value = "/var/lib/gradatum")]
         root: std::path::PathBuf,
-        /// Vault / tenant to read (default: `"main"`).
-        #[arg(long, default_value = "main")]
+        /// Vault / tenant to read.
+        #[arg(long)]
         vault: String,
     },
-    /// Exporte les cartes-feature project-map en JSON trié par F-XX.
+    /// Exports the project-map feature cards as JSON, sorted by feature identifier.
     ///
-    /// Projection : `[{"feature":"F-37","release":"released","version":"v0.5.2","title":"…"}]`.
-    /// Par défaut (miroir-site) : exclut `release:dropped` et `version:*/backlog`.
-    /// Avec `--include-dropped` : expose toutes les cartes-feature pour audit.
-    /// Lecture directe SQLite (rusqlite, sans appel HTTP).
+    /// Projection: `[{"feature":"F-37","release":"released","version":"v0.5.2","title":"…"}]`.
+    /// By default the export mirrors the public website: `release:dropped` cards and cards
+    /// whose kind is not `FEATURE` are excluded. `--include-dropped` lifts both filters and
+    /// exposes every feature card for auditing. Reads SQLite directly, with no HTTP call.
     #[command(name = "export-features")]
     ExportFeatures {
         /// Gradatum root directory.
         #[arg(long, default_value = "/var/lib/gradatum")]
         root: std::path::PathBuf,
-        /// Vault / tenant à lire (défaut : `"main"`).
-        #[arg(long, default_value = "main")]
+        /// Vault / tenant to read.
+        #[arg(long)]
         vault: String,
-        /// Inclure aussi les cartes `release:dropped` et `version:*/backlog`.
+        /// Also include `release:dropped` cards and cards whose kind is not `FEATURE`.
         ///
-        /// Défaut : miroir-site strict (dropped et backlog exclus).
+        /// Default: mirror the public website, which excludes both.
         #[arg(long, default_value_t = false)]
         include_dropped: bool,
     },
-    /// Backfille 41 cartes-feature project-map depuis `features.ts` (T5, idempotent).
+    /// Back-fills project-map feature cards from a `features.ts` catalogue (idempotent).
     ///
-    /// Parse `features.ts`, génère une carte-feature par entrée (6 wikilinks typés
-    /// §10e : `[[feature:F-XX]] [[project:gradatum]] [[status:…]] [[kind:FEATURE]]
-    /// [[release:…]] [[version:gradatum/x.y.z]]`), et poste vers `vault_write`.
-    /// Idempotent : marqueur `pm-feature-source:F-XX` vérifié avant chaque write.
+    /// Parses `features.ts` and emits one feature card per entry, carrying the six typed
+    /// wikilinks `[[feature:F-XX]] [[project:gradatum]] [[status:…]] [[kind:FEATURE]]
+    /// [[release:…]] [[version:gradatum/x.y.z]]`, then posts them to `vault_write`.
+    /// Idempotent: the `pm-feature-source:F-XX` marker is checked before every write.
     ///
-    /// Défaut : dry-run (preview sans POST). `--apply` déclenche l'écriture réelle.
-    /// **GATE STÉPHANE** : ne jamais lancer `--apply` sans GO explicite.
+    /// Defaults to a dry-run that previews without posting. `--apply` performs the real
+    /// writes into the vault and should be used deliberately.
     #[command(name = "backfill-features")]
     BackfillFeatures {
-        /// Chemin vers `features.ts` (défaut : relatif au CWD, à ajuster selon le layout local).
+        /// Path to `features.ts` (default: relative to the current directory).
         #[arg(long, default_value = "./features.ts")]
         features_path: std::path::PathBuf,
-        /// Écrire les cartes dans le vault (défaut : false = dry-run). Requiert --api-key.
+        /// Write the cards into the vault (default: false, i.e. dry-run). Requires
+        /// `--api-key`.
         #[arg(long, default_value_t = false)]
         apply: bool,
-        /// URL de base du serveur gradatum.
+        /// Base URL of the gradatum server.
         #[arg(long, default_value = "http://127.0.0.1:19090")]
         server_url: String,
-        /// Clé API pour l'authentification (vide = dry-run uniquement).
+        /// API key for authentication (empty means dry-run only).
         #[arg(long, default_value = "")]
         api_key: String,
     },
@@ -299,6 +417,43 @@ enum VaultCmd {
         #[command(subcommand)]
         cmd: vault_forget_cmd::ForgetCmd,
     },
+    /// Provisions a vault: active tenant plus a self write grant. Idempotent.
+    Create(VaultLifecycleCliArgs),
+    /// Suspends a vault — immediate refusal of every request/job, reversible.
+    Suspend(VaultLifecycleCliArgs),
+    /// Soft-deletes a vault — immediate refusal; physical note purge is deferred to jobs.
+    #[command(name = "soft-delete")]
+    SoftDelete(VaultLifecycleCliArgs),
+    /// Physically purges a SOFT-DELETED vault (dry-run by default, batched — IRREVERSIBLE).
+    Purge {
+        /// Target vault id (must be soft-deleted first — 409 otherwise).
+        vault_id: String,
+        /// Execute the real purge (default: dry-run). IRREVERSIBLE.
+        #[arg(long)]
+        execute: bool,
+        /// Max batch size for this call (server cap: 500). Re-run while remaining > 0.
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+        /// Internal admin API URL (default: loopback `127.0.0.1:19092`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Admin token file (default: `/etc/gradatum/admin.token`, 0600).
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
+    },
+}
+
+/// Arguments for the vault lifecycle commands (create / suspend / soft-delete).
+#[derive(Debug, Args)]
+struct VaultLifecycleCliArgs {
+    /// Target vault id (charset `[a-z0-9-]`, ≤ 64 bytes — validated server-side).
+    pub vault_id: String,
+    /// Internal admin API URL (default: loopback `127.0.0.1:19092`).
+    #[arg(long)]
+    pub url: Option<String>,
+    /// Admin token file (default: `/etc/gradatum/admin.token`, 0600).
+    #[arg(long)]
+    pub token_file: Option<std::path::PathBuf>,
 }
 
 /// Sub-commands of `code`.
@@ -365,14 +520,14 @@ struct CodeUpdateCliArgs {
 #[derive(Debug, Args)]
 struct VaultRenameCliArgs {
     /// Current title of the note (must exist with `status='live'`).
-    pub ancien: String,
+    pub current_title: String,
     /// New title to apply.
-    pub nouveau: String,
+    pub new_title: String,
     /// Gradatum root directory.
     #[arg(long, default_value = "/var/lib/gradatum")]
     pub root: std::path::PathBuf,
-    /// Tenant (`vault_id`) — default `"main"`.
-    #[arg(long, default_value = "main")]
+    /// Tenant (`vault_id`).
+    #[arg(long)]
     pub tenant: String,
 }
 
@@ -477,8 +632,8 @@ async fn main() -> anyhow::Result<()> {
             VaultCmd::Rename(cli_args) => {
                 let args = VaultRenameArgs {
                     root: cli_args.root,
-                    ancien: cli_args.ancien,
-                    nouveau: cli_args.nouveau,
+                    current_title: cli_args.current_title,
+                    new_title: cli_args.new_title,
                     tenant: cli_args.tenant,
                 };
                 let report = vault_rename(args).await?;
@@ -489,6 +644,21 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
             VaultCmd::Forget { cmd } => vault_forget_cmd::run_forget(cmd).await,
+            VaultCmd::Create(a) => run_vault_lifecycle_cli(a, VaultLifecycleOpCli::Create).await,
+            VaultCmd::Suspend(a) => run_vault_lifecycle_cli(a, VaultLifecycleOpCli::Suspend).await,
+            VaultCmd::SoftDelete(a) => {
+                run_vault_lifecycle_cli(a, VaultLifecycleOpCli::SoftDelete).await
+            }
+            VaultCmd::Purge {
+                vault_id,
+                execute,
+                limit,
+                url,
+                token_file,
+            } => {
+                use gradatum_admin::admin_cmd::{Conn, run_vault_purge};
+                run_vault_purge(Conn { url, token_file }, vault_id, execute, limit).await
+            }
         },
         Cmd::Code { cmd } => match cmd {
             CodeCmd::Ingest(cli_args) => {
@@ -534,6 +704,94 @@ async fn main() -> anyhow::Result<()> {
                     report.duration_ms,
                 );
                 Ok(())
+            }
+        },
+        Cmd::Delete {
+            id,
+            tenant,
+            url,
+            token_file,
+            execute,
+        } => {
+            use gradatum_admin::admin_cmd::{Conn, run_delete};
+            let conn = Conn { url, token_file };
+            run_delete(conn, id, tenant, execute).await
+        }
+        Cmd::Archives { cmd } => match cmd {
+            ArchivesCmd::List {
+                vault,
+                section,
+                since_ms,
+                until_ms,
+                include_gc,
+                include_restored,
+                limit,
+                offset,
+                tenant,
+                url,
+                token_file,
+            } => {
+                use gradatum_admin::admin_cmd::{ArchivesListArgs, Conn, run_archives_list};
+                let conn = Conn { url, token_file };
+                let args = ArchivesListArgs {
+                    vault,
+                    section,
+                    since_ms,
+                    until_ms,
+                    include_gc,
+                    include_restored,
+                    limit,
+                    offset,
+                    tenant,
+                };
+                run_archives_list(conn, args).await
+            }
+            ArchivesCmd::Purge {
+                id,
+                tenant,
+                url,
+                token_file,
+                execute,
+            } => {
+                use gradatum_admin::admin_cmd::{Conn, run_archives_purge};
+                let conn = Conn { url, token_file };
+                run_archives_purge(conn, id, tenant, execute).await
+            }
+            ArchivesCmd::Restore {
+                id,
+                from,
+                to,
+                section,
+                tenant,
+                url,
+                token_file,
+                execute,
+            } => {
+                use gradatum_admin::admin_cmd::{
+                    ArchivesRestoreRangeArgs, Conn, run_archives_restore_one,
+                    run_archives_restore_range,
+                };
+                let conn = Conn { url, token_file };
+                let range_mode = from.is_some() || to.is_some() || section.is_some();
+                match (id, range_mode) {
+                    (Some(id), false) => run_archives_restore_one(conn, id, tenant, execute).await,
+                    (None, true) => {
+                        let args = ArchivesRestoreRangeArgs {
+                            from_ms: from,
+                            to_ms: to,
+                            section,
+                            tenant,
+                            execute,
+                        };
+                        run_archives_restore_range(conn, args).await
+                    }
+                    (Some(_), true) => anyhow::bail!(
+                        "modes exclusifs : fournir SOIT <id>, SOIT --from/--to/--section, pas les deux"
+                    ),
+                    (None, false) => anyhow::bail!(
+                        "specify an <id> (single mode) or --from/--to/--section (range mode)"
+                    ),
+                }
             }
         },
         Cmd::ProjectMap { cmd } => match cmd {
@@ -641,7 +899,7 @@ async fn main() -> anyhow::Result<()> {
                 let features = export_features(&root, &vault, opts).await?;
                 // Sérialisation JSON sur stdout (opérateur redirige ou pipe vers CI).
                 let json = serde_json::to_string_pretty(&features)
-                    .context("sérialisation JSON export-features")?;
+                    .context("export-features JSON serialization")?;
                 println!("{json}");
                 Ok(())
             }
@@ -704,6 +962,32 @@ async fn main() -> anyhow::Result<()> {
             }
         },
     }
+}
+
+/// Local alias for the vault lifecycle operations, mapped onto
+/// `admin_cmd::VaultLifecycleOp`.
+enum VaultLifecycleOpCli {
+    Create,
+    Suspend,
+    SoftDelete,
+}
+
+/// Wires a `vault create|suspend|soft-delete` command onto the internal admin API.
+async fn run_vault_lifecycle_cli(
+    args: VaultLifecycleCliArgs,
+    op: VaultLifecycleOpCli,
+) -> anyhow::Result<()> {
+    use gradatum_admin::admin_cmd::{Conn, VaultLifecycleOp, run_vault_lifecycle};
+    let conn = Conn {
+        url: args.url,
+        token_file: args.token_file,
+    };
+    let op = match op {
+        VaultLifecycleOpCli::Create => VaultLifecycleOp::Create,
+        VaultLifecycleOpCli::Suspend => VaultLifecycleOp::Suspend,
+        VaultLifecycleOpCli::SoftDelete => VaultLifecycleOp::SoftDelete,
+    };
+    run_vault_lifecycle(conn, op, args.vault_id).await
 }
 
 #[cfg(test)]

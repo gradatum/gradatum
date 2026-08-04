@@ -55,7 +55,7 @@ async fn sqlite_index_is_document_store_via_dyn() {
     // get_content_hash retourne donc Err(Storage("content_hash trop court")).
     // On teste que la méthode est câblée (pas de panic, pas de "method not found").
     let ulid = note_id_str.parse::<ulid::Ulid>().unwrap();
-    let hash_result = store.get_content_hash(NoteId(ulid)).await;
+    let hash_result = store.get_content_hash("main", NoteId(ulid)).await;
     // Résultat acceptable : Ok(Some(_)) avec 32 bytes OU Err(Storage) si stub 1-byte.
     // Les deux prouvent que la méthode de trait est résolue et dispatche correctement.
     assert!(
@@ -102,13 +102,13 @@ async fn sqlite_index_is_vector_store_via_dyn() {
     // insert_note_embedding via dyn VectorStore
     let dim: u16 = 3;
     vstore
-        .insert_note_embedding(&note_id, "test-embedder", dim, &[1.0f32, 0.0, 0.0])
+        .insert_note_embedding("main", &note_id, "test-embedder", dim, &[1.0f32, 0.0, 0.0])
         .await
         .expect("insert_note_embedding via dyn VectorStore ne doit pas échouer");
 
     // get_note_embedding via dyn VectorStore
     let emb = vstore
-        .get_note_embedding(&note_id, "test-embedder")
+        .get_note_embedding("main", &note_id, "test-embedder")
         .await
         .expect("get_note_embedding via dyn VectorStore ne doit pas échouer");
     assert!(
@@ -124,7 +124,15 @@ async fn sqlite_index_is_vector_store_via_dyn() {
 
     // search_semantic via dyn VectorStore
     let results = vstore
-        .search_semantic("main", "test-embedder", &[1.0f32, 0.0, 0.0], 5, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "test-embedder",
+            &[1.0f32, 0.0, 0.0],
+            5,
+            None,
+        )
         .await
         .expect("search_semantic via dyn VectorStore ne doit pas échouer");
     assert_eq!(results.len(), 1, "1 note avec embedding attendu");

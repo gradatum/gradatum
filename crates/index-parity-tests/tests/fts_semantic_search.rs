@@ -94,18 +94,26 @@ async fn semantic_ranks_by_cosine_descending() {
     idx.write_note(&far).await.expect("write far");
 
     // query = [1,0,0,0]. near aligné, mid à 45°, far orthogonal.
-    idx.insert_note_embedding(&near.id, embedder_id, dim, &[1.0, 0.0, 0.0, 0.0])
+    idx.insert_note_embedding("main", &near.id, embedder_id, dim, &[1.0, 0.0, 0.0, 0.0])
         .await
         .expect("emb near");
-    idx.insert_note_embedding(&mid.id, embedder_id, dim, &[1.0, 1.0, 0.0, 0.0])
+    idx.insert_note_embedding("main", &mid.id, embedder_id, dim, &[1.0, 1.0, 0.0, 0.0])
         .await
         .expect("emb mid");
-    idx.insert_note_embedding(&far.id, embedder_id, dim, &[0.0, 0.0, 1.0, 0.0])
+    idx.insert_note_embedding("main", &far.id, embedder_id, dim, &[0.0, 0.0, 1.0, 0.0])
         .await
         .expect("emb far");
 
     let results = idx
-        .search_semantic("main", embedder_id, &[1.0, 0.0, 0.0, 0.0], 10, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            embedder_id,
+            &[1.0, 0.0, 0.0, 0.0],
+            10,
+            None,
+        )
         .await
         .expect("search_semantic");
 
@@ -129,12 +137,12 @@ async fn semantic_roundtrips_embedding() {
     idx.write_note(&note).await.expect("write");
 
     let vec = vec![0.1_f32, 0.2, 0.3, 0.4];
-    idx.insert_note_embedding(&note.id, "emb", 4, &vec)
+    idx.insert_note_embedding("main", &note.id, "emb", 4, &vec)
         .await
         .expect("insert emb");
 
     let got = idx
-        .get_note_embedding(&note.id, "emb")
+        .get_note_embedding("main", &note.id, "emb")
         .await
         .expect("get emb")
         .expect("emb présent");
@@ -151,12 +159,20 @@ async fn semantic_null_query_returns_empty() {
     let idx = make_index().await;
     let note = make_note_with_id(NoteId::new(), minimal_frontmatter("main"), "x");
     idx.write_note(&note).await.expect("write");
-    idx.insert_note_embedding(&note.id, "emb", 4, &[1.0, 0.0, 0.0, 0.0])
+    idx.insert_note_embedding("main", &note.id, "emb", 4, &[1.0, 0.0, 0.0, 0.0])
         .await
         .expect("insert emb");
 
     let results = idx
-        .search_semantic("main", "emb", &[0.0, 0.0, 0.0, 0.0], 10, None)
+        .search_semantic(
+            &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                gradatum_core::scope::VaultId::new("main"),
+            ),
+            "emb",
+            &[0.0, 0.0, 0.0, 0.0],
+            10,
+            None,
+        )
         .await
         .expect("search_semantic vecteur nul");
     assert!(

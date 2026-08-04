@@ -15,7 +15,7 @@ const MAX_SALIENCE_QUERY_CHARS: usize = 512;
 ///
 /// Concatène les titres et les tags des notes récentes (`recent`) en une seule chaîne
 /// de texte utilisable directement comme requête de recherche. La longueur est bornée à
-/// [`MAX_SALIENCE_QUERY_CHARS`] pour éviter les requêtes géantes qui nuisent à la qualité
+/// `MAX_SALIENCE_QUERY_CHARS` pour éviter les requêtes géantes qui nuisent à la qualité
 /// BM25 et à la latence embedding.
 ///
 /// # Retour

@@ -34,8 +34,8 @@ impl PerIpRateLimiter {
         // Quota : 1 jeton toutes les (60 / per_minute) secondes, burst max.
         let refill_interval = Duration::from_secs_f64(60.0 / per_minute as f64);
         // NonZeroU32 : burst est garanti > 0 ici.
-        let burst_nz = NonZeroU32::new(burst)
-            .expect("burst > 0 vérifié ci-dessus — NonZeroU32::new ne peut pas échouer");
+        let burst_nz =
+            NonZeroU32::new(burst).expect("burst > 0 checked above — NonZeroU32::new cannot fail");
 
         let quota = Quota::with_period(refill_interval)
             .expect("refill_interval > 0 — per_minute > 0 garanti")
@@ -58,7 +58,9 @@ impl PerIpRateLimiter {
     /// Computes the minimum wait time in seconds before the next allowed request.
     ///
     /// Used to populate the `retry-after` header.
-    /// Returns `1` when the quota is not exceeded (nominal case; this method should not be called then).
+    /// Returns `0` when the quota is not exceeded (nominal case; this method should not be
+    /// called then). When it is exceeded, returns the remaining wait, floored at `1`
+    /// second — a sub-second wait is reported as `1`, never `0`.
     pub fn wait_time_secs(&self, ip: IpAddr) -> u64 {
         match self.inner.check_key(&ip) {
             Ok(_) => 0,

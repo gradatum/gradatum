@@ -52,7 +52,7 @@ impl ProviderPool {
             .timeout(Duration::from_secs(120))
             .build()
             // SAFETY: reqwest::Client construction can only fail if TLS is unavailable on the system.
-            .expect("construction du client HTTP partagé impossible — TLS système absent");
+            .expect("cannot build shared HTTP client — system TLS missing");
 
         // Generic default capabilities for OpenAI-compat providers.
         let default_caps = Capabilities {
@@ -78,7 +78,7 @@ impl ProviderPool {
                     tracing::debug!(
                         provider = %name,
                         env_var = %env_name,
-                        "variable env api_key absente — provider fonctionnera sans auth"
+                        "api_key env variable absent — provider will run without auth"
                     );
                 }
                 key
@@ -95,13 +95,13 @@ impl ProviderPool {
             ) {
                 Ok(provider) => {
                     providers.insert(name.clone(), Arc::new(provider));
-                    tracing::info!(provider = %name, endpoint = %cfg.endpoint, "provider enregistré");
+                    tracing::info!(provider = %name, endpoint = %cfg.endpoint, "provider registered");
                 }
                 Err(e) => {
                     tracing::warn!(
                         provider = %name,
                         error = %e,
-                        "échec construction provider — exclu du pool"
+                        "provider construction failed — excluded from pool"
                     );
                 }
             }
@@ -200,6 +200,7 @@ mod tests {
             gateway: HashMap::new(),
             vault_aware: Default::default(),
             messages: Default::default(),
+            router: Default::default(),
         }
     }
 

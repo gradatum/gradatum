@@ -1,0 +1,33 @@
+pub mod gradatum_cache
+pub mod gradatum_cache::effective_note
+pub struct gradatum_cache::effective_note::EffectiveNoteCache
+impl gradatum_cache::effective_note::EffectiveNoteCache
+pub fn gradatum_cache::effective_note::EffectiveNoteCache::entry_count(&self) -> u64
+pub async fn gradatum_cache::effective_note::EffectiveNoteCache::get<F, Fut, E>(&self, gradatum_cache::effective_note::CacheKey, F) -> core::result::Result<core::option::Option<alloc::sync::Arc<gradatum_core::note::EffectiveNote>>, E> where F: core::ops::function::FnOnce(gradatum_core::identity::NoteId) -> Fut, Fut: core::future::future::Future<Output = core::result::Result<gradatum_core::identity::ContentHash, E>>
+pub async fn gradatum_cache::effective_note::EffectiveNoteCache::insert(&self, gradatum_cache::effective_note::CacheKey, alloc::sync::Arc<gradatum_core::note::EffectiveNote>, gradatum_core::identity::ContentHash)
+pub async fn gradatum_cache::effective_note::EffectiveNoteCache::invalidate(&self, &gradatum_cache::effective_note::CacheKey)
+pub fn gradatum_cache::effective_note::EffectiveNoteCache::new(gradatum_cache::effective_note::EffectiveNoteCacheConfig) -> Self
+pub async fn gradatum_cache::effective_note::EffectiveNoteCache::run_pending_tasks(&self)
+pub struct gradatum_cache::effective_note::EffectiveNoteCacheConfig
+pub gradatum_cache::effective_note::EffectiveNoteCacheConfig::max_capacity: u64
+pub gradatum_cache::effective_note::EffectiveNoteCacheConfig::time_to_idle: core::time::Duration
+pub gradatum_cache::effective_note::EffectiveNoteCacheConfig::time_to_live: core::time::Duration
+impl core::default::Default for gradatum_cache::effective_note::EffectiveNoteCacheConfig
+pub fn gradatum_cache::effective_note::EffectiveNoteCacheConfig::default() -> Self
+pub type gradatum_cache::effective_note::CacheKey = (gradatum_core::scope::VaultId, gradatum_core::identity::NoteId, u64)
+pub struct gradatum_cache::EffectiveNoteCache
+impl gradatum_cache::effective_note::EffectiveNoteCache
+pub fn gradatum_cache::effective_note::EffectiveNoteCache::entry_count(&self) -> u64
+pub async fn gradatum_cache::effective_note::EffectiveNoteCache::get<F, Fut, E>(&self, gradatum_cache::effective_note::CacheKey, F) -> core::result::Result<core::option::Option<alloc::sync::Arc<gradatum_core::note::EffectiveNote>>, E> where F: core::ops::function::FnOnce(gradatum_core::identity::NoteId) -> Fut, Fut: core::future::future::Future<Output = core::result::Result<gradatum_core::identity::ContentHash, E>>
+pub async fn gradatum_cache::effective_note::EffectiveNoteCache::insert(&self, gradatum_cache::effective_note::CacheKey, alloc::sync::Arc<gradatum_core::note::EffectiveNote>, gradatum_core::identity::ContentHash)
+pub async fn gradatum_cache::effective_note::EffectiveNoteCache::invalidate(&self, &gradatum_cache::effective_note::CacheKey)
+pub fn gradatum_cache::effective_note::EffectiveNoteCache::new(gradatum_cache::effective_note::EffectiveNoteCacheConfig) -> Self
+pub async fn gradatum_cache::effective_note::EffectiveNoteCache::run_pending_tasks(&self)
+pub struct gradatum_cache::EffectiveNoteCacheConfig
+pub gradatum_cache::EffectiveNoteCacheConfig::max_capacity: u64
+pub gradatum_cache::EffectiveNoteCacheConfig::time_to_idle: core::time::Duration
+pub gradatum_cache::EffectiveNoteCacheConfig::time_to_live: core::time::Duration
+impl core::default::Default for gradatum_cache::effective_note::EffectiveNoteCacheConfig
+pub fn gradatum_cache::effective_note::EffectiveNoteCacheConfig::default() -> Self
+pub const gradatum_cache::VERSION: &str
+pub type gradatum_cache::CacheKey = (gradatum_core::scope::VaultId, gradatum_core::identity::NoteId, u64)

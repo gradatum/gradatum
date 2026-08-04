@@ -68,9 +68,6 @@ async fn heuristic_only_llm_disabled_ambiguous_note_returns_pending() {
         heuristic_default_status: None,
         llm_review_enabled: Some(false),
         confidence_threshold: Some(0.7),
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: None,
         llm_review_fallback: None,
     };
@@ -105,9 +102,6 @@ async fn heuristic_only_high_confidence_note_admitted_directly() {
         heuristic_default_status: None,
         llm_review_enabled: Some(false),
         confidence_threshold: Some(0.7),
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: None,
         llm_review_fallback: None,
     };
@@ -161,9 +155,6 @@ async fn llm_review_enabled_calls_llm_and_uses_verdict() {
         heuristic_default_status: None,
         llm_review_enabled: Some(true),
         confidence_threshold: Some(1.0), // Toujours appeler le LLM
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: None,
         llm_review_fallback: None,
     };
@@ -216,9 +207,6 @@ async fn llm_review_server_error_returns_pending_fallback() {
         heuristic_default_status: None,
         llm_review_enabled: Some(true),
         confidence_threshold: Some(1.0), // Toujours appeler le LLM
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: None,
         llm_review_fallback: Some("pending-review-fallback".to_string()),
     };
@@ -263,9 +251,6 @@ async fn llm_review_server_error_with_reject_fallback() {
         heuristic_default_status: None,
         llm_review_enabled: Some(true),
         confidence_threshold: Some(1.0),
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: None,
         llm_review_fallback: Some("reject".to_string()),
     };
@@ -319,9 +304,6 @@ async fn llm_review_max_tokens_propagated_to_backend_request() {
         heuristic_default_status: None,
         llm_review_enabled: Some(true),
         confidence_threshold: Some(1.0), // Force appel LLM sur toutes notes
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: Some(2048), // Valeur à propager
         llm_review_fallback: None,
     };
@@ -384,9 +366,6 @@ async fn section_hint_valid_admits_directly_without_llm() {
         heuristic_default_status: None,
         llm_review_enabled: Some(true),
         confidence_threshold: Some(1.0), // Sans hint, forcerait le LLM
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: None,
         llm_review_fallback: None,
     };
@@ -446,9 +425,6 @@ async fn section_hint_invalid_falls_through_to_normal_path() {
         heuristic_default_status: None,
         llm_review_enabled: Some(true),
         confidence_threshold: Some(1.0), // Force toujours le LLM (confiance heuristique < 1.0)
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: None,
         llm_review_fallback: None,
     };
@@ -489,9 +465,6 @@ async fn section_hint_none_behavior_unchanged() {
         heuristic_default_status: None,
         llm_review_enabled: Some(false),
         confidence_threshold: Some(0.7),
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: None,
         llm_review_fallback: None,
     };
@@ -568,9 +541,6 @@ async fn llm_mock_council_section_propagated() {
         heuristic_default_status: None,
         llm_review_enabled: Some(true),
         confidence_threshold: Some(1.0), // Force toujours le LLM
-        llm_review_endpoint: None,
-        llm_review_model: None,
-        llm_review_timeout_ms: None,
         llm_review_max_tokens: None,
         llm_review_fallback: None,
     };

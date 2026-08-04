@@ -3,7 +3,10 @@ name        = "gradatum-warden"
 version.workspace = true
 edition     = "2021"
 license     = "MIT OR Apache-2.0"
-description = "L0 network guard for Gradatum: IP filter + rate limit + loopback bypass (MVP)"
+description = "Network guard for gradatum: IP CIDR filter + per-IP rate limit + loopback bypass"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 repository.workspace = true
 
 [dependencies]

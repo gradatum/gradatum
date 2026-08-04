@@ -52,7 +52,7 @@ impl OllamaCompatBackend {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .build()
-            .expect("construction reqwest Client avec timeout valide");
+            .expect("reqwest Client build with valid timeout");
         Self {
             client,
             base_url,
@@ -66,7 +66,7 @@ impl OllamaCompatBackend {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .expect("construction reqwest Client avec timeout valide");
+            .expect("reqwest Client build with valid timeout");
         Self { client, ..self }
     }
 }

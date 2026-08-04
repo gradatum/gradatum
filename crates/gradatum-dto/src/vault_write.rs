@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::default_main;
+use gradatum_core::scope::TenantId;
 
 /// Request body for `vault_write` — creates a note via the async queue.
 ///
@@ -23,14 +23,55 @@ pub struct VaultWriteRequest {
     /// Suggested section (optional — the curator may override).
     #[serde(default)]
     pub section_hint: Option<String>,
-    /// Target tenant (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
-    /// Expected SHA-256 hash for optimistic locking (optional, hexadecimal).
+    /// Target tenant (principal) — optional; when omitted the server resolves it
+    /// from the credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
+    /// Expected SHA-256 of the note being overwritten (optional, hexadecimal).
     ///
-    /// When present, the worker checks that the current hash of the note matches
-    /// before writing. On mismatch: terminal job `Conflict` (note not overwritten).
-    /// `None` = unconditional write (backward-compatible).
+    /// **Both the presence AND the value are load-bearing** — but only when `note_id` is
+    /// supplied. Front-gate checks, applied synchronously before the job is enqueued:
+    ///
+    /// - `note_id` absent → the write creates a new note; this field is ignored.
+    /// - `note_id` points at a **live** note → the field is **required**. Omitting it is
+    ///   rejected with **409** (`overwrite without expected_sha256`).
+    /// - `note_id` points at a **ghost** note (indexed, `.md` missing) → supplying the
+    ///   field is rejected with **409** (the hash cannot be checked against any content).
+    /// - `note_id` points at a **never-indexed** ULID → this is a creation: it proceeds
+    ///   **unconditionally**, since there is no current content to compare against.
+    /// - a syntactically invalid value is rejected with **400**, before the checks above.
+    ///
+    /// On the **live-note** path a genuine **compare-and-swap** follows. The write is
+    /// asynchronous: the request answers **202**, and the hash is matched against the stored
+    /// note inside the curate worker (`write_if_match`). A *stale* hash aborts the write and
+    /// drives the job to terminal `JobStatus::Conflict`, leaving the concurrent winner
+    /// intact; the conflict payload carries the winning `current_sha256`.
+    ///
+    /// What this does **not** give you. There is no synchronous **409** on a hash mismatch —
+    /// poll `job_status` until `terminal = true`, or the conflict goes unnoticed. The
+    /// compare-and-swap is not atomic in the store either: `write_if_match` reads, compares,
+    /// then writes, and no storage-layer lock holds that sequence together.
+    ///
+    /// Its protection is also **scoped to one write path**, and it is **directional**. The
+    /// hash is consulted by the curate handler only, so it guards a live note against a
+    /// competing *curate* writer — not against every writer. `forget` carries no
+    /// `expected_sha256` at all, and `distill` ignores the one it carries; both write
+    /// unconditionally, from workers that run alongside `curate`. Which direction that
+    /// leaves open matters, and it is not the intuitive one:
+    ///
+    /// - **A read-modify-write cannot undo a `forget`.** Not because `forget` checks a hash
+    ///   — it checks none — but because it rewrites the note, which invalidates the hash a
+    ///   racing write is carrying; that write then lands in `Conflict`. Content that was
+    ///   forgotten stays forgotten, even under a concurrent update.
+    /// - **The reverse is not guarded.** `forget` and `distill` can overwrite a concurrent
+    ///   read-modify-write without consulting its hash. For `forget` that is the intent. For
+    ///   `distill` it is a real gap, bounded only by that pipeline's reach: the distill cron
+    ///   is disabled unless an operator turns it on, runs on a weekly schedule by default,
+    ///   and enqueues nothing below a per-section pressure threshold (`distill_cron`).
+    ///
+    /// Read this field as a guard against a competing read-modify-write of the same note,
+    /// never as a lock on the note: no deployment shape makes it one.
     ///
     /// Format: 64 lowercase hexadecimal characters (SHA-256 = 32 bytes).
     /// Example: `"a3f1c2d4..."`
@@ -63,7 +104,7 @@ pub struct VaultWriteRequest {
     ///
     /// An unparseable value is rejected by the server with **400 InvalidInput**.
     ///
-    /// Dates arbitraires (passé/futur) acceptées by-design — pas de borne sémantique.
+    /// Arbitrary dates (past/future) accepted by-design — no semantic bound.
     #[serde(default)]
     pub occurred_at: Option<String>,
 }
@@ -72,7 +113,7 @@ pub struct VaultWriteRequest {
 mod tests {
     use super::*;
 
-    /// occurred_at présent → désérialisé en Some.
+    /// occurred_at present → deserialized to Some.
     #[test]
     fn vault_write_request_occurred_at_present_parses_to_some() {
         let json = r#"{"title":"T","body":"B","occurred_at":"2026-01-15"}"#;

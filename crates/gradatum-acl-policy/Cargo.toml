@@ -6,7 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AclPolicy trait + globset matching + ACLFilter visibility marker"
+description = "ACL policy engine: globset matching, deny-wins, default-deny"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 gradatum-core.workspace = true

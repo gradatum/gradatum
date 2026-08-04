@@ -8,6 +8,7 @@
 //! |------|------|--------|-------|
 //! | `engine_requests_total` | Counter | route, status_code | Processed requests |
 //! | `engine_request_latency_ms` | Histogram | route, status_code | Latency in ms |
+//! | `engine_event_log_errors_total` | Counter | status_code | Non-2xx / undelivered event-log POSTs (observability) |
 //!
 //! ## Cardinality
 //!
@@ -34,6 +35,14 @@ pub struct ReqLabels {
     pub status_code: String,
 }
 
+/// Labels for the event-log delivery error counter.
+#[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
+pub struct EventLogErrLabels {
+    /// HTTP status code as a string (e.g. `"401"`, `"500"`), or `"transport"`
+    /// when the POST failed before any HTTP response was received.
+    pub status_code: String,
+}
+
 /// Application metrics for `gradatum-engine`.
 ///
 /// Thread-safe via an internal `Mutex<Registry>`.
@@ -41,6 +50,8 @@ pub struct EngineMetrics {
     registry: Mutex<Registry>,
     requests: Family<ReqLabels, Counter>,
     latency: Family<ReqLabels, Histogram>,
+    /// Non-2xx / undelivered event-log POST attempts.
+    event_log_errors: Family<EventLogErrLabels, Counter>,
 }
 
 impl EngineMetrics {
@@ -51,6 +62,8 @@ impl EngineMetrics {
             // Buckets : 10ms → ~10s en progression exponentielle (base 2, 10 niveaux)
             Histogram::new(exponential_buckets(10.0, 2.0, 10))
         });
+
+        let event_log_errors: Family<EventLogErrLabels, Counter> = Family::default();
 
         let mut registry = Registry::default();
         registry.register(
@@ -63,11 +76,17 @@ impl EngineMetrics {
             "Engine request latency in milliseconds",
             latency.clone(),
         );
+        registry.register(
+            "engine_event_log_errors",
+            "Event-log POST attempts that returned a non-2xx status or were undelivered",
+            event_log_errors.clone(),
+        );
 
         Self {
             registry: Mutex::new(registry),
             requests,
             latency,
+            event_log_errors,
         }
     }
 
@@ -81,6 +100,23 @@ impl EngineMetrics {
         self.latency
             .get_or_create(&labels)
             .observe(latency_ms as f64);
+    }
+
+    /// Records a failed (non-2xx) or undelivered event-log POST attempt.
+    ///
+    /// `status_code` is the HTTP status as a string (e.g. `"401"`, `"500"`), or
+    /// `"transport"` when the POST failed before any HTTP response was received.
+    ///
+    /// A rising `engine_event_log_errors_total` signals that the engine's
+    /// event-log is degraded (JWT expiry/revocation, server down). This is the
+    /// observability that was missing when a 401 silently killed the event-log
+    /// for days on end — the counter turns an invisible outage into a scrape.
+    pub fn record_event_log_error(&self, status_code: &str) {
+        self.event_log_errors
+            .get_or_create(&EventLogErrLabels {
+                status_code: status_code.into(),
+            })
+            .inc();
     }
 
     /// Encodes metrics in OpenMetrics text format (for `/metrics`).

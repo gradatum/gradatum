@@ -150,18 +150,15 @@ async fn open_queue_pool(root: &std::path::Path) -> Result<SqlitePool> {
     // SSOT : chemin via helper canonique — jamais root.join(...) manuel.
     let db_path = queue_db_path(root);
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    let pool = SqlitePool::connect(&url).await.with_context(|| {
-        format!(
-            "impossible d'ouvrir la queue SQLite : {}",
-            db_path.display()
-        )
-    })?;
+    let pool = SqlitePool::connect(&url)
+        .await
+        .with_context(|| format!("cannot open the SQLite queue: {}", db_path.display()))?;
     apply_sqlite_pragmas(&pool)
         .await
-        .context("erreur pragmas WAL queue")?;
+        .context("queue WAL pragmas error")?;
     run_migrations(&pool)
         .await
-        .context("erreur migrations queue")?;
+        .context("queue migrations error")?;
     Ok(pool)
 }
 
@@ -192,7 +189,7 @@ fn parse_status(s: &str) -> Result<JobStatus> {
         "dlq" => Ok(JobStatus::DLQ),
         "cancelled" | "canceled" => Ok(JobStatus::Cancelled),
         other => anyhow::bail!(
-            "statut inconnu : '{}' (valeurs valides : pending, running, waiting, done, failed, dlq, cancelled)",
+            "unknown status: '{}' (valid values: pending, running, waiting, done, failed, dlq, cancelled)",
             other
         ),
     }
@@ -220,10 +217,10 @@ async fn jobs_list(args: JobsListArgs) -> Result<()> {
     let records = store
         .list(filter)
         .await
-        .context("erreur lors du listing des jobs")?;
+        .context("error while listing jobs")?;
 
     if records.is_empty() {
-        println!("Aucun job trouvé.");
+        println!("No job found.");
         return Ok(());
     }
 
@@ -247,20 +244,20 @@ async fn jobs_get(args: JobsGetArgs) -> Result<()> {
     let id = args
         .id
         .parse::<Ulid>()
-        .with_context(|| format!("ULID invalide : '{}'", args.id))?;
+        .with_context(|| format!("invalid ULID: '{}'", args.id))?;
 
     let pool = open_queue_pool(&args.root).await?;
     let store = SqliteQueueStore::new(pool);
 
-    match store.get(id).await.context("erreur get job")? {
+    match store.get(id, None).await.context("get job error")? {
         None => {
-            eprintln!("Job {} introuvable.", id);
+            eprintln!("Job {} not found.", id);
             std::process::exit(1);
         }
         Some(record) => {
             // Pretty-print the full JobRecord as JSON
             let json = serde_json::to_string_pretty(&record)
-                .context("erreur sérialisation JSON JobRecord")?;
+                .context("JobRecord JSON serialization error")?;
             println!("{}", json);
         }
     }
@@ -273,15 +270,15 @@ async fn jobs_cancel(args: JobsCancelArgs) -> Result<()> {
     let id = args
         .id
         .parse::<Ulid>()
-        .with_context(|| format!("ULID invalide : '{}'", args.id))?;
+        .with_context(|| format!("invalid ULID: '{}'", args.id))?;
 
     let pool = open_queue_pool(&args.root).await?;
     let store = SqliteQueueStore::new(pool);
 
     // Check current status before cancellation
-    let record = match store.get(id).await.context("erreur get job")? {
+    let record = match store.get(id, None).await.context("get job error")? {
         None => {
-            eprintln!("Job {} introuvable.", id);
+            eprintln!("Job {} not found.", id);
             std::process::exit(1);
         }
         Some(r) => r,
@@ -289,16 +286,13 @@ async fn jobs_cancel(args: JobsCancelArgs) -> Result<()> {
 
     match record.lifecycle.status {
         JobStatus::Running => {
-            eprintln!(
-                "Impossible d'annuler le job {} : statut Running (409 Conflict).",
-                id
-            );
-            eprintln!("Attendre la fin d'exécution ou utiliser `fail_dlq` si le worker est mort.");
+            eprintln!("Cannot cancel job {} : Running status (409 Conflict).", id);
+            eprintln!("Wait for execution to finish or use `fail_dlq` if the worker is dead.");
             std::process::exit(1);
         }
         JobStatus::Done | JobStatus::DLQ | JobStatus::Cancelled => {
             println!(
-                "Job {} déjà terminal (statut={:?}) — annulation idempotente.",
+                "Job {} already terminal (status={:?}) — idempotent cancellation.",
                 id, record.lifecycle.status
             );
             return Ok(());
@@ -307,11 +301,11 @@ async fn jobs_cancel(args: JobsCancelArgs) -> Result<()> {
     }
 
     store
-        .cancel(id)
+        .cancel(id, None)
         .await
-        .context("erreur lors de l'annulation du job")?;
+        .context("error while cancelling the job")?;
 
-    println!("Job {} annulé (statut=Cancelled).", id);
+    println!("Job {} cancelled (status=Cancelled).", id);
     Ok(())
 }
 
@@ -329,7 +323,7 @@ async fn jobs_dlq(args: JobsDlqArgs) -> Result<()> {
     if let Some(ref id_str) = args.replay {
         let id = id_str
             .parse::<Ulid>()
-            .with_context(|| format!("ULID invalide : '{}'", id_str))?;
+            .with_context(|| format!("invalid ULID: '{}'", id_str))?;
         return replay_single(&store, &pool, id).await;
     }
 
@@ -339,17 +333,17 @@ async fn jobs_dlq(args: JobsDlqArgs) -> Result<()> {
         limit: args.limit.clamp(1, 200),
         ..Default::default()
     };
-    let dlq_jobs = store.list(filter).await.context("erreur listing DLQ")?;
+    let dlq_jobs = store.list(filter).await.context("DLQ listing error")?;
 
     if dlq_jobs.is_empty() {
-        println!("DLQ vide — aucun job en Dead Letter Queue.");
+        println!("DLQ empty — no job in the Dead Letter Queue.");
         return Ok(());
     }
 
     println!("{} job(s) en DLQ :", dlq_jobs.len());
     println!("{}", "─".repeat(90));
     for r in &dlq_jobs {
-        let last_err = r.retry.last_error.as_deref().unwrap_or("(sans détail)");
+        let last_err = r.retry.last_error.as_deref().unwrap_or("(no detail)");
         println!(
             "{}  retries={}/{}  last_error={}",
             format_record_short(r),
@@ -369,12 +363,12 @@ async fn jobs_dlq(args: JobsDlqArgs) -> Result<()> {
             match replay_single(&store, &pool, r.id).await {
                 Ok(()) => replayed += 1,
                 Err(e) => {
-                    eprintln!("  ERREUR replay {} : {e}", r.id);
+                    eprintln!("  REPLAY ERROR {} : {e}", r.id);
                     errors += 1;
                 }
             }
         }
-        println!("Replay terminé : {} OK, {} erreur(s).", replayed, errors);
+        println!("Replay complete: {} OK, {} error(s).", replayed, errors);
     }
 
     Ok(())
@@ -391,9 +385,9 @@ async fn replay_single(_store: &SqliteQueueStore, pool: &SqlitePool, id: Ulid) -
         SET status        = 'Pending',
             lease_until   = NULL,
             scheduled_at  = datetime('now'),
-            -- Réinitialise le compteur de tentatives : sans reset, le job replayed
-            -- aurait attempt_count >= max_attempts et serait immédiatement renvoyé
-            -- en DLQ par promote_retries dès le prochain sweep (30s).
+            -- Reset the attempt counter: without reset, the replayed job would
+            -- have attempt_count >= max_attempts and be immediately sent back
+            -- to DLQ by promote_retries on the next sweep (30s).
             attempt_count = 0,
             last_error    = NULL
         WHERE id = ?
@@ -403,10 +397,10 @@ async fn replay_single(_store: &SqliteQueueStore, pool: &SqlitePool, id: Ulid) -
     .bind(&id_str)
     .execute(pool)
     .await
-    .with_context(|| format!("erreur replay DLQ job {}", id))?;
+    .with_context(|| format!("DLQ replay error job {}", id))?;
 
     if result.rows_affected() == 0 {
-        anyhow::bail!("Job {} non trouvé en DLQ (statut ≠ DLQ ou ID inconnu)", id);
+        anyhow::bail!("Job {} not found in DLQ (status ≠ DLQ or unknown ID)", id);
     }
 
     println!("  Job {} remis en Pending (replay DLQ OK).", id);
@@ -419,13 +413,13 @@ async fn replay_single(_store: &SqliteQueueStore, pool: &SqlitePool, id: Ulid) -
 fn parse_older_than(spec: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     let spec = spec.trim();
     let days_str = spec.strip_suffix('d').with_context(|| {
-        format!("--older-than: format attendu '<N>d' (ex. '30d'), reçu '{spec}'")
+        format!("--older-than: expected format '<N>d' (e.g. '30d'), received '{spec}'")
     })?;
     let days: i64 = days_str
         .parse()
-        .with_context(|| format!("--older-than: nombre de jours invalide dans '{spec}'"))?;
+        .with_context(|| format!("--older-than: invalid number of days in '{spec}'"))?;
     if days < 0 {
-        anyhow::bail!("--older-than: le nombre de jours doit être positif (reçu '{spec}')");
+        anyhow::bail!("--older-than: the number of days must be positive (received '{spec}')");
     }
     Ok(chrono::Utc::now() - chrono::Duration::days(days))
 }
@@ -449,22 +443,22 @@ async fn jobs_dlq_prune(
     let targeted = store
         .count_dlq_jobs(cutoff)
         .await
-        .context("erreur comptage DLQ (prune)")?;
+        .context("DLQ count error (prune)")?;
 
     let scope = match older_than {
-        Some(spec) => format!("plus vieux que {spec}"),
-        None => "tous".to_string(),
+        Some(spec) => format!("older than {spec}"),
+        None => "all".to_string(),
     };
 
     if targeted == 0 {
-        println!("Prune DLQ ({scope}) : aucun job ciblé — rien à supprimer.");
+        println!("Prune DLQ ({scope}): no job targeted — nothing to delete.");
         return Ok(());
     }
 
     if !apply {
         println!(
-            "Prune DLQ ({scope}) — DRY-RUN : {targeted} job(s) seraient supprimés DÉFINITIVEMENT.\n\
-             Relancer avec --apply pour exécuter la suppression (irréversible)."
+            "Prune DLQ ({scope}) — DRY-RUN: {targeted} job(s) would be PERMANENTLY deleted.\n\
+             Re-run with --apply to perform the deletion (irreversible)."
         );
         return Ok(());
     }
@@ -473,8 +467,8 @@ async fn jobs_dlq_prune(
     let deleted = store
         .delete_dlq_jobs(cutoff)
         .await
-        .context("erreur suppression DLQ (prune)")?;
-    println!("Prune DLQ ({scope}) : {deleted} job(s) supprimé(s) définitivement.");
+        .context("DLQ deletion error (prune)")?;
+    println!("Prune DLQ ({scope}): {deleted} job(s) permanently deleted.");
     Ok(())
 }
 

@@ -115,7 +115,7 @@ impl IdentityFixture {
 
         // Indexer la note pour que le chemin reclassification puisse la lire.
         index
-            .upsert_note_title(&NoteId(note_id), "identity/test-agent")
+            .upsert_note_title("main", &NoteId(note_id), "identity/test-agent")
             .await
             .expect("upsert_note_title");
 
@@ -207,6 +207,7 @@ async fn identity_reclass_is_noop() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await
     .expect("handle_curate identity reclassify doit retourner Ok");

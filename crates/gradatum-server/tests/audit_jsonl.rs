@@ -19,6 +19,7 @@ fn make_audit_event(event: &str, outcome: &str) -> HttpAuditEvent {
             kid: "test-kid".into(),
             sub: "test-agent".into(),
             aud: "gradatum".into(),
+            jti: None,
         },
         tenant_id: "main".into(),
         locus: "decisions/test".into(),

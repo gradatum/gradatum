@@ -133,6 +133,18 @@ fn vault_err_to_client(e: VaultError, note_id: &str) -> InternalClientError {
     }
 }
 
+/// Rendu hexadécimal minuscule d'un hash brut (colonne `notes.content_hash`), pour les
+/// lectures servies depuis l'index seul (aucun `.md` du vault demandé).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+}
+
 fn section_to_str(section: Section) -> String {
     // Délègue à la SSOT `Section::as_str` (IMPORT > COPIER) : évite une landmine
     // de match exhaustif à chaque extension de section (spec §16 B2).
@@ -240,7 +252,14 @@ impl InternalClient for TestInternalClient {
                 .map_err(|e| vault_err_to_client(e, &req.note_id))?
         };
 
-        let _ = self.index.upsert_note_title(&written.id, &req.title).await;
+        let _ = self
+            .index
+            .upsert_note_title(
+                written.frontmatter.vault_id.as_str(),
+                &written.id,
+                &req.title,
+            )
+            .await;
 
         if let Some(temporal) = &req.temporal {
             let anchor_src = match temporal.anchor_src.as_str() {
@@ -265,7 +284,10 @@ impl InternalClient for TestInternalClient {
         }
 
         if let Some(trust) = req.trust {
-            let _ = self.index.set_note_trust(&written.id, trust).await;
+            let _ = self
+                .index
+                .set_note_trust(written.frontmatter.vault_id.as_str(), &written.id, trust)
+                .await;
         }
 
         Ok(PersistOkResponse {
@@ -287,7 +309,7 @@ impl InternalClient for TestInternalClient {
 
         let dim = req.vector.len();
         self.index
-            .insert_note_embedding(&note_id, &req.embedder_id, req.dim, &req.vector)
+            .insert_note_embedding("main", &note_id, &req.embedder_id, req.dim, &req.vector)
             .await
             .map_err(|e| InternalClientError::ServerError {
                 status: 500,
@@ -339,6 +361,22 @@ impl InternalClient for TestInternalClient {
             note_id: req.note_id.clone(),
             status: "ok".to_string(),
         })
+    }
+
+    /// Miroir de `POST /internal/v1/note/:ulid/forget-resync` : ré-affirme la marque
+    /// d'index SANS toucher au frontmatter ni aux colonnes d'audit.
+    async fn resync_forget_index(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<(), InternalClientError> {
+        self.index
+            .reassert_forgotten(vault_id, ulid)
+            .await
+            .map_err(|e| InternalClientError::ServerError {
+                status: 500,
+                body: format!("reassert_forgotten failed: {e}"),
+            })
     }
 
     async fn persist_distill(
@@ -443,11 +481,21 @@ impl InternalClient for TestInternalClient {
             .map_err(|e| vault_err_to_client(e, &req.note_id))?;
 
         if !req.title.is_empty() {
-            let _ = self.index.upsert_note_title(&written.id, &req.title).await;
+            let _ = self
+                .index
+                .upsert_note_title(
+                    written.frontmatter.vault_id.as_str(),
+                    &written.id,
+                    &req.title,
+                )
+                .await;
         }
 
         if let Some(trust) = req.trust {
-            let _ = self.index.set_note_trust(&written.id, trust).await;
+            let _ = self
+                .index
+                .set_note_trust(written.frontmatter.vault_id.as_str(), &written.id, trust)
+                .await;
         }
 
         Ok(PersistOkResponse {
@@ -456,7 +504,7 @@ impl InternalClient for TestInternalClient {
         })
     }
 
-    async fn delete_note(&self, ulid: &str) -> Result<(), InternalClientError> {
+    async fn delete_note(&self, vault_id: &str, ulid: &str) -> Result<(), InternalClientError> {
         let note_id =
             Ulid::from_string(ulid)
                 .map(NoteId)
@@ -470,13 +518,35 @@ impl InternalClient for TestInternalClient {
             .await
             .map_err(|e| vault_err_to_client(e, ulid))?;
 
-        let _ = self.index.delete_note_from_index("main", ulid).await;
-        let _ = self.index.delete_redirect_by_ulid(ulid).await;
+        let _ = self.index.delete_note_from_index(vault_id, ulid).await;
+        let _ = self.index.delete_redirect_by_ulid(vault_id, ulid).await;
 
         Ok(())
     }
 
-    async fn get_note(&self, ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+    /// Lecture **scopée par vault** (A2-bis) — miroir de
+    /// `GET /internal/v1/note/:ulid?vault_id=…`.
+    ///
+    /// Le harnais n'a qu'UN vault physique : le `.md` ne peut donc pas, à lui seul,
+    /// distinguer deux homonymes. Ce qui distingue les vaults ici, c'est l'INDEX, dont la
+    /// clé est composite `(vault_id, id)` (migration 0032) — la **même source** que les
+    /// listings (`search_fts_for_forget`, `list_notes_by_locus`, `list_notes_by_agent`).
+    ///
+    /// Règle :
+    /// - l'index tranche l'**existence** et les métadonnées scopées (`section`, `status`) ;
+    /// - le `.md` n'enrichit (corps, hash, tags, `forgotten`, `processed`) que s'il
+    ///   appartient au vault demandé, sinon ses colonnes d'index font foi.
+    ///
+    /// Repli sur le `.md` seul **uniquement** quand l'index n'a pas de ligne ET que le
+    /// vault demandé est le vault physique : c'est le comportement historique, préservé
+    /// pour les tests qui écrivent hors index. Pour tout autre vault, l'absence de ligne
+    /// est un `NotFound` — jamais un repli silencieux sur l'homonyme du vault physique,
+    /// qui est exactement le trou que ce lot ferme.
+    async fn get_note(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError> {
         let note_id =
             Ulid::from_string(ulid)
                 .map(NoteId)
@@ -484,39 +554,109 @@ impl InternalClient for TestInternalClient {
                     status: 400,
                     body: format!("{e}"),
                 })?;
-        let note = self
-            .vault
-            .read_note(note_id)
+
+        let record = self.index.get_note(vault_id, ulid).await.map_err(|e| {
+            InternalClientError::ServerError {
+                status: 500,
+                body: format!("{e}"),
+            }
+        })?;
+
+        let is_physical_vault = self.vault.vault_id().as_str() == vault_id;
+        let md = if is_physical_vault {
+            self.vault.read_note(note_id).await.ok()
+        } else {
+            None
+        };
+
+        match (record, md) {
+            // Ligne d'index + `.md` du même vault : métadonnées de l'index, corps du `.md`.
+            (Some(rec), Some(note)) => Ok(NoteReadDto {
+                note_id: ulid.to_string(),
+                sha256_hex: note.content_hash.hex(),
+                body: note.body.markdown,
+                section: rec.section,
+                status: rec.status,
+                tags: note
+                    .frontmatter
+                    .tags
+                    .iter()
+                    .map(|t| t.as_str().to_string())
+                    .collect(),
+                forgotten: note.frontmatter.forgotten.unwrap_or(false),
+                processed: note
+                    .frontmatter
+                    .extra
+                    .get("processed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            }),
+            // Ligne d'index sans `.md` accessible dans ce vault : l'index fait foi seul.
+            (Some(rec), None) => Ok(NoteReadDto {
+                note_id: ulid.to_string(),
+                sha256_hex: hex_lower(&rec.content_hash),
+                body: rec.body_text,
+                section: rec.section,
+                status: rec.status,
+                tags: rec
+                    .tags_raw
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+                forgotten: false,
+                processed: false,
+            }),
+            // Pas de ligne d'index mais un `.md` du vault physique : comportement
+            // historique (tests qui écrivent le `.md` sans passer par l'index).
+            (None, Some(note)) => Ok(NoteReadDto {
+                note_id: ulid.to_string(),
+                sha256_hex: note.content_hash.hex(),
+                body: note.body.markdown,
+                section: section_to_str(note.frontmatter.section),
+                status: status_to_str(note.frontmatter.status),
+                tags: note
+                    .frontmatter
+                    .tags
+                    .iter()
+                    .map(|t| t.as_str().to_string())
+                    .collect(),
+                forgotten: note.frontmatter.forgotten.unwrap_or(false),
+                processed: note
+                    .frontmatter
+                    .extra
+                    .get("processed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            }),
+            // Absente de CE vault.
+            (None, None) => Err(InternalClientError::NotFound {
+                ulid: ulid.to_string(),
+            }),
+        }
+    }
+
+    /// Re-check statut SCOPÉ (C4-1e W3) : délègue à l'INDEX réel
+    /// (`get_note_status(vault_id, id)`, `WHERE vault_id = ?1 AND id = ?2`) — même
+    /// source que `list_garbage`, contrairement à `get_note` qui lit le `.md` mono-vault.
+    async fn get_note_status(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<Option<String>, InternalClientError> {
+        self.index
+            .get_note_status(vault_id, ulid)
             .await
-            .map_err(|e| vault_err_to_client(e, ulid))?;
-
-        let sha256_hex = note.content_hash.hex();
-        let tags: Vec<String> = note
-            .frontmatter
-            .tags
-            .iter()
-            .map(|t| t.as_str().to_string())
-            .collect();
-
-        Ok(NoteReadDto {
-            note_id: ulid.to_string(),
-            sha256_hex,
-            body: note.body.markdown,
-            section: section_to_str(note.frontmatter.section),
-            status: status_to_str(note.frontmatter.status),
-            tags,
-            forgotten: note.frontmatter.forgotten.unwrap_or(false),
-            processed: note
-                .frontmatter
-                .extra
-                .get("processed")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-        })
+            .map(|opt| opt.map(|s| s.to_string()))
+            .map_err(|e| InternalClientError::ServerError {
+                status: 500,
+                body: format!("{e}"),
+            })
     }
 
     async fn get_note_embedding(
         &self,
+        vault_id: &str,
         ulid: &str,
         embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
@@ -528,7 +668,11 @@ impl InternalClient for TestInternalClient {
                     body: format!("{e}"),
                 })?;
 
-        match self.index.get_note_embedding(&note_id, embedder_id).await {
+        match self
+            .index
+            .get_note_embedding(vault_id, &note_id, embedder_id)
+            .await
+        {
             Ok(Some(vector)) => Ok(EmbeddingReadDto {
                 note_id: ulid.to_string(),
                 embedder_id: embedder_id.to_string(),
@@ -545,7 +689,7 @@ impl InternalClient for TestInternalClient {
         }
     }
 
-    async fn get_trust(&self, ulid: &str) -> Result<f32, InternalClientError> {
+    async fn get_trust(&self, vault_id: &str, ulid: &str) -> Result<f32, InternalClientError> {
         let note_id =
             Ulid::from_string(ulid)
                 .map(NoteId)
@@ -554,7 +698,7 @@ impl InternalClient for TestInternalClient {
                     body: format!("{e}"),
                 })?;
 
-        match self.index.get_trust(&note_id).await {
+        match self.index.get_trust(vault_id, &note_id).await {
             Ok(Some(trust)) => Ok(trust),
             Ok(None) => Err(InternalClientError::NotFound {
                 ulid: ulid.to_string(),

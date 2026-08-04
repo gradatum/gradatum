@@ -3,13 +3,12 @@
 //! Extracts `[[...]]` references from a note body and attempts to resolve
 //! them by exact title match or Jaro-Winkler similarity.
 //!
-//! ## Format wikilink ULID-first (B5 fix)
+//! ## ULID-first wikilink format
 //!
-//! Les wikilinks écrits par le vault ont la forme `[[section:ULID]]` (ex :
-//! `[[decisions:01KVBTMYNK4XXZJAKWMTB4AM9K]]`). La fonction
-//! [`parse_ulid_target`] détecte si la cible est un ULID valide, permettant
-//! au worker de court-circuiter le lookup H1 et de résoudre directement par
-//! identifiant — avec vérification d'existence sur le serveur.
+//! Wikilinks written by the vault take the form `[[section:ULID]]`, for example
+//! `[[decisions:01KVBTMYNK4XXZJAKWMTB4AM9K]]`. [`parse_ulid_target`] detects whether the
+//! target is a valid ULID, which lets the worker skip the title lookup and resolve by
+//! identifier instead — still checking existence server-side.
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -20,7 +19,7 @@ use ulid::Ulid;
 /// Group 1: the target (before the optional `|`).
 static WIKILINK_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]")
-        .expect("Pattern wikilink est une constante — ne peut pas échouer à la compilation")
+        .expect("wikilink pattern is a constant — cannot fail to compile")
 });
 
 /// Jaro-Winkler similarity threshold for fuzzy resolution.
@@ -37,29 +36,29 @@ pub enum WikilinkResolution {
     Unresolved(String),
 }
 
-/// Détecte si une cible de wikilink encode un ULID résolvable par identifiant.
+/// Detects whether a wikilink target encodes a ULID resolvable by identifier.
 ///
-/// Supporte deux formes :
-/// - `"section:ULID"` — le ULID se trouve après le dernier `:` (ex. `"decisions:01KV..."`)
-/// - `"ULID"` nu — la cible est directement un ULID Crockford
+/// Two forms are supported:
+/// - `"section:ULID"` — the ULID follows the last `:` (for example `"decisions:01KV..."`);
+/// - a bare `"ULID"` — the target is directly a Crockford ULID.
 ///
-/// Un ULID Crockford valide = exactement 26 caractères base32 (insensible à la casse).
+/// A valid Crockford ULID is exactly 26 base32 characters, case-insensitive.
 ///
-/// # Retour
+/// # Returns
 ///
-/// - `Some(ulid)` si la partie extraite est un ULID valide au sens de [`Ulid::from_string`].
-/// - `None` si la cible est un titre libre (ex. `"Mon Architecture Note"`,
-///   `"example-agent Phase D"`) ou un ULID malformé.
+/// - `Some(ulid)` when the extracted part is a valid ULID per [`Ulid::from_string`].
+/// - `None` when the target is a free-form title (for example `"My Architecture Note"`
+///   or `"example-agent stage D"`), or a malformed ULID.
 ///
-/// # Exemples
+/// # Examples
 ///
 /// ```
 /// use gradatum_curator::wikilinks::parse_ulid_target;
 ///
 /// assert!(parse_ulid_target("decisions:01KVBTMYNK4XXZJAKWMTB4AM9K").is_some());
 /// assert!(parse_ulid_target("01KVBTMYNK4XXZJAKWMTB4AM9K").is_some());
-/// assert!(parse_ulid_target("Mon Titre Humain").is_none());
-/// assert!(parse_ulid_target("example-agent Phase D").is_none());
+/// assert!(parse_ulid_target("My Human Title").is_none());
+/// assert!(parse_ulid_target("example-agent stage D").is_none());
 /// ```
 pub fn parse_ulid_target(target: &str) -> Option<Ulid> {
     // Extraire la partie candidate : tout ce qui suit le dernier `:`,

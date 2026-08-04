@@ -1,4 +1,4 @@
-//! Task 13 Step 1 — Harness évaluation apport Context Efficiency F-29/F-30 (v0.7.2).
+//! Harness évaluation apport Context Efficiency F-29/F-30 (v0.7.2).
 //!
 //! ## Objectif
 //!
@@ -14,7 +14,7 @@
 //!
 //! ## Style
 //!
-//! Pattern identique à `tests/proactive_eval.rs` (Task 14 v0.7.1) :
+//! Pattern identique à `tests/proactive_eval.rs` (v0.7.1) :
 //! - corpus seedé via `write_note_in_section` / `seed_note_return_ulid`.
 //! - helpers `call_vault_context_json` / `call_vault_context_json_status`.
 //! - assertions sanity sans seuils stricts : ratio > 0, delta ≥ 0, aucune perte.

@@ -17,46 +17,47 @@
 //!
 //! ## Schema compliance
 //!
-//! Feature cards satisfy the quintuple wikilink rule of the T1 validator:
+//! Every generated card satisfies the project-map schema, which requires exactly one of
+//! each of the following links:
 //! `[[feature:F-XX]] [[project:gradatum]] [[status:<S>]] [[kind:FEATURE]]
 //!  [[release:<R>]] [[version:gradatum/x.y.z]]`
 //!
-//! Base mapping (from `features.ts`):
-//! - `released  → status:DONE   + release:released`
-//! - `planned   → status:OPEN   + release:planned`
-//! - `vX.Y.Z   → version:gradatum/x.y.z`  (strips the leading `v`)
+//! Base mapping, straight from `features.ts`:
+//! - `released` → `status:DONE` and `release:released`
+//! - `planned` → `status:OPEN` and `release:planned`
+//! - `vX.Y.Z` → `version:gradatum/x.y.z`, stripping the leading `v`
 //!
-//! ## Overlay layer `apply_amendment_overlay` (in-place)
+//! ## The in-place overlay layer
 //!
-//! The overlay appends no cards. The cards for F-02/08/13/15/16/42 (released) and
-//! F-29/66 (planned) are site-resident in `features.ts` and parsed as the base.
-//! The overlay only corrects the `release` axis and `[[parent:]]` links:
+//! [`crate::feature_backfill::apply_amendment_overlay`] never appends a card: it rewrites
+//! some of the parsed ones and leaves the count untouched. It exists because the website
+//! expresses only two delivery states, `released` and `planned`, while the vault schema
+//! has a wider `release` axis.
 //!
-//! ### `release` axis override: planned → roadmap (14 cards)
+//! ### Release-axis override: `planned` → `roadmap`
 //!
-//! F-06, F-36, F-17, F-25, F-26, F-51, F-63..F-70: parsed as `planned vX.Y.Z`
-//! on the site (Rule A), but the canonical `release` axis is `roadmap`
-//! (orthogonal to status). Only `release_wire` is flipped; `status_wire` (OPEN)
-//! and `display_version` (vX.Y.Z) remain as sourced from the site.
-//! F-09: promoted out of the backlog (planned v1.0.0 on the site).
+//! Fourteen cards are declared `planned` on the website but genuinely belong to the
+//! roadmap. For each of them only `release_wire` is flipped; `status_wire` stays `OPEN`
+//! and `display_version` stays exactly as sourced from the website. A target identifier
+//! that cannot be found is a hard error, so that a website change can never make an
+//! override silently disappear.
 //!
-//! Fails loudly if an expected ref_label is missing (silent-regression guard).
+//! Cards already marked `released` on the website are deliberately absent from the
+//! override table: `features.ts` carries the correct state, and the plain
+//! `FeatureCardSpec::from` conversion already yields the right axis.
 //!
-//! The `released` refs (F-31/44/55 + F-02/08/13/15/16/42) are NOT in the
-//! override table: `features.ts` already carries the correct state, so
-//! `FeatureCardSpec::from` produces the correct axis without intervention.
+//! ### The backlog display sentinel
 //!
-//! ### Rule A — display sentinel
+//! A `roadmap` card has the wire value `gradatum/backlog` but shows the literal `vX.Y.Z`
+//! in its title, so it stays visible on the website instead of being filtered out as
+//! version-less. [`crate::feature_backfill::map_version`] maps `"vX.Y.Z"` onto
+//! `"gradatum/backlog"`, and the feature export performs the inverse mapping on the
+//! website side.
 //!
-//! A `roadmap` card has wire value `gradatum/backlog` but displays `vX.Y.Z`
-//! in its title. `map_version("vX.Y.Z") → "gradatum/backlog"` (sentinel case).
-//! The T2 export performs the inverse mapping (`backlog → "vX.Y.Z"`) on the site side.
+//! ### The `[[parent:F-YY]]` link
 //!
-//! ### `[[parent:F-YY]]` link (Rule B — continuations)
-//!
-//! Continuation cards carry `[[parent:F-XX]]` (original feature):
-//! F-63 → F-31, F-64 → F-44, F-65 → F-55, F-66 → F-42. Appended at the end of the
-//! wikilinks line.
+//! A card that continues an earlier feature carries a `[[parent:F-XX]]` link naming that
+//! original feature. It is appended at the end of the wikilink line.
 //!
 //! ## DRY reuse
 //!
@@ -77,41 +78,35 @@ use anyhow::{Context, Result, bail};
 use crate::changelog_backfill::{HttpVaultClient, VaultWriteClient};
 use crate::project_map_card::VaultWriteCard;
 
-/// Expected feature count in `features.ts`.
+/// Number of features `features.ts` is expected to declare.
 ///
-/// Safety guard: if the parser returns a different count → explicit error
-/// (prevents silent partial backfill).
+/// Safety guard: a parse returning any other count raises an explicit error, which
+/// prevents a truncated parse from silently producing a partial back-fill.
 ///
-/// Current count includes:
-/// - F-75 (planned v0.7.0, Anthropic gateway)
-/// - F-76..F-79 (planned v0.8.0, gradatum-code, 4 cards)
-/// - F-80 (planned vX.Y.Z, gradatum-as-channel)
-/// - F-81 (planned vX.Y.Z, HippoRAG-2)
-/// - F-82 (planned vX.Y.Z, Arbor HTR)
-///
-/// All are `planned` with no parent and no overlay override.
-/// Convention: `features.ts` uses only `released` / `planned`; the `roadmap`
-/// release axis is carried exclusively by the `roadmap_overrides` overlay.
+/// By convention `features.ts` uses only `released` and `planned`; the `roadmap` release
+/// axis is introduced exclusively by the overlay.
 const EXPECTED_FEATURE_COUNT: usize = 69;
 
-/// Arguments pour la sous-commande `project-map backfill-features`.
+/// Arguments for the `project-map backfill-features` sub-command.
 pub struct BackfillFeaturesArgs {
-    /// Chemin vers `features.ts`.
+    /// Path to `features.ts`.
     pub features_path: PathBuf,
-    /// Mode apply : `false` (défaut) = dry-run, `true` = POST réel.
+    /// Apply mode: `false` (the default) previews, `true` writes to the vault.
     ///
-    /// Garde-fou : `apply == true` ET `api_key` vide → `Err` immédiat.
+    /// Guard rail: when `apply` is `true` and `api_key` is empty, the run fails
+    /// immediately, before any network access.
     pub apply: bool,
-    /// URL de base du serveur gradatum (ex. `http://127.0.0.1:19090`).
+    /// Base URL of the gradatum server (e.g. `http://127.0.0.1:19090`).
     pub server_url: String,
-    /// Clé API pour l'authentification (vide = dry-run uniquement).
+    /// API key used for authentication; empty means dry-run only.
     pub api_key: String,
-    /// Nombre de features attendu (défaut : 53 — overridable pour les tests).
+    /// Number of features the parse must yield, defaulting to the crate's
+    /// `EXPECTED_FEATURE_COUNT`. Overridable so tests can use small fixtures.
     pub expected_count: usize,
 }
 
 impl BackfillFeaturesArgs {
-    /// Crée les args avec les valeurs par défaut production.
+    /// Builds the arguments with the production defaults.
     #[must_use]
     pub fn new(features_path: PathBuf, apply: bool, server_url: String, api_key: String) -> Self {
         Self {
@@ -124,36 +119,40 @@ impl BackfillFeaturesArgs {
     }
 }
 
-/// Rapport d'un run de backfill features.
+/// Report of a feature back-fill run.
 #[derive(Debug, Default, Clone)]
 #[must_use]
 pub struct BackfillFeaturesReport {
-    /// Nombre de features parsées depuis `features.ts`.
+    /// Number of features parsed out of `features.ts`.
     pub parsed: usize,
-    /// (dry-run) Nombre de cartes qui seraient créées.
+    /// Dry-run only: number of cards that would be created.
+    ///
+    /// A dry-run does not query the vault, so this counts every card, including those
+    /// that already exist.
     pub would_create: usize,
-    /// (dry-run) Nombre de cartes sautées (déjà existantes — N/A en dry-run).
+    /// Always `0`: a dry-run performs no existence check, so nothing is ever counted
+    /// here. Kept for symmetry with [`Self::skipped`].
     pub would_skip: usize,
-    /// (réel) Nombre de cartes effectivement créées.
+    /// Apply mode only: number of cards actually created.
     pub created: usize,
-    /// (réel) Nombre de cartes sautées (déjà existantes).
+    /// Apply mode only: number of cards skipped because they already existed.
     pub skipped: usize,
 }
 
-/// Feature parsée depuis `features.ts`.
+/// One feature parsed out of `features.ts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedFeature {
-    /// Identifiant (ex. `F-37`).
+    /// Identifier (e.g. `F-37`).
     pub ref_label: String,
-    /// Titre lisible (ex. `gradatum-studio: Vault Management Interface`).
+    /// Human-readable title (e.g. `gradatum-studio: Vault Management Interface`).
     pub name: String,
-    /// Statut du site (`released` ou `planned`).
+    /// Delivery status as declared on the site (`released` or `planned`).
     pub status: FeatureSiteStatus,
-    /// Version du site (ex. `v0.4.6`).
+    /// Version as declared on the site (e.g. `v0.4.6`).
     pub version: String,
 }
 
-/// Statut de livraison tel qu'exprimé dans `features.ts`.
+/// Delivery status as expressed in `features.ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureSiteStatus {
     Released,
@@ -161,7 +160,7 @@ pub enum FeatureSiteStatus {
 }
 
 impl FeatureSiteStatus {
-    /// Valeur wire `[[status:…]]` — SCREAMING_SNAKE (comme StatusKind).
+    /// Wire value for `[[status:…]]`, in SCREAMING_SNAKE_CASE, matching `StatusKind`.
     #[must_use]
     pub const fn as_status_wire(&self) -> &'static str {
         match self {
@@ -170,7 +169,7 @@ impl FeatureSiteStatus {
         }
     }
 
-    /// Valeur wire `[[release:…]]` — lowercase (comme ReleaseKind).
+    /// Wire value for `[[release:…]]`, lowercase, matching `ReleaseKind`.
     #[must_use]
     pub const fn as_release_wire(&self) -> &'static str {
         match self {
@@ -180,16 +179,17 @@ impl FeatureSiteStatus {
     }
 }
 
-/// Parse `features.ts` et retourne la liste des features.
+/// Parses `features.ts` and returns the list of features it declares.
 ///
-/// Stratégie : extraction bloc-par-bloc ancrée sur `refLabel:` jusqu'au
-/// prochain `refLabel:` ou fin de fichier. Robuste aux champs intercalés.
+/// Extraction proceeds block by block, anchored on each `refLabel:` and running to the
+/// next `refLabel:` or to the end of the input, which keeps it robust against interleaved
+/// fields.
 ///
 /// # Errors
 ///
-/// - Si le fichier est illisible.
-/// - Si le compte de features parsées ≠ `expected_count` (guard anti-partiel).
-/// - Si un bloc ne contient pas `name:`, `status:` ou `version:`.
+/// - The parsed feature count differs from `expected_count`, which guards against a
+///   partial parse silently producing a truncated back-fill.
+/// - A block is missing its `name:`, `status:` or `version:` field.
 pub fn parse_features(content: &str, expected_count: usize) -> Result<Vec<ParsedFeature>> {
     // Découpe le contenu en blocs en se basant sur `refLabel:`.
     // Chaque bloc démarre juste avant `refLabel:` et se termine avant le suivant.
@@ -199,7 +199,7 @@ pub fn parse_features(content: &str, expected_count: usize) -> Result<Vec<Parsed
         .collect();
 
     if ref_label_positions.is_empty() {
-        bail!("parse features.ts : aucun `refLabel:` trouvé — fichier vide ou format inattendu");
+        bail!("parse features.ts: no `refLabel:` found — empty file or unexpected format");
     }
 
     let mut features = Vec::with_capacity(ref_label_positions.len());
@@ -218,8 +218,8 @@ pub fn parse_features(content: &str, expected_count: usize) -> Result<Vec<Parsed
 
     if features.len() != expected_count {
         bail!(
-            "parse features.ts : {parsed} features parsées, {expected} attendues — \
-             parse incomplet ou fichier modifié. Refuser le backfill partiel (ADN 1).",
+            "parse features.ts: {parsed} features parsed, {expected} expected — \
+             incomplete parse or modified file. Reject the partial backfill (ADN 1).",
             parsed = features.len(),
             expected = expected_count,
         );
@@ -228,9 +228,9 @@ pub fn parse_features(content: &str, expected_count: usize) -> Result<Vec<Parsed
     Ok(features)
 }
 
-/// Parse un bloc TS correspondant à une feature.
+/// Parses the TypeScript block describing one feature.
 ///
-/// Format attendu (lignes distinctes) :
+/// Expected shape, one field per line:
 /// ```text
 /// refLabel: 'F-XX',
 /// name: '<texte>',
@@ -241,31 +241,31 @@ pub fn parse_features(content: &str, expected_count: usize) -> Result<Vec<Parsed
 ///
 /// # Errors
 ///
-/// [`anyhow::Error`] si `ref_label`, `name`, `status` ou `version` sont absents
-/// ou ont un format inattendu.
+/// One of `refLabel`, `name`, `status` or `version` is absent or malformed, or `status`
+/// holds a value other than `released` or `planned`.
 fn parse_feature_block(block: &str, block_idx: usize) -> Result<ParsedFeature> {
     let ref_label = extract_single_quoted_value(block, "refLabel:")
-        .with_context(|| format!("bloc #{block_idx} : `refLabel:` absent ou mal formé"))?;
+        .with_context(|| format!("block #{block_idx}: `refLabel:` absent or malformed"))?;
 
     let name = extract_single_quoted_value(block, "name:").with_context(|| {
-        format!("bloc #{block_idx} ({ref_label}) : `name:` absent ou mal formé")
+        format!("block #{block_idx} ({ref_label}): `name:` absent or malformed")
     })?;
 
     let status_raw = extract_single_quoted_value(block, "status:").with_context(|| {
-        format!("bloc #{block_idx} ({ref_label}) : `status:` absent ou mal formé")
+        format!("block #{block_idx} ({ref_label}): `status:` absent or malformed")
     })?;
 
     let status = match status_raw.as_str() {
         "released" => FeatureSiteStatus::Released,
         "planned" => FeatureSiteStatus::Planned,
         other => bail!(
-            "bloc #{block_idx} ({ref_label}) : statut inconnu {other:?} \
-             (attendu 'released' ou 'planned')"
+            "block #{block_idx} ({ref_label}): unknown status {other:?} \
+             (expected 'released' or 'planned')"
         ),
     };
 
     let version = extract_single_quoted_value(block, "version:").with_context(|| {
-        format!("bloc #{block_idx} ({ref_label}) : `version:` absent ou mal formé")
+        format!("block #{block_idx} ({ref_label}): `version:` absent or malformed")
     })?;
 
     Ok(ParsedFeature {
@@ -276,12 +276,13 @@ fn parse_feature_block(block: &str, block_idx: usize) -> Result<ParsedFeature> {
     })
 }
 
-/// Extrait la valeur entre guillemets simples après `key` sur la même ligne.
+/// Extracts the single-quoted value that follows `key` on the same line.
 ///
-/// Cherche `key` dans `text`, puis capture le contenu entre la première `'`
-/// et la `'` fermante sur la même ligne.
+/// Looks up `key` in `text`, then captures whatever sits between the first `'` and its
+/// closing `'` on that same line.
 ///
-/// Retourne `None` si la clé est absente ou si aucune valeur entre `'…'` n'est trouvée.
+/// Returns `None` when the key is absent, when no quoted value follows it, or when the
+/// quoted value is empty.
 fn extract_single_quoted_value(text: &str, key: &str) -> Option<String> {
     // Cherche la position de la clé dans le texte.
     let key_pos = text.find(key)?;
@@ -303,16 +304,17 @@ fn extract_single_quoted_value(text: &str, key: &str) -> Option<String> {
     }
 }
 
-/// Mappe une version site `vX.Y.Z` vers le wire de `[[version:gradatum/…]]`.
+/// Maps a website version `vX.Y.Z` onto the wire value of `[[version:gradatum/…]]`.
 ///
-/// Retire le `v` initial et préfixe `gradatum/`.
-/// Ex. `v0.4.0 → gradatum/0.4.0`.
+/// Strips the leading `v` and prefixes `gradatum/`, so `v0.4.0` becomes
+/// `gradatum/0.4.0`.
 ///
-/// Cas sentinelle (Règle A) :
-/// - `""` (vide) → `gradatum/backlog`
-/// - `"vX.Y.Z"` (littéral sentinelle d'affichage) → `gradatum/backlog`
+/// Two inputs map to the backlog sentinel instead:
+/// - `""` (empty) → `gradatum/backlog`
+/// - `"vX.Y.Z"`, the literal placeholder shown on the website → `gradatum/backlog`
 ///
-/// Ce mapping est l'inverse de l'export T2 qui fait `backlog → "vX.Y.Z"` côté site.
+/// This is the exact inverse of the feature export, which renders a backlog card's
+/// version as the literal `"vX.Y.Z"` so it stays visible on the website.
 #[must_use]
 pub fn map_version(version: &str) -> String {
     // Cas sentinelle : vide ou littéral "vX.Y.Z" → backlog wire.
@@ -323,9 +325,10 @@ pub fn map_version(version: &str) -> String {
     format!("gradatum/{numeric}")
 }
 
-/// Construit le marqueur source d'idempotence pour une feature.
+/// Builds the idempotence source marker of a feature.
 ///
-/// Format : `pm-feature-source:F-XX` (identique pour chaque run → idempotent).
+/// The marker is `pm-feature-source:F-XX`. Being a pure function of the feature
+/// identifier, it is stable across runs, which is what makes the back-fill idempotent.
 #[must_use]
 pub fn feature_marker(ref_label: &str) -> String {
     format!("pm-feature-source:{ref_label}")
@@ -340,38 +343,40 @@ pub fn feature_marker(ref_label: &str) -> String {
 /// Fails loudly if the output of `apply_amendment_overlay` differs.
 const TARGET_CARD_COUNT: usize = 69;
 
-/// Spécification d'une carte-feature project-map, indépendante du parse site.
+/// Specification of a project-map feature card, decoupled from the website parse.
 ///
-/// Produite par conversion depuis [`ParsedFeature`] (base 41) puis enrichie
-/// par la couche overlay (6 overrides + 4 cartes neuves).
+/// Built by converting a [`ParsedFeature`], then refined in place by the overlay layer.
 ///
-/// Contient tous les champs wire nécessaires à `render_card_spec` :
-/// `status_wire`/`release_wire` dérivés de l'axe release (orthogonal au
-/// `FeatureSiteStatus` qui ne couvre que `released`/`planned`).
+/// It carries every wire field `render_card_spec` needs. In particular `status_wire` and
+/// `release_wire` describe the release axis, which is orthogonal to [`FeatureSiteStatus`]:
+/// the website only ever expresses `released` or `planned`, while the release axis also
+/// covers `roadmap` and `dropped`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureCardSpec {
-    /// Identifiant court (ex. `F-37`).
+    /// Short identifier (e.g. `F-37`).
     pub ref_label: String,
-    /// Nom lisible complet.
+    /// Full human-readable name.
     pub name: String,
-    /// Valeur wire `[[status:…]]` — SCREAMING_SNAKE (`OPEN` | `DONE`).
+    /// Wire value for `[[status:…]]`, in SCREAMING_SNAKE_CASE (`OPEN` or `DONE`).
     pub status_wire: &'static str,
-    /// Valeur wire `[[release:…]]` — lowercase (`roadmap`|`planned`|`released`|`dropped`).
+    /// Wire value for `[[release:…]]`, lowercase
+    /// (`roadmap`, `planned`, `released` or `dropped`).
     pub release_wire: &'static str,
-    /// Version d'affichage (dans le titre et le mapping `map_version`).
+    /// Display version, used in the card title and fed to [`map_version`].
     ///
     /// - `"v0.4.3"` → wire `gradatum/0.4.3`
-    /// - `"vX.Y.Z"` → wire `gradatum/backlog` (Règle A sentinelle)
+    /// - `"vX.Y.Z"` → wire `gradatum/backlog` (the backlog sentinel)
     /// - `""` → wire `gradatum/backlog`
     pub display_version: String,
-    /// Feature d'origine dont cette carte est une continuation (Règle B).
+    /// The originating feature this card continues, when it is a continuation.
     ///
-    /// Si `Some("F-31")` → wikilink `[[parent:F-31]]` ajouté à la ligne des liens.
+    /// `Some("F-31")` adds a `[[parent:F-31]]` wikilink to the card's link line.
     pub parent: Option<String>,
 }
 
 impl From<&ParsedFeature> for FeatureCardSpec {
-    /// Conversion base : site binaire → spec riche (sans overlay).
+    /// Base conversion: the website's two-state status becomes a full spec, before any
+    /// overlay is applied.
     fn from(f: &ParsedFeature) -> Self {
         Self {
             ref_label: f.ref_label.clone(),
@@ -384,17 +389,22 @@ impl From<&ParsedFeature> for FeatureCardSpec {
     }
 }
 
-/// Applique la couche overlay amendment sur la base de 53 specs parse-site.
+/// Applies the amendment overlay on top of the specs parsed from the website.
 ///
-/// Opérations (in-place uniquement — zéro append depuis la rebaseline Voie A) :
-/// 1. 9 overrides axe `release` (planned → roadmap) + `[[parent:]]` — fail-loud
-///    si un ref attendu est absent.
-/// 2. Assert sortie == `TARGET_CARD_COUNT` (53).
+/// The overlay only ever rewrites cards in place; it appends none, so the input and
+/// output lengths are identical. It performs two steps:
+///
+/// 1. Fourteen overrides on the `release` axis, moving cards from `planned` to `roadmap`
+///    and setting their `[[parent:]]` link. A target that cannot be found is a hard
+///    error rather than a silent no-op.
+/// 2. A final assertion that the output length still equals the expected card count.
 ///
 /// # Errors
 ///
-/// - Si un des 9 ref_labels cibles est absent dans `base` (anti-régression).
-/// - Si le compte final ≠ 53 (invariant overlay cassé).
+/// - One of the fourteen target identifiers is absent from `base`, which usually means
+///   the website changed and the overlay would have silently missed an override.
+/// - The final card count differs from the expected one, meaning the overlay invariant
+///   is broken.
 pub fn apply_amendment_overlay(
     mut base: Vec<FeatureCardSpec>,
 ) -> anyhow::Result<Vec<FeatureCardSpec>> {
@@ -448,8 +458,8 @@ pub fn apply_amendment_overlay(
             .find(|s| s.ref_label == *ref_label)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "overlay: ref_label {ref_label:?} absent de la base — \
-                     le site a peut-être changé. Override silencieusement manqué évité (ADN 1)."
+                    "overlay: ref_label {ref_label:?} absent from the base — \
+                     the site may have changed. Silently missed override avoided (ADN 1)."
                 )
             })?;
         spec.release_wire = "roadmap";
@@ -461,7 +471,7 @@ pub fn apply_amendment_overlay(
     // ── Invariant final : 53 cartes exactement (zéro append) ────────────────
     if base.len() != TARGET_CARD_COUNT {
         anyhow::bail!(
-            "overlay: {got} cartes produites, {expected} attendues — invariant overlay cassé",
+            "overlay: {got} maps produced, {expected} expected — overlay invariant broken",
             got = base.len(),
             expected = TARGET_CARD_COUNT,
         );
@@ -470,10 +480,11 @@ pub fn apply_amendment_overlay(
     Ok(base)
 }
 
-/// Rend une [`VaultWriteCard`] depuis une [`FeatureCardSpec`] (overlay-aware).
+/// Renders a [`VaultWriteCard`] from a [`FeatureCardSpec`], overlay included.
 ///
-/// Gère les 3 axes : `[[status:…]]`, `[[release:…]]`, `[[parent:…]]` optionnel.
-/// La `display_version` est mappée vers le wire via `map_version` (Règle A incluse).
+/// Handles all three axes: `[[status:…]]`, `[[release:…]]`, and the optional
+/// `[[parent:…]]`. The `display_version` is turned into its wire form by [`map_version`],
+/// backlog sentinel included.
 ///
 /// Body :
 /// ```text
@@ -532,9 +543,9 @@ pub fn render_card_spec(spec: &FeatureCardSpec) -> VaultWriteCard {
     }
 }
 
-/// Rend une carte-feature project-map valide depuis une [`ParsedFeature`].
+/// Renders a schema-valid project-map feature card from a [`ParsedFeature`].
 ///
-/// Body format (6 wikilinks typés + marker + name) :
+/// Body format — six typed wikilinks, then the name, then the source marker:
 /// ```text
 /// [[feature:F-XX]] [[project:gradatum]] [[status:<S>]] [[kind:FEATURE]]
 /// [[release:<R>]] [[version:gradatum/x.y.z]]
@@ -544,7 +555,9 @@ pub fn render_card_spec(spec: &FeatureCardSpec) -> VaultWriteCard {
 /// pm-feature-source:F-XX
 /// ```
 ///
-/// Satisfait la règle quintuple §10e du validateur T1 (LIVE).
+/// This satisfies the project-map schema validator, which requires a feature card to
+/// carry exactly one `[[feature:]]`, `[[project:]]`, `[[status:]]`, `[[kind:]]` and
+/// `[[version:]]` link.
 #[must_use]
 pub fn render_feature_card(feature: &ParsedFeature) -> VaultWriteCard {
     let version_wire = map_version(&feature.version);
@@ -592,20 +605,24 @@ pub fn render_feature_card(feature: &ParsedFeature) -> VaultWriteCard {
     }
 }
 
-/// Orchestre le backfill des 53 cartes-feature vers le vault gradatum.
+/// Drives the back-fill of the feature cards into the gradatum vault.
 ///
-/// Pipeline : parse `features.ts` (53) → specs → `apply_amendment_overlay`
-/// (53, in-place) → render → dry-run print / apply.
+/// The pipeline reads `features.ts`, parses it into features, converts them into card
+/// specs, refines those in place through [`apply_amendment_overlay`], renders each card,
+/// and finally either prints it or writes it.
 ///
-/// Sans `apply` (défaut) : affiche chaque payload sur stdout, ne POST rien.
-/// Avec `apply=true` : vérifie l'idempotence via `marker_exists` avant chaque write.
+/// Without `apply` (the default) each payload is printed to stdout and nothing is posted.
+/// With `apply` set, idempotence is checked through [`VaultWriteClient::marker_exists`]
+/// before every write.
 ///
 /// # Errors
 ///
-/// - `apply == true` et `api_key` vide → `Err` immédiat (guard avant tout réseau).
-/// - Parse `features.ts` échoue ou compte ≠ `args.expected_count`.
-/// - `apply_amendment_overlay` échoue (ref_label absent ou invariant 45 cassé).
-/// - Appel HTTP non-récupérable.
+/// - `apply` is `true` while `api_key` is empty, which fails before any network access.
+/// - `features.ts` cannot be read, or the parsed count differs from
+///   `args.expected_count`.
+/// - [`apply_amendment_overlay`] fails: a target identifier is missing, or the card count
+///   invariant is broken.
+/// - An HTTP call fails unrecoverably.
 pub async fn run_backfill_features<C: VaultWriteClient>(
     args: &BackfillFeaturesArgs,
     client: &C,
@@ -616,7 +633,7 @@ pub async fn run_backfill_features<C: VaultWriteClient>(
     }
 
     let content = std::fs::read_to_string(&args.features_path)
-        .with_context(|| format!("lecture features.ts : {}", args.features_path.display()))?;
+        .with_context(|| format!("reading features.ts: {}", args.features_path.display()))?;
 
     let features = parse_features(&content, args.expected_count)
         .with_context(|| format!("parsing features.ts : {}", args.features_path.display()))?;
@@ -645,18 +662,18 @@ pub async fn run_backfill_features<C: VaultWriteClient>(
             let exists = client
                 .marker_exists(&marker)
                 .await
-                .with_context(|| format!("vérification idempotence marker={marker}"))?;
+                .with_context(|| format!("idempotency check marker={marker}"))?;
 
             if exists {
                 report.skipped += 1;
-                tracing::debug!(%marker, "carte-feature déjà existante — skip");
+                tracing::debug!(%marker, "feature-map already exists — skip");
             } else {
                 client
                     .vault_write(&card)
                     .await
-                    .with_context(|| format!("vault_write pour marker={marker}"))?;
+                    .with_context(|| format!("vault_write for marker={marker}"))?;
                 report.created += 1;
-                tracing::info!(%marker, "carte-feature créée");
+                tracing::info!(%marker, "feature-map created");
             }
         }
     }
@@ -664,17 +681,17 @@ pub async fn run_backfill_features<C: VaultWriteClient>(
     Ok(report)
 }
 
-/// Construit un [`HttpVaultClient`] depuis les args (échange api-key → JWT).
+/// Builds an [`HttpVaultClient`] from the arguments, exchanging the API key for a JWT.
 ///
-/// Appelé uniquement en mode apply — DRY-RUN n'instancie pas le client HTTP.
+/// Only called in apply mode: a dry-run never instantiates an HTTP client.
 ///
 /// # Errors
 ///
-/// Si l'échange api-key échoue ou si la construction du client reqwest échoue.
+/// The API key exchange fails, or the underlying `reqwest` client cannot be built.
 pub async fn build_http_client(args: &BackfillFeaturesArgs) -> Result<HttpVaultClient> {
     HttpVaultClient::new(&args.server_url, &args.api_key)
         .await
-        .context("construction HttpVaultClient pour backfill-features")
+        .context("building HttpVaultClient for backfill-features")
 }
 
 // ─── Tests unitaires ─────────────────────────────────────────────────────────

@@ -90,7 +90,7 @@ async fn index_persists_across_reopens() {
 
     let stored_hash = vault2
         .index()
-        .get_content_hash(note_id)
+        .get_content_hash("main", note_id)
         .await
         .expect("get_content_hash")
         .expect("Le ContentHash doit être présent dans l'index après reopen");

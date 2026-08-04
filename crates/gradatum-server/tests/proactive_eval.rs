@@ -1,4 +1,4 @@
-//! Task 14 Step 1 — Harness d'acceptation simulée proactive recall (v0.7.1).
+//! Harness d'acceptation simulée proactive recall (v0.7.1).
 //!
 //! ## Objectif
 //!
@@ -98,6 +98,7 @@ fn bearer_main() -> TrustContext {
         sub: TEST_IDENTITY.into(),
         scopes: vec!["read".into()],
         tenant_id: "main".into(),
+        jti: None,
     }
 }
 
@@ -213,7 +214,7 @@ async fn end_to_end_proactive_cycle_acceptance_rate_above_zero() {
 
     // ── 4. Pull proactive (context=None → lit la surface pré-calculée) ────────
     let req_proactive = ProactiveRecallRequest {
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         context: None,
         sections: None,
         limit: None,
@@ -241,7 +242,7 @@ async fn end_to_end_proactive_cycle_acceptance_rate_above_zero() {
     // Vérifie que le mode contextuel ne retourne pas d'erreur. Non bloquant pour
     // l'assertion principale (le taux est mesuré sur le mode proactive).
     let req_contextual = ProactiveRecallRequest {
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         context: Some("async rust mémoire pattern".into()),
         sections: Some(vec!["lessons-learned".into(), "reasoning".into()]),
         limit: Some(5),
@@ -276,7 +277,7 @@ async fn end_to_end_proactive_cycle_acceptance_rate_above_zero() {
     let accepted = vec![surfaced_ulids[0].clone()];
 
     let feedback_req = ProactiveRecallFeedbackRequest {
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         recall_id: resp_proactive.recall_id.clone(),
         accepted_ulids: accepted.clone(),
     };

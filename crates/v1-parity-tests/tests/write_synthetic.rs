@@ -443,7 +443,7 @@ async fn test_22_worker_run_once_processes_curate_job() {
         author: None,
         tags: vec![],
         section_hint: None,
-        tenant_id: "main".into(),
+        tenant_id: Some("main".into()),
         expected_sha256: None,
         note_id: None,
         occurred_at: None,
@@ -498,7 +498,7 @@ async fn test_22_worker_run_once_processes_curate_job() {
                 .collect();
             let frontmatter = Frontmatter {
                 schema_version: 1,
-                vault_id: VaultId::new(&req.tenant_id),
+                vault_id: VaultId::new(req.tenant_id.as_str()),
                 locus: None,
                 section,
                 status,
@@ -567,6 +567,7 @@ async fn test_22_worker_run_once_processes_curate_job() {
 
         async fn delete_note(
             &self,
+            _vault_id: &str,
             _ulid: &str,
         ) -> Result<(), gradatum_worker::internal_client::InternalClientError> {
             unimplemented!()
@@ -574,6 +575,7 @@ async fn test_22_worker_run_once_processes_curate_job() {
 
         async fn get_note(
             &self,
+            _vault_id: &str,
             _ulid: &str,
         ) -> Result<
             gradatum_worker::internal_client::NoteReadDto,
@@ -582,8 +584,17 @@ async fn test_22_worker_run_once_processes_curate_job() {
             unimplemented!()
         }
 
+        async fn get_note_status(
+            &self,
+            _vault_id: &str,
+            _ulid: &str,
+        ) -> Result<Option<String>, gradatum_worker::internal_client::InternalClientError> {
+            unimplemented!()
+        }
+
         async fn get_note_embedding(
             &self,
+            _vault_id: &str,
             _ulid: &str,
             _embedder_id: &str,
         ) -> Result<
@@ -595,6 +606,7 @@ async fn test_22_worker_run_once_processes_curate_job() {
 
         async fn get_trust(
             &self,
+            _vault_id: &str,
             _ulid: &str,
         ) -> Result<f32, gradatum_worker::internal_client::InternalClientError> {
             unimplemented!()

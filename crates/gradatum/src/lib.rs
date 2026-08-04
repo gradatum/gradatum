@@ -4,15 +4,22 @@
 //!
 //! ## Stability
 //!
-//! `0.x` — no API stability guarantee. All public traits are tagged
-//! [`#[stability::unstable]`] or [`#[stability::experimental]`].
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
+//! additions only within `1.x`, breaking changes deferred to the next major. Traits still
+//! tagged `#[stability::unstable]` or `#[stability::experimental]` carry a finer-grained
+//! tier per RELEASE-POLICY.md AM1.
 //! See the [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 //!
 //! ## Contents
 //!
 //! Re-exports curated subsets of focused crates:
-//! - `core` feature → `gradatum-core` (shared primitives, traits, types)
-//! - `client` feature → `gradatum-sdk-rs` (HTTP client SDK — planned)
+//! - `core` feature — **enabled by default** → `gradatum-core` (shared primitives,
+//!   traits, types), reachable as `gradatum::core`
+//! - `client` feature — opt-in → `gradatum-sdk-rs` (HTTP client SDK — planned; the
+//!   crate is currently a placeholder with no client surface, hence not in `default`)
+//!
+//! A plain `cargo add gradatum` therefore exposes `gradatum::core` in addition to
+//! [`VERSION`]. Use `default-features = false` to opt out of the `core` re-export.
 //!
 //! Downstream crates that need the full workspace surface can depend on `gradatum`
 //! directly and enable the relevant features, rather than listing individual crates.

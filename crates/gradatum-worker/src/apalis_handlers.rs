@@ -26,10 +26,20 @@
 //! # Dependency injection
 //!
 //! `build_monitor` injects via `.data()`:
-//! - `Data<Arc<Vault>>` — vault registry for reading/writing notes
+//! - `Data<Arc<dyn InternalClient>>` — **the only read/write path to the vault and index**
 //! - `Data<Arc<dyn CuratorProcess + Send + Sync>>` — curator pipeline
 //! - `Data<Arc<dyn Embedder + Send + Sync>>` — embedding backend
-//! - `Data<Arc<dyn Index>>` — type-erased index (FTS5 + lifecycle)
+//! - `Data<Arc<dyn QueueStore + Send + Sync>>` — job queue (enqueue, `mark_conflict`)
+//! - `Data<Arc<dyn DistillSynthesizer + Send + Sync>>` — synthesis producer (distill)
+//! - `Data<MultiTenantCfg>` — multi-tenant config, for vault resolution
+//!
+//! The cron workers additionally receive their own data (DLQ pool, retention,
+//! distill-cron config, metrics).
+//!
+//! Neither `Vault` nor `Index` is injected, and no handler holds one: `gradatum-vault` and
+//! `gradatum-index` are **dev-dependencies** of this crate, reachable from `tests/` only.
+//! Handler documentation that mentions `vault.*` or `index.*` calls is describing what the
+//! *server* does behind an `InternalClient` call, not what the handler does.
 //!
 //! # ReIndex — deferred
 //!
@@ -94,40 +104,249 @@ use crate::wikilinks::resolve_wikilinks_via_client;
 #[derive(Debug, thiserror::Error)]
 pub enum HandlerError {
     /// Dependency not injected — `build_monitor` must call `.data()` on the worker.
-    #[error("dépendance absente : {0}")]
+    #[error("dependency absent: {0}")]
     MissingDependency(&'static str),
 
     /// Received `Job` variant not handled by this handler.
-    #[error("variant job inattendu : {0}")]
+    #[error("unexpected job variant: {0}")]
     UnexpectedVariant(String),
 
     /// Job payload missing or invalid (title/body absent for vault_write).
-    #[error("payload job invalide : {0}")]
+    #[error("invalid job payload: {0}")]
     InvalidPayload(String),
 
     /// Business error propagated from the vault or the curator.
-    #[error("erreur métier : {0}")]
+    #[error("business error: {0}")]
     Business(String),
 }
 
-/// tenant guard — cross-tenant isolation for a single-vault deployment.
+/// The worker's multi-vault configuration — a mirror of the `[multi_tenant]` section of
+/// `server.toml`. Worker and server read the same file and the same flag, so the setting
+/// has a single source of truth.
 ///
-/// The worker is a separate process NOT covered by the HTTP middleware.
-/// While the vault is physically mono-tenant (`"main"`), a `JobSpec` carrying a
-/// `tenant_id` ≠ `"main"` must be rejected terminally — never retried infinitely
+/// Defaults to `enabled = false`, which keeps the strict single-vault path.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+pub struct MultiTenantCfg {
+    /// Enables per-vault job iteration and the acceptance of tenants other than `"main"`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Generalised tenant guard — supersedes [`ensure_main_tenant`] at the call sites.
+///
+/// - Flag off: strictly [`ensure_main_tenant`], with the same messages and logs.
+/// - Flag on: `VaultId::parse`, because the spec comes off the queue and is therefore an
+///   untrusted boundary. Any well-formed tenant passes: AUTHORISATION was already decided
+///   at enqueue time by the server-side grants, so the worker does not re-decide it, it
+///   only validates the shape.
+///
+/// # Errors
+/// `HandlerError::Business` — terminal **by default** (`max_retries = 0`, the serde default of
+/// [`crate::monitor`], overridable in configuration) — on a rejected or malformed tenant.
+#[must_use = "the tenant guard result must short-circuit the handler"]
+fn ensure_job_tenant(tenant_id: &str, multi_tenant_enabled: bool) -> Result<(), HandlerError> {
+    if !multi_tenant_enabled {
+        return ensure_main_tenant(tenant_id);
+    }
+    gradatum_core::scope::VaultId::parse(tenant_id)
+        .map(|_| ())
+        .map_err(|e| HandlerError::Business(format!("invalid job tenant '{tenant_id}': {e}")))
+}
+
+/// Truncates a string copied into a **persisted** error message.
+///
+/// Handler error messages end up in the database (`apalis_backend.rs`,
+/// `AckResult::Failure(format!("{e:#}"), _)`). The strings that feed them come from
+/// the queue — an untrusted boundary, of unbounded length. The cut is made on a
+/// `char` boundary (never in the middle of a UTF-8 sequence).
+fn truncate_for_log(s: &str) -> String {
+    /// Maximum length, in `char`s, of a fragment copied into a persisted message.
+    const MAX_FRAGMENT: usize = 48;
+    match s.char_indices().nth(MAX_FRAGMENT) {
+        None => s.to_owned(),
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+    }
+}
+
+/// **Bounded** rendering of a `JobScope` for a persisted error message.
+///
+/// `{scope:?}` is not usable here: `Notes(Vec<Ulid>)` grows with the batch and
+/// `Locus(String)` / `Vault(String)` are unbounded. We render a label of bounded
+/// size — cardinality for collections, a truncated prefix for strings.
+fn scope_label(scope: &gradatum_core::job::JobScope) -> String {
+    match scope {
+        JobScope::VaultWide => "VaultWide".to_owned(),
+        JobScope::Vault(v) => format!("Vault({})", truncate_for_log(v)),
+        JobScope::Locus(l) => format!("Locus({})", truncate_for_log(l)),
+        JobScope::Notes(ids) => format!("Notes({} ids)", ids.len()),
+        JobScope::Session(id) => format!("Session({id})"),
+        // `JobScope` est `#[non_exhaustive]` — bras exigé par le compilateur.
+        _ => "<unknown variant>".to_owned(),
+    }
+}
+
+/// Resolves the vault of a job whose spec carries no tenant, using `JobSpec.scope`.
+///
+/// A scope determines a vault only if it **carries** one: `JobScope::Vault(v)` does,
+/// `VaultWide` / `Locus` / `Notes` / `Session` do not — they describe *what* the work
+/// covers, never *where* it lives.
+///
+/// - Flag off: a single vault exists, so a scope carrying no vault resolves to `"main"`.
+///   That is *the* answer, not an arbitrary pick. A `Vault(v)` with `v != "main"` is
+///   rejected terminally (fail-closed — such a scope can only come from an enqueue made
+///   with the flag on). This OFF path is NOT a "let everything through": the `_` arm
+///   (a future `JobScope` variant) returns `Err` **at OFF too** — an unknown variant
+///   inherits no vault, whatever the state of the flag.
+/// - Flag on: `Vault(v)` is validated by `VaultId::parse`. Every other scope is rejected
+///   terminally. Falling back to `"main"` would silently elect one vault out of N while
+///   the returned `vault_id` scopes destructive access (`delete_note` in `handle_purge`,
+///   `persist_forget` in `handle_forget`). The enqueue site must carry `JobScope::Vault(v)`.
+///
+/// # Errors
+/// `HandlerError::Business` — terminal **by default** (`max_retries = 0`, the serde default of
+/// [`crate::monitor`]; the value is overridable in configuration, so the absence of a
+/// retry is a property of the config, not of the error type) — on a malformed vault, on a
+/// non-`main` vault while the flag is off, or on a scope carrying no vault while the
+/// flag is on. Retrying cannot make an absent vault appear, so the job must fail loudly.
+#[must_use = "the resolved job vault must scope every index/vault access"]
+fn resolve_job_vault(
+    scope: &gradatum_core::job::JobScope,
+    multi_tenant_enabled: bool,
+) -> Result<String, HandlerError> {
+    match scope {
+        JobScope::Vault(v) => {
+            if !multi_tenant_enabled {
+                if v == "main" {
+                    return Ok("main".to_owned());
+                }
+                return Err(HandlerError::Business(format!(
+                    "unsupported vault scope (mono-vault): '{v}' ≠ 'main'"
+                )));
+            }
+            VaultId::parse(v)
+                .map(|vid| vid.as_str().to_owned())
+                .map_err(|e| HandlerError::Business(format!("invalid job vault '{v}': {e}")))
+        }
+        // Scopes portant un périmètre mais AUCUN vault. À OFF ils désignent le vault
+        // unique ; à ON ils sont ambigus → refus terminal, jamais un « main » silencieux.
+        JobScope::VaultWide | JobScope::Locus(_) | JobScope::Notes(_) | JobScope::Session(_) => {
+            if multi_tenant_enabled {
+                Err(HandlerError::Business(format!(
+                    "ambiguous job vault: scope {} carries no vault while multi-vault is \
+                     enabled — the enqueue site must carry JobScope::Vault(v)",
+                    scope_label(scope)
+                )))
+            } else {
+                Ok("main".to_owned())
+            }
+        }
+        // `JobScope` est `#[non_exhaustive]` et vit dans `gradatum-core` : depuis cette
+        // crate le compilateur EXIGE ce bras, il ne peut pas être supprimé. Fail-closed —
+        // une variante future n'hérite d'aucun vault par défaut.
+        _ => Err(HandlerError::Business(format!(
+            "unhandled job scope {}: no determinable vault",
+            scope_label(scope)
+        ))),
+    }
+}
+
+/// The **"one job = exactly one vault"** invariant, applied to `Job::Forget`.
+///
+/// `handle_forget` used to have TWO sources of vault truth: `ForgetScope.vault*` drove
+/// the **listing**, `resolve_job_vault(JobSpec.scope)` drove the **mutation**
+/// (`persist_forget`). Nothing tied them together: a job could list in one vault and
+/// mutate in another.
+///
+/// Operator ruling (2026-07-27): **a job carries exactly one vault**, and that vault is
+/// given to it by its scope (the job runs under a system profile with access to all the
+/// vaults of its tenant; it does not derive a vault from a calling credential). The
+/// single source is therefore `vault_id`, taken from `JobSpec.scope` — the **only** one
+/// of the two that scopes destructive access.
+///
+/// `ForgetScope.vault*` is demoted to the rank of **consistency assertion**: it no longer
+/// elects anything, it must merely agree. Disagreement is refused terminally rather than
+/// arbitrated silently — arbitrating means picking a vault at random between two
+/// contradictory intents, on a destructive path.
+///
+/// A multi-vault `Agent { vaults }` is refused here: the **fan-out** (N vaults ⇒ N jobs,
+/// one per vault) is the responsibility of the enqueue site, not of the handler. A handler
+/// that "fanned out" at execution time would drop a single job onto N vaults, which the
+/// invariant forbids.
+///
+/// The guard is **unconditional** (it is not gated on `multi_tenant`): at OFF
+/// `vault_id` is always `"main"`, so only an already inconsistent `ForgetScope` (listing
+/// outside the mutated vault) can trigger it. It does not turn a healthy case red, it
+/// makes loud a case that was silently wrong.
+///
+/// # Errors
+/// `HandlerError::Business` — terminal, never retried: a contradictory scope does not
+/// become consistent on retry.
+#[must_use = "the forget scope consistency verdict must short-circuit the handler"]
+fn ensure_forget_scope_vault(scope: &ForgetScope, vault_id: &str) -> Result<(), HandlerError> {
+    let divergent = |field: &str, found: &str| {
+        HandlerError::Business(format!(
+            "forget: scope vault mismatch — ForgetScope::{field} carries '{}' while the job \
+             is scoped on vault '{vault_id}'. A job targets exactly one vault; the enqueue site \
+             must emit one job per vault (JobScope::Vault(v) + ForgetScope on the same v).",
+            truncate_for_log(found)
+        ))
+    };
+    match scope {
+        // `None` ne contredit rien : le vault reste celui du job.
+        ForgetScope::Topic { vault: None, .. } => Ok(()),
+        ForgetScope::Topic { vault: Some(v), .. } => {
+            if v == vault_id {
+                Ok(())
+            } else {
+                Err(divergent("Topic.vault", v))
+            }
+        }
+        ForgetScope::Locus { vault, .. } => {
+            if vault == vault_id {
+                Ok(())
+            } else {
+                Err(divergent("Locus.vault", vault))
+            }
+        }
+        // Vide = « aucune contrainte », singleton = accord exigé, N > 1 = fan-out non fait.
+        ForgetScope::Agent { vaults, .. } => match vaults.as_slice() {
+            [] => Ok(()),
+            [only] if only == vault_id => Ok(()),
+            [only] => Err(divergent("Agent.vaults", only)),
+            many => Err(HandlerError::Business(format!(
+                "forget: multi-vault ForgetScope::Agent ({} vaults) on a job scoped '{vault_id}' — \
+                 a job targets exactly one vault. The enqueue site must fan out one job per vault.",
+                many.len()
+            ))),
+        },
+        // `ForgetScope` est `#[non_exhaustive]` : fail-closed, une variante future
+        // n'hérite d'aucun accord implicite avec le vault du job.
+        _ => Err(HandlerError::Business(
+            "forget: unsupported ForgetScope variant for vault reconciliation — a future \
+             variant inherits no agreement with the job vault (fail-closed)"
+                .to_owned(),
+        )),
+    }
+}
+
+/// Single-vault tenant guard — cross-tenant isolation on the flag-off path.
+///
+/// The worker is a separate process, NOT covered by the HTTP middleware. While the
+/// deployment is mono-tenant (`"main"`), a `JobSpec` carrying a `tenant_id` other than
+/// `"main"` must be rejected terminally rather than retried forever
 /// (`HandlerError::Business` is not retried on the business side). Restrictive-only.
 ///
 /// # Errors
 /// Returns `HandlerError::Business` if `tenant_id != "main"`.
-#[must_use = "le résultat de la garde tenant doit court-circuiter le handler"]
+#[must_use = "the tenant guard result must short-circuit the handler"]
 fn ensure_main_tenant(tenant_id: &str) -> Result<(), HandlerError> {
     if tenant_id != "main" {
         tracing::warn!(
             tenant_id = %tenant_id,
-            "worker: job rejeté — tenant ≠ main (invariant mono-vault, P0 cross-tenant)"
+            "worker: job rejected — tenant ≠ main (mono-vault invariant, P0 cross-tenant)"
         );
         return Err(HandlerError::Business(format!(
-            "tenant non supporté (mono-vault) : '{tenant_id}' ≠ 'main'"
+            "unsupported tenant (mono-vault): '{tenant_id}' ≠ 'main'"
         )));
     }
     Ok(())
@@ -149,7 +368,17 @@ fn ensure_main_tenant(tenant_id: &str) -> Result<(), HandlerError> {
 /// # Two use cases
 ///
 /// 1. **vault_write (new note)**: `CurateSpec.title` + `.body` are `Some` —
-///    the note is created via `write_if_match`, honoring the pre-allocated ULID (`spec.note_id`).
+///    the note is created through the internal persist API (`POST /internal/v1/persist/curated`),
+///    honoring the pre-allocated ULID (`spec.note_id`). `spec.expected_sha256` is
+///    forwarded to that API and **is honoured**; it also discriminates the two modes:
+///    - `None` → CREATE (fresh ULID), unconditional write;
+///    - `Some` → RMW update under an **optimistic lock** (compare-and-swap on the hash).
+///
+///    On a mismatch the server answers `InternalClientError::Conflict`; the handler then
+///    calls `queue.mark_conflict(...)` — moving the job to the **`Conflict`** status — and
+///    returns `Ok(JobOutput)` with a `result_note_md` describing the conflict and the
+///    current `sha256`. It does **not** return `Err`, so a conflict is visible on the job
+///    status, not through the handler's `Result`.
 /// 2. **reclassification**: `title`/`body` are `None` —
 ///    the note already exists; it is read from the vault via `note_id` and updated via
 ///    `write_note_with_id` to **preserve the ULID** (spec.note_id == stored ULID).
@@ -158,13 +387,16 @@ fn ensure_main_tenant(tenant_id: &str) -> Result<(), HandlerError> {
 ///
 /// # Title persistence
 ///
-/// After the vault write, `index.upsert_note_title()` is called with the resolved title
-/// (`spec.title` for vault_write, `extract_h1_title(body)` for reclassification).
-/// Non-fatal: a warning is logged on failure without propagating.
+/// The handler does **not** call `index.upsert_note_title()` — it holds no index. The
+/// resolved title (`spec.title` for vault_write, `extract_h1_title(body)` for
+/// reclassification) is sent in the persist request, and the **server** performs
+/// `upsert_note_title` (and `write_temporal_entry`) inside `persist_curated`.
 ///
 /// # Side effects
 ///
-/// - Writes the note to the vault (Admitted → Live, Pending → Staging).
+/// - Writes the note to the vault: `Admitted` → `live`, `Pending` → `pending-review`
+///   (`outcome_to_status` maps `Pending` to `NoteStatus::PendingReview`; it never yields
+///   `Staging`, despite the wording of the log line on that branch).
 /// - Persists `[[...]]` wikilinks via `SqliteIndex` (non-fatal).
 /// - Enqueues a `Job::Embed` if the note is admitted or pending (non-fatal, best-effort).
 ///
@@ -178,6 +410,7 @@ pub async fn handle_curate(
     client: Data<Arc<dyn InternalClient>>,
     curator: Data<Arc<dyn CuratorProcess + Send + Sync>>,
     queue: Data<Arc<dyn QueueStore + Send + Sync>>,
+    mt: Data<MultiTenantCfg>,
 ) -> Result<JobOutput, HandlerError> {
     // DryRun guard — first instruction
     if job.record.is_dry_run() {
@@ -192,7 +425,7 @@ pub async fn handle_curate(
     };
 
     // Cross-tenant guard: terminally reject if tenant ≠ main (worker outside HTTP middleware).
-    ensure_main_tenant(&spec.tenant_id)?;
+    ensure_job_tenant(&spec.tenant_id, mt.enabled)?;
 
     // Build the CuratorNote from the spec.
     // vault_write path: title + body present in the spec.
@@ -212,8 +445,11 @@ pub async fn handle_curate(
             // Reclassification path: read the existing note via InternalClient
             let note_id = NoteId(spec.note_id);
             let id_str = note_id.to_string();
+            // Lecture scopée sur le tenant DÉJÀ validé par `ensure_job_tenant` — le même
+            // que celui porté par le `persist_curated` en aval. Une lecture non scopée
+            // résoudrait sur `main` et re-classifierait l'homonyme du mauvais vault.
             let existing_dto = client
-                .get_note(&id_str)
+                .get_note(&spec.tenant_id, &id_str)
                 .await
                 .map_err(|e| HandlerError::Business(format!("read_note: {e}")))?;
 
@@ -229,15 +465,15 @@ pub async fn handle_curate(
                 tracing::info!(
                     job_id = %job.record.id,
                     note_id = %spec.note_id,
-                    "curate: note identity — reclassification ignorée (no-op F-34 v0.7.3)"
+                    "curate: identity note — reclassification skipped (no-op F-34 v0.7.3)"
                 );
                 return Ok(JobOutput {
                     notes_created: vec![],
                     notes_modified: vec![],
                     files: vec![],
                     result_note_md: format!(
-                        "curate: note identity {} — reclassification no-op \
-                         (section protégée F-34 v0.7.3)",
+                        "curate: identity note {} — no-op reclassification \
+                         (protected section F-34 v0.7.3)",
                         spec.note_id
                     ),
                 });
@@ -264,11 +500,20 @@ pub async fn handle_curate(
     // Used after the match for `upsert_note_title` — populates the near-empty `notes.title` column.
     let title_resolved = curator_note.title.clone();
 
-    let curate_outcome = curator.process(curator_note).await;
+    let (curate_outcome, curation_path) = curator.process_traced(curator_note).await;
 
     // Status resolved via the single canonical mapping (worker SSOT parity).
     // Admitted → Live, Pending → PendingReview, Rejected → None (no write).
     let write_status = gradatum_curator::outcome_to_status(&curate_outcome);
+
+    // F-66 instrumentation: decision path + outcome forwarded to the server, which
+    // owns the Prometheus registry (:19091). The server increments
+    // `gradatum_curator_decisions{path, outcome}` once per persisted note.
+    // Rejected outcomes are not persisted (no round-trip) — a dormant path in LIVE.
+    let curator_decision = gradatum_dto::CuratorDecisionDto {
+        path: curation_path.as_str().to_string(),
+        outcome: gradatum_curator::outcome_label(&curate_outcome).to_string(),
+    };
 
     let written_note_id = match curate_outcome {
         CurateOutcome::Admitted { ref decisions } => {
@@ -312,7 +557,7 @@ pub async fn handle_curate(
                 )
             } else {
                 // vault_write path
-                let status = write_status.expect("Admitted → Some(Live) par outcome_to_status");
+                let status = write_status.expect("Admitted → Some(Live) by outcome_to_status");
                 let status_str = status_to_str(status);
                 let author = spec.author.clone();
                 let provenance = Some(
@@ -404,7 +649,7 @@ pub async fn handle_curate(
                 resolve_wikilinks_via_client(&client, &tenant_id, &note_id_str, &curate_body).await;
             let persist_req = PersistCuratedRequest {
                 note_id: note_id_str.clone(),
-                tenant_id: tenant_id.clone(),
+                tenant_id: tenant_id.clone().into(),
                 title: curate_title,
                 body: curate_body,
                 section: curate_section_str,
@@ -421,6 +666,8 @@ pub async fn handle_curate(
                 }),
                 links,
                 provenance: curate_provenance,
+                curator_decision: Some(curator_decision.clone()),
+                target_vault: None,
             };
             match client.persist_curated(&persist_req).await {
                 Ok(_ok) => {}
@@ -438,12 +685,16 @@ pub async fn handle_curate(
                                 .min(i64::from(u32::MAX)) as u32
                         })
                         .unwrap_or(0);
-                    let conflict_payload_str = serde_json::json!({
-                        "note_id": note_id_str,
-                        "timestamp_ms": Utc::now().timestamp_millis(),
-                        "current_sha256": current_sha256_hex,
-                    })
-                    .to_string();
+                    // Contrat gelé WriteConflictDto (gradatum-dto) : `current_sha256` = hash
+                    // gagnant récupéré du corps 409, `attempted_sha256` = hex périmé envoyé par
+                    // l'appelant (toujours Some sur le chemin RMW). Zéro `note_id` (hors contrat).
+                    let conflict_payload_str =
+                        serde_json::to_string(&gradatum_dto::WriteConflictDto {
+                            current_sha256: current_sha256_hex.clone().unwrap_or_default(),
+                            attempted_sha256: persist_req.expected_sha256.clone(),
+                            timestamp_ms: Utc::now().timestamp_millis(),
+                        })
+                        .unwrap_or_else(|_| "{}".to_string());
                     if let Err(e) = queue
                         .mark_conflict(job_id, conflict_payload_str, duration_ms)
                         .await
@@ -451,7 +702,7 @@ pub async fn handle_curate(
                         tracing::error!(
                             job_id = %job_id,
                             error = %e,
-                            "curate: mark_conflict échoué — job restera en état courant"
+                            "curate: mark_conflict failed — job will stay in current state"
                         );
                     }
                     let sha_suffix = current_sha256_hex
@@ -463,7 +714,7 @@ pub async fn handle_curate(
                         notes_modified: vec![],
                         files: vec![],
                         result_note_md: format!(
-                            "curate: conflit optimistic-lock sur note {} (Admitted){sha_suffix}",
+                            "curate: optimistic-lock conflict on note {} (Admitted){sha_suffix}",
                             spec.note_id
                         ),
                     });
@@ -478,7 +729,7 @@ pub async fn handle_curate(
             tracing::info!(
                 job_id = %job.record.id,
                 section = %decisions.canonical_section,
-                "curate: note admise et persistée"
+                "curate: note admitted and persisted"
             );
             let written_id = NoteId(spec.note_id);
             Some(written_id)
@@ -491,7 +742,7 @@ pub async fn handle_curate(
                 section_from_str(&decisions.canonical_section).unwrap_or(Section::Reference);
 
             // Pending path — same structure as Admitted but with PendingReview status
-            let status = write_status.expect("Pending → Some(PendingReview) par outcome_to_status");
+            let status = write_status.expect("Pending → Some(PendingReview) by outcome_to_status");
             let pending_status_str = status_to_str(status);
             let (
                 pend_title,
@@ -553,7 +804,7 @@ pub async fn handle_curate(
                     .await;
             let persist_req_pending = PersistCuratedRequest {
                 note_id: note_id_str_pending.clone(),
-                tenant_id: tenant_id.clone(),
+                tenant_id: tenant_id.clone().into(),
                 title: pend_title,
                 body: pend_body,
                 section: pend_section_str,
@@ -565,6 +816,8 @@ pub async fn handle_curate(
                 temporal: None,
                 links: links_pending,
                 provenance: pend_provenance,
+                curator_decision: Some(curator_decision.clone()),
+                target_vault: None,
             };
             match client.persist_curated(&persist_req_pending).await {
                 Ok(_ok) => {}
@@ -581,12 +834,14 @@ pub async fn handle_curate(
                                 .min(i64::from(u32::MAX)) as u32
                         })
                         .unwrap_or(0);
-                    let conflict_payload_str = serde_json::json!({
-                        "note_id": note_id_str_pending,
-                        "timestamp_ms": Utc::now().timestamp_millis(),
-                        "current_sha256": current_sha256_hex,
-                    })
-                    .to_string();
+                    // Contrat gelé WriteConflictDto (parité avec le bras Admitted).
+                    let conflict_payload_str =
+                        serde_json::to_string(&gradatum_dto::WriteConflictDto {
+                            current_sha256: current_sha256_hex.clone().unwrap_or_default(),
+                            attempted_sha256: persist_req_pending.expected_sha256.clone(),
+                            timestamp_ms: Utc::now().timestamp_millis(),
+                        })
+                        .unwrap_or_else(|_| "{}".to_string());
                     if let Err(e) = queue
                         .mark_conflict(job_id, conflict_payload_str, duration_ms)
                         .await
@@ -594,7 +849,7 @@ pub async fn handle_curate(
                         tracing::error!(
                             job_id = %job_id,
                             error = %e,
-                            "curate: mark_conflict échoué (pending) — job restera en état courant"
+                            "curate: mark_conflict failed (pending) — job will stay in current state"
                         );
                     }
                     let sha_suffix = current_sha256_hex
@@ -606,7 +861,7 @@ pub async fn handle_curate(
                         notes_modified: vec![],
                         files: vec![],
                         result_note_md: format!(
-                            "curate: conflit optimistic-lock (pending) sur note {}{sha_suffix}",
+                            "curate: optimistic-lock conflict (pending) on note {}{sha_suffix}",
                             spec.note_id
                         ),
                     });
@@ -621,7 +876,7 @@ pub async fn handle_curate(
             tracing::info!(
                 job_id = %job.record.id,
                 reason = %reason,
-                "curate: note mise en Staging (revue manuelle requise)"
+                "curate: note moved to Staging (manual review required)"
             );
             Some(NoteId(spec.note_id))
         }
@@ -629,7 +884,7 @@ pub async fn handle_curate(
             tracing::info!(
                 job_id = %job.record.id,
                 reason = %reason,
-                "curate: note rejetée — aucune écriture vault"
+                "curate: note rejected — no vault write"
             );
             None
         }
@@ -658,14 +913,14 @@ pub async fn handle_curate(
             tracing::warn!(
                 note_id = %note_id,
                 error = %e,
-                "curate: enqueue Job::Embed échoué — note curée, embed non schedulé (best-effort)"
+                "curate: Job::Embed enqueue failed — note curated, embed not scheduled (best-effort)"
             );
         }
     }
 
     let result_desc = written_note_id
-        .map(|id| format!("note {} créée/mise à jour", id))
-        .unwrap_or_else(|| "rejetée".to_string());
+        .map(|id| format!("note {} created/updated", id))
+        .unwrap_or_else(|| "rejected".to_string());
 
     Ok(JobOutput {
         notes_created: written_note_id.map(|nid| vec![nid.0]).unwrap_or_default(),
@@ -698,6 +953,7 @@ pub async fn handle_embed(
     job: GradatumJob,
     client: Data<Arc<dyn InternalClient>>,
     embedder: Data<Arc<dyn Embedder + Send + Sync>>,
+    mt: Data<MultiTenantCfg>,
 ) -> Result<JobOutput, HandlerError> {
     // DryRun guard — first instruction
     if job.record.is_dry_run() {
@@ -712,14 +968,16 @@ pub async fn handle_embed(
     };
 
     // Cross-tenant guard: terminally reject if tenant ≠ main (defense-in-depth).
-    ensure_main_tenant(&spec.tenant_id)?;
+    ensure_job_tenant(&spec.tenant_id, mt.enabled)?;
 
     let note_id = NoteId(spec.note_id);
     let id_str = note_id.to_string();
 
     // Read the note via InternalClient to obtain the body.
+    // Lecture scopée sur le tenant validé juste au-dessus — même vault que le
+    // `persist_embedding` en aval.
     let note_dto = client
-        .get_note(&id_str)
+        .get_note(&spec.tenant_id, &id_str)
         .await
         .map_err(|e| HandlerError::Business(format!("embed: read_note: {e}")))?;
 
@@ -728,13 +986,13 @@ pub async fn handle_embed(
         tracing::info!(
             job_id = %job.record.id,
             note_id = %spec.note_id,
-            "embed: skip — body vide"
+            "embed: skip — empty body"
         );
         return Ok(JobOutput {
             notes_created: vec![],
             notes_modified: vec![],
             files: vec![],
-            result_note_md: format!("embed: skip note {} — body vide", spec.note_id),
+            result_note_md: format!("embed: skip note {} — empty body", spec.note_id),
         });
     }
 
@@ -762,6 +1020,9 @@ pub async fn handle_embed(
             embedder_id: embedder.embedder_id().to_string(),
             dim: embedder.dim(),
             vector: vec,
+            // C4-1e Slice B3 (MIGRATE) : le worker émet le vault réel du job.
+            // OFF → spec.tenant_id == "main" (garde ensure_job_tenant l.791) = byte-identical.
+            vault_id: Some(spec.tenant_id.clone().into()),
         })
         .await
         .map_err(|e| HandlerError::Business(format!("embed: persist_embedding: {e}")))?;
@@ -779,7 +1040,7 @@ pub async fn handle_embed(
         notes_modified: vec![note_id.0],
         files: vec![],
         result_note_md: format!(
-            "embed: note {} vecteur dim={} persisté",
+            "embed: note {} vector dim={} persisted",
             spec.note_id,
             embedder.dim()
         ),
@@ -842,7 +1103,7 @@ pub async fn handle_reindex(
     tracing::warn!(
         job_id = %job.record.id,
         mode = ?mode,
-        "reindex: non implémenté en v0.4.x — job rejeté explicitement"
+        "reindex: not implemented in v0.4.x — job explicitly rejected"
     );
 
     Err(HandlerError::Business(format!(
@@ -859,13 +1120,17 @@ pub async fn handle_reindex(
 /// # Contract
 ///
 /// - Receives a `GradatumJob` with `record.spec.kind = Job::Purge(PurgeSpec { ... })`.
-/// - Checks `DryRunAware::is_dry_run()` **AND** `spec.dry_run` as the FIRST instruction
-///   (double guard for an irreversible operation).
+/// - Checks `DryRunAware::is_dry_run()` **OR** `spec.dry_run` as the FIRST instruction —
+///   either flag alone forces dry-run (`is_dry_run() || spec.dry_run`). The guard is a
+///   double *opportunity* to stay in simulation, not a conjunction: for an irreversible
+///   operation, real mode requires **both** to be false.
 /// - In dry-run: lists eligible notes and returns `JobOutput::dry_run(count, ulids)` **without deleting anything**.
-/// - In real mode: for each eligible `Garbage` note:
-///   1. Re-verifies the current status (TOCTOU mitigation between listing and delete).
-///   2. `vault.delete_note(id)` — removes `.md` and purges `.history/<ulid>/`.
-///   3. `index.delete_redirect_by_ulid(id)` — cleans `redirect_table` (non-fatal).
+/// - In real mode, through the injected [`InternalClient`] (the handler holds no `Vault`
+///   and no `Index`), for each eligible `Garbage` note:
+///   1. `client.get_note_status` — re-verifies the current status (TOCTOU mitigation
+///      between listing and delete).
+///   2. `client.delete_note` — the server removes the `.md`, purges `.history/<ulid>/`
+///      and cleans the `redirect_table`.
 ///
 /// # Eligibility
 ///
@@ -885,6 +1150,7 @@ pub async fn handle_reindex(
 pub async fn handle_purge(
     job: GradatumJob,
     client: Data<Arc<dyn InternalClient>>,
+    mt: Data<MultiTenantCfg>,
 ) -> Result<JobOutput, HandlerError> {
     // ── Double dry-run guard — first instruction (DryRun mode + PurgeSpec.dry_run) ──
     let spec = match &job.record.spec.kind {
@@ -901,8 +1167,9 @@ pub async fn handle_purge(
 
     // Compute the cutoff timestamp (UTC ms) from grace_days.
     // grace_days = None → no age limit (all Garbage notes).
-    // INTERNAL_TENANT_ID == "main" for single-vault deployment.
-    let vault_id = "main";
+    // C2 (EX-C2-3) : vault résolu depuis JobSpec.scope — "main" à OFF (byte-identical).
+    let vault_id = resolve_job_vault(&job.record.spec.scope, mt.enabled)?;
+    let vault_id = vault_id.as_str();
     let cutoff_ms: Option<i64> = spec.grace_days.map(|days| {
         Utc::now()
             .timestamp_millis()
@@ -910,24 +1177,20 @@ pub async fn handle_purge(
     });
 
     // List eligible Garbage notes (or all if cutoff_ms = None).
-    let candidates: Vec<NoteIdDto> = match cutoff_ms {
-        Some(cutoff) => {
-            let grace_days = spec.grace_days.unwrap_or(0);
-            client
-                .list_garbage(vault_id, cutoff, grace_days)
-                .await
-                .map_err(|e| HandlerError::Business(format!("purge: list_garbage: {e}")))?
-        }
-        None => {
-            // No grace period — list all Garbage notes.
-            client
-                .list_by_status(vault_id, "Garbage")
-                .await
-                .map_err(|e| {
-                    HandlerError::Business(format!("purge: list_by_status(Garbage): {e}"))
-                })?
-        }
-    };
+    //
+    // Both paths go through the garbage listing (`list_garbage` → server
+    // `list_garbage_older_than`), which **excludes PROTECTED_DELETE sections**
+    // (F-100 P1-1, defense in depth). The no-grace case uses `i64::MAX` as the
+    // cutoff so every Garbage note qualifies — semantically "no age limit" — while
+    // still inheriting the protected-section exclusion. The generic
+    // `list_by_status(Garbage)` is deliberately not used here (it has no protected
+    // filter and is shared with non-purge callers).
+    let cutoff = cutoff_ms.unwrap_or(i64::MAX);
+    let grace_days = spec.grace_days.unwrap_or(0);
+    let candidates: Vec<NoteIdDto> = client
+        .list_garbage(vault_id, cutoff, grace_days)
+        .await
+        .map_err(|e| HandlerError::Business(format!("purge: list_garbage: {e}")))?;
 
     let count = candidates.len();
 
@@ -939,23 +1202,23 @@ pub async fn handle_purge(
             .collect::<Vec<_>>()
             .join(", ");
         let description = if ulid_list.is_empty() {
-            "purge lifecycle dry-run — aucune note éligible".to_string()
+            "purge lifecycle dry-run — no eligible note".to_string()
         } else {
-            format!("purge lifecycle dry-run — notes éligibles : [{ulid_list}]")
+            format!("purge lifecycle dry-run — eligible notes: [{ulid_list}]")
         };
         tracing::info!(
             job_id = %job.record.id,
             count = count,
             grace_days = ?spec.grace_days,
             dry_run = true,
-            "purge: dry-run — {count} note(s) seraient supprimées"
+            "purge: dry-run — {count} note(s) would be deleted"
         );
         return Ok(JobOutput::dry_run(count, &description));
     }
 
     // ── Real mode: delete with per-note status re-verification ───────────────
-    let mut supprimées: Vec<String> = Vec::with_capacity(count);
-    let mut ignorées: usize = 0;
+    let mut deleted: Vec<String> = Vec::with_capacity(count);
+    let mut skipped: usize = 0;
 
     for note_dto in candidates {
         let id_str = note_dto.note_id.clone();
@@ -963,23 +1226,31 @@ pub async fn handle_purge(
         // Re-verify status at delete time (TOCTOU mitigation).
         // If the note was restored (Garbage→Live) between the listing and now,
         // it is silently skipped.
-        let current_status_opt = match client.get_note(&id_str).await {
-            Ok(dto) => Some(dto.status),
+        //
+        // C4-1e (W3) : re-check SCOPÉ par `vault_id` du tick (le vault d'où provient le
+        // candidat, `list_garbage` étant scopé). `get_note_status` lit l'INDEX filtré
+        // `WHERE vault_id = ?1 AND id = ?2` — même source que le listing. Avant ce fix,
+        // `get_note(id)` résolvait par ULID seul via le singleton `main` : un candidat de
+        // `vault-b` voyait son statut re-vérifié dans `main` (classe hijack cross-vault —
+        // skip erroné si `main` Live, ou purge fondée sur le mauvais vault). À OFF
+        // `vault_id == "main"` → byte-identical.
+        let current_status_opt = match client.get_note_status(vault_id, &id_str).await {
+            Ok(opt) => opt,
             Err(InternalClientError::NotFound { .. }) => {
                 tracing::debug!(
                     note_id = %id_str,
-                    "purge: note absente — déjà supprimée, skip"
+                    "purge: note absent — already deleted, skip"
                 );
-                ignorées += 1;
+                skipped += 1;
                 continue;
             }
             Err(e) => {
                 tracing::warn!(
                     note_id = %id_str,
                     error = %e,
-                    "purge: get_note illisible — note ignorée, batch continue"
+                    "purge: get_note_status unreadable — note skipped, batch continues"
                 );
-                ignorées += 1;
+                skipped += 1;
                 continue;
             }
         };
@@ -992,53 +1263,68 @@ pub async fn handle_purge(
                 tracing::info!(
                     note_id = %id_str,
                     status = %other_status,
-                    "purge: note ignorée — statut changé depuis le listing (TOCTOU mitigation)"
+                    "purge: note skipped — status changed since listing (TOCTOU mitigation)"
                 );
-                ignorées += 1;
+                skipped += 1;
                 continue;
             }
             None => {
                 tracing::debug!(
                     note_id = %id_str,
-                    "purge: note absente de l'index — déjà supprimée, skip"
+                    "purge: note absent from index — already deleted, skip"
                 );
-                ignorées += 1;
+                skipped += 1;
                 continue;
             }
         }
 
         // Delete via server (vault + index + redirects in sequence).
-        match client.delete_note(&id_str).await {
+        // C4-1e (Slice E) : `vault_id` (résolu du JobSpec.scope, `main` à OFF) scope la
+        // cascade au vault propriétaire — plus de clobber de l'homonyme `main`.
+        match client.delete_note(vault_id, &id_str).await {
             Ok(()) => {
                 tracing::info!(
                     note_id = %id_str,
-                    "purge: note supprimée"
+                    "purge: note deleted"
                 );
             }
             Err(InternalClientError::NotFound { .. }) => {
-                tracing::debug!(note_id = %id_str, "purge: note déjà absente — skip");
-                ignorées += 1;
+                tracing::debug!(note_id = %id_str, "purge: note already absent — skip");
+                skipped += 1;
+                continue;
+            }
+            // Section protégée (garde system-wide côté serveur, F-100 P1-1) : le
+            // hard-delete est refusé (403). Distinct d'un échec technique — SKIP
+            // journalisé explicite, le batch continue, la note reste en garbage.
+            // Normalement inatteignable (le listing exclut déjà les sections
+            // protégées) — ceinture-et-bretelles si une note protégée y parvenait.
+            Err(InternalClientError::ServerError { status: 403, .. }) => {
+                tracing::info!(
+                    note_id = %id_str,
+                    "purge: note in protected section (PROTECTED_DELETE) — SKIP, never hard-delete"
+                );
+                skipped += 1;
                 continue;
             }
             Err(e) => {
                 tracing::warn!(
                     note_id = %id_str,
                     error = %e,
-                    "purge: delete_note échoué — note ignorée, batch continue"
+                    "purge: delete_note failed — note skipped, batch continues"
                 );
-                ignorées += 1;
+                skipped += 1;
                 continue;
             }
         }
-        supprimées.push(id_str);
+        deleted.push(id_str);
     }
 
-    let supprimées_count = supprimées.len();
+    let deleted_count = deleted.len();
     tracing::info!(
         job_id = %job.record.id,
-        supprimées = supprimées_count,
-        ignorées = ignorées,
-        "purge: terminé"
+        deleted = deleted_count,
+        skipped = skipped,
+        "purge: complete"
     );
 
     Ok(JobOutput {
@@ -1046,7 +1332,7 @@ pub async fn handle_purge(
         notes_modified: vec![],
         files: vec![],
         result_note_md: format!(
-            "purge lifecycle : {supprimées_count} note(s) supprimée(s), {ignorées} ignorée(s)"
+            "purge lifecycle: {deleted_count} note(s) deleted, {skipped} skipped"
         ),
     })
 }
@@ -1066,22 +1352,31 @@ pub async fn handle_purge(
 ///
 /// # Protected sections
 ///
-/// Notes belonging to `Section::AgentIssues` or `Section::Council` are systematically
-/// excluded from the batch and reported in the preview.
-/// The job does not fail on exclusions — it continues with the eligible notes.
+/// Source of truth: `Section::PROTECTED_FORGET`, which holds **four** sections —
+/// `AgentIssues`, `Council`, `ProjectMap` and `Identity`. They are systematically excluded
+/// from the batch and counted in the preview. The check is re-applied **per candidate**
+/// (via the note's own section) and is fail-closed: a candidate whose section cannot be
+/// read is skipped, not forgotten. The job does not fail on exclusions — it continues with
+/// the eligible notes.
 ///
 /// # Dry-run
 ///
-/// Returns `JobOutput` with the list of candidate ULIDs and exclusions, without
-/// any frontmatter mutation or index update.
+/// Returns `JobOutput::dry_run` carrying **counts only** — eligible and excluded — never
+/// the candidate ULIDs, and never the scope query. This is deliberate: the raw scope may
+/// contain sensitive data (PII, project names, identifiers) and must not be persisted in
+/// `result_note_md`. No frontmatter mutation, no index update.
 ///
 /// # Real mode
 ///
-/// For each eligible note:
-/// 1. Read via `vault.read_note` (cache + disk).
-/// 2. Mutate the frontmatter (`forgotten=true`, `forgotten_at`, `forgotten_by`).
-/// 3. Write via `vault.write_note_with_id` (CoW traced → snapshot in `.history/`).
-/// 4. Synchronise the index via `index.mark_forgotten`.
+/// The handler holds no `Vault` and no `Index` — `gradatum-vault` and `gradatum-index` are
+/// dev-dependencies of this crate. Every operation goes through the injected
+/// [`InternalClient`]. For each eligible note:
+/// 1. `client.get_note` — read, to skip notes already forgotten and to resolve the section.
+/// 2. `client.persist_forget` — the server mutates the frontmatter
+///    (`forgotten=true`, `forgotten_at`, `forgotten_by`), writes it CoW-traced
+///    (snapshot in `.history/`) and marks the index, in sequence.
+/// 3. `client.resync_forget_index` — best-effort repair when the server's index marking
+///    failed after a successful vault write.
 ///
 /// # Double confirmation
 ///
@@ -1091,6 +1386,7 @@ pub async fn handle_purge(
 pub async fn handle_forget(
     job: GradatumJob,
     client: Data<Arc<dyn InternalClient>>,
+    mt: Data<MultiTenantCfg>,
 ) -> Result<JobOutput, HandlerError> {
     // ── Double dry-run guard — first instruction (DryRun mode + ForgetSpec.dry_run) ──
     let spec = match &job.record.spec.kind {
@@ -1101,7 +1397,14 @@ pub async fn handle_forget(
     };
 
     let is_dry_run = job.record.is_dry_run() || spec.dry_run;
-    let vault_id = "main";
+    // C2 (EX-C2-3) : vault résolu depuis JobSpec.scope — "main" à OFF (byte-identical).
+    let vault_id = resolve_job_vault(&job.record.spec.scope, mt.enabled)?;
+    let vault_id = vault_id.as_str();
+
+    // A2-bis — SOURCE UNIQUE DE VAULT. `vault_id` (issu de `JobSpec.scope`) pilote
+    // désormais le listing ET la mutation ; `ForgetScope.vault*` n'est plus qu'une
+    // assertion de cohérence, vérifiée ici avant tout accès.
+    ensure_forget_scope_vault(&spec.scope, vault_id)?;
 
     // ── Protected sections — never forgotten ─────────────────────────────────
     // Source of truth: Section::PROTECTED_FORGET in gradatum-core::section.
@@ -1110,37 +1413,32 @@ pub async fn handle_forget(
     // ── Scope resolution → raw candidate list ────────────────────────────────
     // Methods return Vec<(id, section)> — only the id is extracted here.
     // The protected-section check is re-applied per candidate via get_note_section.
+    //
+    // Le vault de listing est `vault_id`, JAMAIS le champ du `ForgetScope` : celui-ci
+    // vient d'être prouvé égal (ou absent) par `ensure_forget_scope_vault`, donc lire
+    // `vault_id` est équivalent — et le reste après toute évolution du ForgetScope.
     let raw_candidates: Vec<String> = match &spec.scope {
-        ForgetScope::Topic {
-            query,
-            vault: scope_vault,
-            limit,
-        } => {
-            let effective_vault = scope_vault.as_deref().unwrap_or(vault_id);
+        ForgetScope::Topic { query, limit, .. } => {
             let max_limit = limit.unwrap_or(50).min(200);
             client
-                .search_fts_for_forget(effective_vault, query, max_limit)
+                .search_fts_for_forget(vault_id, query, max_limit)
                 .await
                 .map_err(|e| HandlerError::Business(format!("forget: search_fts_for_forget: {e}")))?
                 .into_iter()
                 .map(|dto| dto.note_id)
                 .collect()
         }
-        ForgetScope::Locus {
-            vault: scope_vault,
-            locus,
-        } => {
-            let effective_vault = scope_vault.as_str();
-            client
-                .list_notes_by_locus(effective_vault, locus)
-                .await
-                .map_err(|e| HandlerError::Business(format!("forget: list_notes_by_locus: {e}")))?
-                .into_iter()
-                .map(|dto| dto.note_id)
-                .collect()
-        }
-        ForgetScope::Agent { agent_id, vaults } => {
-            let vault_strs: Vec<String> = vaults.to_vec();
+        ForgetScope::Locus { locus, .. } => client
+            .list_notes_by_locus(vault_id, locus)
+            .await
+            .map_err(|e| HandlerError::Business(format!("forget: list_notes_by_locus: {e}")))?
+            .into_iter()
+            .map(|dto| dto.note_id)
+            .collect(),
+        ForgetScope::Agent { agent_id, .. } => {
+            // Un seul vault par job : la liste passée en aval est toujours `[vault_id]`,
+            // quel que soit le contenu de `vaults` (prouvé compatible ci-dessus).
+            let vault_strs: Vec<String> = vec![vault_id.to_string()];
             client
                 .list_notes_by_agent(agent_id, &vault_strs)
                 .await
@@ -1149,12 +1447,14 @@ pub async fn handle_forget(
                 .map(|dto| dto.note_id)
                 .collect()
         }
-        // Future exhaustive case — guarded by #[non_exhaustive] on ForgetScope
+        // Future exhaustive case — guarded by #[non_exhaustive] on ForgetScope.
+        // Déjà refusé en amont par `ensure_forget_scope_vault` ; conservé fail-closed.
+        // Pas de `{:?}` : ce message est persisté en base, la variante peut porter des
+        // champs non bornés.
         _ => {
-            return Err(HandlerError::Business(format!(
-                "forget: scope variant non supporté : {:?}",
-                spec.scope
-            )));
+            return Err(HandlerError::Business(
+                "forget: unsupported ForgetScope variant".to_owned(),
+            ));
         }
     };
 
@@ -1164,7 +1464,14 @@ pub async fn handle_forget(
     let mut excluded_details: Vec<(String, String)> = Vec::new(); // (ulid, section)
 
     for ulid in raw_candidates {
-        let section_str = client.get_note(&ulid).await.ok().map(|dto| dto.section);
+        // Scopé `vault_id` : la garde « section protégée » DOIT porter sur la note qui
+        // sera mutée. Non scopée, elle jugeait l'homonyme de `main` — une note protégée
+        // du vault cible pouvait passer, une note libre être bloquée par un homonyme.
+        let section_str = client
+            .get_note(vault_id, &ulid)
+            .await
+            .ok()
+            .map(|dto| dto.section);
 
         // Fail-closed: unknown section (note absent from index) = PROTECTED.
         // unwrap_or(true) ensures that any out-of-index ULID is excluded rather
@@ -1180,7 +1487,7 @@ pub async fn handle_forget(
             tracing::info!(
                 note_id = %ulid,
                 section = %section,
-                "forget: note exclue — section protégée"
+                "forget: note excluded — protected section"
             );
             excluded_details.push((ulid, section));
         } else {
@@ -1197,11 +1504,9 @@ pub async fn handle_forget(
         // it may contain sensitive data (PII, project names, identifiers).
         // The eligible note count is sufficient for poll-status on the caller side.
         let description = if eligible_count == 0 {
-            format!("forget dry-run — aucune note éligible (exclusions: {excluded_count})")
+            format!("forget dry-run — no eligible note (exclusions: {excluded_count})")
         } else {
-            format!(
-                "forget dry-run — {eligible_count} note(s) éligible(s), {excluded_count} exclue(s)"
-            )
+            format!("forget dry-run — {eligible_count} eligible note(s), {excluded_count} excluded")
         };
 
         tracing::info!(
@@ -1209,7 +1514,7 @@ pub async fn handle_forget(
             eligible = eligible_count,
             excluded = excluded_count,
             dry_run = true,
-            "forget: dry-run — {eligible_count} note(s) seraient oubliées, {excluded_count} exclue(s)"
+            "forget: dry-run — {eligible_count} note(s) would be forgotten, {excluded_count} excluded"
         );
         return Ok(JobOutput::dry_run(eligible_count, &description));
     }
@@ -1228,8 +1533,8 @@ pub async fn handle_forget(
 
         if expected_sorted != confirmed_sorted {
             return Err(HandlerError::Business(format!(
-                "forget: confirm_ulids ne correspond pas aux ULIDs résolus — \
-                 attendus={}, fournis={}. Relancer une preview et confirmer les ULIDs exacts.",
+                "forget: confirm_ulids does not match the resolved ULIDs — \
+                 expected={}, provided={}. Re-run a preview and confirm the exact ULIDs.",
                 expected_sorted.len(),
                 confirmed_sorted.len()
             )));
@@ -1238,9 +1543,9 @@ pub async fn handle_forget(
 
     // ── Real mode: frontmatter mutation + index sync ──────────────────────────
     let forgotten_by = spec.forgotten_by.as_deref();
-    let mut oubliées_ulids: Vec<ulid::Ulid> = Vec::with_capacity(eligible_count);
-    let mut oubliées: Vec<String> = Vec::with_capacity(eligible_count);
-    let mut ignorées: usize = 0;
+    let mut forgotten_ulids: Vec<ulid::Ulid> = Vec::with_capacity(eligible_count);
+    let mut forgotten: Vec<String> = Vec::with_capacity(eligible_count);
+    let mut skipped: usize = 0;
 
     for ulid in &eligible {
         let raw_ulid = match ulid::Ulid::from_string(ulid) {
@@ -1249,50 +1554,87 @@ pub async fn handle_forget(
                 tracing::warn!(
                     note_id = %ulid,
                     error = %e,
-                    "forget: ULID invalide — ignoré"
+                    "forget: invalid ULID — skipped"
                 );
-                ignorées += 1;
+                skipped += 1;
                 continue;
             }
         };
         let _note_id = NoteId(raw_ulid);
 
         // TOCTOU re-verification: if the note is already forgotten, skip idempotently.
-        let already_forgotten = match client.get_note(ulid).await {
-            Ok(dto) => dto.status == "forgotten",
+        //
+        // A7 — the flag lives in `NoteReadDto.forgotten` (frontmatter `forgotten: true`),
+        // NOT in `status`: `NoteStatus` has no `Forgotten` variant, so comparing the
+        // status against `"forgotten"` was always false and this skip never ran. A second
+        // forget then overwrote `forgotten_at`/`forgotten_by`, losing the audit trail of
+        // the first one. Same field as the distill path already reads below.
+        let already_forgotten = match client.get_note(vault_id, ulid).await {
+            Ok(dto) => dto.forgotten,
             Err(InternalClientError::NotFound { .. }) => {
-                tracing::debug!(note_id = %ulid, "forget: note absente — skip");
-                ignorées += 1;
+                tracing::debug!(note_id = %ulid, "forget: note absent — skip");
+                skipped += 1;
                 continue;
             }
             Err(e) => {
                 tracing::warn!(
                     note_id = %ulid,
                     error = %e,
-                    "forget: get_note échoué — note ignorée, batch continue"
+                    "forget: get_note failed — note skipped, batch continues"
                 );
-                ignorées += 1;
+                skipped += 1;
                 continue;
             }
         };
 
         if already_forgotten {
-            tracing::debug!(note_id = %ulid, "forget: déjà oubliée — skip idempotent");
-            oubliées.push(ulid.clone());
-            oubliées_ulids.push(raw_ulid);
+            // A7-bis — le skip garde la piste d'audit, la re-synchro garde l'index.
+            //
+            // A7 avait ressuscité ce skip (mort tant qu'il comparait `status`), ce qui a
+            // troqué une propriété contre l'autre : `forgotten_at`/`forgotten_by` du
+            // premier oubli étaient enfin préservés, mais le `continue` laissait l'index
+            // désynchronisé POUR TOUJOURS — la note restait indexée vivante, donc
+            // CHERCHABLE, alors que le vault la dit oubliée, et elle était malgré tout
+            // comptée dans la liste `forgotten` du job.
+            //
+            // Cette désynchronisation n'est pas une fenêtre de course : deux chemins de
+            // production ordinaires la créent — `vault_unforgot` (route publique) efface
+            // la marque d'index sans toucher au frontmatter, et `persist_forget` rend 200
+            // best-effort si son `mark_forgotten` échoue après un write vault réussi.
+            //
+            // `resync_forget_index` ne réécrit QUE `forgotten = 1` : surtout pas
+            // `persist_forget`, qui ré-estamperait `forgotten_at`/`forgotten_by` à
+            // l'instant présent et détruirait ce que ce skip existe pour protéger.
+            //
+            // Best-effort assumé, jamais silencieux : la note EST oubliée côté vault, donc
+            // un échec de réparation ne doit pas faire échouer le lot — mais il est
+            // journalisé en WARN, sans quoi la désynchronisation redeviendrait invisible.
+            if let Err(e) = client.resync_forget_index(vault_id, ulid).await {
+                tracing::warn!(
+                    note_id = %ulid,
+                    error = %e,
+                    "forget: index resync failed — note left desynchronised (searchable), batch continues"
+                );
+            }
+            tracing::debug!(
+                note_id = %ulid,
+                "forget: already forgotten — idempotent skip, index mark re-asserted"
+            );
+            forgotten.push(ulid.clone());
+            forgotten_ulids.push(raw_ulid);
             continue;
         }
 
         // Get section for persist_forget (server handles frontmatter mutation + index sync)
-        let note_section = match client.get_note(ulid).await {
+        let note_section = match client.get_note(vault_id, ulid).await {
             Ok(dto) => dto.section,
             Err(e) => {
                 tracing::warn!(
                     note_id = %ulid,
                     error = %e,
-                    "forget: get_note (section) échoué — note ignorée, batch continue"
+                    "forget: get_note (section) failed — note skipped, batch continues"
                 );
-                ignorées += 1;
+                skipped += 1;
                 continue;
             }
         };
@@ -1301,7 +1643,7 @@ pub async fn handle_forget(
         match client
             .persist_forget(&PersistForgetRequest {
                 note_id: ulid.clone(),
-                tenant_id: vault_id.to_string(),
+                tenant_id: vault_id.to_string().into(),
                 body: String::new(), // server reads the body internally
                 section: note_section,
                 forgotten_by: forgotten_by.map(|s| s.to_string()),
@@ -1309,37 +1651,37 @@ pub async fn handle_forget(
             .await
         {
             Ok(_) => {
-                tracing::info!(note_id = %ulid, "forget: note oubliée");
+                tracing::info!(note_id = %ulid, "forget: note forgotten");
             }
             Err(e) => {
                 tracing::warn!(
                     note_id = %ulid,
                     error = %e,
-                    "forget: persist_forget échoué — note ignorée, batch continue"
+                    "forget: persist_forget failed — note skipped, batch continues"
                 );
-                ignorées += 1;
+                skipped += 1;
                 continue;
             }
         }
-        oubliées.push(ulid.clone());
-        oubliées_ulids.push(raw_ulid);
+        forgotten.push(ulid.clone());
+        forgotten_ulids.push(raw_ulid);
     }
 
-    let oubliées_count = oubliées.len();
+    let forgotten_count = forgotten.len();
     tracing::info!(
         job_id = %job.record.id,
-        oubliées = oubliées_count,
-        ignorées = ignorées,
+        forgotten = forgotten_count,
+        skipped = skipped,
         exclusions = excluded_count,
-        "forget: terminé"
+        "forget: complete"
     );
 
     Ok(JobOutput {
         notes_created: vec![],
-        notes_modified: oubliées_ulids,
+        notes_modified: forgotten_ulids,
         files: vec![],
         result_note_md: format!(
-            "forget sémantique : {oubliées_count} note(s) oubliée(s), {ignorées} ignorée(s), {excluded_count} exclue(s) (sections protégées)"
+            "semantic forget: {forgotten_count} note(s) forgotten, {skipped} skipped, {excluded_count} excluded (protected sections)"
         ),
     })
 }
@@ -1369,7 +1711,7 @@ pub struct ClusterSynthesis {
 #[derive(Debug, thiserror::Error)]
 pub enum SynthesisError {
     /// The synthesis service (LLM gateway) is unavailable or failed.
-    #[error("synthèse indisponible : {0}")]
+    #[error("synthesis unavailable: {0}")]
     Unavailable(String),
 }
 
@@ -1419,7 +1761,7 @@ impl DistillSynthesizer for TemplateSynthesizer {
     ) -> Result<ClusterSynthesis, SynthesisError> {
         if cluster.is_empty() {
             return Err(SynthesisError::Unavailable(
-                "cluster vide — rien à synthétiser".to_string(),
+                "empty cluster — nothing to synthesize".to_string(),
             ));
         }
         // Title: derived from the first non-empty title in the cluster.
@@ -1427,21 +1769,21 @@ impl DistillSynthesizer for TemplateSynthesizer {
             .iter()
             .map(|(t, _)| t.trim())
             .find(|t| !t.is_empty())
-            .unwrap_or("notes connexes");
-        let title = format!("Synthèse distillée — {lead_title}");
+            .unwrap_or("related notes");
+        let title = format!("Distilled synthesis — {lead_title}");
 
         // Body: header + list of source notes with bounded excerpt.
         let mut body = format!(
             "# {title}\n\n\
-             > Note de synthèse distillée (F-22) — **en attente de revue**.\n\
-             > Regroupe {} note(s) sémantiquement proches.\n\n\
-             ## Sources distillées\n\n",
+             > Distilled synthesis note (F-22) — **pending review**.\n\
+             > Groups {} semantically close note(s).\n\n\
+             ## Distilled sources\n\n",
             cluster.len()
         );
         for (i, (src_title, src_body)) in cluster.iter().enumerate() {
             let excerpt: String = src_body.trim().chars().take(280).collect();
             let display_title = if src_title.trim().is_empty() {
-                "(sans titre)"
+                "(untitled)"
             } else {
                 src_title.trim()
             };
@@ -1466,14 +1808,17 @@ impl DistillSynthesizer for TemplateSynthesizer {
 ///
 /// # Real mode
 ///
-/// For each cluster:
-/// 1. Synthesis via [`DistillSynthesizer`] (failure → clean `Failed` job, no partial note written).
-/// 2. Write the synthesis note as `PendingReview`:
-///    `provenance = "distilled"`, `derived-from = [source ulids]` (ExtraFields).
-/// 3. Dynamic trust: `compute_distill_trust(sources, index, confidence_threshold)`
-///    persisted via `index.set_note_trust` (overwrites the static 0.60 from `provenance`).
-/// 4. Mark sources: `processed = true` + `derived-into = <synthesis ulid>`
-///    (ExtraFields — keys in `HISTORY_EXCLUDED_FIELDS`, CoW-safe: no spurious version entry).
+/// **This handler writes nothing.** It synthesises, then hands the persistence off to a
+/// `Job::Validate`. For each cluster:
+/// 1. Synthesis via [`DistillSynthesizer`] (failure → clean `Failed` job, nothing enqueued).
+/// 2. Compute the base trust for the synthesis and snapshot the source trusts.
+/// 3. Build a `ValidateSpec` (synthesis ULID, title, body, source ulids, source texts,
+///    source trusts, base trust, threshold) and `queue.enqueue` it as `Job::Validate`.
+///    Enqueue failure is **best-effort**: it is logged as a warning and the cluster is
+///    skipped, without failing the distill job.
+///
+/// Writing the synthesis note, persisting its trust and marking the sources
+/// (`processed = true` + `derived-into`) all happen in `handle_validate`, not here.
 ///
 /// # Required scope in real mode
 ///
@@ -1485,16 +1830,26 @@ impl DistillSynthesizer for TemplateSynthesizer {
 /// A note with `processed = true` is never re-collected (filtered before clustering) —
 /// a double run on the same scope is idempotent (already-distilled clusters are excluded).
 ///
+/// **Caveat**: this handler never sets `processed` itself — the flag is written by
+/// `handle_validate`. Idempotence therefore only holds once the enqueued `Job::Validate`
+/// has run. A second distill launched before that (or after a best-effort enqueue
+/// failure) re-collects the same sources and re-synthesises the cluster.
+///
 /// # Injected dependencies
 ///
-/// `vault`, `index`, `embedder` (reads precomputed embeddings via `embedder_id`),
-/// `synthesizer` (pluggable synthesis producer).
+/// `client` ([`InternalClient`] — the only write path), `embedder` (reads precomputed
+/// embeddings via `embedder_id`), `synthesizer` (pluggable synthesis producer), `queue`
+/// (to enqueue the `Job::Validate`) and `mt` (multi-tenant config for vault resolution).
+///
+/// Neither `vault` nor `index` is injected: `gradatum-vault` and `gradatum-index` are
+/// **dev-dependencies** of this crate, unavailable to the handler.
 pub async fn handle_distill(
     job: GradatumJob,
     client: Data<Arc<dyn InternalClient>>,
     embedder: Data<Arc<dyn Embedder + Send + Sync>>,
     synthesizer: Data<Arc<dyn DistillSynthesizer + Send + Sync>>,
     queue: Data<Arc<dyn QueueStore>>,
+    mt: Data<MultiTenantCfg>,
 ) -> Result<JobOutput, HandlerError> {
     // ── Spec extraction — first instruction ──────────────────────────────────
     let spec = match &job.record.spec.kind {
@@ -1505,11 +1860,17 @@ pub async fn handle_distill(
     };
 
     let is_dry_run = job.record.is_dry_run();
-    let vault_id = "main".to_string();
-    // Mono-vault: vault_id is hardcoded to "main" (single-vault deployment).
-    // not from a tenant_id injected via DistillSpec — ensure_main_tenant not applicable here.
-    // If DistillSpec gains a tenant_id field, apply ensure_main_tenant(&spec.tenant_id)
-    // immediately after spec extraction (same pattern as handle_curate/handle_embed).
+    // C2 (EX-C2-3) : vault résolu depuis JobSpec.scope (le cron enqueue Vault(v) à ON,
+    // Locus(locus) à OFF → "main", byte-identical). Le locus vit dans DistillSource.scope.
+    //
+    // ⚠️ HOMONYMES — deux champs `scope`, MÊME type `JobScope`, contrats OPPOSÉS. Le
+    // typage ne protège de rien ici : intervertir les deux compile sans un warning.
+    //   • `job.record.spec.scope` (ci-dessous) = OÙ. Doit porter `Vault(v)` à ON ;
+    //     `resolve_job_vault` refuse toute autre variante.
+    //   • `spec.scope` = `DistillSource.scope` (l. ~1817) = QUOI. Doit porter
+    //     `Locus`/`Notes` ; `resolve_distill_scope` refuse justement `Vault`.
+    // Un `Vault(v)` valide pour l'un est terminal pour l'autre, et réciproquement.
+    let vault_id = resolve_job_vault(&job.record.spec.scope, mt.enabled)?;
     let embedder_id = embedder.embedder_id().to_string();
 
     // Clamp confidence_threshold to [0, 1].
@@ -1526,7 +1887,7 @@ pub async fn handle_distill(
     // ── VaultWide scope guard in real mode ───────────────────────────────────
     if !is_dry_run && matches!(spec.scope, JobScope::VaultWide) {
         return Err(HandlerError::Business(
-            "distill: JobScope::VaultWide refusé hors dry-run — scope Locus ou Notes requis (R3)"
+            "distill: JobScope::VaultWide rejected outside dry-run — Locus or Notes scope required (R3)"
                 .to_string(),
         ));
     }
@@ -1539,13 +1900,16 @@ pub async fn handle_distill(
         && prefix.trim().is_empty()
     {
         return Err(HandlerError::Business(
-            "distill: JobScope::Locus vide/whitespace refusé hors dry-run \
-                     (matcherait tout le vault — contourne R3)"
+            "distill: empty/whitespace JobScope::Locus refused outside dry-run \
+                     (would match the whole vault — bypasses R3)"
                 .to_string(),
         ));
     }
 
     // ── Scope resolution → raw candidates (ULIDs) ────────────────────────────
+    // ⚠️ `spec.scope` = `DistillSource.scope` (le QUOI), à ne pas confondre avec
+    // `job.record.spec.scope` (le OÙ, consommé par `resolve_job_vault` plus haut) — même
+    // type, contrats opposés. Cf. le bloc HOMONYMES en tête de handler.
     let raw_candidates: Vec<NoteId> =
         resolve_distill_scope(&**client, &vault_id, &spec.scope).await?;
 
@@ -1564,37 +1928,40 @@ pub async fn handle_distill(
             break;
         }
         let note_id_str = note_id.to_string();
-        let note_dto = match client.get_note(&note_id_str).await {
+        let note_dto = match client.get_note(&vault_id, &note_id_str).await {
             Ok(n) => n,
             Err(InternalClientError::NotFound { .. }) => {
-                tracing::warn!(note_id = %note_id, "distill: note absente — ignorée");
+                tracing::warn!(note_id = %note_id, "distill: note absent — skipped");
                 continue;
             }
             Err(e) => {
-                tracing::warn!(note_id = %note_id, error = %e, "distill: get_note échoué — note ignorée");
+                tracing::warn!(note_id = %note_id, error = %e, "distill: get_note failed — note skipped");
                 continue;
             }
         };
         // Defensive skip: never distill a forgotten note.
         if note_dto.forgotten {
-            tracing::debug!(note_id = %note_id, "distill: note forgotten — ignorée");
+            tracing::debug!(note_id = %note_id, "distill: note forgotten — skipped");
             continue;
         }
         // Defensive skip: never distill a Garbage note.
         if note_dto.status == "garbage" {
-            tracing::debug!(note_id = %note_id, "distill: note Garbage — ignorée");
+            tracing::debug!(note_id = %note_id, "distill: Garbage note — skipped");
             continue;
         }
         // Skip if already distilled (idempotence — check via processed field in NoteReadDto).
         if note_dto.processed {
-            tracing::debug!(note_id = %note_id, "distill: note déjà processed — ignorée");
+            tracing::debug!(note_id = %note_id, "distill: note already processed — skipped");
             continue;
         }
         // Skip if no embedding (cannot be clustered).
-        let emb = match client.get_note_embedding(&note_id_str, &embedder_id).await {
+        let emb = match client
+            .get_note_embedding(&vault_id, &note_id_str, &embedder_id)
+            .await
+        {
             Ok(e) => e.vector,
             Err(InternalClientError::NotFound { .. }) => {
-                tracing::debug!(note_id = %note_id, "distill: pas d'embedding — note ignorée");
+                tracing::debug!(note_id = %note_id, "distill: no embedding — note skipped");
                 continue;
             }
             Err(e) => {
@@ -1614,7 +1981,7 @@ pub async fn handle_distill(
     // ── Dry-run: list clusters without mutation ──────────────────────────────
     if is_dry_run {
         let description = format!(
-            "distill dry-run — {} note(s) candidate(s), {} cluster(s) (seuil cosine {:.2})",
+            "distill dry-run — {} candidate note(s), {} cluster(s) (cosine threshold {:.2})",
             candidates.len(),
             clusters.len(),
             confidence_threshold
@@ -1643,7 +2010,7 @@ pub async fn handle_distill(
         // Synthesis — failure = clean job Failed (no partial note written for THIS
         // cluster; previously written clusters remain committed, documented batch behaviour).
         let synthesis = synthesizer.synthesize(&cluster_pairs).await.map_err(|e| {
-            HandlerError::Business(format!("distill: synthèse cluster échouée: {e}"))
+            HandlerError::Business(format!("distill: cluster synthesis failed: {e}"))
         })?;
 
         // Synthesis note frontmatter: PendingReview + provenance distilled +
@@ -1680,7 +2047,7 @@ pub async fn handle_distill(
         let mut trust_map: std::collections::HashMap<ulid::Ulid, f32> =
             std::collections::HashMap::with_capacity(source_ids.len());
         for src in &source_ids {
-            if let Ok(t) = client.get_trust(&src.to_string()).await {
+            if let Ok(t) = client.get_trust(&vault_id, &src.to_string()).await {
                 trust_map.insert(src.0, t);
             }
         }
@@ -1728,7 +2095,7 @@ pub async fn handle_distill(
         job_id = %job.record.id,
         clusters = clusters.len(),
         enqueued = notes_created.len(),
-        "distill: terminé"
+        "distill: complete"
     );
 
     let enqueued_count = notes_created.len();
@@ -1737,7 +2104,7 @@ pub async fn handle_distill(
         notes_modified: vec![],
         files: vec![],
         result_note_md: format!(
-            "distill: {} cluster(s) → {enqueued_count} synthèse(s) enqueued for validation",
+            "distill: {} cluster(s) → {enqueued_count} synthesis/es enqueued for validation",
             clusters.len()
         ),
     })
@@ -1785,7 +2152,12 @@ async fn resolve_distill_scope(
             Ok(all)
         }
         JobScope::Session(_) => Err(HandlerError::Business(
-            "distill: JobScope::Session non supporté".to_string(),
+            "distill: JobScope::Session not supported".to_string(),
+        )),
+        // JobScope est #[non_exhaustive] (A3) : toute variante future est refusée
+        // tant qu'elle n'est pas câblée explicitement (fail-closed, zéro mutation).
+        _ => Err(HandlerError::Business(
+            "distill: JobScope variant not supported".to_string(),
         )),
     }
 }
@@ -1870,7 +2242,7 @@ fn build_embed_job_record(
     }
 }
 
-/// Builds a [`JobRecord`] for a `Job::Validate(ValidateSpec)` job (F-43).
+/// Builds a [`JobRecord`] for a `Job::Validate(ValidateSpec)` job.
 ///
 /// Mirrors `build_embed_job_record` and the pattern of `build_curate_job_record` in
 /// `gradatum-server/src/api_v1/write.rs`.
@@ -1978,7 +2350,7 @@ fn build_frontmatter_from_spec(
                 tracing::warn!(
                     original = %t,
                     normalized = ?norm.as_ref().map(|n| n.as_str()),
-                    "build_frontmatter_from_spec: tag normalisé (C-TAG-1)"
+                    "build_frontmatter_from_spec: normalized tag (C-TAG-1)"
                 );
             }
             if let Some(tag) = norm
@@ -2106,7 +2478,7 @@ pub(crate) fn extract_valid_until(extra: &ExtraFields, anchor_ms: i64) -> Option
         tracing::warn!(
             anchor_ms,
             valid_until_ms,
-            "valid_until ≤ anchor_ms : fenêtre invalide ignorée (note reste visible)"
+            "valid_until ≤ anchor_ms: invalid window skipped (note stays visible)"
         );
         return None;
     }
@@ -2126,7 +2498,7 @@ pub(crate) fn extract_valid_until(extra: &ExtraFields, anchor_ms: i64) -> Option
 ///
 /// # Steps
 ///
-/// 1. Compute quality via [`compute_quality`] (embedder + heuristics).
+/// 1. Compute quality via `compute_quality` (embedder + heuristics).
 /// 2. Determine disposition: `pass` (score ≥ threshold) or `degrade`.
 /// 3. Persist synthesis note via `client.persist_distill` (mark_processed=false).
 /// 4. Mark each source processed=true + derived-into (non-fatal on per-source failure).
@@ -2138,6 +2510,7 @@ pub async fn handle_validate(
     job: GradatumJob,
     client: Data<Arc<dyn InternalClient>>,
     embedder: Data<Arc<dyn Embedder + Send + Sync>>,
+    mt: Data<MultiTenantCfg>,
 ) -> Result<JobOutput, HandlerError> {
     let spec = match &job.record.spec.kind {
         Job::Validate(s) => s.clone(),
@@ -2150,7 +2523,7 @@ pub async fn handle_validate(
     };
 
     // Cross-tenant guard: terminally reject if tenant ≠ main (defense-in-depth).
-    ensure_main_tenant(&spec.tenant_id)?;
+    ensure_job_tenant(&spec.tenant_id, mt.enabled)?;
 
     // Grounding + score — best-effort; any error ⇒ neutral score (pass, no note loss).
     let (quality, mode) = match compute_quality(&embedder, &spec).await {
@@ -2196,7 +2569,7 @@ pub async fn handle_validate(
     // Persist the synthesis note.
     let persist_req = PersistDistillRequest {
         note_id: spec.note_id.to_string(),
-        tenant_id: spec.tenant_id.clone(),
+        tenant_id: spec.tenant_id.clone().into(),
         title: spec.title.clone(),
         body: spec.body.clone(),
         section: "reference".to_string(),
@@ -2220,7 +2593,7 @@ pub async fn handle_validate(
         if let Err(e) = client
             .persist_distill(&PersistDistillRequest {
                 note_id: src_id.to_string(),
-                tenant_id: spec.tenant_id.clone(),
+                tenant_id: spec.tenant_id.clone().into(),
                 title: String::new(),
                 body: String::new(),
                 section: String::new(),
@@ -2466,11 +2839,13 @@ mod tests {
             async fn delete_note(
                 &self,
                 _: &str,
+                _: &str,
             ) -> Result<(), crate::internal_client::InternalClientError> {
                 unimplemented!()
             }
             async fn get_note(
                 &self,
+                _: &str,
                 _: &str,
             ) -> Result<
                 crate::internal_client::NoteReadDto,
@@ -2478,8 +2853,16 @@ mod tests {
             > {
                 unimplemented!()
             }
+            async fn get_note_status(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<String>, crate::internal_client::InternalClientError> {
+                unimplemented!()
+            }
             async fn get_note_embedding(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<
@@ -2490,6 +2873,7 @@ mod tests {
             }
             async fn get_trust(
                 &self,
+                _: &str,
                 _: &str,
             ) -> Result<f32, crate::internal_client::InternalClientError> {
                 unimplemented!()
@@ -2605,6 +2989,209 @@ mod tests {
             super::ensure_main_tenant(""),
             Err(HandlerError::Business(_))
         ));
+    }
+
+    // ── Tests C2 (EX-C2-3) — ensure_job_tenant / resolve_job_vault ───────────
+
+    /// OFF : strictement le comportement `ensure_main_tenant` (byte-identical).
+    #[test]
+    fn ensure_job_tenant_off_is_legacy() {
+        assert!(super::ensure_job_tenant("main", false).is_ok());
+        assert!(matches!(
+            super::ensure_job_tenant("research", false),
+            Err(HandlerError::Business(_))
+        ));
+    }
+
+    /// ON : tout tenant bien formé passe (l'autorisation est rendue à l'enqueue) ;
+    /// un tenant mal formé est rejeté terminalement (`VaultId::parse`).
+    #[test]
+    fn ensure_job_tenant_on_parses() {
+        assert!(super::ensure_job_tenant("research", true).is_ok());
+        assert!(matches!(
+            super::ensure_job_tenant("Bad Vault!", true),
+            Err(HandlerError::Business(_))
+        ));
+        assert!(matches!(
+            super::ensure_job_tenant("", true),
+            Err(HandlerError::Business(_))
+        ));
+    }
+
+    /// OFF : un seul vault existe, donc tout scope n'en portant aucun → "main" ;
+    /// `Vault(v ≠ main)` rejeté (fail-closed).
+    ///
+    /// Garde d'anti-régression du lot A2 : le durcissement ne vise QUE le chemin ON.
+    /// Le chemin OFF doit rester byte-identical — le cron distill y enqueue
+    /// `JobScope::Locus(locus)` (`schedules.rs::build_distill_job_record`).
+    #[test]
+    fn resolve_job_vault_off_matrix() {
+        use gradatum_core::job::JobScope;
+        assert_eq!(
+            super::resolve_job_vault(&JobScope::VaultWide, false).expect("VaultWide"),
+            "main"
+        );
+        assert_eq!(
+            super::resolve_job_vault(&JobScope::Locus("decisions".into()), false).expect("Locus"),
+            "main"
+        );
+        assert_eq!(
+            super::resolve_job_vault(&JobScope::Notes(vec![]), false).expect("Notes"),
+            "main"
+        );
+        assert_eq!(
+            super::resolve_job_vault(&JobScope::Session(ulid::Ulid::new()), false)
+                .expect("Session"),
+            "main"
+        );
+        assert_eq!(
+            super::resolve_job_vault(&JobScope::Vault("main".into()), false).expect("Vault(main)"),
+            "main"
+        );
+        assert!(matches!(
+            super::resolve_job_vault(&JobScope::Vault("research".into()), false),
+            Err(HandlerError::Business(_))
+        ));
+    }
+
+    /// ON : `Vault(v)` validé et retourné ; vault mal formé rejeté.
+    #[test]
+    fn resolve_job_vault_on_matrix() {
+        use gradatum_core::job::JobScope;
+        assert_eq!(
+            super::resolve_job_vault(&JobScope::Vault("research".into()), true)
+                .expect("Vault(research)"),
+            "research"
+        );
+        // `Vault("main")` à ON : `main` n'a rien de spécial une fois le flag levé, c'est
+        // un vault comme un autre — il passe par `VaultId::parse` et est rendu tel quel.
+        // Le cas manquait : la matrice ON ne couvrait que le vault secondaire.
+        assert_eq!(
+            super::resolve_job_vault(&JobScope::Vault("main".into()), true).expect("Vault(main)"),
+            "main"
+        );
+        assert!(matches!(
+            super::resolve_job_vault(&JobScope::Vault("../Evil".into()), true),
+            Err(HandlerError::Business(_))
+        ));
+    }
+
+    /// A2 — ON : un scope ne portant AUCUN vault est refusé terminalement au lieu de
+    /// retomber en silence sur "main".
+    ///
+    /// Discriminant : sur le code d'avant (catch-all `_ => Ok("main")`) les quatre
+    /// variantes rendaient `Ok("main")` et chaque `assert!(matches!(.., Err(..)))`
+    /// échoue. Le vault résolu scope des accès destructifs (`delete_note` dans
+    /// `handle_purge`, `persist_forget` dans `handle_forget`) : élire "main" parmi N
+    /// vaults écrivait dans le mauvais vault sans le dire.
+    #[test]
+    fn resolve_job_vault_on_rejects_scopes_carrying_no_vault() {
+        use gradatum_core::job::JobScope;
+        for scope in [
+            JobScope::VaultWide,
+            JobScope::Locus("decisions".into()),
+            JobScope::Notes(vec![ulid::Ulid::new()]),
+            JobScope::Session(ulid::Ulid::new()),
+        ] {
+            assert!(
+                matches!(
+                    super::resolve_job_vault(&scope, true),
+                    Err(HandlerError::Business(_))
+                ),
+                "scope {scope:?} doit être refusé à ON (aucun vault porté)"
+            );
+        }
+    }
+
+    /// A2-bis — invariant « un job = exactement un vault » sur `Job::Forget`.
+    ///
+    /// Accepté : le `ForgetScope` est muet (`Topic.vault = None`, `Agent.vaults = []`) ou
+    /// d'accord avec le vault du job. Refusé : tout désaccord, et tout `Agent` multi-vault
+    /// (le fan-out N vaults ⇒ N jobs appartient au site d'enqueue, pas au handler).
+    #[test]
+    fn ensure_forget_scope_vault_accepts_only_agreement_on_one_vault() {
+        use gradatum_core::ForgetScope;
+
+        let accepted = [
+            ForgetScope::Topic {
+                query: "q".into(),
+                vault: None,
+                limit: None,
+            },
+            ForgetScope::Topic {
+                query: "q".into(),
+                vault: Some("vault-b".into()),
+                limit: None,
+            },
+            ForgetScope::Locus {
+                vault: "vault-b".into(),
+                locus: "inbox/".into(),
+            },
+            ForgetScope::Agent {
+                agent_id: "a".into(),
+                vaults: vec![],
+            },
+            ForgetScope::Agent {
+                agent_id: "a".into(),
+                vaults: vec!["vault-b".into()],
+            },
+        ];
+        for scope in accepted {
+            assert!(
+                super::ensure_forget_scope_vault(&scope, "vault-b").is_ok(),
+                "scope d'accord avec le vault du job doit passer : {scope:?}"
+            );
+        }
+
+        let rejected = [
+            ForgetScope::Topic {
+                query: "q".into(),
+                vault: Some("main".into()),
+                limit: None,
+            },
+            ForgetScope::Locus {
+                vault: "main".into(),
+                locus: "inbox/".into(),
+            },
+            ForgetScope::Agent {
+                agent_id: "a".into(),
+                vaults: vec!["main".into()],
+            },
+            // Multi-vault : le fan-out n'a pas été fait à l'enqueue.
+            ForgetScope::Agent {
+                agent_id: "a".into(),
+                vaults: vec!["vault-b".into(), "main".into()],
+            },
+        ];
+        for scope in rejected {
+            assert!(
+                matches!(
+                    super::ensure_forget_scope_vault(&scope, "vault-b"),
+                    Err(HandlerError::Business(_))
+                ),
+                "scope divergent ou multi-vault doit être refusé terminalement : {scope:?}"
+            );
+        }
+    }
+
+    /// Le rendu d'un scope dans un message **persisté en base** est borné.
+    ///
+    /// Discriminant : avec `{scope:?}`, `Notes` sérialise ses N ULIDs (26 o pièce) et
+    /// `Locus` sa chaîne entière — les deux assertions de longueur tombent.
+    #[test]
+    fn scope_label_is_bounded_for_persisted_messages() {
+        use gradatum_core::job::JobScope;
+
+        let many = JobScope::Notes((0..500).map(|_| ulid::Ulid::new()).collect());
+        let label = super::scope_label(&many);
+        assert_eq!(label, "Notes(500 ids)");
+
+        let long = JobScope::Locus("x".repeat(4096));
+        let label = super::scope_label(&long);
+        assert!(
+            label.chars().count() < 80,
+            "un Locus non borné ne doit pas être recopié en base : {label}"
+        );
     }
 
     #[tokio::test]

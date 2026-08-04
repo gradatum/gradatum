@@ -67,6 +67,7 @@ fn test_config_with_default_alias(provider_endpoint: &str) -> Config {
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
         messages: Default::default(),
+        router: Default::default(),
     }
 }
 
@@ -109,6 +110,7 @@ fn test_config_without_default_alias(provider_endpoint: &str) -> Config {
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
         messages: Default::default(),
+        router: Default::default(),
     }
 }
 
@@ -802,6 +804,7 @@ fn test_config_with_model_map(provider_endpoint: &str) -> Config {
             default_alias: "fallback-alias".to_string(),
             model_map,
         },
+        router: Default::default(),
     }
 }
 
@@ -1199,6 +1202,7 @@ async fn alias_not_found_response_does_not_leak_alias_list() {
         logging: LoggingConfig::default(),
         vault_aware: VaultAwareConfig::default(),
         messages: Default::default(),
+        router: Default::default(),
     };
     let state = AppState::for_test(config);
     let app = build_router(state);

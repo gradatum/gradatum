@@ -14,27 +14,28 @@ use serde::{Deserialize, Serialize};
 
 // ── Requête entrant ────────────────────────────────────────────────────────────
 
-/// Requête `POST /v1/messages` au format Anthropic Messages API.
+/// Inbound `POST /v1/messages` request in Anthropic Messages API format.
 ///
-/// Champs inconnus du JSON sont ignorés (comportement serde par défaut).
+/// Unknown JSON fields are ignored (serde default behaviour), so a client using a
+/// newer Anthropic field is never rejected with a deserialization error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagesRequest {
-    /// Identifiant modèle — sera résolu vers un alias interne.
+    /// Model identifier — resolved to an internal alias by the gateway.
     pub model: String,
-    /// Messages de la conversation.
+    /// Conversation messages.
     pub messages: Vec<AnthropicMessage>,
-    /// Système optionnel (texte brut ou blocs de contenu).
+    /// Optional system prompt (plain text or content blocks).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemContent>,
-    /// Nombre maximal de tokens à générer (obligatoire côté Anthropic).
+    /// Maximum number of tokens to generate (required by the Anthropic API).
     pub max_tokens: u32,
-    /// Température d'échantillonnage.
+    /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    /// Probabilité cumulative (nucleus sampling).
+    /// Cumulative probability cutoff (nucleus sampling).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    /// Séquences d'arrêt supplémentaires.
+    /// Additional stop sequences.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
     /// `true` = Anthropic SSE streaming mode.
@@ -46,88 +47,89 @@ pub struct MessagesRequest {
     /// Tool selection strategy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
-    /// Blocs `thinking` extended (hors scope MVP — ignorés silencieusement).
+    /// Extended-thinking configuration — accepted for wire compatibility, never read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
-    /// Contrôle de cache prompt (ignoré silencieusement au MVP).
+    /// Anthropic beta feature opt-ins — accepted for wire compatibility, never read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub betas: Option<Vec<String>>,
-    /// Métadonnées utilisateur arbitraires (ignorées).
+    /// Arbitrary caller metadata — accepted for wire compatibility, never read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Définition d'un outil exposé au modèle.
+/// Definition of a tool exposed to the model.
 ///
-/// Correspond à `tools[i]` dans la requête Anthropic.
-/// Mappé vers `ToolDefinition` OpenAI lors de la traduction.
+/// Corresponds to `tools[i]` in the Anthropic request. Mapped to an OpenAI
+/// `ToolDefinition` during translation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Tool {
-    /// Nom de l'outil — identifiant unique dans la liste.
+    /// Tool name — unique identifier within the list.
     pub name: String,
-    /// Description de l'outil (optionnelle mais recommandée).
+    /// Tool description (optional, but recommended).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Schéma JSON des paramètres de l'outil.
+    /// JSON Schema of the tool parameters.
     ///
-    /// Anthropic appelle ce champ `input_schema` ; il est mappé vers `parameters`
-    /// dans la `FunctionDefinition` OpenAI.
+    /// Anthropic names this field `input_schema`; it is mapped to `parameters`
+    /// in the OpenAI `FunctionDefinition`.
     pub input_schema: serde_json::Value,
 }
 
-/// Stratégie de sélection d'outil.
+/// Tool selection strategy.
 ///
-/// Format Anthropic :
-/// - `{"type": "auto"}` — le modèle choisit
-/// - `{"type": "any"}` — le modèle doit appeler au moins un outil
-/// - `{"type": "tool", "name": "X"}` — force l'outil nommé
-/// - `{"type": "none"}` — aucun outil (rare, non officiel)
+/// Anthropic wire format:
+/// - `{"type": "auto"}` — the model decides
+/// - `{"type": "any"}` — the model must call at least one tool
+/// - `{"type": "tool", "name": "X"}` — force the named tool
+/// - `{"type": "none"}` — no tool at all
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoice {
-    /// Le modèle choisit librement d'utiliser un outil ou non.
+    /// The model freely decides whether to use a tool.
     Auto,
-    /// Le modèle doit appeler au moins un outil (equiv. OpenAI "required").
+    /// The model must call at least one tool (OpenAI equivalent: `"required"`).
     Any,
-    /// Force l'appel à l'outil nommé.
+    /// Force a call to the named tool.
     Tool {
-        /// Nom de l'outil à forcer.
+        /// Name of the tool to force.
         name: String,
     },
-    /// Désactive les outils (le modèle ne doit pas en appeler).
+    /// Disable tools (the model must not call any).
     None,
 }
 
-/// Message dans la conversation Anthropic.
+/// A message in an Anthropic conversation.
 ///
-/// `role` est `"user"` ou `"assistant"`.
-/// `content` accepte une chaîne de texte directe OU un tableau de blocs.
+/// `role` is `"user"` or `"assistant"`. `content` accepts either a bare string
+/// or an array of content blocks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnthropicMessage {
-    /// Rôle de l'auteur : `"user"` ou `"assistant"`.
+    /// Author role: `"user"` or `"assistant"`.
     pub role: String,
-    /// Contenu du message — texte brut ou liste de blocs.
+    /// Message content — plain text or a list of blocks.
     pub content: AnthropicContent,
 }
 
-/// Contenu d'un message Anthropic — texte brut ou tableau de blocs.
+/// Content of an Anthropic message — plain text or an array of blocks.
 ///
-/// `#[serde(untagged)]` permet la désérialisation transparente des deux formes :
-/// - `"texte"` → `Text(String)`
+/// `#[serde(untagged)]` deserializes both shapes transparently:
+/// - `"text"` → `Text(String)`
 /// - `[{...}]` → `Blocks(Vec<ContentBlock>)`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum AnthropicContent {
-    /// Texte brut (forme courte Anthropic).
+    /// Plain text (Anthropic short form).
     Text(String),
-    /// Tableau de blocs de contenu (forme étendue).
+    /// Array of content blocks (extended form).
     Blocks(Vec<ContentBlock>),
 }
 
 impl AnthropicContent {
-    /// Extrait le texte concaténé de tous les blocs texte.
+    /// Returns the concatenation of every text block.
     ///
-    /// Pour un `Text` simple, retourne directement la chaîne.
+    /// For a plain `Text` value, returns the string as-is. Non-text blocks
+    /// (tool use, tool result, image, thinking) contribute nothing.
     #[must_use]
     pub fn as_text(&self) -> String {
         match self {
@@ -156,35 +158,35 @@ impl AnthropicContent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    /// Bloc de texte.
+    /// Text block.
     Text {
-        /// Contenu textuel du bloc.
+        /// Textual content of the block.
         text: String,
     },
     /// Tool-call block generated by the assistant.
     ///
     /// Mapped to `tool_calls[i]` in the OpenAI `Message` with role `assistant`.
     ToolUse {
-        /// Identifiant unique de cet appel d'outil dans le tour courant.
+        /// Unique identifier of this tool call within the current turn.
         id: String,
-        /// Nom de l'outil appelé.
+        /// Name of the called tool.
         name: String,
-        /// Arguments fournis à l'outil (objet JSON).
+        /// Arguments passed to the tool (JSON object).
         input: serde_json::Value,
     },
     /// Tool result provided by the user.
     ///
     /// Mapped to an OpenAI `Message` with role `tool` and a `tool_call_id`.
     ToolResult {
-        /// Identifiant de l'appel d'outil auquel ce résultat répond.
+        /// Identifier of the tool call this result answers.
         tool_use_id: String,
-        /// Contenu du résultat — texte brut ou tableau de blocs.
+        /// Result content — plain text or an array of blocks.
         ///
-        /// Anthropic accepte `String` ou `Vec<ContentBlock>` (blocs Text).
-        /// On stocke en `serde_json::Value` pour absorber les deux formes ;
-        /// la traduction extrait le texte.
+        /// Anthropic accepts either a `String` or a `Vec<ContentBlock>` of text
+        /// blocks. Stored as `serde_json::Value` to absorb both shapes; the
+        /// translation layer extracts the text.
         content: serde_json::Value,
-        /// Indique si l'exécution a échoué (pour les tool results en erreur).
+        /// Whether the tool execution failed (used for error tool results).
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
@@ -192,86 +194,86 @@ pub enum ContentBlock {
     ///
     /// Mapped to an OpenAI `ContentPart::ImageUrl` with a data-URI `data:<media_type>;base64,<data>`.
     Image {
-        /// Source de l'image.
+        /// Image source.
         source: ImageSource,
     },
-    /// Bloc thinking (extended thinking Anthropic) — hors scope MVP, ignoré.
+    /// Extended-thinking block — parsed, then dropped by the translation layer.
     Thinking {
-        /// Contenu du thinking (ignoré).
+        /// Thinking content (ignored).
         thinking: String,
     },
-    /// Bloc de type inconnu — ignoré silencieusement lors de la traduction.
+    /// Block of an unrecognized type — silently dropped during translation.
     ///
-    /// Absorbe les variantes futures de l'API Anthropic (ex: `"document"`,
-    /// `"redacted_thinking"`) pour éviter qu'un type non reconnu ne provoque
-    /// une erreur de désérialisation 400 sur l'ensemble de la requête.
+    /// Absorbs future Anthropic API variants (for example `"document"` or
+    /// `"redacted_thinking"`) so that an unknown block type never turns the
+    /// whole request into a 400 deserialization error.
     ///
-    /// Note : `#[serde(other)]` sur une variante unit fonctionne avec les enums
-    /// `internally_tagged` — les champs de l'objet inconnu sont ignorés (dropped).
+    /// Note: `#[serde(other)]` on a unit variant works with internally tagged
+    /// enums — the fields of the unknown object are dropped.
     #[serde(other)]
     Unknown,
 }
 
-/// Source d'une image dans un bloc `ContentBlock::Image`.
+/// Source of an image carried by a [`ContentBlock::Image`] block.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImageSource {
-    /// Type de source : `"base64"` ou `"url"`.
+    /// Source type: `"base64"` or `"url"`.
     #[serde(rename = "type")]
     pub source_type: String,
-    /// Type MIME de l'image (ex: `"image/jpeg"`, `"image/png"`).
+    /// MIME type of the image (for example `"image/jpeg"`, `"image/png"`).
     ///
-    /// Présent pour `type = "base64"`.
+    /// Present when `type = "base64"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
-    /// Données base64 de l'image (pour `type = "base64"`).
+    /// Base64-encoded image data (when `type = "base64"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
-    /// URL de l'image (pour `type = "url"`).
+    /// Image URL (when `type = "url"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
 
 // ── DTO count_tokens ──────────────────────────────────────────────────────────
 
-/// Requête `POST /v1/messages/count_tokens` au format Anthropic Messages API.
+/// Inbound `POST /v1/messages/count_tokens` request in Anthropic Messages API format.
 ///
-/// Structurellement identique à `MessagesRequest` SAUF que `max_tokens` est **absent** :
-/// l'API Anthropic count_tokens ne le requiert pas (contrairement à /v1/messages).
+/// Structurally identical to [`MessagesRequest`] except that `max_tokens` is **absent**:
+/// the Anthropic `count_tokens` API does not require it, unlike `/v1/messages`.
 ///
-/// Utiliser ce DTO dédié évite de rendre `max_tokens` optionnel dans `MessagesRequest`
-/// (qui doit rester strict pour la route principale).
+/// Keeping a dedicated DTO avoids making `max_tokens` optional on [`MessagesRequest`],
+/// which must stay strict for the main route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountTokensRequest {
-    /// Identifiant modèle — ignoré pour le comptage (pas de dispatch).
+    /// Model identifier — not used for counting (no provider dispatch happens).
     pub model: String,
-    /// Messages de la conversation.
+    /// Conversation messages.
     pub messages: Vec<AnthropicMessage>,
-    /// Système optionnel (texte brut ou blocs de contenu).
+    /// Optional system prompt (plain text or content blocks).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemContent>,
-    /// Définitions d'outils exposés au modèle.
+    /// Tool definitions exposed to the model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
-    /// Blocs `thinking` extended (ignorés).
+    /// Extended-thinking configuration — accepted for wire compatibility, never read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
 }
 
-/// Contenu d'un message système — texte brut ou blocs.
+/// Content of a system prompt — plain text or blocks.
 ///
-/// Identique à `AnthropicContent` mais sémantiquement distinct
-/// (le système n'accepte que des blocs `Text` en pratique).
+/// Same shape as [`AnthropicContent`], kept as a distinct type because a system
+/// prompt only carries `Text` blocks in practice.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum SystemContent {
-    /// Texte brut.
+    /// Plain text.
     Text(String),
-    /// Tableau de blocs (généralement `Text` uniquement pour le system).
+    /// Array of blocks (normally `Text` only for a system prompt).
     Blocks(Vec<ContentBlock>),
 }
 
 impl SystemContent {
-    /// Extrait le texte concaténé des blocs texte.
+    /// Returns the concatenation of every text block.
     #[must_use]
     pub fn as_text(&self) -> String {
         match self {
@@ -293,27 +295,27 @@ impl SystemContent {
 
 // ── Réponse sortant ────────────────────────────────────────────────────────────
 
-/// Réponse `POST /v1/messages` au format Anthropic.
+/// Outbound `POST /v1/messages` response in Anthropic format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessagesResponse {
-    /// Identifiant unique du message — commence par `msg_`.
+    /// Unique message identifier — prefixed with `msg_`.
     pub id: String,
-    /// Type de l'objet — toujours `"message"`.
+    /// Object type — always `"message"`.
     #[serde(rename = "type")]
     pub object_type: String,
-    /// Rôle de l'auteur de la réponse — toujours `"assistant"`.
+    /// Author role of the response — always `"assistant"`.
     pub role: String,
-    /// Modèle utilisé (tel que fourni dans la requête).
+    /// Model used, echoed as supplied in the request.
     pub model: String,
-    /// Blocs de contenu de la réponse.
+    /// Content blocks of the response.
     pub content: Vec<ResponseBlock>,
-    /// Raison d'arrêt de la génération.
+    /// Reason generation stopped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
-    /// Séquence d'arrêt qui a déclenché la fin (si `stop_reason = "stop_sequence"`).
+    /// Stop sequence that ended generation (when `stop_reason = "stop_sequence"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
-    /// Usage tokens (entrée + sortie).
+    /// Token usage (input + output).
     pub usage: AnthropicUsage,
 }
 
@@ -323,27 +325,27 @@ pub struct MessagesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseBlock {
-    /// Bloc de texte généré.
+    /// Generated text block.
     Text {
-        /// Texte généré par le modèle.
+        /// Text generated by the model.
         text: String,
     },
     /// Tool-call block generated by the model.
     ToolUse {
-        /// Identifiant unique de l'appel dans ce message.
+        /// Unique identifier of the call within this message.
         id: String,
-        /// Nom de l'outil appelé.
+        /// Name of the called tool.
         name: String,
-        /// Arguments de l'appel (objet JSON parsé depuis la chaîne OpenAI).
+        /// Call arguments (JSON object parsed from the OpenAI argument string).
         input: serde_json::Value,
     },
 }
 
-/// Usage tokens dans la réponse Anthropic.
+/// Token usage reported in an Anthropic response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnthropicUsage {
-    /// Tokens d'entrée (prompt).
+    /// Input (prompt) tokens.
     pub input_tokens: u32,
-    /// Tokens de sortie (completion).
+    /// Output (completion) tokens.
     pub output_tokens: u32,
 }

@@ -34,7 +34,7 @@ async fn dynamic_trust_preserved_when_provenance_unchanged() {
 
     // Le trust statique distilled = 0.60 (TRUST_SCORES).
     let t0 = idx
-        .get_trust(&id)
+        .get_trust("main", &id)
         .await
         .expect("get_trust")
         .expect("trust non NULL");
@@ -44,8 +44,14 @@ async fn dynamic_trust_preserved_when_provenance_unchanged() {
     );
 
     // F-22 : pose un trust DYNAMIQUE 0.42 (compute_distill_trust).
-    idx.set_note_trust(&id, 0.42).await.expect("set_note_trust");
-    let t1 = idx.get_trust(&id).await.expect("get_trust").expect("trust");
+    idx.set_note_trust("main", &id, 0.42)
+        .await
+        .expect("set_note_trust");
+    let t1 = idx
+        .get_trust("main", &id)
+        .await
+        .expect("get_trust")
+        .expect("trust");
     assert!(
         (t1 - 0.42).abs() < 1e-4,
         "trust dynamique attendu 0.42, got {t1}"
@@ -53,7 +59,11 @@ async fn dynamic_trust_preserved_when_provenance_unchanged() {
 
     // Re-upsert de la MÊME note (provenance inchangée) — ex. ré-indexation, embed cascade.
     idx.upsert_note(&note).await.expect("re-upsert");
-    let t2 = idx.get_trust(&id).await.expect("get_trust").expect("trust");
+    let t2 = idx
+        .get_trust("main", &id)
+        .await
+        .expect("get_trust")
+        .expect("trust");
     assert!(
         (t2 - 0.42).abs() < 1e-4,
         "P1-1 : trust dynamique DOIT survivre au re-upsert (provenance inchangée), got {t2}"
@@ -70,7 +80,9 @@ async fn static_trust_recomputed_when_provenance_changes() {
     let id = note.id;
 
     // Pose un trust dynamique 0.42.
-    idx.set_note_trust(&id, 0.42).await.expect("set_note_trust");
+    idx.set_note_trust("main", &id, 0.42)
+        .await
+        .expect("set_note_trust");
 
     // Re-upsert avec une provenance DIFFÉRENTE (human-decision → trust statique 0.95).
     let mut note2 = note.clone();
@@ -81,7 +93,11 @@ async fn static_trust_recomputed_when_provenance_changes() {
         .await
         .expect("re-upsert provenance changée");
 
-    let t = idx.get_trust(&id).await.expect("get_trust").expect("trust");
+    let t = idx
+        .get_trust("main", &id)
+        .await
+        .expect("get_trust")
+        .expect("trust");
     assert!(
         (t - 0.95).abs() < 1e-4,
         "P1-1 : provenance changée → trust statique recalculé 0.95, got {t}"
@@ -98,11 +114,17 @@ async fn dynamic_trust_preserved_when_provenance_null_unchanged() {
     idx.upsert_note(&note).await.expect("upsert initial");
     let id = note.id;
 
-    idx.set_note_trust(&id, 0.33).await.expect("set_note_trust");
+    idx.set_note_trust("main", &id, 0.33)
+        .await
+        .expect("set_note_trust");
 
     // Re-upsert avec provenance toujours None — IS NOT doit considérer NULL==NULL inchangé.
     idx.upsert_note(&note).await.expect("re-upsert");
-    let t = idx.get_trust(&id).await.expect("get_trust").expect("trust");
+    let t = idx
+        .get_trust("main", &id)
+        .await
+        .expect("get_trust")
+        .expect("trust");
     assert!(
         (t - 0.33).abs() < 1e-4,
         "P1-1 : NULL→NULL inchangé → trust dynamique préservé, got {t}"

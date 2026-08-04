@@ -46,7 +46,7 @@
 ///   canonical event date (`occurred_at` / `event-date` / `valid_from` via
 ///   `temporal_index`), falling back to the ingestion timestamp (`notes.created`)
 ///   when absent. For static notes (`anchor_src = Created`), `anchor_ms == created_ms`
-///   and the result is **bit-identical** to the pre-F-17 behaviour.
+///   and the result is **bit-identical** to the legacy behaviour.
 /// - `now_ms`: current timestamp in UTC epoch milliseconds.
 ///
 /// # Returns
@@ -361,9 +361,132 @@ pub fn composite_score_with_trust(
     }
 }
 
+/// Usage-salience scoring parameters, resolved from server config.
+///
+/// Same role as [`TrustDecayConfig`] for the trust factor: the *absence* of these
+/// params at the call site (config `enabled = false`) is the disable lever —
+/// scores stay bit-identical to the salience-free baseline.
+#[derive(Debug, Clone)]
+pub struct SalienceParams {
+    /// Boost coefficient — max boost `× (1 + gamma)`. Spec default: `0.10`.
+    pub gamma: f64,
+    /// Soft-saturation constant (> 0, validated at config load). Spec default: `10.0`.
+    pub k_norm: f64,
+    /// Per-kind weights; a kind absent from the map weighs `0.0` (ignored).
+    pub kind_weights: std::collections::HashMap<String, f64>,
+}
+
+/// Normalised salience `s / (s + k_norm)` ∈ `[0, 1)`.
+///
+/// `weighted_sum = 0` ⇒ exactly `0.0` (neutral downstream factor).
+///
+/// # Errors
+///
+/// Pure function — infaillible.
+#[must_use]
+pub fn salience_factor(weighted_sum: f64, k_norm: f64) -> f64 {
+    if weighted_sum <= 0.0 {
+        return 0.0;
+    }
+    weighted_sum / (weighted_sum + k_norm)
+}
+
+/// Weighted sum `Σ (w_kind × count)` over the per-kind usage counts of one note.
+///
+/// Unknown kinds (absent from `kind_weights`) contribute `0.0`.
+///
+/// # Errors
+///
+/// Pure function — infaillible.
+#[must_use]
+pub fn salience_weighted_sum(
+    counts: &[(String, u64)],
+    kind_weights: &std::collections::HashMap<String, f64>,
+) -> f64 {
+    counts
+        .iter()
+        .map(|(kind, count)| kind_weights.get(kind).copied().unwrap_or(0.0) * (*count as f64))
+        .sum()
+}
+
+/// Applies the salience factor: `composite × (1 + gamma × salience)`.
+///
+/// `weighted_sum = 0` ⇒ returns `composite` unchanged (bit-identical, no extra
+/// floating-point op) — same non-regression contract as `composite_score_with_trust(None)`.
+///
+/// # Errors
+///
+/// Pure function — infaillible.
+#[must_use]
+pub fn apply_salience(composite: f64, weighted_sum: f64, params: &SalienceParams) -> f64 {
+    let s = salience_factor(weighted_sum, params.k_norm);
+    if s == 0.0 {
+        return composite;
+    }
+    composite * (1.0 + params.gamma * s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // F-110 Phase 2 : salience_factor — zéro usage ⇒ 0.0 exact (facteur neutre en aval)
+    #[test]
+    fn salience_factor_zero_usage_is_zero() {
+        assert_eq!(salience_factor(0.0, 10.0), 0.0);
+    }
+
+    // Saturation douce : s == k_norm ⇒ 0.5 exact
+    #[test]
+    fn salience_factor_saturates_at_half_when_sum_equals_k() {
+        assert_eq!(salience_factor(10.0, 10.0), 0.5);
+    }
+
+    // Monotone croissante, bornée < 1
+    #[test]
+    fn salience_factor_is_monotonic_and_bounded() {
+        let a = salience_factor(1.0, 10.0);
+        let b = salience_factor(100.0, 10.0);
+        assert!(a < b && b < 1.0);
+    }
+
+    // Somme pondérée : kinds connus pondérés, kind inconnu ignoré (poids 0)
+    #[test]
+    fn salience_weighted_sum_weights_kinds_and_ignores_unknown() {
+        let mut w = std::collections::HashMap::new();
+        w.insert("read".to_string(), 3.0);
+        w.insert("search-hit".to_string(), 0.5);
+        let counts = vec![
+            ("read".to_string(), 2u64),          // 2×3.0 = 6.0
+            ("search-hit".to_string(), 4u64),    // 4×0.5 = 2.0
+            ("kind-inconnu".to_string(), 99u64), // ignoré
+        ];
+        assert_eq!(salience_weighted_sum(&counts, &w), 8.0);
+    }
+
+    // apply_salience : weighted_sum = 0 ⇒ composite inchangé bit-à-bit
+    #[test]
+    fn apply_salience_zero_sum_is_identity() {
+        let p = SalienceParams {
+            gamma: 0.10,
+            k_norm: 10.0,
+            kind_weights: Default::default(),
+        };
+        let c = 0.032_774_5_f64;
+        assert_eq!(apply_salience(c, 0.0, &p), c);
+    }
+
+    // apply_salience : formule complète c × (1 + γ·s/(s+K))
+    #[test]
+    fn apply_salience_full_formula() {
+        let p = SalienceParams {
+            gamma: 0.10,
+            k_norm: 10.0,
+            kind_weights: Default::default(),
+        };
+        let got = apply_salience(1.0, 10.0, &p); // salience = 0.5 → ×1.05
+        assert!((got - 1.05).abs() < 1e-12);
+    }
 
     /// `TrustDecayConfig::default` derives its half-lives from the shared const.
     /// Non-regression: `distilled = 90d`, no other source.

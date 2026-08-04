@@ -43,6 +43,79 @@ pub struct Config {
     /// Absent from TOML → serde default (sensible defaults, backward compat).
     #[serde(default)]
     pub messages: MessagesConfig,
+    /// Reasoning router configuration (`[router]` section).
+    ///
+    /// Absent from TOML → serde default with `enabled = false` (router off, the
+    /// gateway uses the no-think default — zero behavior change until turned on).
+    #[serde(default)]
+    pub router: RouterConfig,
+}
+
+/// Reasoning router configuration (`[router]` section).
+///
+/// The router decides THINK / NO_THINK per chat request. A cheap deterministic
+/// pre-classifier handles the obvious cases; only the boundary invokes the curator
+/// LLM (GBNF-constrained). Disabled by default: the gateway falls back to the
+/// no-think default, so enabling it is an explicit opt-in (cutover).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RouterConfig {
+    /// Master switch. `false` (default) → router off, no-think default applies.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Curator `/v1/chat/completions` endpoint (e.g. `http://127.0.0.1:18083`).
+    #[serde(default = "default_router_endpoint")]
+    pub endpoint: String,
+    /// Model name sent in the curator request body.
+    #[serde(default = "default_router_model")]
+    pub model: String,
+    /// Hard per-decision timeout (ms). Beyond it → no-think fallback (never blocks).
+    #[serde(default = "default_router_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Max concurrent curator calls (isolation vs the enrich workload). A saturated
+    /// router fails fast to the no-think fallback rather than starving the hot path.
+    /// NOTE: the definitive sizing (slots/parallel) comes from Bob at cutover — this
+    /// is a configurable, safe default.
+    #[serde(default = "default_router_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Chars of the user query sent to the router (`QUERY:` head, ≈4 chars/token).
+    #[serde(default = "default_router_query_head_chars")]
+    pub query_head_chars: usize,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_router_endpoint(),
+            model: default_router_model(),
+            timeout_ms: default_router_timeout_ms(),
+            max_concurrent: default_router_max_concurrent(),
+            query_head_chars: default_router_query_head_chars(),
+        }
+    }
+}
+
+fn default_router_endpoint() -> String {
+    "http://127.0.0.1:18083".to_string()
+}
+
+fn default_router_model() -> String {
+    "curator".to_string()
+}
+
+fn default_router_timeout_ms() -> u64 {
+    // > max observed warm curator latency (343 ms probe 2026-07-10) + margin.
+    500
+}
+
+fn default_router_max_concurrent() -> usize {
+    // Curator runs `--parallel 2`; keep 1 slot's worth of headroom for enrich.
+    1
+}
+
+fn default_router_query_head_chars() -> usize {
+    // ≈96 tokens × 4 chars/token.
+    384
 }
 
 /// Configuration for the Anthropic Messages API inbound gateway (`/v1/messages`).
@@ -299,11 +372,10 @@ impl Config {
     ///
     /// Returns `Err` with a precise message if the file is missing or malformed.
     pub fn load(path: &str) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            anyhow::anyhow!("impossible de lire le fichier config '{}': {}", path, e)
-        })?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read config file '{}': {}", path, e))?;
         let mut config: Config = toml::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("config TOML invalide dans '{}': {}", path, e))?;
+            .map_err(|e| anyhow::anyhow!("invalid TOML config in '{}': {}", path, e))?;
 
         // Override MAX_TOTAL_TOKENS from env var.
         if let Ok(val) = std::env::var("MAX_TOTAL_TOKENS") {
@@ -311,13 +383,13 @@ impl Config {
                 Ok(n) => {
                     tracing::info!(
                         max_total_tokens = n,
-                        "cap tokens surchargé via MAX_TOTAL_TOKENS"
+                        "token cap overridden via MAX_TOTAL_TOKENS"
                     );
                     config.server.max_total_tokens = n;
                 }
                 Err(_) => {
                     anyhow::bail!(
-                        "MAX_TOTAL_TOKENS='{}' invalide — doit être un entier positif",
+                        "MAX_TOTAL_TOKENS='{}' invalid — must be a positive integer",
                         val
                     );
                 }
@@ -330,20 +402,21 @@ impl Config {
 
     /// Validates configuration consistency after parsing.
     ///
-    /// Vérifie :
-    /// 1. Chaque alias référence un provider existant dans `[providers]`.
-    /// 2. `messages.default_alias` ∈ clés `[aliases]` (P1-A — typo = erreur au boot).
-    /// 3. Chaque valeur de `messages.model_map` ∈ clés `[aliases]` (P1-A).
+    /// Checks that:
+    /// 1. every alias references a provider declared in `[providers]`;
+    /// 2. `messages.default_alias` is a key of `[aliases]`, so a typo fails at boot
+    ///    rather than at the first request;
+    /// 3. every value of `messages.model_map` is a key of `[aliases]`.
     ///
     /// # Errors
-    /// Retourne une erreur descriptive nommant l'alias fautif, permettant un diagnostic
-    /// immédiat sans relecture du TOML complet.
+    /// Returns a descriptive error naming the offending alias, so the problem can be
+    /// diagnosed without re-reading the whole TOML file.
     fn validate(&self) -> anyhow::Result<()> {
         // ── Validation providers ────────────────────────────────────────────
         for (alias, target) in &self.aliases {
             if !self.providers.contains_key(&target.provider) {
                 anyhow::bail!(
-                    "alias '{}' référence le provider '{}' absent de [providers]",
+                    "alias '{}' references provider '{}' absent from [providers]",
                     alias,
                     target.provider
                 );
@@ -352,7 +425,7 @@ impl Config {
                 && !self.providers.contains_key(fb)
             {
                 anyhow::bail!(
-                    "alias '{}' référence le fallback_provider '{}' absent de [providers]",
+                    "alias '{}' references fallback_provider '{}' absent from [providers]",
                     alias,
                     fb
                 );
@@ -376,7 +449,7 @@ impl Config {
         if messages_is_customised {
             if !self.aliases.contains_key(&self.messages.default_alias) {
                 anyhow::bail!(
-                    "[messages] default_alias '{}' absent de [aliases] — alias disponibles : {:?}",
+                    "[messages] default_alias '{}' absent from [aliases] — available aliases: {:?}",
                     self.messages.default_alias,
                     {
                         let mut keys: Vec<_> = self.aliases.keys().cloned().collect();
@@ -391,11 +464,48 @@ impl Config {
             for (model_name, target_alias) in &self.messages.model_map {
                 if !self.aliases.contains_key(target_alias) {
                     anyhow::bail!(
-                        "[messages.model_map] entrée '{}' pointe vers l'alias '{}' absent de [aliases]",
+                        "[messages.model_map] entry '{}' points to alias '{}' absent from [aliases]",
                         model_name,
                         target_alias
                     );
                 }
+            }
+        }
+
+        // ── Validation router (uniquement si activé) ───────────────────────
+        // Les champs `[router]` ne sont consultés que lorsque `enabled = true`. Les valider
+        // à froid casserait des configs legacy qui héritent des défauts serde sans les
+        // utiliser. Activé, une valeur invalide dégraderait SILENCIEUSEMENT le routeur en
+        // fallback permanent (timeout nul), ce que l'invariant ctx-gating proscrit : on
+        // échoue au boot (fail-fast) plutôt qu'en prod.
+        // `max_concurrent` n'est pas validé ici : `RouterClient::from_config` le plancher à 1
+        // (`.max(1)`), donc `0` dégrade proprement vers une concurrence de 1 — documenté.
+        if self.router.enabled {
+            if self.router.timeout_ms == 0 {
+                anyhow::bail!(
+                    "[router] timeout_ms = 0 invalid — a zero timeout would force a permanent no-think fallback (router inoperative)"
+                );
+            }
+            if self.router.query_head_chars == 0 {
+                anyhow::bail!(
+                    "[router] query_head_chars = 0 invalid — an empty query would be sent to the curator"
+                );
+            }
+            let endpoint = self.router.endpoint.trim();
+            if endpoint.is_empty() {
+                anyhow::bail!(
+                    "[router] empty endpoint — expected an http(s) URL (e.g. http://127.0.0.1:18083)"
+                );
+            }
+            let url = reqwest::Url::parse(endpoint).map_err(|e| {
+                anyhow::anyhow!("[router] malformed endpoint '{}': {}", endpoint, e)
+            })?;
+            if !matches!(url.scheme(), "http" | "https") {
+                anyhow::bail!(
+                    "[router] endpoint '{}' — unsupported scheme '{}' (expected http/https)",
+                    endpoint,
+                    url.scheme()
+                );
             }
         }
 
@@ -458,6 +568,7 @@ mod tests {
                 default_alias: "real-alias".to_string(),
                 model_map: HashMap::new(),
             },
+            router: RouterConfig::default(),
         }
     }
 
@@ -573,6 +684,7 @@ mod tests {
             // Section [messages] absente → serde default : default_alias = "default", model_map vide.
             // "default" n'est PAS dans aliases → aurait échoué avec P1-A non relâché.
             messages: MessagesConfig::default(),
+            router: Default::default(),
         };
 
         let result = config.validate();
@@ -580,6 +692,99 @@ mod tests {
             result.is_ok(),
             "config sans [messages] (défauts purs) doit passer la validation même sans alias 'default', erreur: {:?}",
             result.err()
+        );
+    }
+
+    // ── R2 : validation RouterConfig (uniquement si activé) ────────────────────
+
+    /// Router désactivé : aucune validation des champs (défauts serde tolérés tels quels).
+    #[test]
+    fn router_disabled_skips_validation() {
+        let mut config = base_config();
+        // Valeurs qui seraient invalides SI activées — ignorées car enabled = false.
+        config.router = RouterConfig {
+            enabled: false,
+            endpoint: String::new(),
+            model: "curator".to_string(),
+            timeout_ms: 0,
+            max_concurrent: 0,
+            query_head_chars: 0,
+        };
+        assert!(
+            config.validate().is_ok(),
+            "router désactivé → champs non validés"
+        );
+    }
+
+    /// Router activé + timeout_ms = 0 → rejet (dégradation silencieuse proscrite).
+    #[test]
+    fn router_enabled_rejects_zero_timeout() {
+        let mut config = base_config();
+        config.router.enabled = true;
+        config.router.timeout_ms = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("timeout_ms"),
+            "erreur doit nommer timeout_ms : {err}"
+        );
+    }
+
+    /// Router activé + endpoint vide → rejet.
+    #[test]
+    fn router_enabled_rejects_empty_endpoint() {
+        let mut config = base_config();
+        config.router.enabled = true;
+        config.router.endpoint = "   ".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("endpoint"),
+            "erreur doit nommer endpoint : {err}"
+        );
+    }
+
+    /// Router activé + endpoint mal formé / mauvais schéma → rejet.
+    #[test]
+    fn router_enabled_rejects_malformed_endpoint() {
+        let mut config = base_config();
+        config.router.enabled = true;
+        config.router.endpoint = "not a url".to_string();
+        assert!(
+            config.validate().is_err(),
+            "URL mal formée doit être rejetée"
+        );
+
+        config.router.endpoint = "ftp://127.0.0.1:18083".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("schéma") || err.contains("http"),
+            "schéma non-http doit être rejeté : {err}"
+        );
+    }
+
+    /// Router activé + query_head_chars = 0 → rejet.
+    #[test]
+    fn router_enabled_rejects_zero_query_head() {
+        let mut config = base_config();
+        config.router.enabled = true;
+        config.router.query_head_chars = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("query_head_chars"),
+            "erreur doit nommer query_head_chars : {err}"
+        );
+    }
+
+    /// Router activé avec des valeurs par défaut valides → validation OK.
+    #[test]
+    fn router_enabled_valid_defaults_pass() {
+        let mut config = base_config();
+        config.router = RouterConfig {
+            enabled: true,
+            ..RouterConfig::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "router activé avec défauts valides doit passer"
         );
     }
 }

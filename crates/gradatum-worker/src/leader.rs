@@ -70,7 +70,7 @@ impl LeaderElection {
     fn now_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("horloge système valide (post-epoch)")
+            .expect("system clock valid (post-epoch)")
             .as_millis() as i64
     }
 
@@ -168,12 +168,12 @@ impl LeaderElection {
                 interval.tick().await;
                 match self.renew().await {
                     Ok(true) => {
-                        tracing::debug!(holder = %self.holder, "leadership renouvelé");
+                        tracing::debug!(holder = %self.holder, "leadership renewed");
                     }
                     Ok(false) => {
                         tracing::warn!(
                             holder = %self.holder,
-                            "leadership perdu — arrêt de la boucle de renouvellement"
+                            "leadership lost — stopping renewal loop"
                         );
                         break;
                     }
@@ -181,7 +181,7 @@ impl LeaderElection {
                         tracing::error!(
                             holder = %self.holder,
                             error = %e,
-                            "erreur lors du renouvellement du leadership"
+                            "error during leadership renewal"
                         );
                         break;
                     }

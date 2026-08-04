@@ -13,11 +13,11 @@
 //! ## Round-trip guarantee
 //!
 //! `parse(write_parsed(parse(x)?)) == parse(x)` (idempotent over one cycle).
-//! Strict string equality is not guaranteed — `serde_yml` may reorder fields
-//! relative to the original. The guarantee covers **values** after re-parsing,
-//! not the exact textual representation.
+//! Strict string equality is not guaranteed — the YAML backend may reorder
+//! fields or requote scalars relative to the original. The guarantee covers
+//! **values** after re-parsing, not the exact textual representation.
 
-use crate::error::MarkdownError;
+use crate::error::{MarkdownError, YamlError};
 use crate::parser::ParsedNote;
 use gradatum_core::note::Note;
 
@@ -28,16 +28,17 @@ use gradatum_core::note::Note;
 /// ---\n<yaml>\n---\n\n<body>
 /// ```
 ///
-/// `serde_yml::to_string` emits YAML without a leading `---` delimiter,
+/// The YAML backend emits the document without a leading `---` delimiter,
 /// so the delimiters are added manually before and after.
 ///
 /// ## Errors
 ///
-/// Returns `MarkdownError::Yaml` if the frontmatter cannot be serialized.
+/// Returns [`MarkdownError::Yaml`] if the frontmatter cannot be serialized.
 /// In practice this cannot occur for `Frontmatter` (no `f32::NAN` or non-YAML types).
 pub fn write_parsed(note: &ParsedNote) -> Result<String, MarkdownError> {
-    let yaml = serde_yml::to_string(&note.frontmatter).map_err(MarkdownError::Yaml)?;
-    // serde_yml 0.9 produit "<yaml content>\n" sans délimiteur ---
+    let yaml = serde_norway::to_string(&note.frontmatter)
+        .map_err(|e| MarkdownError::Yaml(YamlError::new(e)))?;
+    // Le backend produit "<yaml content>\n" sans délimiteur ---.
     // On enveloppe manuellement.
     Ok(format!("---\n{}---\n\n{}", yaml, note.body.markdown))
 }
@@ -51,7 +52,7 @@ pub fn write_parsed(note: &ParsedNote) -> Result<String, MarkdownError> {
 ///
 /// ## Errors
 ///
-/// Returns `MarkdownError::Yaml` if serialization fails.
+/// Returns [`MarkdownError::Yaml`] if serialization fails.
 pub fn write(note: &Note) -> Result<String, MarkdownError> {
     let parsed = ParsedNote {
         frontmatter: note.frontmatter.clone(),

@@ -5,6 +5,15 @@
 //!
 //! The client polls `GET /api/v1/jobs/{id}` → `lifecycle.status = "Conflict"` +
 //! `lifecycle.result.result_note_md` contains the JSON of this DTO.
+//!
+//! # Emitted on optimistic-lock conflicts
+//!
+//! The RMW `vault_write` path produces this payload. When `expected_sha256` no longer matches
+//! the note's stored content, the persist compare-and-swap refuses the write and the worker
+//! marks the job `JobStatus::Conflict`, carrying this DTO. `current_sha256` holds the hash of
+//! the version that "won" (the one still in the vault); `attempted_sha256` mirrors the stale
+//! hash the caller supplied. A CREATE (`expected_sha256 = None`) is unconditional and never
+//! conflicts, so a client must not infer from this payload's absence that a write occurred.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,10 +1,69 @@
 # Gradatum — Dépendances
 
-> Cargo dependency tree. Generated semi-manually — to be regenerated via `cargo tree --workspace --depth 1` once the workspace compiles.
-> Updated: 2026-06-11 — 0.4.6 bump; new workspace members: gradatum-studio (publish=false), index-parity-tests (test-only); tower-http +fs,set-header; async-trait (dev). Dependency graph otherwise unchanged.
-> Updated: 2026-06-11 — 0.4.6 bump; new workspace members: gradatum-studio (publish=false), index-parity-tests (test-only); tower-http +fs,set-header; async-trait (dev). Dependency graph otherwise unchanged.
-> Updated: 2026-06-11 — 0.4.6 bump; new workspace members: gradatum-studio (publish=false), index-parity-tests (test-only); tower-http +fs,set-header; async-trait (dev). Dependency graph otherwise unchanged.
-> Updated: 2026-06-11 — 0.4.6 bump; new workspace members: gradatum-studio (publish=false), index-parity-tests (test-only); tower-http +fs,set-header; async-trait (dev). Dependency graph otherwise unchanged.
+> Arbre de dépendances Cargo. Établi par lecture des `Cargo.toml` du workspace (source de
+> vérité) ; à recouper avec `cargo tree --workspace --depth 1`.
+> Version workspace `1.0.0`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> Arbres établis au commit `fb0742e5` pour la structure des crates ; le graphe des dépendances
+> externes a évolué depuis — voir l'entrée Updated 2026-07-31 ci-dessous pour le changement tracé.
+>
+> Updated: 2026-08-04 — gradatum-studio passée **publiable** (F-131, commit `2e274bea` : retrait
+> `publish = false`, licence composite `Apache-2.0 AND OFL-1.1 AND MIT AND ISC` [bundle `dist/`
+> redistribue code + fontes + paquets npm tiers, notices THIRD-PARTY-LICENSES.md],
+> categories web-programming/gui, include allow-list sur le bundle Vite). 4 non-publiables
+> désormais : `gradatum-cli` (déjà 0.7.6 sur crates.io, reportée v2.0.0), `gradatum-bench`,
+> `index-parity-tests`, `v1-parity-tests`. Structure 31 membres inchangée ; graphe externe inchangé
+> depuis l'entrée 2026-07-31 (re-vérifié au commit `761f9625`).
+>
+> Updated: 2026-07-31 — bump `opendal` `=0.51.0` → `=0.58.1` au commit `6dfdb8f0` (ferme
+> RUSTSEC-2026-0194 / -0195 au lieu de les exempter ; relève la MSRV workspace 1.88 → 1.91,
+> exigence d'opendal 0.58). Graphe externe changé : `Cargo.lock` +17 paquets net (688 → 705,
+> mesuré `git show <ref>:Cargo.lock | grep -c '^name = '` avant/après). `opendal` est éclaté
+> depuis sa 0.56 en façade + `opendal-core` + 5 `opendal-service-*` (azblob/azure-common/fs/gcs/s3),
+> confirmé `cargo tree -i opendal`. Entrent : `reqsign-*` (5 crates : aws-v4/azure-storage/core/
+> file-read-tokio/google, remplace `reqsign` monolithique) + `jiff*` (5 crates : jiff/core/static/
+> tzdb/tzdb-platform). Sortent : `backon`, `reqsign` (monolithique), `time`/`time-core`/`time-macros`,
+> `quick-xml` 0.36.2 et 0.37.5 (deux versions coexistantes avant, remplacées par une unique 0.41.0).
+> Updated: 2026-07-24 — réalignement complet sur le code (`d6c0135a..fb0742e5` : 279 fichiers,
+> 26 157 insertions sur `crates/`). Corrections : décompte des crates (22 annoncés → **31 membres
+> de workspace, dont 27 publiables**), arbres par crate refaits depuis les `[dependencies]` réels,
+> versions externes remplacées par les pins exacts du `[workspace.dependencies]`, table des feature
+> flags refaite (l'ancienne listait 6 features dont **aucune** n'existe dans le code). Une seule
+> dépendance a réellement bougé sur la période : `gradatum-dto` gagne `gradatum-core` (typage
+> `TenantId`/`VaultId` des DTOs) et `bincode` en dev-dep. Graphe externe inchangé.
+> Updated: 2026-07-16 — vérifié sans changement de dépendances (train v0.9.0 F-110 P2/F-111/F-112).
+> Updated: 2026-07-12 — F-70 qualified method-call resolution (code-only `gradatum-ingest`). Graphe inchangé.
+> Updated: 2026-07-11 — bumps 0.7.8 / 0.7.9 (champ version seul) + Cargo.lock only (`fix(deps)`) :
+> crossbeam-epoch 0.9.18→0.9.20 (RUSTSEC-2026-0204), quinn-proto 0.11.14→0.11.16 (RUSTSEC-2026-0185).
+> Updated: 2026-07-10 — 0.7.7 (champ version seul). Cutover E1 : code seul, zéro impact Cargo.toml.
+> Updated: 2026-06-11 — 0.4.6 : nouveaux membres `gradatum-studio` (publish=false), `index-parity-tests`.
+
+---
+
+## Périmètre du workspace
+
+**31 membres** déclarés dans `[workspace] members` (`ls crates/` = 31 répertoires).
+**27 sont publiables** ; 4 portent `publish = false` :
+
+| Crate | Raison du `publish = false` |
+|---|---|
+| `gradatum-cli` | reportée v2.0.0 (roadmap) — ⚠️ déjà publiée en 0.7.6 sur crates.io |
+| `gradatum-bench` | benchmarks internes |
+| `index-parity-tests` | suite de parité backend-agnostique |
+| `v1-parity-tests` | suite de parité v1 |
+
+> ⚠️ Piège de décompte : **27 = crates publiés sur crates.io**, **31 = membres du workspace**.
+> Les deux chiffres sont corrects et ne se substituent pas.
+
+Répartition fonctionnelle des 31 (3 + 1 + 19 + 1 + 3 + 4) :
+
+| Groupe | N | Membres |
+|---|---|---|
+| Binaires control plane | 3 | `gradatum-server`, `gradatum-worker`, `gradatum-admin` |
+| Binaire gateway | 1 | `gradatum-gateway` |
+| Bibliothèques data plane | 19 | `core`, `dto`, `markdown`, `vault`, `storage`, `index`, `search`, `queue`, `db-sqlite`, `cache`, `chat`, `curator`, `embed`, `engine`, `ingest`, `warden`, `acl-policy`, `acl-auth`, `auth` (préfixe `gradatum-`) |
+| Binaire web UI | 1 | `gradatum-studio` (bundle React+TS servi à `/ui/*`, publiable depuis F-131) |
+| Clients | 3 | `gradatum-mcp-stub`, `gradatum-sdk-rs`, `gradatum` (umbrella) |
+| Non publiables | 4 | `gradatum-cli`, `gradatum-bench`, `index-parity-tests`, `v1-parity-tests` |
 
 ---
 
@@ -13,213 +72,322 @@
 **3 binaires (control plane)** :
 
 ```
-gradatum-server         (stateless HTTP/MCP façade)
-├── gradatum-core
-├── gradatum-vault
-├── gradatum-storage
-├── gradatum-index
-├── gradatum-search
-├── gradatum-queue
-├── gradatum-cache
-├── gradatum-auth
-├── gradatum-acl-auth
-├── axum
-├── tower-http
-├── rmcp
-└── tokio + tracing
+gradatum-server         (façade HTTP/MCP stateless)
+├── gradatum-core          gradatum-dto           gradatum-vault
+├── gradatum-storage       gradatum-index         gradatum-search
+├── gradatum-queue         gradatum-db-sqlite     gradatum-cache
+├── gradatum-embed         gradatum-chat          gradatum-curator
+├── gradatum-acl-policy    gradatum-acl-auth      gradatum-auth
+├── gradatum-warden
+├── axum + axum-server + rustls + tower + tower-http + http
+├── rmcp + schemars                    (serveur MCP natif /mcp)
+├── rusqlite + sqlx + sqlite-vec       (index + queue + ANN)
+├── figment + toml + clap              (config + CLI)
+├── prometheus-client                  (metrics)
+└── tokio (+ tokio-stream, tokio-util) + tracing + tracing-subscriber
 
-gradatum-worker         (async queue consumer)
-├── gradatum-core
-├── gradatum-vault
-├── gradatum-storage
-├── gradatum-index
-├── gradatum-queue
-├── gradatum-chat
-├── gradatum-curator
+gradatum-worker         (consommateur de queue asynchrone)
+├── gradatum-core          gradatum-dto           gradatum-db-sqlite
+├── gradatum-queue         gradatum-curator       gradatum-chat
 ├── gradatum-embed
-├── gradatum-acl-auth
-└── tokio + tracing
+├── apalis + apalis-cron + cron        (Monitor + schedules)
+├── prometheus                         (exporter :19091)
+├── axum + tower                       (surface health/metrics)
+├── sqlx + bincode                     (QueueStore + payloads)
+├── figment + toml + clap + reqwest + secrecy
+└── tokio + tracing + tracing-subscriber
 
 gradatum-admin          (CLI ops)
-├── gradatum-core
-├── gradatum-vault
-├── gradatum-storage
-├── gradatum-index
-├── gradatum-acl-policy
-├── clap
-└── argon2 + rand
+├── gradatum-core          gradatum-dto           gradatum-vault
+├── gradatum-storage       gradatum-index         gradatum-queue
+├── gradatum-db-sqlite     gradatum-curator
+├── gradatum-ingest  (features code-rust, code-python, code-bash, code-typescript)
+├── gradatum-acl-policy    gradatum-acl-auth      gradatum-auth
+├── clap + toml + toml_edit + walkdir + hex
+├── argon2 + rand + ed25519-dalek + pkcs8        (bootstrap auth/token)
+├── rusqlite + sqlx + reqwest
+└── tokio + tracing + tracing-subscriber + anyhow
 ```
 
-**22 crates** (3 binaires control plane + 15 lib data plane + 3 clients + 1 umbrella):
+**1 binaire (gateway)** :
 
 ```
-gradatum-core           (primitives partagées)
-├── thiserror
-├── chrono
-├── serde + serde_json
-└── ulid
+gradatum-gateway        (proxy LLM autonome :8436)
+├── gradatum-core          gradatum-embed         gradatum-search
+├── axum + http + tower + tower-http + reqwest
+├── figment + toml + rusqlite
+├── secrecy + subtle + bytes + futures + once_cell + ulid + chrono
+└── tokio + tracing + tracing-subscriber + anyhow + thiserror
+```
+
+**Bibliothèques data plane** :
+
+```
+gradatum-core           (primitives partagées : erreurs, ids, scope, sections, jobs, audit)
+├── serde + serde_json + serde_jcs
+├── chrono + ulid + sha2 + smallvec + http
+├── secrecy                (SecretBytes, zeroize-on-drop)
+├── include_dir            (schémas embarqués)
+├── stability              (annotations #[stability::unstable])
+└── async-trait + thiserror + toml + tokio
+
+gradatum-dto            (DTOs contrats wire — source de vérité unique)
+├── gradatum-core          ← NOUVEAU 2026-07 : typage TenantId (principal) / VaultId (namespace)
+├── serde
+├── (feature schemars) schemars + serde_json
+└── (dev) bincode          ← NOUVEAU 2026-07
 
 gradatum-markdown       (parse/serialize MD + frontmatter + wikilinks)
 ├── gradatum-core
-├── serde_yaml
-└── regex
+├── serde + serde_norway   (⚠ backend YAML ; a remplacé serde_yml, archivé + unsound)
+└── regex + once_cell + thiserror
 
-gradatum-vault          (multi-vault registry + lifecycle + swap)
-├── gradatum-core
-├── gradatum-storage
-├── gradatum-index
-└── tokio
+gradatum-vault          (registre multi-vault + cycle de vie + swap)
+├── gradatum-core + gradatum-markdown + gradatum-cache
+├── gradatum-index + gradatum-storage
+├── serde + serde_json + toml + chrono + ulid + sha2
+└── async-trait + thiserror + tokio + tracing
 
-gradatum-storage        (FS abstraction + loci paths)
+gradatum-storage        (abstraction FS/objet + garde NFS)
 ├── gradatum-core
-├── gradatum-markdown
-├── walkdir
-├── tokio + tracing
-└── (cfg(unix)) nix      (statfs NFS detect — RFC-0002 R1)
+├── opendal                (feature `fs` par défaut ; s3/gcs/azure opt-in)
+└── async-trait + thiserror + tokio + tracing
 
-gradatum-index          (SQLite + FTS5 + migrations idempotentes + drift Phase A)
-├── gradatum-core
-├── rusqlite 0.32 (bundled — FTS5 activé nativement, 4 PRAGMA C12)
-├── async-trait
-├── serde + serde_json   (notes + audit_trail + extra_json)
-├── sha2                 (drift Phase A — hash prefix 4KB + hash complet)
-├── chrono               (timestamps ISO 8601)
-├── ulid                 (IDs override + audit_trail)
-├── thiserror            (GradatumError typed)
-└── tracing
-(Phase 3+: tantivy, sqlite-vec ANN — non inclus Phase 1)
+gradatum-index          (SQLite + FTS5 + migrations idempotentes + drift + ANN)
+├── gradatum-core + gradatum-storage
+├── rusqlite (bundled — FTS5 natif, 4 PRAGMA C12)
+├── (feature sqlite-vec-ann) sqlite-vec
+├── serde + serde_json + chrono + ulid + sha2
+└── async-trait + thiserror + tokio + tracing
 
-gradatum-search         (multi-mode reader + RRF fusion)
-├── gradatum-core
-├── gradatum-index
-├── gradatum-cache
+gradatum-search         (lecteur multi-mode + fusion RRF + scoring composite)
+├── gradatum-core + gradatum-index + gradatum-cache
+├── (feature onnx-reranker) ort + tokenizers
 └── tracing
 
-gradatum-queue          (SQLite-backed jobs + lease atomic)
-├── gradatum-core
-├── rusqlite
-└── tokio
+gradatum-queue          (façade GradatumQueue + lease atomique)
+├── gradatum-core + gradatum-db-sqlite
+├── sqlx + rusqlite + bincode
+├── serde + serde_json + chrono + ulid
+└── async-trait + thiserror + tokio + tracing
 
-gradatum-cache          (moka LRU in-process)
+gradatum-db-sqlite      (SqliteQueueStore — impl QueueStore)
 ├── gradatum-core
-└── moka
+├── sqlx
+├── serde + serde_json + chrono + ulid
+└── async-trait + thiserror + tokio + tracing
+
+gradatum-cache          (LRU moka in-process — clé composite (vault_id, note_id, scope_hash))
+├── gradatum-core
+├── moka
+└── tokio
 
 gradatum-chat           (trait Chat + OpenAICompat + Heuristic + Noop)
 ├── gradatum-core
-├── async-trait
-├── reqwest (rustls-tls default)
-├── serde_json
-├── tracing
-└── (feature windows-native-tls) native-tls — OFF default (RFC-0002 §4.6)
+├── reqwest (rustls-tls par défaut)
+├── secrecy + regex + once_cell + chrono
+├── (feature windows-native-tls) native-tls via reqwest — OFF par défaut (RFC-0002 §4.6)
+└── async-trait + serde + serde_json + thiserror + tokio + tracing
 
-gradatum-curator        (note curation: filtering, routing, tagging, wikilinks)
+gradatum-curator        (curation : filtrage, routage, tagging, audit/dedup)
+├── gradatum-core + gradatum-chat + gradatum-index
+├── regex + once_cell + strsim + unicode-segmentation
+├── secrecy + sha2 + chrono + ulid
+└── async-trait + serde + serde_json + thiserror + tokio + tracing
+
+gradatum-embed          (trait Embedder + impl remote/local)
 ├── gradatum-core
-├── gradatum-vault
-├── gradatum-queue
-├── gradatum-chat
-├── gradatum-embed
-├── gradatum-markdown
-└── tokio
+├── reqwest (rustls-tls par défaut)
+├── (feature fastembed-cpu) fastembed + ort-sys — OFF par défaut
+├── (feature windows-native-tls) native-tls via reqwest — OFF par défaut
+└── async-trait + serde + serde_json + thiserror + tokio
 
-gradatum-embed          (Embedder trait + remote/local impl)
+gradatum-engine         (superviseur des sous-processus llama-server)
 ├── gradatum-core
-├── reqwest (rustls-tls default)
-├── (feature windows-native-tls) native-tls — OFF default (RFC-0002 §4.6)
-└── (feature fastembed-cpu) fastembed + ort — OFF default (bug ort-sys via private registry)
+└── (feature serve — porte TOUTES les deps ci-dessous)
+    ├── gradatum-dto       (QaEvent pour l'event-log)
+    ├── axum + reqwest + prometheus-client
+    ├── figment + toml + serde + serde_json + url
+    ├── zeroize            (JWT/api-key du sink event-log)
+    ├── nix                (signalisation de groupe de processus POSIX)
+    └── tokio + tracing + tracing-subscriber + async-trait + chrono + anyhow
 
-gradatum-engine         (supervisor for llama-server subprocesses)
+gradatum-ingest         (pipeline code-ingest tree-sitter, zéro LLM)
+├── gradatum-core + gradatum-index
+├── (feature code-rust, défaut)  tree-sitter + tree-sitter-rust
+├── (feature code-python)        tree-sitter + tree-sitter-python
+├── (feature code-bash)          tree-sitter + tree-sitter-bash
+├── (feature code-typescript)    tree-sitter + tree-sitter-typescript
+└── sha2 + serde_json + thiserror + tracing
+
+gradatum-warden         (garde réseau L0 — filtre IP, rate-limit, bypass loopback)
+├── axum + tower + tower-http + http
+├── governor + ipnet + dashmap
+└── async-trait + serde + thiserror + tokio + tracing
+
+gradatum-acl-policy     (presets ACL + chargement du modèle de config + matching glob)
 ├── gradatum-core
-├── gradatum-dto (QaEvent for event-log)
-├── tokio + tracing (async subprocess management)
-├── nix (POSIX process group signaling)
-└── (feature serve) axum + reqwest + prometheus-client
+├── globset                (⚠ le matching glob vit ICI, pas dans gradatum-acl-auth)
+├── serde + toml
+└── thiserror + tracing
 
-gradatum-acl-policy     (ACL preset + config model loading)
+gradatum-acl-auth       (store de clés d'API + vérification de bearer token)
 ├── gradatum-core
-├── toml
-└── serde + serde_yaml
+├── argon2 + rand          (hachage argon2id des clés)
+├── sqlx
+├── serde + serde_json + ulid
+└── async-trait + thiserror + tokio + tracing
 
-gradatum-acl-auth       (glob pattern matching + bearer token verify)
+gradatum-auth           (auth JWT/OIDC/API-key + validation de token)
 ├── gradatum-core
-├── globset
-├── argon2
-└── rand
-
-gradatum-auth           (JWT/OIDC/API-key auth + token validation)
-├── gradatum-core
-├── jsonwebtoken
-├── serde_json
-└── chrono
-
+├── jsonwebtoken + ed25519-dalek + pkcs8 + zeroize
+├── dashmap + sqlx
+├── serde + serde_json + chrono + ulid + rand
+└── async-trait + thiserror + tokio + tracing
 ```
 
-**3 clients** :
+**Clients** :
 
 ```
-gradatum-cli            (CLI utilisateur)
+gradatum-mcp-stub       (adapter MCP stdio → HTTP)
+├── gradatum-core + gradatum-dto
+├── rmcp + schemars
+├── reqwest
+└── tokio + tracing + tracing-subscriber + anyhow + async-trait + serde + serde_json
+
+gradatum-sdk-rs         (SDK Rust pour intégration directe)
 ├── gradatum-core
 ├── reqwest
-└── clap
+└── serde + serde_json + tokio
 
-gradatum-mcp-stub       (adapter MCP stdio → HTTP)
-├── gradatum-core
-├── rmcp (stdio mode)
-└── reqwest
+gradatum                (façade SDK parapluie — re-exports feature-gated)
+├── (feature client) gradatum-sdk-rs
+└── (feature core)   gradatum-core
+```
 
-gradatum-sdk-rs         (SDK Rust pour intégration)
+**Non publiables** :
+
+```
+gradatum-cli            (CLI utilisateur — publish=false, reportée v2.0.0, ⚠️ déjà 0.7.6 sur crates.io)
 ├── gradatum-core
-└── reqwest
+├── reqwest + clap
+└── serde + serde_json + tokio
+index-parity-tests      (suite de parité backend-agnostique — dev-deps uniquement)
+v1-parity-tests         (suite de parité v1 — dev-deps uniquement)
+gradatum-bench          (criterion + core/cache/chat/curator/embed/index/storage)
 ```
 
 ---
 
 ## Dépendances externes principales
 
+Les dépendances du workspace sont **épinglées à l'exact** (`=x.y.z`) dans le
+`[workspace.dependencies]` racine. Les versions ci-dessous en sont la lecture directe.
+Exceptions non épinglées, volontaires : `stability 0.2`, `subtle 2` (workspace) ainsi que
+`ipnet 2`, `bytes 1` et `tokenizers 0.21` (déclarées au niveau crate).
+
 | Crate | Version | Usage | Justification |
 |---|---|---|---|
-| `tokio` | 1.x | Async runtime | Standard Rust async |
-| `axum` | 0.7 | HTTP server | Léger, performant, ergonomique |
-| `tower` / `tower-http` | 0.5 | Middleware | Compose avec axum |
-| `rmcp` | =0.17 | MCP server/client | Lib officielle Rust MCP, pinnée |
-| `rusqlite` | 0.32 (bundled) | SQLite + FTS5 | Embedded, multi-feature |
-| `tantivy` | (à fixer Phase 3) | Full-text Lucene-quality | Rust pur, embedded |
-| `globset` | 0.4 | ACL pattern matching | Lib pure, simple |
-| `argon2` | 0.5 | Password hashing OWASP | Standard recommandation |
-| `moka` | 0.12 | LRU cache | Performant, thread-safe |
-| `reqwest` | 0.12 (rustls) | HTTP client | Standard, no OpenSSL |
-| `serde` + `serde_json` + `serde_yaml` + `toml` | latest | Serialization | Markdown frontmatter, JSON-RPC, configs |
-| `tracing` + `tracing-subscriber` | latest | Logs structurés | JSON output ready for SIEM ingestion |
-| `clap` | 4 | CLI parsing | Standard derive |
-| `ulid` | 1.x | Stable note IDs | Lexicographically sortable, time-ordered |
-| `chrono` | 0.4 | Dates ISO 8601 | Standard |
-| `walkdir` | 2 | FS scan | Pour reindex / migrate |
-| `regex` | 1 | Wikilinks parsing | Standard |
-| `thiserror` + `anyhow` | latest | Error handling | Standard Rust |
-| `tempfile` | 3 (dev) | Tests | Standard |
-| `apalis` | `=1.0.0-rc.9` | Job queue framework (v0.2.0 F-15 Monitor multi-worker + Layers Timeout/Retry/CatchPanic/LoadShed) | Type-safe Rust job framework, embedded crate compile-time (pas service runtime — ARCH-D15 F-24). Pin exact D-09 + caveat C1 RC9→v1.0 stable Q3 2026 watch |
-| `apalis-sql` | `=1.0.0-rc.9` | Apalis backend traits | Cohérent pin Apalis core. Schema SQLite via SqliteQueueStore custom (pas apalis-sqlite tables — F-24 agnostique) |
-| `apalis-cron` | `=1.0.0-rc.8` | Schedules périodiques (cleanup_dlq_daily + cleanup_idempotency) | NB rc.9 non publié pour apalis-cron sur crates.io. Caveat C1 double RC watch |
-| `prometheus` | `=0.13.4` | Metrics exporter (v0.2.0 F-15 :19091 + F-16 /metrics) | Pin exact patch level (0.14 breaking change connu) |
-| `sqlx` | (workspace) | SqliteQueueStore + GradatumQueue + gradatum-db-sqlite impl QueueStore (v0.2.0 F-14 partiel) | WAL mode + atomic UPDATE...RETURNING leases |
+| `tokio` | `=1.52.1` | Runtime async | Standard Rust async |
+| `axum` | `=0.8.9` | Serveur HTTP | Léger, performant, ergonomique |
+| `axum-server` | `=0.8.0` | Terminaison TLS native (`[server.tls]`, B-2) | `tls-rustls-no-provider` : provider crypto explicite |
+| `rustls` | `=0.23.40` | Provider crypto process-default | `aws_lc_rs` installé au boot — évite un second provider `ring` ambigu |
+| `tower` / `tower-http` | `=0.5.2` / `=0.6.10` | Middleware | Compose avec axum (`cors`, `trace`, `fs`, `set-header`, `limit`) |
+| `http` | `=1.4.0` | Types HTTP partagés | Contrat commun serveur/warden/gateway |
+| `rmcp` | `=1.6.0` | Serveur MCP natif | Lib Rust MCP officielle, pinnée (`transport-streamable-http-server`) |
+| `schemars` | `=1.0.4` | Schémas JSON des outils MCP | Dérivation auto des schémas d'outils |
+| `rusqlite` | `=0.32.1` (bundled) | SQLite + FTS5 | Embarqué, multi-feature |
+| `sqlx` | `=0.8.6` | QueueStore + auth + acl-auth | WAL + `UPDATE … RETURNING` atomique |
+| `sqlite-vec` | `=0.1.9` | Index ANN vec0 | `default-features = false` : évite un rusqlite ^0.31 conflictuel |
+| `globset` | `=0.4.18` | Matching de patterns ACL | Lib pure, simple |
+| `argon2` | `=0.5.3` | Hachage de clés d'API (OWASP) | Recommandation standard |
+| `moka` | `=0.12.15` | Cache LRU | Performant, thread-safe |
+| `reqwest` | `=0.13.3` (rustls) | Client HTTP | Standard, sans OpenSSL |
+| `opendal` | `=0.58.1` | Abstraction de stockage (façade `opendal-core` + `opendal-service-*` depuis 0.56) | `fs` par défaut ; s3/gcs/azure derrière features |
+| `serde` / `serde_json` / `serde_jcs` / `serde_norway` / `toml` | `=1.0.228` / `=1.0.149` / `=0.1.0` / `=0.9.42` / `=1.1.2` | Sérialisation | Frontmatter MD, JSON-RPC, JCS RFC 8785, configs |
+| `toml_edit` | `=0.25.11` | Édition TOML préservant le format | Écriture de config par la CLI |
+| `figment` | `=0.10.19` | Chargement de config | Fusion fichier + env |
+| `bincode` | `=2.0.1` | Payloads de jobs | Sérialisation binaire compacte |
+| `tracing` / `tracing-subscriber` | `=0.1.44` / `=0.3.23` | Logs structurés | Sortie JSON prête pour SIEM |
+| `clap` | `=4.6.1` | Parsing CLI | Derive standard |
+| `ulid` | `=1.2.1` | IDs de notes stables | Triable lexicographiquement, ordonné dans le temps |
+| `chrono` | `=0.4.44` | Dates ISO 8601 | Standard |
+| `walkdir` | `=2.5.0` | Scan FS | Reindex / migrate (`gradatum-admin`) |
+| `regex` / `once_cell` | `=1.12.3` / `=1.21.4` | Parsing wikilinks, statiques paresseux | Standard |
+| `thiserror` / `anyhow` | `=2.0.18` / `=1.0.103` | Gestion d'erreurs | `anyhow` 1.0.103 = fix RUSTSEC-2026-0190 |
+| `sha2` | `=0.11.0` | Hachage (drift, content_hash JCS) | — |
+| `secrecy` / `zeroize` / `subtle` | `=0.10.3` / `=1.8.2` / `2` | Secrets zeroize-on-drop, comparaison constante | Credentials LLM + JWT |
+| `ed25519-dalek` / `pkcs8` | `=2.1.1` / `=0.10.2` | Signature JWT EdDSA | Clé Ed25519 persistée chmod 600 |
+| `jsonwebtoken` | `=9.3.1` | Encodage/décodage JWT | ⚠ **maintenu en 9.x** : 10.x exige la feature `rust_crypto` (`sha2 ^0.10.7`), incompatible avec `sha2 =0.11.0` |
+| `governor` / `ipnet` / `dashmap` | `=0.10.4` / `2` / `=6.1.0` | Rate-limit, CIDR, map concurrente | `gradatum-warden`, `gradatum-auth` |
+| `nix` | `=0.31.2` | Syscalls UNIX (`fs`, `signal`, `process`) | Signalisation de groupe de processus (`gradatum-engine`) |
+| `apalis` | `=1.0.0-rc.9` | Framework de job queue (Monitor multi-worker + layers Timeout/Retry/CatchPanic/LoadShed) | Framework Rust type-safe, crate embarquée à la compilation (pas un service runtime — ARCH-D15 F-24). Pin exact D-09 + caveat C1 RC9→v1.0 |
+| `apalis-sql` | `=1.0.0-rc.9` | Traits backend Apalis | Cohérent avec le pin du core |
+| `apalis-sqlite` | `=1.0.0-rc.8` | Backend SQLite réel (via sqlx 0.8) | rc.9 non publié |
+| `apalis-cron` / `cron` | `=1.0.0-rc.8` / `=0.16.0` | Schedules périodiques | rc.9 non publié pour `apalis-cron` |
+| `prometheus` | `=0.13.4` | Exporter worker (:19091) | Pin exact patch level (0.14 breaking connu) |
+| `prometheus-client` | `=0.22.3` | Metrics serveur + engine | — |
+| `ort` / `tokenizers` | `=2.0.0-rc.9` / `0.21` | Reranker cross-encoder ONNX | Optionnels (`onnx-reranker`) |
+| `fastembed` / `ort-sys` | `=4.6.0` / `=2.0.0-rc.9` | Embeddings CPU locaux | Optionnels (`fastembed-cpu`) ; `ort-sys` pinné rc.9 (rc.12 tire ureq v3) |
+| `tree-sitter` (+ `-rust`, `-python`, `-bash`, `-typescript`) | `=0.26.9` (+ `=0.24.2`, `=0.25.0`, `=0.25.1`, `=0.23.2`) | Parsing code-ingest | Optionnels, une feature par langage |
+| `stability` | `0.2` | Annotations `#[stability::unstable]` | Seule dépendance non épinglée à l'exact |
+| `include_dir` / `smallvec` / `strsim` / `unicode-segmentation` / `hex` / `bytes` / `url` / `futures` | `=0.7.4` / `=1.13.2` / `=0.11.1` / `=1.13.2` / `=0.4.3` / `1` / `=2.5.8` / `=0.3.32` | Utilitaires | — |
+| `tempfile` / `proptest` / `serde_test` / `wiremock` / `mockito` / `insta` / `criterion` | `=3.27.0` / `=1.11.0` / `=1.0.171` / `=0.6.5` / `=1.6.1` / `=1.42.2` / `=0.5.1` | Tests + benchs (dev) | Standard |
 
-### Crate workspace `gradatum-db-sqlite` (v0.2.0 NEW)
+> ❗ `tantivy` a été retiré de cette table : il n'a jamais été une dépendance du workspace
+> (aucune occurrence dans les `Cargo.toml`). La ligne « à fixer Phase 3 » était une intention,
+> pas un état.
 
-Crate dédié `SqliteQueueStore` impl `QueueStore` trait depuis `gradatum-core` (15 méthodes : enqueue/dequeue/get/complete/fail/cancel/fail_dlq/find_awaiting/set_pending/recover_stale_leases/cancel_expired_deadlines/promote_retries/schedule_retry/list/subscribe). Schema custom `gradatum_jobs` (id TEXT ULID + payload JSON + status + priority + class + timestamps + lease_until + attempt_count + deadline + last_error + await_jobs + kind dénormalisé). Migrations 006_apalis_bootstrap + 007_jobs_kind_indexed + 008_idempotency + 009_jobs_v2_drain.
+### Crate workspace `gradatum-db-sqlite`
 
-Pattern F-24 agnostique : QueueStore trait dans gradatum-core, impl SqliteQueueStore Bronze v0.2.0, futur Postgres/libsql/LanceDB sans breaking Apalis worker layer.
+Crate dédié : `SqliteQueueStore` implémente le trait `QueueStore` de `gradatum-core`
+(15 méthodes : enqueue / dequeue / get / complete / fail / cancel / fail_dlq / find_awaiting /
+set_pending / recover_stale_leases / cancel_expired_deadlines / promote_retries / schedule_retry /
+list / subscribe). Schéma custom `gradatum_jobs` (id TEXT ULID + payload JSON + status + priority
++ class + timestamps + lease_until + attempt_count + deadline + last_error + await_jobs + `kind`
+dénormalisé + `tenant_id`).
+
+Migrations (`crates/gradatum-db-sqlite/migrations/`) : `006_apalis_bootstrap` ·
+`007_jobs_kind_indexed` · `008_idempotency` · `009_jobs_v2_drain` · `010_backfill_kind` ·
+**`011_jobs_tenant_scope`** (colonne `tenant_id NOT NULL DEFAULT 'main'` + index — isolation des
+jobs par tenant, filtrage conditionnel : absence de clause à OFF, `AND tenant_id = ?` à ON).
+
+Pattern F-24 agnostique : trait `QueueStore` dans `gradatum-core`, impl `SqliteQueueStore`,
+futur Postgres/libsql/LanceDB sans casser la couche worker Apalis.
+
+> À ne pas confondre avec les migrations de l'**index** (`crates/gradatum-index/migrations/`,
+> numérotées `0001` → `0039`), documentées dans [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
 ## Dépendances optionnelles (feature flags)
 
-| Feature | Activates | Crate | Phase |
+Table établie par lecture des blocs `[features]` de chaque `Cargo.toml`.
+
+| Crate | Feature | Défaut | Active |
 |---|---|---|---|
-| `local-encoder` (default) | Local CPU embedding fallback | `fastembed` | Phase 1 |
-| `reranker` | Cross-encoder rerank | `fastembed` (Jina model) | Phase 3 |
-| `tantivy-index` | Full-text index v2 | `tantivy` | Phase 3 |
-| `sqlite-vec` (default) | Vector ANN | `sqlite-vec` C extension | Phase 3 |
-| `prometheus` | `/metrics` endpoint | `prometheus` | Phase 3 |
-| `tokio-console` | Async runtime debugging | `console-subscriber` | Phase 4 (dev only) |
+| `gradatum-ingest` | `code-rust` | ✅ | `tree-sitter` + `tree-sitter-rust` |
+| `gradatum-ingest` | `code-python` | — | `tree-sitter` + `tree-sitter-python` |
+| `gradatum-ingest` | `code-bash` | — | `tree-sitter` + `tree-sitter-bash` |
+| `gradatum-ingest` | `code-typescript` | — | `tree-sitter` + `tree-sitter-typescript` |
+| `gradatum-storage` | `fs` | ✅ | `opendal/services-fs` |
+| `gradatum-storage` | `s3` / `gcs` / `azure` / `all-cloud` | — | backends objet OpenDAL correspondants |
+| `gradatum-index` | `sqlite-vec-ann` | — | `sqlite-vec` (index ANN vec0) |
+| `gradatum-search` | `onnx-reranker` | — | `ort` + `tokenizers` (cross-encoder) |
+| `gradatum-embed` | `fastembed-cpu` | — | `fastembed` + `ort-sys` (embeddings CPU locaux) |
+| `gradatum-embed` / `gradatum-chat` | `windows-native-tls` | — | `reqwest/native-tls` (RFC-0002 §4.6) |
+| `gradatum-bench` / `gradatum-gateway` | `fastembed-cpu` | — | propage `gradatum-embed/fastembed-cpu` |
+| `gradatum-engine` | `serve` | — | toute la surface serveur du superviseur (axum, reqwest, figment, nix, …) |
+| `gradatum-engine` | `test-utils` | — | implique `serve` |
+| `gradatum-dto` | `schemars` | — | `schemars` + `serde_json` (schémas d'outils MCP) |
+| `gradatum-core` | `test-utils` | — | helpers de test |
+| `gradatum` (umbrella) | `core` | ✅ | `gradatum-core` (défaut : sinon la façade n'expose que `VERSION`) |
+| `gradatum` (umbrella) | `client` | — | `gradatum-sdk-rs` (placeholder sans surface cliente) |
+
+> ❗ L'ancienne table listait `local-encoder`, `reranker`, `tantivy-index`, `sqlite-vec`,
+> `prometheus` et `tokio-console`. **Aucune de ces six features n'existe dans le code.**
+> Les noms réels sont `fastembed-cpu`, `onnx-reranker` et `sqlite-vec-ann` ; l'export
+> Prometheus n'est pas derrière un feature flag.
 
 ---
 
@@ -227,10 +395,10 @@ Pattern F-24 agnostique : QueueStore trait dans gradatum-core, impl SqliteQueueS
 
 | Service | Usage | Dépendance core ? |
 |---|---|---|
-| OpenAI-compatible gateway | Gatekeeper LLM + embeddings | NON (R1 single-source-of-LLM-auth — pluggable, pas hardcodé) |
-| Litestream | Backup continu DB | NON (operator-defined deployment) |
-| SIEM / audit log sink | Audit log ingestion | NON (operator-defined deployment) |
-| Notification system | Ops alerts | NON (operator-defined deployment) |
+| Gateway compatible OpenAI | Curator LLM + embeddings | NON (R1 single-source-of-LLM-auth — pluggable, pas hardcodé) |
+| Litestream | Backup continu de la DB | NON (défini par l'opérateur) |
+| SIEM / sink de logs d'audit | Ingestion des logs d'audit | NON (défini par l'opérateur) |
+| Système de notification | Alertes ops | NON (défini par l'opérateur) |
 
 → **Aucun service externe requis** dans le code core. Tout est pluggable ou optionnel.
 
@@ -246,8 +414,19 @@ cargo tree --workspace --depth 1 > /tmp/cargo-tree.txt
 # Comparer avec ce fichier, mettre à jour si divergence.
 ```
 
-Skill associé : `dependency-architecture-tree` peut être invoqué pour automatiser la mise à jour.
+Contrôles rapides utiles :
+
+```bash
+ls crates/ | wc -l                                   # nombre de membres du workspace
+grep -L 'publish = false' crates/*/Cargo.toml | wc -l  # nombre de crates publiables
+git diff <ref>..HEAD -- Cargo.toml 'crates/*/Cargo.toml'  # tout changement de dépendance
+```
 
 ---
 
-*Document maintenu par l'Architect (Général). Dernière mise à jour : 2026-05-01 — initial scaffold.*
+*Document maintenu par les mainteneurs Gradatum. Dernière mise à jour : 2026-08-04 — réalignement
+arbres workspace / table de répartition (studio publiable F-131, `gradatum-cli` non-publiable), déjà
+committé `1a7d01c8`. Précédent : 2026-07-31 — bump `opendal` `=0.51.0` → `=0.58.1` (MSRV workspace
+1.88 → 1.91, `Cargo.lock` 688 → 705 paquets). Réalignement complet précédent : 2026-07-24, `fb0742e5`
+(décompte des crates, arbres par crate, pins exacts, feature flags réels, migration queue 011).
+Arbre initial : 2026-05-01.*

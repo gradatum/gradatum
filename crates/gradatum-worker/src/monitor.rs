@@ -1,14 +1,21 @@
 //! Apalis multi-worker monitor orchestration.
 //!
-//! Builds an Apalis `Monitor` that orchestrates
-//! the Gradatum workers (curate, embed, reindex) via the custom `GradatumBackend`
-//! and Tower layers:
+//! Builds an Apalis `Monitor` that orchestrates the **seven** Gradatum job workers via the
+//! custom `GradatumBackend` and Tower layers (default values from `WorkersConfig`,
+//! overridable per kind in `[apalis.workers.<kind>]`):
 //!
 //! | Kind | Concurrency | Timeout | Retries | Layer |
 //! |---|---|---|---|---|
 //! | `curate` | 2 | 30s | 3 | Trace + Timeout + Retry + CatchPanic |
 //! | `embed` | 4 | 60s | 3 | Trace + Timeout + Retry + CatchPanic |
 //! | `reindex` | 4 | 120s | 2 | Trace + Timeout + Retry + CatchPanic |
+//! | `purge` | 1 | 300s | 0 | Trace + Timeout + Retry + CatchPanic |
+//! | `forget` | 1 | 300s | 0 | Trace + Timeout + Retry + CatchPanic |
+//! | `distill` | 1 | 300s | 0 | Trace + Timeout + Retry + CatchPanic |
+//! | `validate` | 1 | 300s | 2 | Trace + Timeout + Retry + CatchPanic |
+//!
+//! Two cron workers are registered on top of these: `cleanup-dlq-daily` and
+//! `distill-pressure`.
 //!
 //! # Graceful shutdown
 //!
@@ -47,11 +54,13 @@ use crate::internal_client::InternalClient;
 
 use super::apalis_backend::build_gradatum_backend;
 use super::apalis_handlers::{
-    DistillSynthesizer, handle_curate, handle_distill, handle_embed, handle_forget, handle_purge,
-    handle_reindex, handle_validate,
+    DistillSynthesizer, MultiTenantCfg, handle_curate, handle_distill, handle_embed, handle_forget,
+    handle_purge, handle_reindex, handle_validate,
 };
 use super::metrics::WorkerMetrics;
-use super::schedules::{ScheduleConfig, handle_cleanup_dlq};
+use super::schedules::{
+    DistillCronConfig, ScheduleConfig, handle_cleanup_dlq, handle_distill_cron,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -132,16 +141,18 @@ pub struct WorkersConfig {
     pub forget: WorkerConfig,
     /// Distill worker — semantic distillation.
     ///
-    /// Concurrency 1: LLM/synthesis writes to the vault plus source marking
-    /// (CoW). O(n²) clustering bounded by `batch_limit`. Long timeout (corpus + synthesis).
+    /// Concurrency 1: serial LLM/synthesis. The handler itself writes **nothing** to the
+    /// vault and marks no source — it enqueues a `Job::Validate` that performs both.
+    /// O(n²) clustering bounded by `batch_limit`. Long timeout (corpus + synthesis).
     #[serde(default = "WorkersConfig::default_distill")]
     pub distill: WorkerConfig,
-    /// Validate worker — deterministic quality gate before persistence (F-43).
+    /// Validate worker — deterministic quality gate before persistence.
     ///
     /// Concurrency 1: scorer + persist are sequential per synthesis.
     /// Timeout matches distill (embedder call + persist). Retries=2: `persist_distill` is
-    /// idempotent (fixed pre-allocated note_id, unconditional write; source-marking
-    /// idempotent — sources already marked processed in handle_distill before enqueue).
+    /// idempotent (fixed pre-allocated note_id, unconditional write), and this handler is
+    /// also the one that marks the sources `processed` — re-marking is itself idempotent.
+    /// (`handle_distill` does **not** mark them beforehand.)
     /// Transient failures must not make the job terminal and lose the note.
     #[serde(default = "WorkersConfig::default_validate")]
     pub validate: WorkerConfig,
@@ -200,8 +211,9 @@ impl WorkersConfig {
             // Long timeout: O(n²) clustering over batch_limit notes + synthesis per cluster.
             timeout_secs: 300,
             // No automatic retry: a synthesis failure (gateway down) must not loop.
-            // Idempotent on re-run: sources are marked processed in handle_distill
-            // (early marking before Job::Validate enqueue) — a re-run skips them.
+            // ⚠️ Un re-run n'est PAS idempotent tant que le `Job::Validate` enfilé n'a pas
+            // tourné : c'est `handle_validate` qui marque les sources `processed`, pas
+            // `handle_distill`. Avant cela, un re-run re-collecte les mêmes sources.
             max_retries: 0,
         }
     }
@@ -213,8 +225,8 @@ impl WorkersConfig {
             // Timeout matches distill: embedder call can be slow under load.
             timeout_secs: 300,
             // Retries=2: `persist_distill` is idempotent (fixed pre-allocated note_id,
-            // expected_sha256=None → unconditional write; source-marking idempotent
-            // — sources already marked processed in handle_distill before enqueue).
+            // expected_sha256=None → unconditional write). Le marquage des sources est
+            // fait ICI (pas dans handle_distill) et re-marquer est idempotent.
             // A transient failure must not make the job terminal — without retries
             // the distilled synthesis note is permanently lost.
             max_retries: 2,
@@ -265,18 +277,28 @@ pub struct MonitorDeps {
 /// - `pool`: SQLite pool for cron schedules (`cleanup_dlq_daily`)
 /// - `deps`: handler dependencies — vault, curator, embedder, index
 /// - `config`: worker and schedule configuration read from TOML
+/// - `distill_cron`: top-level `[distill_cron]` config — validated fail-loud here
 /// - `metrics`: shared Prometheus registry for `on_event` hooks
 /// - `shutdown_timeout_secs`: graceful drain duration after SIGTERM/SIGINT
 ///
 /// # Errors
 ///
-/// Returns an error if `GradatumBackend` construction fails or if
-/// a cron expression in the config is invalid.
+/// Returns an error if `GradatumBackend` construction fails, if a cron expression
+/// in the config is invalid, or if the `[distill_cron]` config fails validation
+/// (fail-loud — a malformed distill cron config prevents worker boot).
+// 8 args : câblage racine appelé une seule fois au boot — un struct de params
+// masquerait le wiring sans gain (chaque dépendance est distincte et obligatoire).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single boot wiring — params struct without benefit (C2 adds multi_tenant)"
+)]
 pub fn build_monitor(
     store: Arc<dyn QueueStore + Send + Sync>,
     pool: Arc<SqlitePool>,
     deps: MonitorDeps,
     config: &ApalisConfig,
+    distill_cron: DistillCronConfig,
+    multi_tenant: MultiTenantCfg,
     metrics: WorkerMetrics,
     shutdown_timeout_secs: u64,
 ) -> anyhow::Result<Monitor> {
@@ -339,6 +361,7 @@ pub fn build_monitor(
                     .data(Arc::clone(&queue_c) as Arc<dyn QueueStore + Send + Sync>)
                     // ack_with wires store.complete/fail after each handler.
                     // enable_tracing() active — task_id injected via record_to_task.
+                    .data(multi_tenant)
                     .ack_with(ack.clone())
                     .enable_tracing()
                     .timeout(Duration::from_secs(cfg.timeout_secs))
@@ -375,6 +398,7 @@ pub fn build_monitor(
                     .backend(backend.clone())
                     .data(Arc::clone(&client_e) as Arc<dyn InternalClient>)
                     .data(Arc::clone(&embedder_e) as Arc<dyn Embedder + Send + Sync>)
+                    .data(multi_tenant)
                     .ack_with(ack.clone())
                     .enable_tracing()
                     .timeout(Duration::from_secs(cfg.timeout_secs))
@@ -439,6 +463,7 @@ pub fn build_monitor(
                 WorkerBuilder::new(&worker_name)
                     .backend(backend.clone())
                     .data(Arc::clone(&client_p) as Arc<dyn InternalClient>)
+                    .data(multi_tenant)
                     .ack_with(ack.clone())
                     .enable_tracing()
                     .timeout(Duration::from_secs(cfg.timeout_secs))
@@ -470,6 +495,7 @@ pub fn build_monitor(
                 WorkerBuilder::new(&worker_name)
                     .backend(backend.clone())
                     .data(Arc::clone(&client_f) as Arc<dyn InternalClient>)
+                    .data(multi_tenant)
                     .ack_with(ack.clone())
                     .enable_tracing()
                     .timeout(Duration::from_secs(cfg.timeout_secs))
@@ -508,7 +534,8 @@ pub fn build_monitor(
                     .data(Arc::clone(&client_d) as Arc<dyn InternalClient>)
                     .data(Arc::clone(&embedder_d) as Arc<dyn Embedder + Send + Sync>)
                     .data(Arc::clone(&synth_d) as Arc<dyn DistillSynthesizer + Send + Sync>)
-                    .data(Arc::clone(&store_d) as Arc<dyn QueueStore + Send + Sync>)
+                    .data(Arc::clone(&store_d) as Arc<dyn QueueStore>)
+                    .data(multi_tenant)
                     .ack_with(ack.clone())
                     .enable_tracing()
                     .timeout(Duration::from_secs(cfg.timeout_secs))
@@ -543,6 +570,7 @@ pub fn build_monitor(
                     // Order matches the parameter order of handle_validate.
                     .data(Arc::clone(&client_v) as Arc<dyn InternalClient>)
                     .data(Arc::clone(&embedder_v) as Arc<dyn Embedder + Send + Sync>)
+                    .data(multi_tenant)
                     .ack_with(ack.clone())
                     .enable_tracing()
                     .timeout(Duration::from_secs(cfg.timeout_secs))
@@ -572,7 +600,7 @@ pub fn build_monitor(
             // Validate the cron expression before registering.
             Schedule::from_str(&cron_expr).map_err(|e| {
                 anyhow::anyhow!(
-                    "expression cron invalide pour '{}' ({}): {e}",
+                    "invalid cron expression for '{}' ({}): {e}",
                     sched_cfg.name,
                     cron_expr
                 )
@@ -581,13 +609,12 @@ pub fn build_monitor(
                 name = %sched_cfg.name,
                 cron = %cron_expr,
                 retention_days = retention,
-                "schedule cron enregistré"
+                "cron schedule registered"
             );
             monitor = monitor.register(move |_idx| {
                 // CronStream is not Clone — rebuild from the expression on each factory call.
-                let schedule = Schedule::from_str(&cron_expr).expect(
-                    "expression cron validée avant enregistrement — ne peut pas échouer ici",
-                );
+                let schedule = Schedule::from_str(&cron_expr)
+                    .expect("cron expression validated before registration — cannot fail here");
                 WorkerBuilder::new("cleanup-dlq-daily")
                     .backend(CronStream::new(schedule))
                     // Inject pool and retention via Data (apalis::prelude::Data).
@@ -600,9 +627,52 @@ pub fn build_monitor(
         } else {
             tracing::warn!(
                 name = %sched_cfg.name,
-                "schedule cron inconnu — ignoré (v0.2.0 supporte cleanup_dlq_daily uniquement)"
+                "unknown cron schedule — skipped (v0.2.0 supports cleanup_dlq_daily only)"
             );
         }
+    }
+
+    // ── Cron distill conditionnel (F-112) — hors boucle config.schedules ───────
+    // Validation fail-loud ICI (pas dans load_apalis_config qui est fail-soft) :
+    // un [distill_cron] malformé empêche le boot plutôt que de retomber
+    // silencieusement sur enabled=false.
+    distill_cron
+        .validate()
+        .map_err(|e| anyhow::anyhow!("[distill_cron] invalid: {e}"))?;
+    if distill_cron.enabled {
+        let dc = distill_cron.clone();
+        let client_dc = Arc::clone(&client);
+        let store_dc = Arc::clone(&store);
+        let metrics_dc = metrics.clone();
+        info!(
+            cron = %dc.cron,
+            loci = ?dc.loci,
+            pressure_min = dc.pressure_min,
+            max_jobs_per_tick = dc.max_jobs_per_tick,
+            "cron schedule registered: distill_pressure"
+        );
+        monitor = monitor.register(move |_idx| {
+            // CronStream is not Clone — rebuild the Schedule on each factory call
+            // (validated by distill_cron.validate() above → cannot fail here).
+            let schedule = dc
+                .schedule()
+                .expect("distill_cron expression validated before registration — cannot fail here");
+            WorkerBuilder::new("distill-pressure")
+                .backend(CronStream::new(schedule))
+                .data(dc.clone())
+                // Explicit injection (unlike cleanup_dlq): client (per-locus count),
+                // store (busy-loci dedup + enqueue), metrics (enqueue counter) —
+                // otherwise the handler dependencies + counter are unreachable.
+                .data(Arc::clone(&client_dc) as Arc<dyn InternalClient>)
+                .data(Arc::clone(&store_dc) as Arc<dyn QueueStore + Send + Sync>)
+                .data(metrics_dc.clone())
+                .data(multi_tenant)
+                .enable_tracing()
+                .catch_panic()
+                .build(handle_distill_cron)
+        });
+    } else {
+        tracing::debug!("distill_pressure cron disabled (enabled=false) — not registered");
     }
 
     // ── Graceful shutdown via with_terminator ─────────────────────────────────
@@ -611,7 +681,7 @@ pub fn build_monitor(
         tokio::time::sleep(Duration::from_secs(shutdown_timeout_secs)).await;
         info!(
             secs = shutdown_timeout_secs,
-            "Monitor : timeout graceful shutdown atteint — arrêt forcé"
+            "Monitor: graceful shutdown timeout reached — forced stop"
         );
     });
 

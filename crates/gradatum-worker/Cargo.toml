@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Async queue consumer — curator LLM + maintenance jobs"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "gradatum-worker"
@@ -19,12 +22,12 @@ path = "src/lib.rs"
 [dependencies]
 gradatum-core.workspace = true
 gradatum-dto.workspace = true
-# BLOCAGE CRATES.IO : gradatum-db-sqlite est publish=false. gradatum-worker non publiable.
-gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "0.7.0" }
+# gradatum-db-sqlite is publishable (no `publish` key); this dependency does not block
+# publication of gradatum-worker.
+gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "1.0.0" }
 gradatum-embed.workspace = true
 gradatum-queue.workspace = true
 gradatum-curator.workspace = true
-gradatum-chat.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
 bincode.workspace = true

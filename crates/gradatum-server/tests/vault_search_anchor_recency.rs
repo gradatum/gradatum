@@ -3,10 +3,10 @@
 //! Couvre :
 //! 1. `event_note_fts_recency_uses_anchor_not_created` — note FTS Event (anchor 200j,
 //!    created récent) → `recency_factor` dans scores reflète l'anchor ancien (< 0.5).
-//!    Prouve Task 2 : `recency_factor` est appelé avec `anchor_ms` plutôt que `created_ms`.
+//!    Preuve : `recency_factor` est appelé avec `anchor_ms` plutôt que `created_ms`.
 //! 2. `event_note_semantic_only_recency_uses_anchor` — note semantic-only Event (anchor 200j,
-//!    created récent) → `recency_factor` < 0.5. Prouve Task 1 (enrichissement anchor_ms avant
-//!    scoring pour les hits semantic-only) + Task 2.
+//!    created récent) → `recency_factor` < 0.5. Preuve de l'enrichissement anchor_ms avant
+//!    scoring pour les hits semantic-only).
 //! 3. `anchor_src_created_backward_compat` — note avec anchor_ms == created_ms →
 //!    recency_factor identique à `recency_factor(created_ms)` pré-F-17 (ε = 1e-4).
 //! 4. `no_temporal_index_fallback_no_panic` — note sans entrée temporal_index → fallback sur

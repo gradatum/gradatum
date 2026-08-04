@@ -1,0 +1,87 @@
+pub mod gradatum_auth
+pub mod gradatum_auth::jwt
+pub enum gradatum_auth::jwt::JwtError
+pub gradatum_auth::jwt::JwtError::Expired
+pub gradatum_auth::jwt::JwtError::InvalidAudience
+pub gradatum_auth::jwt::JwtError::InvalidIssuer
+pub gradatum_auth::jwt::JwtError::InvalidKid
+pub gradatum_auth::jwt::JwtError::Malformed(jsonwebtoken::errors::Error)
+pub gradatum_auth::jwt::JwtError::MissingSub
+pub gradatum_auth::jwt::JwtError::Time(std::time::SystemTimeError)
+pub enum gradatum_auth::jwt::TokenScope
+pub gradatum_auth::jwt::TokenScope::Human
+pub gradatum_auth::jwt::TokenScope::Service
+pub struct gradatum_auth::jwt::Claims
+pub gradatum_auth::jwt::Claims::aud: alloc::string::String
+pub gradatum_auth::jwt::Claims::exp: u64
+pub gradatum_auth::jwt::Claims::iat: u64
+pub gradatum_auth::jwt::Claims::iss: alloc::string::String
+pub gradatum_auth::jwt::Claims::jti: alloc::string::String
+pub gradatum_auth::jwt::Claims::scopes: alloc::vec::Vec<alloc::string::String>
+pub gradatum_auth::jwt::Claims::sub: alloc::string::String
+pub gradatum_auth::jwt::Claims::tenant_id: alloc::string::String
+pub struct gradatum_auth::jwt::JwtService
+impl gradatum_auth::jwt::JwtService
+pub fn gradatum_auth::jwt::JwtService::from_signing_bytes(&[u8], alloc::string::String, alloc::string::String, alloc::string::String, u64, u64) -> core::result::Result<Self, &'static str>
+pub fn gradatum_auth::jwt::JwtService::generate_signing_bytes() -> (zeroize::Zeroizing<[u8; 32]>, ed25519_dalek::signing::SigningKey)
+pub fn gradatum_auth::jwt::JwtService::kid(&self) -> &str
+pub fn gradatum_auth::jwt::JwtService::new(ed25519_dalek::signing::SigningKey, alloc::string::String, alloc::string::String, alloc::string::String, u64, u64) -> Self
+pub fn gradatum_auth::jwt::JwtService::new_ephemeral() -> Self
+pub fn gradatum_auth::jwt::JwtService::sign(&self, &str, &[alloc::string::String], gradatum_auth::jwt::TokenScope, &str) -> core::result::Result<alloc::string::String, gradatum_auth::jwt::JwtError>
+pub fn gradatum_auth::jwt::JwtService::ttl_human_secs(&self) -> u64
+pub fn gradatum_auth::jwt::JwtService::ttl_service_secs(&self) -> u64
+pub fn gradatum_auth::jwt::JwtService::verify(&self, &str) -> core::result::Result<gradatum_auth::jwt::Claims, gradatum_auth::jwt::JwtError>
+pub mod gradatum_auth::key_store
+#[non_exhaustive] pub enum gradatum_auth::key_store::KeyStoreError
+pub gradatum_auth::key_store::KeyStoreError::Invalid
+pub gradatum_auth::key_store::KeyStoreError::Invalid::path: std::path::PathBuf
+pub gradatum_auth::key_store::KeyStoreError::Invalid::reason: &'static str
+pub gradatum_auth::key_store::KeyStoreError::NotFound
+pub gradatum_auth::key_store::KeyStoreError::NotFound::path: std::path::PathBuf
+pub gradatum_auth::key_store::KeyStoreError::Read
+pub gradatum_auth::key_store::KeyStoreError::Read::path: std::path::PathBuf
+pub gradatum_auth::key_store::KeyStoreError::Read::source: gradatum_core::secrets::SecretsError
+pub gradatum_auth::key_store::KeyStoreError::Write
+pub gradatum_auth::key_store::KeyStoreError::Write::path: std::path::PathBuf
+pub gradatum_auth::key_store::KeyStoreError::Write::source: gradatum_core::secrets::SecretsError
+pub const gradatum_auth::key_store::AUDIENCE: &str
+pub const gradatum_auth::key_store::ISSUER: &str
+pub const gradatum_auth::key_store::SIGNING_KEY_NAME: &str
+pub const gradatum_auth::key_store::SIGNING_KID: &str
+pub fn gradatum_auth::key_store::load(&std::path::Path, u64, u64) -> core::result::Result<gradatum_auth::jwt::JwtService, gradatum_auth::key_store::KeyStoreError>
+pub fn gradatum_auth::key_store::load_or_generate(&std::path::Path, u64, u64) -> core::result::Result<gradatum_auth::jwt::JwtService, gradatum_auth::key_store::KeyStoreError>
+pub fn gradatum_auth::key_store::signing_key_path(&std::path::Path) -> std::path::PathBuf
+pub mod gradatum_auth::revocation
+pub enum gradatum_auth::revocation::RevocationError
+pub gradatum_auth::revocation::RevocationError::Sqlite(sqlx_core::error::Error)
+pub gradatum_auth::revocation::RevocationError::Time(std::time::SystemTimeError)
+pub struct gradatum_auth::revocation::InMemoryRevocationStore
+impl gradatum_auth::revocation::InMemoryRevocationStore
+pub fn gradatum_auth::revocation::InMemoryRevocationStore::new() -> Self
+impl core::default::Default for gradatum_auth::revocation::InMemoryRevocationStore
+pub fn gradatum_auth::revocation::InMemoryRevocationStore::default() -> Self
+impl gradatum_auth::revocation::RevocationStore for gradatum_auth::revocation::InMemoryRevocationStore
+pub fn gradatum_auth::revocation::InMemoryRevocationStore::gc<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<usize, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_auth::revocation::InMemoryRevocationStore::is_revoked<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_auth::revocation::InMemoryRevocationStore::revoke<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str, std::time::SystemTime) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub struct gradatum_auth::revocation::SqliteRevocationStore
+impl gradatum_auth::revocation::SqliteRevocationStore
+pub async fn gradatum_auth::revocation::SqliteRevocationStore::new(&std::path::Path) -> core::result::Result<Self, gradatum_auth::revocation::RevocationError>
+impl gradatum_auth::revocation::RevocationStore for gradatum_auth::revocation::SqliteRevocationStore
+pub fn gradatum_auth::revocation::SqliteRevocationStore::gc<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<usize, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_auth::revocation::SqliteRevocationStore::is_revoked<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_auth::revocation::SqliteRevocationStore::revoke<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str, std::time::SystemTime) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub trait gradatum_auth::revocation::RevocationStore: core::marker::Send + core::marker::Sync + 'static
+pub fn gradatum_auth::revocation::RevocationStore::gc<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<usize, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_auth::revocation::RevocationStore::is_revoked<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_auth::revocation::RevocationStore::revoke<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str, std::time::SystemTime) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl gradatum_auth::revocation::RevocationStore for gradatum_auth::revocation::InMemoryRevocationStore
+pub fn gradatum_auth::revocation::InMemoryRevocationStore::gc<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<usize, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_auth::revocation::InMemoryRevocationStore::is_revoked<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_auth::revocation::InMemoryRevocationStore::revoke<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str, std::time::SystemTime) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+impl gradatum_auth::revocation::RevocationStore for gradatum_auth::revocation::SqliteRevocationStore
+pub fn gradatum_auth::revocation::SqliteRevocationStore::gc<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<usize, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_auth::revocation::SqliteRevocationStore::is_revoked<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_auth::revocation::SqliteRevocationStore::revoke<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str, std::time::SystemTime) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_auth::revocation::RevocationError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_auth::revocation::boot_guard_check(bool, &str) -> core::result::Result<(), &'static str>
+pub const gradatum_auth::VERSION: &str

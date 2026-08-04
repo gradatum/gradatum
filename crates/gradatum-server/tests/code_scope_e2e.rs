@@ -63,7 +63,7 @@ fn sign(state: &AppState) -> String {
     state
         .jwt
         .sign(
-            "code-tester",
+            "main-agent",
             &["read".to_string()],
             TokenScope::Service,
             "main",

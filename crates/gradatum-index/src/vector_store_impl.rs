@@ -6,17 +6,18 @@
 //!
 //! ## Contention
 //!
-//! All three traits share a single `Arc<Mutex<Connection>>` (v0.3.0 design).
+//! All three traits share a single `Arc<Mutex<Connection>>`.
 //!
-//! ## Routage ANN (v0.5.3 ANN-5)
+//! ## ANN routing
 //!
-//! `search_semantic` route selon `ann_enabled` :
-//! - `true`  → `search_ann_inner` (vec0 sqlite-vec, ef_search configurable).
-//! - `false` → `search_semantic_inner` (brute-force cosine, comportement historique).
+//! `search_semantic` routes on `ann_enabled`:
+//! - `true`  → `search_ann_inner` (sqlite-vec vec0, configurable `ef_search`).
+//! - `false` → `search_semantic_inner` (brute-force cosine).
 //!
-//! Fallback de sûreté : si `search_ann_inner` retourne une erreur (extension absente,
-//! "no such module: vec0"), on logue un warn et on bascule automatiquement sur le
-//! chemin brute-force. Aucun panic, aucun retour de 0 résultats sur erreur ANN seule.
+//! Safety fallback: if `search_ann_inner` returns an error (extension absent,
+//! "no such module: vec0"), the failure is logged at `warn` level and the brute-force path
+//! takes over automatically. An ANN error alone never panics and never yields zero
+//! results.
 
 use async_trait::async_trait;
 
@@ -29,44 +30,48 @@ impl VectorStore for SqliteIndex {
     /// Inserts or updates an embedding — delegates to `insert_note_embedding_inner`.
     async fn insert_note_embedding(
         &self,
+        vault_id: &str,
         note_id: &NoteId,
         embedder_id: &str,
         dim: u16,
         vector: &[f32],
     ) -> Result<(), GradatumError> {
-        self.insert_note_embedding_inner(note_id, embedder_id, dim, vector)
+        self.insert_note_embedding_inner(vault_id, note_id, embedder_id, dim, vector)
             .await
     }
 
     /// Reads back an embedding vector — delegates to `get_note_embedding_inner`.
     async fn get_note_embedding(
         &self,
+        vault_id: &str,
         note_id: &NoteId,
         embedder_id: &str,
     ) -> Result<Option<Vec<f32>>, GradatumError> {
-        self.get_note_embedding_inner(note_id, embedder_id).await
+        self.get_note_embedding_inner(vault_id, note_id, embedder_id)
+            .await
     }
 
-    /// Semantic search — route vers ANN (sqlite-vec) ou brute-force cosine selon config.
+    /// Semantic search — routes to ANN (sqlite-vec) or brute-force cosine, per configuration.
     ///
-    /// ## Routage (v0.5.3 ANN-5)
+    /// ## Routing
     ///
-    /// Si `ann_is_enabled()` :
-    /// 1. Tente `search_ann_inner` (vec0 sqlite-vec, ef_search = `ann_ef_search()`).
-    /// 2. En cas d'erreur ANN (extension absente, "no such module: vec0", table manquante) :
-    ///    - Logue `tracing::warn!` avec le message d'erreur.
-    ///    - Bascule sur `search_semantic_inner` (brute-force) — pas de panic.
+    /// When `ann_is_enabled()` is true:
+    /// 1. `search_ann_inner` is tried first (sqlite-vec vec0, `ef_search = ann_ef_search()`).
+    /// 2. On an ANN error (extension absent, "no such module: vec0", missing table) the
+    ///    error is logged through `tracing::warn!` and the call falls back to
+    ///    `search_semantic_inner` — it never panics.
     ///
-    /// Si `ann_is_enabled()` vaut `false` (défaut) :
-    /// → `search_semantic_inner` directement (comportement byte-compat antérieur).
+    /// When `ann_is_enabled()` is false (the default), `search_semantic_inner` is called
+    /// directly.
     async fn search_semantic(
         &self,
-        vault_id: &str,
+        vault_id: &gradatum_core::scope::AclCheckedVaultId,
         embedder_id: &str,
         query_emb: &[f32],
         limit: usize,
         locus: Option<&str>,
     ) -> Result<Vec<(NoteId, f32)>, GradatumError> {
+        let vault_id = vault_id.as_str();
         if self.ann_is_enabled() {
             let ef_search = self.ann_ef_search();
             match crate::sqlite_vec::search_ann_inner(

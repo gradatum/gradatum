@@ -39,7 +39,7 @@ async fn create_initializes_layout() {
         "<root>/.gradatum/overrides/main/ doit exister"
     );
     // tenant_id correct
-    assert_eq!(vault.tenant_id().as_str(), "main");
+    assert_eq!(vault.vault_id().as_str(), "main");
 }
 
 #[tokio::test]
@@ -58,7 +58,7 @@ async fn create_custom_tenant_id() {
             .join("work")
             .exists()
     );
-    assert_eq!(vault.tenant_id().as_str(), "work");
+    assert_eq!(vault.vault_id().as_str(), "work");
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn open_existing_vault() {
     // Ouvrir ensuite
     let vault = Vault::open(dir.path()).await.unwrap();
 
-    assert_eq!(vault.tenant_id().as_str(), "main");
+    assert_eq!(vault.vault_id().as_str(), "main");
     assert_eq!(vault.root(), dir.path());
 }
 
@@ -104,5 +104,5 @@ async fn open_defaults_tenant_to_main_when_no_config() {
 
     // Ouvrir : le default_tenant_id absent dans config.toml → "main"
     let vault = Vault::open(dir.path()).await.unwrap();
-    assert_eq!(vault.tenant_id().as_str(), "main");
+    assert_eq!(vault.vault_id().as_str(), "main");
 }

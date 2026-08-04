@@ -14,7 +14,7 @@
 
 | Track | Window | Cadence | Stability promise |
 |---|---|---|---|
-| `0.x` | Until `1.0` | Frequent (weekly possible) | **No stability promise on public APIs.** Breaking changes require an RFC and a `CHANGELOG.md` entry. Minimum 6 months of `0.x` before `1.0`. |
+| `0.x` | Until `1.0` | Frequent (weekly possible) | **No stability promise on public APIs.** Breaking changes require an RFC and a `CHANGELOG.md` entry. **1.0 ships when the D5 maturity criteria are met** (see *Public-release criterion* below), not on a fixed calendar. |
 | `1.x` LTS | After `1.0` | Quarterly minor; security patches monthly | SemVer strict. Backward-compatible additions only. Trait-stability tiers apply (see AM1). |
 | `1.x` main | After `1.0` | Continuous | New features land here first. Breaking changes accumulate for the next major. |
 | `2.x+` codenames | When triggered (see below) | Codename per major | Codenames are mnemonic, not marketing. They are issued only when an objective release-signal fires. |
@@ -25,7 +25,10 @@
 
 A codename is assigned only when at least one of the following objective signals fires:
 
-- A schema migration that requires `gradatum-admin migrate --from=N --to=N+1`.
+- A schema migration that is not backward-compatible with the previous on-disk index.
+  (Migrations are applied automatically at startup by the embedded runner, which tracks
+  applied revisions in the `_schema_migrations` table — there is no operator-run
+  `migrate` subcommand, so the signal is the incompatible migration itself.)
 - A breaking change in a `gradatum-core` *stable* trait (see AM1).
 - A removal of a public crate from the umbrella SDK.
 - A change in the default LLM contract (chat or embed).
@@ -40,7 +43,7 @@ Four invariants protect the project from over-coupling and from "AI cannot repli
 
 ### AM1 — Trait stability tiers
 
-Every public trait in `gradatum-core` is tagged with one of three tiers in its rustdoc:
+Three tiers are defined for public traits in `gradatum-core`:
 
 | Tier | Promise |
 |---|---|
@@ -48,46 +51,59 @@ Every public trait in `gradatum-core` is tagged with one of three tiers in its r
 | `#[stability::unstable]` | May change between minors. Documented in `CHANGELOG.md`. |
 | `#[stability::experimental]` | May change between patches. Used only behind a `unstable-` feature flag. |
 
-The CI enforces tier consistency via `cargo public-api` + `cargo semver-checks`.
+**No tier is actually applied in `1.0.0`.** None of the 14 public traits in `gradatum-core`
+carries a `stability::` attribute — the five occurrences in `src/` are rustdoc prose, two of
+which state the attribute is deferred pending an `unstable-storage-traits` feature. Since no
+tier is posted, there is nothing for CI to cross-check: `cargo public-api` and
+`cargo semver-checks` run against the whole surface uniformly, and every public trait is
+treated as SemVer-strict by default. Tagging the traits is planned for a `1.x` minor.
 
 **Detailed rules, decision matrix, deprecation cycles, and examples:** see [`docs/RFC/RFC-0001-versioning-gradatum-core.md`](docs/RFC/RFC-0001-versioning-gradatum-core.md).
 
-### AM2 — Contractual testkit
+### AM2 — Contractual testkit *(planned, not shipped in 1.0.0)*
 
-`gradatum-core` ships a `testkit` feature exposing trait-conformance tests. Any downstream impl must run them in CI:
+`gradatum-core` does not yet ship a `testkit` feature. Trait-conformance tests are planned for a
+future minor; until then, downstream impls are validated against the trait signatures only.
+The crate's only feature is `test-utils`, which exposes `InMemorySink` for consumer tests — it
+carries no conformance macro.
 
-```rust
-#[cfg(test)]
-mod conformance {
-    use gradatum_core::testkit::*;
-    chat_conformance!(MyChatImpl);
-}
-```
+**Planned testkit scope and CI integration:** see [`docs/RFC/RFC-0001-versioning-gradatum-core.md`](docs/RFC/RFC-0001-versioning-gradatum-core.md) §8.
 
-Failing the testkit blocks publishing the impl.
+### AM3 — Crates.io namespace
 
-**Testkit macro signatures, conformance scope, and CI integration:** see [`docs/RFC/RFC-0001-versioning-gradatum-core.md`](docs/RFC/RFC-0001-versioning-gradatum-core.md) §8.
+The names in scope for this namespace are the crates this workspace publishes, plus
+`gradatum-cli` (see the caveats below):
 
-### AM3 — Crates.io name squatting
+- `gradatum`, `gradatum-acl-auth`, `gradatum-acl-policy`, `gradatum-admin`,
+  `gradatum-auth`, `gradatum-cache`, `gradatum-chat`, `gradatum-cli`,
+  `gradatum-core`, `gradatum-curator`, `gradatum-db-sqlite`, `gradatum-dto`,
+  `gradatum-embed`, `gradatum-engine`, `gradatum-gateway`, `gradatum-index`,
+  `gradatum-ingest`, `gradatum-markdown`, `gradatum-mcp-stub`, `gradatum-queue`,
+  `gradatum-sdk-rs`, `gradatum-search`, `gradatum-server`, `gradatum-storage`,
+  `gradatum-studio`, `gradatum-vault`, `gradatum-warden`, `gradatum-worker`.
 
-Reserved crate names on crates.io (`cargo publish` with empty stub):
+Two caveats apply to that list:
 
-- `gradatum`, `gradatum-core`, `gradatum-markdown`, `gradatum-vault`,
-  `gradatum-storage`, `gradatum-cache`, `gradatum-index`, `gradatum-search`,
-  `gradatum-queue`, `gradatum-acl-policy`, `gradatum-acl-auth`, `gradatum-auth`,
-  `gradatum-chat`, `gradatum-curator`, `gradatum-embed`, `gradatum-engine`,
-  `gradatum-server`, `gradatum-worker`, `gradatum-admin`, `gradatum-cli`,
-  `gradatum-mcp-stub`, `gradatum-sdk-rs`.
+- `gradatum-cli` is **no longer published from this workspace** — it carries
+  `publish = false`. The name stays reserved and its last published version remains on
+  crates.io; the crate is not part of the release train.
+- `gradatum-studio` is published only as a `0.0.2` placeholder. The real crate is built and
+  served from this workspace but has not yet been released to crates.io.
 
-Reservation happens at the same time the public release is announced.
+Publishing an entirely new crate name is a structural change and requires an RFC
+(see [`GOVERNANCE.md`](GOVERNANCE.md)).
 
 ### AM4 — "AI bus factor = 0"
 
 Every contribution must be reproducible by a human reviewer **without** any AI assistant. This is enforced by:
 
-- PR template asks "Have you read every line of the diff?" — required checkbox.
 - Maintainers reject PRs that contain output the contributor cannot explain in plain English.
-- All RFCs include a `Drawbacks` section authored without AI assistance.
+- All RFCs include a `Drawbacks` section authored without AI assistance
+  (see [`RFC-TEMPLATE.md`](RFC-TEMPLATE.md) §6).
+
+A repository PR template carrying a "Have you read every line of the diff?" checkbox is
+**planned, not shipped**: `.github/` currently holds workflows only. Until it lands, AM4 is
+enforced by maintainer review, not by tooling.
 
 The point is not to ban AI use; it is to ensure the project survives the AI assistant being unavailable.
 
@@ -112,9 +128,9 @@ The repository may be made public **before `v1.0.0`** at the maintainer's discre
 
 | Status | Meaning |
 |---|---|
-| **Alpha** | Active development; no compatibility guarantee; APIs change without notice. **Current state.** |
+| **Alpha** | Active development; no compatibility guarantee; APIs change without notice. |
 | **Beta** | Functional parity with the predecessor v1.6.2 reached; APIs stabilising; breaking changes still possible per `0.x` policy. |
-| **Stable v1.0** | Public release. SemVer strict. LTS branch cut. |
+| **Stable v1.0** | Public release. SemVer strict. |
 
 ---
 

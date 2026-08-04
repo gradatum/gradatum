@@ -405,11 +405,17 @@ mod tests {
         CircuitConfig {
             failure_threshold: 5,
             failure_window: Duration::from_secs(60),
+            // Cooldowns en SECONDES, pas en millisecondes (anti-flake, 2026-07-29).
+            // Le franchissement d'un cooldown est piloté par `advance_test_clock`
+            // (horloge logique) ; le NON-franchissement dépend, lui, du wall-clock
+            // réel écoulé entre `trip_open()` et l'assertion. Avec 50 ms cette marge
+            // était franchie sous instrumentation `llvm-cov` + tests parallèles du
+            // même binaire. Rapport 1:2:4:8 conservé : backoff inchangé.
             open_durations: vec![
-                Duration::from_millis(50),
-                Duration::from_millis(100),
-                Duration::from_millis(200),
-                Duration::from_millis(400),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+                Duration::from_secs(40),
             ],
             success_threshold: 2,
         }
@@ -485,8 +491,8 @@ mod tests {
         }
         assert!(cb.is_open(), "circuit doit être ouvert");
 
-        // Avancer l'horloge logique au-delà du timeout (50ms) — déterministe (D2.3)
-        cb.advance_test_clock(100);
+        // Avancer l'horloge logique au-delà du timeout (5s) — déterministe (D2.3)
+        cb.advance_test_clock(10_000);
 
         assert!(
             !cb.is_open(),
@@ -503,7 +509,8 @@ mod tests {
         let cfg = CircuitConfig {
             failure_threshold: 5,
             failure_window: Duration::from_secs(60),
-            open_durations: vec![Duration::from_millis(50)],
+            // Cooldown en secondes — cf. note anti-flake dans `default_config_short_window()`.
+            open_durations: vec![Duration::from_secs(5)],
             success_threshold: 2,
         };
         let cb = CircuitBreaker::new(
@@ -521,8 +528,8 @@ mod tests {
         }
         assert!(cb.is_open());
 
-        // Avancer l'horloge au-delà du cooldown (50ms) → HalfOpen — déterministe (D2.3)
-        cb.advance_test_clock(100);
+        // Avancer l'horloge au-delà du cooldown (5s) → HalfOpen — déterministe (D2.3)
+        cb.advance_test_clock(10_000);
         assert!(cb.is_half_open());
 
         // 2 succès → Closed
@@ -541,28 +548,29 @@ mod tests {
         let cfg = CircuitConfig {
             failure_threshold: 5,
             failure_window: Duration::from_secs(60),
+            // Cooldowns en secondes — cf. note anti-flake ci-dessus.
             open_durations: vec![
-                Duration::from_millis(50),
-                Duration::from_millis(100),
-                Duration::from_millis(200),
-                Duration::from_millis(400),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+                Duration::from_secs(40),
             ],
             success_threshold: 2,
         };
         let cb = CircuitBreaker::new(AlwaysFail, Arc::new(HeuristicBackend), cfg);
 
-        // 1ère ouverture (50ms)
+        // 1ère ouverture (5s)
         for _ in 0..5 {
             let _ = cb.classify(S, U).await;
         }
         let first_open_count = cb.open_count.load(Ordering::Relaxed);
         assert_eq!(first_open_count, 1, "première ouverture");
 
-        // Avancer l'horloge au-delà du cooldown (50ms) → HalfOpen — déterministe (D2.3)
-        cb.advance_test_clock(100);
+        // Avancer l'horloge au-delà du cooldown (5s) → HalfOpen — déterministe (D2.3)
+        cb.advance_test_clock(10_000);
         assert!(cb.is_half_open());
 
-        // Re-trip en HalfOpen → 2ème ouverture (100ms)
+        // Re-trip en HalfOpen → 2ème ouverture (10s)
         let _ = cb.classify(S, U).await;
         let second_open_count = cb.open_count.load(Ordering::Relaxed);
         assert!(

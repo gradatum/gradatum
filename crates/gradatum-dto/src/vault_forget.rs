@@ -28,7 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::default_main;
+use gradatum_core::scope::TenantId;
 
 /// Maximum byte length of the `forgotten_by` actor field.
 ///
@@ -127,9 +127,11 @@ pub struct VaultForgetRequest {
     /// Any discrepancy (addition, omission, different order) → **400 Bad Request**.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub confirm_ulids: Vec<String>,
-    /// Target tenant (default `"main"`).
-    #[serde(default = "default_main")]
-    pub tenant_id: String,
+    /// Target tenant (principal) — optional; when omitted the server resolves it
+    /// from the credential identity (JWT/API-key), never `"main"` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub tenant_id: Option<TenantId>,
 }
 
 fn default_true() -> bool {
@@ -234,7 +236,7 @@ mod tests {
             .expect("désérialisation VaultForgetRequest scope topic minimal");
         assert!(req.dry_run, "dry_run doit être true par défaut");
         assert!(req.confirm_ulids.is_empty());
-        assert_eq!(req.tenant_id, "main");
+        assert_eq!(req.tenant_id, None);
     }
 
     #[test]

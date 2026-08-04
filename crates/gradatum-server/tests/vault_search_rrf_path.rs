@@ -212,7 +212,7 @@ async fn rrf_path_semantic_only_note_returned() {
     emb_a[1] = 1.0;
     state
         .search
-        .insert_note_embedding(&nid_a, "fixed-test", 8, &emb_a)
+        .insert_note_embedding("main", &nid_a, "fixed-test", 8, &emb_a)
         .await
         .expect("insert emb A");
 
@@ -224,7 +224,7 @@ async fn rrf_path_semantic_only_note_returned() {
     let nid_b = NoteId(Ulid::from_string(&id_b).unwrap());
     state
         .search
-        .insert_note_embedding(&nid_b, "fixed-test", 8, &q)
+        .insert_note_embedding("main", &nid_b, "fixed-test", 8, &q)
         .await
         .expect("insert emb B");
 
@@ -279,12 +279,12 @@ async fn rrf_path_preserves_title_and_snippet_after_fusion() {
     // upsert_note_title : méthode DocumentStore (trait production) → accessible via state.search.
     state
         .search
-        .upsert_note_title(&nid, "RRF Title preservation")
+        .upsert_note_title("main", &nid, "RRF Title preservation")
         .await
         .expect("upsert title");
     state
         .search
-        .insert_note_embedding(&nid, "fixed-test", 8, &q)
+        .insert_note_embedding("main", &nid, "fixed-test", 8, &q)
         .await
         .expect("insert emb");
 
@@ -338,7 +338,7 @@ async fn rrf_path_semantic_only_hit_enriched_title_section() {
     emb_a[1] = 1.0; // orthogonal à q=[1,0,...] → faible cosine
     state
         .search
-        .insert_note_embedding(&nid_a, "fixed-test", 8, &emb_a)
+        .insert_note_embedding("main", &nid_a, "fixed-test", 8, &emb_a)
         .await
         .expect("insert emb A");
 
@@ -350,12 +350,12 @@ async fn rrf_path_semantic_only_hit_enriched_title_section() {
     let nid_b = NoteId(Ulid::from_string(&id_b).unwrap());
     state
         .search
-        .upsert_note_title(&nid_b, "Titre enrichissement sémantique")
+        .upsert_note_title("main", &nid_b, "Titre enrichissement sémantique")
         .await
         .expect("upsert title B");
     state
         .search
-        .insert_note_embedding(&nid_b, "fixed-test", 8, &q) // aligné → cosine=1
+        .insert_note_embedding("main", &nid_b, "fixed-test", 8, &q) // aligné → cosine=1
         .await
         .expect("insert emb B");
 
@@ -422,7 +422,7 @@ async fn rrf_path_score_within_expected_range_k60() {
     let nid = NoteId(Ulid::from_string(&id).unwrap());
     state
         .search
-        .insert_note_embedding(&nid, "fixed-test", 8, &q)
+        .insert_note_embedding("main", &nid, "fixed-test", 8, &q)
         .await
         .expect("insert emb");
 

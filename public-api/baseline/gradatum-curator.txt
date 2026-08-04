@@ -1,0 +1,241 @@
+pub mod gradatum_curator
+pub use gradatum_curator::extract_h1_title
+pub mod gradatum_curator::audit
+#[non_exhaustive] pub enum gradatum_curator::audit::AuditTier
+pub gradatum_curator::audit::AuditTier::Delete
+pub gradatum_curator::audit::AuditTier::Review
+#[non_exhaustive] pub enum gradatum_curator::audit::DedupCategory
+pub gradatum_curator::audit::DedupCategory::ExactDuplicate
+pub gradatum_curator::audit::DedupCategory::NearDuplicate
+pub gradatum_curator::audit::DedupCategory::SemanticDuplicate
+pub gradatum_curator::audit::DedupCategory::StructuralJunk
+pub gradatum_curator::audit::DedupCategory::TitleCollision
+pub struct gradatum_curator::audit::AuditCandidate
+pub gradatum_curator::audit::AuditCandidate::category: gradatum_curator::audit::DedupCategory
+pub gradatum_curator::audit::AuditCandidate::confidence: f32
+pub gradatum_curator::audit::AuditCandidate::note_id: alloc::string::String
+pub gradatum_curator::audit::AuditCandidate::section: alloc::string::String
+pub gradatum_curator::audit::AuditCandidate::signals: alloc::vec::Vec<alloc::string::String>
+pub gradatum_curator::audit::AuditCandidate::survivor_id: core::option::Option<alloc::string::String>
+pub gradatum_curator::audit::AuditCandidate::tier: gradatum_curator::audit::AuditTier
+pub gradatum_curator::audit::AuditCandidate::title: alloc::string::String
+pub struct gradatum_curator::audit::AuditRecord
+pub gradatum_curator::audit::AuditRecord::author_id: core::option::Option<alloc::string::String>
+pub gradatum_curator::audit::AuditRecord::body: alloc::string::String
+pub gradatum_curator::audit::AuditRecord::embedder_id: core::option::Option<alloc::string::String>
+pub gradatum_curator::audit::AuditRecord::embedding: core::option::Option<alloc::vec::Vec<f32>>
+pub gradatum_curator::audit::AuditRecord::id: alloc::string::String
+pub gradatum_curator::audit::AuditRecord::section: alloc::string::String
+pub gradatum_curator::audit::AuditRecord::title: alloc::string::String
+pub struct gradatum_curator::audit::AuditReport
+pub gradatum_curator::audit::AuditReport::candidates: alloc::vec::Vec<gradatum_curator::audit::AuditCandidate>
+pub gradatum_curator::audit::AuditReport::counts_by_category: alloc::collections::btree::map::BTreeMap<alloc::string::String, usize>
+pub gradatum_curator::audit::AuditReport::counts_by_tier: alloc::collections::btree::map::BTreeMap<alloc::string::String, usize>
+pub gradatum_curator::audit::AuditReport::downgrade_actions: alloc::vec::Vec<gradatum_curator::audit::DowngradeAction>
+pub gradatum_curator::audit::AuditReport::downgrade_enabled: bool
+pub gradatum_curator::audit::AuditReport::downgrade_window_covered: bool
+pub gradatum_curator::audit::AuditReport::generated_at_ms: i64
+pub gradatum_curator::audit::AuditReport::irrelevant: alloc::vec::Vec<gradatum_curator::audit::IrrelevantCandidate>
+pub gradatum_curator::audit::AuditReport::scanned: usize
+pub gradatum_curator::audit::AuditReport::vault_id: alloc::string::String
+pub struct gradatum_curator::audit::AuditThresholds
+pub gradatum_curator::audit::AuditThresholds::cosine_review: f32
+pub gradatum_curator::audit::AuditThresholds::cosine_strong: f32
+pub gradatum_curator::audit::AuditThresholds::jaccard_strong: f32
+pub gradatum_curator::audit::AuditThresholds::min_probe_bytes: usize
+pub gradatum_curator::audit::AuditThresholds::semantic_jaccard_floor: f32
+pub gradatum_curator::audit::AuditThresholds::shingle_k: usize
+impl core::default::Default for gradatum_curator::audit::AuditThresholds
+pub fn gradatum_curator::audit::AuditThresholds::default() -> Self
+pub struct gradatum_curator::audit::DowngradeAction
+pub gradatum_curator::audit::DowngradeAction::note_id: alloc::string::String
+pub gradatum_curator::audit::DowngradeAction::outcome: alloc::string::String
+pub gradatum_curator::audit::DowngradeAction::reason: alloc::string::String
+pub gradatum_curator::audit::DowngradeAction::title: alloc::string::String
+pub struct gradatum_curator::audit::IrrelevanceInput
+pub gradatum_curator::audit::IrrelevanceInput::created_ms: i64
+pub gradatum_curator::audit::IrrelevanceInput::last_used_ms: core::option::Option<i64>
+pub gradatum_curator::audit::IrrelevanceInput::note_id: alloc::string::String
+pub gradatum_curator::audit::IrrelevanceInput::section: alloc::string::String
+pub gradatum_curator::audit::IrrelevanceInput::status: alloc::string::String
+pub gradatum_curator::audit::IrrelevanceInput::title: alloc::string::String
+pub gradatum_curator::audit::IrrelevanceInput::trust: core::option::Option<f64>
+pub struct gradatum_curator::audit::IrrelevanceThresholds
+pub gradatum_curator::audit::IrrelevanceThresholds::age_min_days: u32
+pub gradatum_curator::audit::IrrelevanceThresholds::trust_max: f64
+pub gradatum_curator::audit::IrrelevanceThresholds::usage_window_days: u32
+impl core::default::Default for gradatum_curator::audit::IrrelevanceThresholds
+pub fn gradatum_curator::audit::IrrelevanceThresholds::default() -> Self
+pub struct gradatum_curator::audit::IrrelevantCandidate
+pub gradatum_curator::audit::IrrelevantCandidate::actionable: bool
+pub gradatum_curator::audit::IrrelevantCandidate::note_id: alloc::string::String
+pub gradatum_curator::audit::IrrelevantCandidate::reason: alloc::string::String
+pub gradatum_curator::audit::IrrelevantCandidate::section: alloc::string::String
+pub gradatum_curator::audit::IrrelevantCandidate::title: alloc::string::String
+pub fn gradatum_curator::audit::build_report(&str, i64, usize, alloc::vec::Vec<gradatum_curator::audit::AuditCandidate>, alloc::vec::Vec<gradatum_curator::audit::IrrelevantCandidate>) -> gradatum_curator::audit::AuditReport
+pub fn gradatum_curator::audit::detect(&[gradatum_curator::audit::AuditRecord], &gradatum_curator::audit::AuditThresholds) -> alloc::vec::Vec<gradatum_curator::audit::AuditCandidate>
+pub fn gradatum_curator::audit::detect_irrelevant(&[gradatum_curator::audit::IrrelevanceInput], &gradatum_curator::audit::IrrelevanceThresholds, &[&str], core::option::Option<i64>, i64) -> alloc::vec::Vec<gradatum_curator::audit::IrrelevantCandidate>
+pub fn gradatum_curator::audit::render_admin_commands(&gradatum_curator::audit::AuditReport) -> alloc::string::String
+pub fn gradatum_curator::audit::render_markdown(&gradatum_curator::audit::AuditReport) -> alloc::string::String
+pub fn gradatum_curator::audit::window_covered(core::option::Option<i64>, i64, u32) -> bool
+pub mod gradatum_curator::decision
+pub enum gradatum_curator::decision::FallbackStrategy
+pub gradatum_curator::decision::FallbackStrategy::AdmitPendingReview
+pub gradatum_curator::decision::FallbackStrategy::PendingReviewFallback
+pub gradatum_curator::decision::FallbackStrategy::Reject
+impl gradatum_curator::decision::FallbackStrategy
+pub fn gradatum_curator::decision::FallbackStrategy::from_config(&str) -> Self
+pub struct gradatum_curator::decision::CuratorDecision
+pub gradatum_curator::decision::CuratorDecision::backend_used: gradatum_chat::chat_trait::ChatBackend
+pub gradatum_curator::decision::CuratorDecision::confidence: f32
+pub gradatum_curator::decision::CuratorDecision::fallback_applied: bool
+pub gradatum_curator::decision::CuratorDecision::final_status: gradatum_core::status::NoteStatus
+pub gradatum_curator::decision::CuratorDecision::reason: alloc::string::String
+pub mod gradatum_curator::dedup
+pub enum gradatum_curator::dedup::DedupVerdict
+pub gradatum_curator::dedup::DedupVerdict::DuplicateOf(alloc::string::String, f32)
+pub gradatum_curator::dedup::DedupVerdict::NeedsReview(alloc::string::String, f32)
+pub gradatum_curator::dedup::DedupVerdict::Unique
+pub const gradatum_curator::dedup::DEDUP_THRESHOLD: f32
+pub const gradatum_curator::dedup::REVIEW_LOWER: f32
+pub fn gradatum_curator::dedup::assess(&[f32], &[(alloc::string::String, alloc::vec::Vec<f32>)]) -> gradatum_curator::dedup::DedupVerdict
+pub fn gradatum_curator::dedup::cosine(&[f32], &[f32]) -> f32
+pub mod gradatum_curator::error
+pub enum gradatum_curator::error::CuratorError
+pub gradatum_curator::error::CuratorError::Chat(gradatum_chat::error::ChatError)
+pub mod gradatum_curator::novelty
+pub enum gradatum_curator::novelty::NoveltyVerdict
+pub gradatum_curator::novelty::NoveltyVerdict::Admitted
+pub gradatum_curator::novelty::NoveltyVerdict::Duplicate
+pub gradatum_curator::novelty::NoveltyVerdict::Duplicate::existing_id: alloc::string::String
+pub gradatum_curator::novelty::NoveltyVerdict::Duplicate::similarity: f32
+pub gradatum_curator::novelty::NoveltyVerdict::RevisionOf
+pub gradatum_curator::novelty::NoveltyVerdict::RevisionOf::existing_id: alloc::string::String
+pub gradatum_curator::novelty::NoveltyVerdict::RevisionOf::similarity: f32
+pub const gradatum_curator::novelty::NOVELTY_THRESHOLD: f32
+pub const gradatum_curator::novelty::REVISION_THRESHOLD: f32
+pub fn gradatum_curator::novelty::assess_novelty(&[u64], &[(alloc::string::String, alloc::vec::Vec<u64>)]) -> gradatum_curator::novelty::NoveltyVerdict
+pub fn gradatum_curator::novelty::content_hash(&str) -> alloc::string::String
+pub fn gradatum_curator::novelty::jaccard_estimate(&[u64], &[u64]) -> f32
+pub fn gradatum_curator::novelty::minhash_signature(&[u64], usize) -> alloc::vec::Vec<u64>
+pub fn gradatum_curator::novelty::shingles(&str, usize) -> alloc::vec::Vec<u64>
+pub mod gradatum_curator::routing
+pub struct gradatum_curator::routing::LlmRoutingResponse
+pub gradatum_curator::routing::LlmRoutingResponse::duplicate_hint: core::option::Option<alloc::string::String>
+pub gradatum_curator::routing::LlmRoutingResponse::section: alloc::string::String
+pub gradatum_curator::routing::LlmRoutingResponse::tags: alloc::vec::Vec<alloc::string::String>
+pub gradatum_curator::routing::LlmRoutingResponse::wikilinks: alloc::vec::Vec<alloc::string::String>
+impl gradatum_curator::routing::LlmRoutingResponse
+pub fn gradatum_curator::routing::LlmRoutingResponse::into_curator_decision(self) -> gradatum_chat::backend::CuratorDecision
+pub const gradatum_curator::routing::SECTIONS: &[&str]
+pub fn gradatum_curator::routing::heuristic_route(&str, &str) -> (&'static str, f32)
+pub fn gradatum_curator::routing::is_valid_hint_section(&str) -> bool
+pub mod gradatum_curator::tags
+pub const gradatum_curator::tags::MAX_TAGS: usize
+pub const gradatum_curator::tags::MIN_IDF: f32
+pub const gradatum_curator::tags::MIN_TF: usize
+pub fn gradatum_curator::tags::extract_tags(&str, &std::collections::hash::map::HashMap<alloc::string::String, f32>) -> alloc::vec::Vec<alloc::string::String>
+pub mod gradatum_curator::wikilinks
+pub enum gradatum_curator::wikilinks::WikilinkResolution
+pub gradatum_curator::wikilinks::WikilinkResolution::Fuzzy(alloc::string::String, f64)
+pub gradatum_curator::wikilinks::WikilinkResolution::Resolved(alloc::string::String)
+pub gradatum_curator::wikilinks::WikilinkResolution::Unresolved(alloc::string::String)
+pub const gradatum_curator::wikilinks::FUZZY_THRESHOLD: f64
+pub fn gradatum_curator::wikilinks::extract_wikilinks(&str) -> alloc::vec::Vec<alloc::string::String>
+pub fn gradatum_curator::wikilinks::parse_ulid_target(&str) -> core::option::Option<ulid::Ulid>
+pub fn gradatum_curator::wikilinks::resolve(&str, &[(alloc::string::String, alloc::string::String)]) -> gradatum_curator::wikilinks::WikilinkResolution
+pub mod gradatum_curator::wikilinks_sync
+pub fn gradatum_curator::wikilinks_sync::resolve_wikilinks_sync(&str, &str, &str, impl core::ops::function::FnMut(&str, &str) -> core::option::Option<alloc::string::String>, impl core::ops::function::FnMut(&str, &str) -> core::option::Option<alloc::string::String>) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
+pub mod gradatum_curator::workflow
+pub struct gradatum_curator::workflow::Curator<C: gradatum_chat::chat_trait::Chat>
+pub gradatum_curator::workflow::Curator::cfg: gradatum_core::config::CuratorConfig
+pub gradatum_curator::workflow::Curator::heuristic: gradatum_chat::heuristic::Heuristic
+pub gradatum_curator::workflow::Curator::llm: core::option::Option<alloc::sync::Arc<C>>
+impl<C: gradatum_chat::chat_trait::Chat> gradatum_curator::workflow::Curator<C>
+pub async fn gradatum_curator::workflow::Curator<C>::decide(&self, &gradatum_core::note::Note, &gradatum_chat::chat_trait::CuratorContext) -> gradatum_curator::decision::CuratorDecision
+pub fn gradatum_curator::workflow::Curator<C>::new(gradatum_chat::heuristic::Heuristic, core::option::Option<alloc::sync::Arc<C>>, gradatum_core::config::CuratorConfig) -> Self
+pub enum gradatum_curator::CurateOutcome
+pub gradatum_curator::CurateOutcome::Admitted
+pub gradatum_curator::CurateOutcome::Admitted::decisions: gradatum_curator::CuratorDecisions
+pub gradatum_curator::CurateOutcome::Pending
+pub gradatum_curator::CurateOutcome::Pending::decisions: gradatum_curator::CuratorDecisions
+pub gradatum_curator::CurateOutcome::Pending::reason: alloc::string::String
+pub gradatum_curator::CurateOutcome::Rejected
+pub gradatum_curator::CurateOutcome::Rejected::reason: alloc::string::String
+pub enum gradatum_curator::CurationPath
+pub gradatum_curator::CurationPath::FastAdmit
+pub gradatum_curator::CurationPath::HintBypass
+pub gradatum_curator::CurationPath::LlmReview
+pub gradatum_curator::CurationPath::PendingBand
+impl gradatum_curator::CurationPath
+pub fn gradatum_curator::CurationPath::as_str(&self) -> &'static str
+pub enum gradatum_curator::CuratorError
+pub gradatum_curator::CuratorError::Chat(gradatum_chat::error::ChatError)
+pub enum gradatum_curator::FallbackStrategy
+pub gradatum_curator::FallbackStrategy::AdmitPendingReview
+pub gradatum_curator::FallbackStrategy::PendingReviewFallback
+pub gradatum_curator::FallbackStrategy::Reject
+impl gradatum_curator::decision::FallbackStrategy
+pub fn gradatum_curator::decision::FallbackStrategy::from_config(&str) -> Self
+pub struct gradatum_curator::Curator<C: gradatum_chat::chat_trait::Chat>
+pub gradatum_curator::Curator::cfg: gradatum_core::config::CuratorConfig
+pub gradatum_curator::Curator::heuristic: gradatum_chat::heuristic::Heuristic
+pub gradatum_curator::Curator::llm: core::option::Option<alloc::sync::Arc<C>>
+impl<C: gradatum_chat::chat_trait::Chat> gradatum_curator::workflow::Curator<C>
+pub async fn gradatum_curator::workflow::Curator<C>::decide(&self, &gradatum_core::note::Note, &gradatum_chat::chat_trait::CuratorContext) -> gradatum_curator::decision::CuratorDecision
+pub fn gradatum_curator::workflow::Curator<C>::new(gradatum_chat::heuristic::Heuristic, core::option::Option<alloc::sync::Arc<C>>, gradatum_core::config::CuratorConfig) -> Self
+pub struct gradatum_curator::CuratorDecision
+pub gradatum_curator::CuratorDecision::backend_used: gradatum_chat::chat_trait::ChatBackend
+pub gradatum_curator::CuratorDecision::confidence: f32
+pub gradatum_curator::CuratorDecision::fallback_applied: bool
+pub gradatum_curator::CuratorDecision::final_status: gradatum_core::status::NoteStatus
+pub gradatum_curator::CuratorDecision::reason: alloc::string::String
+pub struct gradatum_curator::CuratorDecisions
+pub gradatum_curator::CuratorDecisions::canonical_section: alloc::string::String
+pub gradatum_curator::CuratorDecisions::dedup: gradatum_curator::dedup::DedupVerdict
+pub gradatum_curator::CuratorDecisions::novelty: gradatum_curator::novelty::NoveltyVerdict
+pub gradatum_curator::CuratorDecisions::tags: alloc::vec::Vec<alloc::string::String>
+pub gradatum_curator::CuratorDecisions::wikilinks: alloc::vec::Vec<gradatum_curator::wikilinks::WikilinkResolution>
+pub struct gradatum_curator::CuratorLlmConfig
+pub gradatum_curator::CuratorLlmConfig::api_key_env: core::option::Option<alloc::string::String>
+pub gradatum_curator::CuratorLlmConfig::backend: alloc::string::String
+pub gradatum_curator::CuratorLlmConfig::base_url: alloc::string::String
+pub gradatum_curator::CuratorLlmConfig::model: alloc::string::String
+pub gradatum_curator::CuratorLlmConfig::timeout_ms: u64
+pub struct gradatum_curator::CuratorPipeline
+impl gradatum_curator::CuratorPipeline
+pub fn gradatum_curator::CuratorPipeline::from_config(&gradatum_curator::CuratorPipelineConfig) -> Self
+pub fn gradatum_curator::CuratorPipeline::heuristic() -> Self
+pub fn gradatum_curator::CuratorPipeline::new() -> Self
+pub async fn gradatum_curator::CuratorPipeline::process(&self, gradatum_curator::Note) -> gradatum_curator::CurateOutcome
+pub async fn gradatum_curator::CuratorPipeline::process_traced(&self, gradatum_curator::Note) -> (gradatum_curator::CurateOutcome, gradatum_curator::CurationPath)
+impl core::default::Default for gradatum_curator::CuratorPipeline
+pub fn gradatum_curator::CuratorPipeline::default() -> Self
+impl gradatum_curator::CuratorProcess for gradatum_curator::CuratorPipeline
+pub fn gradatum_curator::CuratorPipeline::process<'life0, 'async_trait>(&'life0 self, gradatum_curator::Note) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = gradatum_curator::CurateOutcome> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_curator::CuratorPipeline::process_traced<'life0, 'async_trait>(&'life0 self, gradatum_curator::Note) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = (gradatum_curator::CurateOutcome, gradatum_curator::CurationPath)> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub struct gradatum_curator::CuratorPipelineConfig
+pub gradatum_curator::CuratorPipelineConfig::backend: alloc::string::String
+pub gradatum_curator::CuratorPipelineConfig::confidence_threshold: core::option::Option<f32>
+pub gradatum_curator::CuratorPipelineConfig::heuristic_admit_threshold: core::option::Option<f32>
+pub gradatum_curator::CuratorPipelineConfig::heuristic_default_status: core::option::Option<alloc::string::String>
+pub gradatum_curator::CuratorPipelineConfig::llm: core::option::Option<gradatum_curator::CuratorLlmConfig>
+pub gradatum_curator::CuratorPipelineConfig::llm_review_enabled: core::option::Option<bool>
+pub gradatum_curator::CuratorPipelineConfig::llm_review_fallback: core::option::Option<alloc::string::String>
+pub gradatum_curator::CuratorPipelineConfig::llm_review_max_tokens: core::option::Option<u32>
+pub struct gradatum_curator::Note
+pub gradatum_curator::Note::body: alloc::string::String
+pub gradatum_curator::Note::id: alloc::string::String
+pub gradatum_curator::Note::section_hint: core::option::Option<alloc::string::String>
+pub gradatum_curator::Note::tags_hint: alloc::vec::Vec<alloc::string::String>
+pub gradatum_curator::Note::title: alloc::string::String
+pub const gradatum_curator::CLASSIFIER_SYSTEM_PROMPT: &str
+pub const gradatum_curator::VERSION: &str
+pub trait gradatum_curator::CuratorProcess: core::marker::Send + core::marker::Sync
+pub fn gradatum_curator::CuratorProcess::process<'life0, 'async_trait>(&'life0 self, gradatum_curator::Note) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = gradatum_curator::CurateOutcome> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_curator::CuratorProcess::process_traced<'life0, 'async_trait>(&'life0 self, gradatum_curator::Note) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = (gradatum_curator::CurateOutcome, gradatum_curator::CurationPath)> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+impl gradatum_curator::CuratorProcess for gradatum_curator::CuratorPipeline
+pub fn gradatum_curator::CuratorPipeline::process<'life0, 'async_trait>(&'life0 self, gradatum_curator::Note) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = gradatum_curator::CurateOutcome> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_curator::CuratorPipeline::process_traced<'life0, 'async_trait>(&'life0 self, gradatum_curator::Note) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = (gradatum_curator::CurateOutcome, gradatum_curator::CurationPath)> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn gradatum_curator::outcome_label(&gradatum_curator::CurateOutcome) -> &'static str
+pub fn gradatum_curator::outcome_to_status(&gradatum_curator::CurateOutcome) -> core::option::Option<gradatum_core::status::NoteStatus>

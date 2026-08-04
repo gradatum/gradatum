@@ -59,7 +59,6 @@ export function deriveHistogramAvg(
  * Famille counter/gauge → 1 ChartSpec, 1 LineSpec/clé (label = suffixe).
  * Paires histogramme `<fam>_sum.<lbl>` + `<fam>_count.<lbl>` → 1 LineSpec hist_avg.
  *
- * CORRECTION P1-A (Auditeur 2026-06-29) :
  * stripSuffix ET labelOf doivent retirer le token _sum/_count AVANT le lastIndexOf('.')
  * pour que les histogrammes label-less (http.duration_sum/_count) appairent correctement.
  */

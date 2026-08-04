@@ -1,0 +1,28 @@
+# gradatum engine configuration — embeddings (CPU)
+#
+# gradatum-engine adds --embedding automatically when model_kind = "embed".
+#
+# Convention: /etc/gradatum/conf.d/70-engine-<name>.toml
+# Full field reference: docs/DEPLOYMENT.md §4
+
+[engine]
+# ── Required ──────────────────────────────────────────────────────────────────
+model_path    = "/opt/gradatum/models/<embed-model-name>.gguf"
+model_kind    = "embed"
+port          = 11437
+
+# ── Child process ─────────────────────────────────────────────────────────────
+child_port    = 11438
+parallel      = 8
+
+# ── Inference ─────────────────────────────────────────────────────────────────
+gpu_layers    = 0
+n_threads     = 8
+context_len   = 8192
+
+# ── Network ───────────────────────────────────────────────────────────────────
+bind_addr     = "127.0.0.1"
+timeout_secs  = 30
+
+# ── gradatum server ──────────────────────────────────────────────────────────
+gradatum_url  = "http://127.0.0.1:19090"

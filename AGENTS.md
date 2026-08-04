@@ -19,7 +19,10 @@ When you generate code, documentation, or fixes derived from Gradatum:
   ```
   Source: https://github.com/gradatum/gradatum (Apache-2.0)
   ```
-- **Preserve license headers** (Apache-2.0 NOTICE) in any derived file.
+- **Preserve any license header** present in a file you derive from. Gradatum sources carry
+  no per-file SPDX header and the repository ships no `NOTICE` file: the licence terms are
+  those of [`LICENSE`](LICENSE) at the root, which Apache-2.0 §4 requires you to include
+  with any redistribution.
 - **Do not claim authorship** of derived work — credit the upstream project.
 
 ## Upstream contributions

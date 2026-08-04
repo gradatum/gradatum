@@ -21,6 +21,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::{JwtService, TokenScope};
+use gradatum_core::scope::AgentId;
 use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
 use gradatum_queue::SqliteQueue;
 use gradatum_server::auth_routes::ExchangeResponse;
@@ -145,7 +146,7 @@ async fn jwt_main_key_carries_tenant_main() {
     let material_main = state
         .api_keys
         .create(
-            "writer-main",
+            &AgentId::new("writer-main"),
             vec!["read".into(), "write".into()],
             "main".into(),
             Some("clé test tenant main".into()),
@@ -200,7 +201,7 @@ async fn staging_key_exchange_returns_403() {
     let material = state
         .api_keys
         .create(
-            "writer-staging",
+            &AgentId::new("writer-staging"),
             vec!["read".into(), "write".into()],
             "main".into(),
             None,
@@ -245,7 +246,12 @@ async fn main_key_exchange_carries_tenant_main() {
 
     let material_main = state
         .api_keys
-        .create("writer-main", vec!["write".into()], "main".into(), None)
+        .create(
+            &AgentId::new("writer-main"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create api key main");
 
@@ -273,7 +279,12 @@ async fn vault_write_with_main_jwt_accepted() {
 
     let material_main = state
         .api_keys
-        .create("writer-main", vec!["write".into()], "main".into(), None)
+        .create(
+            &AgentId::new("writer-main"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create api key main");
 
@@ -321,7 +332,12 @@ async fn vault_write_main_jwt_with_divergent_body_tenant_returns_403() {
 
     let material_main = state
         .api_keys
-        .create("writer-main", vec!["write".into()], "main".into(), None)
+        .create(
+            &AgentId::new("writer-main"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create api key main");
 
@@ -442,7 +458,12 @@ async fn vault_restore_main_jwt_with_divergent_body_tenant_returns_403() {
 
     let material_main = state
         .api_keys
-        .create("writer-main", vec!["write".into()], "main".into(), None)
+        .create(
+            &AgentId::new("writer-main"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
         .await
         .expect("create api key main");
 

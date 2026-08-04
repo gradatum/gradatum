@@ -86,7 +86,7 @@ pub fn render_assembled(query: &str, notes: &[Selected], stubs: &[Stub]) -> Stri
 
     let n = sorted.len();
     let suffix = if n == 1 { "" } else { "s" };
-    let header = format!("Contexte assemblé pour : «{query}» · {n} note{suffix}");
+    let header = format!("Context assembled for: «{query}» · {n} note{suffix}");
 
     // Construction des blocs par note — format spec §2.3.
     let blocks: Vec<String> = sorted

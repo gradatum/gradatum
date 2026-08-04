@@ -4,10 +4,41 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license.workspace = true
+# Surcharge de l'heritage workspace (Apache-2.0) : le bundle `dist/` redistribue
+# du code et des fontes tiers. Mesure sur la cloture de production de
+# package-lock.json : 3 paquets de fontes OFL-1.1, 68 paquets MIT, 1 paquet ISC
+# (@ungap/structured-clone, dep runtime de hast-util-sanitize et mdast-util-to-hast).
+# Notices integrales : THIRD-PARTY-LICENSES.md.
+license = "Apache-2.0 AND OFL-1.1 AND MIT AND ISC"
 repository.workspace = true
 description = "gradatum Studio web UI — React+TS bundle served at /ui/*"
-publish = false
+homepage.workspace = true
+keywords.workspace = true
+# Surcharge de l'heritage workspace (database/memory-management) : cette crate est
+# un bundle web, pas un moteur de stockage.
+categories = ["web-programming", "gui"]
+
+# F-131 — crate « bundle-only » : le livrable publié EST le bundle Vite `dist/`.
+# `dist/` est COMMITÉ, pas gitignored (`git check-ignore` muet dessus, `git ls-files`
+# le liste) — l'inférence git de cargo l'embarquerait donc déjà toute seule.
+# `include` est obligatoire pour la raison INVERSE : sans lui, `cargo package` publie
+# TOUT ce que git suit sous ce répertoire, donc aussi les sources TS/TSX, `index.html`,
+# les `tsconfig*.json`, `vite.config.ts`, `package.json` et les lockfiles npm.
+# Liste fermée (allow-list) : tout ce qui n'est pas cité est exclu — les sources TS/TSX
+# et les lockfiles (suivis par git), et node_modules/ (non suivi par git, mais atteignable
+# par `include`, qui parcourt le disque au lieu d'interroger l'index git).
+#
+# ⚠️ Le `/` initial est LOAD-BEARING : ces motifs suivent la sémantique .gitignore,
+# où un motif sans `/` matche à TOUTE profondeur. Sans ancre, "README.md" avale tous les
+# `node_modules/**/README.md`. Aucun compte n'est gravé ici : il dépend de l'état de
+# `node_modules/` sur la machine, donc il se périme sans que rien ne le signale. Pour le
+# constater : `cargo package --list -p gradatum-studio`, avec puis sans le `/` initial.
+include = [
+    "/src/lib.rs",
+    "/README.md",
+    "/THIRD-PARTY-LICENSES.md",
+    "/dist/**",
+]
 
 [lib]
 name = "gradatum_studio"

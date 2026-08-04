@@ -16,6 +16,7 @@ fn agent(sub: &str, scopes: &[&str]) -> TrustContext {
         sub: sub.into(),
         scopes: scopes.iter().map(|s| s.to_string()).collect(),
         tenant_id: "main".into(),
+        jti: None,
     }
 }
 

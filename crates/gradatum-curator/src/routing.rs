@@ -115,9 +115,8 @@ static PREFIX_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
     ];
     raw.iter()
         .map(|(section, pattern)| {
-            let re = Regex::new(pattern).unwrap_or_else(|e| {
-                panic!("Pattern préfixe invalide pour section '{section}': {e}")
-            });
+            let re = Regex::new(pattern)
+                .unwrap_or_else(|e| panic!("invalid prefix pattern for section '{section}': {e}"));
             (*section, re)
         })
         .collect()
@@ -134,7 +133,7 @@ static KEYWORD_PATTERNS: Lazy<Vec<(&'static str, Vec<Regex>)>> = Lazy::new(|| {
         ),
         (
             "council",
-            &[r"(?i)\b(council|verdict|multi.?experts?|d[ée]lib[ée]ration)\b"],
+            &[r"(?i)\b(council|verdict|multi.?experts?|d[e\u{e9}]lib[e\u{e9}]ration)\b"],
         ),
         (
             "architecture",
@@ -179,7 +178,7 @@ static KEYWORD_PATTERNS: Lazy<Vec<(&'static str, Vec<Regex>)>> = Lazy::new(|| {
                 .iter()
                 .map(|p| {
                     Regex::new(p).unwrap_or_else(|e| {
-                        panic!("Pattern keyword invalide pour section '{section}': {e}")
+                        panic!("invalid keyword pattern for section '{section}': {e}")
                     })
                 })
                 .collect();

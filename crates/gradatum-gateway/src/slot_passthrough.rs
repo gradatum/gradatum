@@ -51,7 +51,7 @@ pub fn inject_slot_id_if_needed(
         }
         tracing::debug!(
             slot_id = id,
-            "X-Slot-Id passthrough injecté dans body upstream"
+            "X-Slot-Id passthrough injected into upstream body"
         );
     }
     body

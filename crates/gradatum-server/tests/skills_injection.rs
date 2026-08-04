@@ -1,4 +1,4 @@
-//! Tests d'intégration — F-58 Task 9 : injection de skills dans `vault_context` assembled.
+//! Tests d'intégration — F-58 : injection de skills dans `vault_context` assembled.
 //!
 //! # Pattern TDD
 //!

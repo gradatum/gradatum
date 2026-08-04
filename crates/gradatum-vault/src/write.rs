@@ -4,6 +4,17 @@
 //! writing via `write_note_inner`. If the hash does not match → returns
 //! `WriteResult::Conflict { current_sha256 }` without writing.
 //!
+//! # Wired into the live write path
+//!
+//! **`write_if_match` is the production compare-and-swap.** The live `vault_write` pipeline
+//! reaches the vault through the internal persist API; its handler
+//! (`handle_persist_curated`) routes an RMW request (`expected_sha256 = Some`) to
+//! [`crate::Registry::write_if_match_internal`], which delegates here. A CREATE request
+//! (`expected_sha256 = None`) keeps taking the unconditional `write_note_with_id_internal`
+//! path. So a client supplying a `expected_sha256` on `POST /api/v1/vault_write` against a
+//! live note now gets a genuine compare-and-swap: a stale hash yields a `Conflict` and the
+//! note is left intact. The truth table below documents this function's contract.
+//!
 //! ## Contract
 //!
 //! "Note present/absent" here means **the `.md` file is readable on disk** (what
@@ -21,13 +32,18 @@
 //! - `expected_sha256 = Some(h)` AND `.md` present AND `h == current` → write.
 //! - `expected_sha256 = Some(h)` AND `.md` present AND `h != current` → Conflict.
 //!
-//! ## Async flow
+//! ## Async flow — end to end
 //!
 //! The client submits `expected_sha256` in the `POST /api/v1/vault_write` request.
 //! The handler (`gradatum-server`) carries the value in `CurateSpec.expected_sha256`.
-//! The worker (`handle_curate`) calls `write_if_match` with the expected hash.
-//! On `Conflict` → the job is marked terminal with `JobStatus::Conflict` (readable
-//! via `GET /api/v1/jobs/{id}`). No synchronous HTTP 409 (write is asynchronous).
+//! The worker (`handle_curate`) forwards it in the internal persist request.
+//!
+//! **The chain now completes.** On an RMW request the persist handler calls
+//! `write_if_match` (via `Registry::write_if_match_internal`); on a hash mismatch it returns
+//! HTTP 409 over the internal API, the worker maps it to `InternalClientError::Conflict` and
+//! calls `queue.mark_conflict(...)`, moving the job to terminal `JobStatus::Conflict`
+//! (readable via `GET /api/v1/jobs/{id}`). The write being asynchronous, there is no
+//! synchronous 409 to the original `vault_write` caller — exactly the design intent.
 
 use crate::{error::VaultError, registry::Vault};
 use gradatum_core::{frontmatter::Frontmatter, identity::NoteId};
@@ -80,12 +96,16 @@ impl Vault {
         expected_sha256: Option<[u8; 32]>,
     ) -> Result<WriteResult, VaultError> {
         if let Some(expected) = expected_sha256 {
-            // Single-worker invariant: TOCTOU non-issue as gradatum-worker runs
-            // single-instance (un seul goroutine `handle_curate` actif à la fois
-            // par déploiement). La fenêtre read_note→write_note_inner ne peut être
-            // interrompue par un autre write_if_match concurrent.
-            // Atomic upsert (SELECT+UPDATE sous le même rusqlite Mutex) deferred —
-            // requis uniquement si multi-worker devient nécessaire (v0.5+, F-41 phase 2).
+            // TOCTOU assumé : la fenêtre read_note→write_note_inner n'est PAS protégée.
+            // Ne pas se fier à un « invariant mono-worker » — il est faux : le worker
+            // `curate` tourne à une concurrence par défaut de 2 (WorkerConfig::
+            // default_concurrency), et les workers `forget` / `distill` / `embed` sont
+            // enregistrés à côté de lui dans le même process. `forget` écrit sans
+            // expected_sha256 et `distill` ignore le sien : ces chemins ne passent pas
+            // par cette comparaison.
+            // Portée réelle de la garde : sérialise deux read-modify-write `curate` sur
+            // la même note, rien de plus.
+            // Atomic upsert (SELECT+UPDATE sous le même rusqlite Mutex) deferred.
             //
             // Lire la version existante pour comparer les hashes.
             // NoteNotFound → `.md` absent (note neuve OU fantôme) → pas de contenu

@@ -50,7 +50,7 @@ use gradatum_acl_policy::{AclDecision, AclOp};
 use gradatum_core::audit::http::HttpAuditEvent;
 use gradatum_core::error::GradatumError;
 use gradatum_core::identity::NoteId;
-use gradatum_core::scope::{LocusId, VaultId};
+use gradatum_core::scope::{AgentId, LocusId, VaultId};
 use gradatum_core::section::Section;
 use gradatum_core::temporal_query::{TimelineCursor, TimelineFilter};
 use gradatum_core::trust::TrustContext;
@@ -80,16 +80,62 @@ use crate::api_v1::dto::{
 use crate::api_v1::handlers::{
     build_fts_query, filter_semantic_by_section, filter_semantic_by_status, validate_search_status,
 };
-use crate::api_v1::tenant_guard::effective_tenant;
+use crate::api_v1::tenant_guard::{effective_read_vault, effective_tenant, effective_write_vault};
 use crate::api_v1::timeline::{TimelineItem, VaultTimelineResponse};
 use crate::api_v1::write::{
     actor_from_trust, build_curate_job_record, emit_auth_failure_audit, emit_drift_audit,
     emit_read_rejection_audit, emit_write_rejection_audit, parse_sha256_hex,
 };
 use crate::context::retrieval::retrieve_candidates;
+use crate::note_usage_store::{KIND_READ, KIND_SEARCH_HIT, KIND_SEARCH_HIT_TOP3};
 use crate::state::AppState;
 
 // ── Helpers internes ─────────────────────────────────────────────────────────
+
+/// Logs an ACL denial with the identity and the locus that was evaluated (B6′b).
+///
+/// ## Pourquoi ceci existe
+///
+/// `require_read_grant`, `require_write_grant`, `require_active_target` et
+/// `write_scope_allowed` loggent tous leur refus ; l'évaluation ACL, elle, ne loggeait
+/// rien. Sur la route qui les enchaîne, un `403` pouvait donc sortir sans laisser
+/// **aucune trace** : l'opérateur voyait un refus sans corps ni ligne de journal,
+/// indistinguable d'une panne. C'est ce qui a coûté une journée d'instruction sur
+/// l'incident `engine` du 2026-07-27. L'asymétrie était pure — même barrière, même
+/// statut, un seul barreau muet.
+///
+/// ## Ce qu'il porte
+///
+/// L'identité (`sub` / `user` / `cn` selon la variante) et le **locus évalué** : sans le
+/// locus, la ligne dit qu'un refus a eu lieu sans dire sur quoi, ce qui ne réduit pas le
+/// temps de diagnostic. Ce sont exactement les deux valeurs qu'il faut confronter au
+/// preset pour conclure.
+///
+/// Niveau `warn!` : un refus ACL est un fait d'exploitation attendu (le défaut est deny),
+/// pas une défaillance du service.
+///
+/// ## Ce qu'il ne fait pas
+///
+/// Il ne décide rien — l'appelant reste maître du refus. Il n'est PAS appelé depuis
+/// [`gradatum_acl_policy::AclEngine::evaluate`] : ce point central est aussi traversé par
+/// des chemins de **filtrage** (sélection des sections lisibles) où un deny est nominal et
+/// massif ; y loguer noierait le signal que ce helper existe précisément pour rendre
+/// audible.
+pub(crate) fn log_acl_deny(trust: &TrustContext, op: AclOp, locus: &str, site: &str) {
+    let identity = match trust {
+        TrustContext::BearerToken { sub, .. } => sub.as_str(),
+        TrustContext::Studio { user, .. } => user.as_str(),
+        TrustContext::Mtls { cn, .. } => cn.as_str(),
+        _ => "<unauthenticated>",
+    };
+    tracing::warn!(
+        sub = %identity,
+        locus = %locus,
+        op = ?op,
+        site = %site,
+        "acl deny — identity not granted on the evaluated locus (403)"
+    );
+}
 
 /// Builds the ACL locus for a tenant: `{tenant_id}/main` (default section).
 pub(crate) fn locus_for_tenant(tenant_id: &str) -> String {
@@ -115,7 +161,7 @@ pub(crate) fn locus_for_section(tenant_id: &str, section: Option<&str>) -> Strin
 /// - `InvalidInput`  → 400
 /// - `Conflict`      → 409
 /// - `NoteNotFound`  → 404
-/// - `Storage(msg)` contenant "introuvable" ou "Not found" → 404
+/// - `Storage(msg)` contenant "not found" ou "Not found" → 404
 /// - Tout autre      → 500
 pub(crate) fn err_to_status(e: &GradatumError) -> StatusCode {
     match e {
@@ -124,10 +170,35 @@ pub(crate) fn err_to_status(e: &GradatumError) -> StatusCode {
         GradatumError::InvalidInput(_) => StatusCode::BAD_REQUEST,
         GradatumError::Conflict(_) => StatusCode::CONFLICT,
         GradatumError::NoteNotFound(_) => StatusCode::NOT_FOUND,
-        GradatumError::Storage(msg) if msg.contains("introuvable") || msg.contains("Not found") => {
+        GradatumError::Storage(msg) if msg.contains("not found") || msg.contains("Not found") => {
             StatusCode::NOT_FOUND
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Résout le handle de read-back d'un handler `api/v1`, **gaté sur `multi_tenant`**
+/// (évite le split-brain read-back).
+///
+/// - `multi_tenant.enabled = false` (défaut LIVE) → singleton `state.vault` inchangé
+///   (byte-identical).
+/// - `enabled = true` → route via `state.vaults.resolve` sur le vault effectif `tenant`
+///   (déjà résolu par `effective_write_vault`/`effective_tenant` — source de confiance →
+///   [`VaultId::new`]). **Fail-closed** : vault inconnu → [`GradatumError::VaultNotFound`]
+///   (500 via `err_to_status`), jamais un repli silencieux sur `main`.
+///
+/// # Errors
+///
+/// [`GradatumError::VaultNotFound`] à `enabled = true` si `tenant` n'est pas dans le registre.
+#[allow(clippy::result_large_err)]
+fn read_back_reader(
+    state: &AppState,
+    tenant: &str,
+) -> Result<std::sync::Arc<dyn gradatum_vault::Registry>, GradatumError> {
+    if state.server_config.multi_tenant.enabled {
+        state.vaults.resolve(&VaultId::new(tenant))
+    } else {
+        Ok(std::sync::Arc::clone(&state.vault))
     }
 }
 
@@ -158,36 +229,67 @@ pub async fn vault_search_impl(
         .vault_search
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // P0 cross-tenant : tenant dérivé du JWT, refuse body divergent.
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
-    let acl_locus = locus_for_section(&tenant, req.section.as_deref());
-    if state.acl.evaluate(trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
-        return Err(GradatumError::Forbidden("acl deny".into()));
-    }
 
-    // Validation vault_id (mono-vault — cross-read non supporté).
-    if let Some(vid) = req.vault_id.as_deref() {
-        if vid.is_empty() || vid.len() > 128 {
-            return Err(GradatumError::InvalidInput("vault_id invalide".into()));
-        }
-        if vid != "main" {
-            return Err(GradatumError::Forbidden(
-                "cross-read vault_id ≠ main non supporté (mono-vault)".into(),
-            ));
-        }
-    }
+    // EX-C2-1 : à `multi_tenant.enabled = true`, l'ACL est recalculée sur la CIBLE
+    // (`read_vault_id`) + grant read per-vault. À OFF, le chemin legacy ci-dessous
+    // (ACL appelant + garde mono-vault) est conservé inchangé.
+    let checked_on: Option<gradatum_core::scope::AclCheckedVaultId> =
+        if state.server_config.multi_tenant.enabled {
+            Some(
+                effective_read_vault(
+                    state,
+                    trust,
+                    &tenant,
+                    req.vault_id.as_ref(),
+                    req.section.as_deref(),
+                    "acl deny",
+                )
+                .await?,
+            )
+        } else {
+            let acl_locus = locus_for_section(&tenant, req.section.as_deref());
+            if state.acl.evaluate(trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
+                return Err(GradatumError::Forbidden("acl deny".into()));
+            }
+
+            // Validation vault_id (legacy mono-vault — cross-read non supporté à OFF).
+            // `req.vault_id: Option<VaultId>` (newtype transparent, non re-validé à la
+            // désérialisation) → `.as_str()` restitue la même chaîne que l'ancien `&str`.
+            if let Some(vid) = req.vault_id.as_ref() {
+                if vid.as_str().is_empty() || vid.as_str().len() > 128 {
+                    return Err(GradatumError::InvalidInput("invalid vault_id".into()));
+                }
+                if vid.as_str() != "main" {
+                    return Err(GradatumError::Forbidden(
+                        "cross-read vault_id ≠ main not supported (mono-vault)".into(),
+                    ));
+                }
+            }
+            None
+        };
 
     // Validation status filter.
     let status_filter = validate_search_status(req.status.as_deref())
-        .map_err(|()| GradatumError::InvalidInput("status invalide".into()))?;
+        .map_err(|()| GradatumError::InvalidInput("invalid status".into()))?;
 
     // Validation temporal bounds (F-65).
     if matches!((req.from_ms, req.to_ms), (Some(f), Some(t)) if f > t) {
         return Err(GradatumError::InvalidInput("from_ms > to_ms".into()));
     }
 
-    let read_vault_id = req.vault_id.as_deref().unwrap_or(&tenant).to_owned();
+    // Témoin de lecture (EX-C2-2) : à OFF la cible est "main" == tenant, dont l'ACL
+    // vient d'être évaluée ci-dessus — l'attestation est donc exacte sur les 2 chemins.
+    let read_vault = match checked_on {
+        Some(checked) => checked,
+        None => gradatum_core::scope::AclCheckedVaultId::attest_read_checked(
+            req.vault_id
+                .clone()
+                .unwrap_or_else(|| VaultId::new(tenant.as_str())),
+        ),
+    };
     let query = req.query.trim();
     if query.is_empty() {
         return Ok(VaultSearchResponse {
@@ -198,14 +300,13 @@ pub async fn vault_search_impl(
     }
 
     let limit = req.limit.unwrap_or(10).clamp(1, 50) as usize;
-    let vault_id = VaultId::new(&read_vault_id);
     let fts_query = build_fts_query(query);
 
     // Signal BM25.
     let bm25_hits = state
         .search
         .search_fts_with_snippet(
-            &vault_id,
+            &read_vault,
             &fts_query,
             limit * 2,
             req.include_downgraded,
@@ -218,52 +319,49 @@ pub async fn vault_search_impl(
         .await?;
 
     // Signal sémantique (dégradation gracieuse si Noop ou erreur).
-    let mut semantic_hits: Vec<(gradatum_core::identity::NoteId, f32)> = if state
-        .embedder
-        .backend_kind()
-        != EmbedBackend::Noop
-    {
-        match state.embedder.embed(query).await {
-            Ok(query_emb) => {
-                let hits = state
-                    .search
-                    .search_semantic(
-                        &read_vault_id,
-                        state.embedder.embedder_id(),
-                        &query_emb,
-                        limit * 2,
-                        req.locus.as_deref(),
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            err = %e,
+    let mut semantic_hits: Vec<(gradatum_core::identity::NoteId, f32)> =
+        if state.embedder.backend_kind() != EmbedBackend::Noop {
+            match state.embedder.embed(query).await {
+                Ok(query_emb) => {
+                    let hits = state
+                        .search
+                        .search_semantic(
+                            &read_vault,
+                            state.embedder.embedder_id(),
+                            &query_emb,
+                            limit * 2,
+                            req.locus.as_deref(),
+                        )
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                err = %e,
+                                query = %query,
+                                "vault_search_impl: search_semantic failed, BM25 only"
+                            );
+                            vec![]
+                        });
+                    if hits.is_empty() && req.vault_id.is_some() && read_vault.as_str() != tenant {
+                        tracing::info!(
+                            vault_id = %read_vault,
                             query = %query,
-                            "vault_search_impl: search_semantic failed, BM25 only"
+                            "vault_search_impl: 0 semantic hits on cross-tenant vault"
                         );
-                        vec![]
-                    });
-                if hits.is_empty() && req.vault_id.as_deref().is_some() && read_vault_id != tenant {
-                    tracing::info!(
-                        vault_id = %read_vault_id,
-                        query = %query,
-                        "vault_search_impl: 0 hits sémantiques sur vault cross-tenant"
-                    );
+                    }
+                    hits
                 }
-                hits
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        query = %query,
+                        "vault_search_impl: embed() failed, BM25 only"
+                    );
+                    vec![]
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    err = %e,
-                    query = %query,
-                    "vault_search_impl: embed() failed, BM25 only"
-                );
-                vec![]
-            }
-        }
-    } else {
-        vec![]
-    };
+        } else {
+            vec![]
+        };
 
     // Filtre section sur chemin sémantique (fix C2).
     if let Some(wanted_section) = req.section.as_deref()
@@ -272,7 +370,7 @@ pub async fn vault_search_impl(
         let sem_ids: Vec<String> = semantic_hits.iter().map(|(id, _)| id.to_string()).collect();
         let sec_result = state
             .search
-            .get_titles_sections(&read_vault_id, &sem_ids)
+            .get_titles_sections(&read_vault, &sem_ids)
             .await;
         semantic_hits = filter_semantic_by_section(semantic_hits, wanted_section, sec_result);
     }
@@ -282,7 +380,7 @@ pub async fn vault_search_impl(
         && !semantic_hits.is_empty()
     {
         let sem_ids: Vec<String> = semantic_hits.iter().map(|(id, _)| id.to_string()).collect();
-        let status_result = state.search.get_statuses(&read_vault_id, &sem_ids).await;
+        let status_result = state.search.get_statuses(&read_vault, &sem_ids).await;
         semantic_hits = filter_semantic_by_status(semantic_hits, wanted_status, status_result);
     }
 
@@ -295,7 +393,7 @@ pub async fn vault_search_impl(
         let bounds_active = req.from_ms.is_some() || req.to_ms.is_some();
         let anchor_result = state
             .search
-            .get_anchor_ms_batch(&read_vault_id, &sem_ids)
+            .get_anchor_ms_batch(&read_vault, &sem_ids)
             .await
             .unwrap_or_else(|e| {
                 if bounds_active {
@@ -304,15 +402,15 @@ pub async fn vault_search_impl(
                         count = sem_ids.len(),
                         from_ms = ?req.from_ms,
                         to_ms = ?req.to_ms,
-                        "vault_search_impl: get_anchor_ms_batch failed avec bornes actives — \
-                         ALL semantic hits dropés (temporal bound unverifiable)"
+                        "vault_search_impl: get_anchor_ms_batch failed with active bounds — \
+                         ALL semantic hits dropped (temporal bound unverifiable)"
                     );
                 } else {
                     tracing::warn!(
                         err = %e,
                         count = sem_ids.len(),
                         "vault_search_impl: get_anchor_ms_batch failed — \
-                         anchor_ms absent des hits sémantiques (pas de bornes actives)"
+                         anchor_ms absent from semantic hits (no active bounds)"
                     );
                 }
                 std::collections::HashMap::new()
@@ -372,6 +470,47 @@ pub async fn vault_search_impl(
     let mut composite_hits: Vec<(gradatum_search::RrfHit, f64)> = Vec::with_capacity(fused.len());
     let mut score_breakdowns: HashMap<String, ScoreBreakdown> = HashMap::new();
 
+    // F-110 Phase 2 : lookup batch salience — UNE requête pour tout le buffer RRF (≤ 50).
+    // Best-effort absolu : échec ⇒ map vide ⇒ facteur neutre partout + warn!.
+    // Flag OFF (state.salience == None) ou store absent ⇒ aucun lookup, map vide.
+    let salience_counts: HashMap<String, Vec<(String, u64)>> =
+        match (&state.salience, &state.note_usage) {
+            (Some(_), Some(store)) => {
+                let ids: Vec<String> = fused.iter().map(|h| h.note_id.clone()).collect();
+                // Dimension `note_usage` = NAMESPACE (vault cible), pas le principal :
+                // la salience compte l'usage des notes DU vault lu (`read_vault`), cohérent
+                // avec le read-side audit_job. À OFF `read_vault == tenant == "main"`
+                // (byte-identical). Réf conflation Task 11 / `arch/01KXWMDDX1`.
+                match store.counts_for_notes(read_vault.vault_id(), &ids).await {
+                    Ok(map) => map,
+                    Err(e) => {
+                        tracing::warn!(
+                            err = %e,
+                            "vault_search_impl: salience batch lookup failed — neutral factor"
+                        );
+                        HashMap::new()
+                    }
+                }
+            }
+            _ => HashMap::new(),
+        };
+
+    // L6 : params salience EFFECTIFS pour le vault lu — override per-vault A6 s'il existe,
+    // sinon le global. Sélection de RÉFÉRENCE (aucune allocation), résolue UNE fois par requête
+    // (`read_vault` constant sur toute la boucle). Gate `state.salience.as_ref()` : à OFF
+    // (`state.salience == None`) la map per-vault n'est JAMAIS consultée ⇒ `effective_salience
+    // == None`, le bras `None` du scoring ci-dessous reste byte-identical.
+    let effective_salience: Option<&std::sync::Arc<gradatum_search::SalienceParams>> =
+        state.salience.as_ref().and_then(|global| {
+            match state.salience_per_vault.get(read_vault.vault_id().as_str()) {
+                // Override présent : `Some(params)` = actif (raffine) ; `None` = désactivé
+                // ⇒ salience neutralisée pour ce vault (fix footgun C1, symétrie
+                // `review_promote_for`). Aucun override ⇒ global.
+                Some(entry) => entry.as_ref(),
+                None => Some(global),
+            }
+        });
+
     for hit in fused {
         let (created_ms, in_degree) = match state
             .search
@@ -382,7 +521,7 @@ pub async fn vault_search_impl(
             Err(GradatumError::NoteNotFound(_)) => {
                 tracing::debug!(
                     note_id = %hit.note_id,
-                    "vault_search_impl: note absente, fallback (now_ms, 0)"
+                    "vault_search_impl: note absent, fallback (now_ms, 0)"
                 );
                 (now_ms, 0u64)
             }
@@ -419,7 +558,7 @@ pub async fn vault_search_impl(
                     tracing::warn!(
                         err = %e,
                         note_id = %hit.note_id,
-                        "vault_search_impl: get_trust_and_provenance échoué — fallback"
+                        "vault_search_impl: get_trust_and_provenance failed — fallback"
                     );
                     (None, None)
                 }
@@ -432,7 +571,26 @@ pub async fn vault_search_impl(
             None
         };
 
-        let composite = composite_score_with_trust(hit.rrf_score, recency, pagerank, trust_params);
+        let composite_base =
+            composite_score_with_trust(hit.rrf_score, recency, pagerank, trust_params);
+        // F-110 Phase 2 : 4ᵉ facteur salience. `effective_salience == None` (flag OFF, défaut)
+        // ⇒ composite == composite_base bit-à-bit, aucun lookup n'a eu lieu. À ON, `params`
+        // porte l'override per-vault L6 (ou le global si aucun override) — cf. `effective_salience`.
+        let (composite, salience_ws) = match effective_salience {
+            Some(params) => {
+                let ws = salience_counts
+                    .get(&hit.note_id)
+                    .map(|counts| {
+                        gradatum_search::salience_weighted_sum(counts, &params.kind_weights)
+                    })
+                    .unwrap_or(0.0);
+                (
+                    gradatum_search::apply_salience(composite_base, ws, params),
+                    ws,
+                )
+            }
+            None => (composite_base, 0.0),
+        };
 
         if req.include_scores {
             let (trust_raw, trust_decayed) = match trust_params {
@@ -454,6 +612,9 @@ pub async fn vault_search_impl(
                     composite,
                     bm25_rank: hit.bm25_rank,
                     sem_rank: hit.sem_rank,
+                    salience_weighted_sum: effective_salience.map(|_| salience_ws),
+                    salience_factor: effective_salience
+                        .map(|p| gradatum_search::salience_factor(salience_ws, p.k_norm)),
                 },
             );
         }
@@ -539,13 +700,15 @@ pub async fn vault_search_impl(
         } else {
             state
                 .search
-                .get_titles_sections(&tenant, &semantic_only_ids)
+                // C2 : cible vérifiée (et plus `tenant`) — à OFF strictement identique
+                // (cible == tenant), à ON évite de mélanger les vaults.
+                .get_titles_sections(&read_vault, &semantic_only_ids)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!(
                         err = %e,
                         count = semantic_only_ids.len(),
-                        "vault_search_impl: get_titles_sections failed, sem-only sans titre"
+                        "vault_search_impl: get_titles_sections failed, sem-only without title"
                     );
                     HashMap::new()
                 })
@@ -555,13 +718,13 @@ pub async fn vault_search_impl(
     } else {
         state
             .search
-            .get_statuses(&tenant, &semantic_only_ids)
+            .get_statuses(&read_vault, &semantic_only_ids)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     err = %e,
                     count = semantic_only_ids.len(),
-                    "vault_search_impl: get_statuses failed, sem-only sans status"
+                    "vault_search_impl: get_statuses failed, sem-only without status"
                 );
                 HashMap::new()
             })
@@ -624,6 +787,12 @@ pub async fn vault_search_impl(
             let scores = score_breakdowns.remove(&hit.note_id);
             #[allow(deprecated)]
             Some(SearchHit {
+                // Provenance : le vault EFFECTIVEMENT lu, pas celui demandé. Sur le
+                // chemin cross-vault, `read_vault` est le témoin ACL de la CIBLE
+                // (`effective_read_vault`) ; à `multi_tenant` OFF il vaut le vault du
+                // JWT. Restituer `req.vault_id` à la place ré-affirmerait l'entrée
+                // client au lieu d'attester la sortie serveur.
+                vault_id: read_vault.vault_id().clone(),
                 path: format!("{}/{}", section, hit.note_id),
                 score,
                 title: hit.title,
@@ -641,7 +810,7 @@ pub async fn vault_search_impl(
         match state
             .search
             .count_fts_matches(
-                &vault_id,
+                &read_vault,
                 &fts_query,
                 req.include_downgraded,
                 req.section.as_deref(),
@@ -663,6 +832,32 @@ pub async fn vault_search_impl(
     } else {
         (None, false)
     };
+
+    // F-110 : télémétrie salience per-note — APRÈS construction des `items`, succès only,
+    // best-effort (record() ne panique/propage jamais). +search-hit par note retournée,
+    // +search-hit-top3 EN PLUS sur les rangs 1-3 (0-indexés 0..3). `note_id` extrait du
+    // path `{section}/{note_id}` (ULID sans slash → `rsplit('/')` fiable). Aucune mutation
+    // de la réponse — invariant byte-identique préservé.
+    {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for (rank, item) in items.iter().enumerate() {
+            if let Some(note_id) = item.path.rsplit('/').next() {
+                state
+                    .note_usage_accumulators
+                    // Télémétrie salience keyée par NAMESPACE (vault lu) — cf. note
+                    // conflation Task 11. À OFF `read_vault == tenant == "main"`.
+                    .record(read_vault.as_str(), note_id, KIND_SEARCH_HIT, now_ms);
+                if rank < 3 {
+                    state.note_usage_accumulators.record(
+                        read_vault.as_str(),
+                        note_id,
+                        KIND_SEARCH_HIT_TOP3,
+                        now_ms,
+                    );
+                }
+            }
+        }
+    }
 
     Ok(VaultSearchResponse {
         items,
@@ -697,7 +892,7 @@ pub async fn vault_read_impl(
         .read_usage_accumulators
         .vault_read
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
     let locus = locus_for_section(&tenant, req.section.as_deref());
@@ -712,19 +907,16 @@ pub async fn vault_read_impl(
     } else {
         match state.search.title_lookup(&tenant, &req.path).await {
             Ok(Some(found_id)) => {
-                tracing::debug!(title = %req.path, resolved_id = %found_id, "vault_read_impl: titre résolu");
+                tracing::debug!(title = %req.path, resolved_id = %found_id, "vault_read_impl: title resolved");
                 found_id
             }
             Ok(None) => {
                 let slug = title_to_slug(&req.path);
-                match state.search.resolve_redirect(&slug).await {
+                match state.search.resolve_redirect(&tenant, &slug).await {
                     Ok(Some(ulid)) => ulid.to_string(),
                     Ok(None) => {
                         // req.path peut être un titre (pas un ULID) — Storage pour l'intro
-                        return Err(GradatumError::Storage(format!(
-                            "introuvable : {}",
-                            req.path
-                        )));
+                        return Err(GradatumError::Storage(format!("not found: {}", req.path)));
                     }
                     Err(e) => return Err(e),
                 }
@@ -733,7 +925,12 @@ pub async fn vault_read_impl(
         }
     };
 
-    match state.vault.read_note_by_id(&resolved_path).await {
+    // Task 23 (W3) : read public routé par le vault EFFECTIF (`tenant`) — à OFF singleton
+    // `main` byte-identical, à ON handle du registre fail-closed (jamais un repli sur main).
+    match read_back_reader(state, &tenant)?
+        .read_note_by_id(&resolved_path)
+        .await
+    {
         Ok(note) => {
             let body = note.body.markdown;
             let size_bytes = body.len() as u64;
@@ -746,7 +943,14 @@ pub async fn vault_read_impl(
 
             let title: Option<String> = {
                 let ids = std::slice::from_ref(&resolved_path);
-                match state.search.get_titles_sections(&tenant, ids).await {
+                match state
+                    .search
+                    .get_titles_sections(
+                        &crate::api_v1::tenant_guard::own_vault_checked(&tenant),
+                        ids,
+                    )
+                    .await
+                {
                     Ok(map) => map
                         .get(&resolved_path)
                         .and_then(|(t, _)| t.clone())
@@ -755,7 +959,7 @@ pub async fn vault_read_impl(
                         tracing::warn!(
                             err = %e,
                             note_id = %resolved_path,
-                            "vault_read_impl: get_titles_sections échoué — title=None (best-effort)"
+                            "vault_read_impl: get_titles_sections failed — title=None (best-effort)"
                         );
                         None
                     }
@@ -777,7 +981,7 @@ pub async fn vault_read_impl(
                     // `subject()` returns the JWT `sub` — never derived from a client
                     // parameter. `target_agent` is extracted server-side from the note's
                     // own title (`identity/<agent>`), never from request input.
-                    let caller_sub = trust.subject().unwrap_or("");
+                    let caller_sub = trust.subject().map(AgentId::as_str).unwrap_or("");
                     let target_agent = title
                         .as_deref()
                         .and_then(|t| t.strip_prefix("identity/"))
@@ -795,7 +999,7 @@ pub async fn vault_read_impl(
                         )
                         .await;
                         return Err(GradatumError::Forbidden(
-                            "identity: lecture restreinte au propriétaire de l'âme".into(),
+                            "identity: read restricted to the soul's owner".into(),
                         ));
                     }
                 }
@@ -808,14 +1012,17 @@ pub async fn vault_read_impl(
             let note_id_str = note.id.to_string();
             let db_status = state
                 .search
-                .get_statuses(&tenant, std::slice::from_ref(&note_id_str))
+                .get_statuses(
+                    &crate::api_v1::tenant_guard::own_vault_checked(&tenant),
+                    std::slice::from_ref(&note_id_str),
+                )
                 .await
                 .ok()
                 .and_then(|mut m| m.remove(&note_id_str));
             let authoritative_status =
                 db_status.unwrap_or_else(|| note.frontmatter.status.to_string());
 
-            Ok(VaultReadResponse {
+            let resp = VaultReadResponse {
                 path: note_id_str,
                 title,
                 content: body,
@@ -830,7 +1037,19 @@ pub async fn vault_read_impl(
                 })),
                 size_bytes,
                 sha256,
-            })
+            };
+            // F-110 : télémétrie salience per-note — note effectivement lue, succès only,
+            // best-effort. `resp.path` = ULID de la note servie. Aucune mutation de la réponse.
+            // Télémétrie salience keyée par NAMESPACE : le vault où vit la note lue
+            // (`note.frontmatter.vault_id`), pas le principal. À OFF == "main"
+            // (byte-identical). Cf. résolution conflation Task 11 / `arch/01KXWMDDX1`.
+            state.note_usage_accumulators.record(
+                note.frontmatter.vault_id.as_str(),
+                &resp.path,
+                KIND_READ,
+                chrono::Utc::now().timestamp_millis(),
+            );
+            Ok(resp)
         }
         Err(GradatumError::NoteNotFound(_)) => {
             let note_id = ulid::Ulid::from_string(&resolved_path)
@@ -838,7 +1057,7 @@ pub async fn vault_read_impl(
                 .unwrap_or_else(|_| NoteId::new());
             Err(GradatumError::NoteNotFound(note_id))
         }
-        Err(GradatumError::Storage(ref msg)) if msg.contains("ULID invalide") => {
+        Err(GradatumError::Storage(ref msg)) if msg.contains("invalid ULID") => {
             let note_id = ulid::Ulid::from_string(&resolved_path)
                 .map(NoteId)
                 .unwrap_or_else(|_| NoteId::new());
@@ -863,7 +1082,7 @@ pub async fn vault_list_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
     let locus = locus_for_section(&tenant, req.section.as_deref());
@@ -923,6 +1142,145 @@ pub async fn vault_list_impl(
     })
 }
 
+/// Logique métier de `POST /api/v1/vault_archives_list` — LECTURE SEULE (F-100 1.6).
+///
+/// ACL Read. Liste le registre d'archives (filtres section/temps/gc/restored +
+/// pagination). **Aucune mutation** : delete/restore/purge ne sont PAS exposés ici
+/// (namespace interne loopback uniquement — invariant fondateur F-100). Partagée par le
+/// handler HTTP public et l'outil MCP `vault_archives_list`.
+///
+/// ## Isolation multi-vault (C3a, clôture gate flag-ON C2 — P1-1)
+///
+/// `vault_filter` est le **vault CIBLE** du listing — intégré au modèle d'isolation,
+/// parité `vault_search`/`vault_timeline` :
+/// - `multi_tenant.enabled = true` → `effective_read_vault` (ACL recalculée sur la
+///   CIBLE + grant read + cible active, fail-closed) ;
+/// - OFF → ACL appelant historique + garde mono-vault (`vault_filter ≠ "main"` → 403).
+///
+/// Sur les DEUX chemins, le filtre registre est ÉPINGLÉ au vault vérifié : `None` ne
+/// signifie plus « tous vaults » (le scan global reste réservé à l'endpoint admin
+/// interne via [`list_archives_core`]) mais « le vault propre du tenant ».
+///
+/// # Errors
+///
+/// - `GradatumError::Unauthorized` si non authentifié.
+/// - `GradatumError::Forbidden` si le tenant du body diverge, l'ACL Read refuse,
+///   ou la cible n'est pas accessible (grant absent / cible non active / mono-vault).
+/// - `GradatumError::InvalidInput` si `vault_filter` est mal formé (400).
+/// - `GradatumError::Storage` sur échec de requête registre.
+pub async fn vault_archives_list_impl(
+    state: &AppState,
+    trust: &TrustContext,
+    mut req: gradatum_dto::VaultArchivesListRequest,
+) -> Result<gradatum_dto::VaultArchivesListResponse, GradatumError> {
+    if !trust.is_authenticated() {
+        return Err(GradatumError::Unauthorized);
+    }
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
+        .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
+        .to_owned();
+    let checked: gradatum_core::scope::AclCheckedVaultId =
+        if state.server_config.multi_tenant.enabled {
+            // EX-C2-1 : ACL + grant + statut évalués sur la CIBLE (`vault_filter`),
+            // plus jamais sur le seul locus de l'appelant.
+            // `vault_filter: Option<String>` (non typé par Task 7 — filtre de listing) :
+            // matérialisé en `VaultId` local pour la frontière typée `effective_read_vault`.
+            // Le parse validant reste interne au choke-point → 400 byte-identical.
+            let vault_filter_id = req.vault_filter.as_ref().map(|v| VaultId::new(v.as_str()));
+            effective_read_vault(
+                state,
+                trust,
+                &tenant,
+                vault_filter_id.as_ref(),
+                None,
+                "acl deny",
+            )
+            .await?
+        } else {
+            let locus = locus_for_tenant(&tenant);
+            if state.acl.evaluate(trust, AclOp::Read, &locus) != AclDecision::Allow {
+                return Err(GradatumError::Forbidden("acl deny".into()));
+            }
+            // Garde mono-vault (parité search/timeline) : cross-listing interdit à OFF.
+            if let Some(vf) = req.vault_filter.as_deref() {
+                if vf.is_empty() || vf.len() > 128 {
+                    return Err(GradatumError::InvalidInput("invalid vault_filter".into()));
+                }
+                if vf != "main" {
+                    return Err(GradatumError::Forbidden(
+                        "cross-read vault_filter ≠ main not supported (mono-vault)".into(),
+                    ));
+                }
+            }
+            crate::api_v1::tenant_guard::own_vault_checked(&tenant)
+        };
+    // Épingle le filtre au vault vérifié — fail-closed : aucun chemin public ne peut
+    // atteindre le registre sans cible contrôlée (le scan tous-vaults n'existe que
+    // sur le chemin admin interne, qui appelle `list_archives_core` directement).
+    req.vault_filter = Some(checked.as_str().to_owned());
+    list_archives_core(state, req).await
+}
+
+/// Cœur du listing d'archives (filtres → registre → DTO), SANS auth ni ACL.
+///
+/// Partagé par [`vault_archives_list_impl`] (public/MCP, après auth+ACL Read) et par
+/// l'endpoint admin interne (loopback + token admin, ACL bypassée). Zéro duplication du
+/// mapping registre → DTO.
+///
+/// # Errors
+///
+/// - `GradatumError::Storage` sur échec de requête registre.
+pub async fn list_archives_core(
+    state: &AppState,
+    req: gradatum_dto::VaultArchivesListRequest,
+) -> Result<gradatum_dto::VaultArchivesListResponse, GradatumError> {
+    let limit = req.limit.min(gradatum_index::ARCHIVE_LIST_MAX);
+    let filter = gradatum_index::ArchiveListFilter {
+        vault_id: req.vault_filter.clone(),
+        section: req.section.clone(),
+        from_ms: req.since_ms,
+        until_ms: req.until_ms,
+        include_gc: req.include_gc,
+        include_restored: req.include_restored,
+        limit,
+        offset: req.offset,
+    };
+
+    let entries = state.vault.list_archives(&filter).await?;
+    let dtos: Vec<gradatum_dto::ArchiveEntryDto> =
+        entries.into_iter().map(archive_entry_to_dto).collect();
+    let count = dtos.len();
+    Ok(gradatum_dto::VaultArchivesListResponse {
+        entries: dtos,
+        limit,
+        offset: req.offset,
+        count,
+    })
+}
+
+/// Mappe une [`gradatum_index::ArchiveEntry`] vers son DTO filaire.
+///
+/// SSOT du mapping registre → DTO (consommé par le listing ET la purge admin).
+pub(crate) fn archive_entry_to_dto(
+    e: gradatum_index::ArchiveEntry,
+) -> gradatum_dto::ArchiveEntryDto {
+    gradatum_dto::ArchiveEntryDto {
+        note_id: e.note_id,
+        // Frontière index→DTO : `ArchiveEntry.vault_id: String` → `VaultId` (newtype
+        // transparent — même chaîne filaire, byte-identical).
+        vault_id: e.vault_id.into(),
+        section: e.section,
+        title: e.title,
+        original_locus: e.original_locus,
+        archive_path: e.archive_path,
+        archived_at: e.archived_at,
+        archived_by: e.archived_by,
+        gc_due: e.gc_due,
+        gc_at: e.gc_at,
+        restored_at: e.restored_at,
+    }
+}
+
 /// Logique métier de `GET /api/v1/vault_status`.
 ///
 /// ACL Read + compteurs live_note_count + total_body_size_bytes.
@@ -933,19 +1291,37 @@ pub async fn vault_status_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let locus = locus_for_tenant("main");
+    // A3-vault_status (T13) : les 4 hardcodes `"main"` (locus ACL, live_note_count,
+    // total_body_size_bytes, champ tenant_id) sont routés sur le tenant appelant, GATÉS sur
+    // le flag. `effective_tenant` (byte-identical à OFF : retourne le principal, AUCUN grant)
+    // refuse les contextes sans tenant (Studio/Mtls) et n'a PAS de court-circuit OFF ;
+    // l'appliquer inconditionnellement casserait le byte-identical OFF — `vault_status` est
+    // atteignable par TOUT contexte authentifié. On gate donc comme T9/T12 :
+    // - OFF (défaut LIVE) : hardcode `"main"` INCHANGÉ (mono-vault, principal == main).
+    // - ON : métadonnées scopées au principal JWT via `effective_tenant`.
+    let tenant: String = if state.server_config.multi_tenant.enabled {
+        let Some(principal) = trust.tenant_id() else {
+            return Err(GradatumError::Forbidden("acl deny".into()));
+        };
+        effective_tenant(trust, Some(principal))
+            .map_err(|_| GradatumError::Forbidden("acl deny".into()))?
+            .to_owned()
+    } else {
+        "main".to_owned()
+    };
+    let locus = locus_for_tenant(&tenant);
     if state.acl.evaluate(trust, AclOp::Read, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
 
-    let note_count = state.search.live_note_count("main").await.unwrap_or(0);
+    let note_count = state.search.live_note_count(&tenant).await.unwrap_or(0);
     let total_size_bytes = state
         .search
-        .total_body_size_bytes("main")
+        .total_body_size_bytes(&tenant)
         .await
         .unwrap_or(0);
     Ok(VaultStatusResponse {
-        tenant_id: "main".to_string(),
+        tenant_id: tenant,
         note_count,
         total_size_bytes,
         index_version: "v1".to_string(),
@@ -990,7 +1366,10 @@ async fn filter_identity_nodes(
     // Section RÉELLE de chaque nœud résolue server-side (jamais depuis l'input).
     let sections = state
         .search
-        .get_titles_sections(tenant, nodes.as_slice())
+        .get_titles_sections(
+            &crate::api_v1::tenant_guard::own_vault_checked(tenant),
+            nodes.as_slice(),
+        )
         .await?;
     let hidden: std::collections::HashSet<String> = nodes
         .iter()
@@ -1020,7 +1399,7 @@ pub async fn vault_graph_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
     let locus = locus_for_tenant(&tenant);
@@ -1031,7 +1410,7 @@ pub async fn vault_graph_impl(
     let raw_depth = req.depth.unwrap_or(2);
     if raw_depth > 5 {
         return Err(GradatumError::InvalidInput(
-            "depth > 5 refusé (max effectif = 3)".into(),
+            "depth > 5 rejected (effective max = 3)".into(),
         ));
     }
     let depth = raw_depth.min(3) as u8;
@@ -1085,7 +1464,7 @@ pub async fn vault_links_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
     let locus = locus_for_tenant(&tenant);
@@ -1140,7 +1519,7 @@ pub async fn vault_trace_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
     let locus = locus_for_tenant(&tenant);
@@ -1155,7 +1534,7 @@ pub async fn vault_trace_impl(
     } else {
         match state.search.title_lookup(&tenant, &req.query).await {
             Ok(Some(note_id)) => {
-                tracing::debug!(title = %req.query, id = %note_id, "vault_trace_impl: titre résolu");
+                tracing::debug!(title = %req.query, id = %note_id, "vault_trace_impl: title resolved");
                 vec![note_id]
             }
             Ok(None) => {
@@ -1163,7 +1542,7 @@ pub async fn vault_trace_impl(
                 if fts_q.trim_matches(['"', ' ']).is_empty() {
                     return Ok(VaultTraceResponse { entries: vec![] });
                 }
-                let vault_id = VaultId::new(&tenant);
+                let vault_id = crate::api_v1::tenant_guard::own_vault_checked(&tenant);
                 let fts_limit = limit.min(5);
                 match state
                     .search
@@ -1243,7 +1622,7 @@ pub async fn vault_trace_impl(
 /// # Sécurité
 ///
 /// - Authentification vérifiée avant tout accès aux données.
-/// - Tenant validé via [`effective_tenant`] (cross-tenant interdit).
+/// - Tenant validé via `effective_tenant` (cross-tenant interdit).
 /// - ACL Read sur le locus section évalué avant dispatch.
 ///
 /// # Délégation
@@ -1259,7 +1638,7 @@ pub async fn vault_context_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
     let locus = locus_for_section(&tenant, req.section.as_deref());
@@ -1277,7 +1656,17 @@ pub async fn vault_context_impl(
 
 /// Logique métier de `GET /api/v1/vault_authors`.
 ///
-/// ACL Read (tenant "main") + distinct_authors.
+/// ACL Read (vault effectif) + distinct_authors.
+///
+/// # Sécurité (P0-8, famille cross-tenant)
+///
+/// Le vault est résolu depuis le JWT (`effective_tenant`), GATÉ sur
+/// `multi_tenant.enabled` — sibling de lecture own-vault (parité stricte avec
+/// [`vault_forgotten_list`](crate::api_v1::forget::vault_forgotten_list) et
+/// `vault_status_impl`). À OFF le chemin `"main"` est INCHANGÉ (byte-identical). Sans ce
+/// gate le vault était figé à `"main"` : un tenant ≠ main porteur d'un grant ACL couvrant
+/// `main/*` listait les auteurs (identité, PII-adjacent) des notes de `main` → fuite
+/// cross-tenant. À ON, un contexte sans tenant (Studio/Mtls) est refusé 403.
 pub async fn vault_authors_impl(
     state: &AppState,
     trust: &TrustContext,
@@ -1285,11 +1674,21 @@ pub async fn vault_authors_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let locus = locus_for_tenant("main");
+    let vault_id: String = if state.server_config.multi_tenant.enabled {
+        let Some(principal) = trust.tenant_id() else {
+            return Err(GradatumError::Forbidden("no tenant in context".into()));
+        };
+        effective_tenant(trust, Some(principal))
+            .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
+            .to_owned()
+    } else {
+        "main".to_owned()
+    };
+    let locus = locus_for_tenant(&vault_id);
     if state.acl.evaluate(trust, AclOp::Read, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
-    let rows = state.search.distinct_authors("main").await?;
+    let rows = state.search.distinct_authors(&vault_id).await?;
     let authors = rows
         .into_iter()
         .map(|r| AuthorEntry {
@@ -1302,7 +1701,15 @@ pub async fn vault_authors_impl(
 
 /// Logique métier de `GET /api/v1/vault_tags`.
 ///
-/// ACL Read (tenant "main") + distinct_tags.
+/// ACL Read (vault effectif) + distinct_tags.
+///
+/// # Sécurité (P0-8, famille cross-tenant)
+///
+/// Même patron que [`vault_authors_impl`] : vault résolu depuis le JWT
+/// (`effective_tenant`), GATÉ sur `multi_tenant.enabled`. À OFF `"main"` INCHANGÉ. Sans
+/// ce gate un tenant ≠ main porteur d'un grant ACL couvrant `main/*` listait les tags
+/// (topologie/PII-adjacent) des notes de `main` → fuite cross-tenant. À ON, un contexte
+/// sans tenant est refusé 403.
 pub async fn vault_tags_impl(
     state: &AppState,
     trust: &TrustContext,
@@ -1310,11 +1717,21 @@ pub async fn vault_tags_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let locus = locus_for_tenant("main");
+    let vault_id: String = if state.server_config.multi_tenant.enabled {
+        let Some(principal) = trust.tenant_id() else {
+            return Err(GradatumError::Forbidden("no tenant in context".into()));
+        };
+        effective_tenant(trust, Some(principal))
+            .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
+            .to_owned()
+    } else {
+        "main".to_owned()
+    };
+    let locus = locus_for_tenant(&vault_id);
     if state.acl.evaluate(trust, AclOp::Read, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
-    let rows = state.search.distinct_tags("main").await?;
+    let rows = state.search.distinct_tags(&vault_id).await?;
     let tags = rows
         .into_iter()
         .map(|(tag, count)| TagEntry {
@@ -1345,13 +1762,32 @@ pub async fn vault_timeline_impl(
         .read_usage_accumulators
         .vault_timeline
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
-    let acl_locus = format!("{}/timeline", tenant);
-    if state.acl.evaluate(trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
-        return Err(GradatumError::Forbidden("acl deny timeline".into()));
-    }
+
+    // EX-C2-1 : à ON, ACL recalculée sur la CIBLE (locus `{cible}/timeline`) + grant read.
+    // À OFF, chemin legacy byte-identical (ACL appelant ici, garde mono-vault plus bas).
+    let checked_on: Option<gradatum_core::scope::AclCheckedVaultId> =
+        if state.server_config.multi_tenant.enabled {
+            Some(
+                effective_read_vault(
+                    state,
+                    trust,
+                    &tenant,
+                    req.vault_id.as_ref(),
+                    Some("timeline"),
+                    "acl deny timeline",
+                )
+                .await?,
+            )
+        } else {
+            let acl_locus = format!("{}/timeline", tenant);
+            if state.acl.evaluate(trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
+                return Err(GradatumError::Forbidden("acl deny timeline".into()));
+            }
+            None
+        };
 
     // Validation.
     if let (Some(f), Some(t)) = (req.from_ms, req.to_ms)
@@ -1361,7 +1797,7 @@ pub async fn vault_timeline_impl(
     }
     if let Some(kinds) = req.doc_kind.as_ref() {
         if kinds.len() > KNOWN_DOC_KINDS.len() {
-            return Err(GradatumError::InvalidInput("trop de doc_kind".into()));
+            return Err(GradatumError::InvalidInput("too many doc_kind".into()));
         }
         if kinds.iter().any(|k| !KNOWN_DOC_KINDS.contains(&k.as_str())) {
             return Err(GradatumError::InvalidInput(
@@ -1369,26 +1805,35 @@ pub async fn vault_timeline_impl(
             ));
         }
     }
-    if let Some(v) = req.vault_id.as_ref() {
-        if v.is_empty() || v.len() > 128 {
-            return Err(GradatumError::InvalidInput("vault_id invalide".into()));
+    // Garde mono-vault legacy (OFF uniquement — à ON la cible est déjà vérifiée).
+    if checked_on.is_none()
+        && let Some(v) = req.vault_id.as_ref()
+    {
+        if v.as_str().is_empty() || v.as_str().len() > 128 {
+            return Err(GradatumError::InvalidInput("invalid vault_id".into()));
         }
-        if v != "main" {
+        if v.as_str() != "main" {
             return Err(GradatumError::Forbidden(
-                "cross-read vault_id ≠ main non supporté".into(),
+                "cross-read vault_id ≠ main not supported".into(),
             ));
         }
     }
     let cursor = match req.cursor.as_deref() {
         Some(s) => Some(
             TimelineCursor::decode(s)
-                .map_err(|_| GradatumError::InvalidInput("cursor malformé".into()))?,
+                .map_err(|_| GradatumError::InvalidInput("malformed cursor".into()))?,
         ),
         None => None,
     };
 
     let limit = req.limit.unwrap_or(50).clamp(1, 200) as usize;
-    let vault = VaultId::new(req.vault_id.unwrap_or_else(|| tenant.clone()));
+    // Témoin EX-C2-2 : à OFF la cible est "main" == tenant (ACL évaluée ci-dessus).
+    let vault = match checked_on {
+        Some(checked) => checked,
+        None => gradatum_core::scope::AclCheckedVaultId::attest_read_checked(
+            req.vault_id.unwrap_or_else(|| VaultId::new(tenant.clone())),
+        ),
+    };
     let filter = TimelineFilter {
         doc_kind: req.doc_kind,
         from_ms: req.from_ms,
@@ -1464,7 +1909,8 @@ pub(crate) const IDENTITY_SECTION: &str = "identity";
 /// n'est adressable (fan-out RRF).
 #[must_use]
 pub(crate) fn is_identity_privileged(trust: &TrustContext) -> bool {
-    matches!(trust, TrustContext::Studio { .. }) || trust.subject() == Some(SOUL_PRIVILEGED_WRITER)
+    matches!(trust, TrustContext::Studio { .. })
+        || trust.subject().map(AgentId::as_str) == Some(SOUL_PRIVILEGED_WRITER)
 }
 
 /// Vrai si une note de section `section` doit être **masquée** à cet appelant sur
@@ -1521,7 +1967,7 @@ async fn enforce_identity_read_guard(
     }
     // `subject()` = `sub` du JWT (jamais dérivé d'un paramètre client). `target_agent`
     // est extrait server-side du titre `identity/<agent>`, jamais de l'input requête.
-    let caller_sub = trust.subject().unwrap_or("");
+    let caller_sub = trust.subject().map(AgentId::as_str).unwrap_or("");
     let target_agent = note_title
         .and_then(|t| t.strip_prefix("identity/"))
         .unwrap_or("");
@@ -1541,7 +1987,7 @@ async fn enforce_identity_read_guard(
     )
     .await;
     Err(GradatumError::Forbidden(
-        "identity: lecture restreinte au propriétaire de l'âme".into(),
+        "identity: read restricted to the soul's owner".into(),
     ))
 }
 
@@ -1565,13 +2011,20 @@ async fn resolve_title_section_failclosed(
     note_id: &str,
 ) -> (Option<String>, String) {
     let ids = [note_id.to_owned()];
-    match state.search.get_titles_sections(tenant, &ids).await {
+    match state
+        .search
+        .get_titles_sections(
+            &crate::api_v1::tenant_guard::own_vault_checked(tenant),
+            &ids,
+        )
+        .await
+    {
         Ok(mut map) => map.remove(note_id).unwrap_or((None, String::new())),
         Err(e) => {
             tracing::warn!(
                 err = %e,
                 note_id = %note_id,
-                "resolve_title_section_failclosed: get_titles_sections échoué — FAIL-CLOSED identity guard"
+                "resolve_title_section_failclosed: get_titles_sections failed — FAIL-CLOSED identity guard"
             );
             (None, IDENTITY_SECTION.to_string())
         }
@@ -1621,7 +2074,7 @@ async fn enforce_identity_write_guard(
     }
     // `subject()` = `sub` du JWT (jamais dérivé d'un paramètre client). `target_agent`
     // est extrait server-side du titre `identity/<agent>`, jamais de l'input requête.
-    let caller_sub = trust.subject().unwrap_or("");
+    let caller_sub = trust.subject().map(AgentId::as_str).unwrap_or("");
     let target_agent = note_title
         .and_then(|t| t.strip_prefix("identity/"))
         .unwrap_or("");
@@ -1644,19 +2097,45 @@ async fn enforce_identity_write_guard(
     )
     .await;
     Err(GradatumError::Forbidden(
-        "identity: écriture restreinte au propriétaire de l'âme".into(),
+        "identity: write restricted to the soul's owner".into(),
     ))
+}
+
+/// Provenance d'une écriture `project-map` vis-à-vis du rôle d'identité feature.
+///
+/// Le rôle `feature:F-XX` EST l'identité d'une carte-feature : c'est lui qui porte la
+/// garantie d'unicité du numéro. Cette garantie n'est réelle que si **seul** le serveur peut
+/// poser ou modifier ce rôle. Or [`vault_write_impl`] est la voie d'écriture **partagée** par
+/// les appels externes (handlers HTTP / MCP relayant l'input client) ET par l'allocation
+/// interne [`create_feature_card_impl`] — l'inspection du corps seul ne peut donc pas
+/// distinguer une identité serveur légitime d'une identité client illégitime. La distinction
+/// se lit au **site d'appel** : elle est portée ici, explicitement, plutôt que devinée.
+///
+/// Défaut sûr : [`FeatureWriteAuthority::External`] (le contrat d'immuabilité s'applique).
+/// Chaque nouvel appelant est forcé de déclarer sa provenance — fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureWriteAuthority {
+    /// Écriture externe (relais d'input client). Le rôle `feature` est soumis au contrat
+    /// d'immuabilité : interdit à la création, identique à l'existant en mise à jour.
+    External,
+    /// Écriture interne consécutive à une allocation serveur atomique
+    /// ([`create_feature_card_impl`]). Le rôle `feature` injecté est légitime — le
+    /// contrat d'immuabilité est court-circuité pour ce seul chemin.
+    ServerAllocated,
 }
 
 /// Logique métier de `POST /api/v1/vault_write`.
 ///
-/// ACL Write + audit + optimistic-lock (F-41) + enqueue job curate.
+/// ACL Write + audit + optimistic-lock (F-41) + enqueue job curate. Sur `project-map`, une
+/// écriture `External` est en outre soumise au contrat d'immuabilité d'identité feature
+/// (voir [`FeatureWriteAuthority`]).
 ///
 /// # Erreurs
 ///
 /// - `GradatumError::Unauthorized` si non authentifié.
 /// - `GradatumError::Forbidden` si ACL Write denied.
-/// - `GradatumError::InvalidInput` si note_id invalide ou sha256 malformé sur overwrite.
+/// - `GradatumError::InvalidInput` si note_id invalide, sha256 malformé sur overwrite, ou
+///   violation du contrat d'immuabilité feature sur `project-map`.
 /// - `GradatumError::Conflict` si overwrite sans `expected_sha256`.
 /// - `GradatumError::Storage` sur erreur enqueue.
 pub async fn vault_write_impl(
@@ -1664,18 +2143,31 @@ pub async fn vault_write_impl(
     trust: &TrustContext,
     req: crate::api_v1::dto::VaultWriteRequest,
     request_id: &str,
+    authority: FeatureWriteAuthority,
 ) -> Result<EnqueuedResponseUlid, GradatumError> {
     let start = Instant::now();
 
     if !trust.is_authenticated() {
-        emit_auth_failure_audit(state, trust, &req.tenant_id, request_id, "unauthenticated").await;
+        emit_auth_failure_audit(
+            state,
+            trust,
+            req.tenant_id.as_ref().map_or("", |t| t.as_str()),
+            request_id,
+            "unauthenticated",
+        )
+        .await;
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
-        .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
-        .to_owned();
+    // C1 (F-63, EX-C1-1/2) : résolution write-scope — tenant JWT + grant write à flag ON.
+    let tenant = effective_write_vault(state, trust, req.tenant_id.as_ref())
+        .await
+        .map_err(|r| r.into_forbidden("tenant cross mismatch"))?;
     let locus = format!("{}/main", tenant);
     if state.acl.evaluate(trust, AclOp::Write, &locus) != AclDecision::Allow {
+        // B6′b — pendant write d'`effective_read_vault`. L'audit `auth_failure` ci-dessous
+        // n'est PAS un substitut : il part vers le sink JSONL, pas vers le journal du
+        // service, et ne porte pas le locus évalué. Le diagnostic se fait sur le journal.
+        log_acl_deny(trust, AclOp::Write, &locus, "vault_write");
         emit_auth_failure_audit(state, trust, &tenant, request_id, "acl_deny").await;
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
@@ -1695,7 +2187,7 @@ pub async fn vault_write_impl(
             expected = w.expected_section,
             actual = ?w.actual_section,
             title = ?req.title,
-            "write_check: catégorie titre incohérente avec section_hint/tags déclarés — vérifier section_hint et tags (NOMENCLATURE §10a, warn-only F-36)"
+            "write_check: title category inconsistent with declared section_hint/tags — check section_hint and tags (NOMENCLATURE §10a, warn-only F-36)"
         );
         state
             .metrics
@@ -1752,7 +2244,7 @@ pub async fn vault_write_impl(
         )
         .await;
         return Err(GradatumError::InvalidInput(
-            "identity: section_hint=\"identity\" requis quand le titre commence par identity/"
+            "identity: section_hint=\"identity\" required when the title starts with identity/"
                 .into(),
         ));
     }
@@ -1776,12 +2268,12 @@ pub async fn vault_write_impl(
                 )
                 .await;
                 return Err(GradatumError::InvalidInput(
-                    "identity: le titre doit être identity/<agent-id> (non vide)".into(),
+                    "identity: title must be identity/<agent-id> (non-empty)".into(),
                 ));
             }
         };
         // `trust.subject()` renvoie `sub` du JWT — jamais dérivé d'un paramètre client.
-        let caller_sub = trust.subject().unwrap_or("");
+        let caller_sub = trust.subject().map(AgentId::as_str).unwrap_or("");
         let is_privileged = caller_sub == SOUL_PRIVILEGED_WRITER;
         if !is_privileged && target_agent != caller_sub {
             emit_write_rejection_audit(
@@ -1795,7 +2287,7 @@ pub async fn vault_write_impl(
             )
             .await;
             return Err(GradatumError::Forbidden(
-                "identity: un agent ne peut écrire que sa propre âme".into(),
+                "identity: an agent may only write its own soul".into(),
             ));
         }
         // (b) Schema soul après ACL (body traité uniquement si droits OK).
@@ -1830,10 +2322,64 @@ pub async fn vault_write_impl(
                     Some(s.to_string()),
                 )
                 .await;
-                return Err(GradatumError::InvalidInput("note_id invalide".into()));
+                return Err(GradatumError::InvalidInput("invalid note_id".into()));
             }
         },
     };
+
+    // ── project-map : immuabilité de l'identité feature (durcissement) ─────────
+    // Le rôle [[feature:F-XX]] EST l'identité d'une carte-feature ; lui seul porte la
+    // garantie d'unicité du numéro. Une écriture EXTERNE ne peut ni introduire cette
+    // identité à la création (seul create_feature_card alloue+injecte), ni la muter en
+    // place. Les 5 verbes de mise à jour (gov-todo RMW : act/ship/defer/drop + statut)
+    // réécrivent la carte en CONSERVANT le rôle ⇒ identité inchangée ⇒ accepté. Renommer
+    // = nouvelle carte + [[supersedes:]] (jamais une mutation). ServerAllocated
+    // (create_feature_card) est exempté : il vient d'allouer le numéro atomiquement.
+    //
+    // Complète — ne remplace pas — la validation de cardinalité de schéma (plus haut) :
+    // la cardinalité garantit la BONNE FORME (exactement 1 feature sur une carte-feature),
+    // cette garde garantit que ce F-XX précis est PRÉSERVÉ.
+    if authority == FeatureWriteAuthority::External
+        && req.section_hint.as_deref() == Some("project-map")
+    {
+        let new_ident = gradatum_core::project_map::feature_identity_from_targets(
+            &gradatum_curator::wikilinks::extract_wikilinks(&req.body),
+        );
+        // Identité existante : vide à la création (note_id absent) OU si la cible n'existe
+        // pas encore (note_id fourni mais note neuve/fantôme = création déguisée). Lecture
+        // dédiée sur ce chemin froid (governance) — non fusionnée avec la garde overwrite
+        // ci-dessous pour ne pas entangler sa machine à états vivante/fantôme/neuve.
+        let existing_ident: Vec<String> = if req.note_id.is_some() {
+            let reader = read_back_reader(state, &tenant)?;
+            match reader.read_note_by_id(&note_id_prealloc.to_string()).await {
+                Ok(existing) => gradatum_core::project_map::feature_identity_from_targets(
+                    &gradatum_curator::wikilinks::extract_wikilinks(&existing.body.markdown),
+                ),
+                Err(GradatumError::NoteNotFound(_)) => Vec::new(),
+                Err(e) => return Err(e),
+            }
+        } else {
+            Vec::new()
+        };
+
+        if new_ident != existing_ident {
+            emit_write_rejection_audit(
+                state,
+                trust,
+                &tenant,
+                &locus,
+                request_id,
+                "rejected_400_project_map_feature_identity",
+                None,
+            )
+            .await;
+            return Err(GradatumError::InvalidInput(format!(
+                "project-map: the [[feature:…]] role is immutable (card identity) — \
+                 current {existing_ident:?}, submitted {new_ident:?}. Create through \
+                 create_feature_card; a rename is a new card plus [[supersedes:]] on the old one."
+            )));
+        }
+    }
 
     // C1 — anti fail-open sha (overwrite avec sha malformé → 400).
     if req.note_id.is_some()
@@ -1851,7 +2397,7 @@ pub async fn vault_write_impl(
         )
         .await;
         return Err(GradatumError::InvalidInput(
-            "expected_sha256 malformé".into(),
+            "malformed expected_sha256".into(),
         ));
     }
 
@@ -1872,48 +2418,68 @@ pub async fn vault_write_impl(
     // et l'écraserait inconditionnellement (bypass de l'optimistic-lock).
     if req.note_id.is_some() {
         let note_id_str = note_id_prealloc.to_string();
-        match state.vault.read_note_by_id(&note_id_str).await {
-            Ok(_) => {
-                // `.md` présent : note vivante. Sans expected_sha256 → overwrite refusé.
-                if req.expected_sha256.is_none() {
-                    emit_write_rejection_audit(
-                        state,
-                        trust,
-                        &tenant,
-                        &locus,
-                        request_id,
-                        "rejected_409_overwrite_no_sha",
-                        Some(note_id_str),
-                    )
-                    .await;
-                    return Err(GradatumError::Conflict(
-                        "overwrite sans expected_sha256".into(),
-                    ));
+        // C4-1b (P0 security review) : la garde overwrite lit `state.vault` (Vault figé = `main`).
+        // À flag ON, un tenant tiers pouvait ainsi SONDER l'existence d'une note de `main` par ULID
+        // (409 overwrite/phantom vs passage), et — pré-fix write path — la faire écraser. Pour un
+        // tenant ≠ vault servi (`main`), l'existence est désormais jugée sur l'INDEX du tenant
+        // (table partagée, colonne `vault_id`) : absente → note neuve dans le vault du tenant, aucune
+        // fuite cross-vault. Le tenant `main` conserve la garde historique inchangée (byte-identical,
+        // y compris les états orphelins `.md`/index).
+        let scoped_out = tenant != "main"
+            && state
+                .search
+                .get_note(&tenant, &note_id_str)
+                .await?
+                .is_none();
+        if scoped_out {
+            // Note absente du vault du tenant → traitée comme neuve (création), pas de sonde `main`.
+        } else {
+            // Task 14 (W3) : la garde overwrite sonde le vault EFFECTIF (`tenant`), plus le
+            // singleton `main` — à OFF `state.vault` inchangé (byte-identical).
+            let reader = read_back_reader(state, &tenant)?;
+            match reader.read_note_by_id(&note_id_str).await {
+                Ok(_) => {
+                    // `.md` présent : note vivante. Sans expected_sha256 → overwrite refusé.
+                    if req.expected_sha256.is_none() {
+                        emit_write_rejection_audit(
+                            state,
+                            trust,
+                            &tenant,
+                            &locus,
+                            request_id,
+                            "rejected_409_overwrite_no_sha",
+                            Some(note_id_str),
+                        )
+                        .await;
+                        return Err(GradatumError::Conflict(
+                            "overwrite without expected_sha256".into(),
+                        ));
+                    }
+                    // expected_sha256 = Some → optimistic-lock délégué au worker (write_if_match).
                 }
-                // expected_sha256 = Some → optimistic-lock délégué au worker (write_if_match).
-            }
-            Err(gradatum_core::error::GradatumError::NoteNotFound(_)) => {
-                // `.md` absent : fantôme (indexé) ou note neuve (non indexée).
-                // Seul fantôme + sha = Some est refusé ; sinon (None, ou note neuve) on
-                // laisse passer (self-heal / création). L'appel index-level n'est payé
-                // que dans ce cas étroit (`.md` absent ET sha fourni).
-                if req.expected_sha256.is_some() && state.vault.note_indexed(&note_id_str).await? {
-                    emit_write_rejection_audit(
-                        state,
-                        trust,
-                        &tenant,
-                        &locus,
-                        request_id,
-                        "rejected_409_phantom_expected_sha",
-                        Some(note_id_str),
-                    )
-                    .await;
-                    return Err(GradatumError::Conflict(
-                        "note fantôme (.md absent) : expected_sha256 invérifiable".into(),
-                    ));
+                Err(gradatum_core::error::GradatumError::NoteNotFound(_)) => {
+                    // `.md` absent : fantôme (indexé) ou note neuve (non indexée).
+                    // Seul fantôme + sha = Some est refusé ; sinon (None, ou note neuve) on
+                    // laisse passer (self-heal / création). L'appel index-level n'est payé
+                    // que dans ce cas étroit (`.md` absent ET sha fourni).
+                    if req.expected_sha256.is_some() && reader.note_indexed(&note_id_str).await? {
+                        emit_write_rejection_audit(
+                            state,
+                            trust,
+                            &tenant,
+                            &locus,
+                            request_id,
+                            "rejected_409_phantom_expected_sha",
+                            Some(note_id_str),
+                        )
+                        .await;
+                        return Err(GradatumError::Conflict(
+                            "ghost note (.md missing): expected_sha256 unverifiable".into(),
+                        ));
+                    }
                 }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
     }
 
@@ -1926,7 +2492,7 @@ pub async fn vault_write_impl(
     if let Some(occ) = &req.occurred_at
         && gradatum_core::parse_temporal_str_as_ms(occ).is_none()
     {
-        return Err(GradatumError::InvalidInput("occurred_at invalide".into()));
+        return Err(GradatumError::InvalidInput("invalid occurred_at".into()));
     }
 
     let record = build_curate_job_record(&req, note_id_prealloc, &tenant);
@@ -1953,7 +2519,7 @@ pub async fn vault_write_impl(
         request_id: request_id.into(),
     };
     if let Err(e) = state.audit.record(audit_evt).await {
-        tracing::warn!(error = %e, "vault_write_impl: audit emit échoué — non fatal");
+        tracing::warn!(error = %e, "vault_write_impl: audit emit failed — non fatal");
     }
 
     Ok(EnqueuedResponseUlid {
@@ -2020,7 +2586,7 @@ pub async fn vault_classify_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
     let locus = locus_for_tenant(&tenant);
@@ -2031,12 +2597,15 @@ pub async fn vault_classify_impl(
     // Validation ULID — erreur 400 si invalide (avant toute I/O vault).
     if ulid::Ulid::from_string(&req.note_id).is_err() {
         return Err(GradatumError::InvalidInput(
-            "note_id invalide (ULID attendu)".into(),
+            "invalid note_id (ULID expected)".into(),
         ));
     }
 
     // Lecture de la note — 404 si absente, 500 sur erreur disque.
-    let note = state.vault.read_note_by_id(&req.note_id).await?;
+    // Task 14 (W3) : read-back routé par le vault effectif (`tenant`) — à OFF singleton `main`.
+    let note = read_back_reader(state, &tenant)?
+        .read_note_by_id(&req.note_id)
+        .await?;
     let current_section = note.frontmatter.section.to_string();
 
     // Guard identité par-agent (parité `vault_read_impl`) : `vault_classify` lit le CORPS
@@ -2105,7 +2674,7 @@ pub(crate) fn map_err_to_status_history(e: &GradatumError) -> StatusCode {
         GradatumError::Forbidden(_) => StatusCode::FORBIDDEN,
         GradatumError::InvalidInput(_) => StatusCode::BAD_REQUEST,
         GradatumError::NoteNotFound(_) => StatusCode::NOT_FOUND,
-        GradatumError::Storage(msg) if msg.contains("introuvable") || msg.contains("Not found") => {
+        GradatumError::Storage(msg) if msg.contains("not found") || msg.contains("Not found") => {
             StatusCode::NOT_FOUND
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2123,7 +2692,7 @@ pub async fn vault_history_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?;
     let locus = format!("{}/main", tenant);
     if state.acl.evaluate(trust, AclOp::Read, &locus) != AclDecision::Allow {
@@ -2148,7 +2717,11 @@ pub async fn vault_history_impl(
     )
     .await?;
 
-    let versions = state.vault.history_versions(&req.note_id).await?;
+    // Task 23 (W3) : history routé par le vault EFFECTIF (`tenant`) — `history_versions`
+    // est instance-bound (`{self.vault_id}/.history/…`). À OFF singleton `main`.
+    let versions = read_back_reader(state, tenant)?
+        .history_versions(&req.note_id)
+        .await?;
     let count = versions.len();
     Ok(VaultHistoryResponse { versions, count })
 }
@@ -2164,14 +2737,18 @@ pub async fn vault_history_get_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?;
     let locus = format!("{}/main", tenant);
     if state.acl.evaluate(trust, AclOp::Read, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
 
-    let snapshot = state.vault.history_get(&req.note_id, req.ts_ms).await?;
+    // Task 23 (W3) : history routé par le vault EFFECTIF (`tenant`) — `history_get` est
+    // instance-bound (`{self.vault_id}/.history/…`). À OFF singleton `main`.
+    let snapshot = read_back_reader(state, tenant)?
+        .history_get(&req.note_id, req.ts_ms)
+        .await?;
 
     // Guard identité par-agent (parité `vault_read_impl`) : l'historique CoW exposait
     // le corps complet d'une âme cross-agent sans aucune restriction. Section RÉELLE et
@@ -2208,8 +2785,11 @@ pub async fn vault_restore_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
-        .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?;
+    // C1 (F-63, EX-C1-1/2) : résolution write-scope — tenant JWT + grant write à flag ON.
+    let tenant_owned = effective_write_vault(state, trust, req.tenant_id.as_ref())
+        .await
+        .map_err(|r| r.into_forbidden("tenant cross mismatch"))?;
+    let tenant = tenant_owned.as_str();
     let locus = format!("{}/main", tenant);
     // Restauration = écriture → AclOp::Write.
     if state.acl.evaluate(trust, AclOp::Write, &locus) != AclDecision::Allow {
@@ -2232,7 +2812,15 @@ pub async fn vault_restore_impl(
     )
     .await?;
 
-    let content_hash = state.vault.history_restore(&req.note_id, req.ts_ms).await?;
+    // C4 (caveat C1 HAUTE, council 01KXTRART) : témoin write épinglant la restauration
+    // couche-Vault au vault vérifié — un tenant tiers ciblant l'historique d'une note de
+    // `main` par ULID → `NoteNotFound` avant tout CoW (fail-closed, note-victime intacte).
+    let checked =
+        gradatum_core::scope::AclCheckedVaultId::attest_write_checked(VaultId::new(tenant));
+    let content_hash = state
+        .vault
+        .history_restore(&checked, &req.note_id, req.ts_ms)
+        .await?;
     Ok(VaultRestoreResponse {
         note_id: req.note_id,
         ts_ms: req.ts_ms,
@@ -2251,7 +2839,7 @@ pub async fn vault_diff_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
-    let tenant = effective_tenant(trust, &req.tenant_id)
+    let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?;
     let locus = format!("{}/main", tenant);
     if state.acl.evaluate(trust, AclOp::Read, &locus) != AclDecision::Allow {
@@ -2261,7 +2849,7 @@ pub async fn vault_diff_impl(
     let is_valid_selector = |s: &str| -> bool { s == "current" || s.parse::<i64>().is_ok() };
     if !is_valid_selector(&req.a) || !is_valid_selector(&req.b) {
         return Err(GradatumError::InvalidInput(
-            "sélecteur invalide (attendu 'current' ou timestamp ms)".into(),
+            "invalid selector (expected 'current' or timestamp ms)".into(),
         ));
     }
 
@@ -2294,7 +2882,7 @@ pub async fn vault_diff_impl(
 /// Fixed section for the lesson corpus (synchronisé avec `lessons.rs`).
 const LESSONS_SECTION: &str = "lessons-learned";
 /// Single-vault tenant (synchronisé avec `lessons.rs`).
-const LESSONS_TENANT: &str = "main";
+pub(crate) const LESSONS_TENANT: &str = "main";
 
 /// Logique métier de `GET /api/v1/lessons/recall`.
 ///
@@ -2316,18 +2904,47 @@ pub async fn lessons_recall_impl(
 
     let acl_locus = format!("{LESSONS_TENANT}/{LESSONS_SECTION}");
     if state.acl.evaluate(trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
+        log_acl_deny(trust, AclOp::Read, &acl_locus, "lessons_recall");
         return Err(GradatumError::Forbidden("acl deny lessons".into()));
     }
 
     let class = params.class.trim();
     if !is_valid_lesson_class(class) {
         return Err(GradatumError::InvalidInput(format!(
-            "classe hors vocabulaire contrôlé: {class}"
+            "class outside controlled vocabulary: {class}"
         )));
     }
 
     let limit = params.limit.unwrap_or(5).clamp(1, 20) as usize;
-    let vault_id = VaultId::new(LESSONS_TENANT);
+    // A3-lessons (T12, P1) : `lessons` reste un vault GLOBAL partagé (décision du mainteneur),
+    // mais sécurisé explicitement. RÈGLE READ-PATH OFF-GATING :
+    // - OFF (défaut LIVE) : chemin legacy INCHANGÉ — l'ACL `main/lessons-learned` (évaluée
+    //   ci-dessus) a déjà statué, AUCUN grant consulté. Le témoin porte `main` (== tenant à
+    //   OFF) → chemin inchangé (hook lesson-recall.sh, F-60 JIT, MCP vault_lessons_recall).
+    // - ON : la lecture cross-tenant du `main/lessons` partagé exige un grant read EXPLICITE
+    //   du principal JWT sur le vault `main` (fail-closed). Ferme la forge silencieuse
+    //   `own_vault_checked("main")` qui, sans grant, laissait tout tenant lire le lessons de
+    //   main. Le témoin `main` est alors légitimé par le grant vérifié.
+    //   L3 (F-121) : le grant exigé porte sur la SEULE section `lessons-learned`
+    //   (`Some(LESSONS_SECTION)`) — un grant borné à cette section suffit et n'ouvre rien
+    //   d'autre de `main` ; un grant vault-entier reste évidemment couvrant. La lecture
+    //   aval est elle-même bornée à `LESSONS_SECTION` (filtre `section` des deux chemins
+    //   BM25 et sémantique ci-dessous), donc le grant ne sur-autorise pas la requête.
+    let vault_id = if state.server_config.multi_tenant.enabled {
+        let Some(principal) = trust.tenant_id() else {
+            return Err(GradatumError::Forbidden("acl deny lessons".into()));
+        };
+        crate::api_v1::tenant_guard::require_read_grant(
+            state,
+            principal.as_str(),
+            LESSONS_TENANT,
+            Some(LESSONS_SECTION),
+        )
+        .await?;
+        crate::api_v1::tenant_guard::own_vault_checked(LESSONS_TENANT)
+    } else {
+        crate::api_v1::tenant_guard::own_vault_checked(LESSONS_TENANT)
+    };
 
     // ── F-68 semantic opt-in ──────────────────────────────────────────────────
     //
@@ -2375,7 +2992,7 @@ pub async fn lessons_recall_impl(
                     .collect();
                 let hydrated = state
                     .search
-                    .hydrate_lessons_by_ulids(&vault_id, &ulid_refs)
+                    .hydrate_lessons_by_ulids(vault_id.vault_id(), &ulid_refs)
                     .await?;
 
                 // Filtres post-hydratation : codified exclu + classe correcte.
@@ -2430,7 +3047,10 @@ pub async fn lessons_recall_impl(
     }
 
     // ── Chemin BM25 (défaut) ──────────────────────────────────────────────────
-    let raw_hits = state.search.recall_lessons(&vault_id, class, limit).await?;
+    let raw_hits = state
+        .search
+        .recall_lessons(vault_id.vault_id(), class, limit)
+        .await?;
 
     // Recency boost (opt-in) — rétro-compat BLOQUANTE : None / Relevance = BM25 inchangé.
     //
@@ -2514,8 +3134,11 @@ pub async fn vault_downgrade_impl(
         return Err(GradatumError::Unauthorized);
     }
     // tenant dérivé du JWT — req.tenant_id vérifié par cohérence (cross-tenant → 403).
-    let tenant = effective_tenant(trust, &req.tenant_id)
-        .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?;
+    // C1 (F-63, EX-C1-1/2) : + grant write exigé à flag ON.
+    let tenant_owned = effective_write_vault(state, trust, req.tenant_id.as_ref())
+        .await
+        .map_err(|r| r.into_forbidden("tenant cross mismatch"))?;
+    let tenant = tenant_owned.as_str();
     let locus = format!("{tenant}/main");
     if state.acl.evaluate(trust, AclOp::Write, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny write".into()));
@@ -2541,7 +3164,7 @@ pub async fn vault_downgrade_impl(
         .map(NoteId)
         .map_err(|_| {
             GradatumError::Validation(gradatum_core::error::ValidationError::InvalidInput(
-                "note_id invalide (ULID attendu)".into(),
+                "invalid note_id (ULID expected)".into(),
             ))
         })?;
     let replaced_by = req
@@ -2550,15 +3173,19 @@ pub async fn vault_downgrade_impl(
         .map(|s| {
             ulid::Ulid::from_string(s).map(NoteId).map_err(|_| {
                 GradatumError::Validation(gradatum_core::error::ValidationError::InvalidInput(
-                    "replaced_by invalide (ULID attendu)".into(),
+                    "invalid replaced_by (ULID expected)".into(),
                 ))
             })
         })
         .transpose()?;
 
+    // C3a (EX-C3a P0) : la mutation par ULID est épinglée au vault dont l'ACL Write vient
+    // d'être vérifiée (`tenant`) — cross-vault → `NoteNotFound` (fail-closed, pas d'oracle).
+    let checked =
+        gradatum_core::scope::AclCheckedVaultId::attest_write_checked(VaultId::new(tenant));
     state
         .search
-        .downgrade_note(&note_id, &req.reason, replaced_by.as_ref())
+        .downgrade_note(&checked, &note_id, &req.reason, replaced_by.as_ref())
         .await?;
 
     let now = chrono::Utc::now().timestamp_millis();
@@ -2598,12 +3225,33 @@ pub async fn patch_note_impl(
     // Pour patch_note, le DTO n'a pas de tenant_id — on dérive directement du JWT.
     // Un contexte sans tenant (Mtls/Studio/Unauthenticated) est déjà rejeté
     // par is_authenticated() ci-dessus (Unauthenticated) ou ici (Mtls/Studio).
-    let tenant = trust.tenant_id().ok_or_else(|| {
-        GradatumError::Forbidden("contexte sans tenant — accès vault refusé".into())
-    })?;
+    // Frontière : `tenant_id()` typé `Option<&TenantId>` (Groupe B Task 3) ; ce hotspot
+    // (require_write_grant, resolve_title_section, VaultId::new, ACL locus) consomme `&str`
+    // — typage complet réservé Task 11. `.as_str()` = byte-identical.
+    let tenant = trust
+        .tenant_id()
+        .ok_or_else(|| {
+            GradatumError::Forbidden("context without tenant — vault access denied".into())
+        })?
+        .as_str();
     let locus = format!("{tenant}/main");
     if state.acl.evaluate(trust, AclOp::Write, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny write".into()));
+    }
+
+    // C3a (F-45, EX-C3a-1) : à ON, parité avec `effective_write_vault` — le DTO n'a
+    // pas de tenant_id, le vault cible EST le tenant JWT : scope write exigé, puis
+    // grant write du tenant sur son vault propre (fail-closed).
+    if state.server_config.multi_tenant.enabled {
+        use crate::api_v1::tenant_guard::{
+            TenantGuardRefusal, require_write_grant, write_scope_allowed,
+        };
+        if !write_scope_allowed(state, trust) {
+            return Err(TenantGuardRefusal::MissingWriteScope.into_forbidden("acl deny write"));
+        }
+        require_write_grant(state, tenant, tenant)
+            .await
+            .map_err(|r| r.into_forbidden("acl deny write"))?;
     }
 
     // Guard write-restrictive par-agent (parité `vault_write_impl` C6) : `patch_note` mute le
@@ -2622,6 +3270,13 @@ pub async fn patch_note_impl(
     )
     .await?;
 
+    // C3a (EX-C3a P0) + C4 (caveat C1 HAUTE, council 01KXTRART) : témoin write épinglant les
+    // mutations par ULID au vault dont l'ACL Write vient d'être vérifiée — cross-vault →
+    // `NoteNotFound`. Couvre le chemin index (`patch_note_status`) ET le chemin couche-Vault
+    // (`vault.update_note_status`, ex-scopé sur le seul tenant du Vault = vecteur tiers→main).
+    let checked =
+        gradatum_core::scope::AclCheckedVaultId::attest_write_checked(VaultId::new(tenant));
+
     // Logique métier extraite de patch_note (inchangée — contrat métier identique).
     if let Some(ref status_str) = body.status {
         let target: gradatum_core::status::NoteStatus =
@@ -2630,7 +3285,12 @@ pub async fn patch_note_impl(
 
         state
             .vault
-            .update_note_status(&note_id.to_string(), target, body.status_reason.clone())
+            .update_note_status(
+                &checked,
+                &note_id.to_string(),
+                target,
+                body.status_reason.clone(),
+            )
             .await?;
 
         // replaced_by fourni conjointement avec status → patcher via SQL direct
@@ -2641,13 +3301,13 @@ pub async fn patch_note_impl(
                 .as_deref()
                 .map(|s| {
                     ulid::Ulid::from_string(s).map(NoteId).map_err(|_| {
-                        GradatumError::InvalidInput("replaced_by invalide (ULID attendu)".into())
+                        GradatumError::InvalidInput("invalid replaced_by (ULID expected)".into())
                     })
                 })
                 .transpose()?;
             state
                 .search
-                .patch_note_status(note_id, None, None, replaced_by.as_ref())
+                .patch_note_status(&checked, note_id, None, None, replaced_by.as_ref())
                 .await?;
         }
     } else {
@@ -2657,13 +3317,14 @@ pub async fn patch_note_impl(
             .as_deref()
             .map(|s| {
                 ulid::Ulid::from_string(s).map(NoteId).map_err(|_| {
-                    GradatumError::InvalidInput("replaced_by invalide (ULID attendu)".into())
+                    GradatumError::InvalidInput("invalid replaced_by (ULID expected)".into())
                 })
             })
             .transpose()?;
         state
             .search
             .patch_note_status(
+                &checked,
                 note_id,
                 None,
                 body.status_reason.as_deref(),
@@ -2673,6 +3334,128 @@ pub async fn patch_note_impl(
     }
 
     Ok(())
+}
+
+/// Logique métier de `POST /api/v1/project-map/create-feature`.
+///
+/// Crée une **carte-feature** project-map dont le numéro `F-XX` est choisi PAR LE SERVEUR.
+/// Le client fournit le corps SANS rôle `[[feature:…]]` (mais avec les 5 autres rôles
+/// obligatoires) ; le serveur alloue le numéro **atomiquement**, l'injecte, puis enqueue
+/// l'écriture via le chemin `vault_write` existant. La réponse rend le numéro attribué + le
+/// `job_id` — l'écriture est asynchrone (confirmer via `job_status`). Le client ne voit
+/// jamais un numéro qu'il pourrait détourner : il ne le fournit pas et ne peut pas en
+/// fournir un. Ce geste unique remplace l'ancienne allocation nue en deux temps (le client
+/// ne peut plus écrire un numéro différent de celui reçu, écrire deux fois, ni ne jamais
+/// écrire).
+///
+/// ## Invariant
+///
+/// « pas de carte sans numéro, pas deux cartes avec le même » : le numéro est injecté
+/// server-side (jamais de carte sans), et l'allocation est atomique + planchée sur le max
+/// dérivé des cartes (jamais de doublon, y compris avec une carte hors-allocateur). Un
+/// numéro brûlé sans carte (job échoué) reste toléré — la séquence a déjà des trous.
+///
+/// ## Séquence (fail-closed ; allocation APRÈS validation)
+///
+/// 1. auth + résolution vault (ACL Write `{tenant}/main` + grants, miroir `vault_write`).
+/// 2. rejet si le corps porte déjà un `[[feature:…]]` (le client ne choisit pas).
+/// 3. pré-validation schéma avec un rôle feature **synthétique** — attrape un corps
+///    incomplet (project/status/kind/release/version manquant) AVANT d'allouer, pour ne
+///    pas brûler de numéro sur une erreur client.
+/// 4. allocation atomique.
+/// 5. injection de `[[feature:F-XX]]` dans le corps.
+/// 6. délégation à [`vault_write_impl`] (re-valide + enqueue).
+///
+/// # Erreurs
+///
+/// - [`GradatumError::Unauthorized`] si non authentifié.
+/// - [`GradatumError::Forbidden`] si ACL Write refusée / cross-tenant.
+/// - [`GradatumError::InvalidInput`] si le corps porte déjà un feature, ou si la carte est
+///   incomplète (400) — **aucun numéro n'est brûlé** dans ces cas.
+/// - [`GradatumError::Storage`] / [`GradatumError::Conflict`] propagées de l'allocation ou
+///   de l'enqueue.
+#[must_use = "the created card handle (number + job_id) must be used"]
+pub async fn create_feature_card_impl(
+    state: &AppState,
+    trust: &TrustContext,
+    req: crate::api_v1::dto::CreateFeatureCardRequest,
+    request_id: &str,
+) -> Result<crate::api_v1::dto::CreateFeatureCardResponse, GradatumError> {
+    if !trust.is_authenticated() {
+        return Err(GradatumError::Unauthorized);
+    }
+
+    // (1) Résolution vault + ACL Write AVANT allocation : une allocation est une mutation —
+    // ne jamais brûler un numéro pour un appelant non autorisé. Miroir `vault_write_impl`.
+    let tenant =
+        crate::api_v1::tenant_guard::effective_write_vault(state, trust, req.tenant_id.as_ref())
+            .await
+            .map_err(|r| r.into_forbidden("tenant cross mismatch"))?;
+    let locus = format!("{tenant}/main");
+    if state.acl.evaluate(trust, AclOp::Write, &locus) != AclDecision::Allow {
+        return Err(GradatumError::Forbidden("acl deny write".into()));
+    }
+
+    // (2) Le client ne doit PAS fournir de rôle feature — c'est le serveur qui l'attribue.
+    let targets = gradatum_curator::wikilinks::extract_wikilinks(&req.body);
+    if targets
+        .iter()
+        .any(|t| t.trim_start().starts_with("feature:"))
+    {
+        return Err(GradatumError::InvalidInput(
+            "create_feature_card: the body must not carry a [[feature:…]] link — \
+             the server assigns the number"
+                .into(),
+        ));
+    }
+
+    // (3) Pré-validation schéma avec un feature SYNTHÉTIQUE : attrape un corps incomplet
+    // AVANT d'allouer (un numéro n'est brûlé que si la carte est réellement enqueue).
+    let mut precheck = targets;
+    precheck.push("feature:F-00".to_string());
+    gradatum_core::project_map::validate_links_from_targets(&precheck)
+        .map_err(|e| GradatumError::InvalidInput(format!("project-map schema: {e}")))?;
+
+    // (4) Allocation atomique du numéro sur le vault résolu.
+    let vault = VaultId::new(tenant.clone());
+    let number = state.search.allocate_feature_number(&vault).await?;
+    let feature = format!("F-{number:02}");
+
+    // (5) Injection du rôle feature dans le corps (extractible par extract_wikilinks).
+    let body = format!("{}\n\n[[feature:{feature}]]", req.body);
+
+    // (6) Délégation au chemin d'écriture asynchrone existant (re-valide + enqueue).
+    let write_req = crate::api_v1::dto::VaultWriteRequest {
+        title: req.title,
+        body,
+        author: req.author,
+        tags: req.tags,
+        section_hint: Some("project-map".to_string()),
+        tenant_id: Some(gradatum_core::scope::TenantId::new(tenant)),
+        expected_sha256: None,
+        note_id: None,
+        occurred_at: req.occurred_at,
+    };
+    // ServerAllocated : le rôle [[feature:…]] vient d'être injecté après allocation atomique
+    // — il est exempté du contrat d'immuabilité (qui, sinon, refuserait toute création portant
+    // une identité feature). Voir [`FeatureWriteAuthority`].
+    let enq = vault_write_impl(
+        state,
+        trust,
+        write_req,
+        request_id,
+        FeatureWriteAuthority::ServerAllocated,
+    )
+    .await?;
+
+    tracing::debug!(number, job_id = %enq.job_id, "create_feature_card: enqueued");
+    Ok(crate::api_v1::dto::CreateFeatureCardResponse {
+        feature,
+        number,
+        job_id: enq.job_id,
+        note_id: enq.note_id,
+        poll_url: enq.poll_url,
+    })
 }
 
 /// Logique métier de `POST /api/v1/notes/{id}/move`.
@@ -2699,12 +3482,33 @@ pub async fn move_note_locus_impl(
         return Err(GradatumError::Unauthorized);
     }
     // Pour move_note_locus, le DTO n'a pas de tenant_id — dérivé du JWT.
-    let tenant = trust.tenant_id().ok_or_else(|| {
-        GradatumError::Forbidden("contexte sans tenant — accès vault refusé".into())
-    })?;
+    // Frontière : `tenant_id()` typé `Option<&TenantId>` (Groupe B Task 3) ; ce hotspot
+    // (require_write_grant, resolve_title_section, VaultId::new, ACL locus) consomme `&str`
+    // — typage complet réservé Task 11. `.as_str()` = byte-identical.
+    let tenant = trust
+        .tenant_id()
+        .ok_or_else(|| {
+            GradatumError::Forbidden("context without tenant — vault access denied".into())
+        })?
+        .as_str();
     let acl_locus = format!("{tenant}/main");
     if state.acl.evaluate(trust, AclOp::Write, &acl_locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny write".into()));
+    }
+
+    // C3a (F-45, EX-C3a-1) : à ON, parité avec `effective_write_vault` — le DTO n'a
+    // pas de tenant_id, le vault cible EST le tenant JWT : scope write exigé, puis
+    // grant write du tenant sur son vault propre (fail-closed).
+    if state.server_config.multi_tenant.enabled {
+        use crate::api_v1::tenant_guard::{
+            TenantGuardRefusal, require_write_grant, write_scope_allowed,
+        };
+        if !write_scope_allowed(state, trust) {
+            return Err(TenantGuardRefusal::MissingWriteScope.into_forbidden("acl deny write"));
+        }
+        require_write_grant(state, tenant, tenant)
+            .await
+            .map_err(|r| r.into_forbidden("acl deny write"))?;
     }
 
     // Guard write-restrictive par-agent (parité `vault_write_impl` C6) : `move_locus`
@@ -2715,7 +3519,12 @@ pub async fn move_note_locus_impl(
     let (title, section) = resolve_title_section_failclosed(state, tenant, id).await;
     enforce_identity_write_guard(state, trust, tenant, &section, title.as_deref(), id).await?;
 
-    state.vault.move_locus(id, &locus).await?;
+    // C4 (caveat C1 HAUTE, council 01KXTRART) : témoin write épinglant la relocalisation
+    // couche-Vault au vault dont l'ACL Write vient d'être vérifiée (`tenant`) — un tenant
+    // tiers ciblant une note de `main` par ULID → `NoteNotFound` (fail-closed, pas d'oracle).
+    let checked =
+        gradatum_core::scope::AclCheckedVaultId::attest_write_checked(VaultId::new(tenant));
+    state.vault.move_locus(&checked, id, &locus).await?;
     Ok(())
 }
 
@@ -2795,6 +3604,7 @@ mod tests {
             sub: "agent".into(),
             scopes: vec!["read".into()],
             tenant_id: "main".into(),
+            jti: None,
         };
         assert!(
             trust.is_authenticated(),

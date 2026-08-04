@@ -232,9 +232,19 @@ async fn patch_note(
     // applique d'abord la transition d'état, puis fusionne les tags sur la note résultante.
     // Note : add_tags n'est pas soumis à l'ACL séparément (couverte par patch_note_impl).
     if let Some(tags) = validated_tags {
+        // C4 (caveat C1 HAUTE, council 01KXTRART) : témoin write épinglant l'ajout de tags
+        // couche-Vault au vault du tenant JWT — un tenant tiers ciblant une note de `main`
+        // par ULID → `NoteNotFound` (fail-closed). Le tenant est garanti présent : patch_note_impl
+        // ci-dessus a déjà refusé les contextes sans tenant (403).
+        // Frontière : `tenant_id()` typé `Option<&TenantId>` (Task 3). `.as_str()` →
+        // `VaultId::new` inchangé (typage complet du call-site réservé aux tasks aval).
+        let tenant = trust.tenant_id().ok_or(StatusCode::FORBIDDEN)?.as_str();
+        let checked = gradatum_core::scope::AclCheckedVaultId::attest_write_checked(
+            gradatum_core::scope::VaultId::new(tenant),
+        );
         state
             .vault
-            .add_tags(&note_id.to_string(), &tags)
+            .add_tags(&checked, &note_id.to_string(), &tags)
             .await
             .map_err(|e| match e {
                 GradatumError::NoteNotFound(_) => StatusCode::NOT_FOUND,
@@ -303,7 +313,7 @@ async fn move_note_locus(
 
     // Validation stricte du locus cible (parse-don't-validate à la frontière).
     let locus = LocusId::parse(body.locus.trim()).map_err(|e| {
-        tracing::warn!(locus = %body.locus, err = %e, "move_note_locus: locus invalide");
+        tracing::warn!(locus = %body.locus, err = %e, "move_note_locus: invalid locus");
         StatusCode::BAD_REQUEST
     })?;
 

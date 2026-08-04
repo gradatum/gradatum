@@ -81,7 +81,7 @@ pub async fn handler(State(s): State<AppState>) -> Json<HealthPayload> {
     // F-37 S1.3 / T12 — queue_depth réel = jobs `Pending` (GROUP BY status).
     let queue_depth: u64 = s
         .job_store
-        .count_jobs_by_status()
+        .count_jobs_by_status(None)
         .await
         .map(|m| m.get(&JobStatus::Pending).copied().unwrap_or(0))
         .unwrap_or(0);

@@ -2,16 +2,19 @@
 //!
 //! Endpoints lecture-seule :
 //! - `GET /internal/v1/note/:ulid`              — note complète (vault)
+//! - `GET /internal/v1/note/:ulid/status`       — statut scopé par vault (index, TOCTOU purge)
 //! - `GET /internal/v1/note/:ulid/embedding`    — vecteur embedding (index)
 //! - `GET /internal/v1/note/:ulid/trust`        — score trust (index)
 //! - `GET /internal/v1/title-lookup`            — lookup ULID par titre (index)
 //! - `GET /internal/v1/notes/by-locus`          — notes par préfixe locus (index)
+//! - `GET /internal/v1/notes/count-unprocessed` — comptage notes live non-processed (F-112)
 //! - `GET /internal/v1/notes/by-status`         — notes par statut (index)
 //! - `GET /internal/v1/notes/garbage`           — notes Garbage expirées (index)
 //! - `GET /internal/v1/forget/search`           — FTS5 pour scope Topic forget (index)
 //! - `GET /internal/v1/notes/by-agent`          — notes par agent (index)
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -71,6 +74,19 @@ pub(crate) struct TrustReadResponse {
     pub trust: f32,
 }
 
+/// Réponse lecture statut scopé (index).
+///
+/// `status` est `None` si la note est absente du vault ciblé (l'endpoint reste `200`,
+/// jamais `404` : « absence » est une information, pas une erreur — le worker de purge
+/// la traite comme un skip, cf. `handle_note_status`).
+#[derive(Debug, Serialize)]
+pub(crate) struct NoteStatusResponse {
+    /// ULID de la note.
+    pub note_id: String,
+    /// Statut courant (kebab-case, ex. `garbage`, `live`), ou `None` si absente du vault.
+    pub status: Option<String>,
+}
+
 /// Réponse title-lookup.
 #[derive(Debug, Serialize)]
 pub(crate) struct TitleLookupResponse {
@@ -101,6 +117,13 @@ pub(crate) struct NoteListResponse {
     pub note_ids: Vec<NoteIdDto>,
 }
 
+/// Réponse comptage (F-112 `count-unprocessed`).
+#[derive(Debug, Serialize)]
+pub(crate) struct CountResponse {
+    /// Nombre de notes correspondant au filtre (plafonné à `min` si fourni).
+    pub count: u64,
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[allow(clippy::result_large_err)]
@@ -108,7 +131,7 @@ fn parse_ulid(s: &str) -> Result<NoteId, Response> {
     Ulid::from_string(s).map(NoteId).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
-            format!("ULID invalide : {s:?} — {e}"),
+            format!("invalid ULID: {s:?} — {e}"),
         )
             .into_response()
     })
@@ -123,12 +146,12 @@ fn parse_ulid(s: &str) -> Result<NoteId, Response> {
 ///
 /// - `(StatusCode::BAD_REQUEST, message)` si la longueur dépasse `max`.
 #[allow(clippy::result_large_err)]
-fn validate_param_len(param: &str, max: usize, name: &str) -> Result<(), Response> {
+pub(super) fn validate_param_len(param: &str, max: usize, name: &str) -> Result<(), Response> {
     if param.len() > max {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "paramètre `{name}` trop long ({} > {max} octets)",
+                "parameter `{name}` too long ({} > {max} bytes)",
                 param.len()
             ),
         )
@@ -161,8 +184,38 @@ fn parse_note_status(s: &str) -> Result<NoteStatus, Response> {
         "staging" => Ok(NoteStatus::Staging),
         "garbage" => Ok(NoteStatus::Garbage),
         "archived" | "deprecated" => Ok(NoteStatus::Deprecated),
-        _ => Err((StatusCode::BAD_REQUEST, format!("statut invalide : {s:?}")).into_response()),
+        _ => Err((StatusCode::BAD_REQUEST, format!("invalid status: {s:?}")).into_response()),
     }
+}
+
+/// Résout le handle de read-back pour un endpoint interne, **gaté sur `multi_tenant`**
+/// (évite le split-brain read-back).
+///
+/// - `multi_tenant.enabled = false` (défaut LIVE) → singleton `state.vault` inchangé
+///   (byte-identical : un seul vault physique, aucun split-brain possible).
+/// - `enabled = true` → route via le registre `state.vaults.resolve` sur le `vault_id`
+///   effectif (`vault` absent → `"main"`), **fail-closed** : vault inconnu → 500, JAMAIS
+///   un repli silencieux sur `main`.
+///
+/// `vault` provient d'un query param (frontière non fiable) → [`VaultId::parse`] (400 si
+/// malformé), aligné sur `effective_read_vault`.
+#[allow(clippy::result_large_err)]
+fn resolve_read_back_reader(
+    state: &AppState,
+    vault: Option<&str>,
+) -> Result<Arc<dyn gradatum_vault::Registry>, Response> {
+    if !state.server_config.multi_tenant.enabled {
+        return Ok(Arc::clone(&state.vault));
+    }
+    let vid = VaultId::parse(vault.unwrap_or("main"))
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid vault_id: {e}")).into_response())?;
+    state.vaults.resolve(&vid).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("vault routing failed: {e}"),
+        )
+            .into_response()
+    })
 }
 
 // ── Handlers existants ────────────────────────────────────────────────────────
@@ -171,19 +224,32 @@ fn parse_note_status(s: &str) -> Result<NoteStatus, Response> {
 ///
 /// ## Réponses
 ///
+/// ## Query params
+///
+/// - `vault_id` (optionnel, défaut `"main"`) — vault de résolution du read-back.
+///   Honoré uniquement à `multi_tenant.enabled = true` ; à OFF le singleton `main` reste
+///   inline (byte-identical).
+///
 /// - `200` + JSON [`NoteReadResponse`] si la note existe.
 /// - `404` si la note est absente du vault.
-/// - `400` si l'ULID est invalide.
-/// - `500` pour toute erreur I/O inattendue.
+/// - `400` si l'ULID (ou le `vault_id`) est invalide.
+/// - `500` pour toute erreur I/O inattendue (ou vault_id inconnu du registre — fail-closed).
 pub(crate) async fn handle_note_read(
     State(state): State<AppState>,
     Path(ulid): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     // Validate ULID format first (400 on invalid, before any I/O).
     if let Err(e) = parse_ulid(&ulid) {
         return e;
     }
-    match state.vault.read_note_by_id(&ulid).await {
+    // Task 14 (W3) : read-back routé par le vault effectif (fail-closed à ON, singleton à OFF).
+    let reader = match resolve_read_back_reader(&state, params.get("vault_id").map(String::as_str))
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match reader.read_note_by_id(&ulid).await {
         Ok(note) => {
             let sha256_hex = note.content_hash.hex();
             let tags: Vec<String> = note
@@ -211,11 +277,62 @@ pub(crate) async fn handle_note_read(
             .into_response()
         }
         Err(GradatumError::NoteNotFound(_)) => {
-            (StatusCode::NOT_FOUND, format!("note introuvable : {ulid}")).into_response()
+            (StatusCode::NOT_FOUND, format!("note not found: {ulid}")).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("lecture note échouée : {e}"),
+            format!("note read failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /internal/v1/note/:ulid/status` — lecture du statut d'une note depuis l'INDEX,
+/// **scopée par vault** (C4-1e W3, TOCTOU purge).
+///
+/// Contrairement à `handle_note_read` (qui lit le `.md` du vault via le singleton `main`),
+/// ce handler interroge `IndexStore::get_note_status(vault_id, id)` — la **même source
+/// que `list_garbage`** — filtrée `WHERE vault_id = ?1 AND id = ?2`. Il ferme la fenêtre
+/// TOCTOU cross-vault de la purge : la re-vérification de statut du candidat se fait dans
+/// SON vault, plus dans `main`.
+///
+/// ## Query params
+///
+/// - `vault_id` (optionnel, défaut `"main"`) — vault de résolution du statut. À flag OFF
+///   le worker émet `main` (ou rien) → byte-identical au comportement mono-vault.
+///
+/// ## Réponses
+///
+/// - `200` + JSON [`NoteStatusResponse`] : `status = Some(..)` si la note existe dans le
+///   vault ciblé, `status = None` si absente. **L'absence n'est PAS un `404`** — c'est une
+///   information exploitable (le worker de purge skip la note).
+/// - `400` si l'ULID est invalide.
+/// - `500` pour toute erreur I/O inattendue.
+pub(crate) async fn handle_note_status(
+    State(state): State<AppState>,
+    Path(ulid): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    // Valider le format ULID d'abord (400 avant toute I/O).
+    if let Err(e) = parse_ulid(&ulid) {
+        return e;
+    }
+
+    // C4-1e (W3) : vault de résolution optionnel, défaut "main" (byte-identical à OFF).
+    let vault_id = params.get("vault_id").map(String::as_str).unwrap_or("main");
+    if let Err(r) = validate_param_len(vault_id, 256, "vault_id") {
+        return r;
+    }
+
+    match state.search.get_note_status(vault_id, &ulid).await {
+        Ok(status) => Json(NoteStatusResponse {
+            note_id: ulid,
+            status: status.map(|s| s.to_string()),
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("get_note_status failed: {e}"),
         )
             .into_response(),
     }
@@ -225,6 +342,11 @@ pub(crate) async fn handle_note_read(
 ///
 /// L'`embedder_id` est passé en query-param `?embedder_id=<id>`.
 /// Si absent, utilise `"default"` comme fallback.
+///
+/// ## Query params
+///
+/// - `vault_id` (optionnel, défaut `"main"`) — vault de résolution de l'embedding (C4-1e
+///   Slice E). Un worker antérieur, sans le param, reste byte-identical (défaut main).
 ///
 /// ## Réponses
 ///
@@ -247,9 +369,13 @@ pub(crate) async fn handle_note_embedding(
         .unwrap_or("default")
         .to_string();
 
+    // C4-1e (Slice E) EXPAND : `vault_id` optionnel, défaut "main" (un worker antérieur,
+    // sans le param, reste byte-identical). Non requis — jamais de 400 sans param.
+    let vault_id = params.get("vault_id").map(String::as_str).unwrap_or("main");
+
     match state
         .search
-        .get_note_embedding(&note_id, &embedder_id)
+        .get_note_embedding(vault_id, &note_id, &embedder_id)
         .await
     {
         Ok(Some(vector)) => {
@@ -264,18 +390,22 @@ pub(crate) async fn handle_note_embedding(
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            format!("embedding absent pour : {ulid}"),
+            format!("embedding absent for: {ulid}"),
         )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("get_note_embedding échoué : {e}"),
+            format!("get_note_embedding failed: {e}"),
         )
             .into_response(),
     }
 }
 
 /// `GET /internal/v1/note/:ulid/trust` — lecture score trust depuis l'index.
+///
+/// ## Query params
+///
+/// - `vault_id` (optionnel, défaut `"main"`) — vault de résolution du trust (C4-1e Slice B).
 ///
 /// ## Réponses
 ///
@@ -286,22 +416,48 @@ pub(crate) async fn handle_note_embedding(
 pub(crate) async fn handle_note_trust(
     State(state): State<AppState>,
     Path(ulid): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let note_id = match parse_ulid(&ulid) {
         Ok(id) => id,
         Err(e) => return e,
     };
 
-    match state.search.get_trust(&note_id).await {
+    // C4-1e (Slice B) EXPAND : `vault_id` optionnel, défaut "main" (un worker antérieur,
+    // sans le param, reste byte-identical). Non requis — le contract final relève d'une
+    // slice ultérieure.
+    let vault_id = params.get("vault_id").map(String::as_str).unwrap_or("main");
+
+    match state.search.get_trust(vault_id, &note_id).await {
         Ok(Some(trust)) => Json(TrustReadResponse {
             note_id: ulid,
             trust,
         })
         .into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, format!("trust absent pour : {ulid}")).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, format!("trust absent for: {ulid}")).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("get_trust échoué : {e}"),
+            format!("get_trust failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /internal/v1/vaults/active` — vaults actifs (`tenants.status='active'`, triés).
+///
+/// Source d'itération des crons per-vault du worker à `multi_tenant.enabled = true`
+/// (C2, EX-C2-3 / INV-JOB-SCOPE). À OFF le worker n'appelle pas cet endpoint.
+///
+/// ## Réponses
+///
+/// - `200` + JSON `Vec<String>` (au minimum `["main"]` après migration 0030).
+/// - `500` sur erreur SQLite.
+pub(crate) async fn handle_active_vaults(State(state): State<AppState>) -> Response {
+    match state.search.list_active_vaults().await {
+        Ok(vaults) => Json(vaults).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list_active_vaults failed: {e}"),
         )
             .into_response(),
     }
@@ -331,7 +487,7 @@ pub(crate) async fn handle_title_lookup(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `title` manquant".to_string(),
+                "missing `title` parameter".to_string(),
             )
                 .into_response();
         }
@@ -344,7 +500,7 @@ pub(crate) async fn handle_title_lookup(
         Ok(note_id) => Json(TitleLookupResponse { note_id }).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("title_lookup échoué : {e}"),
+            format!("title_lookup failed: {e}"),
         )
             .into_response(),
     }
@@ -372,7 +528,7 @@ pub(crate) async fn handle_id_lookup(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `note_id` manquant".to_string(),
+                "missing `note_id` parameter".to_string(),
             )
                 .into_response();
         }
@@ -386,7 +542,7 @@ pub(crate) async fn handle_id_lookup(
         Ok(note_id) => Json(IdLookupResponse { note_id }).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("id_lookup échoué : {e}"),
+            format!("id_lookup failed: {e}"),
         )
             .into_response(),
     }
@@ -410,7 +566,7 @@ pub(crate) async fn handle_notes_by_locus(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `vault` manquant".to_string(),
+                "missing `vault` parameter".to_string(),
             )
                 .into_response();
         }
@@ -423,7 +579,7 @@ pub(crate) async fn handle_notes_by_locus(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `prefix` manquant".to_string(),
+                "missing `prefix` parameter".to_string(),
             )
                 .into_response();
         }
@@ -442,10 +598,113 @@ pub(crate) async fn handle_notes_by_locus(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("list_notes_by_locus_prefix échoué : {e}"),
+            format!("list_notes_by_locus_prefix failed: {e}"),
         )
             .into_response(),
     }
+}
+
+/// `GET /internal/v1/notes/count-unprocessed?vault=<v>&locus=<l>&min=<n>` —
+/// compte les notes `live` non-`processed` d'un locus (pression de consolidation F-112).
+///
+/// Réutilise le chemin de récupération de [`handle_notes_by_locus`] (index → IDs de notes)
+/// puis lit le frontmatter de chaque note pour filtrer `status == Live && !processed`
+/// (`processed` vit dans `extra["processed"]`, pas une colonne SQL). Coût `O(N)` par locus
+/// (une lecture vault par note) — assumé pour le cron distill hebdomadaire (F-112).
+///
+/// Le paramètre optionnel `min` plafonne le comptage : dès que `min` notes correspondantes
+/// sont trouvées, le comptage s'arrête (early-exit) et retourne `{"count": min}`. Le cron
+/// n'a besoin que de savoir si la pression atteint `pressure_min`, pas le total exact.
+/// `min` absent = compte toutes les notes correspondantes.
+///
+/// ## Réponses
+///
+/// - `200` + JSON [`CountResponse`].
+/// - `400` si `vault` ou `locus` est absent.
+/// - `500` pour toute erreur I/O inattendue.
+pub(crate) async fn handle_count_unprocessed(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let vault = match params.get("vault") {
+        Some(v) => v.as_str(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "missing `vault` parameter".to_string(),
+            )
+                .into_response();
+        }
+    };
+    if let Err(r) = validate_param_len(vault, 256, "vault") {
+        return r;
+    }
+    let locus = match params.get("locus") {
+        Some(l) => l.as_str(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "missing `locus` parameter".to_string(),
+            )
+                .into_response();
+        }
+    };
+    if let Err(r) = validate_param_len(locus, 512, "locus") {
+        return r;
+    }
+    // `min` optionnel : plafond d'early-exit. Absent ou non-parseable → aucun plafond.
+    let min: Option<u64> = params.get("min").and_then(|s| s.parse::<u64>().ok());
+
+    let rows = match state.search.list_notes_by_locus_prefix(vault, locus).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list_notes_by_locus_prefix failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    // Task 14 (W3) : read-back routé par le vault effectif (`vault` du query param) — à OFF
+    // singleton `main` inchangé (byte-identical), à ON le corps lu provient du bon vault.
+    let reader = match resolve_read_back_reader(&state, Some(vault)) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let mut count: u64 = 0;
+    for (note_id, _section) in rows {
+        match reader.read_note_by_id(&note_id).await {
+            Ok(note) => {
+                let is_live = note.frontmatter.status == NoteStatus::Live;
+                let processed = note
+                    .frontmatter
+                    .extra
+                    .get("processed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_live && !processed {
+                    count += 1;
+                    // Early-exit : le cron ne compare le résultat qu'à `min` (pressure_min).
+                    if min.is_some_and(|m| count >= m) {
+                        break;
+                    }
+                }
+            }
+            // Skew index/vault (note indexée mais `.md` absent) → ignorée, best-effort.
+            Err(GradatumError::NoteNotFound(_)) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("count-unprocessed read failed: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    Json(CountResponse { count }).into_response()
 }
 
 /// `GET /internal/v1/notes/by-status?vault=<v>&status=<s>` — notes par statut.
@@ -466,7 +725,7 @@ pub(crate) async fn handle_notes_by_status(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `vault` manquant".to_string(),
+                "missing `vault` parameter".to_string(),
             )
                 .into_response();
         }
@@ -479,7 +738,7 @@ pub(crate) async fn handle_notes_by_status(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `status` manquant".to_string(),
+                "missing `status` parameter".to_string(),
             )
                 .into_response();
         }
@@ -506,7 +765,7 @@ pub(crate) async fn handle_notes_by_status(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("list_by_status échoué : {e}"),
+            format!("list_by_status failed: {e}"),
         )
             .into_response(),
     }
@@ -531,7 +790,7 @@ pub(crate) async fn handle_notes_garbage(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `vault` manquant".to_string(),
+                "missing `vault` parameter".to_string(),
             )
                 .into_response();
         }
@@ -544,7 +803,7 @@ pub(crate) async fn handle_notes_garbage(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `before_ms` manquant ou invalide (i64 requis)".to_string(),
+                "missing or invalid `before_ms` parameter (i64 required)".to_string(),
             )
                 .into_response();
         }
@@ -569,7 +828,7 @@ pub(crate) async fn handle_notes_garbage(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("list_garbage_older_than échoué : {e}"),
+            format!("list_garbage_older_than failed: {e}"),
         )
             .into_response(),
     }
@@ -593,7 +852,7 @@ pub(crate) async fn handle_forget_search(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `vault` manquant".to_string(),
+                "missing `vault` parameter".to_string(),
             )
                 .into_response();
         }
@@ -606,7 +865,7 @@ pub(crate) async fn handle_forget_search(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `query` manquant".to_string(),
+                "missing `query` parameter".to_string(),
             )
                 .into_response();
         }
@@ -619,7 +878,7 @@ pub(crate) async fn handle_forget_search(
 
     match state
         .search
-        .search_fts_for_forget(vault, query, limit)
+        .search_fts_for_forget(&VaultId::new(vault), query, limit)
         .await
     {
         Ok(rows) => {
@@ -631,7 +890,7 @@ pub(crate) async fn handle_forget_search(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("search_fts_for_forget échoué : {e}"),
+            format!("search_fts_for_forget failed: {e}"),
         )
             .into_response(),
     }
@@ -656,7 +915,7 @@ pub(crate) async fn handle_notes_by_agent(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "paramètre `agent` manquant".to_string(),
+                "missing `agent` parameter".to_string(),
             )
                 .into_response();
         }
@@ -676,7 +935,7 @@ pub(crate) async fn handle_notes_by_agent(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("list_notes_by_agent échoué : {e}"),
+            format!("list_notes_by_agent failed: {e}"),
         )
             .into_response(),
     }

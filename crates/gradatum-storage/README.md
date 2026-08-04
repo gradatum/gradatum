@@ -2,7 +2,7 @@
 
 > Storage trait abstraction with OpenDAL filesystem backend and NFS rejection guard.
 
-**Status**: 0.7.6 — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -18,11 +18,12 @@ partitions. `FileStorage::new()` calls this check automatically.
 
 ```toml
 [dependencies]
-gradatum-storage = "0.7.6"
+gradatum-storage = "1.0.0"
 ```
 
 ```rust
 use gradatum_storage::FileStorage;
+use gradatum_storage::Storage; // `read` is a trait method
 use std::path::Path;
 
 let storage = FileStorage::new(Path::new("/var/lib/gradatum/vault"))?;

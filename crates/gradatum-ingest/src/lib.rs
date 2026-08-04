@@ -17,22 +17,22 @@
 //! | Feature          | Language   | Entry point              |
 //! |------------------|------------|--------------------------|
 //! | `code-rust`      | Rust       | [`parse_rust_file`]      |
-//! | `code-python`    | Python     | [`parse_python_file`]    |
-//! | `code-bash`      | Bash       | [`parse_bash_file`]      |
-//! | `code-typescript`| TypeScript | [`parse_typescript_file`]|
+//! | `code-python`    | Python     | `parse_python_file`      |
+//! | `code-bash`      | Bash       | `parse_bash_file`        |
+//! | `code-typescript`| TypeScript | `parse_typescript_file`  |
 //!
 //! `code-rust` is enabled by default. The remaining parsers are opt-in.
 //!
-//! ## API stability
+//! ## Stability
 //!
-//! **This crate is published but the API is not yet stable.** The `parse_<lang>_file`
-//! functions, [`DerivedSymbol`], and [`build_derived_notes`] are internal pipeline APIs
-//! consumed by `gradatum-worker` and `gradatum-admin`. Their signatures may change across
-//! minor versions as new language parsers or symbol kinds are added.
+//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
+//! additions only within `1.x`, breaking changes deferred to the next major. See
+//! [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 //!
-//! External consumers should not depend on this crate directly — it is an implementation
-//! detail of the gradatum stack. No SemVer stability is guaranteed for these APIs until
-//! a `v1.0` release is published.
+//! That said, the `parse_<lang>_file` functions, [`DerivedSymbol`] and
+//! [`build_derived_notes`] are pipeline APIs consumed by `gradatum-worker` and
+//! `gradatum-admin`. They are an implementation detail of the gradatum stack, and
+//! external consumers are advised not to depend on this crate directly.
 //!
 //! ## Pipeline
 //!

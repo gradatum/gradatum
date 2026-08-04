@@ -1,4 +1,4 @@
-//! Harness d'évaluation Task 10 — preuve d'apport RRF+composite vs baseline FTS-only.
+//! Harness d'évaluation — preuve d'apport RRF+composite vs baseline FTS-only.
 //!
 //! ## Philosophie TDD honnête
 //!
@@ -535,7 +535,7 @@ pub async fn seed_eval_corpus(
 
         let note_id =
             NoteId(Ulid::from_string(&ulid_str).expect("seed_eval_corpus: ULID parse — invariant"));
-        idx.upsert_note_title(&note_id, note.title)
+        idx.upsert_note_title("main", &note_id, note.title)
             .await
             .expect("seed_eval_corpus: upsert_note_title");
 
@@ -630,7 +630,7 @@ pub async fn run_eval(
 ) -> EvalReport {
     use gradatum_server::context::retrieval::retrieve_candidates;
 
-    let vault_id = VaultId::new("main");
+    let vault_id = gradatum_core::scope::AclCheckedVaultId::for_system_task(VaultId::new("main"));
     let mut total_precision = 0.0_f64;
     let mut total_recall = 0.0_f64;
     let n = DATASET.len();

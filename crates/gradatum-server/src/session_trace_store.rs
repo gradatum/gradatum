@@ -27,12 +27,26 @@
 //!
 //! `rusqlite::Connection` is neither `Send` nor `Sync` → wrapped in
 //! `Arc<Mutex<Connection>>` (Tokio mutex). Locks held for the minimum scope.
+//!
+//! ## Dimension de scope — per-PRINCIPAL (`TenantId`)
+//!
+//! `session_trace` est un journal d'audit **par principal** : `tenant_id` provient du JWT
+//! (jamais du body), `agent_id = JWT sub`. La dimension est donc le **principal**
+//! ([`gradatum_core::scope::TenantId`]), PAS le namespace vault. Ce store n'est donc **pas**
+//! une surface d'isolation vault : son isolation est per-principal et déjà assurée
+//! par la clause `WHERE tenant_id = ?`.
+//!
+//! Le cœur d'écriture [`SessionTraceStore::insert_at`] est typé `&TenantId`. Les
+//! façades [`SessionTraceStore::insert_trace`] / [`SessionTraceStore::mark_sent`] restent
+//! `&str`-facing car leurs appelants (`session_log.rs`, `context/*`) tiennent une
+//! chaîne brute ; elles construisent un `TenantId` en interne (byte-identical).
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use gradatum_core::scope::TenantId;
 use rusqlite::{Connection, OpenFlags, params};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -44,7 +58,7 @@ pub enum SessionTraceError {
     #[error("session_trace SQLite : {0}")]
     Sqlite(#[from] rusqlite::Error),
     /// Blocking thread failed (panic or cancellation) — cannot happen in practice.
-    #[error("session_trace thread blocking échoué")]
+    #[error("session_trace blocking thread failed")]
     Blocking,
 }
 
@@ -262,29 +276,31 @@ impl SessionTraceStore {
     /// # Errors
     ///
     /// `SessionTraceError::Sqlite` on database error.
-    #[must_use = "le rowid retourné fait partie du contrat de réponse de l'endpoint"]
+    #[must_use = "the returned rowid is part of the endpoint's response contract"]
     pub async fn insert_trace(
         &self,
         tenant_id: &str,
         r: &SessionTraceRow,
     ) -> Result<i64, SessionTraceError> {
         let now = system_now_ms();
-        self.insert_at(tenant_id, r, now).await
+        // Façade `&str` (appelant W2 `session_log.rs`) → cœur typé (byte-identical).
+        self.insert_at(&TenantId::new(tenant_id), r, now).await
     }
 
     /// Inserts a row with an explicit `created_at` (for testing).
     ///
     /// See [`SessionTraceStore::insert_trace`] for semantics. An explicit `created_at`
     /// allows tests to simulate old rows (age-based purge).
-    #[must_use = "le rowid retourné fait partie du contrat de réponse de l'endpoint"]
+    #[must_use = "the returned rowid is part of the endpoint's response contract"]
     pub async fn insert_at(
         &self,
-        tenant_id: &str,
+        tenant_id: &TenantId,
         r: &SessionTraceRow,
         created_at: i64,
     ) -> Result<i64, SessionTraceError> {
         let conn = Arc::clone(&self.conn);
-        let tenant = tenant_id.to_owned();
+        // Byte-identical : `tenant_id` (principal) lie la colonne SQL `tenant_id`.
+        let tenant = tenant_id.as_str().to_owned();
         let r = r.clone();
 
         let id = tokio::task::spawn_blocking(move || {
@@ -422,7 +438,8 @@ impl SessionTraceStore {
             marker: Some(bounded),
             ref_: None,
         };
-        self.insert_at(tenant, &row, now_ms).await?;
+        // Façade `&str` (appelant W2 `context/*`) → cœur typé (byte-identical).
+        self.insert_at(&TenantId::new(tenant), &row, now_ms).await?;
         Ok(())
     }
 
@@ -586,7 +603,7 @@ impl SessionTraceStore {
 fn system_now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("horloge système avant epoch UNIX — invariant système")
+        .expect("system clock before UNIX epoch — system invariant")
         .as_millis() as i64
 }
 
@@ -660,7 +677,9 @@ mod tests {
         let s = SessionTraceStore::open_in_memory()
             .await
             .expect("open in-memory");
-        s.insert_at("main", &row(), 0).await.expect("insert old"); // created_at=0 (vieux)
+        s.insert_at(&TenantId::new("main"), &row(), 0)
+            .await
+            .expect("insert old"); // created_at=0 (vieux)
         s.insert_trace("main", &row()).await.expect("insert now"); // created_at=now
         // cutoff_ms=1000 (la row created_at=0 est en-dessous), max_rows haut.
         let removed = s.purge(1_000, 1_000_000).await.expect("purge");
@@ -675,7 +694,9 @@ mod tests {
             .expect("open in-memory");
         // 4 lignes created_at=now ; cutoff=0 (rien par âge) ; cap=2 → 2 supprimées.
         for i in 0..4 {
-            s.insert_at("main", &row(), 100 + i).await.expect("insert");
+            s.insert_at(&TenantId::new("main"), &row(), 100 + i)
+                .await
+                .expect("insert");
         }
         let removed = s.purge(0, 2).await.expect("purge cap");
         assert_eq!(removed, 2, "5-3 ... ici 4-2 = 2 lignes supprimées par cap");
@@ -692,6 +713,52 @@ mod tests {
         let removed = s.purge(0, 1_000_000).await.expect("purge noop");
         assert_eq!(removed, 0);
         assert_eq!(s.count().await.expect("count"), 1);
+    }
+
+    /// Isolation per-principal du cœur d'écriture typé `insert_at`.
+    ///
+    /// Une trace écrite sous le principal `tenant-b` n'est jamais visible depuis `main`
+    /// (et réciproquement). Rouge par construction avant le typage (l'API `&TenantId`
+    /// n'existait pas) ; prouve que le typage scope bien la colonne `tenant_id`.
+    #[tokio::test]
+    async fn insert_at_is_principal_scoped() {
+        let s = SessionTraceStore::open_in_memory()
+            .await
+            .expect("open in-memory");
+        s.insert_at(&TenantId::new("main"), &row(), 100)
+            .await
+            .expect("insert main");
+        s.insert_at(&TenantId::new("tenant-b"), &row(), 100)
+            .await
+            .expect("insert tenant-b");
+
+        let q_main = TraceQuery {
+            tenant_id: "main".into(),
+            action_type: None,
+            agent_id: None,
+            session_id: None,
+            from_ms: None,
+            to_ms: None,
+            cursor: None,
+            limit: 100,
+        };
+        let rows_main = s.query_traces(&q_main).await.expect("query main");
+        assert_eq!(
+            rows_main.len(),
+            1,
+            "seule la trace du principal `main` est visible"
+        );
+
+        let q_b = TraceQuery {
+            tenant_id: "tenant-b".into(),
+            ..q_main.clone()
+        };
+        let rows_b = s.query_traces(&q_b).await.expect("query tenant-b");
+        assert_eq!(
+            rows_b.len(),
+            1,
+            "seule la trace du principal `tenant-b` est visible"
+        );
     }
 
     // --- Tests sent-tracker (Task 5) ---
@@ -786,7 +853,7 @@ mod tests {
             ref_: None,
         };
         store
-            .insert_at(tenant, &row, created)
+            .insert_at(&TenantId::new(tenant), &row, created)
             .await
             .expect("insert_normal")
     }

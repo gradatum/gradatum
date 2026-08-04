@@ -5,6 +5,15 @@
 //! - `gateway_request_duration_seconds_sum/count{route,model_alias}` — summary
 //! - `gateway_providers_configured` — gauge
 //! - `gateway_uptime_seconds` — gauge
+//! - `gateway_router_decisions_total{source}` — counter (routing decision per source)
+//! - `gateway_router_fallback_total{reason}` — counter (no-think fallback per reason)
+//! - `gateway_router_curator_latency_seconds` — histogram (curator sub-path, metric 1)
+//! - `gateway_router_system_latency_seconds` — histogram (system decision, metric 2, SLA)
+//!
+//! The four `router`/`fallback` series feed the D-9 health probe (scraped by name
+//! pattern). `source` (`override|router|default|fallback`) and `reason`
+//! (`saturated|timeout|http|parse`) are bounded, enum-derived label sets — no user
+//! input, no cardinality risk. Fallback-rate = `router_fallback_total / router_decisions_total`.
 //!
 //! ## Bounded cardinality — `route`, `model_alias`, `provider` labels
 //!
@@ -39,6 +48,61 @@ pub struct DurationLabels {
     pub model_alias: String,
 }
 
+/// Prometheus histogram buckets (seconds) for router latency. Resolution is
+/// concentrated around the system SLA (0.15 s) and the warm curator sub-path
+/// (~0.25 s), so `histogram_quantile` p95 is meaningful in that range.
+const ROUTER_LATENCY_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.15, 0.25, 0.5, 1.0];
+
+/// Minimal fixed-bucket histogram accumulator (native Prometheus export).
+///
+/// Shared by the two router latency histograms (curator sub-path + system decision);
+/// factored because the bucket accounting + text render are non-trivial and identical
+/// for both. `counts[i]` holds the NON-cumulative count for bucket `i`; the last slot
+/// is the `+Inf` overflow. Cumulative `le` sums are computed at render time.
+struct Histogram {
+    buckets: &'static [f64],
+    counts: Vec<u64>,
+    sum_secs: f64,
+    total: u64,
+}
+
+impl Histogram {
+    fn new(buckets: &'static [f64]) -> Self {
+        Self {
+            buckets,
+            counts: vec![0; buckets.len() + 1],
+            sum_secs: 0.0,
+            total: 0,
+        }
+    }
+
+    fn observe(&mut self, secs: f64) {
+        let idx = self
+            .buckets
+            .iter()
+            .position(|&b| secs <= b)
+            .unwrap_or(self.buckets.len());
+        self.counts[idx] += 1;
+        self.sum_secs += secs;
+        self.total += 1;
+    }
+
+    /// Renders the Prometheus histogram text format (cumulative `_bucket` + `_sum` + `_count`).
+    fn render(&self, name: &str, help: &str, out: &mut String) {
+        out.push_str(&format!("# HELP {name} {help}\n"));
+        out.push_str(&format!("# TYPE {name} histogram\n"));
+        let mut cumulative = 0u64;
+        for (i, &le) in self.buckets.iter().enumerate() {
+            cumulative += self.counts[i];
+            out.push_str(&format!("{name}_bucket{{le=\"{le}\"}} {cumulative}\n"));
+        }
+        // `+Inf` bucket = grand total (includes the overflow slot).
+        out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {}\n", self.total));
+        out.push_str(&format!("{name}_sum {:.6}\n", self.sum_secs));
+        out.push_str(&format!("{name}_count {}\n", self.total));
+    }
+}
+
 /// Shared metrics registry.
 #[derive(Clone)]
 pub struct Metrics {
@@ -60,6 +124,14 @@ struct MetricsInner {
     /// Allowlist of providers configured at startup — bounds the cardinality of `provider`.
     /// Unknown providers (e.g. dynamic fallbacks) are counted under `"other"`.
     known_providers: HashSet<String>,
+    /// Routing decisions by source (`override|router|default|fallback`). Bounded, enum-derived.
+    router_decisions: Mutex<HashMap<String, u64>>,
+    /// No-think fallbacks by reason (`saturated|timeout|http|parse`). Bounded, enum-derived.
+    router_fallbacks: Mutex<HashMap<String, u64>>,
+    /// Curator sub-path latency histogram (LLM round-trip; excluded from the routing SLA).
+    router_curator_latency: Mutex<Histogram>,
+    /// System routing-decision latency histogram (all requests; SLA target below 150 ms).
+    router_system_latency: Mutex<Histogram>,
 }
 
 impl Metrics {
@@ -88,7 +160,47 @@ impl Metrics {
                 known_aliases,
                 known_routes,
                 known_providers,
+                router_decisions: Mutex::new(HashMap::new()),
+                router_fallbacks: Mutex::new(HashMap::new()),
+                router_curator_latency: Mutex::new(Histogram::new(ROUTER_LATENCY_BUCKETS)),
+                router_system_latency: Mutex::new(Histogram::new(ROUTER_LATENCY_BUCKETS)),
             }),
+        }
+    }
+
+    /// Increments `gateway_router_decisions_total{source}`.
+    ///
+    /// `source` is a stable label from `crate::smart_router::ReasoningSource::as_str`
+    /// (`override|router|default|fallback`) — bounded, never user input. Recorded once
+    /// per `/v1/chat/completions` request; the denominator of the fallback rate.
+    pub fn record_router_decision(&self, source: &str) {
+        if let Ok(mut map) = self.inner.router_decisions.lock() {
+            *map.entry(source.to_owned()).or_insert(0) += 1;
+        }
+    }
+
+    /// Increments `gateway_router_fallback_total{reason}`.
+    ///
+    /// Recorded at the same point the router logs its no-think-fallback warning, so a
+    /// fallback is both metered and logged — it is never silent.
+    /// `reason` ∈ `saturated|timeout|http|parse` (mapped from `RouterError`).
+    pub fn record_router_fallback(&self, reason: &str) {
+        if let Ok(mut map) = self.inner.router_fallbacks.lock() {
+            *map.entry(reason.to_owned()).or_insert(0) += 1;
+        }
+    }
+
+    /// Observes the curator sub-path latency (LLM round-trip; excluded from the routing SLA).
+    pub fn observe_router_curator_latency(&self, latency: Duration) {
+        if let Ok(mut h) = self.inner.router_curator_latency.lock() {
+            h.observe(latency.as_secs_f64());
+        }
+    }
+
+    /// Observes the system routing-decision latency (all requests; SLA target below 150 ms).
+    pub fn observe_router_system_latency(&self, latency: Duration) {
+        if let Ok(mut h) = self.inner.router_system_latency.lock() {
+            h.observe(latency.as_secs_f64());
         }
     }
 
@@ -175,7 +287,7 @@ impl Metrics {
         let mut out = String::with_capacity(2048);
 
         out.push_str(
-            "# HELP gateway_requests_total Nombre total de requetes traitees par le gateway.\n",
+            "# HELP gateway_requests_total Total number of requests handled by the gateway.\n",
         );
         out.push_str("# TYPE gateway_requests_total counter\n");
         if let Ok(map) = self.inner.requests_total.lock() {
@@ -193,7 +305,7 @@ impl Metrics {
             }
         }
 
-        out.push_str("# HELP gateway_request_duration_seconds Duree des requetes en secondes.\n");
+        out.push_str("# HELP gateway_request_duration_seconds Request duration in seconds.\n");
         out.push_str("# TYPE gateway_request_duration_seconds summary\n");
         if let (Ok(sum_map), Ok(count_map)) = (
             self.inner.duration_ms_sum.lock(),
@@ -221,7 +333,7 @@ impl Metrics {
         }
 
         out.push_str(
-            "# HELP gateway_providers_configured Nombre de providers configures au demarrage.\n",
+            "# HELP gateway_providers_configured Number of providers configured at startup.\n",
         );
         out.push_str("# TYPE gateway_providers_configured gauge\n");
         out.push_str(&format!(
@@ -230,9 +342,55 @@ impl Metrics {
         ));
 
         let uptime = self.inner.start_time.elapsed().as_secs_f64();
-        out.push_str("# HELP gateway_uptime_seconds Duree de vie du gateway en secondes.\n");
+        out.push_str("# HELP gateway_uptime_seconds Gateway uptime in seconds.\n");
         out.push_str("# TYPE gateway_uptime_seconds gauge\n");
         out.push_str(&format!("gateway_uptime_seconds {:.3}\n", uptime));
+
+        // ── Router / fallback (probe D-9) ───────────────────────────────────
+        out.push_str(
+            "# HELP gateway_router_decisions_total Reasoning routing decisions by source.\n",
+        );
+        out.push_str("# TYPE gateway_router_decisions_total counter\n");
+        if let Ok(map) = self.inner.router_decisions.lock() {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by_key(|(k, _)| (*k).clone());
+            for (source, count) in entries {
+                out.push_str(&format!(
+                    "gateway_router_decisions_total{{source=\"{}\"}} {}\n",
+                    escape_label(source),
+                    count,
+                ));
+            }
+        }
+
+        out.push_str("# HELP gateway_router_fallback_total Router no-think fallbacks by reason.\n");
+        out.push_str("# TYPE gateway_router_fallback_total counter\n");
+        if let Ok(map) = self.inner.router_fallbacks.lock() {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by_key(|(k, _)| (*k).clone());
+            for (reason, count) in entries {
+                out.push_str(&format!(
+                    "gateway_router_fallback_total{{reason=\"{}\"}} {}\n",
+                    escape_label(reason),
+                    count,
+                ));
+            }
+        }
+
+        if let Ok(h) = self.inner.router_curator_latency.lock() {
+            h.render(
+                "gateway_router_curator_latency_seconds",
+                "Latency of the router's curator sub-path (metric 1, outside SLA).",
+                &mut out,
+            );
+        }
+        if let Ok(h) = self.inner.router_system_latency.lock() {
+            h.render(
+                "gateway_router_system_latency_seconds",
+                "Latence de decision de routage systeme (metrique 2, cible SLA <150ms).",
+                &mut out,
+            );
+        }
 
         out
     }
@@ -476,6 +634,74 @@ mod tests {
             "b: cardinalité doit être bornée (≤3 clés pour ces 5 appels, map.len={})",
             map.len()
         );
+    }
+
+    // ── Router / fallback (probe D-9) ──────────────────────────────────────────
+
+    /// Chaque source incrémente sa propre série `gateway_router_decisions_total{source}`.
+    #[test]
+    fn router_decision_counter_par_source() {
+        let m = mk_metrics(&["a"], &["p"]);
+        m.record_router_decision("override");
+        m.record_router_decision("router");
+        m.record_router_decision("router");
+        m.record_router_decision("default");
+        m.record_router_decision("fallback");
+        let out = m.render();
+        assert!(out.contains("# TYPE gateway_router_decisions_total counter"));
+        assert!(out.contains("gateway_router_decisions_total{source=\"override\"} 1"));
+        assert!(out.contains("gateway_router_decisions_total{source=\"router\"} 2"));
+        assert!(out.contains("gateway_router_decisions_total{source=\"default\"} 1"));
+        assert!(out.contains("gateway_router_decisions_total{source=\"fallback\"} 1"));
+    }
+
+    /// Chaque raison incrémente sa propre série `gateway_router_fallback_total{reason}`.
+    #[test]
+    fn router_fallback_counter_par_raison() {
+        let m = mk_metrics(&["a"], &["p"]);
+        for r in ["saturated", "timeout", "http", "http", "parse"] {
+            m.record_router_fallback(r);
+        }
+        let out = m.render();
+        assert!(out.contains("# TYPE gateway_router_fallback_total counter"));
+        assert!(out.contains("gateway_router_fallback_total{reason=\"saturated\"} 1"));
+        assert!(out.contains("gateway_router_fallback_total{reason=\"timeout\"} 1"));
+        assert!(out.contains("gateway_router_fallback_total{reason=\"http\"} 2"));
+        assert!(out.contains("gateway_router_fallback_total{reason=\"parse\"} 1"));
+    }
+
+    /// Les histogrammes de latence exposent `_bucket{le=...}` + `_sum` + `_count` cumulés.
+    #[test]
+    fn router_latency_histogrammes_format_prometheus() {
+        let m = mk_metrics(&["a"], &["p"]);
+        m.observe_router_curator_latency(Duration::from_millis(30)); // ≤ 0.05
+        m.observe_router_curator_latency(Duration::from_millis(200)); // ≤ 0.25
+        m.observe_router_system_latency(Duration::from_millis(5)); // ≤ 0.01
+        let out = m.render();
+
+        // Curateur : 2 observations, cumul monotone, +Inf = count total.
+        assert!(out.contains("# TYPE gateway_router_curator_latency_seconds histogram"));
+        assert!(out.contains("gateway_router_curator_latency_seconds_bucket{le=\"0.05\"} 1"));
+        assert!(out.contains("gateway_router_curator_latency_seconds_bucket{le=\"0.25\"} 2"));
+        assert!(out.contains("gateway_router_curator_latency_seconds_bucket{le=\"+Inf\"} 2"));
+        assert!(out.contains("gateway_router_curator_latency_seconds_count 2"));
+
+        // Système : 1 observation dans le 1er bucket.
+        assert!(out.contains("# TYPE gateway_router_system_latency_seconds histogram"));
+        assert!(out.contains("gateway_router_system_latency_seconds_bucket{le=\"0.01\"} 1"));
+        assert!(out.contains("gateway_router_system_latency_seconds_count 1"));
+    }
+
+    /// Une latence hors du dernier bucket tombe dans `+Inf` (overflow), `_count` inclus.
+    #[test]
+    fn router_latency_overflow_dans_inf() {
+        let m = mk_metrics(&["a"], &["p"]);
+        m.observe_router_system_latency(Duration::from_secs(3)); // > 1.0 → overflow
+        let out = m.render();
+        // Dernier bucket fini (1.0) reste à 0, +Inf = 1.
+        assert!(out.contains("gateway_router_system_latency_seconds_bucket{le=\"1\"} 0"));
+        assert!(out.contains("gateway_router_system_latency_seconds_bucket{le=\"+Inf\"} 1"));
+        assert!(out.contains("gateway_router_system_latency_seconds_count 1"));
     }
 
     /// Vérifie qu'un provider connu conserve son label dans les métriques.

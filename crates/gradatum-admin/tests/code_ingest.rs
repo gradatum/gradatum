@@ -1076,3 +1076,103 @@ async fn circuit_breaker_does_not_open_on_valid_rust() {
         "circuit-breaker : aucun fichier skippé sur premier ingest"
     );
 }
+
+// ── Lot REG — garde miroir de registre ────────────────────────────────────────
+
+/// Inscrit `vault_id` dans le registre de DONNÉES en SQL brut.
+///
+/// Le passage par SQL est délibéré : depuis le lot REG, `provision_vault` REFUSE un
+/// `vault_id` préfixé `code-`. L'état simulé ici est donc l'état HÉRITÉ — celui d'un
+/// opérateur ayant lancé `admin vault create code-<projet>` avant que la garde n'existe.
+/// C'est précisément le seul état où la garde d'ingest a un pouvoir discriminant : sur un
+/// `vault_id` non préfixé, l'ingest échouerait de toute façon sur la garde de préfixe
+/// préexistante, et le test ne prouverait rien.
+fn seed_data_registry(index_path: &std::path::Path, vault_id: &str) {
+    let conn = rusqlite::Connection::open(index_path).expect("open index.db");
+    conn.execute(
+        "INSERT INTO tenants (id, status, created_at) VALUES (?1, 'active', 0)",
+        rusqlite::params![vault_id],
+    )
+    .expect("seed tenants");
+}
+
+/// Compte les notes portant ce `vault_id` — mesure l'ABSENCE d'écriture, pas seulement
+/// l'erreur retournée (une garde posée trop tard échouerait aussi, mais après avoir écrit).
+fn count_notes(index_path: &std::path::Path, vault_id: &str) -> i64 {
+    let conn = rusqlite::Connection::open(index_path).expect("open index.db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM notes WHERE vault_id = ?1",
+        rusqlite::params![vault_id],
+        |r| r.get(0),
+    )
+    .expect("count notes")
+}
+
+/// Lot REG : `code ingest` refuse un vault déjà inscrit au registre de données.
+#[tokio::test]
+async fn code_ingest_refuses_a_vault_registered_as_data() {
+    let repo_tmp = setup_git_repo(RUST_SNIPPET);
+    let (index_path, _index_tmp) = setup_index().await;
+    let vault_id = "code-collision".to_string();
+    seed_data_registry(&index_path, &vault_id);
+
+    let err = run_ingest(CodeIngestArgs {
+        repo_path: repo_tmp.path().to_path_buf(),
+        vault_id: vault_id.clone(),
+        index_path: index_path.clone(),
+        rebuild: false,
+        ..Default::default()
+    })
+    .await
+    .expect_err("l'ingest dans un vault de données doit être refusé");
+
+    assert!(
+        format!("{err:#}").contains("DATA registry"),
+        "le refus doit nommer le registre en cause, got: {err:#}"
+    );
+    assert_eq!(
+        count_notes(&index_path, &vault_id),
+        0,
+        "aucune note dérivée ne doit avoir été écrite avant le refus"
+    );
+    let marker = index_path
+        .parent()
+        .expect("parent")
+        .join(format!(".ingest-incomplete-{vault_id}"));
+    assert!(
+        !marker.exists(),
+        "le refus précède la pose du marqueur d'atomicité — sinon le run suivant \
+         basculerait en rebuild forcé sans raison"
+    );
+}
+
+/// Lot REG : `code update` porte la même garde que `code ingest`.
+///
+/// Sans ce test, la garde pourrait n'exister que sur `run_ingest` — `code update` est un
+/// point d'entrée distinct, et c'est celui que le refresh périodique emprunte.
+#[tokio::test]
+async fn code_update_refuses_a_vault_registered_as_data() {
+    let repo_tmp = setup_git_repo(RUST_SNIPPET);
+    let (index_path, _index_tmp) = setup_index().await;
+    let vault_id = "code-collision-update".to_string();
+    seed_data_registry(&index_path, &vault_id);
+
+    let err = gradatum_admin::code_cmd::run_update(gradatum_admin::code_cmd::CodeUpdateArgs {
+        repo_path: repo_tmp.path().to_path_buf(),
+        vault_id: vault_id.clone(),
+        index_path: index_path.clone(),
+        visibility_override: None,
+    })
+    .await
+    .expect_err("l'update dans un vault de données doit être refusé");
+
+    assert!(
+        format!("{err:#}").contains("DATA registry"),
+        "le refus doit nommer le registre en cause, got: {err:#}"
+    );
+    assert_eq!(
+        count_notes(&index_path, &vault_id),
+        0,
+        "aucune note dérivée ne doit avoir été écrite avant le refus"
+    );
+}

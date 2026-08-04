@@ -161,10 +161,13 @@ impl QueueStore for FailingQueueStore {
             "test: enqueue forcément échoué".to_string(),
         ))
     }
-    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError> {
+    async fn dequeue(
+        &self,
+        __tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
         unimplemented!("FailingQueueStore::dequeue — non requis pour ce test")
     }
-    async fn get(&self, _id: Ulid) -> Result<Option<JobRecord>, QueueError> {
+    async fn get(&self, _id: Ulid, _tenant: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
         unimplemented!("FailingQueueStore::get — non requis pour ce test")
     }
     async fn complete(
@@ -177,7 +180,7 @@ impl QueueStore for FailingQueueStore {
     async fn fail(&self, _id: Ulid, _err: &str, _attempt: u32) -> Result<(), QueueError> {
         unimplemented!("FailingQueueStore::fail — non requis pour ce test")
     }
-    async fn cancel(&self, _id: Ulid) -> Result<(), QueueError> {
+    async fn cancel(&self, _id: Ulid, _tenant: Option<&str>) -> Result<(), QueueError> {
         unimplemented!("FailingQueueStore::cancel — non requis pour ce test")
     }
     async fn fail_dlq(&self, _id: Ulid, _err: &str) -> Result<(), QueueError> {
@@ -250,6 +253,7 @@ async fn curate_admitted_enqueues_embed_job() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -360,6 +364,7 @@ async fn enqueue_embed_failure_does_not_fail_curate() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&failing_queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -411,6 +416,7 @@ async fn curate_rejected_does_not_enqueue_embed() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 
@@ -480,6 +486,7 @@ async fn curate_dry_run_does_not_enqueue_embed() {
         )) as Arc<dyn InternalClient>),
         Data::new(Arc::clone(&curator) as Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>),
         Data::new(Arc::clone(&queue)),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
     )
     .await;
 

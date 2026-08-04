@@ -72,7 +72,7 @@ impl SqliteQueueStore {
     /// is best-effort. SSE and cascade consumers subscribe via `subscribe()`.
     fn publish(&self, event: QueueEvent) {
         if let Err(e) = self.tx.send(event) {
-            debug!("SqliteQueueStore: aucun consommateur broadcast actif ({e})");
+            debug!("SqliteQueueStore: no active broadcast consumer ({e})");
         }
     }
 
@@ -114,7 +114,7 @@ impl SqliteQueueStore {
             // Optimistic-lock conflict terminal state (persisted as "Conflict").
             "Conflict" => Ok(JobStatus::Conflict),
             other => Err(QueueError::InvalidTransition(format!(
-                "statut inconnu : '{other}'"
+                "unknown status: '{other}'"
             ))),
         }
     }
@@ -210,6 +210,32 @@ impl QueueStore for SqliteQueueStore {
         // Dénormalise le variant Job → colonne `kind` pour le filtrage SQL natif
         // (fix routing DLQ : chaque worker ne fetch que ses propres jobs via dequeue_by_kind).
         let kind = job_kind_str(&job.spec.kind);
+        // L1 : tenant SERVI par le job, dérivé du spec (source = le spec, pas
+        // l'appelant). Estampillé dans la colonne `tenant_id` pour le filtrage.
+        let tenant = gradatum_core::spec_tenant(&job.spec);
+        // P2 audit (SecAuditor #2, décision (a)) : un `Forget::Agent` multi-vault n'élit
+        // aucun vault (`forget_scope_vault` → `None`). Depuis A6' l'estampille retombe
+        // donc sur le vault porté par le JOB (`JobSpec.scope`, A2-bis) — et `"main"`
+        // seulement en dernier ressort, quand le job lui-même n'en porte aucun.
+        //
+        // Ce log est le SEUL instrument d'enquête a posteriori sur ce cas : il émet la
+        // valeur EFFECTIVEMENT estampillée (`tenant_stamp`, mesurée et non décrite), de
+        // sorte qu'un opérateur retrouve le job dans `gradatum_jobs` sans deviner. Le
+        // job reste refusé terminalement par le worker (`ensure_forget_scope_vault`).
+        if let gradatum_core::Job::Forget(f) = &job.spec.kind
+            && let gradatum_core::ForgetScope::Agent {
+                agent_id, vaults, ..
+            } = &f.scope
+            && vaults.len() > 1
+        {
+            warn!(
+                job_id = %id,
+                agent_id = %agent_id,
+                vaults = ?vaults,
+                tenant_stamp = %tenant,
+                "enqueue: Forget::Agent multi-vault — scope elects no vault; tenant_id stamped from the job vault (see tenant_stamp), not 'main' (audit)"
+            );
+        }
         let created_at = job.lifecycle.created_at.to_rfc3339();
         let scheduled_at = job.scheduling.scheduled_at.to_rfc3339();
         let deadline = job.scheduling.deadline.as_ref().map(|d| d.to_rfc3339());
@@ -233,9 +259,9 @@ impl QueueStore for SqliteQueueStore {
         sqlx::query(
             r#"
             INSERT INTO gradatum_jobs
-                (id, payload, status, priority, class, kind, created_at, scheduled_at, deadline, await_jobs)
+                (id, payload, status, priority, class, kind, created_at, scheduled_at, deadline, await_jobs, tenant_id)
             VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&id_str)
@@ -248,6 +274,7 @@ impl QueueStore for SqliteQueueStore {
         .bind(&scheduled_at)
         .bind(&deadline)
         .bind(&await_jobs)
+        .bind(tenant)
         .execute(&self.pool)
         .await
         .map_err(|e| QueueError::Storage(e.to_string()))?;
@@ -256,7 +283,7 @@ impl QueueStore for SqliteQueueStore {
         Ok(id)
     }
 
-    async fn dequeue(&self) -> Result<Option<JobRecord>, QueueError> {
+    async fn dequeue(&self, tenant_filter: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
         // Lease atomique via transaction EXCLUSIVE
         // Sélectionne le job de plus haute priorité schedulé maintenant
         let now = Utc::now().to_rfc3339();
@@ -272,17 +299,23 @@ impl QueueStore for SqliteQueueStore {
             .await
             .map_err(|e| QueueError::Storage(e.to_string()))?;
 
+        // Pattern `? IS NULL OR tenant_id = ?` : même que `list()` (L1 isolation).
+        // `None` = sans filtre tenant (backward-compatible single-tenant) ;
+        // `Some(t)` = isole le dequeue à un tenant (multi-tenant ON).
         let row = sqlx::query(
             r#"
             SELECT id, payload
             FROM gradatum_jobs
             WHERE status = 'Pending'
               AND scheduled_at <= ?
+              AND (? IS NULL OR tenant_id = ?)
             ORDER BY priority DESC, scheduled_at ASC
             LIMIT 1
             "#,
         )
         .bind(&now)
+        .bind(tenant_filter)
+        .bind(tenant_filter)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| QueueError::Storage(e.to_string()))?;
@@ -336,7 +369,11 @@ impl QueueStore for SqliteQueueStore {
     /// `curate` worker never receives an `Embed` or `ReIndex` job.
     /// Without this filter, contention among concurrent workers (curate=2, embed=4,
     /// reindex=4) produces ~80% DLQ via `HandlerError::UnexpectedVariant`.
-    async fn dequeue_by_kind(&self, kind: &str) -> Result<Option<JobRecord>, QueueError> {
+    async fn dequeue_by_kind(
+        &self,
+        kind: &str,
+        tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
         let now = Utc::now().to_rfc3339();
         let lease_until = (Utc::now() + chrono::Duration::seconds(300)).to_rfc3339();
 
@@ -358,6 +395,9 @@ impl QueueStore for SqliteQueueStore {
             .await
             .map_err(|e| QueueError::Storage(e.to_string()))?;
 
+        // Pattern `? IS NULL OR tenant_id = ?` : même que `list()` (L1 isolation).
+        // `None` = sans filtre tenant (backward-compatible single-tenant) ;
+        // `Some(t)` = isole le dequeue à un tenant (multi-tenant ON).
         let row = sqlx::query(
             r#"
             SELECT id, payload
@@ -365,12 +405,15 @@ impl QueueStore for SqliteQueueStore {
             WHERE status = 'Pending'
               AND kind = ?
               AND scheduled_at <= ?
+              AND (? IS NULL OR tenant_id = ?)
             ORDER BY priority DESC, scheduled_at ASC
             LIMIT 1
             "#,
         )
         .bind(kind)
         .bind(&now)
+        .bind(tenant_filter)
+        .bind(tenant_filter)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| QueueError::Storage(e.to_string()))?;
@@ -416,7 +459,11 @@ impl QueueStore for SqliteQueueStore {
         Ok(Some(record))
     }
 
-    async fn get(&self, id: Ulid) -> Result<Option<JobRecord>, QueueError> {
+    async fn get(
+        &self,
+        id: Ulid,
+        tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
         // Fix E-12 : synchronise le statut du JobRecord avec les colonnes SQL autoritatives.
         //
         // Le payload BLOB contient le JobRecord sérialisé à l'enqueue. Après dequeue(),
@@ -427,14 +474,24 @@ impl QueueStore for SqliteQueueStore {
         // Colonnes SQL autoritatives : status, attempt_count, last_error, completed_at.
         let id_str = id.to_string();
 
-        let row = sqlx::query(
-            r#"SELECT payload, status, attempt_count, last_error, completed_at
-               FROM gradatum_jobs WHERE id = ?"#,
-        )
-        .bind(&id_str)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        // L1 : `None` = SQL actuel (byte-identical) ; `Some(t)` = `AND tenant_id = ?`
+        // → un job d'un autre tenant lit `None` (404 anti-disclosure au handler).
+        let sql = match tenant_filter {
+            None => "SELECT payload, status, attempt_count, last_error, completed_at \
+                     FROM gradatum_jobs WHERE id = ?"
+                .to_string(),
+            Some(_) => "SELECT payload, status, attempt_count, last_error, completed_at \
+                        FROM gradatum_jobs WHERE id = ? AND tenant_id = ?"
+                .to_string(),
+        };
+        let mut query = sqlx::query(&sql).bind(&id_str);
+        if let Some(t) = tenant_filter {
+            query = query.bind(t);
+        }
+        let row = query
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| QueueError::Storage(e.to_string()))?;
 
         match row {
             None => Ok(None),
@@ -494,12 +551,17 @@ impl QueueStore for SqliteQueueStore {
 
         // Met à jour le payload avec le résultat et le statut Done
         // Note : le payload JSON est la source de vérité — on relit, on patche, on réécrit.
-        let row = sqlx::query(r#"SELECT payload FROM gradatum_jobs WHERE id = ?"#)
-            .bind(&id_str)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?
-            .ok_or(QueueError::NotFound(id))?;
+        //
+        // P2-6 : le SELECT vérifie `status = 'Running'`. Un `complete()` sur un job
+        // Pending/Done/Failed/Cancelled/DLQ/Conflict échoue immédiatement (NotFound)
+        // plutôt que d'être silencieux — le handler n'a pas de lease valide.
+        let row =
+            sqlx::query(r#"SELECT payload FROM gradatum_jobs WHERE id = ? AND status = 'Running'"#)
+                .bind(&id_str)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| QueueError::Storage(e.to_string()))?
+                .ok_or(QueueError::NotFound(id))?;
 
         let payload_str: String = row
             .try_get("payload")
@@ -529,7 +591,7 @@ impl QueueStore for SqliteQueueStore {
                 .map_err(|e| QueueError::Storage(e.to_string()))?;
             tracing::debug!(
                 job_id = %id,
-                "complete: job déjà en état terminal Conflict (F-41) — Done ignoré"
+                "complete: job already in terminal state Conflict (F-41) — Done ignored"
             );
             return Ok(());
         }
@@ -539,7 +601,14 @@ impl QueueStore for SqliteQueueStore {
         record.lifecycle.result = Some(result.clone());
         let new_payload = Self::serialize_record(&record)?;
 
-        sqlx::query(
+        // P0-1 — Garde stale-lease : refuse complete si le job n'est pas en
+        // statut 'Running' ou si le lease est expiré. Sans cette garde, un worker
+        // peut marquer `Done` un job dont le lease a expiré et qu'un autre
+        // worker a déjà repris → corruption silencieuse du job.
+        //
+        // Même pattern que `SqliteQueue::complete()` dans `queue.rs:553-574`
+        // (table `jobs_v2`, même logique mais sur `gradatum_jobs`).
+        let rows_affected = sqlx::query(
             r#"
             UPDATE gradatum_jobs
             SET status = 'Done',
@@ -547,14 +616,31 @@ impl QueueStore for SqliteQueueStore {
                 lease_until = NULL,
                 payload = ?
             WHERE id = ?
+              AND status = 'Running'
+              AND lease_until > ?
             "#,
         )
         .bind(&now)
         .bind(&new_payload)
         .bind(&id_str)
+        .bind(&now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|e| QueueError::Storage(e.to_string()))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            // Le job n'est plus en Running ou le lease a expiré — le worker
+            // n'a plus de droit d'écriture sur ce job.
+            tx.rollback()
+                .await
+                .map_err(|e| QueueError::Storage(e.to_string()))?;
+            tracing::warn!(
+                job_id = %id,
+                "complete: job not leased or lease expired — rejected (P0-1 stale-lease guard)"
+            );
+            return Err(QueueError::NotLeased(id));
+        }
 
         tx.commit()
             .await
@@ -583,7 +669,7 @@ impl QueueStore for SqliteQueueStore {
             warn!(
                 job_id = %id,
                 error = %e,
-                "complete: cascade_check_and_promote échouée (best-effort, job Done)"
+                "complete: cascade_check_and_promote failed (best-effort, job Done)"
             );
         }
 
@@ -592,7 +678,12 @@ impl QueueStore for SqliteQueueStore {
 
     async fn fail(&self, id: Ulid, err: &str, attempt: u32) -> Result<(), QueueError> {
         let id_str = id.to_string();
-        let err_truncated = if err.len() > 2048 { &err[..2048] } else { err };
+        let err_truncated: String = if err.chars().count() > 2048 {
+            err.chars().take(2048).collect()
+        } else {
+            err.to_string()
+        };
+        let now = Utc::now().to_rfc3339();
 
         // BEGIN IMMEDIATE : lecture + mise à jour atomiques — évite que deux appels
         // fail() concurrents n'écrasent mutuellement leur compteur d'erreurs.
@@ -602,13 +693,18 @@ impl QueueStore for SqliteQueueStore {
             .await
             .map_err(|e| QueueError::Storage(e.to_string()))?;
 
-        // Relit le payload pour mettre à jour les erreurs
-        let row = sqlx::query(r#"SELECT payload FROM gradatum_jobs WHERE id = ?"#)
-            .bind(&id_str)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?
-            .ok_or(QueueError::NotFound(id))?;
+        // Relit le payload pour mettre à jour les erreurs.
+        //
+        // P2-7 : le SELECT vérifie `status = 'Running'`. Un `fail()` sur un job
+        // Pending/Done/Failed/Cancelled/DLQ/Conflict échoue immédiatement (NotFound)
+        // plutôt que d'être silencieux — le handler n'a pas de lease valide.
+        let row =
+            sqlx::query(r#"SELECT payload FROM gradatum_jobs WHERE id = ? AND status = 'Running'"#)
+                .bind(&id_str)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| QueueError::Storage(e.to_string()))?
+                .ok_or(QueueError::NotFound(id))?;
 
         let payload_str: String = row
             .try_get("payload")
@@ -624,7 +720,14 @@ impl QueueStore for SqliteQueueStore {
         });
         let new_payload = Self::serialize_record(&record)?;
 
-        sqlx::query(
+        // P0-2 — Garde stale-lease : refuse fail si le job n'est pas en
+        // statut 'Running' ou si le lease est expiré. Sans cette garde, un worker
+        // peut marquer `Failed` un job dont le lease a expiré et qu'un autre
+        // worker a déjà repris → corruption silencieuse du job.
+        //
+        // Même pattern que `SqliteQueue::fail()` dans `queue.rs:576-602`
+        // (table `jobs_v2`, même logique mais sur `gradatum_jobs`).
+        let rows_affected = sqlx::query(
             r#"
             UPDATE gradatum_jobs
             SET status = 'Failed',
@@ -633,15 +736,32 @@ impl QueueStore for SqliteQueueStore {
                 attempt_count = ?,
                 payload = ?
             WHERE id = ?
+              AND status = 'Running'
+              AND lease_until > ?
             "#,
         )
-        .bind(err_truncated)
+        .bind(err_truncated.as_str())
         .bind(attempt as i64)
         .bind(&new_payload)
         .bind(&id_str)
+        .bind(&now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|e| QueueError::Storage(e.to_string()))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            // Le job n'est plus en Running ou le lease a expiré — le worker
+            // n'a plus de droit d'écriture sur ce job.
+            tx.rollback()
+                .await
+                .map_err(|e| QueueError::Storage(e.to_string()))?;
+            tracing::warn!(
+                job_id = %id,
+                "fail: job not leased or lease expired — rejected (P0-2 stale-lease guard)"
+            );
+            return Err(QueueError::NotLeased(id));
+        }
 
         tx.commit()
             .await
@@ -651,10 +771,19 @@ impl QueueStore for SqliteQueueStore {
         Ok(())
     }
 
-    async fn cancel(&self, id: Ulid) -> Result<(), QueueError> {
+    async fn cancel(&self, id: Ulid, tenant_filter: Option<&str>) -> Result<(), QueueError> {
         let id_str = id.to_string();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
+
+        // L1 : `None` = SQL actuel (byte-identical) ; `Some(t)` = `AND tenant_id = ?`
+        // sur le SELECT (gate) ET l'UPDATE (defense-in-depth). Un cancel d'un job
+        // d'autrui trouve 0 row → no-op idempotent (le job reste actif).
+        let tenant_clause = if tenant_filter.is_some() {
+            " AND tenant_id = ?"
+        } else {
+            ""
+        };
 
         // BEGIN IMMEDIATE : la vérification du statut courant (SELECT NOT IN terminal)
         // et l'UPDATE sont atomiques — évite qu'un cancel concurrent ne double-écrive.
@@ -668,17 +797,20 @@ impl QueueStore for SqliteQueueStore {
         // F-41 — Conflict ajouté aux états terminaux : un job déjà Conflict (optimistic-lock
         // périmé, conflict_payload requis pour la résolution RMW) ne doit PAS être écrasé
         // en Cancelled, ce qui détruirait le payload que l'appelant attend pour retry/abandon.
-        let row = sqlx::query(
-            // JobStatus::TERMINAL_SQL — single source of truth for the terminal set.
-            &format!(
-                "SELECT payload FROM gradatum_jobs WHERE id = ? AND status NOT IN ({})",
-                JobStatus::TERMINAL_SQL
-            ),
-        )
-        .bind(&id_str)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        // JobStatus::TERMINAL_SQL — single source of truth for the terminal set.
+        let select_sql = format!(
+            "SELECT payload FROM gradatum_jobs WHERE id = ? AND status NOT IN ({}){}",
+            JobStatus::TERMINAL_SQL,
+            tenant_clause
+        );
+        let mut select_q = sqlx::query(&select_sql).bind(&id_str);
+        if let Some(t) = tenant_filter {
+            select_q = select_q.bind(t);
+        }
+        let row = select_q
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| QueueError::Storage(e.to_string()))?;
 
         let Some(row) = row else {
             // Job déjà terminal ou inexistant — opération idempotente
@@ -697,18 +829,24 @@ impl QueueStore for SqliteQueueStore {
         let new_payload = Self::serialize_record(&record)?;
 
         // JobStatus::TERMINAL_SQL — single source of truth for the terminal set.
-        sqlx::query(&format!(
+        let update_sql = format!(
             "UPDATE gradatum_jobs \
                  SET status = 'Cancelled', completed_at = ?, lease_until = NULL, payload = ? \
-                 WHERE id = ? AND status NOT IN ({})",
-            JobStatus::TERMINAL_SQL
-        ))
-        .bind(&now_str)
-        .bind(&new_payload)
-        .bind(&id_str)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+                 WHERE id = ? AND status NOT IN ({}){}",
+            JobStatus::TERMINAL_SQL,
+            tenant_clause
+        );
+        let mut update_q = sqlx::query(&update_sql)
+            .bind(&now_str)
+            .bind(&new_payload)
+            .bind(&id_str);
+        if let Some(t) = tenant_filter {
+            update_q = update_q.bind(t);
+        }
+        update_q
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| QueueError::Storage(e.to_string()))?;
 
         tx.commit()
             .await
@@ -721,7 +859,11 @@ impl QueueStore for SqliteQueueStore {
     async fn fail_dlq(&self, id: Ulid, err: &str) -> Result<(), QueueError> {
         let id_str = id.to_string();
         let now = Utc::now().to_rfc3339();
-        let err_truncated = if err.len() > 2048 { &err[..2048] } else { err };
+        let err_truncated: String = if err.chars().count() > 2048 {
+            err.chars().take(2048).collect()
+        } else {
+            err.to_string()
+        };
 
         // Relit le payload pour mettre à jour le statut DLQ
         let row = sqlx::query(r#"SELECT payload FROM gradatum_jobs WHERE id = ?"#)
@@ -752,7 +894,7 @@ impl QueueStore for SqliteQueueStore {
             "#,
         )
         .bind(&now)
-        .bind(err_truncated)
+        .bind(err_truncated.as_str())
         .bind(&new_payload)
         .bind(&id_str)
         .execute(&self.pool)
@@ -761,7 +903,7 @@ impl QueueStore for SqliteQueueStore {
 
         warn!(
             job_id = %id,
-            "job envoyé en DLQ : {err_truncated}"
+            "job sent to DLQ: {err_truncated}"
         );
         Ok(())
     }
@@ -840,7 +982,7 @@ impl QueueStore for SqliteQueueStore {
                 warn!(
                     ttl_secs = ttl.as_secs(),
                     error = %e,
-                    "recover_stale_leases: TTL invalide (hors plage chrono), skip pour éviter mass-recovery"
+                    "recover_stale_leases: invalid TTL (out of chrono range), skip to avoid mass-recovery"
                 );
                 return Ok(vec![]);
             }
@@ -876,7 +1018,7 @@ impl QueueStore for SqliteQueueStore {
         if !ids.is_empty() {
             debug!(
                 count = ids.len(),
-                "SqliteQueueStore: leases expirés récupérés"
+                "SqliteQueueStore: expired leases recovered"
             );
         }
         Ok(ids)
@@ -1035,6 +1177,7 @@ impl QueueStore for SqliteQueueStore {
             WHERE (? IS NULL OR class = ?)
               AND (? IS NULL OR status = ?)
               AND (? IS NULL OR kind = ?)
+              AND (? IS NULL OR tenant_id = ?)
               AND (? IS NULL OR created_at > ?)
               AND (? IS NULL OR created_at < ?)
               AND (? IS NULL OR id > ?)
@@ -1049,6 +1192,7 @@ impl QueueStore for SqliteQueueStore {
             WHERE (? IS NULL OR class = ?)
               AND (? IS NULL OR status = ?)
               AND (? IS NULL OR kind = ?)
+              AND (? IS NULL OR tenant_id = ?)
               AND (? IS NULL OR created_at > ?)
               AND (? IS NULL OR created_at < ?)
               AND (? IS NULL OR id < ?)
@@ -1065,6 +1209,8 @@ impl QueueStore for SqliteQueueStore {
             .bind(&status_filter)
             .bind(&filter.kind)
             .bind(&filter.kind)
+            .bind(&filter.tenant)
+            .bind(&filter.tenant)
             .bind(&created_after)
             .bind(&created_after)
             .bind(&created_before)
@@ -1094,8 +1240,21 @@ impl QueueStore for SqliteQueueStore {
     /// the dashboard remains tolerant. DLQ is included.
     async fn count_jobs_by_status(
         &self,
+        tenant_filter: Option<&str>,
     ) -> Result<std::collections::HashMap<JobStatus, u64>, QueueError> {
-        let rows = sqlx::query("SELECT status, COUNT(*) AS n FROM gradatum_jobs GROUP BY status")
+        // L1 : `None` = SQL actuel (byte-identical) ; `Some(t)` = `WHERE tenant_id = ?`.
+        let sql = match tenant_filter {
+            None => "SELECT status, COUNT(*) AS n FROM gradatum_jobs GROUP BY status".to_string(),
+            Some(_) => {
+                "SELECT status, COUNT(*) AS n FROM gradatum_jobs WHERE tenant_id = ? GROUP BY status"
+                    .to_string()
+            }
+        };
+        let mut query = sqlx::query(&sql);
+        if let Some(t) = tenant_filter {
+            query = query.bind(t);
+        }
+        let rows = query
             .fetch_all(&self.pool)
             .await
             .map_err(|e| QueueError::Storage(e.to_string()))?;
@@ -1115,7 +1274,7 @@ impl QueueStore for SqliteQueueStore {
                 Err(_) => {
                     warn!(
                         status = %status_str,
-                        "count_jobs_by_status: statut SQL hors-enum ignoré"
+                        "count_jobs_by_status: out-of-enum SQL status ignored"
                     );
                 }
             }
@@ -1235,14 +1394,31 @@ impl QueueStore for SqliteQueueStore {
 
     /// Returns the **most recently created** job via `ORDER BY id DESC LIMIT 1`.
     ///
-    /// `gradatum_jobs` has no tenant column: this store is single-tenant
-    /// (the legacy `tenant_id` lived on `jobs_v2`, which was drained in migration 009).
-    /// The `tenant` parameter is therefore ignored, in accordance with the trait contract.
+    /// `tenant_filter` **is honoured**: migration 011 added
+    /// `tenant_id TEXT NOT NULL DEFAULT 'main'` to `gradatum_jobs` (plus its index), so
+    /// `Some(t)` appends `WHERE tenant_id = ?` and returns the latest job of that tenant
+    /// alone. `None` keeps the historical, tenant-agnostic query (byte-identical SQL).
     ///
     /// Because the ULID `id` is monotonic, `ORDER BY id DESC` correctly returns the
     /// most recently created job — unlike `list()`, which orders by `id ASC` for pagination.
-    async fn latest_job(&self, _tenant: &str) -> Result<Option<JobRecord>, QueueError> {
-        let row = sqlx::query("SELECT payload FROM gradatum_jobs ORDER BY id DESC LIMIT 1")
+    async fn latest_job(
+        &self,
+        tenant_filter: Option<&str>,
+    ) -> Result<Option<JobRecord>, QueueError> {
+        // L1+L2 : `None` = SQL actuel (byte-identical, ferme L2 en l'état) ;
+        // `Some(t)` = `WHERE tenant_id = ?` (dernier job de ce tenant seulement).
+        let sql = match tenant_filter {
+            None => "SELECT payload FROM gradatum_jobs ORDER BY id DESC LIMIT 1".to_string(),
+            Some(_) => {
+                "SELECT payload FROM gradatum_jobs WHERE tenant_id = ? ORDER BY id DESC LIMIT 1"
+                    .to_string()
+            }
+        };
+        let mut query = sqlx::query(&sql);
+        if let Some(t) = tenant_filter {
+            query = query.bind(t);
+        }
+        let row = query
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| QueueError::Storage(e.to_string()))?;
@@ -1353,7 +1529,7 @@ impl QueueStore for SqliteQueueStore {
 
         tracing::info!(
             job_id = %id,
-            "job marqué Conflict (optimistic-lock F-41)"
+            "job marked Conflict (optimistic-lock F-41)"
         );
         Ok(())
     }
@@ -1513,7 +1689,264 @@ mod tests {
             .execute(&pool)
             .await
             .expect("migration 010 doit s'appliquer");
+        // Migration 011 : colonne `tenant_id` (L1+L2 isolation jobs par tenant).
+        sqlx::query(include_str!("../migrations/011_jobs_tenant_scope.sql"))
+            .execute(&pool)
+            .await
+            .expect("migration 011 doit s'appliquer");
         pool
+    }
+
+    /// La migration 011 ajoute `tenant_id TEXT NOT NULL DEFAULT 'main'`
+    /// à `gradatum_jobs` ; les jobs legacy insérés sans la colonne sont backfillés
+    /// à `'main'` par le DEFAULT (correct : à `multi_tenant` OFF tout est `main`).
+    #[tokio::test]
+    async fn migration_011_adds_tenant_id_default_main() {
+        let pool = test_pool().await;
+
+        // La colonne est présente sur gradatum_jobs.
+        let cols: Vec<String> = sqlx::query("SELECT name FROM pragma_table_info('gradatum_jobs')")
+            .fetch_all(&pool)
+            .await
+            .expect("pragma_table_info doit répondre")
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        assert!(
+            cols.contains(&"tenant_id".to_string()),
+            "colonne tenant_id absente de gradatum_jobs"
+        );
+
+        // Un INSERT legacy (sans tenant_id explicite) est backfillé à 'main'.
+        sqlx::query(
+            "INSERT INTO gradatum_jobs (id, payload, status, priority, class, kind, created_at, scheduled_at) \
+             VALUES ('01LEGACY', '{}', 'Pending', 2, 'System', '', ?, ?)",
+        )
+        .bind("2020-01-01T00:00:00Z")
+        .bind("2020-01-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert legacy doit réussir");
+
+        let tenant: String =
+            sqlx::query("SELECT tenant_id FROM gradatum_jobs WHERE id = '01LEGACY'")
+                .fetch_one(&pool)
+                .await
+                .expect("select tenant_id doit répondre")
+                .get::<String, _>("tenant_id");
+        assert_eq!(tenant, "main", "job legacy doit être backfillé à 'main'");
+    }
+
+    /// `enqueue` estampille `tenant_id = spec_tenant(&spec)` et les
+    /// 5 surfaces filtrées (`get`/`cancel`/`list`/`count`/`latest`) isolent par
+    /// tenant à `Some(t)`, tout en restant byte-identical à `None`.
+    #[tokio::test]
+    async fn enqueue_stamps_tenant_from_spec_and_filter_isolates() {
+        let store = SqliteQueueStore::new(test_pool().await);
+        let mk = |tenant: &str| {
+            make_record(
+                Job::Curate(CurateSpec {
+                    tenant_id: tenant.to_string(),
+                    ..Default::default()
+                }),
+                JobClass::Api,
+                JobStatus::Pending,
+            )
+        };
+        let ja = store.enqueue(mk("alice")).await.expect("enqueue alice");
+        let jb = store.enqueue(mk("bob")).await.expect("enqueue bob");
+
+        // Stamp : la colonne tenant_id reflète le spec (pas le DEFAULT 'main').
+        let ta: String = sqlx::query("SELECT tenant_id FROM gradatum_jobs WHERE id = ?")
+            .bind(ja.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .expect("select tenant alice")
+            .get::<String, _>("tenant_id");
+        assert_eq!(ta, "alice", "enqueue doit estampiller le tenant du spec");
+
+        // None = pas de filtre (byte-identical) → voit tout.
+        assert!(store.get(ja, None).await.unwrap().is_some());
+        assert!(store.get(jb, None).await.unwrap().is_some());
+
+        // get scopé : alice n'accède qu'à ses jobs (→ None = 404 anti-disclosure).
+        assert!(store.get(ja, Some("alice")).await.unwrap().is_some());
+        assert!(
+            store.get(jb, Some("alice")).await.unwrap().is_none(),
+            "alice ne doit PAS voir le job de bob"
+        );
+
+        // cancel scopé : alice ne peut pas annuler le job de bob (0 row, reste actif).
+        store
+            .cancel(jb, Some("alice"))
+            .await
+            .expect("cancel cross-tenant = no-op idempotent, pas d'erreur");
+        let jb_after = store.get(jb, None).await.unwrap().expect("job bob existe");
+        assert_ne!(
+            jb_after.lifecycle.status,
+            JobStatus::Cancelled,
+            "job de bob ne doit pas être annulé par alice"
+        );
+        // Le bon tenant annule bien.
+        store.cancel(jb, Some("bob")).await.expect("cancel bob");
+        assert_eq!(
+            store.get(jb, None).await.unwrap().unwrap().lifecycle.status,
+            JobStatus::Cancelled
+        );
+
+        // list scopé : alice ne voit pas le job de bob.
+        let la = store
+            .list(JobFilter {
+                tenant: Some("alice".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            la.iter().all(|j| j.id != jb),
+            "list(alice) ne doit pas contenir jb"
+        );
+        assert!(
+            la.iter().any(|j| j.id == ja),
+            "list(alice) doit contenir ja"
+        );
+
+        // count scopé : alice = 1 job (Pending), sans les jobs de bob.
+        let ca = store.count_jobs_by_status(Some("alice")).await.unwrap();
+        assert_eq!(
+            ca.values().sum::<u64>(),
+            1,
+            "count(alice) doit ne compter que ja"
+        );
+
+        // latest scopé : le dernier job d'alice est ja.
+        assert_eq!(
+            store.latest_job(Some("alice")).await.unwrap().map(|j| j.id),
+            Some(ja)
+        );
+    }
+
+    /// A7 défaut 1 — l'estampille d'un `Forget::Agent` multi-vault est le vault du JOB.
+    ///
+    /// Le `warn!` d'audit d'`enqueue` annonçait un « fallback `'main'` » : faux depuis
+    /// A6'. `forget_scope_vault` n'élit aucun vault (N > 1) → `spec_tenant` retombe sur
+    /// `JobSpec.scope`, et `"main"` n'est plus que le dernier ressort. Un opérateur qui
+    /// enquête sur une fuite cherchait donc le job sous le mauvais tenant.
+    ///
+    /// Ce test mesure la valeur réellement écrite en colonne, seule preuve qui ancre le
+    /// texte du log.
+    #[tokio::test]
+    async fn enqueue_stamps_multi_vault_agent_forget_with_the_job_vault() {
+        let store = SqliteQueueStore::new(test_pool().await);
+        let multi_vault_forget = || {
+            Job::Forget(gradatum_core::ForgetSpec {
+                scope: gradatum_core::ForgetScope::Agent {
+                    agent_id: "alice".to_string(),
+                    vaults: vec!["bob".to_string(), "carol".to_string()],
+                },
+                ..Default::default()
+            })
+        };
+        async fn stamp_of(store: &SqliteQueueStore, id: Ulid) -> String {
+            sqlx::query("SELECT tenant_id FROM gradatum_jobs WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .expect("select tenant_id")
+                .get::<String, _>("tenant_id")
+        }
+
+        // Job scopé sur un vault → c'est CE vault qui est estampillé, jamais "main".
+        let mut scoped = make_record(multi_vault_forget(), JobClass::Api, JobStatus::Pending);
+        scoped.spec.scope = JobScope::Vault("alice".to_string());
+        let scoped_id = store.enqueue(scoped).await.expect("enqueue job scopé");
+        assert_eq!(
+            stamp_of(&store, scoped_id).await,
+            "alice",
+            "l'estampille doit être le vault du job, pas le littéral 'main'"
+        );
+
+        // Job sans vault porté → "main" en DERNIER ressort seulement.
+        let vault_wide = make_record(multi_vault_forget(), JobClass::Api, JobStatus::Pending);
+        assert!(matches!(vault_wide.spec.scope, JobScope::VaultWide));
+        let wide_id = store.enqueue(vault_wide).await.expect("enqueue VaultWide");
+        assert_eq!(
+            stamp_of(&store, wide_id).await,
+            "main",
+            "sans vault porté par le job, le repli mono-vault reste 'main'"
+        );
+    }
+
+    /// GATE d'isolation dimension **tenant** sur la queue (5 surfaces).
+    ///
+    /// À `Some(t)`, le tenant A ne peut ni `get`/`cancel` (→ absent/no-op) ni voir
+    /// dans `list`/`count`/`latest_job` les jobs du tenant B. Distincte de la gate
+    /// notes/vault (`no_cross_vault_leak`) : ici l'axe est `gradatum_jobs.tenant_id`.
+    #[tokio::test]
+    async fn no_cross_tenant_job_leak() {
+        let store = SqliteQueueStore::new(test_pool().await);
+        let mk = |t: &str| {
+            make_record(
+                Job::Curate(CurateSpec {
+                    tenant_id: t.to_string(),
+                    ..Default::default()
+                }),
+                JobClass::Api,
+                JobStatus::Pending,
+            )
+        };
+        let a = store.enqueue(mk("tenant-a")).await.expect("enqueue A");
+        let b = store.enqueue(mk("tenant-b")).await.expect("enqueue B");
+
+        // 1. get(B, Some(A)) == None.
+        assert!(
+            store.get(b, Some("tenant-a")).await.unwrap().is_none(),
+            "get cross-tenant doit être None"
+        );
+
+        // 2. cancel(B, Some(A)) n'annule PAS le job de B.
+        store
+            .cancel(b, Some("tenant-a"))
+            .await
+            .expect("cancel cross-tenant = no-op");
+        assert_ne!(
+            store.get(b, None).await.unwrap().unwrap().lifecycle.status,
+            JobStatus::Cancelled,
+            "cancel cross-tenant ne doit pas annuler B"
+        );
+
+        // 3. list(tenant=Some(A)) ne contient aucun job de B.
+        let la = store
+            .list(JobFilter {
+                tenant: Some("tenant-a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(la.iter().all(|j| j.id != b), "list(A) ne doit pas fuiter B");
+        assert!(la.iter().any(|j| j.id == a), "list(A) doit contenir A");
+
+        // 4. count(Some(A)) == nb jobs de A uniquement.
+        let ca = store.count_jobs_by_status(Some("tenant-a")).await.unwrap();
+        assert_eq!(ca.values().sum::<u64>(), 1, "count(A) ne compte que A");
+
+        // 5. latest_job(Some(A)) ∈ jobs de A ; réciproque pour B.
+        assert_eq!(
+            store
+                .latest_job(Some("tenant-a"))
+                .await
+                .unwrap()
+                .map(|j| j.id),
+            Some(a)
+        );
+        assert_eq!(
+            store
+                .latest_job(Some("tenant-b"))
+                .await
+                .unwrap()
+                .map(|j| j.id),
+            Some(b)
+        );
     }
 
     fn make_record(job: Job, class: JobClass, status: JobStatus) -> JobRecord {
@@ -1579,7 +2012,7 @@ mod tests {
         let inserted_id = store.enqueue(record).await.expect("enqueue doit réussir");
         assert_eq!(inserted_id, id);
 
-        let fetched = store.get(id).await.expect("get doit réussir");
+        let fetched = store.get(id, None).await.expect("get doit réussir");
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().id, id);
     }
@@ -1609,7 +2042,7 @@ mod tests {
             .expect("enqueue high doit réussir");
 
         let dequeued = store
-            .dequeue()
+            .dequeue(None)
             .await
             .expect("dequeue doit réussir")
             .expect("doit retourner un job");
@@ -1627,7 +2060,7 @@ mod tests {
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
         let id = record.id;
         store.enqueue(record).await.expect("enqueue doit réussir");
-        let _ = store.dequeue().await.expect("dequeue doit réussir");
+        let _ = store.dequeue(None).await.expect("dequeue doit réussir");
 
         let result = JobResult {
             success: true,
@@ -1642,7 +2075,7 @@ mod tests {
             .expect("complete doit réussir");
 
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -1652,9 +2085,14 @@ mod tests {
     /// `complete()` must not overwrite a job already in the terminal `Conflict` state.
     ///
     /// Reproduces the real-world interleaving: `mark_conflict` sets `Conflict`, then the
-    /// apalis acknowledgement (which sees the handler's `Ok`) calls `complete()`. Without the
-    /// anti-clobber guard the status would become `Done`, making the conflict undetectable
-    /// by the caller's read-modify-write path.
+    /// apalis acknowledgement (which sees the handler's `Ok`) calls `complete()`.
+    ///
+    /// **P2-6** : le SELECT vérifie `status = 'Running'` — un job Conflict n'est
+    /// pas Running, donc `complete()` retourne `Err(NotFound)` (rejeté immédiatement
+    /// sans atteindre le BLOB guard F-41). Le statut Conflict est préservé **par la
+    /// base de données elle-même** (le `WHERE` SQL), pas seulement par le guard
+    /// BLOB applicatif. Cette garantie est plus forte — elle ne dépend pas de la
+    /// cohérence BLOB/SQL.
     #[tokio::test]
     async fn complete_preserves_terminal_conflict() {
         let pool = test_pool().await;
@@ -1671,7 +2109,7 @@ mod tests {
         );
         let id = record.id;
         store.enqueue(record).await.expect("enqueue doit réussir");
-        let _ = store.dequeue().await.expect("dequeue doit réussir");
+        let _ = store.dequeue(None).await.expect("dequeue doit réussir");
 
         // Le worker marque le job Conflict (optimistic-lock périmé).
         let conflict_payload = serde_json::json!({
@@ -1685,7 +2123,7 @@ mod tests {
             .expect("mark_conflict doit réussir");
 
         let after_conflict = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -1696,7 +2134,9 @@ mod tests {
         );
 
         // L'ack apalis appelle complete() avec un JobResult succès (le handler a
-        // retourné Ok). La garde anti-clobber doit préserver Conflict.
+        // retourné Ok). P2-6 : le SELECT `WHERE status = 'Running'` ne trouve plus
+        // le job (Conflict ≠ Running) → Err(NotFound). Le statut Conflict est
+        // préservé par la base elle-même, sans que le BLOB guard ne soit sollicité.
         let ack_result = JobResult {
             success: true,
             duration_ms: 0,
@@ -1704,26 +2144,30 @@ mod tests {
             result_note: None,
             conflict_payload: None,
         };
-        store
-            .complete(id, ack_result)
-            .await
-            .expect("complete (ack) doit réussir sans erreur");
+        let err = store.complete(id, ack_result).await.expect_err(
+            "complete sur job Conflict doit échouer (P2-6 : SELECT WHERE status='Running')",
+        );
+        assert!(
+            matches!(err, QueueError::NotFound(_)),
+            "attendu NotFound (job Conflict → pas Running), obtenu {err:?}"
+        );
 
+        // Le statut Conflict est préservé.
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
         assert_eq!(
             fetched.lifecycle.status,
             JobStatus::Conflict,
-            "complete() ne doit PAS écraser un état terminal Conflict par Done (F-41)"
+            "complete() ne doit PAS écraser un état terminal Conflict par Done (F-41, garanti par P2-6)"
         );
         // Le conflict_payload posé par mark_conflict doit survivre.
         let result = fetched.lifecycle.result.expect("result doit être présent");
         assert!(
             result.conflict_payload.is_some(),
-            "le conflict_payload doit survivre au complete() ignoré"
+            "le conflict_payload doit survivre"
         );
     }
 
@@ -1740,7 +2184,7 @@ mod tests {
         record.retry.max = 1; // max 1 retry pour le test
         let id = record.id;
         store.enqueue(record).await.expect("enqueue doit réussir");
-        let _ = store.dequeue().await.expect("dequeue doit réussir");
+        let _ = store.dequeue(None).await.expect("dequeue doit réussir");
 
         // Premier fail
         store
@@ -1761,7 +2205,7 @@ mod tests {
             .expect("fail_dlq doit réussir");
 
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -1777,10 +2221,10 @@ mod tests {
         let id = record.id;
         store.enqueue(record).await.expect("enqueue doit réussir");
 
-        store.cancel(id).await.expect("cancel doit réussir");
+        store.cancel(id, None).await.expect("cancel doit réussir");
 
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -1928,8 +2372,8 @@ mod tests {
 
         // Bornes : after = id[0].created_at, before = id[3].created_at (exclusives)
         // → ne capte que id[1] et id[2].
-        let r0 = store.get(ids[0]).await.expect("get").expect("existe");
-        let r3 = store.get(ids[3]).await.expect("get").expect("existe");
+        let r0 = store.get(ids[0], None).await.expect("get").expect("existe");
+        let r3 = store.get(ids[3], None).await.expect("get").expect("existe");
 
         let filter = JobFilter {
             created_after: Some(r0.lifecycle.created_at),
@@ -1968,7 +2412,7 @@ mod tests {
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
         let id = record.id;
         store.enqueue(record).await.expect("enqueue doit réussir");
-        let _ = store.dequeue().await.expect("dequeue doit réussir");
+        let _ = store.dequeue(None).await.expect("dequeue doit réussir");
 
         // Simuler lease expirée en patchant directement
         sqlx::query("UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?")
@@ -1986,7 +2430,7 @@ mod tests {
         assert!(recovered.contains(&id));
 
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -2006,7 +2450,7 @@ mod tests {
         store.enqueue(record).await.expect("enqueue doit réussir");
 
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -2028,7 +2472,7 @@ mod tests {
         store.enqueue(record).await.expect("enqueue doit réussir");
 
         let dequeued = store
-            .dequeue()
+            .dequeue(None)
             .await
             .expect("dequeue doit réussir")
             .expect("doit retourner un job");
@@ -2036,7 +2480,7 @@ mod tests {
 
         // C'est ici que le bug E-12 se manifestait : get() retournait Pending stale.
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -2060,7 +2504,7 @@ mod tests {
         let record = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
         let id = record.id;
         store.enqueue(record).await.expect("enqueue doit réussir");
-        let _ = store.dequeue().await.expect("dequeue doit réussir");
+        let _ = store.dequeue(None).await.expect("dequeue doit réussir");
 
         let result = JobResult {
             success: true,
@@ -2075,7 +2519,7 @@ mod tests {
             .expect("complete doit réussir");
 
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -2123,7 +2567,7 @@ mod tests {
 
         // Un worker curate ne doit JAMAIS recevoir un job Embed
         let got = store
-            .dequeue_by_kind("Curate")
+            .dequeue_by_kind("Curate", None)
             .await
             .expect("dequeue_by_kind Curate doit réussir")
             .expect("doit retourner un job");
@@ -2138,7 +2582,7 @@ mod tests {
 
         // Le job Embed est encore Pending — un worker embed peut le prendre
         let got_embed = store
-            .dequeue_by_kind("Embed")
+            .dequeue_by_kind("Embed", None)
             .await
             .expect("dequeue_by_kind Embed doit réussir")
             .expect("le job Embed doit être disponible");
@@ -2169,7 +2613,7 @@ mod tests {
 
         // Un worker embed ne doit rien trouver
         let got = store
-            .dequeue_by_kind("Embed")
+            .dequeue_by_kind("Embed", None)
             .await
             .expect("dequeue_by_kind Embed doit réussir");
         assert!(
@@ -2382,7 +2826,7 @@ mod tests {
         store.enqueue(record).await.expect("enqueue");
 
         // Simuler 2 dequeues + fails successifs : attempt_count SQL monte à 2.
-        let _ = store.dequeue().await.expect("dequeue 1");
+        let _ = store.dequeue(None).await.expect("dequeue 1");
         store.fail(id, "erreur 1", 1).await.expect("fail 1");
         // promote_retries → encore < max (1 < 2) → Pending
         store
@@ -2400,7 +2844,7 @@ mod tests {
         );
 
         // Deuxième cycle
-        let _ = store.dequeue().await.expect("dequeue 2");
+        let _ = store.dequeue(None).await.expect("dequeue 2");
         store.fail(id, "erreur 2", 2).await.expect("fail 2");
         store
             .schedule_retry(id, Utc::now() - chrono::Duration::seconds(1))
@@ -2418,7 +2862,11 @@ mod tests {
             "job à max_retries ne doit PAS être dans la liste promoted (il est en DLQ)"
         );
 
-        let fetched = store.get(id).await.expect("get").expect("job doit exister");
+        let fetched = store
+            .get(id, None)
+            .await
+            .expect("get")
+            .expect("job doit exister");
         assert_eq!(
             fetched.lifecycle.status,
             JobStatus::DLQ,
@@ -2447,7 +2895,7 @@ mod tests {
         store.enqueue(record).await.expect("enqueue");
 
         // Amener le job en DLQ après déqueue + fail_dlq.
-        let _ = store.dequeue().await.expect("dequeue");
+        let _ = store.dequeue(None).await.expect("dequeue");
         // Force attempt_count=3 via fail() avant fail_dlq.
         store.fail(id, "erreur max", 3).await.expect("fail");
         store
@@ -2455,7 +2903,7 @@ mod tests {
             .await
             .expect("fail_dlq");
 
-        let before = store.get(id).await.expect("get").expect("job");
+        let before = store.get(id, None).await.expect("get").expect("job");
         assert_eq!(before.lifecycle.status, JobStatus::DLQ);
 
         // Replay SQL — même requête que gradatum-admin/src/jobs_cmd.rs::replay_single.
@@ -2513,7 +2961,7 @@ mod tests {
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
 
-        let _ = store.dequeue().await.expect("dequeue");
+        let _ = store.dequeue(None).await.expect("dequeue");
         store.fail(id, "erreur 1", 1).await.expect("fail");
         store
             .schedule_retry(id, Utc::now() - chrono::Duration::seconds(1))
@@ -2530,7 +2978,7 @@ mod tests {
             "job en dessous de max_retries doit être promu Pending"
         );
 
-        let fetched = store.get(id).await.expect("get").expect("job");
+        let fetched = store.get(id, None).await.expect("get").expect("job");
         assert_eq!(
             fetched.lifecycle.status,
             JobStatus::Pending,
@@ -2641,7 +3089,7 @@ mod tests {
             .await
             .expect("set_pending doit réussir");
 
-        let fetched = store.get(id).await.expect("get").expect("job");
+        let fetched = store.get(id, None).await.expect("get").expect("job");
         assert_eq!(
             fetched.lifecycle.status,
             JobStatus::Pending,
@@ -2665,7 +3113,7 @@ mod tests {
             .await
             .expect("second set_pending idempotent");
 
-        let fetched = store.get(id).await.expect("get").expect("job");
+        let fetched = store.get(id, None).await.expect("get").expect("job");
         assert_eq!(
             fetched.lifecycle.status,
             JobStatus::Pending,
@@ -2684,7 +3132,7 @@ mod tests {
         let rec = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
         let id = rec.id;
         store.enqueue(rec).await.expect("enqueue");
-        let _ = store.dequeue().await.expect("dequeue");
+        let _ = store.dequeue(None).await.expect("dequeue");
         store
             .complete(
                 id,
@@ -2705,7 +3153,7 @@ mod tests {
             .await
             .expect("set_pending no-op sur Done doit réussir");
 
-        let fetched = store.get(id).await.expect("get").expect("job");
+        let fetched = store.get(id, None).await.expect("get").expect("job");
         assert_eq!(
             fetched.lifecycle.status,
             JobStatus::Done,
@@ -2725,7 +3173,7 @@ mod tests {
         let job_a = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
         let id_a = job_a.id;
         store.enqueue(job_a).await.expect("enqueue A");
-        let _ = store.dequeue().await.expect("dequeue A");
+        let _ = store.dequeue(None).await.expect("dequeue A");
         store
             .complete(
                 id_a,
@@ -2755,7 +3203,7 @@ mod tests {
             .await
             .expect("cascade");
 
-        let fetched_b = store.get(id_b).await.expect("get B").expect("job B");
+        let fetched_b = store.get(id_b, None).await.expect("get B").expect("job B");
         assert_eq!(
             fetched_b.lifecycle.status,
             JobStatus::Pending,
@@ -2773,7 +3221,7 @@ mod tests {
         let job_a = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
         let id_a = job_a.id;
         store.enqueue(job_a).await.expect("enqueue A");
-        let _ = store.dequeue().await.expect("dequeue A");
+        let _ = store.dequeue(None).await.expect("dequeue A");
         store
             .complete(
                 id_a,
@@ -2814,7 +3262,7 @@ mod tests {
             .await
             .expect("cascade");
 
-        let fetched_b = store.get(id_b).await.expect("get B").expect("job B");
+        let fetched_b = store.get(id_b, None).await.expect("get B").expect("job B");
         assert_eq!(
             fetched_b.lifecycle.status,
             JobStatus::Waiting,
@@ -2855,7 +3303,7 @@ mod tests {
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
-        let _ = store.dequeue().await.expect("dequeue");
+        let _ = store.dequeue(None).await.expect("dequeue");
 
         let result_a = JobResult {
             success: true,
@@ -2887,7 +3335,7 @@ mod tests {
         let _ = r_b;
 
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -2908,7 +3356,7 @@ mod tests {
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
-        let _ = store.dequeue().await.expect("dequeue");
+        let _ = store.dequeue(None).await.expect("dequeue");
 
         let store_a = store.clone();
         let store_b = store.clone();
@@ -2920,7 +3368,7 @@ mod tests {
         let _ = r_b;
 
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -2944,7 +3392,7 @@ mod tests {
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
-        let _ = store.dequeue().await.expect("dequeue");
+        let _ = store.dequeue(None).await.expect("dequeue");
 
         // TTL invalide = Duration::MAX (> i64::MAX ns → hors plage chrono::Duration).
         // Avant le fix, unwrap_or_default() → Duration::ZERO → threshold = now → le job
@@ -2962,7 +3410,7 @@ mod tests {
 
         // Vérifier que le job Running est intact (pas faussement remis en Pending).
         let fetched = store
-            .get(id)
+            .get(id, None)
             .await
             .expect("get doit réussir")
             .expect("job doit exister");
@@ -2982,7 +3430,7 @@ mod tests {
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
-        let _ = store.dequeue().await.expect("dequeue");
+        let _ = store.dequeue(None).await.expect("dequeue");
 
         // Forcer la lease dans le passé.
         sqlx::query("UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?")
@@ -3036,7 +3484,7 @@ mod tests {
         }
 
         let latest = store
-            .latest_job("main")
+            .latest_job(None)
             .await
             .expect("latest_job doit réussir")
             .expect("la file n'est pas vide → un job attendu");
@@ -3059,7 +3507,7 @@ mod tests {
         let store = SqliteQueueStore::new(pool);
 
         let latest = store
-            .latest_job("main")
+            .latest_job(None)
             .await
             .expect("latest_job doit réussir même sur file vide");
 
@@ -3077,7 +3525,7 @@ mod tests {
         );
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
-        let _ = store.dequeue().await.expect("dequeue");
+        let _ = store.dequeue(None).await.expect("dequeue");
         store.fail_dlq(id, "test prune").await.expect("fail_dlq");
         id
     }
@@ -3095,7 +3543,7 @@ mod tests {
         record.lifecycle.created_at = created_at;
         let id = record.id;
         store.enqueue(record).await.expect("enqueue");
-        let _ = store.dequeue().await.expect("dequeue");
+        let _ = store.dequeue(None).await.expect("dequeue");
         store.fail_dlq(id, "test prune").await.expect("fail_dlq");
         id
     }
@@ -3246,7 +3694,7 @@ mod tests {
         let job_a = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
         let id_a = job_a.id;
         store.enqueue(job_a).await.expect("enqueue A");
-        let _ = store.dequeue().await.expect("dequeue A");
+        let _ = store.dequeue(None).await.expect("dequeue A");
         store
             .complete(
                 id_a,
@@ -3272,7 +3720,11 @@ mod tests {
         store.enqueue(job_b).await.expect("enqueue B");
 
         // Verification prealable : B est bien bloque en Waiting.
-        let before = store.get(id_b).await.expect("get B before").expect("B");
+        let before = store
+            .get(id_b, None)
+            .await
+            .expect("get B before")
+            .expect("B");
         assert_eq!(
             before.lifecycle.status,
             JobStatus::Waiting,
@@ -3287,7 +3739,11 @@ mod tests {
 
         assert_eq!(promoted, 1, "exactement 1 job doit etre promu");
 
-        let after = store.get(id_b).await.expect("get B after").expect("B");
+        let after = store
+            .get(id_b, None)
+            .await
+            .expect("get B after")
+            .expect("B");
         assert_eq!(
             after.lifecycle.status,
             JobStatus::Pending,
@@ -3338,7 +3794,7 @@ mod tests {
         let job_a = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
         let id_a = job_a.id;
         store.enqueue(job_a).await.expect("enqueue A");
-        let _ = store.dequeue().await.expect("dequeue A");
+        let _ = store.dequeue(None).await.expect("dequeue A");
         store
             .complete(
                 id_a,
@@ -3380,11 +3836,331 @@ mod tests {
 
         assert_eq!(promoted, 0, "B ne doit pas etre promu -- C n'est pas Done");
 
-        let fetched_b = store.get(id_b).await.expect("get B").expect("B");
+        let fetched_b = store.get(id_b, None).await.expect("get B").expect("B");
         assert_eq!(
             fetched_b.lifecycle.status,
             JobStatus::Waiting,
             "B doit rester Waiting car une dependance n'est pas Done"
+        );
+    }
+
+    // ── P0-4 Tests stale-lease sur SqliteQueueStore (chemin de production) ────
+
+    /// `complete()` rejeté après expiration du lease (garde `lease_until > ?`
+    /// au niveau UPDATE).
+    ///
+    /// Scénario : un worker obtient un lease (dequeue), puis son lease expire.
+    /// Le job est toujours `Running` (le sweep n'est pas encore passé),
+    /// donc le SELECT P2-6 (`status = 'Running'`) le trouve encore.
+    /// Mais l'UPDATE P0-1 (`AND lease_until > ?`) échoue car le lease est
+    /// expiré → `rows_affected() = 0` → `NotLeased`.
+    ///
+    /// Ce test isole la garde UPDATE du P0-1 (le SELECT P2-6 n'est pas le
+    /// garde-fou ici — le statut SQL est toujours Running).
+    #[tokio::test]
+    async fn complete_rejected_after_stale_lease_recovered() {
+        let pool = test_pool().await;
+        let store = SqliteQueueStore::new(pool);
+
+        let record = make_record(
+            Job::Curate(CurateSpec {
+                note_id: Ulid::new(),
+                tenant_id: "main".to_string(),
+                ..Default::default()
+            }),
+            JobClass::Agent,
+            JobStatus::Pending,
+        );
+        let id = record.id;
+        store.enqueue(record).await.expect("enqueue doit réussir");
+        let _ = store.dequeue(None).await.expect("dequeue doit réussir");
+
+        // Simuler un lease expiré dans le passé, MAIS le statut reste Running
+        // (le sweep n'est pas encore passé — on teste la garde lease_until).
+        sqlx::query("UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&store.pool)
+            .await
+            .expect("patch lease doit réussir");
+
+        // Vérifier que le statut SQL est toujours Running (pas Pending).
+        let row = sqlx::query("SELECT status FROM gradatum_jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .expect("select status");
+        let sql_status: String = row.try_get("status").expect("colonne status");
+        assert_eq!(
+            sql_status, "Running",
+            "précondition : le statut SQL doit être Running (le sweep n'est pas passé)"
+        );
+
+        // L'ancien worker appelle complete() → le SELECT P2-6 trouve le job
+        // (status=Running OK), mais l'UPDATE P0-1 échoue (lease_until expiré).
+        let result = JobResult {
+            success: true,
+            duration_ms: 100,
+            cost_usd: None,
+            result_note: None,
+            conflict_payload: None,
+        };
+        let err = store
+            .complete(id, result)
+            .await
+            .expect_err("complete doit échouer avec lease expiré");
+        assert!(
+            matches!(err, QueueError::NotLeased(_)),
+            "attendu NotLeased (garde UPDATE lease_until > now), obtenu {err:?}"
+        );
+
+        // Le statut du job est toujours Running — le complete() a été rejeté.
+        let after = store
+            .get(id, None)
+            .await
+            .expect("get doit réussir")
+            .expect("job doit exister");
+        assert_eq!(
+            after.lifecycle.status,
+            JobStatus::Running,
+            "le job doit rester Running après NotLeased"
+        );
+    }
+
+    /// `fail()` après expiration du lease → rejeté (`NotLeased`).
+    ///
+    /// Scénario : un worker obtient un lease, puis son lease expire.
+    /// Un autre worker a déjà pu reprendre le job via `recover_stale_leases`,
+    /// ou le job est simplement en état Pending. `fail()` doit être rejeté.
+    #[tokio::test]
+    async fn fail_rejected_after_lease_expired() {
+        let pool = test_pool().await;
+        let store = SqliteQueueStore::new(pool);
+
+        let record = make_record(
+            Job::Curate(CurateSpec {
+                note_id: Ulid::new(),
+                tenant_id: "main".to_string(),
+                ..Default::default()
+            }),
+            JobClass::Agent,
+            JobStatus::Pending,
+        );
+        let id = record.id;
+        store.enqueue(record).await.expect("enqueue doit réussir");
+        let _ = store.dequeue(None).await.expect("dequeue doit réussir");
+
+        // Simuler un lease expiré.
+        sqlx::query("UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&store.pool)
+            .await
+            .expect("patch lease doit réussir");
+
+        // fail() avec le lease expiré → NotLeased.
+        let err = store
+            .fail(id, "erreur test", 1)
+            .await
+            .expect_err("fail doit échouer avec lease expiré");
+        assert!(
+            matches!(err, QueueError::NotLeased(_)),
+            "attendu NotLeased, obtenu {err:?}"
+        );
+    }
+
+    /// `complete()` appelé deux fois : le premier réussit, le second est rejeté
+    /// (le job n'est plus Running après le premier complete).
+    #[tokio::test]
+    async fn double_complete_rejected() {
+        let pool = test_pool().await;
+        let store = SqliteQueueStore::new(pool);
+
+        let record = make_record(
+            Job::Curate(CurateSpec {
+                note_id: Ulid::new(),
+                tenant_id: "main".to_string(),
+                ..Default::default()
+            }),
+            JobClass::Agent,
+            JobStatus::Pending,
+        );
+        let id = record.id;
+        store.enqueue(record).await.expect("enqueue doit réussir");
+        let _ = store.dequeue(None).await.expect("dequeue doit réussir");
+
+        // Premier complete → OK.
+        let result = JobResult {
+            success: true,
+            duration_ms: 100,
+            cost_usd: None,
+            result_note: None,
+            conflict_payload: None,
+        };
+        store
+            .complete(id, result.clone())
+            .await
+            .expect("premier complete doit réussir");
+
+        // Vérifier que le job est Done.
+        let after_first = store
+            .get(id, None)
+            .await
+            .expect("get doit réussir")
+            .expect("job doit exister");
+        assert_eq!(
+            after_first.lifecycle.status,
+            JobStatus::Done,
+            "le job doit être Done après le premier complete"
+        );
+
+        // Deuxième complete → rejeté (le job n'est plus Running).
+        let err = store
+            .complete(id, result)
+            .await
+            .expect_err("deuxième complete doit échouer");
+        // Le SELECT `WHERE status = 'Running'` ne trouve plus le job (Done)
+        // → NotFound (pas NotLeased, car le job n'est même plus Running).
+        assert!(
+            matches!(err, QueueError::NotFound(_)),
+            "attendu NotFound (job Done → pas Running), obtenu {err:?}"
+        );
+    }
+
+    /// `fail()` appelé sur un job Pending (sans lease) → rejeté.
+    #[tokio::test]
+    async fn fail_on_pending_job_rejected() {
+        let pool = test_pool().await;
+        let store = SqliteQueueStore::new(pool);
+
+        let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
+        let id = record.id;
+        store.enqueue(record).await.expect("enqueue doit réussir");
+        // Pas de dequeue → le job est toujours Pending, pas de lease.
+
+        let err = store
+            .fail(id, "erreur test", 1)
+            .await
+            .expect_err("fail sur job Pending doit échouer");
+        // Le SELECT `WHERE status = 'Running'` ne trouve pas le job Pending.
+        assert!(
+            matches!(err, QueueError::NotFound(_)),
+            "attendu NotFound (job Pending → pas Running), obtenu {err:?}"
+        );
+    }
+
+    // ── P0-3 Test : worker pool partagé (shared pool, tenant_filter = None) ──
+
+    /// `dequeue_by_kind(kind, None)` avec un pool partagé : les jobs de tous
+    /// les tenants sont éligibles. Ce test prouve que le `None` filter
+    /// n'empêche PAS le dequeue cross-tenant — le worker voit tous les jobs.
+    ///
+    /// Le handler (curate/embed/etc.) est responsable de l'isolation des
+    /// données par tenant via `ensure_job_tenant()`. Le worker lui-même
+    /// n'a pas d'affiliation à un tenant.
+    #[tokio::test]
+    async fn shared_pool_dequeue_sees_all_tenants() {
+        let pool = test_pool().await;
+        let store = SqliteQueueStore::new(pool);
+
+        // Job tenant A.
+        let job_a = make_record(
+            Job::Curate(CurateSpec {
+                note_id: Ulid::new(),
+                tenant_id: "alice".to_string(),
+                ..Default::default()
+            }),
+            JobClass::Agent,
+            JobStatus::Pending,
+        );
+        let id_a = job_a.id;
+        store.enqueue(job_a).await.expect("enqueue alice");
+
+        // Job tenant B.
+        let job_b = make_record(
+            Job::Curate(CurateSpec {
+                note_id: Ulid::new(),
+                tenant_id: "bob".to_string(),
+                ..Default::default()
+            }),
+            JobClass::Agent,
+            JobStatus::Pending,
+        );
+        let id_b = job_b.id;
+        store.enqueue(job_b).await.expect("enqueue bob");
+
+        // Shared pool (None) → premier dequeue obtient un job (peu importe le tenant).
+        let first = store
+            .dequeue_by_kind("Curate", None)
+            .await
+            .expect("dequeue")
+            .expect("un job doit être dispo");
+        assert!(
+            first.id == id_a || first.id == id_b,
+            "shared pool doit dequeue un job existant"
+        );
+
+        // Deuxième dequeue → l'autre job.
+        let second = store
+            .dequeue_by_kind("Curate", None)
+            .await
+            .expect("dequeue")
+            .expect("le second job doit être dispo");
+        assert_ne!(first.id, second.id, "les deux jobs doivent être différents");
+
+        // Les deux jobs sont bien accessibles par le pool partagé.
+        let all_ids = [id_a, id_b];
+        assert!(
+            all_ids.contains(&first.id) && all_ids.contains(&second.id),
+            "les deux jobs (alice + bob) doivent être dequés par le pool partagé"
+        );
+
+        // Vérifier que chaque job porte son tenant dans le payload
+        // (le handler peut ainsi isoler les opérations par tenant).
+        let first_record = store
+            .get(first.id, None)
+            .await
+            .expect("get first")
+            .expect("first existe");
+        let first_tenant = match &first_record.spec.kind {
+            Job::Curate(c) => c.tenant_id.clone(),
+            _ => panic!("pas un Curate"),
+        };
+        assert!(
+            first_tenant == "alice" || first_tenant == "bob",
+            "le tenant est préservé dans le payload du job"
+        );
+    }
+
+    /// G10-P1 : régression — une erreur > 2048 octets avec un caractère
+    /// multi-octets à la frontière 2048 ne doit PAS paniquer.
+    ///
+    /// L'ancien code `&err[..2048]` slice sur les octets → panique
+    /// `"byte index 2048 is not a char boundary"` si la frontière 2048
+    /// tombe au milieu d'un caractère multi-octets (ex: 'é' = 2 octets).
+    /// Scénario réel : erreur LLM/HTTP longue (> 2048 octets) → fail()
+    /// panic → job non failé → lease expire → recover repend → re-panic.
+    #[test]
+    fn fail_truncation_utf8_boundary_no_panic() {
+        // Construit une erreur où l'octet 2048 est le second octet d'un 'é'
+        // (U+00E9 = C3 A9 en UTF-8). 2047 × 'a' + 'é' → frontière au milieu
+        // du caractère.
+        let prefix = "a".repeat(2047);
+        let err = format!("{prefix}é padding padding padding padding");
+        assert!(err.len() > 2048, "l'erreur doit dépasser 2048 octets");
+
+        // La troncation par chars (fix) ne doit pas paniquer.
+        let truncated: String = if err.chars().count() > 2048 {
+            err.chars().take(2048).collect()
+        } else {
+            err.to_string()
+        };
+        assert!(
+            truncated.chars().count() <= 2048,
+            "tronqué à max 2048 chars"
+        );
+        // Vérifie que le caractère 'é' (multi-octets) est intact.
+        assert!(
+            truncated.ends_with('é'),
+            "le dernier caractère multi-octets doit être préservé"
         );
     }
 }

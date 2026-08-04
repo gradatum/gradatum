@@ -358,11 +358,11 @@ async fn cancel_job_conflict_running() {
     let record = make_test_job();
     let job_id = store.enqueue(record).await.expect("enqueue invariant test");
 
-    let _ = store.dequeue().await.expect("dequeue invariant test");
+    let _ = store.dequeue(None).await.expect("dequeue invariant test");
 
     // Vérifier que le job est bien Running avant le test
     let fetched = store
-        .get(job_id)
+        .get(job_id, None)
         .await
         .expect("get après dequeue")
         .expect("job doit exister");
@@ -409,7 +409,7 @@ async fn e12_regression_get_after_dequeue() {
     let job_id = store.enqueue(record).await.expect("enqueue E-12 test");
 
     // Dequeue met le statut SQL en Running MAIS le payload BLOB reste Pending (optimisation)
-    let _ = store.dequeue().await.expect("dequeue E-12 test");
+    let _ = store.dequeue(None).await.expect("dequeue E-12 test");
 
     let state = state_with_store(store, pool);
     let token = test_token(&state);
@@ -539,7 +539,7 @@ async fn list_jobs_filter_status() {
     }
 
     // Dequeue 1 et le complète → Done
-    if let Some(running) = store.dequeue().await.expect("dequeue filter test") {
+    if let Some(running) = store.dequeue(None).await.expect("dequeue filter test") {
         let result = JobResult {
             success: true,
             duration_ms: 10,
@@ -602,7 +602,11 @@ async fn list_jobs_filter_status() {
             .await
             .expect("enqueue done test");
     }
-    let r = store2.dequeue().await.expect("dequeue done test").unwrap();
+    let r = store2
+        .dequeue(None)
+        .await
+        .expect("dequeue done test")
+        .unwrap();
     store2
         .complete(
             r.id,

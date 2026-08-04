@@ -1,8 +1,8 @@
 # gradatum-curator
 
-> LLM-powered note curation: heuristic-first gating, optional LLM review for low-confidence notes, and a five-step offline-capable pipeline for novelty, routing, tagging, wikilinks, and deduplication.
+> LLM-powered note curation: heuristic-first section routing with an optional LLM review for low-confidence notes.
 
-**Status**: Alpha (v0.7.6) — public, Apache-2.0. API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -21,24 +21,32 @@ Curator<C: Chat>::decide(note, ctx) → CuratorDecision
   step 4: LLM error → FallbackStrategy applied
 ```
 
-**`CuratorPipeline` (five-step offline-capable pipeline)**
+**`CuratorPipeline` (heuristic routing + optional LLM review)**
 
 ```text
 CuratorPipeline::process(note) → CurateOutcome
-  step 1: novelty   — SHA-256 exact match + MinHash 128-perm Jaccard ≥ 0.92
-  step 2: routing   — regex heuristic across 13 gradatum sections
-  step 3: tags      — TF-IDF top-5 + kebab-case normalization
-  step 4: wikilinks — regex extraction + Jaro-Winkler 0.88 fuzzy matching
-  step 5: dedup     — cosine 0.95 over bge-small embeddings
+  step 0: valid section_hint → admitted directly with that section (no enrichment)
+  step 1: routing::heuristic_route(title, body) → (section, confidence)
+          confidence ≥ heuristic_admit_threshold (default 0.8) → Admitted
+  step 2: llm_review_enabled = false OR confidence > confidence_threshold (default 0.7) → Pending
+  step 3: llm_review_enabled = true AND confidence <= confidence_threshold
+          → LLM classify → Admitted { section, tags } | Pending | Rejected
 ```
 
-The pipeline is offline-first: all steps except optional LLM review run without network access.
+In `1.0.0`, `process` runs section routing plus the optional LLM review only. The
+`CuratorDecisions` fields `novelty`, `wikilinks`, and `dedup` always hold fixed defaults
+(`Admitted` / `[]` / `Unique`); `tags` are populated only by the LLM review. Novelty
+detection (SHA-256 + MinHash), TF-IDF tagging, wikilink scoring (Jaro-Winkler), and
+semantic deduplication (cosine over embeddings) are **planned for a post-1.0 release** and
+are not wired into `process`.
+
+Routing runs offline: no network call is made unless the optional LLM review is enabled.
 
 ## Usage
 
 ```toml
 [dependencies]
-gradatum-curator = "0.7.6"
+gradatum-curator = "1.0.0"
 ```
 
 ```rust
@@ -47,7 +55,7 @@ use gradatum_curator::{CuratorPipeline, CurateOutcome, CuratorPipelineConfig};
 // Build from TOML configuration (reads api_key_env if set).
 let pipeline = CuratorPipeline::from_config(&config);
 
-// Run the cascade — infallible (LLM errors are absorbed into the outcome).
+// Run curation — infallible (LLM errors are absorbed into the outcome).
 let outcome: CurateOutcome = pipeline.process(note).await;
 ```
 

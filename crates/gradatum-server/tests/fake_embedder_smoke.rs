@@ -1,4 +1,4 @@
-//! Test de fumée — `FakeEmbedder` déterministe + `build_app_with_embedder` (Task 3.5).
+//! Test de fumée — `FakeEmbedder` déterministe + `build_app_with_embedder`.
 //!
 //! Vérifie :
 //! - `backend_kind() != Noop` → le chemin sémantique est activé.

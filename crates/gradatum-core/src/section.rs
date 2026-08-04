@@ -7,7 +7,7 @@
 //! The `Council` variant was added to align the enum with the full section registry.
 //! The `ProjectMap` variant (12th) tracks traceable work units carrying a
 //! typed-wikilink schema (`[[project:…]]` + `[[status:…]]` + `[[kind:…]]`).
-//! The `Identity` variant (13th) stores agent soul notes (persona/governance, since v0.7.3).
+//! The `Identity` variant (13th) stores agent soul notes (persona/governance, since v0.7.6).
 
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +57,7 @@ pub enum Section {
     ///
     // Extension requires a governance review (anti-incremental-drift).
     ProjectMap,
-    /// Identity: declarative agent soul (persona/governance) — soul notes, since v0.7.3.
+    /// Identity: declarative agent soul (persona/governance) — soul notes, since v0.7.6.
     ///
     /// Notes here carry the agent persona, immutable invariants (INVARIANTS/GATES/NARRATIVE
     /// schema), and are protected from semantic forget (see [`Section::PROTECTED_FORGET`]).
@@ -76,13 +76,75 @@ impl Section {
     ///
     /// # Invariant
     ///
-    /// `AgentIssues` and `Council` are excluded from every forget batch,
-    /// whether triggered via the API (preview handler) or executed by the worker.
+    /// `AgentIssues`, `Council`, `ProjectMap` and `Identity` are excluded from
+    /// every forget batch, whether triggered via the API (preview handler) or
+    /// executed by the worker. This list must stay in sync with the constant below.
     pub const PROTECTED_FORGET: &'static [Section] = &[
         Section::AgentIssues,
         Section::Council,
         Section::ProjectMap,
         Section::Identity,
+    ];
+
+    /// Sections protected from **hard-delete**.
+    ///
+    /// Strictly wider than [`Section::PROTECTED_FORGET`]: a hard-delete is
+    /// irreversible, so the governance perimeter is extended to `Decisions`
+    /// (target of `gov-save-decision`) and `Reasoning` (ReasoningBank).
+    /// A note in any of these sections can **never** be hard-deleted — there is
+    /// **no bypass flag**; this was a deliberate maintainer decision.
+    ///
+    /// The guard is **system-wide**, not API-only: it is enforced at the single
+    /// cascade choke point (`cascade_delete_note`), so it protects both the
+    /// `vault_delete` endpoint **and** the background Purge job (which reaches
+    /// the same cascade through the internal delete endpoint). A protected note
+    /// that is downgraded to `garbage` is never purged. Removing such a
+    /// governance note is an exceptional manual operation, out of band.
+    ///
+    /// # Invariant
+    ///
+    /// `PROTECTED_FORGET ⊆ PROTECTED_DELETE` — enforced by the unit test
+    /// `protected_delete_superset_of_protected_forget`. Anything that can never
+    /// be forgotten can never be hard-deleted either.
+    pub const PROTECTED_DELETE: &'static [Section] = &[
+        Section::AgentIssues,
+        Section::Council,
+        Section::ProjectMap,
+        Section::Identity,
+        Section::Decisions,
+        Section::Reasoning,
+    ];
+
+    /// Returns `true` if `name` (kebab-case section) can never be hard-deleted.
+    ///
+    /// Single source of truth for the [`Section::PROTECTED_DELETE`] membership
+    /// test, shared by the `vault_delete` endpoint and the cascade choke point
+    /// (`cascade_delete_note`). Unknown section names return `false` (they are
+    /// not in the governance perimeter).
+    #[must_use]
+    pub fn is_protected_delete(name: &str) -> bool {
+        Section::PROTECTED_DELETE.iter().any(|s| s.as_str() == name)
+    }
+
+    /// Sections protected from the automatic downgrade policy (graduated forgetting).
+    ///
+    /// The four [`Section::PROTECTED_FORGET`] sections, plus the durable-memory
+    /// sections that must never lose trust just because they went quiet ("never
+    /// downgrade unless factually wrong"), plus `architecture`, which feeds the
+    /// regression-analysis tooling through `vault_trace`. Single source of truth —
+    /// the irrelevance detector filters its candidates on this set, and configuration
+    /// may only extend it, never remove a baseline entry.
+    /// Kebab-case, matching [`Section::as_str`].
+    pub const PROTECTED_DOWNGRADE: &'static [&'static str] = &[
+        "agent-issues",
+        "council",
+        "project-map",
+        "identity",
+        "decisions",
+        "lessons-learned",
+        "feedback",
+        "retrospectives",
+        "architecture",
     ];
 
     /// All canonical sections, in declaration order.
@@ -152,6 +214,15 @@ impl std::fmt::Display for Section {
     }
 }
 
+/// Returns `true` if `section` (kebab-case) is protected from automatic downgrade.
+///
+/// Membership test against [`Section::PROTECTED_DOWNGRADE`]. Unknown section names
+/// return `false` (not in the governance perimeter).
+#[must_use]
+pub fn is_protected_downgrade(section: &str) -> bool {
+    Section::PROTECTED_DOWNGRADE.contains(&section)
+}
+
 // ── CoALA scoring-only — deterministic section → c_kind / doc_kind mappings ──
 //
 // These functions capture CoALA metadata without modifying any search/scoring
@@ -186,7 +257,7 @@ pub const fn section_to_c_kind(section: &Section) -> &'static str {
         Section::Council => "episodic",
         // ProjectMap : unité de travail/process → procedural (spec §16 B1)
         Section::ProjectMap => "procedural",
-        // Identity : gouvernance/comportement agent → procedural (F-34 v0.7.3)
+        // Identity : gouvernance/comportement agent → procedural (F-34 v0.7.6)
         Section::Identity => "procedural",
     }
 }
@@ -209,7 +280,7 @@ pub const fn section_to_doc_kind(section: &Section) -> &'static str {
         // Toutes les autres sections : connaissance stable
         // ProjectMap : entité mutée par RMW (carte = work-status piloté), pas
         // un événement immuable → Static (spec §16 B1).
-        // Identity : âme stable, mutée par RMW uniquement → Static (F-34 v0.7.3, A4).
+        // Identity : âme stable, mutée par RMW uniquement → Static (F-34 v0.7.6, A4).
         Section::Architecture
         | Section::Decisions
         | Section::Reasoning
@@ -288,7 +359,7 @@ mod from_canonical_str_tests {
         }
     }
 
-    /// Vérifie les propriétés canoniques de la 13e section `identity` (F-34 v0.7.3).
+    /// Vérifie les propriétés canoniques de la 13e section `identity` (F-34 v0.7.6).
     ///
     /// Invariants vérifiés :
     /// - round-trip parse (`from_canonical_str` / `as_str`)
@@ -312,6 +383,79 @@ mod from_canonical_str_tests {
         assert_eq!(section_to_c_kind(&Section::Identity), "procedural");
         // Jamais oubliée (A3 PROTECTED_FORGET).
         assert!(Section::PROTECTED_FORGET.contains(&Section::Identity));
+    }
+
+    /// Invariant F-100 : `PROTECTED_FORGET ⊆ PROTECTED_DELETE`.
+    ///
+    /// Toute note qui ne peut JAMAIS être oubliée ne peut JAMAIS être
+    /// hard-delete non plus. Ce test verrouille l'invariant contre toute
+    /// dérive future (ajout d'une section à PROTECTED_FORGET sans miroir dans
+    /// PROTECTED_DELETE).
+    #[test]
+    fn protected_delete_superset_of_protected_forget() {
+        for forget in Section::PROTECTED_FORGET {
+            assert!(
+                Section::PROTECTED_DELETE.contains(forget),
+                "section {forget:?} protégée en forget doit l'être aussi en delete (invariant ⊃)"
+            );
+        }
+    }
+
+    /// F-100 1.2b — périmètre exact du refus dur hard-delete (arbitrage du mainteneur).
+    ///
+    /// PROTECTED_DELETE = PROTECTED_FORGET ∪ {Decisions, Reasoning}.
+    #[test]
+    fn protected_delete_exact_perimeter() {
+        // Les 4 sections de PROTECTED_FORGET.
+        assert!(Section::PROTECTED_DELETE.contains(&Section::AgentIssues));
+        assert!(Section::PROTECTED_DELETE.contains(&Section::Council));
+        assert!(Section::PROTECTED_DELETE.contains(&Section::ProjectMap));
+        assert!(Section::PROTECTED_DELETE.contains(&Section::Identity));
+        // + les 2 sections élargies (gov-save-decision + ReasoningBank).
+        assert!(Section::PROTECTED_DELETE.contains(&Section::Decisions));
+        assert!(Section::PROTECTED_DELETE.contains(&Section::Reasoning));
+        // Exactement 6 sections, pas plus.
+        assert_eq!(Section::PROTECTED_DELETE.len(), 6);
+        // Une section non gouvernance N'EST PAS protégée (ex. Feedback).
+        assert!(!Section::PROTECTED_DELETE.contains(&Section::Feedback));
+    }
+
+    /// La fonction partagée `is_protected_delete` reflète exactement la constante.
+    #[test]
+    fn is_protected_delete_matches_constant() {
+        // Chaque section protégée est reconnue par son nom kebab-case.
+        for sec in Section::PROTECTED_DELETE {
+            assert!(Section::is_protected_delete(sec.as_str()));
+        }
+        // Une section hors périmètre et un nom inconnu → false.
+        assert!(!Section::is_protected_delete("feedback"));
+        assert!(!Section::is_protected_delete("bogus-section"));
+    }
+
+    // F-111 : protégées = 4 PROTECTED_FORGET + 4 mémoire durable + architecture (GO du mainteneur 2026-07-16)
+    #[test]
+    fn protected_downgrade_covers_forget_set_plus_durable_memory() {
+        for s in [
+            "agent-issues",
+            "council",
+            "project-map",
+            "identity",
+            "decisions",
+            "lessons-learned",
+            "feedback",
+            "retrospectives",
+            "architecture",
+        ] {
+            assert!(Section::PROTECTED_DOWNGRADE.contains(&s), "{s} manquant");
+            assert!(is_protected_downgrade(s), "{s} devrait être protégée");
+        }
+        assert_eq!(Section::PROTECTED_DOWNGRADE.len(), 9);
+        for s in ["debug", "experiments", "reference", "reasoning"] {
+            assert!(
+                !is_protected_downgrade(s),
+                "{s} ne devrait pas être protégée"
+            );
+        }
     }
 }
 

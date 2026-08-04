@@ -76,7 +76,7 @@ impl Embedder for FastEmbedCpu {
         // SAFETY: embed_batch guarantees 1 vector when the input contains 1 text.
         Ok(out
             .pop()
-            .expect("embed_batch a retourné exactement 1 vecteur pour 1 texte"))
+            .expect("embed_batch returned exactly 1 vector for 1 text"))
     }
 
     /// Computes embeddings for a batch of texts (synchronous, blocking inside tokio).
@@ -91,7 +91,7 @@ impl Embedder for FastEmbedCpu {
         let guard = self
             .inner
             .lock()
-            .expect("Mutex FastEmbedCpu non-poisonné : une panique dans un autre thread a corrompu l'état du modèle ONNX, redémarrer le process");
+            .expect("FastEmbedCpu mutex not poisoned: a panic in another thread corrupted the ONNX model state, restart the process");
 
         guard
             .embed(texts_owned, None)

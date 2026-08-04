@@ -16,9 +16,7 @@ gradatum-markdown = { path = "../gradatum-markdown" }
 gradatum-cache   = { path = "../gradatum-cache" }
 gradatum-queue   = { path = "../gradatum-queue" }
 gradatum-chat    = { path = "../gradatum-chat" }
-gradatum-embed   = { path = "../gradatum-embed" }
 gradatum-index   = { path = "../gradatum-index" }
-gradatum-storage = { path = "../gradatum-storage" }
 gradatum-vault   = { path = "../gradatum-vault" }
 gradatum-curator = { path = "../gradatum-curator" }
 gradatum-worker  = { path = "../gradatum-worker" }

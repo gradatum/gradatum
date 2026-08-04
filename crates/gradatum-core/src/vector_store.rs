@@ -23,7 +23,8 @@ use crate::identity::NoteId;
 ///
 /// ## Stability
 ///
-/// This trait's API may change before v1.0.0. Method names
+/// This trait sits outside the crate's SemVer guarantee and may change in a future
+/// release. The method names
 /// `insert_note_embedding`/`search_semantic` may converge toward `upsert`/`search`
 /// with `VectorMeta`/`VectorMatch` when switching to ANN.
 ///
@@ -42,26 +43,36 @@ pub trait VectorStore: Send + Sync {
     /// The vector is serialised as an f32 little-endian BLOB (4 bytes/dimension).
     /// `ON CONFLICT(note_id, embedder_id)` replaces the existing vector.
     ///
+    /// `vault_id` is the ANN partition key (`note_embeddings_ann`, vec0) supplied by the
+    /// scoped caller — never derived from `notes` by id alone (id-only lookup is a
+    /// cross-vault leak vector on ULID collision, composite PK since migration 0032).
+    ///
     /// # Errors
     ///
     /// Returns `GradatumError::Storage` if `vector.len() != dim` or if the write fails.
     async fn insert_note_embedding(
         &self,
+        vault_id: &str,
         note_id: &NoteId,
         embedder_id: &str,
         dim: u16,
         vector: &[f32],
     ) -> Result<(), GradatumError>;
 
-    /// Reads an existing embedding vector from the index.
+    /// Reads an existing embedding vector from the index, scoped to `vault_id`.
     ///
-    /// Returns `None` if no embedding exists for `(note_id, embedder_id)`.
+    /// Returns `None` if no embedding exists for `(note_id, embedder_id, vault_id)`.
     /// Returns `Some(Vec<f32>)` after decoding the f32 little-endian BLOB.
     ///
     /// Used by the embedding pipeline to avoid recomputing an already-stored
     /// embedding when `computed_at` is recent.
+    ///
+    /// `vault_id` scopes the read to a single tenant (`note_embeddings` composite PK
+    /// `(note_id, embedder_id, vault_id)` since migration 0033) — a lookup by
+    /// `(note_id, embedder_id)` alone is a cross-vault leak on ULID collision (C4-1e).
     async fn get_note_embedding(
         &self,
+        vault_id: &str,
         note_id: &NoteId,
         embedder_id: &str,
     ) -> Result<Option<Vec<f32>>, GradatumError>;
@@ -87,7 +98,7 @@ pub trait VectorStore: Send + Sync {
     /// Will converge toward ANN (sqlite-vec) for corpora larger than ~10k notes.
     async fn search_semantic(
         &self,
-        vault_id: &str,
+        vault_id: &crate::scope::AclCheckedVaultId,
         embedder_id: &str,
         query_emb: &[f32],
         limit: usize,

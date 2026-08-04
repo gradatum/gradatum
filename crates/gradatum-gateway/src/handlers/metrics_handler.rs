@@ -27,6 +27,6 @@ pub async fn handler(State(state): State<AppState>) -> Response {
         )
         .body(axum::body::Body::from(body))
         // SAFETY: headers are static values — this error cannot occur.
-        .expect("construction réponse /metrics impossible avec headers statiques")
+        .expect("cannot build /metrics response with static headers")
         .into_response()
 }

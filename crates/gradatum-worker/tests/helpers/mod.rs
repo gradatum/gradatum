@@ -92,7 +92,7 @@ impl InternalClient for MockInternalClient {
 
         let frontmatter = Frontmatter {
             schema_version: 1,
-            vault_id: VaultId::new(&req.tenant_id),
+            vault_id: VaultId::new(req.tenant_id.as_str()),
             locus: None,
             section,
             status,
@@ -127,7 +127,10 @@ impl InternalClient for MockInternalClient {
 
         // Also upsert the note title into the index for title_lookup resolution.
         if !req.title.is_empty() {
-            let _ = self.index.upsert_note_title(&note.id, &req.title).await;
+            let _ = self
+                .index
+                .upsert_note_title(note.frontmatter.vault_id.as_str(), &note.id, &req.title)
+                .await;
         }
 
         // Process links — upsert each (src→dst) pair into note_links.
@@ -135,7 +138,7 @@ impl InternalClient for MockInternalClient {
         for link in &req.links {
             if let Err(e) = self
                 .index
-                .upsert_link(&req.tenant_id, &link.src, &link.dst)
+                .upsert_link(req.tenant_id.as_str(), &link.src, &link.dst)
                 .await
             {
                 tracing::warn!(
@@ -165,7 +168,7 @@ impl InternalClient for MockInternalClient {
         let note_id = NoteId(note_ulid);
 
         self.index
-            .insert_note_embedding(&note_id, &req.embedder_id, req.dim, &req.vector)
+            .insert_note_embedding("main", &note_id, &req.embedder_id, req.dim, &req.vector)
             .await
             .map_err(|e| InternalClientError::ServerError {
                 status: 500,
@@ -193,13 +196,17 @@ impl InternalClient for MockInternalClient {
         unimplemented!("MockInternalClient::persist_distill not used by Dispatcher tests")
     }
 
-    async fn delete_note(&self, _ulid: &str) -> Result<(), InternalClientError> {
+    async fn delete_note(&self, _vault_id: &str, _ulid: &str) -> Result<(), InternalClientError> {
         unimplemented!("MockInternalClient::delete_note not used by Dispatcher tests")
     }
 
     // ── Reads ──
 
-    async fn get_note(&self, ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+    async fn get_note(
+        &self,
+        _vault_id: &str,
+        ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError> {
         let note_ulid = Ulid::from_string(ulid).map_err(|_| InternalClientError::NotFound {
             ulid: ulid.to_string(),
         })?;
@@ -230,15 +237,32 @@ impl InternalClient for MockInternalClient {
         })
     }
 
+    async fn get_note_status(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<Option<String>, InternalClientError> {
+        // Délégation à l'index réel (scopé `WHERE vault_id AND id`), cohérent prod.
+        self.index
+            .get_note_status(vault_id, ulid)
+            .await
+            .map(|opt| opt.map(|s| s.to_string()))
+            .map_err(|e| InternalClientError::ServerError {
+                status: 500,
+                body: format!("{e}"),
+            })
+    }
+
     async fn get_note_embedding(
         &self,
+        _vault_id: &str,
         _ulid: &str,
         _embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
         unimplemented!("MockInternalClient::get_note_embedding not used by Dispatcher tests")
     }
 
-    async fn get_trust(&self, _ulid: &str) -> Result<f32, InternalClientError> {
+    async fn get_trust(&self, _vault_id: &str, _ulid: &str) -> Result<f32, InternalClientError> {
         unimplemented!("MockInternalClient::get_trust not used by Dispatcher tests")
     }
 
@@ -379,7 +403,7 @@ fn encode_write_payload(title: &str, body: &str, section_hint: Option<&str>) -> 
         author: None,
         tags: vec![],
         section_hint: section_hint.map(|s| s.to_string()),
-        tenant_id: "main".to_string(),
+        tenant_id: Some("main".to_string().into()),
         expected_sha256: None,
         note_id: None,
         occurred_at: None,

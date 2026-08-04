@@ -60,6 +60,17 @@ pub enum InternalClientError {
 // DTOs de réponse locaux (indépendants de gradatum-server)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Corps JSON d'un 409 optimistic-lock émis par `handle_persist_curated` (chemin RMW, F-41).
+///
+/// Le serveur y sérialise le hash de la version gagnante ; on l'extrait pour renseigner
+/// `WriteConflictDto.current_sha256`. Un corps non-JSON (arms défensifs create/distill) est
+/// simplement ignoré → `current_sha256_hex = None`.
+#[derive(Debug, serde::Deserialize)]
+struct ConflictBody {
+    /// SHA-256 hex (64 chars) de la note telle qu'elle est actuellement stockée.
+    current_sha256: String,
+}
+
 /// Full note returned by `GET /internal/v1/note/:ulid`.
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
@@ -94,6 +105,14 @@ pub struct EmbeddingReadDto {
     pub dim: usize,
     /// f32 embedding vector.
     pub vector: Vec<f32>,
+}
+
+/// Scoped status returned by `GET /internal/v1/note/:ulid/status`.
+#[derive(Debug, serde::Deserialize)]
+struct NoteStatusDto {
+    /// Current status in kebab-case (e.g. `garbage`, `live`), or `None` if the note is
+    /// absent from the targeted vault. Absence is not a `404` — it is a valid outcome.
+    status: Option<String>,
 }
 
 /// Trust score returned by `GET /internal/v1/note/:ulid/trust`.
@@ -134,6 +153,13 @@ struct NoteListDto {
     note_ids: Vec<NoteIdDto>,
 }
 
+/// Count returned by `GET /internal/v1/notes/count-unprocessed`.
+#[derive(Debug, serde::Deserialize)]
+struct CountDto {
+    /// Live non-processed notes in the locus (capped at the `min` query param).
+    count: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Trait InternalClient (injectable pour les tests)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -167,29 +193,106 @@ pub trait InternalClient: Send + Sync + 'static {
         req: &PersistForgetRequest,
     ) -> Result<PersistOkResponse, InternalClientError>;
 
+    /// `POST /internal/v1/note/:ulid/forget-resync?vault_id=<vault_id>`
+    ///
+    /// Re-asserts the INDEX forgotten mark of a note already forgotten in the vault,
+    /// **without** touching the frontmatter or the `forgotten_at`/`forgotten_by` audit
+    /// columns. Repairs the divergence "index says live, frontmatter says forgotten",
+    /// which leaves the note searchable although the vault declares it forgotten.
+    ///
+    /// Deliberately NOT [`Self::persist_forget`]: that one re-stamps
+    /// `forgotten_at`/`forgotten_by` at call time, so replaying it on an already-forgotten
+    /// note destroys the audit trail of the FIRST forget.
+    ///
+    /// The default implementation is **fail-closed** (`Err`, status 501): only the concrete
+    /// HTTP client overrides it, so test doubles that never reach the idempotent skip
+    /// branch inherit the default without having to stub it. Callers treat the failure as
+    /// best-effort (the note IS forgotten in the vault) but must log it: a silent failure
+    /// would leave the divergence in place, which is the very defect this closes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the concrete client's HTTP or parse error; the default implementation
+    /// always returns `InternalClientError::ServerError`.
+    async fn resync_forget_index(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<(), InternalClientError> {
+        let _ = (vault_id, ulid);
+        Err(InternalClientError::ServerError {
+            status: 501,
+            body: "resync_forget_index not implemented by this InternalClient".to_string(),
+        })
+    }
+
     /// `POST /internal/v1/persist/distill`
     async fn persist_distill(
         &self,
         req: &PersistDistillRequest,
     ) -> Result<PersistOkResponse, InternalClientError>;
 
-    /// `DELETE /internal/v1/note/:ulid`
-    async fn delete_note(&self, ulid: &str) -> Result<(), InternalClientError>;
+    /// `DELETE /internal/v1/note/:ulid?vault_id=<vault_id>`
+    ///
+    /// `vault_id` scopes the delete cascade to the owning vault. In single-vault mode it
+    /// is always `"main"`; in multi-vault mode it prevents purging a secondary vault from
+    /// clobbering the note that shares the same ULID in `main`.
+    async fn delete_note(&self, vault_id: &str, ulid: &str) -> Result<(), InternalClientError>;
 
     // ── Reads ──
 
-    /// `GET /internal/v1/note/:ulid`
-    async fn get_note(&self, ulid: &str) -> Result<NoteReadDto, InternalClientError>;
+    /// `GET /internal/v1/note/:ulid?vault_id=<vault_id>`
+    ///
+    /// **Vault-scoped** full read. Without this parameter the server resolves the read-back
+    /// on `"main"` (`resolve_read_back_reader`, `vault.unwrap_or("main")`): a caller scoped
+    /// on a secondary vault therefore read the `main` homonym — the note read and the note
+    /// mutated could be two different notes. `get_note` was the **last** unscoped note read
+    /// of the trait (`get_note_status`, `get_note_embedding`, `get_trust` and `delete_note`
+    /// already carried `vault_id`).
+    ///
+    /// In single-vault mode `vault_id` is always `"main"`: since the server applies that
+    /// same default, passing `"main"` explicitly is byte-identical to omitting the parameter.
+    async fn get_note(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError>;
 
-    /// `GET /internal/v1/note/:ulid/embedding?embedder_id=<id>`
+    /// `GET /internal/v1/note/:ulid/status?vault_id=<vault_id>`
+    ///
+    /// **Vault-scoped** status re-check, used by the purge to close its time-of-check /
+    /// time-of-use window. The status is read from the INDEX (`get_note_status`,
+    /// `WHERE vault_id = ?1 AND id = ?2`) — the **same source as `list_garbage`** — not
+    /// from the vault's `.md` file. The candidate is therefore re-checked inside ITS OWN
+    /// vault rather than in the `main` singleton.
+    ///
+    /// Returns `Ok(None)` when the note is absent from the target vault: that is not a
+    /// `404` error but information, and the purge treats it as a skip. In single-vault
+    /// mode `vault_id` is always `"main"`.
+    async fn get_note_status(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<Option<String>, InternalClientError>;
+
+    /// `GET /internal/v1/note/:ulid/embedding?embedder_id=<id>&vault_id=<vault_id>`
+    ///
+    /// `vault_id` scopes the embedding lookup. The server accepts this query parameter
+    /// and defaults it to `"main"` when absent, so passing `"main"` explicitly matches the
+    /// single-vault behaviour byte for byte.
     async fn get_note_embedding(
         &self,
+        vault_id: &str,
         ulid: &str,
         embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError>;
 
-    /// `GET /internal/v1/note/:ulid/trust`
-    async fn get_trust(&self, ulid: &str) -> Result<f32, InternalClientError>;
+    /// `GET /internal/v1/note/:ulid/trust?vault_id=<vault_id>`
+    ///
+    /// `vault_id` scopes the trust lookup. The server accepts this query parameter and
+    /// defaults it to `"main"` when absent, so passing `"main"` explicitly matches the
+    /// single-vault behaviour byte for byte.
+    async fn get_trust(&self, vault_id: &str, ulid: &str) -> Result<f32, InternalClientError>;
 
     /// `GET /internal/v1/title-lookup?tenant=<t>&title=<title>`
     async fn title_lookup(
@@ -245,6 +348,51 @@ pub trait InternalClient: Send + Sync + 'static {
         agent: &str,
         vaults: &[String],
     ) -> Result<Vec<NoteIdDto>, InternalClientError>;
+
+    /// `GET /internal/v1/notes/count-unprocessed?vault=<v>&locus=<l>&min=<m>`
+    ///
+    /// Counts the `live`, non-`processed` notes of the locus, capped at `min` so the
+    /// server can exit early. Consumed by the conditional distill cron to measure
+    /// consolidation pressure per locus.
+    ///
+    /// The default implementation is **fail-closed** (`Err`): only the concrete HTTP
+    /// client overrides it, and test doubles that never call it inherit the default
+    /// without having to stub it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the concrete client's HTTP or parse error; the default implementation
+    /// always returns `InternalClientError::ServerError`.
+    async fn count_unprocessed(
+        &self,
+        vault: &str,
+        locus: &str,
+        min: u64,
+    ) -> Result<u64, InternalClientError> {
+        let _ = (vault, locus, min);
+        Err(InternalClientError::ServerError {
+            status: 501,
+            body: "count_unprocessed not implemented by this InternalClient".to_string(),
+        })
+    }
+
+    /// `GET /internal/v1/vaults/active` — the active vaults, which per-vault crons
+    /// iterate over when `multi_tenant.enabled = true`.
+    ///
+    /// The default implementation is **fail-closed** (`Err`, status 501): only the
+    /// concrete HTTP client overrides it. A cron left without a vault list skips its tick
+    /// and NEVER falls back to an implicit cross-vault scan.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the concrete client's HTTP or parse error; the default implementation
+    /// always returns `InternalClientError::ServerError`.
+    async fn list_active_vaults(&self) -> Result<Vec<String>, InternalClientError> {
+        Err(InternalClientError::ServerError {
+            status: 501,
+            body: "list_active_vaults not implemented by this InternalClient".to_string(),
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -330,7 +478,7 @@ impl InternalPersistClient {
                     let body = resp
                         .text()
                         .await
-                        .unwrap_or_else(|_| "<lecture body échouée>".to_string());
+                        .unwrap_or_else(|_| "<body read failed>".to_string());
                     tracing::warn!(
                         attempt = attempt + 1,
                         max = MAX_ATTEMPTS,
@@ -344,14 +492,14 @@ impl InternalPersistClient {
                         attempt = attempt + 1,
                         max = MAX_ATTEMPTS,
                         error = %e,
-                        "internal_client: erreur réseau — retry"
+                        "internal_client: network error — retry"
                     );
                     last_err = Some(InternalClientError::Http(e));
                 }
             }
         }
 
-        Err(last_err.expect("MAX_ATTEMPTS > 0 — last_err est toujours Some ici"))
+        Err(last_err.expect("MAX_ATTEMPTS > 0 — last_err is always Some here"))
     }
 
     /// Parses the JSON response, or returns a semantic error (409, 404, 5xx).
@@ -361,9 +509,15 @@ impl InternalPersistClient {
     ) -> Result<T, InternalClientError> {
         let status = resp.status();
         if status.as_u16() == 409 {
-            return Err(InternalClientError::Conflict {
-                current_sha256_hex: None,
-            });
+            // F-41 CAS : le corps 409 du chemin RMW porte `{ "current_sha256": "<hex>" }`.
+            // On le lit pour propager le hash gagnant ; un corps non-JSON retombe sur `None`.
+            let current_sha256_hex = resp
+                .text()
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_str::<ConflictBody>(&body).ok())
+                .map(|c| c.current_sha256);
+            return Err(InternalClientError::Conflict { current_sha256_hex });
         }
         if status.as_u16() == 404 {
             return Err(InternalClientError::NotFound {
@@ -374,7 +528,7 @@ impl InternalPersistClient {
             let body = resp
                 .text()
                 .await
-                .unwrap_or_else(|_| "<lecture body échouée>".to_string());
+                .unwrap_or_else(|_| "<body read failed>".to_string());
             return Err(InternalClientError::ServerError {
                 status: status.as_u16(),
                 body,
@@ -398,7 +552,7 @@ impl InternalPersistClient {
             let body = resp
                 .text()
                 .await
-                .unwrap_or_else(|_| "<lecture body échouée>".to_string());
+                .unwrap_or_else(|_| "<body read failed>".to_string());
             return Err(InternalClientError::ServerError {
                 status: status.as_u16(),
                 body,
@@ -443,6 +597,18 @@ impl InternalClient for InternalPersistClient {
         Self::parse_json(resp, &req.note_id).await
     }
 
+    async fn resync_forget_index(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<(), InternalClientError> {
+        let url = format!("{}/internal/v1/note/{ulid}/forget-resync", self.base_url);
+        let resp = self
+            .execute_with_retry(|| self.client.post(&url).query(&[("vault_id", vault_id)]))
+            .await?;
+        Self::check_no_body(resp, ulid).await
+    }
+
     async fn persist_distill(
         &self,
         req: &PersistDistillRequest,
@@ -454,33 +620,61 @@ impl InternalClient for InternalPersistClient {
         Self::parse_json(resp, &req.note_id).await
     }
 
-    async fn delete_note(&self, ulid: &str) -> Result<(), InternalClientError> {
+    async fn delete_note(&self, vault_id: &str, ulid: &str) -> Result<(), InternalClientError> {
         let url = format!("{}/internal/v1/note/{ulid}", self.base_url);
-        let resp = self.execute_with_retry(|| self.client.delete(&url)).await?;
+        let resp = self
+            .execute_with_retry(|| self.client.delete(&url).query(&[("vault_id", vault_id)]))
+            .await?;
         Self::check_no_body(resp, ulid).await
     }
 
-    async fn get_note(&self, ulid: &str) -> Result<NoteReadDto, InternalClientError> {
+    async fn get_note(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<NoteReadDto, InternalClientError> {
         let url = format!("{}/internal/v1/note/{ulid}", self.base_url);
-        let resp = self.execute_with_retry(|| self.client.get(&url)).await?;
+        let resp = self
+            .execute_with_retry(|| self.client.get(&url).query(&[("vault_id", vault_id)]))
+            .await?;
         Self::parse_json(resp, ulid).await
+    }
+
+    async fn get_note_status(
+        &self,
+        vault_id: &str,
+        ulid: &str,
+    ) -> Result<Option<String>, InternalClientError> {
+        let url = format!("{}/internal/v1/note/{ulid}/status", self.base_url);
+        let resp = self
+            .execute_with_retry(|| self.client.get(&url).query(&[("vault_id", vault_id)]))
+            .await?;
+        let dto: NoteStatusDto = Self::parse_json(resp, ulid).await?;
+        Ok(dto.status)
     }
 
     async fn get_note_embedding(
         &self,
+        vault_id: &str,
         ulid: &str,
         embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
         let url = format!("{}/internal/v1/note/{ulid}/embedding", self.base_url);
         let resp = self
-            .execute_with_retry(|| self.client.get(&url).query(&[("embedder_id", embedder_id)]))
+            .execute_with_retry(|| {
+                self.client
+                    .get(&url)
+                    .query(&[("embedder_id", embedder_id), ("vault_id", vault_id)])
+            })
             .await?;
         Self::parse_json(resp, ulid).await
     }
 
-    async fn get_trust(&self, ulid: &str) -> Result<f32, InternalClientError> {
+    async fn get_trust(&self, vault_id: &str, ulid: &str) -> Result<f32, InternalClientError> {
         let url = format!("{}/internal/v1/note/{ulid}/trust", self.base_url);
-        let resp = self.execute_with_retry(|| self.client.get(&url)).await?;
+        let resp = self
+            .execute_with_retry(|| self.client.get(&url).query(&[("vault_id", vault_id)]))
+            .await?;
         let dto: TrustReadDto = Self::parse_json(resp, ulid).await?;
         Ok(dto.trust)
     }
@@ -615,5 +809,33 @@ impl InternalClient for InternalPersistClient {
             .await?;
         let dto: NoteListDto = Self::parse_json(resp, agent).await?;
         Ok(dto.note_ids)
+    }
+
+    async fn count_unprocessed(
+        &self,
+        vault: &str,
+        locus: &str,
+        min: u64,
+    ) -> Result<u64, InternalClientError> {
+        let url = format!("{}/internal/v1/notes/count-unprocessed", self.base_url);
+        let min_str = min.to_string();
+        let resp = self
+            .execute_with_retry(|| {
+                self.client.get(&url).query(&[
+                    ("vault", vault),
+                    ("locus", locus),
+                    ("min", min_str.as_str()),
+                ])
+            })
+            .await?;
+        let dto: CountDto = Self::parse_json(resp, locus).await?;
+        Ok(dto.count)
+    }
+
+    async fn list_active_vaults(&self) -> Result<Vec<String>, InternalClientError> {
+        let url = format!("{}/internal/v1/vaults/active", self.base_url);
+        let resp = self.execute_with_retry(|| self.client.get(&url)).await?;
+        let vaults: Vec<String> = Self::parse_json(resp, "vaults/active").await?;
+        Ok(vaults)
     }
 }

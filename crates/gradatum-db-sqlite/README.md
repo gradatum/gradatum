@@ -2,7 +2,7 @@
 
 > Async SQLite queue store (`SqliteQueueStore`) — `sqlx`-backed job queue for gradatum-worker.
 
-**Status**: Alpha (v0.7.6) — internal (publish = false). API not yet stable before v1.0.
+**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -20,7 +20,7 @@ The only public type is **`SqliteQueueStore`**: async SQLite queue via `sqlx` (W
 
 ```toml
 [dependencies]
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "0.7.6" }
+gradatum-db-sqlite = "1.0.0"
 ```
 
 ```rust
@@ -37,7 +37,7 @@ let store = SqliteQueueStore::new(pool);
 ```text
 gradatum-core (L0) — QueueStore trait
     ↑
-gradatum-db-sqlite (L2) — SqliteQueueStore (this crate, internal only)
+gradatum-db-sqlite (L2) — SqliteQueueStore (this crate)
     ↑
 gradatum-worker / gradatum-server (L4)
 ```

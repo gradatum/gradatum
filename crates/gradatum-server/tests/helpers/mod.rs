@@ -380,11 +380,76 @@ pub async fn build_app_with_embedder(embedder: Arc<dyn Embedder>) -> TestEnv {
     build_app_inner(embedder).await
 }
 
+/// Construit un `AppState` **2-vaults réels** (`main` + `vault-b`), adossés au MÊME pool
+/// `SqliteIndex` (un seul `index.db`, partition par la colonne `vault_id`) — modèle
+/// multi-vault cible (council `01KXWMCR0N`) : md par-vault sous `<root>/<vault_id>/`.
+///
+/// Choke-point de routage peuplé : `state.vaults.resolve(&vault_id)` sert le handle du
+/// vault demandé (fail-closed `VaultNotFound` sur absence). Réutilisé par tous les tests
+/// **ON** des vagues W1-W3 qui exercent l'isolation cross-vault.
+///
+/// ## Régime flag
+///
+/// Ce harnais est PUREMENT local aux tests : il matérialise un 2e vault que le LIVE
+/// n'aura JAMAIS tant que `multi_tenant` est OFF (byte-identical LIVE = registre `{main}`
+/// singleton via `with_vault_path`). Il ne modifie AUCUN flag.
+///
+/// ## Cycle de vie disque
+///
+/// Le contrat plan (T1) impose la signature `-> AppState` : le helper ne peut donc pas
+/// porter le guard `TempDir`. La racine est volontairement **fuitée** (`TempDir::keep()`)
+/// pour que le vault disque survive à toute la durée du test — sans quoi le drop du guard
+/// supprimerait `index.db`/les `.md` et casserait les reads des consommateurs. Fuite
+/// test-only, bornée à la durée du binaire de test (process court).
+pub async fn spawn_two_vault_state() -> AppState {
+    use gradatum_core::scope::VaultId;
+    use gradatum_server::state::VaultRegistry;
+    use gradatum_vault::Vault;
+
+    let root = TempDir::new()
+        .expect("TempDir spawn_two_vault_state")
+        .keep();
+
+    // `main` ouvre le pool `index.db` ; `vault-b` le RÉUTILISE (handle partagé, un seul pool).
+    let vault_main = Arc::new(
+        Vault::create(&root, VaultId::new("main"))
+            .await
+            .expect("Vault::create main — invariant harnais 2-vaults"),
+    );
+    let shared_index = Arc::clone(vault_main.index());
+    let vault_b = Arc::new(
+        Vault::with_shared_index(&root, VaultId::new("vault-b"), Arc::clone(&shared_index))
+            .await
+            .expect("Vault::with_shared_index vault-b — invariant harnais 2-vaults"),
+    );
+
+    // Registre 2-vaults via `insert` (fail-closed vault_id — réutilise state.rs:565).
+    let registry = VaultRegistry::new();
+    registry
+        .insert(VaultId::new("main"), Arc::clone(&vault_main))
+        .expect("insert main — vault_id cohérent par construction");
+    registry
+        .insert(VaultId::new("vault-b"), Arc::clone(&vault_b))
+        .expect("insert vault-b — vault_id cohérent par construction");
+
+    let jwt = JwtService::new_ephemeral();
+    let acl = AclEngine::from_preset_str(TEST_ACL).expect("preset ACL alpha13 valide");
+    let vault_registry: Arc<dyn gradatum_vault::Registry> = vault_main.clone();
+    let mut state = AppState::with_jwt_and_acl(jwt, acl)
+        .with_embedder(Arc::new(NoopBackend))
+        .with_vault_arc(vault_registry);
+    // Aligner `state.search` sur le pool partagé (cohérence write/read côté SQLite).
+    state.search = shared_index;
+    // Peupler le registre de handles — `with_vault_arc` ne set que le singleton `state.vault`.
+    state.vaults = Arc::new(registry);
+    state
+}
+
 // ── Helpers Task 6 — Filtre incrémental session (F-30) ──────────────────────
 
 /// Variante de [`build_app_with_embedder`] avec un [`SessionTraceStore`] in-memory câblé.
 ///
-/// Nécessaire pour les tests Task 6 (F-30 filtre incrémental session) : `get_sent`
+/// Nécessaire pour les tests F-30 (filtre incrémental session) : `get_sent`
 /// et `mark_sent` sont opérationnels (store présent), contrairement à
 /// [`build_app_with_embedder`] où `state.session_trace` est `None`.
 ///
@@ -523,7 +588,7 @@ pub async fn seed_note_sql_only(
         .await
         .expect("seed_note_with_fts");
     let nid = NoteId(Ulid::from_string(ulid).expect("ULID parse seed_note_sql_only"));
-    idx.upsert_note_title(&nid, title)
+    idx.upsert_note_title("main", &nid, title)
         .await
         .expect("upsert_note_title");
     nid
@@ -532,9 +597,16 @@ pub async fn seed_note_sql_only(
 /// Variante SQL-only avec downgrade (status='downgraded').
 pub async fn seed_note_downgraded_sql(idx: &SqliteIndex, ulid: &str, title: &str) -> NoteId {
     let nid = seed_note_sql_only(idx, ulid, "reference", title, "downgraded body").await;
-    idx.downgrade_note(&nid, "test fixture downgrade", None)
-        .await
-        .expect("downgrade_note");
+    idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        ),
+        &nid,
+        "test fixture downgrade",
+        None,
+    )
+    .await
+    .expect("downgrade_note");
     nid
 }
 
@@ -610,7 +682,7 @@ impl TestEnv {
         // Upsert title (mimique du curator post-extract — alpha.10 migration 0005).
         self.state
             .search
-            .upsert_note_title(&note.id, title)
+            .upsert_note_title(note.frontmatter.vault_id.as_str(), &note.id, title)
             .await
             .expect("upsert_note_title seed");
 
@@ -622,7 +694,14 @@ impl TestEnv {
         let nid = self.write_note_with_h1(title, "downgraded body").await;
         self.state
             .search
-            .downgrade_note(&nid, "test fixture downgrade", None)
+            .downgrade_note(
+                &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+                    gradatum_core::scope::VaultId::new("main"),
+                ),
+                &nid,
+                "test fixture downgrade",
+                None,
+            )
             .await
             .expect("downgrade_note");
         nid
@@ -777,7 +856,7 @@ pub async fn call_vault_context(
 /// Seed une note dans la section `skills` (colonne SQL string directe — hors enum Section).
 ///
 /// Écrit via `seed_note_with_fts` sur l'index concret du vault (accessible via
-/// `env._vault_typed.index()`). Utilisé par Task 9 (injection skills opt-in `vault_context`).
+/// `env._vault_typed.index()`). Utilisé pour l'injection de skills opt-in `vault_context`.
 ///
 /// # Note sur la section
 ///
@@ -794,7 +873,7 @@ pub async fn seed_skill(env: &TestEnv, title: &str, body: &str) {
         .expect("seed_skill: seed_note_with_fts — invariant test");
     let note_id =
         NoteId(ulid::Ulid::from_string(&ulid).expect("seed_skill: ULID parse — invariant"));
-    idx.upsert_note_title(&note_id, title)
+    idx.upsert_note_title("main", &note_id, title)
         .await
         .expect("seed_skill: upsert_note_title — invariant test");
 }
@@ -872,7 +951,7 @@ pub async fn seed_notes(env: &TestEnv, count: usize) {
             .await
             .expect("seed_notes: seed_note_with_fts — invariant test");
         let nid = NoteId(Ulid::from_string(&ulid).expect("seed_notes: ULID parse"));
-        idx.upsert_note_title(&nid, &format!("Note alpha beta {i}"))
+        idx.upsert_note_title("main", &nid, &format!("Note alpha beta {i}"))
             .await
             .expect("seed_notes: upsert_note_title — invariant test");
     }

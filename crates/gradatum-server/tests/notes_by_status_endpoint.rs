@@ -260,12 +260,26 @@ async fn notes_by_status_ok_lists_downgraded() {
     let note_id_a = NoteId(id_a.parse().expect("ULID valide id_a"));
     let note_id_b = NoteId(id_b.parse().expect("ULID valide id_b"));
 
-    idx.downgrade_note(&note_id_a, "test: drill-down fix", None)
-        .await
-        .expect("downgrade_note A");
-    idx.downgrade_note(&note_id_b, "test: drill-down fix", None)
-        .await
-        .expect("downgrade_note B");
+    idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        ),
+        &note_id_a,
+        "test: drill-down fix",
+        None,
+    )
+    .await
+    .expect("downgrade_note A");
+    idx.downgrade_note(
+        &gradatum_core::scope::AclCheckedVaultId::for_system_task(
+            gradatum_core::scope::VaultId::new("main"),
+        ),
+        &note_id_b,
+        "test: drill-down fix",
+        None,
+    )
+    .await
+    .expect("downgrade_note B");
 
     // Requête GET /api/v1/notes/by-status?status=downgraded
     let resp = app
