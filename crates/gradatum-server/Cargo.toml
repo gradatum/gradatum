@@ -76,7 +76,7 @@ tokio-util   = { version = "=0.7.18" }
 sqlite-vec = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-sd-notify = "0.4"
+sd-notify = "0.5"
 async-trait.workspace = true
 
 [dev-dependencies]
