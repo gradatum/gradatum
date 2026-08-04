@@ -144,7 +144,7 @@ axum-server = { version = "=0.8.0", default-features = false, features = ["tls-r
 rustls      = { version = "=0.23.40", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 http        = "=1.4.0"
 tower       = "=0.5.2"
-tower-http      = { version = "=0.6.10", features = ["cors", "trace", "fs", "set-header", "limit"] }
+tower-http      = { version = "=0.7.0", features = ["cors", "trace", "fs", "set-header", "limit"] }
 governor        = "=0.10.4"
 reqwest     = { version = "=0.13.3", default-features = false, features = ["rustls", "json", "stream", "query"] }
 
