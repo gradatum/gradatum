@@ -1,0 +1,21 @@
+# Dependabot configuration — public repo gradatum/gradatum.
+#
+# cargo  : écosystème significatif du workspace Rust — mises à jour de version hebdomadaires.
+# npm    : gradatum-studio utilise bun (bun.lock) et son bundle est figé-par-version (crate
+#          bundle-only) — les mises à jour npm automatiques sont désactivées (open-pull-requests-limit: 0).
+#          Les alertes de sécurité react-router (3, medium) sont traitées par migration
+#          6.x→7.x planifiée v1.1.0 — voir TODO correspondant. L'alerte jsonwebtoken est stale
+#          (package absent de bun.lock et package-lock.json).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: "/crates/gradatum-studio"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
