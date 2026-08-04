@@ -212,7 +212,7 @@ nix         = { version = "=0.31.2", features = ["fs", "signal", "process"] }
 # Tests
 tempfile    = "=3.27.0"
 proptest    = "=1.11.0"
-serde_test  = "=1.0.171"
+serde_test  = "=1.0.177"
 wiremock    = "=0.6.5"
 mockito     = "=1.6.1"
 futures     = "=0.3.32"
