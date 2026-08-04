@@ -86,7 +86,7 @@ toml_edit   = "=0.25.11"
 bincode     = { version = "=2.0.1", features = ["serde"] }
 
 # Errors
-thiserror   = "=2.0.18"
+thiserror   = "=2.0.19"
 # anyhow 1.0.103 : fix RUSTSEC-2026-0190 (unsound Error::downcast_mut sous Error::context).
 anyhow      = "=1.0.103"
 
