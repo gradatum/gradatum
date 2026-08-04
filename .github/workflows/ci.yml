@@ -98,60 +98,15 @@ jobs:
             cargo test --workspace
           fi
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # test-engine — cargo nextest gradatum-engine (feature `serve`)
-  # Runner: self-hosted (ÉPINGLÉ — parité avec .forgejo/workflows/ci.yml).
-  # POURQUOI l'épinglage : plusieurs tests de gradatum-engine valident le binaire
-  # llama-server réel présent sur disque (canonicalisation + garde des préfixes
-  # privilégiés SP-P0-4). Ce binaire n'existe que sur ce runner ; un runner qui ne
-  # l'a pas (dont GitHub-hosted ubuntu-latest) fait échouer ces tests. Les hermétiser
-  # exigerait une couture de test dans un garde de sécurité — refusé (décision
-  # Général 2026-07-05). On épingle honnêtement là où le binaire existe.
-  # ─────────────────────────────────────────────────────────────────────────
-  test-engine:
-    name: test-engine
-    runs-on: [self-hosted, lxc-500]
-    needs: lint
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install pinned toolchain (rust-toolchain.toml)
-        # Voir job `lint` : version lue depuis rust-toolchain.toml, jamais écrite ici.
-        run: |
-          rustup toolchain install --no-self-update
-          rustc --version
-
-      - name: Install SQLite dev headers
-        run: sudo apt-get update -qq && sudo apt-get install -y libsqlite3-dev
-
-      - name: Cache cargo registry + build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target/
-          key: cargo-test-engine-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-test-engine-${{ runner.os }}-
-
-      - name: Install cargo-nextest
-        run: |
-          cargo install cargo-nextest --locked 2>/dev/null \
-            || cargo install cargo-nextest 2>/dev/null \
-            || true
-
-      - name: cargo nextest run -p gradatum-engine --features serve
-        # gradatum-engine gate ses modules (config, supervisor) derrière la feature `serve`.
-        # Couvre spec decoding, superviseur, validation config — dont plusieurs tests
-        # couplés au binaire llama-server on-disk (voir en-tête du job).
-        run: |
-          if command -v cargo-nextest &>/dev/null || cargo nextest --version &>/dev/null 2>&1; then
-            cargo nextest run -p gradatum-engine --features serve
-          else
-            cargo test -p gradatum-engine --features serve
-          fi
+  # test-engine — cargo nextest gradatum-engine (feature `serve`).
+  # SKIPPÉ sur GitHub (Option A, 2026-08-04) : ce job est épinglé au runner
+  # self-hosted homelab `lxc-500` (le binaire llama-server on-disk est requis par
+  # plusieurs tests de gradatum-engine — canonicalisation + garde des préfixes
+  # privilégiés SP-P0-4). Aucun runner self-hosted n'est enregistré sur
+  # github.com/gradatum/gradatum, donc le job restait « queued » indéfiniment et
+  # bloquait chaque run CI public. La couverture test-engine s'exécute
+  # exclusivement sur le CI Forgejo (`.forgejo/workflows/ci.yml`, job `test-engine`,
+  # runner `lxc-500` présent) — qui reste la source de vérité des gates.
 
   # index-backends — suite de parité backend-agnostique du trait Index (W2 v0.4.5).
   # Job splitté + matrix. Ajouter un backend = 1 entrée matrix + 1 bras factory
