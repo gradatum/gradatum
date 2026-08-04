@@ -239,47 +239,14 @@ jobs:
   # Ne jamais rediriger ce `run` dans un `tee` — le code observé deviendrait
   # celui du dernier maillon du pipe, et le gate rendrait un vert silencieux.
   # ─────────────────────────────────────────────────────────────────────────
-  mcp-catalog-parity:
-    name: mcp-catalog-parity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  # mcp-catalog-parity — SKIPPÉ sur GitHub (Option A, 2026-08-04) : le job exécute
+  # `scripts/mcp-catalog-parity.sh`, absent du snapshot public (`scripts/` exclu) →
+  # exit 127 sur GitHub. S'exécute exclusivement sur le CI Forgejo
+  # (`.forgejo/workflows/ci.yml`), qui reste la source de vérité des gates.
 
-      - name: Parité des catalogues MCP (serveur ↔ stub)
-        # BLOCKING — no continue-on-error, commande nue.
-        run: bash scripts/mcp-catalog-parity.sh
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # docs-consistency — la prose confrontée au CODE, jamais à elle-même
-  # Voir le pendant Forgejo pour le raisonnement complet. En résumé : 5 `.md` et
-  # 2 READMEs de crates-stub se citent mutuellement, maintenus à la main, et rien
-  # ne les comparait au code — trois rounds de correction ont tenu un ratio stable
-  # de 2 faussetés neuves pour 6 corrections. Gate lexical pur (bash/awk/grep/git),
-  # aucune toolchain Rust, aucun secret : portable, câblé sur les deux surfaces.
-  #
-  # ⚠️ ROUGE AU CÂBLAGE : 34 divergences mesurées à `c5c3909a`. Ce n'est pas une
-  # panne du job. Ne pas le désarmer, ne pas ajouter `continue-on-error` — le
-  # rouge est l'état réel de la documentation, résorbé par le lot suivant.
-  #
-  # Le script sort 2 pour « gate NON EXÉCUTÉ ». Ce cas DOIT échouer : commande
-  # nue, sans `continue-on-error` ni pipe. Ne jamais rediriger dans un `tee` —
-  # le code observé deviendrait celui du dernier maillon du pipe.
-  #
-  # `fetch-depth: 0` est LOAD-BEARING : C3 confronte les versions aux tags, C5
-  # confronte une ancre à `git log <sha>..HEAD -- <fichier>`. Vérifié le
-  # 2026-08-01 : sur un clone `--depth 1 --no-tags`, le script sort en 2 sur sa
-  # précondition anti-shallow (il refuse de mesurer plutôt que de rendre un faux
-  # vert, mais le job serait rouge pour la mauvaise raison).
-  # ─────────────────────────────────────────────────────────────────────────
-  docs-consistency:
-    name: docs-consistency
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # Historique complet + tags : requis par C3 et C5. Voir l'en-tête.
-          fetch-depth: 0
-
-      - name: Cohérence documentaire (prose ↔ code)
-        # BLOCKING — no continue-on-error, commande nue.
-        run: bash scripts/docs-consistency-gate.sh
+  # docs-consistency — SKIPPÉ sur GitHub (Option A, 2026-08-04) : le job exécute
+  # `scripts/docs-consistency-gate.sh`, absent du snapshot public (`scripts/` exclu)
+  # → exit 127 sur GitHub. S'exécute exclusivement sur le CI Forgejo
+  # (`.forgejo/workflows/ci.yml`), qui reste la source de vérité des gates.
+  # Raisonnement complet (ratio faussetés/corrections, anti-shallow fetch-depth:0) :
+  # voir le pendant Forgejo.
