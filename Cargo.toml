@@ -199,7 +199,7 @@ zeroize     = { version = "=1.8.2", features = ["derive"] }
 
 # Crypto / auth
 argon2      = "=0.5.3"
-rand        = "=0.8.6"
+rand        = "=0.10.1"
 ed25519-dalek = { version = "=2.1.1", features = ["pkcs8", "rand_core", "pem", "zeroize"] }
 jsonwebtoken  = { version = "=9.3.1", default-features = false }
 # PR-5 NOTE : jsonwebtoken 10.x nécessite feature rust_crypto (sha2 ^0.10.7) — incompatible
