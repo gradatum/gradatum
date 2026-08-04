@@ -207,7 +207,7 @@ jsonwebtoken  = { version = "=9.3.1", default-features = false }
 pkcs8         = "=0.10.2"
 
 # UNIX syscalls (statfs NFS check — caveat C11; signal: SIGTERM smoke test)
-nix         = { version = "=0.31.2", features = ["fs", "signal", "process"] }
+nix         = { version = "=0.31.3", features = ["fs", "signal", "process"] }
 
 # Tests
 tempfile    = "=3.27.0"
