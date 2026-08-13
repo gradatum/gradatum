@@ -7678,7 +7678,7 @@ mod downgrade_tests {
 
     /// Insère une note minimale avec le statut donné et retourne son NoteId.
     async fn seed_note(idx: &SqliteIndex, status: &str) -> NoteId {
-        let id = NoteId(ulid::Ulid::new());
+        let id = NoteId(ulid::Ulid::generate());
         let now = chrono::Utc::now().timestamp_millis();
         let zero_hash: &[u8] = &[0u8; 32];
         let conn = idx.conn.lock().await;
@@ -7762,7 +7762,7 @@ mod downgrade_tests {
     #[tokio::test]
     async fn downgrade_note_nonexistent_returns_not_found() {
         let idx = SqliteIndex::open_in_memory().await.expect("idx");
-        let id = NoteId(ulid::Ulid::new());
+        let id = NoteId(ulid::Ulid::generate());
 
         let result = idx.downgrade_note(&checked_main(), &id, "test", None).await;
         assert!(
@@ -7781,7 +7781,7 @@ mod downgrade_tests {
     async fn downgrade_note_replaced_by_nonexistent_returns_not_found() {
         let idx = SqliteIndex::open_in_memory().await.expect("idx");
         let target = seed_note(&idx, "live").await;
-        let ghost = NoteId(ulid::Ulid::new()); // ULID qui n'existe pas dans la DB
+        let ghost = NoteId(ulid::Ulid::generate()); // ULID qui n'existe pas dans la DB
 
         let result = idx
             .downgrade_note(
@@ -7962,7 +7962,7 @@ mod downgrade_tests {
     async fn downgrade_note_cross_vault_matches_nonexistent_oracle() {
         let idx = SqliteIndex::open_in_memory().await.expect("idx");
         let id = seed_note(&idx, "live").await; // 'main'
-        let ghost = NoteId(ulid::Ulid::new()); // n'existe nulle part
+        let ghost = NoteId(ulid::Ulid::generate()); // n'existe nulle part
 
         let cross = idx.downgrade_note(&checked_other(), &id, "x", None).await;
         let absent = idx
@@ -8242,7 +8242,7 @@ mod title_tests {
         // Le backfill est exécuté lors de l'application de la migration 0005.
         // En mémoire, les notes seedées après la migration n'ont pas de backfill automatique.
         // Ce test vérifie que upsert_note_title fonctionne correctement.
-        let note_id = NoteId(ulid::Ulid::new());
+        let note_id = NoteId(ulid::Ulid::generate());
         idx.seed_note(&note_id.to_string(), "decisions", "# Mon Titre\n\nbody")
             .await
             .unwrap();
@@ -8271,7 +8271,7 @@ mod title_tests {
         let idx = SqliteIndex::open_in_memory()
             .await
             .expect("open_in_memory ne doit pas échouer");
-        let note_id = NoteId(ulid::Ulid::new());
+        let note_id = NoteId(ulid::Ulid::generate());
         idx.seed_note(&note_id.to_string(), "reference", "# Titre A\nbody")
             .await
             .unwrap();
@@ -8314,13 +8314,13 @@ mod title_tests {
             .expect("open_in_memory ne doit pas échouer");
 
         // Cas A : title=NULL, body commence par un H1 suivi d'une section
-        let id_a = ulid::Ulid::new().to_string();
+        let id_a = ulid::Ulid::generate().to_string();
         idx.seed_note(&id_a, "decisions", "# Mon Titre\n## section\ncontenu")
             .await
             .expect("seed note A");
 
         // Cas B : title déjà renseigné — ne doit pas être écrasé
-        let id_b = ulid::Ulid::new().to_string();
+        let id_b = ulid::Ulid::generate().to_string();
         idx.seed_note(&id_b, "reference", "# Autre Titre\nbody")
             .await
             .expect("seed note B");
@@ -8334,7 +8334,7 @@ mod title_tests {
         }
 
         // Cas C : title=NULL, body sans H1 → title doit rester NULL
-        let id_c = ulid::Ulid::new().to_string();
+        let id_c = ulid::Ulid::generate().to_string();
         idx.seed_note(&id_c, "debug", "Pas de H1 ici\n## Section")
             .await
             .expect("seed note C");
@@ -8424,7 +8424,7 @@ mod title_tests {
     ///
     /// - A) note identity, title=NULL, body `# identity/main\n...` → title='identity/main'.
     /// - B) note identity, title déjà peuplé → non écrasé (idempotence).
-    /// - C) note identity, body `# identity/main\r\nSuite` (CRLF) → title sans `\r` (P2-4 council).
+    /// - C) note identity, body `# identity/main\r\nSuite` (CRLF) → title sans `\r`.
     /// - D) note non-identity, title=NULL, body `# identity/main\n...` → non affectée.
     ///
     /// Le SQL est ré-appliqué manuellement sur une DB déjà ouverte (idempotent :
@@ -8436,7 +8436,7 @@ mod title_tests {
             .expect("open_in_memory — migration_0025");
 
         // Cas A : section=identity, title=NULL, body LF-only → backfill attendu.
-        let id_a = ulid::Ulid::new().to_string();
+        let id_a = ulid::Ulid::generate().to_string();
         idx.seed_note(
             &id_a,
             "identity",
@@ -8446,7 +8446,7 @@ mod title_tests {
         .expect("seed note A");
 
         // Cas B : section=identity, title déjà peuplé → NON écrasé.
-        let id_b = ulid::Ulid::new().to_string();
+        let id_b = ulid::Ulid::generate().to_string();
         idx.seed_note(
             &id_b,
             "identity",
@@ -8464,7 +8464,7 @@ mod title_tests {
         }
 
         // Cas C : section=identity, body avec CRLF → title sans \r (rtrim edge CRLF).
-        let id_c = ulid::Ulid::new().to_string();
+        let id_c = ulid::Ulid::generate().to_string();
         idx.seed_note(
             &id_c,
             "identity",
@@ -8474,7 +8474,7 @@ mod title_tests {
         .expect("seed note C");
 
         // Cas D : section ≠ identity, body identity-like → NON affectée.
-        let id_d = ulid::Ulid::new().to_string();
+        let id_d = ulid::Ulid::generate().to_string();
         idx.seed_note(
             &id_d,
             "reference",
@@ -8725,7 +8725,7 @@ mod snippet_fts_tests {
             .await
             .expect("open_in_memory ne doit pas échouer");
 
-        let note_id = NoteId(ulid::Ulid::new());
+        let note_id = NoteId(ulid::Ulid::generate());
         idx.seed_note_with_fts(
             &note_id.to_string(),
             "architecture",
@@ -9561,7 +9561,7 @@ mod review_queue_resilience_tests {
         let now = chrono::Utc::now().timestamp_millis();
 
         // Ligne valide (ULID) en pending-review.
-        let valid_id = ulid::Ulid::new().to_string();
+        let valid_id = ulid::Ulid::generate().to_string();
         {
             let conn = idx.conn.lock().await;
             conn.execute(
@@ -10602,7 +10602,7 @@ mod temporal_index_tests {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
         // 201 notes, ULID valides distincts, anchor_ms variés.
         for i in 0..201_i64 {
-            let id = Ulid::new().to_string();
+            let id = Ulid::generate().to_string();
             seed_note_with_temporal(&idx, &id, 1000 + i, "Event", "live").await;
         }
         let rows = idx
@@ -11070,7 +11070,7 @@ mod temporal_index_tests {
 mod recall_lessons_tests {
     use super::*;
 
-    /// Anti-regression (revue securite finding#1 / TODO 01KYAZK7YP) -- le filtre
+    /// Anti-regression -- le filtre
     /// `AND n.section = 'lessons-learned'` de `hydrate_lessons_by_ulids` est load-bearing.
     ///
     /// Sur le chemin semantique de recall, `retrieve_candidates` (branche ULID-direct)
@@ -11254,7 +11254,7 @@ mod recall_lessons_tests {
         assert_eq!(hits.len(), 2, "limit=2 doit borner le résultat net");
     }
 
-    /// Audit lot C P1.2 — une leçon `forgotten` (F-44) n'est jamais recallée.
+    /// Une leçon `forgotten` (F-44) n'est jamais recallée.
     #[tokio::test]
     async fn recall_lessons_excludes_forgotten() {
         let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");

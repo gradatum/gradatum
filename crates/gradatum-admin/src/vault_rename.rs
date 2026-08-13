@@ -179,7 +179,7 @@ mod tests {
         let idx = vault.index();
 
         // Seed une note avec le titre initial
-        let ulid_str = ulid::Ulid::new().to_string();
+        let ulid_str = ulid::Ulid::generate().to_string();
         idx.seed_note_with_fts(&ulid_str, "decisions", &format!("# {title}\ncorps."))
             .await
             .expect("seed_note_with_fts");
@@ -275,7 +275,7 @@ mod tests {
             .expect("Vault::create vault_rename cross-vault test");
 
         let idx = vault.index();
-        let ulid_str = ulid::Ulid::new().to_string();
+        let ulid_str = ulid::Ulid::generate().to_string();
         let nid = gradatum_core::identity::NoteId(
             ulid::Ulid::from_string(&ulid_str).expect("ULID parse setup collision"),
         );

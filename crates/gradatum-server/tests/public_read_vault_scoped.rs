@@ -186,12 +186,8 @@ async fn vault_read_reads_target_vault_body_not_main() {
     let id = NoteId::new();
     seed_homonym(&env, id).await;
 
-    let req = VaultReadRequest {
-        tenant_id: Some("vault-b".into()),
-        path: id.0.to_string(),
-        section: None,
-        compact: false,
-    };
+    let mut req = VaultReadRequest::new(id.0.to_string());
+    req.tenant_id = Some("vault-b".into());
     let resp = vault_read_impl(&env.state, &bearer("vault-b"), req)
         .await
         .expect("vault_read vault-b → Ok");
@@ -216,12 +212,8 @@ async fn vault_read_main_reads_main_body() {
     let id = NoteId::new();
     seed_homonym(&env, id).await;
 
-    let req = VaultReadRequest {
-        tenant_id: Some("main".into()),
-        path: id.0.to_string(),
-        section: None,
-        compact: false,
-    };
+    let mut req = VaultReadRequest::new(id.0.to_string());
+    req.tenant_id = Some("main".into());
     let resp = vault_read_impl(&env.state, &bearer("main"), req)
         .await
         .expect("vault_read main → Ok");
@@ -250,12 +242,8 @@ async fn vault_read_unknown_vault_is_fail_closed() {
         .await
         .expect("write main");
 
-    let req = VaultReadRequest {
-        tenant_id: Some("vault-absent".into()),
-        path: id.0.to_string(),
-        section: None,
-        compact: false,
-    };
+    let mut req = VaultReadRequest::new(id.0.to_string());
+    req.tenant_id = Some("vault-absent".into());
     let err = vault_read_impl(&env.state, &bearer("vault-absent"), req)
         .await
         .expect_err("vault absent du registre → fail-closed (jamais Ok)");
@@ -290,10 +278,8 @@ async fn vault_history_versions_scoped_to_target_vault() {
         .await
         .expect("main v1");
 
-    let req = VaultHistoryRequest {
-        tenant_id: Some("vault-b".into()),
-        note_id: id.0.to_string(),
-    };
+    let mut req = VaultHistoryRequest::new(id.0.to_string());
+    req.tenant_id = Some("vault-b".into());
     let resp = vault_history_impl(&env.state, &bearer("vault-b"), req)
         .await
         .expect("vault_history vault-b → Ok");
@@ -332,11 +318,8 @@ async fn vault_history_get_reads_target_vault_snapshot() {
         .expect("history_versions vault-b");
     let ts = *versions.first().expect("au moins 1 snapshot vault-b");
 
-    let req = VaultHistoryGetRequest {
-        tenant_id: Some("vault-b".into()),
-        note_id: id.0.to_string(),
-        ts_ms: ts,
-    };
+    let mut req = VaultHistoryGetRequest::new(id.0.to_string(), ts);
+    req.tenant_id = Some("vault-b".into());
     let resp = vault_history_get_impl(&env.state, &bearer("vault-b"), req)
         .await
         .expect("vault_history_get vault-b → Ok (avant le fix, main n'a pas ce snapshot)");

@@ -160,10 +160,10 @@ fn make_test_job() -> gradatum_core::JobRecord {
 
     let now = Utc::now();
     JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind: Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 ..Default::default()
             }),
@@ -249,7 +249,7 @@ async fn get_job_not_found() {
     let token = test_token(&state);
     let router = build_router(state);
 
-    let unknown_id = Ulid::new();
+    let unknown_id = Ulid::generate();
     let req = with_bearer(
         Request::builder()
             .method("GET")
@@ -325,7 +325,7 @@ async fn cancel_job_not_found() {
     let token = test_token(&state);
     let router = build_router(state);
 
-    let unknown_id = Ulid::new();
+    let unknown_id = Ulid::generate();
     let req = with_bearer(
         Request::builder()
             .method("POST")
@@ -851,7 +851,7 @@ async fn get_job_detail(router: Router, id: &str, token: &str) -> (StatusCode, s
 
 /// Test F-16.1 (a) — POST Curate {note_id réel} → job Curate sur CETTE note.
 ///
-/// Cœur du fix E-13 : avant, le note_id était aléatoire (`Ulid::new()`) → DLQ
+/// Cœur du fix E-13 : avant, le note_id était aléatoire (`Ulid::generate()`) → DLQ
 /// garanti. Après, le note_id fourni par le client est honoré dans le JobSpec.
 #[tokio::test]
 async fn create_job_curate_honors_client_note_id() {
@@ -859,7 +859,7 @@ async fn create_job_curate_honors_client_note_id() {
     let token = test_token(&state);
     let router = build_router(state.clone());
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let body = serde_json::json!({
         "spec": { "kind": { "type": "Curate", "data": { "note_id": note_id } } }
     });
@@ -1018,7 +1018,7 @@ async fn create_job_garbage_kind_rejected_400() {
 async fn create_job_idempotency_key_replay_same_id() {
     let state = build_state_with_job_store().await;
     let token = test_token(&state);
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let body = serde_json::json!({
         "spec": { "kind": { "type": "Curate", "data": { "note_id": note_id } } }
     });

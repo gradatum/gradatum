@@ -5,7 +5,7 @@
 # trop bruyant par l'opérateur. Les mises à jour de dépendances se font en revue manuelle
 # (cargo bump) dans le flux release.
 # Les alertes de sécurité restent actives (par défaut GitHub) : react-router (3, medium)
-# traitée par migration 6.x→7.x planifiée v1.1.0 (TODO decisions:01KZ7J2V0YDW6R0AWJZP099ZWK),
+# traitée par migration 6.x→7.x planifiée v2.0.0 (TODO decisions:01KZ7J2V0YDW6R0AWJZP099ZWK),
 # jsonwebtoken dismissée stale (absent des lockfiles). Dismiss 2026-08-04.
 version: 2
 updates:

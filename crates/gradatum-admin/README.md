@@ -2,7 +2,7 @@
 
 > Operator CLI for gradatum: init, token, api-key, backfill, jobs, vault rename/forget.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -32,7 +32,7 @@ databases (`queue`, `revocation`, `api_keys`).
 Manage service JWT tokens.
 
 ```bash
-gradatum-admin token issue --root /var/lib/gradatum --sub mcp-stub --scopes vault_read
+gradatum-admin token issue --root /var/lib/gradatum --sub my-service --scopes vault_read
 ```
 
 ### api-key

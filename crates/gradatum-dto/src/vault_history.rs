@@ -9,6 +9,7 @@ use gradatum_core::scope::TenantId;
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultHistoryRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -19,6 +20,17 @@ pub struct VaultHistoryRequest {
     pub note_id: String,
 }
 
+impl VaultHistoryRequest {
+    /// Constructs a history request for `note_id`; `tenant_id` defaults to `None`.
+    #[must_use]
+    pub fn new(note_id: String) -> Self {
+        Self {
+            tenant_id: None,
+            note_id,
+        }
+    }
+}
+
 /// Request body for `vault_history_get` — reads a specific historical snapshot.
 ///
 /// Returns the note content at the time of snapshot `ts_ms`.
@@ -26,6 +38,7 @@ pub struct VaultHistoryRequest {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultHistoryGetRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -38,6 +51,19 @@ pub struct VaultHistoryGetRequest {
     pub ts_ms: i64,
 }
 
+impl VaultHistoryGetRequest {
+    /// Constructs a snapshot-read request for `note_id` at `ts_ms`; `tenant_id`
+    /// defaults to `None`.
+    #[must_use]
+    pub fn new(note_id: String, ts_ms: i64) -> Self {
+        Self {
+            tenant_id: None,
+            note_id,
+            ts_ms,
+        }
+    }
+}
+
 /// Request body for `vault_restore` — restores a note from a snapshot.
 ///
 /// Writes snapshot `ts_ms` as the new current version.
@@ -46,6 +72,7 @@ pub struct VaultHistoryGetRequest {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultRestoreRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -58,6 +85,19 @@ pub struct VaultRestoreRequest {
     pub ts_ms: i64,
 }
 
+impl VaultRestoreRequest {
+    /// Constructs a restore request for `note_id` at snapshot `ts_ms`; `tenant_id`
+    /// defaults to `None`.
+    #[must_use]
+    pub fn new(note_id: String, ts_ms: i64) -> Self {
+        Self {
+            tenant_id: None,
+            note_id,
+            ts_ms,
+        }
+    }
+}
+
 /// Request body for `vault_diff` — raw line-by-line diff between two versions.
 ///
 /// `a` and `b` are Unix ms timestamps (obtained from `vault_history`)
@@ -66,6 +106,7 @@ pub struct VaultRestoreRequest {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultDiffRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -78,6 +119,20 @@ pub struct VaultDiffRequest {
     pub a: String,
     /// Version B: Unix ms timestamp or `"current"`.
     pub b: String,
+}
+
+impl VaultDiffRequest {
+    /// Constructs a diff request between versions `a` and `b` of `note_id`;
+    /// `tenant_id` defaults to `None`.
+    #[must_use]
+    pub fn new(note_id: String, a: String, b: String) -> Self {
+        Self {
+            tenant_id: None,
+            note_id,
+            a,
+            b,
+        }
+    }
 }
 
 /// Response for `vault_history`.

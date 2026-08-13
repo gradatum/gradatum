@@ -17,6 +17,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 /// Error variants for `RevocationStore` operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RevocationError {
     /// SQLite error (via sqlx).
     #[error("sqlite error: {0}")]

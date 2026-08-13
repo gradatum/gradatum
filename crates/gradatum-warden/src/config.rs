@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// All fields have safe default values via [`Default`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WardenConfig {
     /// Enables or disables the warden. When `false`, all requests pass through without any check.
     pub enabled: bool,

@@ -107,7 +107,7 @@ impl LegacyQueue {
     ///
     /// Returns [`LegacyQueueError::Sqlite`] if the insert fails.
     pub async fn enqueue(&self, kind: &str, payload_json: &str) -> Result<Ulid, LegacyQueueError> {
-        let id = Ulid::new();
+        let id = Ulid::generate();
         let now_ms = now_ms();
 
         let conn = self.conn.lock().await;

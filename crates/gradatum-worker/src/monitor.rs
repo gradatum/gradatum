@@ -6,7 +6,7 @@
 //!
 //! | Kind | Concurrency | Timeout | Retries | Layer |
 //! |---|---|---|---|---|
-//! | `curate` | 2 | 30s | 3 | Trace + Timeout + Retry + CatchPanic |
+//! | `curate` | 1 | 300s | 3 | Trace + Timeout + Retry + CatchPanic |
 //! | `embed` | 4 | 60s | 3 | Trace + Timeout + Retry + CatchPanic |
 //! | `reindex` | 4 | 120s | 2 | Trace + Timeout + Retry + CatchPanic |
 //! | `purge` | 1 | 300s | 0 | Trace + Timeout + Retry + CatchPanic |
@@ -161,8 +161,14 @@ pub struct WorkersConfig {
 impl WorkersConfig {
     fn default_curate() -> WorkerConfig {
         WorkerConfig {
-            concurrency: 2,
-            timeout_secs: 30,
+            // Concurrency 1 — LLM-bound: serial to avoid saturating a single-slot chat
+            // endpoint. The default Docker stack starts `llama-chat` with `--parallel 1`;
+            // extra curate slots would only queue on that one slot with no throughput gain.
+            concurrency: 1,
+            // Long timeout: a single classification call (Qwen3-4B) can take tens of
+            // seconds under load. 300s leaves margin above the 60s client-side timeout
+            // configured in `[curator.llm]`, so the client's own timeout fires first.
+            timeout_secs: 300,
             max_retries: 3,
         }
     }
@@ -699,8 +705,10 @@ mod tests {
     #[test]
     fn apalis_config_defaults_coherent() {
         let cfg = ApalisConfig::default();
-        assert_eq!(cfg.workers.curate.concurrency, 2);
-        assert_eq!(cfg.workers.curate.timeout_secs, 30);
+        // Curate is LLM-bound: serial (1 slot) to match a single-slot chat endpoint,
+        // long timeout (300s) to clear the 60s client-side [curator.llm] timeout.
+        assert_eq!(cfg.workers.curate.concurrency, 1);
+        assert_eq!(cfg.workers.curate.timeout_secs, 300);
         assert_eq!(cfg.workers.curate.max_retries, 3);
         assert_eq!(cfg.workers.embed.concurrency, 4);
         assert_eq!(cfg.workers.embed.timeout_secs, 60);

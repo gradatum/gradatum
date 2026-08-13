@@ -105,7 +105,7 @@ fn sign(state: &AppState) -> String {
 }
 
 async fn seed_one(idx: &Arc<SqliteIndex>) -> String {
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     let now_ms = chrono::Utc::now().timestamp_millis();
     idx.seed_note_with_created(
         &id,

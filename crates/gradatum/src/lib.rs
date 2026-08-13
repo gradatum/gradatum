@@ -4,8 +4,8 @@
 //!
 //! ## Stability
 //!
-//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
-//! additions only within `1.x`, breaking changes deferred to the next major. Traits still
+//! `2.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
+//! additions only within `2.x`, breaking changes deferred to the next major. Traits still
 //! tagged `#[stability::unstable]` or `#[stability::experimental]` carry a finer-grained
 //! tier per RELEASE-POLICY.md AM1.
 //! See the [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).

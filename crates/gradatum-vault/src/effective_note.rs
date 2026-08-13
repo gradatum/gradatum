@@ -39,7 +39,6 @@ use gradatum_core::identity::{NoteId, NoteVersion};
 // DocumentStore as _ serait nécessaire si on passait par Arc<dyn DocumentStore>.
 use gradatum_core::note::EffectiveNote;
 use gradatum_core::scope::OverrideScope;
-use gradatum_storage::Storage as _;
 
 use crate::registry::Vault;
 

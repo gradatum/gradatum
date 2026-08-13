@@ -100,7 +100,7 @@ fn build_router(state: AppState) -> Router {
 
 /// Insère une note minimale dans l'index concret et retourne son ULID.
 async fn seed_note(idx: &SqliteIndex) -> String {
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     idx.seed_note(&id, "reference", "test note pour security_f1")
         .await
         .expect("seed_note — doit réussir sur index in-memory");
@@ -272,7 +272,7 @@ async fn patch_note_returns_403_when_acl_denies() {
 #[tokio::test]
 async fn move_note_locus_returns_401_when_unauthenticated() {
     let (state, _token, _idx) = build_state_with_index(ACL_ALLOW).await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let router = build_router(state);
 
     let body = serde_json::json!({"locus": "archive"});
@@ -298,7 +298,7 @@ async fn move_note_locus_returns_401_when_unauthenticated() {
 #[tokio::test]
 async fn move_note_locus_passes_auth_reaches_business_logic() {
     let (state, token, _idx) = build_state_with_index(ACL_ALLOW).await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let router = build_router(state);
 
     let body = serde_json::json!({"locus": "archive"});
@@ -322,7 +322,7 @@ async fn move_note_locus_passes_auth_reaches_business_logic() {
 #[tokio::test]
 async fn move_note_locus_returns_403_when_acl_denies() {
     let (state, token, _idx) = build_state_with_index(ACL_DENY).await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let router = build_router(state);
 
     let body = serde_json::json!({"locus": "archive"});

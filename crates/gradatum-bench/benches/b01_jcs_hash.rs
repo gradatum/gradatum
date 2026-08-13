@@ -6,7 +6,8 @@
 //! Critère de passage T14 : le bench compile et produit des mesures.
 //! Le verdict final (PASS/FAIL target) est établi en T15 sur main.
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use gradatum_bench::build_frontmatter;
 use gradatum_core::identity::ContentHash;

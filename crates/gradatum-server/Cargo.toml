@@ -29,10 +29,14 @@ gradatum-dto = { workspace = true, features = ["schemars"] }
 rusqlite.workspace = true
 gradatum-embed.workspace = true
 gradatum-vault.workspace = true
+# Fabrique de stockage OpenDAL (`build_storage`, trait `Storage`) — la passe d'audit F-51
+# écrit ses artefacts via cette couche, jamais en accès fichier direct. Crate first-party
+# déjà présente transitivement via gradatum-vault ; l'edge direct rend la dépendance honnête.
+gradatum-storage.workspace = true
 gradatum-index = { workspace = true, features = ["sqlite-vec-ann"] }
 gradatum-search.workspace = true
 gradatum-queue.workspace = true
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "1.0.0" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.0.0" }
 gradatum-acl-policy.workspace = true
 gradatum-acl-auth.workspace = true
 gradatum-auth.workspace = true
@@ -57,7 +61,6 @@ thiserror.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 prometheus-client.workspace = true
-bincode.workspace = true
 sqlx.workspace = true
 ulid.workspace = true
 async-trait.workspace = true
@@ -78,6 +81,15 @@ sqlite-vec = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 sd-notify = "0.4"
 async-trait.workspace = true
+
+[features]
+# Le binaire serveur embarque le backend objet S3 PAR DÉFAUT : la bascule vault
+# local <-> S3 est un réglage de configuration (`[storage] service = "s3"`), jamais
+# une recompilation ni un binaire différent (F-86, critère d'acceptation principal).
+# Un déploiement purement local ne déclare rien et reste sur fs — la capacité est
+# présente dans le binaire, inactive tant que la config ne l'appelle pas.
+default = ["s3"]
+s3 = ["gradatum-vault/s3", "gradatum-storage/s3"]
 
 [dev-dependencies]
 tempfile.workspace = true

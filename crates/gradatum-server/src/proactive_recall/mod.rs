@@ -217,7 +217,7 @@ pub async fn proactive_recall(
         .inc_by(items.len() as u64);
 
     // ── Session : surfaced = items POST-filtrage ACL ──────────────────────────
-    let recall_id = Ulid::new().to_string();
+    let recall_id = Ulid::generate().to_string();
     let surfaced: Vec<String> = items.iter().map(|h| h.ulid.clone()).collect();
     if let Some(store) = state.proactive_recall.as_ref() {
         store

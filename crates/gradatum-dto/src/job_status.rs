@@ -19,9 +19,18 @@ use serde::Deserialize;
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct JobStatusRequest {
     /// ULID of the job to inspect — the `job_id` returned by the enqueuing endpoint.
     ///
     /// Crockford base32, 26 chars (e.g. `01KYX5FBTXQSG37BQEYP0RF47B`).
     pub job_id: String,
+}
+
+impl JobStatusRequest {
+    /// Constructs a job-status request for the given `job_id`.
+    #[must_use]
+    pub fn new(job_id: String) -> Self {
+        Self { job_id }
+    }
 }

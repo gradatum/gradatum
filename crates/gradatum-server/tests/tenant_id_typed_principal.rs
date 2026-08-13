@@ -7,7 +7,7 @@
 //! 3. Le claim JWT `tenant_id` sérialisé en JSON reste un `String` nu
 //!    (`#[serde(transparent)]` → wire inchangé, aucune migration).
 
-use gradatum_auth::jwt::{Claims, JwtService, TokenScope};
+use gradatum_auth::jwt::{JwtService, TokenScope};
 use gradatum_core::scope::TenantId;
 use gradatum_core::trust::TrustContext;
 
@@ -54,16 +54,22 @@ fn bearer_from_jwt_exposes_typed_tenant_id() {
 /// inchangé (byte-identical wire), la conversion vers `TenantId` a lieu en aval.
 #[test]
 fn jwt_claim_tenant_id_serialises_as_bare_string() {
-    let claims = Claims {
-        iss: "gradatum".to_string(),
-        sub: "agent-1".to_string(),
-        aud: "gradatum".to_string(),
-        iat: 1_000,
-        exp: 4_000,
-        jti: "01JTESTULID0000000000000000".to_string(),
-        scopes: vec!["read".to_string()],
-        tenant_id: "main".to_string(),
-    };
+    // `Claims` est `#[non_exhaustive]` : hors du crate d'origine (gradatum-auth) la
+    // construction par littéral est interdite. On l'obtient par le VRAI chemin — le
+    // seul par lequel un consommateur externe reçoit des `Claims` : signer puis
+    // vérifier un jeton. `tenant_id` reste `"main"`, ce que le test éprouve.
+    let svc = JwtService::new_ephemeral();
+    let token = svc
+        .sign(
+            "agent-1",
+            &["read".to_string()],
+            TokenScope::Service,
+            "main",
+        )
+        .expect("sign doit réussir avec une clé éphémère");
+    let claims = svc
+        .verify(&token)
+        .expect("verify immédiat ne peut pas échouer");
     let json = serde_json::to_string(&claims).expect("sérialisation des claims");
     assert!(
         json.contains("\"tenant_id\":\"main\""),

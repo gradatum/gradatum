@@ -42,6 +42,7 @@ pub struct ScoringWeights {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultContextRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -91,6 +92,27 @@ pub struct VaultContextRequest {
     /// **Additive field**: existing clients that omit it receive `None`.
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+impl VaultContextRequest {
+    /// Constructs a context request with the mandatory `query`; `mode` defaults to
+    /// [`ContextMode::default`] and every other field to its unset value.
+    #[must_use]
+    pub fn new(query: String) -> Self {
+        Self {
+            tenant_id: None,
+            query,
+            max_tokens: None,
+            budget_tokens: None,
+            section: None,
+            mode: ContextMode::default(),
+            scoring: None,
+            inject_skills: false,
+            skill_query: None,
+            reference_mode: false,
+            session_id: None,
+        }
+    }
 }
 
 #[cfg(test)]

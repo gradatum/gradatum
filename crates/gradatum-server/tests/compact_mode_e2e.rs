@@ -135,7 +135,7 @@ async fn search_compact_end_to_end() {
 
     // Seed 12 realistic notes matching the query (realistic titles + bodies).
     for i in 0..12 {
-        let id = Ulid::new().to_string();
+        let id = Ulid::generate().to_string();
         idx.seed_note_with_created(
             &id,
             "reference",
@@ -273,7 +273,7 @@ fn read_compact_gain_and_shape() {
 fn timeline_compact_gain_and_shape() {
     let items: Vec<TimelineItem> = (0..50)
         .map(|i| TimelineItem {
-            note_id: Ulid::new().to_string(),
+            note_id: Ulid::generate().to_string(),
             anchor_ms: 1_753_900_000_000 + i * 3_600_000,
             anchor_src: "created".to_string(),
             doc_kind: if i % 2 == 0 { "Event" } else { "Static" }.to_string(),
@@ -301,7 +301,7 @@ fn timeline_compact_gain_and_shape() {
 fn recall_compact_gain_and_shape() {
     let items: Vec<LessonHit> = (0..5)
         .map(|i| LessonHit {
-            ulid: Ulid::new().to_string(),
+            ulid: Ulid::generate().to_string(),
             title: format!("Leçon apprise numéro {i} sur les déploiements irréversibles"),
             snippet: format!(
                 "Snippet FTS5 réaliste {i} : un gate qui réclame une intervention sans canal \

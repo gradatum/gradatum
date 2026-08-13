@@ -9,7 +9,7 @@
 //! Security invariant #2 (G10-P1): code_scope reads source code indexed in `code_vault`
 //! tables that carry NO `tenant` column (migrations 0017/0018). Only privileged
 //! contexts (Studio, mTLS, main-agent) are authorized — a regular tenant token
-//! MUST NOT read cross-tenant source code. Gated by [`is_code_scope_privileged`].
+//! MUST NOT read cross-tenant source code. Gated by the private `is_code_scope_privileged`.
 //!
 //! # Contract
 //!
@@ -319,7 +319,7 @@ pub(crate) async fn code_scope_impl(
 ///   — unsupported scenario (any CLI ingest calls both).
 /// - `500 Internal Server Error`: storage failure on the index side.
 ///
-/// G10-P1: ACL 403 enforced via [`is_code_scope_privileged`] — only Studio, mTLS,
+/// G10-P1: ACL 403 enforced via the private `is_code_scope_privileged` — only Studio, mTLS,
 /// and main-agent contexts are authorized (invariant #2). The `code-` prefix validation
 /// (invariant #1) remains as defense-in-depth. Any non-privileged authenticated caller
 /// → 403 Forbidden. Known vault + selector with no match → 200 `{entries:[], total_matched:0}`.

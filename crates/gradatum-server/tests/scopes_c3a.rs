@@ -171,7 +171,7 @@ async fn request_scoped(
 /// ULID (patch/move) + append-only (event-log/session-log) + jobs (create/cancel).
 /// `(method, uri, body JSON valide côté DTO — le refus vient du scope, pas du parsing)`.
 fn extended_write_surfaces() -> Vec<(&'static str, String, serde_json::Value)> {
-    let ulid = ulid::Ulid::new().to_string();
+    let ulid = ulid::Ulid::generate().to_string();
     vec![
         (
             "PATCH",

@@ -110,7 +110,7 @@ fn make_scoped_forget_job(vault_id: &str, spec: ForgetSpec) -> GradatumJob {
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Forget(spec),
                 class,

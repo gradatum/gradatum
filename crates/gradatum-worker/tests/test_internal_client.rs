@@ -60,26 +60,44 @@ fn parse_status(s: &str) -> Result<NoteStatus, InternalClientError> {
     }
 }
 
-fn parse_author(s: &str) -> AuthorRef {
-    if let Some((kind_str, id)) = s.split_once(':') {
-        let kind = match kind_str {
-            "human" => AuthorKind::Human,
-            "main-agent" => AuthorKind::MainAgent,
-            "sub-agent" => AuthorKind::SubAgent,
-            "system" => AuthorKind::System,
-            _ => AuthorKind::MainAgent,
-        };
-        AuthorRef {
-            kind,
-            id: id.to_string(),
-            display_name: None,
+// Miroir exact de `parse_author` côté serveur (`internal/persist.rs`, Tâche 11 — R2).
+// R2 refuse d'inventer une identité, pas de défaulter une métadonnée d'audit : sont refusés
+// un `kind:` explicite mais inconnu et la chaîne vide/blanche ; un nom nu PORTE l'identité du
+// credential (l'`id`, charset AgentId sans `:`) et est accepté avec un `kind` par défaut. Ce
+// double doit suivre le serveur au comportement près, sous peine de divergence silencieuse.
+fn parse_author(s: &str) -> Result<AuthorRef, GradatumError> {
+    if s.trim().is_empty() {
+        return Err(GradatumError::InvalidInput(
+            "empty author — no identity resolved (R2)".to_string(),
+        ));
+    }
+    match s.split_once(':') {
+        Some((kind_str, id)) => {
+            let kind = match kind_str {
+                "human" => AuthorKind::Human,
+                "main-agent" => AuthorKind::MainAgent,
+                "sub-agent" => AuthorKind::SubAgent,
+                "system" => AuthorKind::System,
+                other => {
+                    return Err(GradatumError::InvalidInput(format!(
+                        "unknown author kind {other:?} — an explicit 'kind:id' must name a recognized kind (R2)"
+                    )));
+                }
+            };
+            Ok(AuthorRef {
+                kind,
+                id: id.to_string(),
+                display_name: None,
+            })
         }
-    } else {
-        AuthorRef {
+        // Nom nu = identité résolue du credential (charset AgentId interdit `:`) ; `kind`
+        // par défaut = métadonnée d'audit sans effet d'autorisation. Voir persist.rs pour
+        // la justification complète.
+        None => Ok(AuthorRef {
             kind: AuthorKind::MainAgent,
             id: s.to_string(),
             display_name: None,
-        }
+        }),
     }
 }
 
@@ -190,7 +208,15 @@ impl InternalClient for TestInternalClient {
         })?;
         let section = parse_section(&req.section)?;
         let status = parse_status(&req.status)?;
-        let author_ref = req.author.as_deref().map(parse_author);
+        let author_ref = req
+            .author
+            .as_deref()
+            .map(parse_author)
+            .transpose()
+            .map_err(|e| InternalClientError::ServerError {
+                status: 400,
+                body: format!("invalid author: {e}"),
+            })?;
         let tags = parse_tags(&req.tags)?;
 
         let frontmatter = Frontmatter {

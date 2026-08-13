@@ -1,6 +1,6 @@
 pub mod gradatum_warden
 pub mod gradatum_warden::config
-pub struct gradatum_warden::config::WardenConfig
+#[non_exhaustive] pub struct gradatum_warden::config::WardenConfig
 pub gradatum_warden::config::WardenConfig::bypass_loopback: bool
 pub gradatum_warden::config::WardenConfig::enabled: bool
 pub gradatum_warden::config::WardenConfig::ip_allow: alloc::vec::Vec<ipnet::ipnet::IpNet>
@@ -10,12 +10,12 @@ pub gradatum_warden::config::WardenConfig::rate_limit_per_minute: u32
 impl core::default::Default for gradatum_warden::config::WardenConfig
 pub fn gradatum_warden::config::WardenConfig::default() -> Self
 pub mod gradatum_warden::error
-pub enum gradatum_warden::error::WardenDecision
+#[non_exhaustive] pub enum gradatum_warden::error::WardenDecision
 pub gradatum_warden::error::WardenDecision::Allow
 pub gradatum_warden::error::WardenDecision::Bypass
 pub gradatum_warden::error::WardenDecision::DenyIp
 pub gradatum_warden::error::WardenDecision::DenyRateLimit
-pub enum gradatum_warden::error::WardenError
+#[non_exhaustive] pub enum gradatum_warden::error::WardenError
 pub gradatum_warden::error::WardenError::InvalidRateLimit(u32, u32)
 pub mod gradatum_warden::ip
 pub mod gradatum_warden::ip::filter
@@ -52,14 +52,14 @@ pub type gradatum_warden::service::WardenService<S>::Future = core::pin::Pin<all
 pub type gradatum_warden::service::WardenService<S>::Response = http::response::Response<ResBody>
 pub fn gradatum_warden::service::WardenService<S>::call(&mut self, http::request::Request<ReqBody>) -> Self::Future
 pub fn gradatum_warden::service::WardenService<S>::poll_ready(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::result::Result<(), Self::Error>>
-pub enum gradatum_warden::WardenDecision
+#[non_exhaustive] pub enum gradatum_warden::WardenDecision
 pub gradatum_warden::WardenDecision::Allow
 pub gradatum_warden::WardenDecision::Bypass
 pub gradatum_warden::WardenDecision::DenyIp
 pub gradatum_warden::WardenDecision::DenyRateLimit
-pub enum gradatum_warden::WardenError
+#[non_exhaustive] pub enum gradatum_warden::WardenError
 pub gradatum_warden::WardenError::InvalidRateLimit(u32, u32)
-pub struct gradatum_warden::WardenConfig
+#[non_exhaustive] pub struct gradatum_warden::WardenConfig
 pub gradatum_warden::WardenConfig::bypass_loopback: bool
 pub gradatum_warden::WardenConfig::enabled: bool
 pub gradatum_warden::WardenConfig::ip_allow: alloc::vec::Vec<ipnet::ipnet::IpNet>

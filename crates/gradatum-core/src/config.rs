@@ -54,6 +54,91 @@ pub struct VaultConfig {
     /// Snapshot retention policy for the `.history/` directory.
     #[serde(default)]
     pub history: HistoryConfig,
+
+    /// Storage backend for the vault's Markdown notes.
+    ///
+    /// Absent section → local filesystem (default), byte-identical to prior behaviour.
+    #[serde(default)]
+    pub storage: StorageBackendConfig,
+}
+
+/// `[storage]` section — where the vault's Markdown notes physically live.
+///
+/// This is the **declarative switch** between a local-disk vault and a remote
+/// S3-compatible object vault. Changing it is a configuration edit — no recompilation,
+/// no binary variant. An absent `[storage]` section behaves exactly like today
+/// (`service = "fs"`), so existing installations are untouched.
+///
+/// ## What lives here vs. what does not
+///
+/// - **Here** (declarative, non-secret): the service selector and its connection
+///   parameters — `endpoint`, `bucket`, `region`, `root` prefix.
+/// - **Never here**: credentials. Access keys are read exclusively from the process
+///   environment by OpenDAL's native credential chain (e.g. `AWS_ACCESS_KEY_ID`).
+///   Gradatum neither reads nor forwards any secret. A field for a secret would
+///   eventually be used, then committed — so none exists.
+///
+/// ## Scope
+///
+/// This selects the backend for the **Markdown notes only**. The SQLite index always
+/// remains on the local filesystem: a remote-notes / local-index deployment is the
+/// supported combination.
+///
+/// ## Example (S3 on OVH)
+///
+/// ```toml
+/// [storage]
+/// service = "s3"
+/// endpoint = "https://s3.gra.io.cloud.ovh.net"
+/// bucket = "my-vault"
+/// region = "gra"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageBackendConfig {
+    /// OpenDAL service selector. `"fs"` (default) or `"s3"`.
+    ///
+    /// An object service configured in a build that did not enable the matching
+    /// Cargo feature fails **at construction** with a clear error naming the service —
+    /// a silent no-op is never produced.
+    #[serde(default = "default_storage_service")]
+    pub service: String,
+
+    /// Endpoint URL of the object service (e.g. OVH S3). Ignored by `fs`.
+    ///
+    /// When omitted for `s3`, OpenDAL falls back to `AWS_ENDPOINT_URL` from the
+    /// environment if present.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Bucket (a.k.a. container) name. Required by object services.
+    #[serde(default)]
+    pub bucket: Option<String>,
+
+    /// Region. Optional depending on the provider.
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// Root prefix within the backend (a bucket key prefix, or an `fs` sub-path).
+    /// Optional — defaults to the backend's own root.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+/// Default storage service: local filesystem.
+fn default_storage_service() -> String {
+    "fs".to_owned()
+}
+
+impl Default for StorageBackendConfig {
+    fn default() -> Self {
+        Self {
+            service: default_storage_service(),
+            endpoint: None,
+            bucket: None,
+            region: None,
+            root: None,
+        }
+    }
 }
 
 /// `[vault]` section — vault identity.
@@ -359,4 +444,136 @@ pub enum ConfigError {
     /// Malformed TOML or incorrect field type.
     #[error("config parse: {0}")]
     Parse(#[from] toml::de::Error),
+}
+
+/// Builds an operator-facing message for a `figment::Error` that never echoes a
+/// value read from a configuration source.
+///
+/// # Why this exists (security)
+/// figment's own `Display` embeds the *offending value*: a type mismatch prints
+/// `found string "<value>"` (via `figment::error::Actual`), and a TOML syntax
+/// error is wrapped as `Kind::Message` carrying the source line verbatim. A secret
+/// mistakenly placed in a config file — pasted into a typed field such as a port,
+/// a timeout, or a dimension — would then reach the boot log. This helper rebuilds
+/// the message from the *structured* fields only — the key path (`section.key`)
+/// and the source file — plus a kind category whose value payload is dropped. The
+/// operator still learns *what* is wrong, *which key*, and *which file*, but never
+/// *the value*.
+///
+/// # Single guard for every figment consumer
+/// Every binary that loads TOML through figment funnels its error rendering here:
+/// `gradatum-server` (boot config), `gradatum-worker` (per-section fallback,
+/// including the `[curator]` section that carries `base_url`/`model`), and
+/// `gradatum-engine` (local config load). Centralising the redaction — and its
+/// anti-regression test — in one place means a new leak cannot slip back into one
+/// binary while the others stay safe.
+///
+/// The `match` on `figment::error::Kind` is intentionally exhaustive (no `_`
+/// arm): should a future figment version add a variant, compilation fails loudly
+/// rather than let a new leak slip through a catch-all.
+#[must_use]
+pub fn redact_figment_error(err: &figment::Error) -> String {
+    use figment::error::Kind;
+
+    // A figment error may chain several sub-errors; redact and join each.
+    err.clone()
+        .into_iter()
+        .map(|e| {
+            // Kind category. Value-bearing payloads (the `Actual` value, the raw
+            // `Message` text, the user-typed enum variant) are deliberately
+            // discarded; only schema-side facts (expected type, declared
+            // field/key names) are kept.
+            let kind = match &e.kind {
+                Kind::Message(_) => {
+                    "invalid syntax or value (withheld to avoid leaking config content)".to_string()
+                }
+                Kind::InvalidType(_, expected) => format!("invalid type, expected {expected}"),
+                Kind::InvalidValue(_, expected) => format!("invalid value, expected {expected}"),
+                Kind::InvalidLength(_, expected) => {
+                    format!("invalid length, expected {expected}")
+                }
+                // The offending variant string is a *value*; surface only the
+                // accepted set.
+                Kind::UnknownVariant(_, expected) => {
+                    format!("unknown value, expected one of {expected:?}")
+                }
+                // A field name is a *key*, safe (and useful) to name.
+                Kind::UnknownField(name, expected) => {
+                    format!("unknown field `{name}`, expected one of {expected:?}")
+                }
+                Kind::MissingField(name) => format!("missing field `{name}`"),
+                Kind::DuplicateField(name) => format!("duplicate field `{name}`"),
+                Kind::ISizeOutOfRange(_) | Kind::USizeOutOfRange(_) => {
+                    "integer value out of range".to_string()
+                }
+                Kind::Unsupported(_) => "unsupported value type".to_string(),
+                Kind::UnsupportedKey(_, expected) => {
+                    format!("unsupported key type, must be {expected}")
+                }
+            };
+
+            // Key location — configuration keys, never values.
+            let at = if e.path.is_empty() {
+                String::new()
+            } else {
+                format!(" at key `{}`", e.path.join("."))
+            };
+
+            // Source file when known ("which file"); otherwise the provider name
+            // (e.g. environment), which carries no value either.
+            let source = match &e.metadata {
+                Some(md) => match md.source.as_ref().and_then(|s| s.file_path()) {
+                    Some(path) => format!(" in {}", path.display()),
+                    None => format!(" in {}", md.name),
+                },
+                None => String::new(),
+            };
+
+            format!("{kind}{at}{source}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod redact_figment_error_tests {
+    use super::redact_figment_error;
+    use figment::error::{Actual, Kind};
+
+    /// Chaîne distinctive jouant le rôle du secret mal placé. Choisie pour n'être
+    /// sous-chaîne d'aucun mot de schéma (types attendus, noms de champs).
+    const SECRET: &str = "s3cr3t-do-not-leak-deadbeef-cafe";
+
+    /// Chaque variante de `Kind` porteuse d'une valeur fuit nativement mais est
+    /// masquée par [`redact_figment_error`]. Le `match` de la fonction est
+    /// exhaustif : cette liste couvre toutes les variantes dont le `Display`
+    /// figment embarque la valeur. Ce garde-fou unique couvre les trois binaires
+    /// consommateurs (server, worker, engine).
+    #[test]
+    fn every_value_bearing_kind_is_redacted() {
+        let s = SECRET.to_string();
+        let cases = [
+            figment::Error::from(Kind::Message(format!("erreur près de {s} ligne 3"))),
+            figment::Error::from(Kind::InvalidType(Actual::Str(s.clone()), "u64".into())),
+            figment::Error::from(Kind::InvalidValue(Actual::Str(s.clone()), "un port".into())),
+            figment::Error::from(Kind::UnknownVariant(s.clone(), &["json", "text"])),
+            figment::Error::from(Kind::Unsupported(Actual::Str(s.clone()))),
+            figment::Error::from(Kind::UnsupportedKey(
+                Actual::Str(s.clone()),
+                "une chaîne".into(),
+            )),
+        ];
+        for e in &cases {
+            // Sanity : figment fuit bien la valeur nativement (sinon test vacué).
+            assert!(
+                e.to_string().contains(SECRET),
+                "pré-condition : figment doit fuiter nativement pour ce Kind"
+            );
+            let redacted = redact_figment_error(e);
+            assert!(
+                !redacted.contains(SECRET),
+                "redact_figment_error a laissé fuiter la valeur : {redacted}"
+            );
+        }
+    }
 }

@@ -4,7 +4,7 @@
 //!
 //! | Method | Path | Response | Notes |
 //! |--------|------|----------|-------|
-//! | POST | `/vault_forget` | 200 `ForgetPreview` (dry) or 202 `EnqueuedResponse` (real) | Two-step confirmation |
+//! | POST | `/vault_forget` | 200 `ForgetPreview` (dry) or 202 `EnqueuedResponseUlid` (real) | Two-step confirmation |
 //! | GET  | `/vault/forgotten` | 200 `ForgottenListResponse` | Cursor pagination |
 //! | POST | `/vault/unforgot/{ulid}` | 200 `UnforgotResponse` | Synchronous restore (index only) |
 //!
@@ -300,7 +300,7 @@ fn build_forget_job_record(
         confirm_ulids,
     };
     JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind: Job::Forget(spec),
             class,

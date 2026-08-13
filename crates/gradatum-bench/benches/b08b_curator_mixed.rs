@@ -13,7 +13,8 @@
 
 use std::sync::Arc;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use gradatum_bench::build_note;
 use gradatum_chat::{CuratorContext, Heuristic, Noop};

@@ -32,6 +32,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[features]
+# Backend objet S3 pour le stockage des notes — opt-in, forwarde vers gradatum-storage.
+# Aucun défaut ici : les binaires consommateurs décident de l'embarquer (cf. serveur).
+s3 = ["gradatum-storage/s3"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }

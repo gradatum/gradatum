@@ -2,7 +2,7 @@
 //!
 //! Vault domain logic: registry + lifecycle + overrides + drift + effective_note cache.
 //!
-//! Layer L2 of the Gradatum architecture — composes the following L1 crates:
+//! Composes the following lower-level crates:
 //! - `gradatum-core`: primitives, traits, errors.
 //! - `gradatum-markdown`: parse + write `.md`.
 //! - `gradatum-cache`: `EffectiveNoteCache` (moka).
@@ -21,7 +21,7 @@
 //!
 //! ## Stability
 //!
-//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible additions only within `1.x`.
+//! `2.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible additions only within `2.x`.
 //! See [RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 
 #![forbid(unsafe_code)]

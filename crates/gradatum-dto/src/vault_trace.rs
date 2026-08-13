@@ -6,6 +6,7 @@ use gradatum_core::scope::TenantId;
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultTraceRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -16,4 +17,17 @@ pub struct VaultTraceRequest {
     pub query: String,
     /// Result limit (default 20, max 100).
     pub limit: Option<u32>,
+}
+
+impl VaultTraceRequest {
+    /// Constructs a trace request with the mandatory `query`; `tenant_id` and
+    /// `limit` default to `None`.
+    #[must_use]
+    pub fn new(query: String) -> Self {
+        Self {
+            tenant_id: None,
+            query,
+            limit: None,
+        }
+    }
 }

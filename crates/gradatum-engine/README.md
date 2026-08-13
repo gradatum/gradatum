@@ -2,7 +2,7 @@
 
 > Rust supervisor for llama-server inference processes — transparent OpenAI-compatible reverse proxy with restart-on-failure.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -23,7 +23,7 @@ interface including streaming, vision (mmproj), sampling parameters, and slot ID
 Supports multi-model deployments (one engine instance per model, each on its own port).
 Binds only the explicitly configured address; it does not default to `0.0.0.0`.
 
-### Operational hardening (v0.7.6)
+### Operational hardening
 
 - **`extra_args` allow-list** — extra `llama-server` flags are validated against a fixed
   allow-list (`ALLOWED_EXTRA_FLAGS`); unknown flags are rejected at boot. Flags owned by

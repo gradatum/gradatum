@@ -4,8 +4,9 @@ use gradatum_core::scope::TenantId;
 
 /// Request body for `vault_list` — legacy vault v1.6.2 `VaultListArgs` parity.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultListRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.

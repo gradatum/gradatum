@@ -98,7 +98,7 @@ async fn build_env(enabled: bool) -> Env {
 fn make_curate(tenant: &str) -> JobRecord {
     let now = chrono::Utc::now();
     JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind: Job::Curate(CurateSpec {
                 tenant_id: tenant.to_string(),
@@ -144,14 +144,14 @@ fn make_curate(tenant: &str) -> JobRecord {
 
 /// Variante DÉTERMINISTE de [`make_curate`] : `id` (ULID) et `created_at` imposés.
 ///
-/// `Ulid::new()` n'est **pas** monotone à l'intérieur d'une même milliseconde : seuls
+/// `Ulid::generate()` n'est **pas** monotone à l'intérieur d'une même milliseconde : seuls
 /// les 48 bits de poids fort portent l'horodatage (résolution ms), les 80 bits
 /// restants sont tirés aléatoirement. Deux ULID générés dans la même ms ont donc un
 /// ordre lexicographique aléatoire (~50 % d'inversions, mesuré sur 200 000 paires).
 ///
 /// `SqliteQueueStore::latest_job()` tranchant par `ORDER BY id DESC`, tout test qui
 /// dépend de « quel job est le plus récent » DOIT imposer des ULID strictement
-/// ordonnés — jamais s'en remettre à `Ulid::new()` ni à un `sleep`. Même parti pris
+/// ordonnés — jamais s'en remettre à `Ulid::generate()` ni à un `sleep`. Même parti pris
 /// que le test unitaire `latest_job_returns_most_recent_not_oldest`.
 ///
 /// `created_at` est aligné sur le même instant que l'ULID : l'assertion reste vraie
@@ -263,7 +263,7 @@ async fn get_body(router: axum::Router, uri: &str, jwt: &str) -> (StatusCode, St
 async fn post_curate(router: axum::Router, jwt: &str, idem: &str, spec_tenant: &str) -> StatusCode {
     let body = serde_json::json!({
         "spec": { "kind": { "type": "Curate", "data": {
-            "note_id": Ulid::new().to_string(),
+            "note_id": Ulid::generate().to_string(),
             "tenant_id": spec_tenant,
         }}}
     });
@@ -346,7 +346,7 @@ async fn create_job_scopes_record_to_bearer_vault() {
         &sign(&on.state, "alice"),
         "k-scope-on",
         serde_json::json!({ "kind": { "type": "Curate", "data": {
-            "note_id": Ulid::new().to_string(),
+            "note_id": Ulid::generate().to_string(),
             "tenant_id": "alice",
         }}}),
     )
@@ -365,7 +365,7 @@ async fn create_job_scopes_record_to_bearer_vault() {
         &sign(&off.state, "main"),
         "k-scope-off",
         serde_json::json!({ "kind": { "type": "Curate", "data": {
-            "note_id": Ulid::new().to_string(),
+            "note_id": Ulid::generate().to_string(),
             "tenant_id": "main",
         }}}),
     )
@@ -802,7 +802,7 @@ async fn dashboard_isolation() {
     // ── OFF : dashboard voit le job le plus récent global (byte-identical).
     //
     // Déterminisme (flake ~1/40 mesuré sur `main` avant correctif) : les deux
-    // `enqueue` tombaient massivement dans la même milliseconde, et `Ulid::new()`
+    // `enqueue` tombaient massivement dans la même milliseconde, et `Ulid::generate()`
     // n'est pas monotone à cette résolution → `ORDER BY id DESC` désignait le
     // « dernier job » à pile ou face. On impose ici deux instants distincts (donc
     // deux ULID strictement ordonnés), sans dépendre de l'horloge ni d'un `sleep`.

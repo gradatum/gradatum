@@ -47,16 +47,10 @@ unsound = "all"
 #   fastembed-cpu feature is OFF by default (feature gate, not compiled in default build).
 #   No fix available upstream as of 2026-05-05. Impact: none in default build (CPU embedder gated).
 #   Revisit when fastembed upgrades tokenizers or tokenizers drops paste.
-# RUSTSEC-2025-0141 — `bincode` v2 unmaintained (team ceased development permanently).
-#   Transitive dep: bincode 2.0.1 → gradatum-queue + gradatum-server.
-#   No security vulnerability — unmaintained classification only. API stable, no known issues.
-#   Migration to alternative (postcard/bitcode/rkyv) deferred to Phase 2.1+ when data format
-#   is stabilised. Tracked as debt in CHANGELOG deny.toml migrate-bincode Phase 2.1+.
 ignore = [
     # RUSTSEC-2024-0436 (paste) — supprimé de l'arbre de dépendances post-bump reqwest 0.13
     # (paste n'est plus tiré transitivement depuis fastembed 4.6.0 avec default-features=false).
     # Entrée conservée en commentaire pour traçabilité — PR-3 HTTP stack bump.
-    { id = "RUSTSEC-2025-0141", reason = "bincode v2 unmaintained (no security issue) — migration to alternative deferred Phase 2.1+ after data format stabilisation" },
     # RUSTSEC-2025-0068 (serde_yml) — RETIRÉ : lot I-013 a migré serde_yml → serde_norway.
     # Le motif de l'exemption était de surcroît faux sur deux points, mesurés avant retrait :
     #   1. Usage — il affirmait que « seul le Deserializer est utilisé ». Le chemin d'ÉCRITURE
@@ -157,7 +151,23 @@ allow = [
 confidence-threshold = 0.8
 
 # Exceptions for dual-licensed crates that include a non-standard identifier
-exceptions = []
+#
+# tiny-keccak (CC0-1.0) — sixth-level transitive of the S3 object-storage backend:
+#   opendal -> opendal-service-s3 -> reqsign-aws-v4 -> rust-ini -> ordered-multimap
+#   -> dlv-list -> const-random -> const-random-macro -> tiny-keccak
+# It is a compile-time hashing helper, mandatory in const-random-macro (no feature
+# gate avoids it). The whole branch exists so reqsign can parse the AWS credentials
+# file — which this project never reads: credentials come from the environment only.
+#
+# CC0-1.0 is an INBOUND waiver, not an outbound obligation: the upstream author
+# relinquishes their rights, this project relinquishes none of its own. Gradatum
+# stays Apache-2.0, and CC0 imposes no attribution and no copyleft.
+# The single reason CC0 sits outside the allow-list is that, unlike Apache-2.0, it
+# carries no explicit patent grant. That is a property of this one crate, scoped
+# here deliberately rather than opened project-wide.
+exceptions = [
+    { name = "tiny-keccak", allow = ["CC0-1.0"] },
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [bans] — forbidden and restricted crates
@@ -225,8 +235,6 @@ deny = [
 #
 # Version lock (pinned 2026-05-29) :
 #   apalis        = "=1.0.0-rc.9"   (latest stable rc as of 2026-05-29)
-#   apalis-sql    = "=1.0.0-rc.9"   (Diesel compat layer)
-#   apalis-sqlite = "=1.0.0-rc.8"   (rc.9 not published on crates.io)
 #   apalis-cron   = "=1.0.0-rc.8"   (rc.9 not published on crates.io)
 #
 # Enforcement mechanism:
@@ -285,16 +293,14 @@ skip = [
     # ⚠️ Cette entrée est un no-op aujourd'hui : une seule version au graphe, cargo-deny
     # rend `warning[unnecessary-skip]`. Elle documente la revue, elle ne l'applique pas.
     { name = "libsqlite3-sys" },
-    # apalis ecosystem: apalis-sqlite pulls apalis-sql + apalis-core as transitive deps.
-    # Multiple versions may appear across apalis/apalis-sql/apalis-sqlite/apalis-cron
-    # sub-dependency resolution — skip to suppress false-positive multiple-version warns.
+    # apalis ecosystem: apalis pulls apalis-core as a transitive dep. Multiple versions
+    # may appear across apalis/apalis-core/apalis-cron sub-dependency resolution — skip
+    # to suppress false-positive multiple-version warns.
     # Real version enforcement: exact `=` pins in workspace Cargo.toml (see D-09 block above).
     # ⚠️ Mesuré 2026-07-30 : le doublon anticipé ne se produit PAS aujourd'hui — cargo-deny
-    # rend `warning[unnecessary-skip]` sur 'apalis-core' (une seule version) et
-    # `warning[unmatched-skip]: skipped crate 'apalis-sql' was not encountered` (absent du
-    # graphe résolu). Les deux entrées sont préventives, pas actives. Conservées telles quelles.
+    # rend `warning[unnecessary-skip]` sur 'apalis-core' (une seule version). Entrée
+    # préventive, pas active. Conservée telle quelle.
     { name = "apalis-core" },
-    { name = "apalis-sql" },
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────

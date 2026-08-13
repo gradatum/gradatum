@@ -1,8 +1,8 @@
 //! Tests TDD P0 — handle_curate renseigne persist_req.links (B5 wikilinks).
 //!
-//! Ce fichier teste que `handle_curate` (le handler Apalis actif, distinct du
-//! `Dispatcher` legacy) résout et persiste les wikilinks `[[...]]` via le champ
-//! `PersistCuratedRequest.links`, POUR LES DEUX branches Admitted ET Pending.
+//! Ce fichier teste que `handle_curate` (le handler Apalis actif) résout et persiste
+//! les wikilinks `[[...]]` via le champ `PersistCuratedRequest.links`, POUR LES DEUX
+//! branches Admitted ET Pending.
 //!
 //! # Protocole B5 attendu
 //!
@@ -56,7 +56,7 @@ struct NoopQueueStore;
 #[async_trait]
 impl QueueStore for NoopQueueStore {
     async fn enqueue(&self, _job: JobRecord) -> Result<Ulid, QueueError> {
-        Ok(Ulid::new())
+        Ok(Ulid::generate())
     }
     async fn dequeue(
         &self,
@@ -187,12 +187,12 @@ async fn seed_note(fixture: &HandleCurateFixture, title: &str, body: &str) -> St
 /// Construit un GradatumJob::Curate en mode Batch avec title+body.
 fn make_curate_job(title: &str, body: &str, section_hint: Option<&str>) -> GradatumJob {
     let now = Utc::now();
-    let note_id_ulid = Ulid::new();
+    let note_id_ulid = Ulid::generate();
     let class = JobClass::Agent;
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Curate(CurateSpec {
                     note_id: note_id_ulid,

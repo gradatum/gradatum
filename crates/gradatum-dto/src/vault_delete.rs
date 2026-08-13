@@ -59,6 +59,7 @@ use gradatum_core::scope::TenantId;
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultDeleteRequest {
     /// ULID of the single note to delete.
     pub note_id: String,
@@ -84,6 +85,23 @@ pub struct VaultDeleteRequest {
 
 fn default_true() -> bool {
     true
+}
+
+impl VaultDeleteRequest {
+    /// Constructs a **dry-run** delete request for a single `note_id`.
+    ///
+    /// `dry_run` starts at `true` (the safe default matching deserialization); set
+    /// it to `false` and fill `confirm_ulids` with exactly `[note_id]` to perform
+    /// the real delete. `tenant_id` defaults to `None`.
+    #[must_use]
+    pub fn new(note_id: String) -> Self {
+        Self {
+            note_id,
+            dry_run: true,
+            confirm_ulids: Vec::new(),
+            tenant_id: None,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -38,8 +38,8 @@ async fn fts_with_snippet_forgotten_degraded() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_live = ulid::Ulid::new().to_string();
-    let id_forgotten = ulid::Ulid::new().to_string();
+    let id_live = ulid::Ulid::generate().to_string();
+    let id_forgotten = ulid::Ulid::generate().to_string();
 
     idx.seed_note_with_fts_vault(
         &id_live,
@@ -115,8 +115,8 @@ async fn fts_scored_filtered_sorts_after_decay() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_live = ulid::Ulid::new().to_string();
-    let id_forgotten = ulid::Ulid::new().to_string();
+    let id_live = ulid::Ulid::generate().to_string();
+    let id_forgotten = ulid::Ulid::generate().to_string();
 
     idx.seed_note_with_fts_vault(
         &id_live,
@@ -183,8 +183,8 @@ async fn fts_scored_filtered_sorts_after_decay() {
 async fn semantic_forgotten_degraded() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
 
-    let id_live = ulid::Ulid::new();
-    let id_forgotten_ulid = ulid::Ulid::new();
+    let id_live = ulid::Ulid::generate();
+    let id_forgotten_ulid = ulid::Ulid::generate();
     let id_live_str = id_live.to_string();
     let id_forgotten_str = id_forgotten_ulid.to_string();
 
@@ -283,9 +283,9 @@ async fn semantic_forgotten_degraded() {
 async fn count_forgotten_global_total() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
 
-    let id_a = ulid::Ulid::new().to_string();
-    let id_b = ulid::Ulid::new().to_string();
-    let id_c = ulid::Ulid::new().to_string();
+    let id_a = ulid::Ulid::generate().to_string();
+    let id_b = ulid::Ulid::generate().to_string();
+    let id_c = ulid::Ulid::generate().to_string();
 
     let now_ms = chrono::Utc::now().timestamp_millis();
 

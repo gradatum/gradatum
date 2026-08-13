@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn distill_mean_times_confidence() {
-        let (a, b) = (Ulid::new(), Ulid::new());
+        let (a, b) = (Ulid::generate(), Ulid::generate());
         let mut m = HashMap::new();
         m.insert(a, 0.95);
         m.insert(b, 0.75);
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn distill_clamp_high() {
         // confidence=1.0, score très élevé → pas de dépassement 1.0.
-        let id = Ulid::new();
+        let id = Ulid::generate();
         let mut m = HashMap::new();
         m.insert(id, 1.0_f32);
         let idx = FakeIndex(m);
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn distill_clamp_low() {
         // confidence=0.0 → tout clampé à 0.0 (sauf sources vides = 0.5 ).
-        let id = Ulid::new();
+        let id = Ulid::generate();
         let mut m = HashMap::new();
         m.insert(id, 0.95_f32);
         let idx = FakeIndex(m);
@@ -208,7 +208,7 @@ mod tests {
     fn distill_unknown_sources_counted_as_missing_not_zero() {
         // Les sources sans trust connu sont ignorées (filter_map), pas comptées comme 0.
         // Donc si toutes les sources sont inconnues → neutre 0.5.
-        let (a, b) = (Ulid::new(), Ulid::new());
+        let (a, b) = (Ulid::generate(), Ulid::generate());
         let idx = FakeIndex(HashMap::new()); // aucune source connue
         let got = compute_distill_trust(&[a, b], &idx, 0.9);
         assert_eq!(got, 0.5, "toutes sources inconnues → neutre 0.5");

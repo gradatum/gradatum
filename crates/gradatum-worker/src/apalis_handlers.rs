@@ -645,30 +645,34 @@ pub async fn handle_curate(
             // B5 wikilinks — résolution parallèle AVANT persist_curated (non-fatale).
             // Les liens résolus sont passés dans persist_req.links pour que le serveur
             // exécute upsert_link atomiquement dans persist_curated.
-            let links =
+            let resolved =
                 resolve_wikilinks_via_client(&client, &tenant_id, &note_id_str, &curate_body).await;
-            let persist_req = PersistCuratedRequest {
-                note_id: note_id_str.clone(),
-                tenant_id: tenant_id.clone().into(),
-                title: curate_title,
-                body: curate_body,
-                section: curate_section_str,
-                tags: curate_tags,
-                author: curate_author,
-                status: curate_status_str,
-                trust: curate_trust,
-                expected_sha256: curate_expected_sha256,
-                temporal: curate_temporal_opt.map(|(anchor_ms, anchor_src)| TemporalEntryDto {
+            let mut persist_req = PersistCuratedRequest::new(
+                note_id_str.clone(),
+                tenant_id.clone().into(),
+                curate_title,
+                curate_body,
+                curate_section_str,
+                curate_status_str,
+            );
+            persist_req.tags = curate_tags;
+            persist_req.author = curate_author;
+            persist_req.trust = curate_trust;
+            persist_req.expected_sha256 = curate_expected_sha256;
+            persist_req.temporal =
+                curate_temporal_opt.map(|(anchor_ms, anchor_src)| TemporalEntryDto {
                     anchor_ms,
                     anchor_src: anchor_src.as_db_str().to_string(),
                     doc_kind: curate_doc_kind,
                     valid_until_ms: None,
-                }),
-                links,
-                provenance: curate_provenance,
-                curator_decision: Some(curator_decision.clone()),
-                target_vault: None,
-            };
+                });
+            persist_req.links = resolved.links;
+            // F-147 : liens recalculés depuis le corps → autoritatifs SSI la résolution
+            // fut complète (aucun lookup transitoire en échec).
+            persist_req.links_authoritative = resolved.complete;
+            persist_req.provenance = curate_provenance;
+            persist_req.curator_decision = Some(curator_decision.clone());
+            // target_vault reste None (défaut du constructeur).
             match client.persist_curated(&persist_req).await {
                 Ok(_ok) => {}
                 Err(InternalClientError::Conflict { current_sha256_hex }) => {
@@ -799,26 +803,26 @@ pub async fn handle_curate(
             let note_id_str_pending = spec.note_id.to_string();
             // B5 wikilinks — résolution parallèle AVANT persist_curated (non-fatale).
             // Parité Admitted/Pending : les deux branches renseignent persist_req.links.
-            let links_pending =
+            let resolved_pending =
                 resolve_wikilinks_via_client(&client, &tenant_id, &note_id_str_pending, &pend_body)
                     .await;
-            let persist_req_pending = PersistCuratedRequest {
-                note_id: note_id_str_pending.clone(),
-                tenant_id: tenant_id.clone().into(),
-                title: pend_title,
-                body: pend_body,
-                section: pend_section_str,
-                tags: pend_tags,
-                author: pend_author,
-                status: pending_status_str,
-                trust: None,
-                expected_sha256: pend_expected_sha256,
-                temporal: None,
-                links: links_pending,
-                provenance: pend_provenance,
-                curator_decision: Some(curator_decision.clone()),
-                target_vault: None,
-            };
+            let mut persist_req_pending = PersistCuratedRequest::new(
+                note_id_str_pending.clone(),
+                tenant_id.clone().into(),
+                pend_title,
+                pend_body,
+                pend_section_str,
+                pending_status_str,
+            );
+            persist_req_pending.tags = pend_tags;
+            persist_req_pending.author = pend_author;
+            persist_req_pending.expected_sha256 = pend_expected_sha256;
+            persist_req_pending.links = resolved_pending.links;
+            // F-147 : parité Admitted — autoritatif SSI résolution complète.
+            persist_req_pending.links_authoritative = resolved_pending.complete;
+            persist_req_pending.provenance = pend_provenance;
+            persist_req_pending.curator_decision = Some(curator_decision.clone());
+            // trust, temporal, target_vault restent aux défauts du constructeur.
             match client.persist_curated(&persist_req_pending).await {
                 Ok(_ok) => {}
                 Err(InternalClientError::Conflict { current_sha256_hex }) => {
@@ -1014,16 +1018,18 @@ pub async fn handle_embed(
         .await
         .map_err(|e| HandlerError::Business(format!("embed: embedder: {e}")))?;
 
+    let mut embedding_req = PersistEmbeddingRequest::new(
+        id_str.clone(),
+        embedder.embedder_id().to_string(),
+        embedder.dim(),
+        vec,
+    );
+    // C4-1e Slice B3 (MIGRATE) : le worker émet le vault réel du job.
+    // OFF → spec.tenant_id == "main" (garde ensure_job_tenant l.791) = byte-identical.
+    embedding_req.vault_id = Some(spec.tenant_id.clone().into());
+
     client
-        .persist_embedding(&PersistEmbeddingRequest {
-            note_id: id_str.clone(),
-            embedder_id: embedder.embedder_id().to_string(),
-            dim: embedder.dim(),
-            vector: vec,
-            // C4-1e Slice B3 (MIGRATE) : le worker émet le vault réel du job.
-            // OFF → spec.tenant_id == "main" (garde ensure_job_tenant l.791) = byte-identical.
-            vault_id: Some(spec.tenant_id.clone().into()),
-        })
+        .persist_embedding(&embedding_req)
         .await
         .map_err(|e| HandlerError::Business(format!("embed: persist_embedding: {e}")))?;
 
@@ -1640,16 +1646,14 @@ pub async fn handle_forget(
         };
 
         // Persist via server (vault frontmatter mutation + index mark_forgotten in sequence).
-        match client
-            .persist_forget(&PersistForgetRequest {
-                note_id: ulid.clone(),
-                tenant_id: vault_id.to_string().into(),
-                body: String::new(), // server reads the body internally
-                section: note_section,
-                forgotten_by: forgotten_by.map(|s| s.to_string()),
-            })
-            .await
-        {
+        let mut forget_req = PersistForgetRequest::new(
+            ulid.clone(),
+            vault_id.to_string().into(),
+            String::new(), // server reads the body internally
+            note_section,
+        );
+        forget_req.forgotten_by = forgotten_by.map(|s| s.to_string());
+        match client.persist_forget(&forget_req).await {
             Ok(_) => {
                 tracing::info!(note_id = %ulid, "forget: note forgotten");
             }
@@ -2200,7 +2204,7 @@ fn build_embed_job_record(
     let now = Utc::now();
     let class = JobClass::Agent;
     JobRecord {
-        id: ulid::Ulid::new(),
+        id: ulid::Ulid::generate(),
         spec: JobSpec {
             kind: Job::Embed(EmbedSpec {
                 note_id: note_id.0,
@@ -2263,7 +2267,7 @@ pub fn build_validate_job_record(
     let now = Utc::now();
     let class = JobClass::Agent;
     JobRecord {
-        id: ulid::Ulid::new(),
+        id: ulid::Ulid::generate(),
         spec: JobSpec {
             kind: Job::Validate(spec),
             class,
@@ -2567,19 +2571,17 @@ pub async fn handle_validate(
     );
 
     // Persist the synthesis note.
-    let persist_req = PersistDistillRequest {
-        note_id: spec.note_id.to_string(),
-        tenant_id: spec.tenant_id.clone().into(),
-        title: spec.title.clone(),
-        body: spec.body.clone(),
-        section: "reference".to_string(),
-        trust: Some(final_trust),
-        expected_sha256: None,
-        mark_processed: false,
-        derived_into: None,
-        derived_from: spec.source_ids.iter().map(|id| id.to_string()).collect(),
-        tags,
-    };
+    let mut persist_req = PersistDistillRequest::new(
+        spec.note_id.to_string(),
+        spec.tenant_id.clone().into(),
+        spec.title.clone(),
+        spec.body.clone(),
+        "reference".to_string(),
+    );
+    persist_req.trust = Some(final_trust);
+    persist_req.derived_from = spec.source_ids.iter().map(|id| id.to_string()).collect();
+    persist_req.tags = tags;
+    // expected_sha256, mark_processed (false), derived_into restent aux défauts.
     if let Err(e) = client.persist_distill(&persist_req).await {
         return Err(HandlerError::Business(format!(
             "validate: persist synthesis: {e}"
@@ -2590,22 +2592,16 @@ pub async fn handle_validate(
     let synth_id_str = spec.note_id.to_string();
     let mut modified = Vec::new();
     for src_id in &spec.source_ids {
-        if let Err(e) = client
-            .persist_distill(&PersistDistillRequest {
-                note_id: src_id.to_string(),
-                tenant_id: spec.tenant_id.clone().into(),
-                title: String::new(),
-                body: String::new(),
-                section: String::new(),
-                trust: None,
-                expected_sha256: None,
-                mark_processed: true,
-                derived_into: Some(synth_id_str.clone()),
-                derived_from: vec![],
-                tags: vec![],
-            })
-            .await
-        {
+        let mut src_req = PersistDistillRequest::new(
+            src_id.to_string(),
+            spec.tenant_id.clone().into(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        src_req.mark_processed = true;
+        src_req.derived_into = Some(synth_id_str.clone());
+        if let Err(e) = client.persist_distill(&src_req).await {
             tracing::warn!(note_id = %src_id, error = %e, "validate: source marking failed — non-fatal");
         } else {
             // src_id: &Ulid; Ulid is Copy — use dereference, not .0 (which yields u128).
@@ -2714,7 +2710,7 @@ mod tests {
         GradatumJob {
             priority: JobPriority::default_for(&class).as_u8(),
             record: JobRecord {
-                id: Ulid::new(),
+                id: Ulid::generate(),
                 spec: JobSpec {
                     kind,
                     class,
@@ -2759,7 +2755,7 @@ mod tests {
     async fn curate_dry_run_returns_output() {
         let job = make_job(
             Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 title: Some("Test note".to_string()),
                 body: Some("Test body".to_string()),
@@ -2777,7 +2773,7 @@ mod tests {
     async fn embed_dry_run_is_detected() {
         let job = make_job(
             Job::Embed(EmbedSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 force_regenerate: false,
             }),
@@ -3040,7 +3036,7 @@ mod tests {
             "main"
         );
         assert_eq!(
-            super::resolve_job_vault(&JobScope::Session(ulid::Ulid::new()), false)
+            super::resolve_job_vault(&JobScope::Session(ulid::Ulid::generate()), false)
                 .expect("Session"),
             "main"
         );
@@ -3090,8 +3086,8 @@ mod tests {
         for scope in [
             JobScope::VaultWide,
             JobScope::Locus("decisions".into()),
-            JobScope::Notes(vec![ulid::Ulid::new()]),
-            JobScope::Session(ulid::Ulid::new()),
+            JobScope::Notes(vec![ulid::Ulid::generate()]),
+            JobScope::Session(ulid::Ulid::generate()),
         ] {
             assert!(
                 matches!(
@@ -3182,7 +3178,7 @@ mod tests {
     fn scope_label_is_bounded_for_persisted_messages() {
         use gradatum_core::job::JobScope;
 
-        let many = JobScope::Notes((0..500).map(|_| ulid::Ulid::new()).collect());
+        let many = JobScope::Notes((0..500).map(|_| ulid::Ulid::generate()).collect());
         let label = super::scope_label(&many);
         assert_eq!(label, "Notes(500 ids)");
 
@@ -3554,7 +3550,7 @@ mod tests {
     #[test]
     fn validate_job_record_has_validate_kind() {
         let spec = ValidateSpec {
-            note_id: Ulid::new(),
+            note_id: Ulid::generate(),
             tenant_id: "main".to_string(),
             title: "test title".to_string(),
             body: "test body".to_string(),
@@ -3564,7 +3560,7 @@ mod tests {
             base_trust: 0.6,
             threshold: ValidateSpec::default_threshold(),
         };
-        let rec = build_validate_job_record(spec, "main", Ulid::new());
+        let rec = build_validate_job_record(spec, "main", Ulid::generate());
         assert_eq!(
             gradatum_core::job::job_kind_str(&rec.spec.kind),
             "Validate",

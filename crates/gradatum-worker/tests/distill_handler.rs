@@ -79,7 +79,7 @@ struct NoopQueueStore;
 #[async_trait]
 impl QueueStore for NoopQueueStore {
     async fn enqueue(&self, _job: JobRecord) -> Result<Ulid, QueueError> {
-        Ok(Ulid::new())
+        Ok(Ulid::generate())
     }
     async fn dequeue(
         &self,
@@ -322,7 +322,7 @@ fn make_distill_job(scope: JobScope, mode: JobMode) -> GradatumJob {
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Distill(spec),
                 class,
@@ -706,7 +706,7 @@ fn make_distill_job_with_spec(spec: DistillSource, mode: JobMode) -> GradatumJob
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Distill(spec),
                 class,

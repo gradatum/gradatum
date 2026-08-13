@@ -58,14 +58,14 @@ pub type JobId = i64;
 /// Data required to enqueue a new job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewJob {
-    /// Isolated tenant. Carries the **resolved** tenant, not a constant: all four
-    /// production construction sites (`gradatum-server::api_v1::write`,
-    /// `gradatum-admin::backfill_embeddings`, and two in `gradatum-worker::dispatch`)
-    /// propagate the tenant resolved upstream. Only tests hardcode `"main"`.
+    /// Isolated tenant. Carries the **resolved** tenant, not a constant: the sole
+    /// production construction site (`gradatum-admin::backfill_embeddings`) propagates
+    /// the tenant resolved upstream. Only tests hardcode `"main"`.
     pub tenant_id: String,
     /// Job type, e.g. `"curate"`, `"embed"`.
     pub kind: String,
-    /// Opaque binary payload (bincode-encoded by the caller).
+    /// Opaque payload bytes, encoded by the caller. The sole live caller
+    /// (`gradatum-admin::backfill_embeddings`) serialises via `serde_json`.
     pub payload: Vec<u8>,
     /// Maximum number of attempts before transitioning to `dead`.
     pub max_attempts: i32,
@@ -504,7 +504,7 @@ impl Queue for SqliteQueue {
         let now = Self::now_ms()?;
         // Convert the duration to milliseconds for sub-second precision.
         let lease_until = now + duration.as_millis() as i64;
-        let leased_by = ulid::Ulid::new().to_string();
+        let leased_by = ulid::Ulid::generate().to_string();
 
         // Build placeholders for the IN filter dynamically.
         // `kinds` comes from the calling code (never from external input),

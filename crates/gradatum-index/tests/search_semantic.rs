@@ -32,9 +32,9 @@ async fn search_semantic_returns_top_k_by_cosine() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
 
     // ULIDs cohérents — seed via id explicite string ULID
-    let note_a_id = ulid::Ulid::new();
-    let note_b_id = ulid::Ulid::new();
-    let note_c_id = ulid::Ulid::new();
+    let note_a_id = ulid::Ulid::generate();
+    let note_b_id = ulid::Ulid::generate();
+    let note_c_id = ulid::Ulid::generate();
     use gradatum_core::identity::NoteId;
     let note_a = NoteId(note_a_id);
     let note_b = NoteId(note_b_id);

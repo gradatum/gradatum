@@ -46,7 +46,7 @@ async fn vault_read_phantom_note_returns_404() {
     // Insère dans l'index SQLite SANS créer le fichier .md — note fantôme.
     // `env._vault_typed.index()` retourne `&Arc<SqliteIndex>` ; `.as_ref()` déréférence
     // l'Arc en `&SqliteIndex` attendu par `seed_note_sql_only`.
-    let phantom_ulid = Ulid::new().to_string();
+    let phantom_ulid = Ulid::generate().to_string();
     seed_note_sql_only(
         env._vault_typed.index().as_ref(),
         &phantom_ulid,
@@ -102,7 +102,7 @@ async fn vault_classify_phantom_note_returns_404() {
     let env = build_app().await;
     let token = sign_token(&env.state);
 
-    let phantom_ulid = Ulid::new().to_string();
+    let phantom_ulid = Ulid::generate().to_string();
     seed_note_sql_only(
         env._vault_typed.index().as_ref(),
         &phantom_ulid,

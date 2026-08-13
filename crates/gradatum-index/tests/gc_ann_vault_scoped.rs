@@ -48,19 +48,19 @@ async fn gc_orphan_ann_scoped_preserves_other_vault() {
     let idx = two_vault_index().await;
 
     // Orphelin ANN dans vault-b : aucune note ne porte cet ULID → candidat GC de vault-b.
-    let orphan_b = Ulid::new().to_string();
+    let orphan_b = Ulid::generate().to_string();
     idx.seed_orphan_ann_for_test(&orphan_b, VAULT_B, "bge-m3")
         .await
         .expect("seed orphan ANN vault-b");
 
     // Orphelin ANN dans main : aucune note ne porte cet ULID → candidat GC de main SEULEMENT.
-    let orphan_main = Ulid::new().to_string();
+    let orphan_main = Ulid::generate().to_string();
     idx.seed_orphan_ann_for_test(&orphan_main, VAULT_MAIN, "bge-m3")
         .await
         .expect("seed orphan ANN main");
 
     // Vecteur VIVANT dans main : la note existe → jamais orphelin, jamais supprimé.
-    let live_main = Ulid::new().to_string();
+    let live_main = Ulid::generate().to_string();
     idx.seed_note_with_fts(&live_main, "reference", "note vivante main")
         .await
         .expect("seed note vivante main");
@@ -123,12 +123,12 @@ async fn gc_orphan_ann_scoped_preserves_other_vault() {
 async fn gc_orphan_ann_mono_vault_identical_orphan_set() {
     let idx = two_vault_index().await;
 
-    let orphan = Ulid::new().to_string();
+    let orphan = Ulid::generate().to_string();
     idx.seed_orphan_ann_for_test(&orphan, VAULT_MAIN, "bge-m3")
         .await
         .expect("seed orphan main");
 
-    let live = Ulid::new().to_string();
+    let live = Ulid::generate().to_string();
     idx.seed_note_with_fts(&live, "reference", "note vivante")
         .await
         .expect("seed note vivante");

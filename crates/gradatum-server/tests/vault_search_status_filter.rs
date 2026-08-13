@@ -120,7 +120,7 @@ async fn status_field_present_in_hits() {
     let (app, state, idx) = build_app(Arc::new(NoopBackend)).await;
     let token = sign(&state);
 
-    let id_live = Ulid::new().to_string();
+    let id_live = Ulid::generate().to_string();
     seed(&idx, &id_live, NoteStatus::Live).await;
 
     let req = search_req(
@@ -149,8 +149,8 @@ async fn status_filter_restricts_results() {
     let (app, state, idx) = build_app(Arc::new(NoopBackend)).await;
     let token = sign(&state);
 
-    let id_live = Ulid::new().to_string();
-    let id_pr = Ulid::new().to_string();
+    let id_live = Ulid::generate().to_string();
+    let id_pr = Ulid::generate().to_string();
     seed(&idx, &id_live, NoteStatus::Live).await;
     seed(&idx, &id_pr, NoteStatus::PendingReview).await;
 

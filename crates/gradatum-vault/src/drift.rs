@@ -45,6 +45,6 @@ impl Vault {
     /// - `GradatumError::Storage` if reading checksums from SQLite fails.
     /// - `GradatumError::Storage` if reading an existing file fails (permissions, etc.).
     pub async fn drift_check(&self) -> Result<DriftScanResult, GradatumError> {
-        scan_phase_a(&self.storage, &self.index).await
+        scan_phase_a(self.storage.as_ref(), &self.index).await
     }
 }

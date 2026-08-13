@@ -1,52 +1,63 @@
-//! Tests d'intégration — handler `embed_note` du dispatcher worker.
+//! Tests d'intégration — handler ACTIF `handle_embed` (moteur Apalis).
 //!
 //! Vérifie :
 //! - Cas succès : embedding calculé et persisté dans `note_embeddings`.
-//! - Cas noop-skip : embedder absent → job traité sans insert (Ok silencieux).
 //! - Cas dim-mismatch : le vecteur retourné ne correspond pas à la dimension
-//!   déclarée → `insert_note_embedding` rejette, le job est marqué failed.
+//!   déclarée → `insert_note_embedding` rejette → `handle_embed` renvoie `Err`
+//!   (le monitor marque alors le job failed via la couche Tower).
+//!
+//! Note transposition : l'ancien cas « noop-skip sans embedder » testait un mode du
+//! `Dispatcher` legacy (embedder optionnel). Il a été supprimé : sur le chemin actif,
+//! `handle_embed` reçoit toujours un `Embedder` (`Data<Arc<dyn Embedder>>`) — le mode
+//! « sans embedder » n'existe plus.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use apalis::prelude::Data;
 use async_trait::async_trait;
 use chrono::Utc;
+use gradatum_core::VectorStore as _;
 use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
 use gradatum_core::identity::{ContentHash, NoteId, NoteVersion};
-// VectorStore : insert_note_embedding, get_note_embedding (Étape 0.1 — méthodes *_inner pub(crate)).
-use gradatum_core::VectorStore as _;
 use gradatum_core::note::{Note, NoteBody};
 use gradatum_core::scope::VaultId;
 use gradatum_core::section::Section;
 use gradatum_core::status::NoteStatus;
+use gradatum_core::{
+    EmbedSpec, GradatumJob, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority,
+    JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, TriggerSource,
+};
 use gradatum_dto::{
     EmbeddingOkResponse, PersistCuratedRequest, PersistDistillRequest, PersistEmbeddingRequest,
     PersistForgetRequest, PersistOkResponse,
 };
 use gradatum_embed::{EmbedBackend, EmbedError, Embedder};
 use gradatum_index::SqliteIndex;
-use gradatum_queue::{NewJob, Queue, SqliteQueue};
-use gradatum_vault::Vault;
-use gradatum_worker::dispatch::{Dispatcher, NoopAuditSink};
+use gradatum_worker::apalis_handlers::{MultiTenantCfg, handle_embed};
 use gradatum_worker::internal_client::{
     EmbeddingReadDto, InternalClient, InternalClientError, NoteIdDto, NoteReadDto,
 };
-use tempfile::TempDir;
 use ulid::Ulid;
 
 // ── EmbedTestClient ───────────────────────────────────────────────────────────
 //
-// Minimal mock InternalClient for embed_pipeline tests.
-// Implements persist_embedding → index.insert_note_embedding.
-// Other methods are unimplemented (not called by embed_note path).
+// Mock InternalClient minimal pour handle_embed :
+// - get_note → renvoie le body stocké (handle_embed lit le body via le client).
+// - persist_embedding → index.insert_note_embedding.
+// Les autres méthodes ne sont pas appelées par le chemin embed.
 
 struct EmbedTestClient {
     index: Arc<SqliteIndex>,
+    body: String,
 }
 
 impl EmbedTestClient {
-    fn new(index: Arc<SqliteIndex>) -> Arc<Self> {
-        Arc::new(Self { index })
+    fn new(index: Arc<SqliteIndex>, body: &str) -> Arc<Self> {
+        Arc::new(Self {
+            index,
+            body: body.to_string(),
+        })
     }
 }
 
@@ -106,9 +117,18 @@ impl InternalClient for EmbedTestClient {
     async fn get_note(
         &self,
         _vault_id: &str,
-        _ulid: &str,
+        ulid: &str,
     ) -> Result<NoteReadDto, InternalClientError> {
-        unimplemented!()
+        Ok(NoteReadDto {
+            note_id: ulid.to_string(),
+            sha256_hex: String::new(),
+            body: self.body.clone(),
+            section: "reference".to_string(),
+            status: "live".to_string(),
+            tags: vec![],
+            forgotten: false,
+            processed: false,
+        })
     }
 
     async fn get_note_status(
@@ -257,14 +277,51 @@ impl Embedder for MockEmbedder {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-/// Encode un payload JSON pour un job `embed_note`.
-fn embed_note_payload(note_id: &str, body_text: &str) -> Vec<u8> {
-    serde_json::json!({
-        "note_id": note_id,
-        "body_text": body_text,
-    })
-    .to_string()
-    .into_bytes()
+/// Construit un `GradatumJob::Embed` pour la note donnée (tenant `main`).
+fn make_embed_job(note_id: Ulid) -> GradatumJob {
+    let now = Utc::now();
+    let class = JobClass::System;
+    GradatumJob {
+        priority: JobPriority::default_for(&class).as_u8(),
+        record: JobRecord {
+            id: Ulid::generate(),
+            spec: JobSpec {
+                kind: Job::Embed(EmbedSpec {
+                    note_id,
+                    tenant_id: "main".to_string(),
+                    force_regenerate: false,
+                }),
+                class,
+                mode: JobMode::Batch,
+                scope: JobScope::VaultWide,
+                priority: JobPriority::Low,
+            },
+            scheduling: JobScheduling {
+                trigger: TriggerSource::Cascade,
+                scheduled_at: now,
+                await_jobs: vec![],
+                deadline: None,
+                cron_expr: None,
+            },
+            lifecycle: JobLifecycle {
+                status: JobStatus::Running,
+                created_at: now,
+                started_at: Some(now),
+                completed_at: None,
+                lease_until: None,
+                result: None,
+            },
+            retry: JobRetry::default(),
+            lineage: JobLineage {
+                triggered_by: None,
+                parent_job: None,
+                pipeline_id: None,
+                pipeline_step: None,
+                children: vec![],
+                cost_usd: None,
+            },
+        },
+    }
 }
 
 /// Construit une `Note` minimale valide — même pattern que `gradatum-index/tests/common.rs`.
@@ -306,49 +363,29 @@ fn make_test_note(note_id: NoteId, body: &str) -> Note {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// Cas succès : l'embedder retourne un vecteur de bonne dimension.
-/// Le job est traité et l'embedding est persisté dans `note_embeddings`.
+/// `handle_embed` réussit et l'embedding est persisté dans `note_embeddings`.
 #[tokio::test]
 async fn embed_note_success_persists_embedding() {
-    let dir = TempDir::new().unwrap();
-
-    let queue = Arc::new(
-        SqliteQueue::new(&dir.path().join("queue.db"))
-            .await
-            .unwrap(),
-    );
-    let _vault = Arc::new(
-        Vault::create(dir.path().join("vault").as_path(), VaultId::new("main"))
-            .await
-            .unwrap(),
-    );
     let index = Arc::new(SqliteIndex::open_in_memory().await.unwrap());
 
     // Insérer la note dans l'index pour satisfaire la FK note_embeddings.note_id
-    let note_id = NoteId(Ulid::new());
-    let note = make_test_note(note_id, "Contenu de la note à embedder.");
+    let note_id = NoteId(Ulid::generate());
+    let body = "Contenu de la note à embedder.";
+    let note = make_test_note(note_id, body);
     index.upsert_note(&note).await.unwrap();
 
-    // Enqueue job embed_note
-    let payload = embed_note_payload(&note_id.to_string(), "Contenu de la note à embedder.");
-    queue
-        .enqueue(NewJob {
-            tenant_id: "main".into(),
-            kind: "embed_note".into(),
-            payload,
-            max_attempts: 3,
-        })
-        .await
-        .unwrap();
+    let client: Arc<dyn InternalClient> = EmbedTestClient::new(index.clone(), body);
+    let embedder: Arc<dyn Embedder + Send + Sync> =
+        Arc::new(MockEmbedder::success("mock-bge-small", 384));
 
-    let embedder = Arc::new(MockEmbedder::success("mock-bge-small", 384));
-    let dispatcher = Dispatcher::new(queue.clone())
-        .with_client(EmbedTestClient::new(index.clone()))
-        .with_curator(Arc::new(gradatum_curator::CuratorPipeline::new()))
-        .with_audit(Arc::new(NoopAuditSink))
-        .with_embedder(embedder);
-
-    let processed = dispatcher.run_once().await.unwrap();
-    assert!(processed, "run_once doit signaler un job traité");
+    let result = handle_embed(
+        make_embed_job(note_id.0),
+        Data::new(client),
+        Data::new(embedder),
+        Data::new(MultiTenantCfg::default()),
+    )
+    .await;
+    assert!(result.is_ok(), "handle_embed doit réussir — err={result:?}");
 
     // Vérifier l'embedding persisté
     let vec = index
@@ -366,105 +403,36 @@ async fn embed_note_success_persists_embedding() {
         "valeur vecteur attendue 0.1, obtenu {}",
         vec[0]
     );
-
-    // La queue doit être vide
-    let again = dispatcher.run_once().await.unwrap();
-    assert!(!again, "la queue doit être vide après traitement");
-}
-
-/// Cas noop-skip : le dispatcher n'a pas d'embedder configuré.
-/// Le job est complété sans erreur ni insert.
-#[tokio::test]
-async fn embed_note_noop_skip_without_embedder() {
-    let dir = TempDir::new().unwrap();
-
-    let queue = Arc::new(
-        SqliteQueue::new(&dir.path().join("queue.db"))
-            .await
-            .unwrap(),
-    );
-    let _vault = Arc::new(
-        Vault::create(dir.path().join("vault").as_path(), VaultId::new("main"))
-            .await
-            .unwrap(),
-    );
-
-    let note_ulid = Ulid::new();
-    let payload = embed_note_payload(&note_ulid.to_string(), "Corps quelconque.");
-    queue
-        .enqueue(NewJob {
-            tenant_id: "main".into(),
-            kind: "embed_note".into(),
-            payload,
-            max_attempts: 3,
-        })
-        .await
-        .unwrap();
-
-    // Dispatcher SANS embedder ni client — noop silencieux attendu (client absent → skip)
-    let dispatcher = Dispatcher::new(queue.clone())
-        .with_curator(Arc::new(gradatum_curator::CuratorPipeline::new()))
-        .with_audit(Arc::new(NoopAuditSink));
-
-    let processed = dispatcher.run_once().await.unwrap();
-    assert!(
-        processed,
-        "run_once doit signaler un job traité même en mode noop"
-    );
-
-    // La queue est vide — le job est bien marqué complete (pas failed)
-    let again = dispatcher.run_once().await.unwrap();
-    assert!(!again, "la queue doit être vide après le noop");
 }
 
 /// Cas dim-mismatch : l'embedder retourne un vecteur dont la longueur ne
-/// correspond pas à `dim()` → `insert_note_embedding` rejette l'embedding.
-/// `run_once` retourne `Ok(true)` mais le job est marqué failed dans la queue.
+/// correspond pas à `dim()` → `insert_note_embedding` rejette l'embedding →
+/// `handle_embed` renvoie `Err` (le monitor marque alors le job failed).
 #[tokio::test]
 async fn embed_note_dim_mismatch_job_fails() {
-    let dir = TempDir::new().unwrap();
-
-    let queue = Arc::new(
-        SqliteQueue::new(&dir.path().join("queue.db"))
-            .await
-            .unwrap(),
-    );
-    let _vault = Arc::new(
-        Vault::create(dir.path().join("vault").as_path(), VaultId::new("main"))
-            .await
-            .unwrap(),
-    );
     let index = Arc::new(SqliteIndex::open_in_memory().await.unwrap());
 
     // Insérer la note dans l'index (FK)
-    let note_id = NoteId(Ulid::new());
-    let note = make_test_note(note_id, "Corps quelconque.");
+    let note_id = NoteId(Ulid::generate());
+    let body = "Corps quelconque.";
+    let note = make_test_note(note_id, body);
     index.upsert_note(&note).await.unwrap();
 
-    let payload = embed_note_payload(&note_id.to_string(), "Corps quelconque.");
-    queue
-        .enqueue(NewJob {
-            tenant_id: "main".into(),
-            kind: "embed_note".into(),
-            payload,
-            max_attempts: 3,
-        })
-        .await
-        .unwrap();
-
+    let client: Arc<dyn InternalClient> = EmbedTestClient::new(index.clone(), body);
     // MockEmbedder : dim déclaré=384 mais vecteur réel=100 → mismatch
-    let embedder = Arc::new(MockEmbedder::dim_mismatch("mock-mismatch", 384, 100));
-    let dispatcher = Dispatcher::new(queue.clone())
-        .with_client(EmbedTestClient::new(index.clone()))
-        .with_curator(Arc::new(gradatum_curator::CuratorPipeline::new()))
-        .with_audit(Arc::new(NoopAuditSink))
-        .with_embedder(embedder);
+    let embedder: Arc<dyn Embedder + Send + Sync> =
+        Arc::new(MockEmbedder::dim_mismatch("mock-mismatch", 384, 100));
 
-    // run_once doit retourner Ok(true) — l'erreur est loguée et le job marqué failed
-    let processed = dispatcher.run_once().await.unwrap();
+    let result = handle_embed(
+        make_embed_job(note_id.0),
+        Data::new(client),
+        Data::new(embedder),
+        Data::new(MultiTenantCfg::default()),
+    )
+    .await;
     assert!(
-        processed,
-        "run_once doit signaler un job traité (même en erreur)"
+        result.is_err(),
+        "handle_embed doit renvoyer Err en cas de dim-mismatch — got={result:?}"
     );
 
     // Aucun embedding ne doit avoir été persisté

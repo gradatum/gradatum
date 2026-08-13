@@ -215,7 +215,7 @@ async fn move_bad_ulid_is_400() {
 #[tokio::test]
 async fn move_invalid_locus_is_400() {
     let app = build_app().await;
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     for bad in ["../etc", "Knowledge", "a//b", "knowledge/", ""] {
         let req = move_req(&id, serde_json::json!({ "locus": bad }));
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -231,7 +231,7 @@ async fn move_invalid_locus_is_400() {
 #[tokio::test]
 async fn move_unknown_note_is_404() {
     let (app, token) = build_app_with_token().await;
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     let req = move_req_authed(
         &id,
         serde_json::json!({ "locus": "knowledge/rust" }),
@@ -245,7 +245,7 @@ async fn move_unknown_note_is_404() {
 #[tokio::test]
 async fn move_unknown_field_is_422() {
     let app = build_app().await;
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     let req = move_req(&id, serde_json::json!({ "locus": "knowledge", "bogus": 1 }));
     let resp = app.oneshot(req).await.unwrap();
     // Axum renvoie 422 Unprocessable Entity sur échec de désérialisation Json.

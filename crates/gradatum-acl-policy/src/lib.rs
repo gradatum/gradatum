@@ -58,6 +58,7 @@ pub enum AclDecision {
 
 /// Errors that can occur while loading an ACL preset.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AclError {
     /// Invalid TOML preset.
     #[error("invalid TOML preset: {0}")]

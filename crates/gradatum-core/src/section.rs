@@ -7,7 +7,7 @@
 //! The `Council` variant was added to align the enum with the full section registry.
 //! The `ProjectMap` variant (12th) tracks traceable work units carrying a
 //! typed-wikilink schema (`[[project:…]]` + `[[status:…]]` + `[[kind:…]]`).
-//! The `Identity` variant (13th) stores agent soul notes (persona/governance, since v0.7.6).
+//! The `Identity` variant (13th) stores agent soul notes (persona/governance).
 
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +57,7 @@ pub enum Section {
     ///
     // Extension requires a governance review (anti-incremental-drift).
     ProjectMap,
-    /// Identity: declarative agent soul (persona/governance) — soul notes, since v0.7.6.
+    /// Identity: declarative agent soul (persona/governance) — soul notes.
     ///
     /// Notes here carry the agent persona, immutable invariants (INVARIANTS/GATES/NARRATIVE
     /// schema), and are protected from semantic forget (see [`Section::PROTECTED_FORGET`]).

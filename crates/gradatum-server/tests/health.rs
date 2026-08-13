@@ -328,7 +328,7 @@ impl SlowJobStore {
         let old_created_at = Utc::now() - chrono::Duration::seconds(600);
         let now = Utc::now();
         JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Backup,
                 class: JobClass::System,

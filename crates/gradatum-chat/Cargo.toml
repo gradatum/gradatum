@@ -21,7 +21,7 @@ default = []
 windows-native-tls = ["reqwest/native-tls"]
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "1.0.0" }
+gradatum-core = { path = "../gradatum-core", version = "2.0.0" }
 async-trait   = { workspace = true }
 chrono        = { workspace = true }
 once_cell     = { workspace = true }

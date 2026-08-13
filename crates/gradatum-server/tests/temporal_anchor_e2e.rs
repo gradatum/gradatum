@@ -15,9 +15,8 @@
 //!
 //! ## Architecture
 //!
-//! `vault_write` HTTP → job enqueué dans `SqliteQueueStore` (apalis) — séparé du
-//! `SqliteQueue` legacy que lit `Dispatcher::run_once`. Les tests E2E doivent donc
-//! appeler `handle_curate` directement depuis le crate worker.
+//! `vault_write` HTTP → job enqueué dans `SqliteQueueStore` (apalis, JSON). Les tests
+//! E2E de dispatch appellent `handle_curate` directement depuis le crate worker.
 
 use std::sync::Arc;
 

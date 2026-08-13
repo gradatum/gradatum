@@ -78,7 +78,7 @@ async fn spawn(seed: Option<(&str, &str)>) -> (SocketAddr, Arc<Vault>) {
     std::mem::forget(tmp); // garder le TempDir vivant pour la durée du serveur
 
     let queue = Arc::new(
-        SqliteQueue::new(&std::env::temp_dir().join(format!("fixb-q-{}.db", Ulid::new())))
+        SqliteQueue::new(&std::env::temp_dir().join(format!("fixb-q-{}.db", Ulid::generate())))
             .await
             .unwrap(),
     );
@@ -204,7 +204,7 @@ async fn overwrite_existing_with_sha_is_accepted_and_preserves_note_id() {
 /// comme une note neuve et bypasser silencieusement l'optimistic-lock.
 #[tokio::test]
 async fn overwrite_phantom_with_sha_returns_409() {
-    let nid = Ulid::new().to_string();
+    let nid = Ulid::generate().to_string();
     let (addr, vault) = spawn(None).await;
     // Fantôme : index présent, `.md` absent.
     vault
@@ -236,7 +236,7 @@ async fn overwrite_phantom_with_sha_returns_409() {
 /// (auto-réparation). Au niveau serveur, on fige le 202 (≠ 409).
 #[tokio::test]
 async fn overwrite_phantom_without_sha_is_accepted() {
-    let nid = Ulid::new().to_string();
+    let nid = Ulid::generate().to_string();
     let (addr, vault) = spawn(None).await;
     vault
         .index()
@@ -264,7 +264,7 @@ async fn overwrite_phantom_without_sha_is_accepted() {
 /// (comportement inchangé : aucune entrée d'index, donc pas un fantôme).
 #[tokio::test]
 async fn new_note_with_sha_is_accepted() {
-    let nid = Ulid::new().to_string(); // jamais seedé → absent de l'index
+    let nid = Ulid::generate().to_string(); // jamais seedé → absent de l'index
     let (addr, _vault) = spawn(None).await;
     let sha = "a".repeat(64);
     let resp = reqwest::Client::new()

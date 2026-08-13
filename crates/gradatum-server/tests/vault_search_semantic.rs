@@ -150,7 +150,7 @@ async fn vault_search_noop_embedder_returns_bm25_only() {
         .expect("signature JWT — invariant test");
 
     // Seed une note pour avoir quelque chose dans BM25.
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     idx.seed_note(&note_id, "reference", "gradatum semantic search noop test")
         .await
         .expect("seed_note — invariant test");
@@ -200,7 +200,7 @@ async fn vault_search_fake_embedder_calls_semantic() {
         .expect("signature JWT — invariant test");
 
     // Seed une note avec body contenant le terme de recherche.
-    let note_id_str = Ulid::new().to_string();
+    let note_id_str = Ulid::generate().to_string();
     idx.seed_note(
         &note_id_str,
         "reference",
@@ -286,7 +286,7 @@ async fn vault_search_embed_error_falls_back_to_bm25() {
         .expect("signature JWT — invariant test");
 
     // Seed une note.
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     idx.seed_note(&note_id, "reference", "gradatum alpha11 fallback bm25 only")
         .await
         .expect("seed_note — invariant test");

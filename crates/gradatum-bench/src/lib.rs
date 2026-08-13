@@ -8,7 +8,7 @@
 //! ## Usage
 //!
 //! Chaque bench importe uniquement ce dont il a besoin depuis ce module.
-//! Les fonctions `build_*` sont volontairement déterministes (pas de `Ulid::new()`
+//! Les fonctions `build_*` sont volontairement déterministes (pas de `Ulid::generate()`
 //! en boucle chaude) pour que les mesures criterion restent stables.
 
 #![forbid(unsafe_code)]

@@ -24,13 +24,12 @@ gradatum-core.workspace = true
 gradatum-dto.workspace = true
 # gradatum-db-sqlite is publishable (no `publish` key); this dependency does not block
 # publication of gradatum-worker.
-gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "1.0.0" }
+gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "2.0.0" }
 gradatum-embed.workspace = true
 gradatum-queue.workspace = true
 gradatum-curator.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
-bincode.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
 clap = { workspace = true, features = ["derive"] }
@@ -72,6 +71,11 @@ gradatum-core.workspace = true
 # passent par InternalClient HTTP). Déplacés en dev-dependencies (P2 audit).
 gradatum-index.workspace = true
 gradatum-vault.workspace = true
+# gradatum-admin (dev-only): producer of the init server.toml template. The curator-default
+# integration test drives the REAL producer (generate_server_toml_template) into the REAL
+# worker loader (curator_loader::build_curator_pipeline), proving the produced default config
+# enters LLM mode rather than heuristic. Acyclic: gradatum-admin does not depend on the worker.
+gradatum-admin = { path = "../gradatum-admin" }
 tokio = { workspace = true, features = ["full"] }
 sqlx = { workspace = true, features = ["sqlite", "runtime-tokio"] }
 ulid.workspace = true

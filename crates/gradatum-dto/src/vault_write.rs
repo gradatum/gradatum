@@ -4,11 +4,10 @@ use gradatum_core::scope::TenantId;
 
 /// Request body for `vault_write` — creates a note via the async queue.
 ///
-/// The **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.
-/// The bincode serialization (`bincode::serde::encode_to_vec`) is used only by the
-/// legacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.
+/// The queue path (`SqliteQueueStore`) serialises this struct via `serde_json`.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct VaultWriteRequest {
     /// Title of the note.
     pub title: String,
@@ -77,17 +76,14 @@ pub struct VaultWriteRequest {
     /// Example: `"a3f1c2d4..."`
     #[serde(default)]
     pub expected_sha256: Option<String>,
-    /// Pre-allocated ULID — honored by the legacy `SqliteQueue` dispatcher if present
-    /// and parseable as a valid ULID.
+    /// Pre-allocated ULID — honoured by the active curate worker
+    /// (`handle_curate` → `write_note_with_id`) if present and parseable as a valid ULID.
     ///
-    /// `None` = backward-compatible behavior: the dispatcher generates a fresh ULID.
+    /// `None` = backward-compatible behaviour: a fresh ULID is generated at persist time.
     ///
-    /// ## Bincode field-order invariant
-    ///
-    /// This field is at **position 8** (last) — AFTER `tenant_id` (pos 6) and
-    /// `expected_sha256` (pos 7). Bincode v2 (`config::standard()`) is positional:
-    /// declaration order determines serialization order.
-    /// Never move this field without updating all encoders.
+    /// Field order carries no wire meaning: the struct is serialised via `serde_json`,
+    /// which matches fields by name. (The former bincode positional invariant is gone
+    /// with the legacy dispatcher.)
     #[serde(default)]
     pub note_id: Option<String>,
     /// Temporal anchor — event date of the note (ISO 8601 UTC or YYYY-MM-DD).
@@ -107,6 +103,30 @@ pub struct VaultWriteRequest {
     /// Arbitrary dates (past/future) accepted by-design — no semantic bound.
     #[serde(default)]
     pub occurred_at: Option<String>,
+}
+
+impl VaultWriteRequest {
+    /// Constructs a request with the mandatory `title` and `body`.
+    ///
+    /// All optional fields (`author`, `tags`, `section_hint`, `tenant_id`,
+    /// `expected_sha256`, `note_id`, `occurred_at`) default to their empty/`None`
+    /// values and may be set afterwards. This constructor is the supported way to
+    /// build the request outside `gradatum-dto` now that the struct is
+    /// `#[non_exhaustive]`.
+    #[must_use]
+    pub fn new(title: String, body: String) -> Self {
+        Self {
+            title,
+            body,
+            author: None,
+            tags: Vec::new(),
+            section_hint: None,
+            tenant_id: None,
+            expected_sha256: None,
+            note_id: None,
+            occurred_at: None,
+        }
+    }
 }
 
 #[cfg(test)]

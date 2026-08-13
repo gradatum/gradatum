@@ -1,22 +1,24 @@
-//! `FileStorage` — OpenDAL filesystem implementation of the `Storage` trait.
+//! `FileStorage` — OpenDAL-backed implementation of the `Storage` trait.
+//!
+//! Despite the historical `FileStorage` name, this type is the **generic OpenDAL
+//! wrapper**: every `Storage` method only delegates to the inner `opendal::Operator`,
+//! so it serves any backend. `FileStorage::new` builds a local filesystem operator;
+//! `crate::build_storage` builds an object operator (S3) via `from_operator`.
+//! (A rename to a backend-neutral name is deferred — see the crate root.)
 //!
 //! ## How it works
 //!
-//! Delegates all I/O operations to an `opendal::Operator` configured with
-//! the `services::Fs` backend. The root is fixed at construction time.
+//! Delegates all I/O operations to an `opendal::Operator`. For a filesystem backend
+//! the root is fixed at construction time; for an object backend (S3) the location
+//! comes from configuration.
 //!
-//! ## NFS guard
-//!
-//! `FileStorage::new()` calls `ensure_local_filesystem(root)` **before**
-//! constructing the `Operator`. If the path resides on NFS, construction fails
-//! with `StorageError::Core(GradatumError::VaultOnNfs)`.
 //!
 //! ## Security — path traversal guard
 //!
-//! OpenDAL Fs 0.58 does not natively reject `..` components. Each operation
-//! calls `validate_relative_path()` on entry — a mandatory defense-in-depth layer
-//! enforcing the "confined Storage abstraction" contract (networked S3/GCS backends
-//! are not yet implemented).
+//! OpenDAL does not natively reject `..` components. Each operation calls
+//! `validate_relative_path()` on entry — a mandatory defense-in-depth layer enforcing
+//! the "confined Storage abstraction" contract, applied to **every** backend,
+//! object stores included.
 //!
 //! ## Features
 //!
@@ -25,7 +27,9 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use opendal::{EntryMode, Operator, services};
+#[cfg(feature = "fs")]
+use opendal::services;
+use opendal::{EntryMode, Operator};
 use tracing::instrument;
 
 use crate::error::StorageError;
@@ -68,20 +72,12 @@ fn validate_relative_path(path: &str) -> Result<(), StorageError> {
 impl FileStorage {
     /// Constructs a `FileStorage` rooted at `root`.
     ///
-    /// ## NFS guard
-    ///
-    /// Calls `ensure_local_filesystem(root)` first. Returns
-    /// `Err(StorageError::Core(GradatumError::VaultOnNfs))` if NFS is detected.
-    ///
     /// # Errors
     ///
-    /// - `StorageError::Core(VaultOnNfs)` — path resides on NFS.
     /// - `StorageError::InvalidPath` — path is not valid UTF-8.
     /// - `StorageError::OpenDal` — `Operator` construction failed.
+    #[cfg(feature = "fs")]
     pub fn new(root: &Path) -> Result<Self, StorageError> {
-        // NFS guard — must run before any construction.
-        crate::nfs_check::ensure_local_filesystem(root)?;
-
         let root_str = root
             .to_str()
             .ok_or_else(|| StorageError::InvalidPath(root.to_path_buf()))?;
@@ -102,6 +98,20 @@ impl FileStorage {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Wraps a pre-built OpenDAL [`Operator`] (any backend) as a `Storage`.
+    ///
+    /// This is the generic OpenDAL wrapper: despite the historical `FileStorage`
+    /// name, all seven `Storage` methods only delegate to the inner `Operator` and
+    /// are backend-agnostic. Used by [`crate::build_storage`] for object backends,
+    /// where the operator is produced from configuration rather than from a local path.
+    ///
+    /// `root` is retained for diagnostics only (`root()`) and is never used for I/O —
+    /// for an object backend it carries the configured prefix, not a filesystem path.
+    #[must_use]
+    pub(crate) fn from_operator(op: Operator, root: PathBuf) -> Self {
+        Self { op, root }
     }
 }
 
@@ -158,6 +168,9 @@ impl Storage for FileStorage {
     async fn delete(&self, path: &str) -> Result<(), StorageError> {
         validate_relative_path(path)?;
         self.op.delete(path).await.map_err(|e| {
+            // Note: this `NotFound` arm is reachable on a filesystem backend, but is
+            // unreachable on S3 — object-store delete is idempotent and returns `Ok`
+            // for an absent key. Kept for the filesystem backend; not dead code there.
             if e.kind() == opendal::ErrorKind::NotFound {
                 StorageError::NotFound(path.to_owned())
             } else {
@@ -255,20 +268,32 @@ impl Storage for FileStorage {
             .map_err(|e| StorageError::OpenDal(e.to_string()))
     }
 
-    /// Creates the directory at `path` (idempotent).
+    /// Ensures the directory at `path` exists (idempotent).
     ///
-    /// Delegates to `Operator::create_dir` — a native OpenDAL operation.
     /// `path` must end with `/` (OpenDAL requirement).
+    ///
+    /// On a **filesystem** backend this delegates to `Operator::create_dir`. On an
+    /// **object** backend (S3, …) there are no real directories: OpenDAL rejects
+    /// `create_dir` with `ErrorKind::Unsupported`. Because the trait contract is only
+    /// "ensure this directory exists", and on an object store that assurance holds
+    /// with no operation (a note write creates its key directly), `Unsupported` is
+    /// mapped to success. Every other error still propagates — a permission denial or
+    /// a network failure is never masked.
     ///
     /// # Errors
     ///
     /// - `StorageError::InvalidPath` — absolute path or path containing `..`.
+    /// - `StorageError::OpenDal` — a real backend error (permissions, network, …).
+    ///   `Unsupported` is **not** an error here.
     #[instrument(skip(self), fields(path))]
     async fn create_dir(&self, path: &str) -> Result<(), StorageError> {
         validate_relative_path(path)?;
-        self.op
-            .create_dir(path)
-            .await
-            .map_err(|e| StorageError::OpenDal(e.to_string()))
+        match self.op.create_dir(path).await {
+            Ok(()) => Ok(()),
+            // Object stores have no directories: absence of the operation is the
+            // correct semantics, not a failure.
+            Err(e) if e.kind() == opendal::ErrorKind::Unsupported => Ok(()),
+            Err(e) => Err(StorageError::OpenDal(e.to_string())),
+        }
     }
 }

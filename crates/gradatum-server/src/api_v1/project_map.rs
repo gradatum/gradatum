@@ -257,7 +257,7 @@ pub async fn create_feature(
     ),
     StatusCode,
 > {
-    let request_id = ulid::Ulid::new().to_string();
+    let request_id = ulid::Ulid::generate().to_string();
     crate::api_v1::logic::create_feature_card_impl(&state, &trust, req, &request_id)
         .await
         // 202 Accepted : le numéro est attribué, l'écriture de la carte est asynchrone

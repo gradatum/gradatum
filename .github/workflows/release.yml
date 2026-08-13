@@ -26,6 +26,19 @@ jobs:
   build-release:
     name: build-release
     runs-on: ubuntu-latest
+    # Compiler À L'INTÉRIEUR de Debian 12 (bookworm, glibc 2.36) plutôt que sur
+    # l'hôte ubuntu-latest (glibc 2.39). La glibc récente de l'hôte est héritée
+    # EN SILENCE par l'artefact : les crates `-sys` compilées en C voient leurs
+    # appels sscanf/strtol redirigés vers __isoc23_sscanf / __isoc23_strtol
+    # (symboles GLIBC_2.38, introduits par les en-têtes 2.38), ce qui hisse le
+    # plancher d'exécution à 2.38 et casse Debian 12 (2.36), Ubuntu 22.04 (2.35)
+    # et RHEL 9 (2.34). Les en-têtes 2.36 n'émettent pas cette redirection ; le
+    # plafond restant est 2.34 (symboles de la fusion pthread→libc de glibc 2.34,
+    # déjà présents dans les binaires actuels), ce qui couvre les trois. Image =
+    # `rust:bookworm` COMPLÈTE (pas slim) : elle porte rustup + git + curl ; git
+    # est requis par les steps SBOM/notes. rustup installe malgré tout le pin de
+    # rust-toolchain.toml — le Rust par défaut de l'image est sans effet.
+    container: rust:bookworm
     timeout-minutes: 60
 
     steps:
@@ -67,7 +80,12 @@ jobs:
       # 4. Dépendances système (aligné sur ci.yml)
       # ───────────────────────────────────────────────────────────────────
       - name: Install system dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y libsqlite3-dev
+        # Pas de `sudo` : dans le conteneur rust:bookworm le job tourne en root et
+        # sudo n'est pas installé. `jq` (step SBOM) et `python3` (step notes de
+        # version) sont préinstallés sur ubuntu-latest mais PAS dans cette image —
+        # les ajouter explicitement pour que ces steps ultérieurs continuent de
+        # fonctionner.
+        run: apt-get update -qq && apt-get install -y --no-install-recommends libsqlite3-dev jq python3
 
       # ───────────────────────────────────────────────────────────────────
       # 5. Build release — binaires distribués du workspace
@@ -80,10 +98,42 @@ jobs:
             --bin gradatum-server  \
             --bin gradatum-worker  \
             --bin gradatum-admin   \
-            --bin gradatum-mcp-stub \
             --bin gradatum-gateway
           # gradatum-engine binary is gated behind the `serve` feature
           cargo build --release -p gradatum-engine --features serve --bin gradatum-engine
+
+      # ───────────────────────────────────────────────────────────────────
+      # 5bis. Plancher glibc — MESURÉ, BLOQUANT
+      #    Le but même de compiler dans bookworm est un plancher bas. On le PROUVE
+      #    à chaque release au lieu de faire confiance à l'image : on lit les
+      #    symboles GLIBC versionnés réellement requis par chaque binaire livré et
+      #    on échoue si une référence FORTE (non-weak) dépasse 2.34 — le plancher
+      #    déclaré (docs/DEPLOYMENT.md § Platform support). Les références weak
+      #    (ex. pidfd_spawnp @GLIBC_2.39, weak-linké par la std Rust avec repli à
+      #    l'exécution) ne bloquent PAS le chargement et sont exclues. readelf est
+      #    fourni par binutils, présent dans l'image rust:bookworm complète.
+      # ───────────────────────────────────────────────────────────────────
+      - name: Assert glibc floor (measured, BLOCKING)
+        run: |
+          set -euo pipefail
+          FLOOR_MAX="2.34"
+          BINS="gradatum-server gradatum-worker gradatum-admin gradatum-gateway gradatum-engine"
+          fail=0
+          for b in $BINS; do
+            path="target/release/$b"
+            [ -x "$path" ] || { echo "::error::binaire manquant: $path"; exit 1; }
+            # max symbole GLIBC FORT (GLOBAL/UND) versionné — weak exclus
+            max=$(readelf -W --dyn-syms "$path" \
+              | awk '$5=="GLOBAL" && $7=="UND"' \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1 | sed 's/GLIBC_//')
+            echo "  $b -> glibc ${max:-none}"
+            if [ -n "${max:-}" ] && [ "$(printf '%s\n%s\n' "$FLOOR_MAX" "$max" | sort -V | tail -1)" != "$FLOOR_MAX" ]; then
+              echo "::error::$b exige glibc $max > plancher déclaré $FLOOR_MAX"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || { echo "::error::plancher glibc dépassé — voir docs/DEPLOYMENT.md § Platform support"; exit 1; }
+          echo "OK — tous les binaires <= glibc $FLOOR_MAX"
 
       # ───────────────────────────────────────────────────────────────────
       # 6. Déterminer le nom du tag (push tag ou workflow_dispatch)
@@ -225,13 +275,12 @@ jobs:
           rm -rf "${DIST}/sbom"
 
       # ───────────────────────────────────────────────────────────────────
-      # 7. Packaging — 3 tarballs par rôle + SBOM + SHA256SUMS commun
+      # 7. Packaging — 2 tarballs par rôle + SBOM + SHA256SUMS commun
       #
       #    gradatum-server-<TAG>-x86_64 : server + worker + admin
       #    gradatum-llm-<TAG>-x86_64    : gateway + engine
-      #    gradatum-mcp-<TAG>-x86_64    : mcp-stub
       #    gradatum-sbom-<TAG>          : SBOM CycloneDX (crates publiables)
-      #    SHA256SUMS                   : couvre les 4 tarballs
+      #    SHA256SUMS                   : couvre les 3 tarballs
       # ───────────────────────────────────────────────────────────────────
       - name: Package binaries
         id: package
@@ -260,25 +309,18 @@ jobs:
           done
           (cd /tmp && tar -czf "${DIST}/${GROUP_LLM}.tar.gz" "${GROUP_LLM}/")
 
-          # ── Groupe mcp : gradatum-mcp-stub ──
-          GROUP_MCP="gradatum-mcp-${TAG}-${TARGET}"
-          mkdir -p "/tmp/${GROUP_MCP}"
-          cp "target/release/gradatum-mcp-stub" "/tmp/${GROUP_MCP}/"
-          (cd /tmp && tar -czf "${DIST}/${GROUP_MCP}.tar.gz" "${GROUP_MCP}/")
-
-          # ── SHA256SUMS couvrant les 3 tarballs binaires + le tarball SBOM ──
+          # ── SHA256SUMS couvrant les 2 tarballs binaires + le tarball SBOM ──
           # (gradatum-sbom-${TAG}.tar.gz produit par le step "Generate SBOM" ci-dessus)
           (cd "${DIST}" && sha256sum \
             "${GROUP_SERVER}.tar.gz" \
             "${GROUP_LLM}.tar.gz"    \
-            "${GROUP_MCP}.tar.gz"    \
             "gradatum-sbom-${TAG}.tar.gz" \
             > SHA256SUMS)
 
           echo "dist=${DIST}" >> "$GITHUB_OUTPUT"
 
       # ───────────────────────────────────────────────────────────────────
-      # 8. Attestation SLSA (provenance cryptographique) — 4 tarballs (3
+      # 8. Attestation SLSA (provenance cryptographique) — 3 tarballs (2
       #    binaires + SBOM), couverts par le glob sans modification de ce step
       #    subject-path accepte un glob (actions/attest-build-provenance v2)
       # ───────────────────────────────────────────────────────────────────

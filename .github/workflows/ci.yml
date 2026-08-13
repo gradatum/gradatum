@@ -100,13 +100,13 @@ jobs:
 
   # test-engine — cargo nextest gradatum-engine (feature `serve`).
   # SKIPPÉ sur GitHub (Option A, 2026-08-04) : ce job est épinglé au runner
-  # self-hosted homelab `lxc-500` (le binaire llama-server on-disk est requis par
+  # a self-hosted homelab runner (le binaire llama-server on-disk est requis par
   # plusieurs tests de gradatum-engine — canonicalisation + garde des préfixes
   # privilégiés SP-P0-4). Aucun runner self-hosted n'est enregistré sur
   # github.com/gradatum/gradatum, donc le job restait « queued » indéfiniment et
   # bloquait chaque run CI public. La couverture test-engine s'exécute
   # exclusivement sur le CI Forgejo (`.forgejo/workflows/ci.yml`, job `test-engine`,
-  # runner `lxc-500` présent) — qui reste la source de vérité des gates.
+  # self-hosted runner présent) — qui reste la source de vérité des gates.
 
   # index-backends — suite de parité backend-agnostique du trait Index (W2 v0.4.5).
   # Job splitté + matrix. Ajouter un backend = 1 entrée matrix + 1 bras factory

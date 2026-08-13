@@ -105,7 +105,7 @@ fn distill_sources_marked_processed_skipped_on_retry() {
     extra.insert("processed".to_string(), toml::Value::Boolean(true));
     extra.insert(
         "derived-into".to_string(),
-        toml::Value::String(Ulid::new().to_string()),
+        toml::Value::String(Ulid::generate().to_string()),
     );
 
     // Fonction is_processed (à partir du code du handler).

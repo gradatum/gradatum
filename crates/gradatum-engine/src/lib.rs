@@ -14,8 +14,8 @@
 //!
 //! ## Stability
 //!
-//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible additions
-//! only within `1.x`, breaking changes deferred to the next major. See
+//! `2.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible additions
+//! only within `2.x`, breaking changes deferred to the next major. See
 //! [RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 //!
 //! ## Feature gates

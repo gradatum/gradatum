@@ -2,7 +2,7 @@
 
 > `Embedder` trait with HTTP (OpenAI-compatible) and ONNX CPU backends, plus a fallback decorator.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -22,17 +22,17 @@ the fallback is called transparently.
 
 ```toml
 [dependencies]
-gradatum-embed = "1.0.0"
+gradatum-embed = "2.0.0"
 
 # For local ONNX CPU inference:
-gradatum-embed = { version = "1.0.0", features = ["fastembed-cpu"] }
+gradatum-embed = { version = "2.0.0", features = ["fastembed-cpu"] }
 ```
 
 ```rust
 use gradatum_embed::{Embedder, HttpEmbedder};
 
 // The endpoint is the full URL, and the third argument is the vector dimension.
-let embedder = HttpEmbedder::new("http://127.0.0.1:8432/v1/embeddings", "bge-m3", 1024);
+let embedder = HttpEmbedder::new("http://127.0.0.1:8436/v1/embeddings", "bge-m3", 1024);
 let vectors = embedder.embed_batch(&["hello world", "foo bar"]).await?;
 assert_eq!(vectors[0].len(), 1024); // bge-m3 dimension
 ```

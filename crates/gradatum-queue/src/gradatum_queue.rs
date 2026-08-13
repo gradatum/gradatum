@@ -170,7 +170,7 @@ mod tests {
     async fn find_awaiting_delegates_and_returns_empty_when_no_dependents() {
         let queue = make_queue().await;
         let result = queue
-            .find_awaiting(Ulid::new())
+            .find_awaiting(Ulid::generate())
             .await
             .expect("find_awaiting doit déléguer sans erreur");
         assert!(
@@ -184,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn set_pending_delegates_and_returns_ok_for_unknown_id() {
         let queue = make_queue().await;
-        let result = queue.set_pending(Ulid::new()).await;
+        let result = queue.set_pending(Ulid::generate()).await;
         assert!(
             result.is_ok(),
             "attendu Ok(()) (no-op idempotent) pour ULID inconnu, obtenu : {result:?}"
@@ -209,7 +209,7 @@ mod tests {
         );
         let embed = make_record_for_test(
             Job::Embed(EmbedSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 force_regenerate: false,
             }),
@@ -247,7 +247,7 @@ mod tests {
     fn make_record_for_test(job: Job, class: JobClass, status: JobStatus) -> JobRecord {
         let now = chrono::Utc::now();
         JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: job,
                 class,

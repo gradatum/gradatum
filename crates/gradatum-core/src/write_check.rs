@@ -1,4 +1,4 @@
-//! Write coherence check for vault notes (since v0.7.3).
+//! Write coherence check for vault notes.
 //!
 //! Pure, deterministic, zero I/O, zero LLM.
 //! Detects category-title / declared-section drift in warn-only mode.

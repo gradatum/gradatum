@@ -55,11 +55,12 @@ sees_personal_classified = false
     );
 
     // Le bearer.toml actuel doit avoir été réécrit avec le preset hierarchical.
-    // Le preset "hierarchical" embarqué contient l'identité "maintainer".
+    // Le preset "hierarchical" embarqué contient l'identité "admin" (renommage de
+    // l'ancienne "maintainer", doctrine d'identité v2.0.0).
     let new_content = fs::read_to_string(&bearer).unwrap();
     assert!(
-        new_content.contains("identity = \"maintainer\""),
-        "bearer.toml doit être réécrit avec le preset hierarchical (identity maintainer)"
+        new_content.contains("identity = \"admin\""),
+        "bearer.toml doit être réécrit avec le preset hierarchical (identity admin)"
     );
     assert!(
         !new_content.contains("custom-user-bot"),

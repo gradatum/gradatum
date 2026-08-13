@@ -2,7 +2,7 @@
 
 > Parse and serialize Markdown notes with YAML frontmatter and wikilink extraction.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -23,7 +23,7 @@ Round-trip invariant: `parse(write_parsed(parse(x)?)) == parse(x)`.
 
 ```toml
 [dependencies]
-gradatum-markdown = "1.0.0"
+gradatum-markdown = "2.0.0"
 ```
 
 ```rust

@@ -20,6 +20,8 @@ pub mod admin_cmd;
 #[doc(hidden)]
 pub mod api_key_cmd;
 #[doc(hidden)]
+pub mod backfill_authors;
+#[doc(hidden)]
 pub mod backfill_embeddings;
 #[doc(hidden)]
 pub mod backfill_note_links;
@@ -56,6 +58,9 @@ pub mod project_map_render;
 /// Read-only summary view of a single project, read straight from the SQLite index.
 #[doc(hidden)]
 pub mod project_map_scope;
+/// Sub-command `repair-note-links` — reconciles note_links against current bodies (F-147).
+#[doc(hidden)]
+pub mod repair_note_links;
 #[doc(hidden)]
 pub mod token;
 /// Sub-command `vault forget` — semantic forgetting of a batch of notes.
@@ -66,6 +71,8 @@ pub mod vault_forget_cmd;
 pub mod vault_rename;
 
 // Top-level re-exports for test convenience
+#[doc(hidden)]
+pub use backfill_authors::{BackfillAuthorsArgs, BackfillAuthorsReport};
 #[doc(hidden)]
 pub use backfill_embeddings::{BackfillArgs, backfill};
 #[doc(hidden)]
@@ -78,5 +85,7 @@ pub use downgrade_from_vault_trash::{
 };
 #[doc(hidden)]
 pub use init::{generate_server_toml_template, materialize_preset, merge_user_config};
+#[doc(hidden)]
+pub use repair_note_links::{RepairNoteLinksArgs, RepairNoteLinksReport};
 #[doc(hidden)]
 pub use vault_rename::{VaultRenameArgs, VaultRenameReport, vault_rename};

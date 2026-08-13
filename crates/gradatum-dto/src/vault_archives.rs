@@ -35,6 +35,7 @@ use gradatum_core::scope::{TenantId, VaultId};
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultArchivesListRequest {
     /// Filter by owning vault. `None` = no vault restriction (all vaults are listed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +70,28 @@ pub struct VaultArchivesListRequest {
 
 fn default_limit() -> usize {
     50
+}
+
+impl Default for VaultArchivesListRequest {
+    /// Yields the same request as deserializing an empty JSON body: no filters,
+    /// `limit` at the server default (50), `offset` 0, flags `false`.
+    ///
+    /// A hand-written impl (not `#[derive(Default)]`) is required because `limit`
+    /// carries a non-zero serde default; a derived `Default` would set it to `0`,
+    /// diverging from the wire semantics.
+    fn default() -> Self {
+        Self {
+            vault_filter: None,
+            section: None,
+            since_ms: None,
+            until_ms: None,
+            include_gc: false,
+            include_restored: false,
+            limit: default_limit(),
+            offset: 0,
+            tenant_id: None,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +162,7 @@ pub struct ArchiveEntryDto {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultArchivesPurgeRequest {
     /// ULID of the archived note to purge.
     pub note_id: String,
@@ -157,6 +181,22 @@ pub struct VaultArchivesPurgeRequest {
 
 fn default_true() -> bool {
     true
+}
+
+impl VaultArchivesPurgeRequest {
+    /// Constructs a **dry-run** purge request for the archived `note_id`.
+    ///
+    /// `dry_run` starts at `true` (matching deserialization); set it to `false`
+    /// and fill `confirm_ulids` with exactly `[note_id]` to destroy the archive.
+    #[must_use]
+    pub fn new(note_id: String) -> Self {
+        Self {
+            note_id,
+            dry_run: true,
+            confirm_ulids: Vec::new(),
+            tenant_id: None,
+        }
+    }
 }
 
 /// Response to a `archives purge` request (200 OK).
@@ -192,6 +232,7 @@ pub struct VaultArchivesPurgeResult {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultArchivesRestoreRequest {
     /// ULID of the archived note to restore.
     pub note_id: String,
@@ -206,6 +247,22 @@ pub struct VaultArchivesRestoreRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub tenant_id: Option<TenantId>,
+}
+
+impl VaultArchivesRestoreRequest {
+    /// Constructs a **dry-run** restore request for the archived `note_id`.
+    ///
+    /// `dry_run` starts at `true` (matching deserialization); set it to `false`
+    /// and fill `confirm_ulids` with exactly `[note_id]` to restore the note.
+    #[must_use]
+    pub fn new(note_id: String) -> Self {
+        Self {
+            note_id,
+            dry_run: true,
+            confirm_ulids: Vec::new(),
+            tenant_id: None,
+        }
+    }
 }
 
 /// Response to an `archives restore` request (200 OK).

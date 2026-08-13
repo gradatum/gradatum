@@ -312,6 +312,26 @@ impl ApiKeyStore for NoopApiKeyStore {
     ) -> Result<gradatum_acl_auth::ApiKeyMaterial, gradatum_acl_auth::ApiKeyError> {
         Err(gradatum_acl_auth::ApiKeyError::NotFound)
     }
+
+    /// Un magasin noop signifie « la gestion des clés n'est pas le sujet ici »,
+    /// pas « le registre est vierge ». Le corps par défaut du trait dérive la
+    /// réponse de `list` (qui rend `vec![]`) et conclurait donc à `Ok(false)` —
+    /// une installation non provisionnée. Or `reject_unauthenticated`
+    /// (middleware) est le seul consommateur : `Ok(false)` y déclenche le 503
+    /// d'amorçage (R5) pour toute requête non authentifiée, même dans un test
+    /// qui n'a rien à voir avec le provisioning. On renvoie donc `Ok(true)` —
+    /// « comporte-toi comme une installation provisionnée » — ce qui restaure le
+    /// refus d'auth ordinaire (401) attendu du chemin legacy.
+    ///
+    /// La divergence `has_any_active() == Ok(true)` vs `list() == Ok(vec![])` est
+    /// assumée et sans effet : le noop n'est jamais câblé en production
+    /// (`AppState::with_api_keys_path` le remplace par `SqliteApiKeyStore`), et
+    /// la discrimination réelle 503/401/fail-closed du contrat R5 est prouvée par
+    /// les tests `SpyApiKeyStore` (`middleware.rs`), qui pilotent l'état du
+    /// registre explicitement plutôt que via ce stub.
+    async fn has_any_active(&self) -> Result<bool, gradatum_acl_auth::ApiKeyError> {
+        Ok(true)
+    }
 }
 
 // ── PlaceholderRegistry ───────────────────────────────────────────────────────
@@ -508,8 +528,7 @@ impl Registry for PlaceholderRegistry {
 // ── VaultRegistry — registre de handles multi-vault (GAP-1, W3) ───────────────
 
 /// Registre de handles [`gradatum_vault::Vault`] indexés par
-/// [`gradatum_core::scope::VaultId`] — design cible du routage multi-vault
-/// (council `01KXWMCR0N`).
+/// [`gradatum_core::scope::VaultId`] — design cible du routage multi-vault.
 ///
 /// À flag `multi_tenant` OFF, le registre LIVE contient EXACTEMENT `{main}` (singleton,
 /// byte-identical). Tous les handles partagent le MÊME `Arc<SqliteIndex>` (un seul pool sur
@@ -1302,7 +1321,7 @@ impl AppState {
     /// If the vault layout does not yet exist (`path/.gradatum/` absent), `Vault::create`
     /// initialises the full layout before opening the SQLite index.
     ///
-    /// Returns an error if the directory is on NFS or the index is inaccessible.
+    /// Returns an error if the index is inaccessible.
     /// Used in `main.rs` for production wiring.
     ///
     /// Le `vault_id` (namespace physique) est fourni explicitement — préparation du
@@ -1403,7 +1422,7 @@ impl AppState {
     /// **Conséquence, à énoncer clairement : un seul vault défaillant fait tomber le
     /// démarrage entier, y compris pour les tenants sains.** Le rayon de panne passe d'« un
     /// tenant dégradé en silence » à « service indisponible, bruyamment ». C'est le choix
-    /// acté (decision `01KY828JP28NYSXB7G4ZXBMTR6`) : à flag ON, la panne visible prime sur la
+    /// voulu : à flag ON, la panne visible prime sur la
     /// disponibilité partielle non signalée. À flag OFF ce chemin est inatteignable.
     ///
     /// L'asymétrie avec le volet 2 est **voulue** : volet 1 (registre → disque) est dur,

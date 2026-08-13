@@ -258,7 +258,7 @@ fn make_validate_job(spec: ValidateSpec) -> GradatumJob {
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Validate(spec),
                 class,
@@ -299,7 +299,7 @@ fn make_validate_job(spec: ValidateSpec) -> GradatumJob {
 /// No uppercase words and no numbers → num_penalty=1.0, entity_penalty=1.0.
 fn base_spec(source_id: Ulid) -> ValidateSpec {
     ValidateSpec {
-        note_id: Ulid::new(),
+        note_id: Ulid::generate(),
         tenant_id: "main".to_string(),
         title: "test synthesis".to_string(),
         body: "synthesis body without numbers or proper nouns".to_string(),
@@ -319,7 +319,7 @@ fn base_spec(source_id: Ulid) -> ValidateSpec {
 /// Expected: persist_distill called with trust == base_trust (0.8), tags empty.
 #[tokio::test]
 async fn well_grounded_synthesis_passes_with_base_trust() {
-    let source_id = Ulid::new();
+    let source_id = Ulid::generate();
     let spec = base_spec(source_id);
     let base_trust = spec.base_trust;
 
@@ -361,7 +361,7 @@ async fn well_grounded_synthesis_passes_with_base_trust() {
 /// Expected: persist_distill called with trust < base_trust (degraded), tags=["quality-low"].
 #[tokio::test]
 async fn poorly_grounded_synthesis_degrades_trust_and_adds_tag() {
-    let source_id = Ulid::new();
+    let source_id = Ulid::generate();
     let spec = base_spec(source_id);
     let base_trust = spec.base_trust;
 

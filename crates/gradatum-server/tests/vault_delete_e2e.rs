@@ -228,7 +228,7 @@ async fn admin_delete_without_token_is_401() {
     let env = build_app().await;
     let (status, _json) = post_delete_with(
         env.app,
-        serde_json::json!({ "note_id": Ulid::new().to_string(), "dry_run": true }),
+        serde_json::json!({ "note_id": Ulid::generate().to_string(), "dry_run": true }),
         None,
         loopback(),
     )
@@ -242,7 +242,7 @@ async fn admin_delete_wrong_token_is_401() {
     let env = build_app().await;
     let (status, _json) = post_delete_with(
         env.app,
-        serde_json::json!({ "note_id": Ulid::new().to_string(), "dry_run": true }),
+        serde_json::json!({ "note_id": Ulid::generate().to_string(), "dry_run": true }),
         Some("mauvais-token-completement-different"),
         loopback(),
     )
@@ -256,7 +256,7 @@ async fn admin_delete_non_loopback_is_401() {
     let env = build_app().await;
     let (status, _json) = post_delete_with(
         env.app,
-        serde_json::json!({ "note_id": Ulid::new().to_string(), "dry_run": true }),
+        serde_json::json!({ "note_id": Ulid::generate().to_string(), "dry_run": true }),
         Some(ADMIN_TOKEN),
         SocketAddr::from(([10, 0, 0, 5], 40000)),
     )
@@ -272,12 +272,12 @@ async fn admin_delete_non_loopback_is_401() {
 async fn dry_run_returns_preview_with_backlinks() {
     let env = build_app().await;
 
-    let target = Ulid::new().to_string();
+    let target = Ulid::generate().to_string();
     env.idx
         .seed_note_with_fts(&target, "feedback", "note cible")
         .await
         .expect("seed cible");
-    let src = Ulid::new().to_string();
+    let src = Ulid::generate().to_string();
     env.idx
         .seed_note_with_fts(&src, "feedback", "note source")
         .await
@@ -315,7 +315,7 @@ async fn dry_run_returns_preview_with_backlinks() {
 #[tokio::test]
 async fn dry_run_absent_note_is_noop() {
     let env = build_app().await;
-    let unknown = Ulid::new().to_string();
+    let unknown = Ulid::generate().to_string();
 
     let (status, json) = post_delete(
         env.app,
@@ -341,7 +341,7 @@ async fn protected_sections_refused_403() {
         "decisions",
         "reasoning",
     ] {
-        let id = Ulid::new().to_string();
+        let id = Ulid::generate().to_string();
         env.idx
             .seed_note_with_fts(&id, section, "note gouvernance")
             .await
@@ -382,7 +382,7 @@ async fn protected_sections_refused_403() {
 #[tokio::test]
 async fn confirm_mismatch_returns_400() {
     let env = build_app().await;
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     env.idx
         .seed_note_with_fts(&id, "feedback", "note à confirmer")
         .await
@@ -408,12 +408,12 @@ async fn confirm_mismatch_returns_400() {
 #[tokio::test]
 async fn confirm_multiple_ulids_returns_400() {
     let env = build_app().await;
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     env.idx
         .seed_note_with_fts(&id, "feedback", "note mono")
         .await
         .expect("seed");
-    let other = Ulid::new().to_string();
+    let other = Ulid::generate().to_string();
 
     let (status, json) = post_delete(
         env.app,
@@ -498,7 +498,7 @@ async fn real_delete_archives_note_and_records_registry() {
 #[tokio::test]
 async fn idempotent_delete_absent_note() {
     let env = build_app().await;
-    let unknown = Ulid::new().to_string();
+    let unknown = Ulid::generate().to_string();
 
     let (status, json) = post_delete(
         env.app,
@@ -613,7 +613,7 @@ async fn tombstone_failure_aborts_delete() {
 #[tokio::test]
 async fn real_delete_absent_note_with_malformed_confirm_returns_400() {
     let env = build_app().await;
-    let unknown = Ulid::new().to_string();
+    let unknown = Ulid::generate().to_string();
 
     let (status, json) = post_delete(
         env.app,

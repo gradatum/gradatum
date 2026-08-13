@@ -87,12 +87,12 @@ pub fn gradatum_engine::metrics::EngineMetrics::default() -> Self
 pub struct gradatum_engine::metrics::EventLogErrLabels
 pub gradatum_engine::metrics::EventLogErrLabels::status_code: alloc::string::String
 impl prometheus_client::encoding::EncodeLabelSet for gradatum_engine::metrics::EventLogErrLabels
-pub fn gradatum_engine::metrics::EventLogErrLabels::encode(&self, prometheus_client::encoding::LabelSetEncoder<'_>) -> core::result::Result<(), core::fmt::Error>
+pub fn gradatum_engine::metrics::EventLogErrLabels::encode(&self, &mut prometheus_client::encoding::LabelSetEncoder<'_>) -> core::result::Result<(), core::fmt::Error>
 pub struct gradatum_engine::metrics::ReqLabels
 pub gradatum_engine::metrics::ReqLabels::route: alloc::string::String
 pub gradatum_engine::metrics::ReqLabels::status_code: alloc::string::String
 impl prometheus_client::encoding::EncodeLabelSet for gradatum_engine::metrics::ReqLabels
-pub fn gradatum_engine::metrics::ReqLabels::encode(&self, prometheus_client::encoding::LabelSetEncoder<'_>) -> core::result::Result<(), core::fmt::Error>
+pub fn gradatum_engine::metrics::ReqLabels::encode(&self, &mut prometheus_client::encoding::LabelSetEncoder<'_>) -> core::result::Result<(), core::fmt::Error>
 pub mod gradatum_engine::runtime
 pub struct gradatum_engine::runtime::ForwardProxy
 impl gradatum_engine::runtime::ForwardProxy

@@ -1097,6 +1097,12 @@ impl Default for SessionTraceConfig {
 ///
 /// Default (`backend = "heuristic"`): CPU-only, zero network calls, zero LLM.
 /// The `llm` field is optional and only used when `backend != "heuristic"`.
+///
+/// **Who acts on this section.** The server parses `[curator]` for schema symmetry but never
+/// acts on it: its synchronous `vault_classify` path is always heuristic, whatever `backend`
+/// says. The setting is honoured by the **worker**, which deserialises the same TOML section
+/// into its own mirror type and builds the configured backend there. Changing `backend` here
+/// therefore changes background curation, not the server's classify endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CuratorConfig {
     /// Classification backend.
@@ -1219,15 +1225,39 @@ impl Default for ServerConfig {
 /// `figment::Error` is boxed to avoid `clippy::result_large_err`
 /// (the variant exceeds 128 bytes unboxed). `From<figment::Error>` is implemented
 /// manually because `#[from] Box<T>` does not generate `From<T>`.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
-    #[error("figment error: {0}")]
+    /// A figment/TOML load error.
+    ///
+    /// Its `Display` is **redacted** via `redact_figment_error`: the boxed error
+    /// still carries the full figment error for programmatic use, but no value read
+    /// from the configuration source is ever rendered. Same discipline as the
+    /// gateway's `InvalidImageUrl`, which holds the sensitive URL yet never prints
+    /// it — here it matters because a secret placed by mistake in the config file
+    /// would otherwise be echoed verbatim to the boot log (figment prints the
+    /// offending value on a type mismatch, and quotes the source line on a syntax
+    /// error).
+    #[error("configuration error: {}", gradatum_core::config::redact_figment_error(.0))]
     Figment(Box<figment::Error>),
     #[error(
         "bind/TLS fail-closed: bind={bind} is non-loopback without TLS configured. \
         Advice: set [server.tls] or change bind to 127.0.0.1:19090"
     )]
     BindTlsRefused { bind: SocketAddr },
+}
+
+/// Hand-written `Debug` that never leaks configuration values.
+///
+/// The derived `Debug` would print the inner `figment::Error` verbatim (e.g.
+/// `InvalidType(Str("<secret>"), …)`), re-opening the very leak the redacted
+/// `Display` closes. Any `{:?}` on a `ConfigError` — a stray log line, an
+/// `anyhow` backtrace — must be as safe as `{}`, so `Debug` delegates to
+/// `Display`.
+impl std::fmt::Debug for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl From<figment::Error> for ConfigError {
@@ -2464,6 +2494,68 @@ mod per_vault_config_tests {
             map.len(),
             2,
             "les DEUX overrides (actif + désactivé) sont dans la map"
+        );
+    }
+}
+
+/// Anti-fuite : une valeur du fichier de configuration (potentiellement un secret
+/// placé par mégarde) ne doit JAMAIS réapparaître dans le message d'erreur rendu
+/// vers le journal / la sortie d'erreur.
+///
+/// Ces tests sont le garde-fou durable exigé : la bibliothèque TOML/figment peut
+/// changer de comportement à une montée de version — si elle se remet à publier la
+/// valeur fautive, un de ces tests casse.
+#[cfg(test)]
+mod config_error_redaction_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Chaîne distinctive jouant le rôle du secret mal placé. Choisie pour n'être
+    /// sous-chaîne d'aucun mot de schéma (types attendus, noms de champs).
+    const SECRET: &str = "s3cr3t-do-not-leak-deadbeef-cafe";
+
+    /// Reproduit l'erreur figment via EXACTEMENT le même pipeline que
+    /// [`ServerConfig::load`] (defaults → TOML), pour prouver que la fuite native
+    /// est réelle avant de vérifier qu'elle est masquée (test non vacué).
+    fn raw_figment_error(toml: &str) -> figment::Error {
+        Figment::from(Serialized::defaults(ServerConfig::default()))
+            .merge(Toml::string(toml))
+            .extract::<ServerConfig>()
+            .expect_err("ce TOML doit échouer à l'extraction")
+    }
+
+    /// Bout-en-bout par le VRAI chemin de chargement : un secret placé comme valeur
+    /// d'un champ typé (ici `[auth] jwt_ttl_human_secs`, attendu entier) déclenche
+    /// un `InvalidType` dont le `Display` natif de figment contient
+    /// `found string "<secret>"`. Après masquage, ni `Display` ni `Debug` de
+    /// `ConfigError` ne doivent contenir le secret, mais la clé fautive doit rester
+    /// nommée (sinon on remplace une fuite par une énigme).
+    #[test]
+    fn server_config_load_boundary_redacts_secret() {
+        let toml = format!("[auth]\njwt_ttl_human_secs = \"{SECRET}\"\n");
+
+        // Sanity non vacué : la fuite native est réelle sur ce chemin.
+        let raw = raw_figment_error(&toml);
+        assert!(
+            raw.to_string().contains(SECRET),
+            "pré-condition : figment doit fuiter nativement la valeur du fichier"
+        );
+
+        // Boundary réel : ServerConfig::load → ConfigError.
+        let mut file = tempfile::NamedTempFile::new().expect("fichier temporaire");
+        file.write_all(toml.as_bytes()).expect("écriture TOML");
+        let err = ServerConfig::load(Some(file.path())).expect_err("le chargement doit échouer");
+
+        let shown = err.to_string();
+        let debugged = format!("{err:?}");
+        assert!(!shown.contains(SECRET), "Display fuit le secret : {shown}");
+        assert!(
+            !debugged.contains(SECRET),
+            "Debug fuit le secret : {debugged}"
+        );
+        assert!(
+            shown.contains("jwt_ttl_human_secs"),
+            "le message masqué doit encore nommer la clé fautive : {shown}"
         );
     }
 }

@@ -794,7 +794,7 @@ fn build_job_record_from_spec(
         .or_else(|| Some("api".to_string()));
 
     Ok(JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind,
             class: JobClass::Api,

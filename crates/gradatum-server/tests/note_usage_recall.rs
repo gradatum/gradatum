@@ -96,11 +96,12 @@ fn hit(ulid: &str, section: &str) -> ProactiveHit {
 }
 
 fn req_feedback(recall_id: &str, accepted: &[&str]) -> ProactiveRecallFeedbackRequest {
-    ProactiveRecallFeedbackRequest {
-        tenant_id: Some("main".into()),
-        recall_id: recall_id.into(),
-        accepted_ulids: accepted.iter().map(|s| (*s).to_string()).collect(),
-    }
+    let mut req = ProactiveRecallFeedbackRequest::new(
+        recall_id.into(),
+        accepted.iter().map(|s| (*s).to_string()).collect(),
+    );
+    req.tenant_id = Some("main".into());
+    req
 }
 
 async fn seed_session(state: &AppState, recall_id: &str, surfaced: &[String]) {
@@ -136,18 +137,11 @@ async fn proactive_recall_increments_surfaced_per_note() {
         .await
         .expect("upsert_surface");
 
-    let resp = proactive_recall(
-        &state,
-        &bearer_main(),
-        ProactiveRecallRequest {
-            tenant_id: Some("main".into()),
-            context: None,
-            sections: None,
-            limit: None,
-        },
-    )
-    .await
-    .expect("proactive_recall");
+    let mut recall_req = ProactiveRecallRequest::default();
+    recall_req.tenant_id = Some("main".into());
+    let resp = proactive_recall(&state, &bearer_main(), recall_req)
+        .await
+        .expect("proactive_recall");
     assert_eq!(resp.items.len(), 3);
 
     let batch = state.note_usage_accumulators.swap();

@@ -107,6 +107,7 @@ pub enum ForgetScopeDto {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultForgetRequest {
     /// Resolution scope — determines the target notes.
     pub scope: ForgetScopeDto,
@@ -136,6 +137,23 @@ pub struct VaultForgetRequest {
 
 fn default_true() -> bool {
     true
+}
+
+impl VaultForgetRequest {
+    /// Constructs a **dry-run** forget request for the given resolution `scope`.
+    ///
+    /// `dry_run` starts at `true` (matching deserialization); set it to `false`
+    /// and fill `confirm_ulids` with the ULIDs returned by the preview to apply.
+    #[must_use]
+    pub fn new(scope: ForgetScopeDto) -> Self {
+        Self {
+            scope,
+            dry_run: true,
+            forgotten_by: None,
+            confirm_ulids: Vec::new(),
+            tenant_id: None,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

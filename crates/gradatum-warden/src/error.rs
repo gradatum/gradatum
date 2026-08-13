@@ -2,6 +2,7 @@
 
 /// Construction error for the warden.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WardenError {
     /// Invalid rate limit configuration: `per_minute` or `burst` is zero.
     #[error("invalid rate limit: per_minute={0} burst={1} (both must be > 0)")]
@@ -10,6 +11,7 @@ pub enum WardenError {
 
 /// Warden decision for an incoming request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WardenDecision {
     /// Request is allowed — passed to the next handler.
     Allow,

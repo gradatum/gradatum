@@ -71,6 +71,7 @@ pub fn is_valid_lesson_class(class: &str) -> bool {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct LessonsRecallRequest {
     /// Controlled vocabulary class (one of [`LESSON_CLASSES`]):
     /// `deploy`, `release`, `migration`, `crates-io`, `anti-leak`, `api-external`,
@@ -117,6 +118,22 @@ pub struct LessonsRecallRequest {
     /// `lesson-recall.sh`, agents, MCP) are unaffected.
     #[serde(default)]
     pub compact: bool,
+}
+
+impl LessonsRecallRequest {
+    /// Constructs a lessons-recall request for the controlled-vocabulary `class`;
+    /// every optional field defaults to its unset (`None` / `false`) value.
+    #[must_use]
+    pub fn new(class: String) -> Self {
+        Self {
+            class,
+            limit: None,
+            rank: None,
+            semantic: None,
+            query: None,
+            compact: false,
+        }
+    }
 }
 
 /// A lesson returned by the recall endpoint.

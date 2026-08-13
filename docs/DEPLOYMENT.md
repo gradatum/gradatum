@@ -1,64 +1,70 @@
 # Deployment Guide
 
-> Platform: **Linux only** (x86_64 and aarch64). gradatum does not support Windows or macOS.
+## Platform support
 
-This guide covers:
-- [§0 — Obtaining binaries](#0-obtaining-binaries): which archive to use for each role.
+This is the normative statement — other documents link here rather than restating it.
+
+- **Linux x86_64** — native, pre-built binaries. This is the platform the public GitHub Release
+  (`.github/workflows/release.yml`) actually ships — confirmed against the latest release
+  (`v1.0.0`): every asset (`gradatum-server-*`, `gradatum-llm-*`, `gradatum-mcp-*`,
+  `gradatum-sbom-*`) is `x86_64-unknown-linux-gnu` only, no `aarch64` asset exists.
+- **Linux aarch64** — CI builds and tests it internally (`.forgejo/workflows/release.yml`
+  `build-arm64` job, `aarch64-unknown-linux-gnu` cross target), but that job is **best-effort**
+  (`continue-on-error`, not required for `release` to run) and its output is never published to
+  the public GitHub Release — there are no aarch64 pre-built binaries to download. A multi-arch
+  `linux/amd64,linux/arm64` Docker image build also exists in the same workflow but is gated
+  `if: false` (no Docker-capable runner yet — see [Guide A § Docker
+  image](guides/A-docker-quickstart.md#docker-image)), so it is not published either.
+  **[Guide C — build from source](guides/C-build-from-source.md) is the only path on arm64
+  today.**
+- **Minimum glibc: 2.34** (x86_64 pre-built archives). The public GitHub release binaries are
+  dynamically linked against glibc and are compiled inside Debian 12 (bookworm), so they load on
+  any Linux with **glibc ≥ 2.34** — this covers Debian 12 (2.36), Ubuntu 22.04 LTS (2.35),
+  RHEL / Rocky / AlmaLinux 9 (2.34) and anything newer. Check your host:
+
+  ```
+  ldd --version | head -1     # last field is the glibc version, e.g. "... 2.35"
+  ```
+
+  A binary built against a newer glibc fails at **startup** with
+  `version 'GLIBC_2.xx' not found`, not a clean error message. If you see that, your glibc is
+  older than 2.34 — build from source ([Guide C](guides/C-build-from-source.md)) or run the
+  Docker image ([Guide A](guides/A-docker-quickstart.md)), which carries its own glibc. The
+  release workflow measures this floor on every build and refuses to publish a binary that
+  exceeds 2.34.
+- **Windows** — supported **via Docker only**. Docker Desktop's WSL2 backend runs Linux
+  containers: the image built by `docker compose build` is `linux/amd64`, the same target CI
+  builds and tests, not a separate Windows build. There is no native Windows binary. See
+  [Guide A — Docker quickstart § Windows](guides/A-docker-quickstart.md#windows).
+- **macOS** — out of scope, Docker included. Apple Silicon is `arm64`, but a different target
+  triple (`aarch64-apple-darwin`) from the Linux `arm64` this project builds
+  (`aarch64-unknown-linux-gnu`) — never compiled or tested here. No supported path.
+
+---
+
+This guide covers **exploitation** of an already-installed gradatum: engine topology, sizing,
+upgrade ordering, and troubleshooting.
+
 - [§1–§11 — Engine deployment](#1-how-the-supervisor-works): deploying `gradatum-engine` in single-host or multi-instance mode, wired into `gradatum-gateway`.
 - [§12 — App-host upgrade order](#12-app-host-upgrade-order-gradatum-server-before-gradatum-worker): why `gradatum-server` must be upgraded before `gradatum-worker`, and how to prove which commit is live.
 - [§13 — Troubleshooting](#13-troubleshooting): engine startup and runtime symptoms.
+
+For installation itself, see:
+
+- [docs/guides/A-docker-quickstart.md](guides/A-docker-quickstart.md) — Docker Compose
+- [docs/guides/B-install-binaries.md](guides/B-install-binaries.md) — pre-built binaries + systemd
+- [docs/guides/C-build-from-source.md](guides/C-build-from-source.md) — crates.io / build from source
+- [docs/guides/E-ports-and-config.md](guides/E-ports-and-config.md) — port matrix + config reference
 
 ---
 
 ## 0. Obtaining binaries
 
-### 0.1 Pre-built archives (Linux x86_64, recommended)
-
-Each [GitHub Release](https://github.com/gradatum/gradatum/releases) ships three archives plus a `SHA256SUMS` file and SLSA provenance attestations.
-
-| Archive | Binaries inside | Deploy on |
-|---|---|---|
-| `gradatum-server-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `gradatum-server`, `gradatum-worker`, `gradatum-admin` | **app-host** — vault backbone |
-| `gradatum-llm-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `gradatum-gateway`, `gradatum-engine` | **gpu-host** (engines) + **app-host** (gateway) |
-| `gradatum-mcp-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `gradatum-mcp-stub` | **app-host** — MCP bridge |
-
-All three archives are covered by a single `SHA256SUMS` file. Each archive ships with an individual SLSA provenance attestation verifiable via the GitHub CLI.
-
-**Download and verify (example for the server archive):**
-
-```bash
-VERSION=v1.0.0
-ARCH=x86_64-unknown-linux-gnu
-
-curl -fLO "https://github.com/gradatum/gradatum/releases/download/${VERSION}/gradatum-server-${VERSION}-${ARCH}.tar.gz"
-curl -fLO "https://github.com/gradatum/gradatum/releases/download/${VERSION}/SHA256SUMS"
-
-# Integrity
-sha256sum -c SHA256SUMS --ignore-missing
-
-# Provenance (requires gh CLI, v2.49+)
-gh attestation verify "gradatum-server-${VERSION}-${ARCH}.tar.gz" \
-  --repo gradatum/gradatum
-
-# Extract
-tar -xzf "gradatum-server-${VERSION}-${ARCH}.tar.gz"
-```
-
-Repeat the same steps for `gradatum-llm` and `gradatum-mcp` as needed. Install the extracted binaries to `/usr/local/bin/` (adjust `ExecStart` in your systemd units accordingly).
-
-### 0.2 Build from source
-
-**Prerequisites:** Rust stable (MSRV 1.91), `gcc` or `clang`, `libsqlite3-dev`.
-
-```bash
-git clone https://github.com/gradatum/gradatum.git
-cd gradatum
-cargo build --workspace --release
-```
-
-Binaries land in `target/release/`. `gradatum-engine` requires the `serve` feature when building individually; `--workspace` enables it automatically.
-
-arm64 binaries are not shipped pre-built — build from source on aarch64.
+Moved to [docs/guides/B-install-binaries.md](guides/B-install-binaries.md) (pre-built archives,
+the two release paths, systemd) and
+[docs/guides/C-build-from-source.md](guides/C-build-from-source.md) (crates.io, build from
+source). This anchor (`§0`) is kept because `packaging/systemd/README.md` and other documents
+link to it by number.
 
 ---
 
@@ -134,7 +140,7 @@ All addresses below are illustrative.
  │                                                                               │
  │   ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌──────────┐              │
  │   │ chat    │ │ embed   │ │ small   │ │ reason  │ │ vision   │              │
- │   │ :8083   │ │ :8432   │ │ :8082   │ │ :8081   │ │ :8080 +mm│              │
+ │   │ :8083   │ │ :8084   │ │ :8082   │ │ :8081   │ │ :8080 +mm│              │
  │   └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘ └────┬─────┘              │
  │        │ each instance supervises one llama-server child (loopback child_port)│
  │        └────────── bind: gpu-host LAN IP · /metrics on loopback ─────────────┘
@@ -251,7 +257,8 @@ body_limit_bytes = 33554432
 
 # ── gradatum server ──────────────────────────────────────────────────────────
 # URL of the gradatum server for event logging and JWT exchange.
-# Must be loopback. Default: http://127.0.0.1:19090
+# Must be loopback. Default: unset (event log disabled). Set explicitly (as
+# below) to enable it — the engine then posts events to {url}/api/v1/event-log.
 gradatum_url = "http://127.0.0.1:19090"
 
 # ── Vision (optional) ────────────────────────────────────────────────────────
@@ -269,8 +276,13 @@ extra_args = []
 Environment variable overrides are supported with the prefix `GRADATUM_ENGINE_`:
 
 ```bash
-GRADATUM_ENGINE_GPU_LAYERS=99 GRADATUM_ENGINE_N_THREADS=16 gradatum-engine --config /etc/gradatum/conf.d/70-engine-chat.toml
+GRADATUM_ENGINE_GPU_LAYERS=99 GRADATUM_ENGINE_N_THREADS=16 gradatum-engine /etc/gradatum/conf.d/70-engine-chat.toml
 ```
+
+Note: unlike `gradatum-server`/`gradatum-worker` (which take `--config PATH`),
+`gradatum-engine` takes the config path as a **positional** argument — there is
+no `--config` flag. `gradatum-engine --config /path` fails: `--config` is parsed
+as the path itself, and loading a file literally named `--config` errors out.
 
 ---
 
@@ -460,7 +472,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gradatum-engine --config /etc/gradatum/conf.d/70-engine-chat.toml
+ExecStart=/usr/local/bin/gradatum-engine /etc/gradatum/conf.d/70-engine-chat.toml
 Restart=on-failure
 RestartSec=10
 StartLimitBurst=5
@@ -513,6 +525,55 @@ Each instance needs its own unit file and config file. Example for two instances
 
 The two instances are completely independent: separate processes, separate ports,
 separate restart budgets.
+
+### Running without systemd
+
+None of the binaries require systemd — it supervises and restarts them, nothing more.
+This matters in particular in a container, which has no init system to hand the units to.
+Init must run first: `gradatum-worker` opens `db/queue.sqlite`, a file `gradatum-admin init`
+creates, and fails with `SQLITE_CANTOPEN` if it is started before that file exists.
+
+```bash
+# 1. Initialize the data directory (same command as the systemd path, §package README)
+gradatum-admin init --root /var/lib/gradatum --preset hierarchical --non-interactive
+
+# 2. Start the server first (materializes the remaining SQLite files)
+gradatum-server --config /var/lib/gradatum/config/server.toml &
+
+# 3. Then the worker — GRADATUM_INTERNAL_TOKEN is required, not optional (step 1's `init`
+#    already generated it; this just reads it back — see the note below).
+export GRADATUM_INTERNAL_TOKEN="$(cat /var/lib/gradatum/config/internal-worker.token.txt)"
+gradatum-worker --config /var/lib/gradatum/config/server.toml &
+
+# 4. Optional — one gradatum-engine instance per model (positional config path, §4)
+gradatum-engine /etc/gradatum/conf.d/70-engine-chat.toml &
+
+# 5. Verify
+curl -fsS http://127.0.0.1:19090/health
+```
+
+`gradatum-server` and `gradatum-worker` both take an optional `--config PATH`
+(default `/var/lib/gradatum/config/server.toml` for the worker; the server falls back to
+built-in defaults — no TOML file — when the flag is omitted entirely). `gradatum-engine`
+takes no such flag — see the note on its positional argument in §4. For process
+supervision without systemd (auto-restart, log capture), wrap the commands above in
+whatever the target environment already provides (a container's own entrypoint script,
+`runit`, `s6`, a process manager) — none of the four binaries assume systemd is present.
+
+**`GRADATUM_INTERNAL_TOKEN` is not optional** — omit step 3's `export` and the worker exits
+immediately (verified):
+
+```
+Error: GRADATUM_INTERNAL_TOKEN must be set
+```
+
+`gradatum-admin init` (step 1) always writes this secret to
+`<root>/config/internal-worker.token.txt` (mode 0600) alongside `server.toml` — it is not a
+value you invent yourself; a self-generated token will not match what the server expects unless
+you also override `[internal_api].token` to match it. Field-by-field detail:
+[Guide E — `server.toml` fields set by `gradatum-admin init`](guides/E-ports-and-config.md#servertoml--fields-set-by-gradatum-admin-init).
+Under systemd, the same variable is required and the same failure mode applies — see
+[Guide B § systemd](guides/B-install-binaries.md#systemd).
 
 ---
 
@@ -569,35 +630,77 @@ mapping. Each engine instance registers as a named provider. The gateway handles
 - **Circuit-breaker**: consecutive failures open the circuit and route around the
   unhealthy instance.
 
-Example gateway config fragment (generic):
+Example gateway config fragment (generic, all-loopback — single-host):
 
 ```toml
 [providers.engine-chat]
-base_url = "http://127.0.0.1:11435"
+endpoint = "http://127.0.0.1:11435"
 timeout_secs = 120
 
 [providers.engine-embed]
-base_url = "http://127.0.0.1:11437"
+endpoint = "http://127.0.0.1:11437"
 timeout_secs = 30
 
 [providers.fallback-embed]
-base_url = "http://127.0.0.1:8431"   # standalone embeddings service as fallback (adapt to your deployment)
+endpoint = "http://127.0.0.1:19101"   # standalone embeddings service as fallback (adapt to your deployment)
 timeout_secs = 60
 
-[[aliases]]
-name = "curator"
-primary = "engine-chat"
-# fallback omitted: returns 503 if primary unhealthy
+[aliases.curator]
+provider = "engine-chat"
+model = "curator-model"
+# fallback_provider omitted: returns 503 if primary unhealthy
 
-[[aliases]]
-name = "embed"
-primary = "engine-embed"
-fallback = "fallback-embed"
+[aliases.embed]
+provider = "engine-embed"
+model = "embed-model"
+fallback_provider = "fallback-embed"
+fallback_model = "embed-model"
 ```
+
+`[providers.<name>]` is one table per named provider (`ProviderConfig`: `endpoint` +
+`timeout_secs` + optional `api_key_env`) — not `base_url`. `[aliases.<name>]` is one table
+per alias (`AliasTarget`: `provider` + `model`, with optional `fallback_provider` /
+`fallback_model`) — `aliases` is a map keyed by alias name, **not** an array of tables:
+`[[aliases]]` with a `name = "..."` field fails to parse (`invalid type: sequence, expected
+a map`).
 
 When an engine becomes unhealthy (restart budget exhausted), the gateway's health probe
 detects the `503` from `/health` and routes to the fallback until the engine recovers
 (systemd restart).
+
+### 10.1 Non-loopback example — GPU host on the LAN
+
+Matching the topology in §2: the gateway runs on `app-host`, the chat/embed engines run on
+a separate `gpu-host`. Point the providers at the GPU host's LAN IP instead of loopback —
+`gradatum-engine`'s own `bind_addr` must also be set to that same LAN IP (§4), since it
+defaults to loopback-only and rejects wildcards (§6.1).
+
+```toml
+[providers.engine-chat]
+endpoint = "http://10.0.0.20:11435"   # gpu-host LAN IP — matches [engine] bind_addr there
+timeout_secs = 120
+
+[providers.engine-embed]
+endpoint = "http://10.0.0.20:11437"   # gpu-host LAN IP
+timeout_secs = 30
+
+[providers.fallback-embed]
+endpoint = "http://127.0.0.1:19101"   # local CPU fallback stays on app-host, loopback
+timeout_secs = 60
+
+[aliases.curator]
+provider = "engine-chat"
+model = "curator-model"
+
+[aliases.embed]
+provider = "engine-embed"
+model = "embed-model"
+fallback_provider = "fallback-embed"
+fallback_model = "embed-model"
+```
+
+Only the provider `endpoint` moves to the LAN IP — the gateway's own `[server] listen`
+(§2 diagram: `:8436`) is a separate setting and is not affected by this change.
 
 ---
 

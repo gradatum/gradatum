@@ -163,7 +163,7 @@ pub async fn post_session_trace(
             }
             s
         }
-        None => Ulid::new().to_string(),
+        None => Ulid::generate().to_string(),
     };
 
     // 6. Récupérer le store (None = non câblé → 503).

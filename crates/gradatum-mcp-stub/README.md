@@ -2,21 +2,32 @@
 
 > MCP stdio adapter — forwards MCP tool calls to the gradatum-server HTTP API.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: **retired from the distribution as of `2.0.0`.** `publish = false` — not built, not
+shipped, not on crates.io as anything newer than its last published version, `1.0.0`. Source is
+kept in this repository (retirement is reversible), but there is nothing to install from this
+crate today.
+
+**Why**: the binary only ever compiled for `x86_64-unknown-linux-gnu`, while its intended
+audience — chiefly Claude Desktop, which drives its own auth flow and cannot attach a custom
+header — runs on macOS or Windows, not Linux. `gradatum-server`'s native MCP transport (`/mcp`,
+Streamable HTTP) is now the only integration path, for any client able to attach a request
+header. See [Guide D — MCP & Studio](https://github.com/gradatum/gradatum/blob/main/docs/guides/D-mcp-and-studio.md)
+in the main repository for current MCP setup instructions.
+
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
-## Overview
+## Overview (historical — describes the `1.0.0` binary, not distributed since)
 
-`gradatum-mcp-stub` is a thin stdio process that bridges MCP hosts (Claude Code,
+`gradatum-mcp-stub` was a thin stdio process that bridged MCP hosts (Claude Code,
 Claude Desktop, Continue.dev, etc.) to a running `gradatum-server` instance. Each MCP
-tool call is serialized to JSON and forwarded to the corresponding REST endpoint (POST for
+tool call was serialized to JSON and forwarded to the corresponding REST endpoint (POST for
 most tools; GET for `vault_status`, `vault_authors`, `vault_tags` and `vault_lessons_recall`);
-the response is passed back to the host.
+the response was passed back to the host.
 
-Supports auto-refresh authentication: when configured with an API key file, the stub
-exchanges the key for a JWT at startup and renews it transparently before expiry.
+It supported auto-refresh authentication: when configured with an API key file, the stub
+exchanged the key for a JWT at startup and renewed it transparently before expiry.
 
-## Usage
+## Usage (historical — this binary is not distributed; kept for reference only)
 
 Configure in your MCP host:
 
@@ -34,7 +45,7 @@ Configure in your MCP host:
 }
 ```
 
-## Environment Variables
+## Environment Variables (historical)
 
 | Variable | Default | Description |
 |---|---|---|
@@ -42,7 +53,7 @@ Configure in your MCP host:
 | `GRADATUM_API_KEY_FILE` | — | Path to a chmod-600 file containing `ak_xxx` (preferred) |
 | `GRADATUM_BEARER_TOKEN` | — | Static JWT (fallback if `GRADATUM_API_KEY_FILE` is absent) |
 
-## MCP Tools Exposed
+## MCP Tools Exposed (historical)
 
 | Category | Tools |
 |---|---|

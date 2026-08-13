@@ -27,7 +27,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Construit une `Note` minimale pour les tests.
 fn make_note(title: &str, body: &str) -> Note {
     Note {
-        id: ulid::Ulid::new().to_string(),
+        id: ulid::Ulid::generate().to_string(),
         title: title.to_string(),
         body: body.to_string(),
         tags_hint: vec![],
@@ -345,7 +345,7 @@ async fn section_hint_valid_admits_directly_without_llm() {
 
     // Note délibérément ambiguë (corps court) — seul le hint doit décider.
     let note = Note {
-        id: ulid::Ulid::new().to_string(),
+        id: ulid::Ulid::generate().to_string(),
         title: "Note quelconque".to_string(),
         body: "Contenu court et ambigu.".to_string(),
         tags_hint: vec![],
@@ -405,7 +405,7 @@ async fn section_hint_invalid_falls_through_to_normal_path() {
         .await;
 
     let note = Note {
-        id: ulid::Ulid::new().to_string(),
+        id: ulid::Ulid::generate().to_string(),
         title: "Note quelconque".to_string(),
         body: "Contenu court et ambigu.".to_string(),
         tags_hint: vec![],
@@ -521,7 +521,7 @@ async fn llm_mock_council_section_propagated() {
     // contient "architecture" (score architecture = 1) — signal ambigu (confiance < 1.0)
     // → heuristic ne peut pas admettre directement → LLM invoqué avec confidence_threshold=1.0.
     let note = Note {
-        id: ulid::Ulid::new().to_string(),
+        id: ulid::Ulid::generate().to_string(),
         title: "Verdict — délibération de gouvernance".to_string(),
         body: "Short ambiguous body about architecture.".to_string(),
         tags_hint: vec![],

@@ -14,12 +14,18 @@
 
 | Track | Window | Cadence | Stability promise |
 |---|---|---|---|
-| `0.x` | Until `1.0` | Frequent (weekly possible) | **No stability promise on public APIs.** Breaking changes require an RFC and a `CHANGELOG.md` entry. **1.0 ships when the D5 maturity criteria are met** (see *Public-release criterion* below), not on a fixed calendar. |
+| `0.x` | Until `1.0` | Frequent (weekly possible) | **No stability promise on public APIs.** Breaking changes are tracked as a project-map feature card and require a `CHANGELOG.md` entry. **1.0 ships when the D5 maturity criteria are met** (see *Public-release criterion* below), not on a fixed calendar. |
 | `1.x` LTS | After `1.0` | Quarterly minor; security patches monthly | SemVer strict. Backward-compatible additions only. Trait-stability tiers apply (see AM1). |
 | `1.x` main | After `1.0` | Continuous | New features land here first. Breaking changes accumulate for the next major. |
 | `2.x+` codenames | When triggered (see below) | Codename per major | Codenames are mnemonic, not marketing. They are issued only when an objective release-signal fires. |
 
 **SemVer alignment:** every published crate follows SemVer 2.0.0. The umbrella `gradatum` crate aligns with the highest-precedence breaking change among its re-exports.
+
+**In this concrete instance, the `1.x` LTS branch was closed early.** Rather than following
+the quarterly-minor / monthly-patch cadence in the table above, `1.x` receives a single final
+security fix, `1.0.3`, and is then closed — see [`SECURITY.md`](SECURITY.md) § Supported
+versions. The cadence above is the general policy for an LTS branch that is kept open; it was
+not exercised past `1.0.3` for `1.x`.
 
 ### Codename triggers (`2.0+`)
 
@@ -47,18 +53,33 @@ Three tiers are defined for public traits in `gradatum-core`:
 
 | Tier | Promise |
 |---|---|
-| `#[stability::stable]` | SemVer-strict. Cannot change in a minor. Breakage requires a major + RFC + 1-cycle deprecation. |
+| `#[stability::stable]` | SemVer-strict. Cannot change in a minor. Breakage requires a major + a tracked feature card + 1-cycle deprecation. |
 | `#[stability::unstable]` | May change between minors. Documented in `CHANGELOG.md`. |
 | `#[stability::experimental]` | May change between patches. Used only behind a `unstable-` feature flag. |
 
-**No tier is actually applied in `1.0.0`.** None of the 14 public traits in `gradatum-core`
-carries a `stability::` attribute — the five occurrences in `src/` are rustdoc prose, two of
-which state the attribute is deferred pending an `unstable-storage-traits` feature. Since no
-tier is posted, there is nothing for CI to cross-check: `cargo public-api` and
-`cargo semver-checks` run against the whole surface uniformly, and every public trait is
-treated as SemVer-strict by default. Tagging the traits is planned for a `1.x` minor.
+**No tier is actually applied.** None of the 14 public traits in `gradatum-core` carries a
+`stability::` attribute — the five occurrences in `src/` are rustdoc prose, two of which state
+the attribute is deferred pending an `unstable-storage-traits` feature. Since no tier is
+posted, there is nothing for CI to cross-check: `cargo public-api` and `cargo semver-checks`
+run against the whole surface uniformly, and every public trait is treated as SemVer-strict by
+default. Tagging the traits is planned for a future minor.
 
-**Detailed rules, decision matrix, deprecation cycles, and examples:** see [`docs/RFC/RFC-0001-versioning-gradatum-core.md`](docs/RFC/RFC-0001-versioning-gradatum-core.md).
+**The major + feature-card + 1-cycle deprecation requirement above applies once tiers are
+posted, not before.** The promise is written for a `#[stability::stable]` trait, and no trait
+carries that attribute yet: with no tier posted, there is no stable surface for a deprecation
+cycle to protect, and every public trait is versioned as part of the ordinary major/minor/patch
+surface — a breaking change to it requires a major and a `CHANGELOG.md` entry, nothing more.
+This is the state the `gradatum-core` storage traits are in as of this release: their
+signatures changed in a breaking way, directly, without a tracked feature card or a deprecation
+cycle, because none of them carries a posted tier. Once a trait is tagged
+`#[stability::stable]`, breaking it is held to the full promise — major, feature card, and one
+full cycle of deprecation before removal.
+
+**Detailed decision-matrix rules, deprecation-cycle examples, and Cargo-feature mechanics for
+this tiering scheme** were drafted in a design RFC that predates project-map feature-card
+tracking and has since been retired; no standalone document currently expands on the tier
+table above. The tier definitions in this section are the current complete public record until
+a tier is posted on a trait.
 
 ### AM2 — Contractual testkit *(planned, not shipped in 1.0.0)*
 
@@ -67,7 +88,8 @@ future minor; until then, downstream impls are validated against the trait signa
 The crate's only feature is `test-utils`, which exposes `InMemorySink` for consumer tests — it
 carries no conformance macro.
 
-**Planned testkit scope and CI integration:** see [`docs/RFC/RFC-0001-versioning-gradatum-core.md`](docs/RFC/RFC-0001-versioning-gradatum-core.md) §8.
+**Planned testkit scope and CI integration:** not yet drafted publicly; tracked as future work
+once trait-stability tags are introduced (see AM1 above).
 
 ### AM3 — Crates.io namespace
 
@@ -89,17 +111,19 @@ Two caveats apply to that list:
   crates.io; the crate is not part of the release train.
 - `gradatum-studio` is published only as a `0.0.2` placeholder. The real crate is built and
   served from this workspace but has not yet been released to crates.io.
+- `gradatum-mcp-stub` is **retired from the distribution as of `2.0.0`** — `publish = false`,
+  no longer built or shipped. Its last published crates.io version remains `1.0.0`. The name
+  stays reserved; source is kept in-tree (see [`ARCHITECTURE.md`](ARCHITECTURE.md) § API
+  surface topology for why, and what replaces it).
 
-Publishing an entirely new crate name is a structural change and requires an RFC
-(see [`GOVERNANCE.md`](GOVERNANCE.md)).
+Publishing an entirely new crate name is a structural change, tracked the same way as any
+other (see [`GOVERNANCE.md`](GOVERNANCE.md) § Structural change tracking).
 
 ### AM4 — "AI bus factor = 0"
 
 Every contribution must be reproducible by a human reviewer **without** any AI assistant. This is enforced by:
 
 - Maintainers reject PRs that contain output the contributor cannot explain in plain English.
-- All RFCs include a `Drawbacks` section authored without AI assistance
-  (see [`RFC-TEMPLATE.md`](RFC-TEMPLATE.md) §6).
 
 A repository PR template carrying a "Have you read every line of the diff?" checkbox is
 **planned, not shipped**: `.github/` currently holds workflows only. Until it lands, AM4 is
@@ -136,4 +160,4 @@ The repository may be made public **before `v1.0.0`** at the maintainer's discre
 
 ## Modifying this document
 
-Changes to `RELEASE-POLICY.md` follow the RFC + 14-day lazy-consensus process described in [`GOVERNANCE.md`](GOVERNANCE.md).
+Changes to `RELEASE-POLICY.md` follow the same PR + maintainer review process described in [`GOVERNANCE.md`](GOVERNANCE.md).

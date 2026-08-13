@@ -1,4 +1,4 @@
-//! Structural validator for soul notes (vault section `identity`, since v0.7.3).
+//! Structural validator for soul notes (vault section `identity`).
 //!
 //! Module `soul` — distinct from the core `identity` module (`NoteId`/`ContentHash`).
 //! Deterministic, LLM-free. Bypasses the category gatekeeper on the server side.
@@ -322,7 +322,7 @@ Tu es le Général en Chef. Ton: direct, FR.
         );
     }
 
-    /// Cas 5 — `soul_extends` ignore les occurrences de `extends:` en prose (P1-2 council).
+    /// Cas 5 — `soul_extends` ignore les occurrences de `extends:` en prose.
     ///
     /// La détection est bornée à la 1ère ligne non-vide post-H1 (≤5 lignes post-H1).
     /// Un `extends:` dans NARRATIVE ou après une 1ère ligne non-vide autre ne déclenche PAS
@@ -340,7 +340,7 @@ Tu es le Général en Chef. Ton: direct, FR.
 
     /// Cas 6 — Le champ `scope:` sur une ligne INVARIANT est accepté et ignoré (byte-stable).
     ///
-    /// Les lignes `INV-CANARY | REQUIRED | x | scope:main-only` sont légales (Option A P0 council).
+    /// Les lignes `INV-CANARY | REQUIRED | x | scope:main-only` sont légales.
     /// `scope:` n'est PAS un champ dynamique interdit (C8) : il est statique, versionnée dans le body.
     #[test]
     fn soul_accepts_scope_field() {

@@ -31,8 +31,8 @@ use ulid::Ulid;
 async fn redirect_slug_collision_is_isolated_per_vault() {
     let idx = two_vault_index().await;
     let slug = "titre-collisionne";
-    let ulid_a = Ulid::new();
-    let ulid_b = Ulid::new();
+    let ulid_a = Ulid::generate();
+    let ulid_b = Ulid::generate();
 
     idx.upsert_redirect(VAULT_MAIN, slug, &ulid_a, 1_000)
         .await
@@ -73,7 +73,7 @@ async fn delete_redirect_by_ulid_is_scoped_per_vault() {
     let idx = two_vault_index().await;
     let slug = "titre-a-purger";
     // ULID collisionné volontairement entre les deux vaults.
-    let ulid = Ulid::new();
+    let ulid = Ulid::generate();
 
     idx.upsert_redirect(VAULT_MAIN, slug, &ulid, 1_000)
         .await
@@ -117,8 +117,8 @@ async fn delete_redirect_by_ulid_is_scoped_per_vault() {
 async fn redirect_upsert_off_replace_in_place() {
     let idx = two_vault_index().await;
     let slug = "titre-mono-vault";
-    let ulid1 = Ulid::new();
-    let ulid2 = Ulid::new();
+    let ulid1 = Ulid::generate();
+    let ulid2 = Ulid::generate();
 
     idx.upsert_redirect(VAULT_MAIN, slug, &ulid1, 1_000)
         .await

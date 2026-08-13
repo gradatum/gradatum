@@ -11,7 +11,7 @@
 //!
 //! Robustness: a hard per-decision timeout and a concurrency semaphore isolate the router
 //! from the enrich workload. On saturation / timeout / any error the router **fails fast to
-//! the no-think fallback** — logged, never silent (ctx-gating invariant, council 01KWVXAWB3).
+//! the no-think fallback** — logged, never silent (ctx-gating invariant).
 //! The definitive slot/parallel sizing comes from Bob at cutover; the `max_concurrent` cap
 //! here is a configurable, safe default.
 //!
@@ -19,7 +19,7 @@
 //! AND as Prometheus series on `/metrics` — `gateway_router_decisions_total{source}`,
 //! `gateway_router_fallback_total{reason}`, and the `gateway_router_curator_latency_seconds`
 //! / `gateway_router_system_latency_seconds` histograms (probe D-9). The fallback counter is
-//! incremented at the same point as the WARN below (never silent — invariant 01KWVXAWB3).
+//! incremented at the same point as the WARN below (never silent — invariant).
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -243,7 +243,7 @@ impl RouterClient {
                 Err(e) => {
                     let elapsed = curator_start.elapsed();
                     metrics.observe_router_curator_latency(elapsed);
-                    // Fallback métriqué au même point que le WARN (jamais silencieux — 01KWVXAWB3).
+                    // Fallback métriqué au même point que le WARN (jamais silencieux).
                     metrics.record_router_fallback(e.reason_label());
                     tracing::warn!(
                         reason = %e,

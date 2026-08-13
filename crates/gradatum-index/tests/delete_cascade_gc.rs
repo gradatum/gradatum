@@ -33,7 +33,7 @@ async fn gc_orphan_ann_is_idempotent() {
     let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
 
     // Seed une note vivante puis une note « orpheline » côté notes seulement.
-    idx.seed_note_with_fts(&Ulid::new().to_string(), "feedback", "note vivante")
+    idx.seed_note_with_fts(&Ulid::generate().to_string(), "feedback", "note vivante")
         .await
         .expect("seed note");
 
@@ -49,7 +49,7 @@ async fn gc_orphan_ann_is_idempotent() {
 async fn delete_note_from_index_removes_and_is_idempotent() {
     let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
 
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     idx.seed_note_with_fts(&id, "decisions", "corps cherchable alpha")
         .await
         .expect("seed note");
@@ -90,7 +90,7 @@ async fn delete_note_from_index_absent_returns_false() {
     let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
 
     let deleted = idx
-        .delete_note_from_index("main", &Ulid::new().to_string())
+        .delete_note_from_index("main", &Ulid::generate().to_string())
         .await
         .expect("delete absent");
     assert!(!deleted, "note absente → false");
@@ -105,7 +105,7 @@ async fn list_garbage_older_than_excludes_protected_sections() {
     // Une note garbage par section protégée (jamais candidate au Purge).
     let mut protected_ids = Vec::new();
     for section in Section::PROTECTED_DELETE {
-        let id = Ulid::new().to_string();
+        let id = Ulid::generate().to_string();
         idx.seed_note_with_status(&id, *section, "note gouvernance", NoteStatus::Garbage, None)
             .await
             .expect("seed protected garbage");
@@ -113,7 +113,7 @@ async fn list_garbage_older_than_excludes_protected_sections() {
     }
 
     // Deux notes garbage NON protégées (candidates légitimes, non-régression GC).
-    let feedback_id = Ulid::new().to_string();
+    let feedback_id = Ulid::generate().to_string();
     idx.seed_note_with_status(
         &feedback_id,
         Section::Feedback,
@@ -123,7 +123,7 @@ async fn list_garbage_older_than_excludes_protected_sections() {
     )
     .await
     .expect("seed feedback garbage");
-    let debug_id = Ulid::new().to_string();
+    let debug_id = Ulid::generate().to_string();
     idx.seed_note_with_status(
         &debug_id,
         Section::Debug,

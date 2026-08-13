@@ -90,6 +90,13 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("config loading failed: {e}"))?;
     init_tracing(&cfg.log.format);
 
+    // OpenDAL object backends (S3) : installe le fournisseur crypto puis le transport HTTP
+    // au démarrage, dans cet ordre, AVANT toute écriture via la couche `Storage`. Hors du
+    // chemin TLS (`load_tls_config`), qui n'est emprunté que si `[server.tls]` est configuré :
+    // un déploiement loopback sans TLS n'y passe jamais, mais écrit quand même sur S3.
+    // No-op si ce binaire est bâti sans backend objet.
+    gradatum_storage::install_object_backend_defaults();
+
     // F-110 Phase 2 : validation fail-loud de la config salience (k_norm > 0).
     if let Err(e) = cfg.salience.validate() {
         anyhow::bail!("invalid config: {e}");
@@ -1189,6 +1196,19 @@ async fn main() -> anyhow::Result<()> {
         let index = state.search.clone();
         let metrics = state.metrics.clone();
         let storage_root = cfg.storage.root.clone();
+        // Backend de stockage du vault (fs local ou objet S3) — LA MÊME configuration que
+        // le vault (`<vault_path>/.gradatum/config.toml`), lue une fois au boot comme lui.
+        // La passe d'audit écrit ses rapports via cette couche, jamais en accès fichier
+        // direct : sur un backend objet, les rapports suivent les notes au lieu de rester
+        // silencieusement en local. Chargement déjà validé par `with_vault_path` ci-dessus.
+        let storage_backend = gradatum_core::config::VaultConfig::load_from_root(&vault_path)
+            .with_context(|| {
+                format!(
+                    "load vault storage config from {} (audit report writer)",
+                    vault_path.display()
+                )
+            })?
+            .storage;
         let interval_secs_audit = crate::scheduled_tasks::task_interval_secs(
             crate::scheduled_tasks::TASK_AUDIT_DEDUP,
             &cfg,
@@ -1221,6 +1241,7 @@ async fn main() -> anyhow::Result<()> {
                     &downgrade_cfg,
                     note_usage.as_ref(),
                     Some(&downgrader),
+                    &storage_backend,
                     &storage_root,
                     "main",
                     now_ms,

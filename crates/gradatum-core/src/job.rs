@@ -17,11 +17,12 @@
 //! gradatum-worker (L4)    — Apalis handlers + orchestration
 //! ```
 //!
-//! # Bincode order — IMMUTABLE
+//! # Wire discriminant — variant NAMES are stable
 //!
-//! [`Job`] variants are encoded by position by `bincode`.
-//! **Never reorder existing variants.** New variants must be appended at the
-//! end. Violation causes silent corruption of jobs stored in the database.
+//! [`Job`] is serialised via `serde_json` with `#[serde(tag = "type", content = "data")]`,
+//! so the wire discriminant is each variant's **name** (the `"type"` key), never its
+//! declaration position. **Never rename an existing variant** — it breaks decoding of jobs
+//! already persisted in `gradatum_jobs`. Reordering variants is harmless.
 
 #![allow(dead_code)] // types consommés progressivement selon le pipeline
 
@@ -43,84 +44,85 @@ use ulid::Ulid;
 pub type VaultScope = JobScope;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Job enum — ordre bincode figé (v55)
+// Job enum — noms de variants figés (discriminant JSON "type")
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Job type submitted to the queue.
 ///
-/// # Bincode order — IMMUTABLE
+/// # Wire discriminant — variant NAMES are stable
 ///
-/// Variants are encoded by position (0-20). Never reorder.
-/// New variants must be appended at the end.
-///
-/// Position comments `(N)` are informational — bincode encodes by Rust
-/// declaration order, not by explicit numeric value.
+/// Serialised via `serde_json` (`#[serde(tag = "type", content = "data")]`): the
+/// `"type"` key holds the variant name. **Never rename a variant** — it breaks decoding
+/// of jobs already persisted in `gradatum_jobs`. Reordering variants is harmless.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum Job {
     // System jobs (0-12) — automatic
-    /// ReAct agent loop — bincode position 0.
+    /// ReAct agent loop.
     Agent,
-    /// `[[pipelines]]` step — bincode position 1.
+    /// `[[pipelines]]` step.
     Pipeline,
-    /// Web crawler — bincode position 2.
+    /// Web crawler.
     Collect,
-    /// Semantic distillation — bincode position 3.
+    /// Semantic distillation.
     ///
-    /// The variant changed from unit to tuple; bincode position 3 is
-    /// UNCHANGED (preserves bincode/serde stability of the `kind` column).
-    /// Any `Distill` jobs in the queue must be absent before deployment.
+    /// The variant changed from unit to tuple: the serde representation gained a
+    /// `data` field, while the `"type"` key (and the denormalised `kind` column)
+    /// stays `"Distill"`. Any `Distill` jobs persisted in the old unit form must be
+    /// drained before deployment.
     ///
     /// Only `DistillMode::Semantic` is implemented. `Learn`/`Peer`/`Rationale`
     /// modes require a complete event-log and are deferred (YAGNI).
     Distill(DistillSource),
-    /// Vault backup — bincode position 4.
+    /// Vault backup.
     Backup,
-    /// Lifecycle purge (removes `Garbage` notes) — bincode position 5.
+    /// Lifecycle purge (removes `Garbage` notes).
     ///
-    /// The variant changed from unit to tuple; bincode position 5 is
-    /// UNCHANGED. Any `Purge` jobs in the queue must be absent before deployment.
+    /// The variant changed from unit to tuple: the serde representation gained a
+    /// `data` field (the `"type"` key stays `"Purge"`). Any `Purge` jobs persisted
+    /// in the old unit form must be drained before deployment.
     Purge(PurgeSpec),
-    /// Full-text and/or vector re-index — bincode position 6.
+    /// Full-text and/or vector re-index.
     ReIndex(ReIndexMode),
-    /// Content summarisation — bincode position 7.
+    /// Content summarisation.
     Summarize,
-    /// Memory validation and healing — bincode position 8.
+    /// Memory validation and healing.
     Validate(ValidateSpec),
-    /// Vault scoring and deduplication — bincode position 9.
+    /// Vault scoring and deduplication.
     Audit,
-    /// Mental model consolidation — bincode position 10.
+    /// Mental model consolidation.
     Consolidate,
-    /// Inbox classification and curation — bincode position 11.
+    /// Inbox classification and curation.
     Curate(CurateSpec),
-    /// Semantic forget of notes — bincode position 12.
+    /// Semantic forget of notes.
     ///
-    /// The variant changed from unit to tuple; bincode position 12 is
-    /// UNCHANGED. Any `Forget` jobs in the queue must be absent before deployment.
+    /// The variant changed from unit to tuple: the serde representation gained a
+    /// `data` field (the `"type"` key stays `"Forget"`). Any `Forget` jobs persisted
+    /// in the old unit form must be drained before deployment.
     Forget(ForgetSpec),
 
     // Human jobs (13-16) — JobClass::Human required
-    /// Validates or rejects a batch of `needs-review` notes — bincode position 13.
+    /// Validates or rejects a batch of `needs-review` notes.
     Review,
-    /// Manually classifies an unresolved `inbox/` note — bincode position 14.
+    /// Manually classifies an unresolved `inbox/` note.
     Classify,
-    /// Merges two duplicate notes (after `Job::Audit`) — bincode position 15.
+    /// Merges two duplicate notes (after `Job::Audit`).
     Merge,
-    /// Enriches metadata for a batch of notes — bincode position 16.
+    /// Enriches metadata for a batch of notes.
     Annotate,
 
-    // Added at the end to preserve bincode order
-    /// Predecessor vault import · `JobClass::Human` — bincode position 17.
+    // Human→machine variants (variant names are the wire discriminant; order is cosmetic)
+    /// Predecessor vault import · `JobClass::Human`.
     Migrate(MigrateSource),
-    /// CSV/PDF/JSON export from notes · `JobClass::Agent|Human` — bincode position 18.
+    /// CSV/PDF/JSON export from notes · `JobClass::Agent|Human`.
     Export(ExportSource),
-    /// Cascade external notification · `JobClass::System` — bincode position 19.
+    /// Cascade external notification · `JobClass::System`.
     Notify(NotifySource),
-    /// Document ingestion via queue · `JobClass::Agent|Human` — bincode position 20.
+    /// Document ingestion via queue · `JobClass::Agent|Human`.
     Ingest(IngestSource),
 
-    // Embed appended at the end to preserve bincode order of positions 0-20
-    /// Vector embedding generation — bincode position 21.
+    // Embed variant (variant name is the wire discriminant; order is cosmetic)
+    /// Vector embedding generation.
     Embed(EmbedSpec),
 }
 
@@ -199,8 +201,8 @@ pub struct CurateSpec {
     /// absent `occurred_at` leaves the existing anchor untouched instead of re-stamping it with
     /// the current time.
     ///
-    /// Serialised in bincode as `Option<[u8; 32]>` (32 fixed bytes or `None`).
-    /// Payload overhead: +33 bytes (1 bincode discriminant + 32-byte hash) — negligible.
+    /// Serialised in JSON as `Option<[u8; 32]>` — a 32-element byte array, or omitted
+    /// entirely when `None` (`skip_serializing_if = "Option::is_none"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_sha256: Option<[u8; 32]>,
     /// Temporal anchor — event date of the note (ISO 8601 UTC or YYYY-MM-DD string).
@@ -976,7 +978,7 @@ pub enum JobMode {
 
 /// Scope of a job — what the work operates on.
 ///
-/// `#[non_exhaustive]`: new scope variants may be added within the `1.x` line, so
+/// `#[non_exhaustive]`: new scope variants may be added within the `2.x` line, so
 /// downstream matches must carry a `_` arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1987,7 +1989,7 @@ mod tests {
     fn make_job_record(job: Job, class: JobClass) -> JobRecord {
         let now = Utc::now();
         JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: job,
                 class,
@@ -2134,7 +2136,7 @@ mod tests {
     fn job_record_serialize_roundtrip() {
         let record = make_job_record(
             Job::Embed(EmbedSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 force_regenerate: false,
             }),
@@ -2163,10 +2165,10 @@ mod tests {
         let record = {
             let now = Utc::now();
             JobRecord {
-                id: Ulid::new(),
+                id: Ulid::generate(),
                 spec: JobSpec {
                     kind: Job::Curate(CurateSpec {
-                        note_id: Ulid::new(),
+                        note_id: Ulid::generate(),
                         tenant_id: "main".to_string(),
                         ..Default::default()
                     }),
@@ -2241,7 +2243,7 @@ mod tests {
 
     #[test]
     fn queue_event_variants_serialize() {
-        let id = Ulid::new();
+        let id = Ulid::generate();
         let ev = QueueEvent::JobInserted(id);
         let json = serde_json::to_string(&ev).expect("QueueEvent doit être sérialisable");
         assert!(json.contains("JobInserted"));
@@ -2485,11 +2487,11 @@ mod tests {
     #[test]
     fn validate_spec_roundtrip_and_kind() {
         let spec = ValidateSpec {
-            note_id: Ulid::new(),
+            note_id: Ulid::generate(),
             tenant_id: "main".to_string(),
             title: "t".to_string(),
             body: "b".to_string(),
-            source_ids: vec![Ulid::new()],
+            source_ids: vec![Ulid::generate()],
             source_texts: vec!["s".to_string()],
             source_trusts: vec![0.6],
             base_trust: 0.6,
@@ -2618,7 +2620,7 @@ mod tests {
 
         // Embed → EmbedSpec.tenant_id (enqueué LIVE après curate — apalis_handlers:1945).
         let embed = mk(Job::Embed(EmbedSpec {
-            note_id: Ulid::new(),
+            note_id: Ulid::generate(),
             tenant_id: "eve".into(),
             force_regenerate: false,
         }));

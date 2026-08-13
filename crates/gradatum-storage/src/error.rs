@@ -8,10 +8,11 @@ use thiserror::Error;
 
 /// Error produced by storage operations (`Storage` trait and implementations).
 ///
-/// `StorageError::Core` wraps `GradatumError` values propagated from the NFS guard.
+/// `StorageError::Core` wraps `GradatumError` values propagated from the core crate.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum StorageError {
-    /// Generic I/O error (statfs, read, write, permissions).
+    /// Generic I/O error (read, write, permissions).
     #[error("io: {0}")]
     Io(String),
 
@@ -27,7 +28,16 @@ pub enum StorageError {
     #[error("opendal: {0}")]
     OpenDal(String),
 
-    /// Error originating from `gradatum-core` (e.g. `GradatumError::VaultOnNfs`).
+    /// Invalid or unsupported storage configuration.
+    ///
+    /// Produced by the storage factory when the configured service is unknown, when
+    /// its Cargo feature is not enabled in this build, or when a required connection
+    /// parameter (e.g. `bucket` for `s3`) is missing. The message names what is wrong
+    /// and **never** contains a credential — gradatum reads no secret.
+    #[error("storage config: {0}")]
+    ConfigInvalid(String),
+
+    /// Error originating from `gradatum-core`.
     #[error("core: {0}")]
     Core(#[from] gradatum_core::error::GradatumError),
 }

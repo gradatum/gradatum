@@ -525,7 +525,7 @@ pub async fn seed_eval_corpus(
     let mut key_to_ulid: HashMap<String, String> = HashMap::with_capacity(CORPUS.len());
 
     for note in CORPUS {
-        let ulid_str = Ulid::new().to_string();
+        let ulid_str = Ulid::generate().to_string();
         // Corps FTS : titre en H1 + body (même pattern que seed_note_sql_only dans helpers).
         let body_fts = format!("# {}\n{}", note.title, note.body);
 

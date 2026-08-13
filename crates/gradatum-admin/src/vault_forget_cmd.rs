@@ -550,7 +550,7 @@ fn build_forget_job_record(
         confirm_ulids,
     };
     JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind: Job::Forget(spec),
             class: JobClass::Human,

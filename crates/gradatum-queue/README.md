@@ -2,7 +2,7 @@
 
 > SQLite-backed durable job queue with atomic lease acquisition and automatic recovery.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -27,7 +27,7 @@ The crate provides two APIs:
 
 ```toml
 [dependencies]
-gradatum-queue = "1.0.0"
+gradatum-queue = "2.0.0"
 ```
 
 ```rust
@@ -37,11 +37,13 @@ use gradatum_core::QueueStore;
 // GradatumQueue wraps a SqliteQueueStore (see the gradatum workspace).
 let queue = GradatumQueue::new(store);
 
-// Enqueue a job.
+// Enqueue a job. `job` is a `gradatum_core::JobRecord` — assembled from its five
+// blocks (spec, scheduling, lifecycle, retry, lineage); see `gradatum_core::job`.
 let id: ulid::Ulid = queue.enqueue(job).await?;
 
 // Atomic lease acquisition — only one consumer receives a given job.
-if let Some(leased) = queue.dequeue().await? {
+// `tenant_filter`: `None` = no tenant clause (single-tenant / backward-compatible).
+if let Some(leased) = queue.dequeue(None).await? {
     // process job …
 }
 ```

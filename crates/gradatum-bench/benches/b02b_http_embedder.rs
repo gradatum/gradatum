@@ -8,7 +8,8 @@
 //! En pratique sur localhost (loopback), on mesure sub-1ms.
 //! Le résultat documenté dans BENCH.md représente le coût client pur — pas LAN réel.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

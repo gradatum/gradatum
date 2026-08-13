@@ -12,7 +12,8 @@
 //! ```
 //! Attention : ~150MB de téléchargement de modèle ONNX au premier run.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 #[cfg(feature = "fastembed-cpu")]
 fn bench_fastembed_cpu(c: &mut Criterion) {

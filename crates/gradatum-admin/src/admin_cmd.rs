@@ -60,16 +60,14 @@ pub async fn run_delete(
     execute: bool,
 ) -> anyhow::Result<()> {
     let client = conn.client()?;
-    let req = VaultDeleteRequest {
-        note_id: id.clone(),
-        dry_run: !execute,
-        confirm_ulids: if execute {
-            vec![id.clone()]
-        } else {
-            Vec::new()
-        },
-        tenant_id: tenant.map(|t| t.into()),
+    let mut req = VaultDeleteRequest::new(id.clone());
+    req.dry_run = !execute;
+    req.confirm_ulids = if execute {
+        vec![id.clone()]
+    } else {
+        Vec::new()
     };
+    req.tenant_id = tenant.map(|t| t.into());
     let resp = client
         .delete(&req)
         .await
@@ -113,17 +111,16 @@ pub struct ArchivesListArgs {
 /// an error status.
 pub async fn run_archives_list(conn: Conn, args: ArchivesListArgs) -> anyhow::Result<()> {
     let client = conn.client()?;
-    let req = VaultArchivesListRequest {
-        vault_filter: args.vault,
-        section: args.section,
-        since_ms: args.since_ms,
-        until_ms: args.until_ms,
-        include_gc: args.include_gc,
-        include_restored: args.include_restored,
-        limit: args.limit.unwrap_or(50),
-        offset: args.offset.unwrap_or(0),
-        tenant_id: args.tenant.map(|t| t.into()),
-    };
+    let mut req = VaultArchivesListRequest::default();
+    req.vault_filter = args.vault;
+    req.section = args.section;
+    req.since_ms = args.since_ms;
+    req.until_ms = args.until_ms;
+    req.include_gc = args.include_gc;
+    req.include_restored = args.include_restored;
+    req.limit = args.limit.unwrap_or(50);
+    req.offset = args.offset.unwrap_or(0);
+    req.tenant_id = args.tenant.map(|t| t.into());
     let resp = client
         .archives_list(&req)
         .await
@@ -168,16 +165,14 @@ pub async fn run_archives_purge(
     execute: bool,
 ) -> anyhow::Result<()> {
     let client = conn.client()?;
-    let req = VaultArchivesPurgeRequest {
-        note_id: id.clone(),
-        dry_run: !execute,
-        confirm_ulids: if execute {
-            vec![id.clone()]
-        } else {
-            Vec::new()
-        },
-        tenant_id: tenant.map(|t| t.into()),
+    let mut req = VaultArchivesPurgeRequest::new(id.clone());
+    req.dry_run = !execute;
+    req.confirm_ulids = if execute {
+        vec![id.clone()]
+    } else {
+        Vec::new()
     };
+    req.tenant_id = tenant.map(|t| t.into());
     let resp = client
         .archives_purge(&req)
         .await
@@ -210,16 +205,14 @@ async fn restore_one(
     tenant: Option<&str>,
     execute: bool,
 ) -> anyhow::Result<VaultArchivesRestoreResult> {
-    let req = VaultArchivesRestoreRequest {
-        note_id: id.to_string(),
-        dry_run: !execute,
-        confirm_ulids: if execute {
-            vec![id.to_string()]
-        } else {
-            Vec::new()
-        },
-        tenant_id: tenant.map(|t| t.to_string().into()),
+    let mut req = VaultArchivesRestoreRequest::new(id.to_string());
+    req.dry_run = !execute;
+    req.confirm_ulids = if execute {
+        vec![id.to_string()]
+    } else {
+        Vec::new()
     };
+    req.tenant_id = tenant.map(|t| t.to_string().into());
     client
         .archives_restore(&req)
         .await
@@ -306,18 +299,14 @@ pub async fn run_archives_restore_range(
     args: ArchivesRestoreRangeArgs,
 ) -> anyhow::Result<()> {
     let client = conn.client()?;
+    let mut list_req = VaultArchivesListRequest::default();
+    list_req.section = args.section;
+    list_req.since_ms = args.from_ms;
+    list_req.until_ms = args.to_ms;
+    list_req.limit = 500;
+    list_req.tenant_id = args.tenant.clone().map(|t| t.into());
     let list = client
-        .archives_list(&VaultArchivesListRequest {
-            vault_filter: None,
-            section: args.section,
-            since_ms: args.from_ms,
-            until_ms: args.to_ms,
-            include_gc: false,
-            include_restored: false,
-            limit: 500,
-            offset: 0,
-            tenant_id: args.tenant.clone().map(|t| t.into()),
-        })
+        .archives_list(&list_req)
         .await
         .context("listing of the range to restore failed")?;
 
@@ -387,9 +376,7 @@ pub async fn run_vault_lifecycle(
     vault_id: String,
 ) -> anyhow::Result<()> {
     let client = conn.client()?;
-    let req = VaultLifecycleRequest {
-        vault_id: vault_id.into(),
-    };
+    let req = VaultLifecycleRequest::new(vault_id.into());
     let resp = match op {
         VaultLifecycleOp::Create => client.vault_create(&req).await,
         VaultLifecycleOp::Suspend => client.vault_suspend(&req).await,
@@ -422,12 +409,10 @@ pub async fn run_vault_purge(
     limit: usize,
 ) -> anyhow::Result<()> {
     let client = conn.client()?;
-    let req = VaultPurgeRequest {
-        vault_id: vault_id.clone().into(),
-        dry_run: !execute,
-        confirm_vault_id: if execute { Some(vault_id.into()) } else { None },
-        limit,
-    };
+    let mut req = VaultPurgeRequest::new(vault_id.clone().into());
+    req.dry_run = !execute;
+    req.confirm_vault_id = if execute { Some(vault_id.into()) } else { None };
+    req.limit = limit;
     let resp = client
         .vault_purge(&req)
         .await

@@ -101,10 +101,10 @@ fn make_vault_write_curate_job(title: &str, body: &str) -> GradatumJob {
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Curate(CurateSpec {
-                    note_id: Ulid::new(),
+                    note_id: Ulid::generate(),
                     tenant_id: "main".to_string(),
                     title: Some(title.to_string()),
                     body: Some(body.to_string()),

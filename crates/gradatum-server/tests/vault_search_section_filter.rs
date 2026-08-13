@@ -120,8 +120,8 @@ async fn section_filter_excludes_other_sections_in_semantic_path() {
         )
         .expect("jwt");
 
-    let id_ref = Ulid::new().to_string();
-    let id_debug = Ulid::new().to_string();
+    let id_ref = Ulid::generate().to_string();
+    let id_debug = Ulid::generate().to_string();
 
     // Deux notes, sections différentes, MÊME corpus de mots → match BM25 + cosine.
     seed_embedded(

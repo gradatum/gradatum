@@ -1,7 +1,7 @@
 # Gradatum — Architecture
 
 > Source of truth for technical design. Updated as the project evolves.
-> Last architectural review : 2026-08-01 — workspace version 1.0.0, Rust edition 2024, MSRV 1.91.
+> Last architectural review : 2026-08-01 — workspace version 1.0.2, Rust edition 2024, MSRV 1.91.
 > This header deliberately carries no commit anchor. An anchor written by hand into the
 > very file it dates cannot be kept accurate: making it current requires naming the commit
 > that writes it, which is a fixed point of the hash. For the document's actual position in
@@ -15,7 +15,7 @@
 
 > All endpoint fields introduced here are optional; omitting them preserves prior behavior
 > exactly. See [CHANGELOG.md](CHANGELOG.md) `[0.7.6]` for the full list of changes in that
-> release, and `[1.0.0]` for the current one — including its **breaking changes**.
+> release, and `[2.0.0]` for the current one — including its **breaking changes**.
 
 ### Context assembly pipeline (`vault_context`)
 
@@ -413,13 +413,13 @@ Gradatum is a **memory backbone** for multi-agent AI systems — not a note-taki
 └──────────────────────────────────┬─────────────────────────────────┘
                                    │
 ┌──────────────────────────────────┴─────────────────────────────────┐
-│  DATA PLANE      (workspace 31 crates total, 27 publishable)         │
+│  DATA PLANE      (workspace 31 crates total, 26 publishable)         │
 ├────────────────────────────────────────────────────────────────────┤
 │  gradatum-core         shared primitives (errors, ids, types)      │
 │  gradatum-dto          wire-contract DTOs (single source of truth) │
 │  gradatum-markdown     parse/serialize MD + frontmatter + wikilinks│
 │  gradatum-vault        multi-vault registry + lifecycle + swap     │
-│  gradatum-storage      FS/object abstraction (opendal) + NFS guard │
+│  gradatum-storage      FS/object abstraction (opendal): fs, s3     │
 │  gradatum-index        SQLite + FTS5 + brute-force cosine + PageRank│
 │  gradatum-db-sqlite    SqliteQueueStore — Apalis job queue impl    │
 │  gradatum-search       multi-mode reader (BM25/semantic/graph/RRF) │
@@ -461,9 +461,14 @@ Gradatum is a **memory backbone** for multi-agent AI systems — not a note-taki
 └────────────────────────────────────────────────────────────────────┘
                                    │
 ┌──────────────────────────────────┴─────────────────────────────────┐
-│  CLIENTS         (2 binaries + 2 libraries)                        │
+│  CLIENTS         (1 distributed binary + 2 libraries;              │
+│                    1 retired binary, source kept in-tree)          │
 ├────────────────────────────────────────────────────────────────────┤
-│  gradatum-mcp-stub  adapter MCP stdio → HTTP (thin proxy)          │
+│  gradatum-mcp-stub  RETIRED in 2.0.0 — was adapter MCP stdio → HTTP│
+│                     (thin proxy); publish = false, no longer built │
+│                     or distributed. MCP clients connect to /mcp    │
+│                     on gradatum-server directly (see § API surface │
+│                     topology, further down in this document).      │
 │  gradatum-cli       end-user CLI (placeholder, not implemented)    │
 │  gradatum-sdk-rs    Rust SDK for direct integration                │
 │  gradatum           umbrella SDK facade (feature-gated re-exports) │
@@ -657,8 +662,12 @@ state to back up, not as a derived artefact you can regenerate on demand.
 │
 ├── audit/                             ← <storage.root>/audit — NOT under vault/
 │   ├── audit.YYYY-MM-DD.jsonl         (HTTP audit sink, daily UTC rotation, mode 0640;
-│   │                                   holds note bodies — see SECURITY.md)
-│   └── audit-report-<vault>-*.{json,md}, audit-commands-<vault>-*.sh   (audit job output)
+│   │                                   holds note bodies — see SECURITY.md; always local,
+│   │                                   independent of [storage])
+│   └── audit-report-<vault>-*.{json,md}, audit-commands-<vault>-*.sh   (audit/dedup job
+│                                       output, opt-in via [audit] enabled; written through
+│                                       the same [storage] backend as the vault — follows it
+│                                       to the object store when service = "s3"; see SECURITY.md)
 │
 ├── md/                                (optional, empty by default)
 │
@@ -900,7 +909,7 @@ matching `*.down.sql` (the runner itself is forward-only; rollback is manual).
 | 0037 `archive_active_vault_scope` | `uidx_archive_active` | Partial unique index `note_id` → `(vault_id, note_id)`. Availability fix (cross-vault archive DoS), not a leak. |
 | 0038 `ann_composite_vault` | `note_embeddings_ann` (vec0) | Drops the global `note_id PRIMARY KEY`; partition identity becomes `(vault_id, embedder_id)`. Table recreated **empty** and rebuilt at boot from `note_embeddings` (source of truth). Gated by the `vec0` extension: not applied while `search.ann_backend = BruteForce`. |
 | 0039 `child_tables_composite_fk` | `note_audit_trail`, `note_embeddings`, `note_history` | Restores the referential guard removed by 0032: `FOREIGN KEY (vault_id, note_id) REFERENCES notes(vault_id, id) ON DELETE CASCADE`. Effective, not decorative (`PRAGMA foreign_keys = ON` at runtime). |
-| 0040 `grants_section_scope` | `tenant_vault_grants` | L3 (F-121, ledger pré-flip) : grant **SECTION-scopé**. `ALTER TABLE ... ADD COLUMN section` nullable — `NULL` = grant vault-entier = sémantique C1 stricte. Rows existing (seed `main↔main`, self-grants `provision_vault`) stay `NULL` → zero data migration. Serveur `tenant_guard` exige que le grant COUVRE la section demandée. PK reste `(tenant_id, vault_id)` — au plus une ligne par (tenant, vault). Inerte à OFF (byte-identical v0.9.0). |
+| 0040 `grants_section_scope` | `tenant_vault_grants` | L3 (F-121, ledger pré-flip) : grant **SECTION-scopé**. `ALTER TABLE ... ADD COLUMN section` nullable — `NULL` = grant vault-entier = sémantique C1 stricte. Rows existing (seed `main↔main`, self-grants `provision_vault`) stay `NULL` → zero data migration. Serveur `tenant_guard` exige que le grant COUVRE la section demandée. PK reste `(tenant_id, vault_id)` — au plus une ligne par (tenant, vault). Inerte à OFF (byte-identical v1.0.0). |
 | 0041 `feature_counter` | `feature_counter` | F-41-adjacent : compteur persistant **per-vault** (`vault_id` PK) pour l'allocation ATOMIQUE des numéros de carte project-map (`[[feature:F-XX]]`). `value` = dernier numéro alloué ; l'allocation rend `max(value, max dérivé des cartes) + 1` (le dérivé recalculé à chaque appel corrige le plancher). Pas de seed en dur. Inerte tant qu'aucune allocation (`allocate_feature_number`). |
 | 0042 `agent_vault_grants` | `agent_vault_grants` | Substrat **agent↔vault** (lot B6, plan v1.0.0) : duplique `tenant_vault_grants` (0030) un cran plus bas — l'agent, pas le tenant. `access ∈ {read, write}` ('write' couvre la lecture), colonne `section` nullable, PK `(agent_id, vault_id)`. Absence de ligne = **REFUS** (fail-closed, invariant 5). Seed idempotent `INSERT OR IGNORE ('main-agent', 'main', 'write')`. Inerte tant qu'aucune consultation — câblée en B7 (identité) + B8 (portée section). |
 
@@ -1056,13 +1065,14 @@ Failover is manual (or scripted via systemd watchdog if user wants).
 
 ## Platform support
 
-| Tier | Platform | CI compile | CI runtime | Guarantees |
-|---|---|---|---|---|
-| Primary | Linux x86_64 | Forgejo Actions | All tests | Full feature set, official support |
-| Secondary | Windows x86_64 | Cross-compile mingw-w64 (`continue-on-error`) | Manual pre-release | Compile clean, core tests, NFS check warn |
-| Future | macOS | — | — | Code remains portable by design (`cfg(unix)` preferred) |
+Gradatum targets **Linux exclusively** (x86_64, aarch64) as native platform, as of 2026-06-05;
+Windows is supported **via Docker only** (no native binary); macOS is out of scope entirely. The
+tiered Linux-primary/Windows-secondary/macOS-future model that used to govern this section was
+retired along with the written-RFC process that defined it (see [`GOVERNANCE.md`](GOVERNANCE.md)
+§ Structural change tracking).
 
-See [`docs/RFC/RFC-0002-cross-platform-support.md`](docs/RFC/RFC-0002-cross-platform-support.md) for full tiered support model and portability rules R1–R13. Established 2026-05-04.
+[`docs/DEPLOYMENT.md` § Platform support](docs/DEPLOYMENT.md#platform-support) is the normative
+statement — this section is a pointer, not a second copy, to avoid the two drifting apart.
 
 ---
 
@@ -1109,7 +1119,7 @@ this one is a pointer rather than a duplicate.
 
 **Health checks**:
 
-- `/health` endpoint returns `{"status":"ok"|"degraded", ...}` (sync with RFC-0003 §8)
+- `/health` endpoint returns `{"status":"ok"|"degraded", ...}`
 - `smoke-alpha-5.sh`: 9-step acceptance test (auth path 2 criteria, write→curator→read, audit JSONL generation)
 - Smoke result (2026-05-07): 4 PASS / 5 WARN / 0 FAIL (auth runtime + deploy patterns validated, docs/non-blocking warnings)
 
@@ -1138,9 +1148,45 @@ Two distinct audit systems coexist:
 
 ---
 
+## API surface topology
+
+`gradatum-server` exposes **one TCP listener, one HTTP port** (default `19090`, see
+[Guide E — Ports & configuration](docs/guides/E-ports-and-config.md)). Every surface — native
+HTTP API, MCP, health probe, token issuance, the Studio UI — is multiplexed on that single port
+by path-prefix routing (`axum::Router::nest()` / `.merge()`, `crates/gradatum-server/src/main.rs`):
+
+```
+http://<host>:19090
+├── /api/v1/...   → native HTTP API (auth required)         — gradatum-cli, gradatum-sdk-rs, curl, custom integrations
+├── /mcp          → native MCP server, StreamableHTTP (auth required) — any MCP-aware client that can attach a header
+├── /health       → liveness/readiness probe (unauthenticated)
+├── /auth/exchange → API key → JWT issuance (unauthenticated — this is the token issuer itself)
+└── /ui/...       → gradatum-studio SPA (served by gradatum-server, own JWT-based login)
+```
+
+A separate listener, bound to loopback only by default (`127.0.0.1:19091`, security caveat C7,
+[SECURITY.md § Hardening defaults](SECURITY.md#hardening-defaults)), exposes Prometheus
+`/metrics`. It is not reachable through the main port.
+
+This single-port, path-prefix topology was the routing decision of a design note
+(`RFC-0003 §§3–4`) written before `gradatum-server` existed; the note itself is retired (see
+[`GOVERNANCE.md`](GOVERNANCE.md) § Structural change tracking), but the decision it records is
+still the router's actual shape, verified against `crates/gradatum-server/src/main.rs`. Two
+prefixes that same note proposed, `/sse` (MCP-over-SSE, legacy transport) and a dedicated
+`/admin` prefix, were never implemented — admin-scoped operations live under `/api/v1/...`,
+gated by ACL scope rather than by a separate path.
+
+MCP client integration used to run through a companion binary, `gradatum-mcp-stub`, translating
+stdio MCP calls into HTTP requests against `gradatum-server`. That binary is **retired as of
+`2.0.0`** — source kept in-tree (`publish = false`), no longer built or distributed. Every MCP
+client now connects directly to `/mcp` above; see
+[Guide D — MCP & Studio](docs/guides/D-mcp-and-studio.md) for current client setup.
+
+---
+
 ## Endpoints
 
-Server `:19090` exposes the following HTTP (REST) endpoints — MCP parity via `gradatum-mcp-stub`.
+Server `:19090` exposes the following HTTP (REST) endpoints.
 
 **Body limits** : `/mcp` capped at **512 KiB** (`RequestBodyLimitLayer`, applied at the service level — `DefaultBodyLimit` is ineffective on rmcp) ; `/internal/v1/persist/embedding` capped at **512 KiB** (`DefaultBodyLimit::max(EMBEDDING_BODY_LIMIT)`).
 

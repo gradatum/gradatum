@@ -5,12 +5,13 @@
 //!
 //! ## Contents
 //!
-//! - `SqliteIndex`: SQLite + FTS5 store, four mandatory PRAGMAs, migration `0001_phase1.sql`.
-//! - `drift::scan_phase_a`: three-level helper (size → prefix-4 KB → full SHA-256).
+//! - `SqliteIndex`: SQLite + FTS5 store, four mandatory PRAGMAs, schema applied by an
+//!   embedded migration.
+//! - `drift::scan_phase_a`: three-level change detection (size → first 4 KB → full SHA-256).
 //!
 //! ## Stability
 //!
-//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible additions only within `1.x`. See [RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
+//! `2.0.0` — public API under [SemVer 2.0.0](https://semver.org); backward-compatible additions only within `2.x`. See [RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 //!
 //! ## Status
 //!

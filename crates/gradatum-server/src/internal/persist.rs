@@ -23,6 +23,7 @@ use gradatum_core::error::GradatumError;
 use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
 use gradatum_core::identity::NoteId;
 use gradatum_core::index::TemporalEntry;
+use gradatum_core::index_store::CuratedLinks;
 use gradatum_core::scope::VaultId;
 use gradatum_core::section::Section;
 use gradatum_core::status::NoteStatus;
@@ -221,30 +222,81 @@ fn parse_status(s: &str) -> Result<NoteStatus, Response> {
     }
 }
 
-/// Parse un author string optionnel → AuthorRef.
+/// Parse un author → [`AuthorRef`], **sans jamais fabriquer d'identité**.
 ///
-/// Format attendu : "kind:id" (ex: "main-agent:backend", "human:alice").
-/// Fallback : si le format est absent ou type inconnu → `MainAgent` avec l'id brut.
-fn parse_author(s: &str) -> AuthorRef {
-    if let Some((kind_str, id)) = s.split_once(':') {
-        let kind = match kind_str {
-            "human" => AuthorKind::Human,
-            "main-agent" => AuthorKind::MainAgent,
-            "sub-agent" => AuthorKind::SubAgent,
-            "system" => AuthorKind::System,
-            _ => AuthorKind::MainAgent,
-        };
-        AuthorRef {
-            kind,
-            id: id.to_string(),
-            display_name: None,
+/// Deux formes acceptées :
+/// - **préfixée `"kind:id"`** — `kind` doit être l'une des quatre variantes canoniques
+///   (`human` / `main-agent` / `sub-agent` / `system`), ex. `"main-agent:main"`,
+///   `"human:alice"`. L'`id` peut contenir des `:` (seul le premier sépare `kind` de `id`) ;
+/// - **nom nu** (sans `:`) — c'est l'identité résolue issue du credential (l'`owner` lu à
+///   la frontière publique par `effective_author`) : l'`id` est le nom, le `kind` prend une
+///   valeur par défaut documentée (voir le corps de la fonction).
+///
+/// ## R2 — aucune identité par défaut (Tâche 11)
+///
+/// R2 refuse d'*inventer une identité*, pas de défaulter une métadonnée d'audit. Sont donc
+/// refusés : un `kind:` explicite mais **inconnu** (`"bogus:x"` — un `kind:id` malformé), et
+/// la chaîne **vide ou blanche** (aucune identité). Un nom nu, lui, PORTE une identité
+/// (l'`id`) et reste accepté — le refuser (état de 1d42c38c) cassait le chemin d'écriture
+/// nominal, car un subject de credential ne peut jamais produire un `kind:id` (cf. corps).
+///
+/// # Errors
+///
+/// [`GradatumError::InvalidInput`] si la chaîne est vide/blanche, ou si elle est de la forme
+/// `"kind:id"` avec un `kind` hors des quatre variantes reconnues.
+fn parse_author(s: &str) -> Result<AuthorRef, GradatumError> {
+    // Chaîne vide ou blanche : aucune identité à porter → refus (R2, pas de défaut).
+    if s.trim().is_empty() {
+        return Err(GradatumError::InvalidInput(
+            "empty author — no identity resolved (R2)".to_string(),
+        ));
+    }
+
+    match s.split_once(':') {
+        // Forme préfixée `"kind:id"` : le `kind` DÉCLARÉ doit être positivement reconnu.
+        // Un `kind:` explicite mais inconnu est un `kind:id` malformé — refusé (jamais
+        // rabattu sur `MainAgent` comme l'ancien fourre-tout `_ => MainAgent`).
+        Some((kind_str, id)) => {
+            let kind = match kind_str {
+                "human" => AuthorKind::Human,
+                "main-agent" => AuthorKind::MainAgent,
+                "sub-agent" => AuthorKind::SubAgent,
+                "system" => AuthorKind::System,
+                other => {
+                    return Err(GradatumError::InvalidInput(format!(
+                        "unknown author kind {other:?} — an explicit 'kind:id' must name a recognized kind (R2)"
+                    )));
+                }
+            };
+            Ok(AuthorRef {
+                kind,
+                id: id.to_string(),
+                display_name: None,
+            })
         }
-    } else {
-        AuthorRef {
+        // Nom nu sans préfixe : identité RÉSOLUE issue du credential, acceptée.
+        //
+        // Pourquoi défaulter le `kind` ici est légitime — et n'enfreint PAS R2 :
+        // le `kind` (`AuthorKind`) est une métadonnée DESCRIPTIVE d'audit ; il ne gouverne
+        // AUCUNE décision d'autorisation (constat du plan Tâche 11, Step 0). C'est l'`id`
+        // qui PORTE l'identité — ici le nom nu, présent et véridique. R2 (« aucune identité
+        // par défaut ») est donc satisfait par l'`id`, jamais par le `kind` : défaulter le
+        // `kind` ne fabrique aucune identité.
+        //
+        // Ce n'est pas un cas résiduel mais le chemin NOMINAL : `effective_author`
+        // (api_v1/logic.rs) attribue la note au subject du credential, et le charset
+        // d'`AgentId` (`a-z 0-9 -`, cf. scope.rs) INTERDIT le `:`. Un subject de credential
+        // ne peut donc jamais produire un `kind:id` — refuser le nom nu (état 1d42c38c)
+        // rejetait toute écriture de note neuve (400 → épuisement des retries → DLQ).
+        //
+        // `MainAgent` par défaut restaure le comportement d'avant 1d42c38c (moindre
+        // surprise, aucune migration de données) ; il reste écrasable par une forme
+        // préfixée explicite ou un `req.author` fourni.
+        None => Ok(AuthorRef {
             kind: AuthorKind::MainAgent,
             id: s.to_string(),
             display_name: None,
-        }
+        }),
     }
 }
 
@@ -323,7 +375,12 @@ pub(crate) async fn handle_persist_curated(
         Err(e) => return e,
     };
 
-    let author_ref = req.author.as_deref().map(parse_author);
+    // R2 : un author déclaré doit être un `"kind:id"` reconnu — sinon refus 400, jamais
+    // un repli silencieux sur `MainAgent` (cf. `parse_author`). Absent (`None`) reste licite.
+    let author_ref = match req.author.as_deref().map(parse_author).transpose() {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid author: {e}")).into_response(),
+    };
 
     let tags = parse_tags(&req.tags);
 
@@ -482,7 +539,12 @@ pub(crate) async fn handle_persist_curated(
             &written_id,
             &req.title,
             temporal_entry.as_ref(),
-            &links,
+            // F-147 : `authoritative` n'active la suppression des arêtes périmées que si
+            // l'appelant déclare que `edges` est le jeu complet recalculé du corps courant.
+            CuratedLinks {
+                edges: &links,
+                authoritative: req.links_authoritative,
+            },
             req.trust,
             req.tenant_id.as_str(),
         )
@@ -1094,7 +1156,7 @@ pub(crate) async fn handle_persist_distill(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_section, parse_tags, resolve_write_namespace};
+    use super::{parse_author, parse_section, parse_tags, resolve_write_namespace};
     use gradatum_core::scope::VaultId;
     use gradatum_core::section::Section;
 
@@ -1270,6 +1332,110 @@ mod tests {
     fn parse_tags_empty_input() {
         let result = parse_tags(&[]);
         assert!(result.is_empty());
+    }
+
+    // ── parse_author (Tâche 11 — R2 : aucune identité/kind par défaut) ─────────────
+
+    /// Les quatre kinds canoniques `"kind:id"` continuent de parser (variantes légitimes).
+    #[test]
+    fn parse_author_accepts_recognized_kinds() {
+        use gradatum_core::author::AuthorKind;
+        let cases = [
+            ("human:alice", AuthorKind::Human, "alice"),
+            ("main-agent:main", AuthorKind::MainAgent, "main"),
+            ("sub-agent:backend", AuthorKind::SubAgent, "backend"),
+            ("system:cron-decay", AuthorKind::System, "cron-decay"),
+        ];
+        for (input, kind, id) in cases {
+            let a = parse_author(input).expect("un kind reconnu doit parser");
+            assert_eq!(a.kind, kind, "kind de {input:?}");
+            assert_eq!(a.id, id, "id de {input:?}");
+        }
+    }
+
+    /// Un `kind:` inconnu (ex-fourre-tout `_ => MainAgent`) est refusé par une erreur
+    /// typée, jamais rabattu sur `MainAgent`.
+    #[test]
+    fn parse_author_rejects_unknown_kind() {
+        use gradatum_core::error::GradatumError;
+        let err = parse_author("bogus:x").expect_err("un kind inconnu doit être refusé (R2)");
+        assert!(
+            matches!(err, GradatumError::InvalidInput(_)),
+            "erreur typée InvalidInput attendue, obtenu : {err:?}"
+        );
+    }
+
+    /// Un nom nu sans préfixe est une **identité résolue** (l'`owner` du credential,
+    /// lu à la frontière publique via `effective_author`) : il est accepté, avec l'`id`
+    /// égal au nom et le `kind` par défaut documenté. R2 est satisfait par l'`id`, pas
+    /// par le `kind` (métadonnée descriptive sans effet d'autorisation).
+    #[test]
+    fn parse_author_accepts_bare_name() {
+        use gradatum_core::author::AuthorKind;
+        let a = parse_author("agent-buzz").expect("un nom nu (identité de credential) doit parser");
+        assert_eq!(a.id, "agent-buzz", "l'id porte l'identité du credential");
+        assert_eq!(
+            a.kind,
+            AuthorKind::MainAgent,
+            "kind par défaut documenté sur nom nu"
+        );
+    }
+
+    /// Une chaîne vide ou blanche ne porte aucune identité → refus (R2, pas de défaut).
+    #[test]
+    fn parse_author_rejects_empty_or_blank() {
+        use gradatum_core::error::GradatumError;
+        for input in ["", "   "] {
+            let err = parse_author(input)
+                .expect_err("une chaîne vide/blanche ne porte aucune identité (R2)");
+            assert!(
+                matches!(err, GradatumError::InvalidInput(_)),
+                "erreur typée InvalidInput attendue pour {input:?}, obtenu : {err:?}"
+            );
+        }
+    }
+
+    // ── Test de FRONTIÈRE — la vraie leçon de l'incident 1d42c38c ──────────────────
+    //
+    // Deux tests unitaires verts se contredisaient sans que rien ne le détecte :
+    // `effective_author` (api_v1/logic.rs) dérive l'author du subject de credential —
+    // un nom NU (charset `AgentId` = `a-z 0-9 -`, cf. scope.rs, JAMAIS de `:`) — tandis
+    // que le `parse_author` de 1d42c38c refusait tout nom nu. Chaque unité passait ; le
+    // chemin d'écriture nominal était pourtant cassé (400 → épuisement des retries → DLQ).
+    //
+    // Ce test traverse la frontière `effective_author → author de la requête →
+    // parse_author` : il aurait été ROUGE dès 1d42c38c et rend la réintroduction du
+    // défaut impossible. Il vit dans ce module `#[cfg(test)]` (et non dans `tests/`) car
+    // `effective_author` est `pub(crate)` et `parse_author` privée — les rendre publiques
+    // pour un test externe exigerait de toucher `logic.rs`, hors périmètre.
+
+    /// Un author dérivé du subject de credential (nom nu) traverse `parse_author` sans
+    /// être refusé, et l'identité (`id`) est préservée bout-en-bout.
+    #[test]
+    fn effective_author_bare_subject_survives_parse_author() {
+        use crate::api_v1::logic::effective_author;
+        use gradatum_core::scope::AgentId;
+
+        // 1. Frontière publique : credential sans `req.author` → author dérivé du subject.
+        //    (v2.0.0 Task 10 : `effective_author` renvoie `Result` — un author fourni ou une
+        //    absence d'identité serait un `Err` ; ici le sujet est résolu, donc `Ok(nom nu)`.)
+        let subject = AgentId::new("agent-buzz");
+        let author_str = effective_author(&None, Some(&subject))
+            .expect("un nom nu (identité de credential) doit être dérivé du sujet");
+        assert_eq!(
+            author_str, "agent-buzz",
+            "author dérivé = subject de credential, un nom nu sans ':'"
+        );
+
+        // 2. Ce même author voyage dans la requête et atteint `parse_author` (persist).
+        let parsed = parse_author(&author_str)
+            .expect("un nom nu issu d'un credential est une identité résolue — il doit parser");
+
+        // 3. L'identité (`id`) est préservée telle quelle bout-en-bout.
+        assert_eq!(
+            parsed.id, "agent-buzz",
+            "l'id porte l'identité réelle issue du credential"
+        );
     }
 }
 

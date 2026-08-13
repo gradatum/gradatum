@@ -100,7 +100,7 @@ fn curate_job_with_hash(
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Curate(CurateSpec {
                     note_id: prealloc,
@@ -159,7 +159,7 @@ async fn handle_curate_conflict_on_stale_hash() {
     let queue: Arc<dyn gradatum_core::QueueStore + Send + Sync> = Arc::clone(&store) as _;
     let curator = Arc::new(gradatum_curator::CuratorPipeline::new());
 
-    let prealloc = Ulid::new();
+    let prealloc = Ulid::generate();
 
     // ── Étape 1 : écrire v1 sans expected_sha256 → obtenir hash_v1 ─────────
     let job_v1 = curate_job_with_hash(prealloc, "# Corps v1\nbody v1.", None);
@@ -324,7 +324,7 @@ async fn golden_f41_ack_complete_preserves_conflict_status() {
     let queue: Arc<dyn gradatum_core::QueueStore + Send + Sync> = Arc::clone(&store) as _;
     let curator = Arc::new(gradatum_curator::CuratorPipeline::new());
 
-    let prealloc = Ulid::new();
+    let prealloc = Ulid::generate();
 
     // ── Helper : exécute le seam complet handler → ack(complete sur Ok) ─────────
     // Reproduit `GradatumAcknowledger::ack` : sur `Ok(JobOutput)` → `store.complete`.
@@ -523,7 +523,7 @@ async fn handle_curate_no_expected_sha_writes_normally() {
     let queue: Arc<dyn gradatum_core::QueueStore + Send + Sync> = Arc::clone(&store) as _;
     let curator = Arc::new(gradatum_curator::CuratorPipeline::new());
 
-    let prealloc = Ulid::new();
+    let prealloc = Ulid::generate();
     let job = curate_job_with_hash(
         prealloc,
         "## Corps sans expected_sha256\nbody suffisant.",
@@ -566,7 +566,7 @@ async fn handle_curate_correct_hash_writes_normally() {
     let queue: Arc<dyn gradatum_core::QueueStore + Send + Sync> = Arc::clone(&store) as _;
     let curator = Arc::new(gradatum_curator::CuratorPipeline::new());
 
-    let prealloc = Ulid::new();
+    let prealloc = Ulid::generate();
 
     // Écriture initiale sans hash → obtenir hash_v1.
     let job_v1 = curate_job_with_hash(prealloc, "# Corps initial\nbody initial.", None);

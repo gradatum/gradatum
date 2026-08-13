@@ -22,9 +22,16 @@ liste est calculée par `cargo metadata`, jamais par `grep publish` : un membre 
 clé `publish` explicite est publiable par défaut.
 
 Mesuré au 2026-07-30 (`9b7bc5e6`) : **31 membres, 27 publiables, 26 avec cible lib**
-(`gradatum-mcp-stub` est un binaire pur — publié, mais sans surface d'API), pour
+(`gradatum-mcp-stub` était alors un binaire pur — publié, mais sans surface d'API), pour
 **4 842 items**. Le décompte par crate vit dans `baseline/_INDEX.tsv`, régénéré et
 vérifié comme le reste : il ne peut pas devenir périmé sans que le gate échoue.
+
+> **Depuis `2.0.0` (2026-08-10)** : `gradatum-mcp-stub` bascule `publish = false` (retiré de la
+> distribution, source conservée — voir `ARCHITECTURE.md` § API surface topology). Le décompte
+> publiables ci-dessus passe donc à **26** ; le compte « avec cible lib » (26) est inchangé — le
+> crate n'a jamais eu de cible `lib`, donc jamais de baseline dans ce répertoire (confirmé :
+> aucun fichier `gradatum-mcp-stub` sous `baseline/`). Le total de 4 842 items n'a pas été
+> re-mesuré dans cette passe.
 
 Options de mesure :
 

@@ -156,7 +156,7 @@ async fn vault_read_not_found_increments_nothing() {
     let env = build_app().await;
     let token = sign_token(&env.state);
     // ULID valide mais aucune note associée → chemin d'erreur AVANT l'incrément `read`.
-    let ghost = Ulid::new().to_string();
+    let ghost = Ulid::generate().to_string();
 
     let resp = call_vault_read_raw(env.app.clone(), &token, &ghost, "main").await;
     assert_ne!(
@@ -196,7 +196,7 @@ async fn vault_search_response_identical_with_usage_store_wired_or_not() {
 
     // Seed 3 notes partagées (mêmes ULID pour les deux states).
     for i in 0..3 {
-        let ulid = Ulid::new().to_string();
+        let ulid = Ulid::generate().to_string();
         let body = format!("# Note alpha beta {i}\nalpha beta contenu partagé {i}");
         index
             .seed_note_with_fts(&ulid, "reference", &body)

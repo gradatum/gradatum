@@ -116,9 +116,9 @@ async fn review_lists_pending_review_and_staging() {
     let token = sign(&state);
 
     // Seed 3 notes : PendingReview (distilled), Staging (legacy), Live (exclue).
-    let id_pr = Ulid::new().to_string();
-    let id_st = Ulid::new().to_string();
-    let id_live = Ulid::new().to_string();
+    let id_pr = Ulid::generate().to_string();
+    let id_st = Ulid::generate().to_string();
+    let id_live = Ulid::generate().to_string();
 
     idx.seed_note_with_status(
         &id_pr,

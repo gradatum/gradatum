@@ -125,7 +125,12 @@ pub struct EngineConfig {
     /// Inference runtime (default: `llamaserver`).
     #[serde(default)]
     pub runtime: RuntimeKind,
-    /// Warm-up strategy: `"eager"` (load then ready) or `"lazy"` (ready after first request).
+    /// Warm-up strategy. **Accepted and validated, but not yet acted upon**: the engine
+    /// always warms up eagerly today, whatever this is set to. Setting `"lazy"` changes
+    /// nothing. Kept so existing configuration files keep loading, and so the strategy
+    /// can be honoured without a breaking change once implemented.
+    // not yet wired (v2.1) — no branch reads this field; `health.rs::warm_up_state` is a
+    // runtime state (loading/ready), unrelated to this setting.
     #[serde(default = "default_warmup")]
     pub warm_up: String,
     /// Number of layers to offload to the GPU (0 = CPU only).
@@ -163,8 +168,14 @@ pub struct EngineConfig {
     /// On expiry → `EngineError::Timeout` (HTTP 504) → the gateway triggers its fallback.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    /// Maximum number of tokens generated per chat request (default 512).
-    /// Clamped to `[1, 65535]` by the binary.
+    /// Intended cap on tokens generated per chat request (default 512).
+    ///
+    /// **Not enforced.** This value is parsed and then ignored: nothing caps generation
+    /// length today. Do not rely on it as a safety limit — to bound generation, pass
+    /// `--n-predict` explicitly through `extra_args`, which the child process does honour.
+    // not yet wired (v2.1) — never reaches `build_child_args`; wiring it to `--n-predict`
+    // would suddenly cap every running engine at the 512 default, so it is a deliberate
+    // behavioural change, not a mechanical fix.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     /// Base URL of the gradatum server (for the event-log and JWT exchange).

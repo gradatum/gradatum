@@ -24,6 +24,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::JwtService;
+use gradatum_core::author::AuthorKind;
 use gradatum_core::identity::NoteId;
 use gradatum_core::scope::VaultId;
 use gradatum_embed::{EmbedBackend, Embedder};
@@ -200,7 +201,7 @@ async fn internal_api_wrong_token_is_401() {
 async fn internal_api_persist_curated_ok() {
     let env = build_internal_env().await;
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let req = make_request(
         "POST",
         "/internal/v1/persist/curated",
@@ -234,6 +235,72 @@ async fn internal_api_persist_curated_ok() {
     assert_eq!(json["note_id"], note_id);
 }
 
+/// Frontière HTTP (tâche 11, R2) — un author NU (`"main-agent"`, sans préfixe
+/// `kind:`) traverse la désérialisation de `PersistCuratedRequest`, le wiring
+/// `req.author.as_deref().map(parse_author).transpose()` du handler, et attribue
+/// correctement la note → 200.
+///
+/// C'est le cas qui aurait attrapé le P0 (author nu rejeté → 400 → épuisement des
+/// retries → DLQ) au bon niveau : les dix `internal_api_persist_curated_*` frappent
+/// le vrai handler mais passent tous `"author": null`, aveugles au champ en cause.
+/// Le test in-crate `effective_author_bare_subject_survives_parse_author` prouve la
+/// frontière fonction ; celui-ci prouve la frontière HTTP réelle.
+#[tokio::test]
+async fn internal_api_persist_curated_bare_author_is_attributed() {
+    let env = build_internal_env().await;
+
+    let note_id = Ulid::generate().to_string();
+    let req = make_request(
+        "POST",
+        "/internal/v1/persist/curated",
+        json!({
+            "note_id": note_id,
+            "tenant_id": "main",
+            "section": "decisions",
+            "status": "live",
+            "title": "Author nu",
+            "body": "# Author nu\n\nCorps.",
+            "tags": [],
+            "author": "main-agent",
+            "provenance": null,
+            "temporal": null,
+            "links": [],
+            "trust": null
+        }),
+        TEST_TOKEN,
+    );
+
+    let resp = env.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "author nu (identité résolue du credential) doit être accepté → 200, jamais 400"
+    );
+
+    // La note est écrite ET attribuée : l'id porte le nom nu, le kind est le défaut
+    // descriptif MainAgent (métadonnée d'audit, n'enfreint pas R2 — c'est l'id qui
+    // porte l'identité).
+    let id = NoteId(Ulid::from_string(&note_id).expect("ULID valide"));
+    let note = env
+        ._vault
+        .read_note(id)
+        .await
+        .expect("note présente dans le vault après persist");
+    let author = note
+        .frontmatter
+        .author
+        .expect("la note porte un author résolu (pas None) — author nu accepté");
+    assert_eq!(
+        author.id, "main-agent",
+        "l'id porte l'identité résolue du credential (nom nu)"
+    );
+    assert_eq!(
+        author.kind,
+        AuthorKind::MainAgent,
+        "kind descriptif par défaut pour un nom nu"
+    );
+}
+
 /// persist/curated section invalide → 400.
 #[tokio::test]
 async fn internal_api_persist_curated_bad_section_is_400() {
@@ -243,7 +310,7 @@ async fn internal_api_persist_curated_bad_section_is_400() {
         "POST",
         "/internal/v1/persist/curated",
         json!({
-            "note_id": Ulid::new().to_string(),
+            "note_id": Ulid::generate().to_string(),
             "tenant_id": "main",
             "section": "invalid-section",
             "status": "live",
@@ -306,7 +373,7 @@ fn curated_body(note_id: &str, body: &str, expected_sha256: Option<&str>) -> ser
 async fn internal_api_persist_curated_optimistic_lock_cas() {
     let env = build_internal_env().await;
     let router = env.router.clone();
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     // 1. CREATE (expected_sha256 = None) → écriture inconditionnelle, MARQUEUR-V1.
     let req = make_request(
@@ -389,7 +456,7 @@ async fn internal_api_persist_curated_optimistic_lock_cas() {
 #[tokio::test]
 async fn internal_api_persist_curated_malformed_expected_sha_is_400() {
     let env = build_internal_env().await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let req = make_request(
         "POST",
         "/internal/v1/persist/curated",
@@ -415,7 +482,7 @@ async fn internal_api_persist_and_read_embedding() {
     let env = build_internal_env().await;
     let router = env.router;
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     // 0. Créer la note préalablement (FK constraint note_embeddings → notes.id).
     let req = make_request(
@@ -490,7 +557,7 @@ Corps.",
 #[tokio::test]
 async fn internal_api_get_note_not_found() {
     let env = build_internal_env().await;
-    let unknown_id = Ulid::new().to_string();
+    let unknown_id = Ulid::generate().to_string();
     let req = make_get(&format!("/internal/v1/note/{unknown_id}"), TEST_TOKEN);
     let resp = env.router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -501,7 +568,7 @@ async fn internal_api_get_note_not_found() {
 async fn internal_api_get_note_after_persist() {
     let env = build_internal_env().await;
     let router = env.router;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     // 1. persist
     let req = make_request(
@@ -547,7 +614,7 @@ async fn internal_api_get_note_after_persist() {
 #[tokio::test]
 async fn internal_api_delete_note_not_found() {
     let env = build_internal_env().await;
-    let unknown_id = Ulid::new().to_string();
+    let unknown_id = Ulid::generate().to_string();
     let req = make_delete(&format!("/internal/v1/note/{unknown_id}"), TEST_TOKEN);
     let resp = env.router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -558,7 +625,7 @@ async fn internal_api_delete_note_not_found() {
 async fn internal_api_delete_note_after_persist() {
     let env = build_internal_env().await;
     let router = env.router;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     // persist (section NON protégée — la note doit être supprimable)
     let req = make_request(
@@ -609,7 +676,7 @@ async fn internal_api_delete_note_after_persist() {
 async fn internal_api_delete_protected_section_is_403() {
     let env = build_internal_env().await;
     let router = env.router;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     // persist d'une note council (PROTECTED_DELETE). La garde cascade refuse quel que
     // soit le statut — l'endpoint interne DELETE ne gate pas sur `garbage` (c'est le
@@ -744,7 +811,7 @@ async fn internal_api_persist_curated_routes_to_request_tenant_vault() {
         .expect("seed tenants research");
     }
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let req = make_request(
         "POST",
         "/internal/v1/persist/curated",
@@ -805,7 +872,7 @@ async fn internal_api_persist_curated_main_lands_in_main() {
     let env = build_internal_env().await;
     let index_path = gradatum_core::paths::vault_dir_index_path(&env._tmp.path().join("vault"));
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let req = make_request(
         "POST",
         "/internal/v1/persist/curated",
@@ -849,7 +916,7 @@ async fn internal_api_persist_curated_main_lands_in_main() {
 #[tokio::test]
 async fn internal_api_get_trust_not_found() {
     let env = build_internal_env().await;
-    let unknown_id = Ulid::new().to_string();
+    let unknown_id = Ulid::generate().to_string();
     let req = make_get(&format!("/internal/v1/note/{unknown_id}/trust"), TEST_TOKEN);
     let resp = env.router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -877,7 +944,7 @@ async fn internal_api_invalid_ulid_is_400() {
 async fn persist_distill_tags() {
     let env = build_internal_env().await;
     let router = env.router;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     // POST /internal/v1/persist/distill — new note with tags: ["quality-low"]
     let req = make_request(
@@ -932,7 +999,7 @@ async fn seed_note_with_locus(
     status: &str,
     locus: &str,
 ) -> String {
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     let req = make_request(
         "POST",
         "/internal/v1/persist/curated",
@@ -1082,7 +1149,7 @@ async fn persist_curated_refuses_a_vault_absent_from_both_registries() {
         "POST",
         "/internal/v1/persist/curated",
         json!({
-            "note_id": Ulid::new().to_string(),
+            "note_id": Ulid::generate().to_string(),
             "tenant_id": "default",
             "section": "decisions",
             "status": "live",
@@ -1123,7 +1190,7 @@ async fn persist_curated_refuses_a_code_vault() {
         "POST",
         "/internal/v1/persist/curated",
         json!({
-            "note_id": Ulid::new().to_string(),
+            "note_id": Ulid::generate().to_string(),
             "tenant_id": "code-gradatum",
             "section": "decisions",
             "status": "live",

@@ -27,8 +27,9 @@
 
 use anyhow::Context as _;
 use gradatum_admin::{
-    BackfillArgs, BackfillNoteLinksArgs, BackfillTitlesArgs, DowngradeFromTrashArgs,
-    VaultRenameArgs, api_key_cmd, code_cmd, init, jobs_cmd, token, vault_forget_cmd, vault_rename,
+    BackfillArgs, BackfillAuthorsArgs, BackfillNoteLinksArgs, BackfillTitlesArgs,
+    DowngradeFromTrashArgs, RepairNoteLinksArgs, VaultRenameArgs, api_key_cmd, code_cmd, init,
+    jobs_cmd, token, vault_forget_cmd, vault_rename,
 };
 use gradatum_core::paths::vault_index_path;
 
@@ -45,9 +46,26 @@ fn parse_ingest_visibility(s: &str) -> Result<code_cmd::IngestVisibility, String
     }
 }
 
+/// Chaîne rendue par `--version` : version sémantique **suivie du SHA du commit de build**.
+///
+/// Format stable, garanti extractible par script (`deploy-gradatum-local.sh`, étape 0d) :
+/// `gradatum-admin <semver> (build_sha <sha>)`
+///
+/// La valeur `<sha>` est celle injectée au compile-time par `build.rs`
+/// (`cargo:rustc-env=BUILD_SHA`). Elle vaut `unknown` lorsque le SHA n'a pas pu être
+/// résolu au build (absence de `.git`, build depuis un tarball `.crate`) — le repli est
+/// porté par `build.rs`, qui n'échoue jamais. `env!` est donc toujours résoluble ici :
+/// `build.rs` émet la variable de façon inconditionnelle.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (build_sha ",
+    env!("BUILD_SHA"),
+    ")"
+);
+
 /// Gradatum operator CLI.
 #[derive(Debug, Parser)]
-#[command(version, about = "gradatum-admin — Gradatum operator CLI")]
+#[command(version = VERSION, about = "gradatum-admin — Gradatum operator CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -118,6 +136,55 @@ enum Cmd {
         #[arg(long)]
         tenant: String,
         /// Preview actions without writing to the database.
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum number of notes to process (unlimited if absent).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Reconciles `note_links` against the current bodies: DELETEs stale edges and INSERTs
+    /// missing ones (F-147). The curative counterpart of `backfill-note-links` (which only
+    /// ever ADDS edges to zero-edge notes and never removes anything).
+    ///
+    /// Dry-run by DEFAULT (prints the exact edges it would delete/add without writing);
+    /// pass `--execute` to mutate. The source of truth is the note body, never insertion
+    /// order nor `created_at`.
+    #[command(name = "repair-note-links")]
+    RepairNoteLinks {
+        /// Gradatum root directory.
+        #[arg(long, default_value = "/var/lib/gradatum")]
+        root: std::path::PathBuf,
+        /// Tenant to process.
+        #[arg(long)]
+        tenant: String,
+        /// Perform the reconciliation for real (default: dry-run preview). This DELETEs
+        /// stale edges, so it is opt-in.
+        #[arg(long)]
+        execute: bool,
+        /// Maximum number of notes to process (unlimited if absent).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Attributes an author to notes that have none — writes BOTH the `.md` frontmatter and
+    /// the index column, coherently (idempotent).
+    ///
+    /// Targets notes whose index author is NULL or empty and rewrites the author field only,
+    /// re-linking `.md` and index through `content_hash`. Never touches status, locus, trust
+    /// or a note that already carries an author. `--dry-run` previews without writing. The
+    /// target identity is validated against the ACL preset — an undeclared identity is
+    /// refused.
+    #[command(name = "backfill-authors")]
+    BackfillAuthors {
+        /// Gradatum root directory.
+        #[arg(long, default_value = "/var/lib/gradatum")]
+        root: std::path::PathBuf,
+        /// Tenant to process.
+        #[arg(long)]
+        tenant: String,
+        /// Target author identity (validated against the ACL preset, like `api-key --owner`).
+        #[arg(long)]
+        author: String,
+        /// Preview actions without writing anything.
         #[arg(long)]
         dry_run: bool,
         /// Maximum number of notes to process (unlimited if absent).
@@ -536,7 +603,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::try_init().ok();
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Init(args) => init::run(args),
+        Cmd::Init(args) => init::run(args).await,
         Cmd::Token { cmd } => token::run(cmd),
         Cmd::ApiKey { cmd } => api_key_cmd::run(cmd).await,
         Cmd::BackfillNoteLinks {
@@ -563,6 +630,65 @@ async fn main() -> anyhow::Result<()> {
                     report.notes_scanned, report.edges_written, report.notes_touched
                 );
             }
+            Ok(())
+        }
+        Cmd::RepairNoteLinks {
+            root,
+            tenant,
+            execute,
+            limit,
+        } => {
+            // Dry-run par défaut (sûr) : la reconciliation SUPPRIME des arêtes, mutation
+            // opt-in via --execute.
+            let args = RepairNoteLinksArgs {
+                root,
+                tenant,
+                dry_run: !execute,
+                limit,
+            };
+            let report = gradatum_admin::repair_note_links::run(args).await?;
+            if report.dry_run {
+                println!(
+                    "DRY-RUN repair-note-links: {} notes scanned, {} edges would be deleted, {} edges would be added ({} notes unchanged)",
+                    report.notes_scanned,
+                    report.edges_deleted,
+                    report.edges_added,
+                    report.notes_unchanged
+                );
+            } else {
+                println!(
+                    "repair-note-links: {} notes scanned, {} edges deleted, {} edges added ({} notes unchanged)",
+                    report.notes_scanned,
+                    report.edges_deleted,
+                    report.edges_added,
+                    report.notes_unchanged
+                );
+            }
+            Ok(())
+        }
+        Cmd::BackfillAuthors {
+            root,
+            tenant,
+            author,
+            dry_run,
+            limit,
+        } => {
+            let args = BackfillAuthorsArgs {
+                root,
+                tenant,
+                author,
+                dry_run,
+                limit,
+            };
+            let report = gradatum_admin::backfill_authors::run(args).await?;
+            let tag = if report.dry_run { " [DRY-RUN]" } else { "" };
+            println!(
+                "backfill-authors{tag}: notes_scanned={} authors_assigned={} skipped_drift={} skipped_missing_md={}",
+                report.notes_scanned,
+                report.authors_assigned,
+                report.skipped_drift,
+                report.skipped_missing_md,
+            );
             Ok(())
         }
         Cmd::Jobs { cmd } => jobs_cmd::run(cmd).await,

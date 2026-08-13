@@ -10,7 +10,8 @@
 use std::io::{BufWriter, Write as _};
 
 use chrono::Utc;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use gradatum_core::audit::{AuditEvent, AuditEventType};
 use gradatum_core::author::AuthorRef;

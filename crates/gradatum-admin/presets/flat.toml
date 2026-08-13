@@ -7,9 +7,13 @@
 #
 # Apply with: gradatum-admin init --preset=flat
 
+# The single consumer IS the orchestrator identity `main-agent` — the identity
+# `gradatum-server` resolves from the credential and that `init` mints at install (R4).
+# Naming it `main-agent` (not `default`) satisfies the mandatory-bootstrap-identity rule
+# without adding a second consumer: one locus, no isolation, one identity.
 [[consumer]]
-id = "default"
-description = "Single consumer, full read/write on the only locus 'default'"
+identity = "main-agent"
+description = "Orchestrator (main-agent) — single consumer, full read/write on the only locus 'default'"
 read_patterns = ["default"]
 write_patterns = ["default"]
 sees_personal_classified = false

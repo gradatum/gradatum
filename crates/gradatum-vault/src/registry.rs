@@ -18,7 +18,6 @@
 //! - `vault_id`: the physical namespace of the vault — NOT the authenticated principal,
 //!   which is `TenantId`. Non-empty, derived from `VaultConfig.vault.default_tenant_id`
 //!   or defaulting to `"main"`.
-//! - NFS reject: `FileStorage::new()` checks `statfs(2)`.
 //! - Idempotent: `create` is safe if directories already exist (`create_dir_all`).
 
 use std::path::{Path, PathBuf};
@@ -31,7 +30,7 @@ use gradatum_core::error::GradatumError;
 use gradatum_core::paths::vault_dir_index_path;
 use gradatum_core::scope::VaultId;
 use gradatum_index::SqliteIndex;
-use gradatum_storage::{FileStorage, Storage as _};
+use gradatum_storage::{Storage, build_storage};
 
 use crate::error::VaultError;
 
@@ -62,7 +61,7 @@ pub struct Vault {
     /// **principal**, which is carried by `TenantId` in the `TrustContext`.
     pub(crate) vault_id: VaultId,
     pub(crate) config: VaultConfig,
-    pub(crate) storage: FileStorage,
+    pub(crate) storage: Box<dyn Storage>,
     pub(crate) index: Arc<SqliteIndex>,
     pub(crate) cache: Arc<EffectiveNoteCache>,
     /// Cache hit counter — incremented on each return from cache.
@@ -86,13 +85,13 @@ impl Vault {
     ///
     /// ## Errors
     ///
-    /// - `VaultError::Core(GradatumError::VaultOnNfs)` if `root` is on NFS.
     /// - `VaultError::Core(GradatumError::Storage(...))` on filesystem error.
     pub async fn create(root: &Path, vault_id: VaultId) -> Result<Self, VaultError> {
-        // Construit le FileStorage — vérifie NFS (caveat C11) en premier.
-        // FileStorage::new() appelle ensure_local_filesystem() avant tout I/O.
-        let storage = FileStorage::new(root)
-            .map_err(|e| GradatumError::Storage(format!("FileStorage init: {e}")))?;
+        // Charge la config AVANT le stockage : le backend (fs local ou objet
+        // S3-compatible) est piloté par `config.storage`. Fichier absent → défaut fs.
+        let config = VaultConfig::load_from_root(root).map_err(GradatumError::from)?;
+        let storage = build_storage(&config.storage, root)
+            .map_err(|e| GradatumError::Storage(format!("storage init: {e}")))?;
 
         // Initialise l'arborescence layout spec §5.1 via OpenDAL (convergence v81 §6).
         // Les chemins OpenDAL sont relatifs à root et se terminent par `/` pour create_dir.
@@ -116,7 +115,6 @@ impl Vault {
         let index_path = vault_dir_index_path(root);
         let index = SqliteIndex::open(&index_path).await?;
 
-        let config = VaultConfig::load_from_root(root).map_err(GradatumError::from)?;
         let cache = EffectiveNoteCache::new(EffectiveNoteCacheConfig::default());
 
         Ok(Self {
@@ -137,11 +135,9 @@ impl Vault {
     /// - Loads `VaultConfig` from `<root>/.gradatum/config.toml`.
     /// - Derives `vault_id` (namespace) from `config.vault.default_tenant_id` (default: `"main"`).
     /// - Opens the existing SQLite index via `SqliteIndex::open` (applies any pending migrations).
-    /// - Rejects NFS mounts via `FileStorage::new`.
     ///
     /// ## Errors
     ///
-    /// - `VaultError::Core(GradatumError::VaultOnNfs)` if `root` is on NFS.
     /// - `VaultError::Core(GradatumError::Config(...))` if the TOML is malformed.
     pub async fn open(root: &Path) -> Result<Self, VaultError> {
         let config = VaultConfig::load_from_root(root).map_err(GradatumError::from)?;
@@ -153,8 +149,9 @@ impl Vault {
                 .unwrap_or_else(|| "main".into()),
         );
 
-        let storage = FileStorage::new(root)
-            .map_err(|e| GradatumError::Storage(format!("FileStorage init: {e}")))?;
+        // Backend piloté par `config.storage` (chargée ci-dessus) — fs local ou objet.
+        let storage = build_storage(&config.storage, root)
+            .map_err(|e| GradatumError::Storage(format!("storage init: {e}")))?;
 
         // SSOT : index_path via helper canonique — jamais root.join(".gradatum").join("index.db").
         // `root` ici est le répertoire vault/ (vault_dir), donc vault_dir_index_path.
@@ -200,7 +197,6 @@ impl Vault {
     ///
     /// ## Errors
     ///
-    /// - `VaultError::Core(GradatumError::VaultOnNfs)` if `root` sits on NFS.
     /// - `VaultError::Core(GradatumError::Storage(...))` on a filesystem error.
     /// - `VaultError::Core(GradatumError::Config(...))` if `config.toml` is malformed.
     #[must_use = "a constructed Vault must be used or registered, otherwise the namespace is provisioned for nothing"]
@@ -209,9 +205,10 @@ impl Vault {
         vault_id: VaultId,
         index: Arc<SqliteIndex>,
     ) -> Result<Self, VaultError> {
-        // FileStorage::new() vérifie NFS (caveat C11) avant tout I/O.
-        let storage = FileStorage::new(root)
-            .map_err(|e| GradatumError::Storage(format!("FileStorage init: {e}")))?;
+        // Charge la config AVANT le stockage — backend piloté par `config.storage`.
+        let config = VaultConfig::load_from_root(root).map_err(GradatumError::from)?;
+        let storage = build_storage(&config.storage, root)
+            .map_err(|e| GradatumError::Storage(format!("storage init: {e}")))?;
 
         // Matérialise le namespace md du vault (idempotent) — le `.gradatum/`/index.db est
         // déjà ouvert (partagé), on ne le recrée pas.
@@ -224,7 +221,6 @@ impl Vault {
             .await
             .map_err(|e| GradatumError::Storage(format!("create overrides dir: {e}")))?;
 
-        let config = VaultConfig::load_from_root(root).map_err(GradatumError::from)?;
         let cache = EffectiveNoteCache::new(EffectiveNoteCacheConfig::default());
 
         Ok(Self {
@@ -279,7 +275,7 @@ impl Vault {
     /// Exposed to allow integration tests to verify the existence and physical
     /// location of a `.md` after a relocation operation (`move_locus`).
     /// Read-only — tests do not mutate storage directly.
-    pub fn storage(&self) -> &FileStorage {
-        &self.storage
+    pub fn storage(&self) -> &dyn Storage {
+        self.storage.as_ref()
     }
 }

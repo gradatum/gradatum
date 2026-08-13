@@ -105,7 +105,7 @@ async fn build_with_concrete_index() -> (
 /// Utilise `SqliteIndex::seed_note` (méthode pub sur le type concret, pas dans le trait
 /// `IndexStore`). La note a `status='live'`, section=`"reference"`, vault_id=`"main"`.
 async fn seed_note(idx: &SqliteIndex) -> String {
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     idx.seed_note(&id, "reference", "corps de test pour vault_downgrade e2e")
         .await
         .expect("seed_note — doit réussir sur index in-memory");
@@ -239,7 +239,7 @@ async fn vault_downgrade_replaced_by_nonexistent_returns_404() {
     let note_id = seed_note(&idx).await;
 
     // ULID syntaxiquement valide mais absent de l'index.
-    let ghost_id = Ulid::new().to_string();
+    let ghost_id = Ulid::generate().to_string();
 
     let body = serde_json::json!({
         "note_id": note_id,

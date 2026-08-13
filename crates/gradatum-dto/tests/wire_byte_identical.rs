@@ -2,9 +2,8 @@
 //!
 //! Prouve que renforcer `tenant_id` en [`TenantId`] (principal) et `vault_id` en
 //! [`VaultId`] (namespace) — deux newtypes `#[serde(transparent)]` — ne change RIEN sur
-//! le fil : représentation JSON, représentation bincode (le chemin file `SqliteQueueStore`
-//! pour `VaultWriteRequest`) et le schéma JSON MCP généré restent identiques au contrat
-//! `String`/`Option<String>` d'avant typage.
+//! le fil : la représentation JSON et le schéma JSON MCP généré restent identiques au
+//! contrat `String`/`Option<String>` d'avant typage.
 //!
 //! Red→green : ce fichier référence `TenantId`/`VaultId` sur les champs des DTO ; il ne
 //! compile QUE si le typage a bien été appliqué. Il échoue si un `default`, une dérive
@@ -18,12 +17,7 @@ use gradatum_dto::{
     VaultWriteRequest,
 };
 
-fn bincode_bytes<T: serde::Serialize>(v: &T) -> Vec<u8> {
-    bincode::serde::encode_to_vec(v, bincode::config::standard())
-        .expect("bincode encode ne doit jamais échouer sur ces DTO")
-}
-
-// ── 1. Transparence des newtypes (garantie racine JSON + bincode) ──
+// ── 1. Transparence des newtypes (garantie racine JSON) ──
 
 #[test]
 fn tenant_id_json_transparent() {
@@ -43,39 +37,17 @@ fn vault_id_json_transparent() {
     assert_eq!(typed, "\"vault-b\"");
 }
 
-#[test]
-fn newtypes_bincode_transparent() {
-    assert_eq!(
-        bincode_bytes(&TenantId::new("main")),
-        bincode_bytes(&"main".to_string()),
-        "TenantId doit être bincode-identique à String"
-    );
-    assert_eq!(
-        bincode_bytes(&VaultId::new("vault-b")),
-        bincode_bytes(&"vault-b".to_string()),
-        "VaultId doit être bincode-identique à String"
-    );
-    // La forme du champ namespace : Option<VaultId> vs Option<String>.
-    assert_eq!(
-        bincode_bytes(&Some(VaultId::new("vault-b"))),
-        bincode_bytes(&Some("vault-b".to_string())),
-    );
-    assert_eq!(
-        bincode_bytes(&Option::<VaultId>::None),
-        bincode_bytes(&Option::<String>::None),
-    );
-}
-
-// ── 2. VaultWriteRequest — chemin file (queue bincode) + JSON, struct entière ──
+// ── 2. VaultWriteRequest — JSON, struct entière ──
 
 /// Miroir à l'identique de [`VaultWriteRequest`] mais avec les types "nus".
 ///
 /// Lot A1 : `tenant_id` est passé de `String` à `Option<String>` pour refléter le nouveau
 /// champ `Option<TenantId>`. Le newtype `#[serde(transparent)]` garantit que
-/// `Some(TenantId)` reste bincode/JSON-identique à `Some(String)` — la transparence n'est
-/// pas perdue par le passage à `Option`. L'ordre des champs DOIT matcher (bincode v2 =
-/// positionnel). Valeur toujours `Some(_)` dans ce test (le serveur pose le tenant effectif
-/// avant l'enqueue) — `skip_serializing_if` ne se déclenche donc pas.
+/// `Some(TenantId)` reste JSON-identique à `Some(String)` — la transparence n'est pas
+/// perdue par le passage à `Option`. L'ordre des champs DOIT matcher : `serde_json` émet
+/// les clés dans l'ordre de déclaration, donc le miroir doit suivre le même ordre pour un
+/// JSON byte-identique. Valeur toujours `Some(_)` dans ce test (le serveur pose le tenant
+/// effectif avant l'enqueue) — `skip_serializing_if` ne se déclenche donc pas.
 #[derive(serde::Serialize)]
 struct VaultWriteRequestStringMirror {
     title: String,
@@ -91,18 +63,12 @@ struct VaultWriteRequestStringMirror {
 }
 
 #[test]
-fn vault_write_request_bincode_and_json_match_string_mirror() {
-    let typed = VaultWriteRequest {
-        title: "T".to_string(),
-        body: "B".to_string(),
-        author: Some("main-agent".to_string()),
-        tags: vec!["x".to_string()],
-        section_hint: Some("decisions".to_string()),
-        tenant_id: Some(TenantId::new("main")),
-        expected_sha256: None,
-        note_id: None,
-        occurred_at: None,
-    };
+fn vault_write_request_json_matches_string_mirror() {
+    let mut typed = VaultWriteRequest::new("T".to_string(), "B".to_string());
+    typed.author = Some("main-agent".to_string());
+    typed.tags = vec!["x".to_string()];
+    typed.section_hint = Some("decisions".to_string());
+    typed.tenant_id = Some(TenantId::new("main"));
     let mirror = VaultWriteRequestStringMirror {
         title: "T".to_string(),
         body: "B".to_string(),
@@ -114,11 +80,6 @@ fn vault_write_request_bincode_and_json_match_string_mirror() {
         note_id: None,
         occurred_at: None,
     };
-    assert_eq!(
-        bincode_bytes(&typed),
-        bincode_bytes(&mirror),
-        "TenantId transparent doit être bincode-identique à String (chemin queue)"
-    );
     assert_eq!(
         serde_json::to_string(&typed).expect("json typed"),
         serde_json::to_string(&mirror).expect("json mirror"),
@@ -185,13 +146,7 @@ fn persist_embedding_vault_namespace_internal() {
     .expect("embedding avec vault_id");
     assert_eq!(req.vault_id, Some(VaultId::new("vault-b")));
     // skip_serializing_if : None ne réémet pas le champ (byte-identical schéma pré-B2).
-    let req = PersistEmbeddingRequest {
-        note_id: "X".to_string(),
-        embedder_id: "bge-m3".to_string(),
-        dim: 1024,
-        vector: vec![],
-        vault_id: None,
-    };
+    let req = PersistEmbeddingRequest::new("X".to_string(), "bge-m3".to_string(), 1024, vec![]);
     assert!(
         !serde_json::to_string(&req)
             .expect("json")

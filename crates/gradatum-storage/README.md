@@ -1,24 +1,24 @@
 # gradatum-storage
 
-> Storage trait abstraction with OpenDAL filesystem backend and NFS rejection guard.
+> Storage trait abstraction with an OpenDAL-backed filesystem or S3-compatible object backend.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
 
-`gradatum-storage` defines the `Storage` async trait and provides a filesystem implementation
-backed by OpenDAL. S3 and Azure Blob backends are planned for a future release.
+`gradatum-storage` defines the `Storage` async trait and provides a generic OpenDAL-backed
+implementation, selected by configuration: `fs` (local filesystem, default) or `s3` (any
+S3-compatible provider — AWS, OVH, MinIO, Ceph, Scaleway). The `gcs` and `azure` Cargo
+features enable their respective OpenDAL client dependencies, but `build_storage` has no
+match arm for either yet — the feature is compiled in, the backend is not selectable.
 
-The NFS guard (`ensure_local_filesystem`) uses `statfs(2)` to verify that the vault root
-is not on an NFS mount before opening. This prevents silent data loss on network
-partitions. `FileStorage::new()` calls this check automatically.
 
 ## Usage
 
 ```toml
 [dependencies]
-gradatum-storage = "1.0.0"
+gradatum-storage = "2.0.0"
 ```
 
 ```rust
@@ -49,10 +49,10 @@ pub trait Storage: Send + Sync {
 
 | Feature | Default | Description |
 |---|---|---|
-| `fs` | yes | Filesystem backend via OpenDAL |
-| `s3` | no | Enables the OpenDAL S3 service dependency (no `Storage` impl included yet) |
-| `gcs` | no | Enables the OpenDAL GCS service dependency (no `Storage` impl included yet) |
-| `azure` | no | Enables the OpenDAL Azure Blob service dependency (no `Storage` impl included yet) |
+| `fs` | yes | Filesystem backend via OpenDAL — selectable via `service = "fs"` |
+| `s3` | no | S3-compatible object backend via OpenDAL — selectable via `service = "s3"` |
+| `gcs` | no | Enables the OpenDAL GCS service dependency — not wired into `build_storage`, no selectable backend |
+| `azure` | no | Enables the OpenDAL Azure Blob service dependency — not wired into `build_storage`, no selectable backend |
 | `all-cloud` | no | Shorthand to enable `s3 + gcs + azure` together |
 
 ## License

@@ -205,7 +205,7 @@ async fn f30_session_two_tours_delta_tokens() {
         env.write_note_in_section(section, title, body).await;
     }
 
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
 
     // Requête sur des tokens présents INDIVIDUELLEMENT dans plusieurs notes du CORPUS[..5].
     // "f29 f30" ensemble dans la même requête forcerait un AND FTS5 → aucune note
@@ -285,7 +285,7 @@ async fn compact_mode_all_sent_visible() {
 
     let env = build_app_with_session_trace_and_embedder(Arc::new(FakeEmbedder { dim: 1024 })).await;
     let token = sign_token(&env.state);
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
     let now_ms = Utc::now().timestamp_millis();
 
     // ── 1. Seed 4 notes (4 premiers items du corpus) ─────────────────────────

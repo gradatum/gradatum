@@ -76,6 +76,7 @@ pub const DEFAULT_BODY_BUDGET_TOKENS: usize = 4_000;
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CodeScopeRequest {
     /// Target logical vault — MUST start with `code-` (e.g. `code-gradatum`).
     /// Any other vault (`main`, arbitrary vault_id) → 400 (security invariant).
@@ -105,6 +106,22 @@ pub struct CodeScopeRequest {
     /// See module documentation for the `include_callers` field semantics.
     #[serde(default)]
     pub include_callers: bool,
+}
+
+impl CodeScopeRequest {
+    /// Constructs a code-scope request with the mandatory `vault` and `selector`;
+    /// budgets and flags default to their unset (`None` / `false`) values.
+    #[must_use]
+    pub fn new(vault: String, selector: CodeSelectorDto) -> Self {
+        Self {
+            vault,
+            selector,
+            budget_tokens: None,
+            include_body: false,
+            body_budget_tokens: None,
+            include_callers: false,
+        }
+    }
 }
 
 /// Maximum number of callers returned per entry when `include_callers=true`.

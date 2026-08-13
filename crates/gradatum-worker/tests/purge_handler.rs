@@ -46,7 +46,7 @@ fn make_purge_job(spec: PurgeSpec, mode: JobMode) -> GradatumJob {
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Purge(spec),
                 class,

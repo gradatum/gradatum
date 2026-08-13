@@ -10,7 +10,8 @@
 //! L'heuristique `Heuristic::new()` retourne `confidence = 0.5` par défaut
 //! pour les notes sans keywords suspects → fast path garanti.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use gradatum_bench::build_note;
 use gradatum_chat::{CuratorContext, Heuristic, Noop};

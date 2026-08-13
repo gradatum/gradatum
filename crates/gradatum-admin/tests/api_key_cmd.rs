@@ -500,19 +500,20 @@ fn create_with_declared_owner_succeeds() {
 
 /// Des identités déclarées SANS clé ne gênent pas la création d'une autre clé.
 ///
-/// Discriminant : `maintainer`, `sub-external-agent`, `validator` et `expert-rust` sont les
-/// 4 identités mesurées sur le parc qui n'ont aucune clé active. La garde porte sur le
-/// sens clé → identité ; une implémentation qui aurait joint les deux sens échouerait ici.
+/// Discriminant : `admin`, `expert-prompt`, `expert-llm` et `expert-infra` sont des identités
+/// du preset livré pour lesquelles ce test ne frappe AUCUNE clé. La garde porte sur le sens
+/// clé → identité (l'owner d'une clé est-il déclaré ?), jamais sur identité → clé ; une
+/// implémentation qui aurait joint les deux sens échouerait ici.
 #[test]
 fn declared_identities_without_keys_do_not_block_creation() {
     let dir = TempDir::new().expect("tempdir");
     write_preset(
         dir.path(),
         &[
-            "maintainer",
-            "sub-external-agent",
-            "validator",
-            "expert-rust",
+            "admin",
+            "expert-prompt",
+            "expert-llm",
+            "expert-infra",
             "engine",
         ],
     );
@@ -623,4 +624,504 @@ fn malformed_owner_refusal_is_distinct_from_the_identity_refusal() {
         stderr.contains("invalid --owner"),
         "un owner mal formé doit être annoncé comme tel, obtenu : {stderr}"
     );
+}
+
+// ── Une seule clé active par identité (R1, tâche 7, niveau CLI) ────────────────
+//
+// R1 : une identité = une seule clé active. `create` refuse de frapper une seconde
+// clé active pour un owner qui en porte déjà une — deux secrets qui mappent un même
+// `sub` (`api_keys.owner`) est précisément l'état que le modèle d'identité v2.0.0
+// interdit. La garde vit dans la commande (même raison que les gardes de scopes et
+// d'identité ci-dessus : la tester au niveau du store ne prouverait rien sur le CLI
+// livré). L'état de départ est arrangé directement dans le store, au chemin exact que
+// le CLI dérive (`<root>/db/api_keys.sqlite`), puis le binaire est invoqué.
+
+/// Ouvre (ou crée) le store à l'emplacement exact dérivé par le CLI depuis `--root`.
+///
+/// Le helper `open_store` en tête de fichier vise `<dir>/api_keys.sqlite` (tests de
+/// store pur) ; le CLI, lui, dérive `<root>/db/api_keys.sqlite`. Arranger l'état de
+/// ces tests CLI exige donc CE chemin, sinon binaire et arrangement viseraient deux
+/// fichiers distincts.
+async fn open_store_at_cli_path(root: &std::path::Path) -> SqliteApiKeyStore {
+    std::fs::create_dir_all(root.join("db")).expect("créer <root>/db");
+    SqliteApiKeyStore::init(&root.join("db/api_keys.sqlite"))
+        .await
+        .expect("init store au chemin CLI doit réussir")
+}
+
+/// Lance `gradatum-admin api-key rotate --root <root> --prefix <prefix>`.
+fn run_rotate_cli(root: &std::path::Path, prefix: &str) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_gradatum-admin"))
+        .args(["api-key", "rotate"])
+        .arg("--root")
+        .arg(root)
+        .args(["--prefix", prefix])
+        .output()
+        .expect("lancer le binaire gradatum-admin")
+}
+
+/// (a) `create` pour un owner qui porte déjà une clé active → refus (exit ≠ 0),
+/// et le message oriente vers `rotate` en nommant le préfixe de la clé existante (R3).
+#[tokio::test]
+async fn create_is_refused_when_owner_already_has_an_active_key() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    write_preset(root, &["engine"]);
+
+    // Arrange : une clé active pour `engine`.
+    let store = open_store_at_cli_path(root).await;
+    let existing = store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create clé active");
+    drop(store);
+
+    // Act : create pour le même owner.
+    let out = run_create_cli_owner(root, "engine", &["--scopes", "write"]);
+
+    assert!(
+        !out.status.success(),
+        "une 2e clé active pour le même owner doit être refusée (R1), code : {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&existing.prefix) && stderr.contains("rotate"),
+        "le refus doit nommer le préfixe existant ({}) ET la commande de rotation, obtenu : {stderr}",
+        existing.prefix
+    );
+}
+
+/// (b) `create` pour un owner dont la clé est révoquée → succès : R1 compte les clés
+/// ACTIVES, une clé révoquée ne bloque pas la frappe d'une remplaçante.
+#[tokio::test]
+async fn create_succeeds_when_the_owners_key_is_revoked() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    write_preset(root, &["engine"]);
+
+    // Arrange : une clé pour `engine`, puis révoquée.
+    let store = open_store_at_cli_path(root).await;
+    let existing = store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create");
+    store
+        .revoke(&existing.prefix)
+        .await
+        .expect("arrange : revoke");
+    drop(store);
+
+    // Act : create pour le même owner, dont la seule clé est désormais révoquée.
+    let out = run_create_cli_owner(root, "engine", &["--scopes", "write"]);
+
+    assert!(
+        out.status.success(),
+        "une clé révoquée ne doit pas bloquer une nouvelle clé (R1), code : {:?}, stderr : {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// (c) `rotate` sur un owner → exactement une clé active subsiste.
+///
+/// L'invariant est déjà préservé nativement (rotate révoque + remplace atomiquement) ;
+/// ce test verrouille l'acquis contre une régression future.
+#[tokio::test]
+async fn rotate_leaves_exactly_one_active_key_for_the_owner() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    write_preset(root, &["engine"]);
+
+    // Arrange : une clé active pour `engine`.
+    let store = open_store_at_cli_path(root).await;
+    let existing = store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create");
+    drop(store);
+
+    // Act : rotation de cette clé.
+    let out = run_rotate_cli(root, &existing.prefix);
+    assert!(
+        out.status.success(),
+        "rotate doit réussir, code : {:?}, stderr : {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Assert : exactement une clé active pour `engine`.
+    let store = open_store_at_cli_path(root).await;
+    let active = store.list(false, None).await.expect("list active");
+    let n = active.iter().filter(|k| k.owner == "engine").count();
+    assert_eq!(
+        n, 1,
+        "après rotation, exactement une clé active doit subsister pour 'engine'"
+    );
+}
+
+// ── Remise à zéro du registre (R6/R7, tâche 8, niveau CLI) ─────────────────────
+//
+// R6 : une remise à zéro du registre de clés doit être possible.
+// R7 : son périmètre est le registre de clés SEUL, JAMAIS le vault. Le reset opère
+// par RÉVOCATION (jamais par suppression de ligne), donc la trace d'audit survit ;
+// après reset, plus aucune clé active ⇒ le service tombe en état R5 (503 registre
+// vierge) jusqu'à re-provisionnement.
+//
+// La confirmation suit l'idiome de l'oubli de notes : aperçu (dry-run) puis écho de
+// la liste prévisualisée via `--confirm-prefixes`. Il n'existe volontairement AUCUN
+// drapeau de contournement (`--yes`/`--force`) — le booléen aveugle qu'un alias
+// porterait sans qu'un humain lise jamais la liste est précisément ce que l'écho
+// interdit. La garde vit dans la commande : les tests invoquent le VRAI binaire.
+
+/// Lance `gradatum-admin api-key reset --root <root> [extra…]`.
+fn run_reset_cli(root: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    std::fs::create_dir_all(root.join("db")).expect("créer <root>/db");
+    std::process::Command::new(env!("CARGO_BIN_EXE_gradatum-admin"))
+        .args(["api-key", "reset"])
+        .arg("--root")
+        .arg(root)
+        .args(extra)
+        .output()
+        .expect("lancer le binaire gradatum-admin")
+}
+
+/// Instantané logique d'un `index.db` de vault : (nombre de notes, attributions triées).
+///
+/// C'est exactement le couple que R7 exige de voir inchangé — « nombre de notes et
+/// attributions identiques avant/après ». Le reset n'ouvre jamais ce fichier ; ce
+/// helper le lit dans une connexion neuve, indépendante du binaire testé.
+fn vault_notes_snapshot(index_db: &std::path::Path) -> (i64, Option<String>) {
+    let conn = rusqlite::Connection::open(index_db).expect("ouvrir index.db pour l'instantané");
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM notes", [], |r| r.get(0))
+        .expect("compter les notes");
+    let authors: Option<String> = conn
+        .query_row(
+            "SELECT group_concat(author_id) FROM (SELECT author_id FROM notes ORDER BY id)",
+            [],
+            |r| r.get(0),
+        )
+        .expect("concaténer les attributions");
+    (count, authors)
+}
+
+/// (1) Aperçu (dry-run) : liste les clés qui seront révoquées, ne mute rien.
+#[tokio::test]
+async fn reset_dry_run_lists_active_keys_and_mutates_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+
+    // Arrange : 2 clés actives.
+    let store = open_store_at_cli_path(root).await;
+    let a = store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create a");
+    let b = store
+        .create(
+            &AgentId::new("main-agent"),
+            vec!["admin".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create b");
+    drop(store);
+
+    // Act : dry-run (pas de --execute).
+    let out = run_reset_cli(root, &[]);
+    assert!(
+        out.status.success(),
+        "un aperçu doit réussir, code : {:?}, stderr : {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // L'aperçu nomme les 2 préfixes actifs.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&a.prefix) && stdout.contains(&b.prefix),
+        "l'aperçu doit nommer les préfixes actifs, obtenu : {stdout}"
+    );
+
+    // Aucune mutation : les 2 clés restent actives.
+    let store = open_store_at_cli_path(root).await;
+    let active = store.list(false, None).await.expect("list active");
+    assert_eq!(active.len(), 2, "un aperçu ne doit rien révoquer");
+}
+
+/// (2) Exécution confirmée : toutes les clés révoquées, AUCUNE ligne supprimée.
+///
+/// La trace d'audit survit — `list --all` continue de montrer les clés retirées.
+#[tokio::test]
+async fn reset_execute_revokes_all_keys_without_deleting_rows() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+
+    let store = open_store_at_cli_path(root).await;
+    let a = store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create a");
+    let b = store
+        .create(
+            &AgentId::new("main-agent"),
+            vec!["admin".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create b");
+    drop(store);
+
+    // Act : reset confirmé par l'écho exact des préfixes actifs.
+    let confirm = format!("{},{}", a.prefix, b.prefix);
+    let out = run_reset_cli(root, &["--execute", "--confirm-prefixes", &confirm]);
+    assert!(
+        out.status.success(),
+        "un reset confirmé doit réussir, code : {:?}, stderr : {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let store = open_store_at_cli_path(root).await;
+    // Plus aucune clé active.
+    let active = store.list(false, None).await.expect("list active");
+    assert!(active.is_empty(), "toutes les clés doivent être révoquées");
+    // Aucune ligne supprimée : les 2 clés existent toujours, révoquées (audit).
+    let all = store.list(true, None).await.expect("list all");
+    assert_eq!(
+        all.len(),
+        2,
+        "aucune ligne ne doit être supprimée — la trace d'audit survit"
+    );
+    assert!(
+        all.iter().all(|k| k.is_revoked()),
+        "les 2 clés doivent être révoquées, pas absentes"
+    );
+}
+
+/// (3) Après reset, `has_any_active` rend `false` → le service tombe en état R5.
+#[tokio::test]
+async fn reset_leaves_store_with_no_active_key() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+
+    let store = open_store_at_cli_path(root).await;
+    let a = store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create");
+    drop(store);
+
+    let out = run_reset_cli(root, &["--execute", "--confirm-prefixes", &a.prefix]);
+    assert!(
+        out.status.success(),
+        "reset doit réussir, code : {:?}, stderr : {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let store = open_store_at_cli_path(root).await;
+    assert!(
+        !store.has_any_active().await.expect("has_any_active"),
+        "après reset, has_any_active doit être false (état R5)"
+    );
+}
+
+/// (4) R7 — le vault n'est PAS touché : notes et attributions identiques avant/après.
+///
+/// Discriminant : un `index.db` de vault peuplé est planté au chemin canonique. Le
+/// reset n'en tient aucune référence — il n'ouvre que `<root>/db/api_keys.sqlite`.
+/// Une implémentation qui déborderait sur le vault ferait diverger l'instantané.
+#[tokio::test]
+async fn reset_leaves_the_vault_untouched() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+
+    // Arrange : registre avec 1 clé active.
+    let store = open_store_at_cli_path(root).await;
+    let a = store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create");
+    drop(store);
+
+    // Arrange : un index.db de vault avec des notes attribuées, au chemin canonique.
+    let vault_dir = root.join("vault/.gradatum");
+    std::fs::create_dir_all(&vault_dir).expect("créer le répertoire de vault");
+    let index_db = vault_dir.join("index.db");
+    {
+        let conn = rusqlite::Connection::open(&index_db).expect("ouvrir index.db");
+        conn.execute_batch(
+            "CREATE TABLE notes (id TEXT PRIMARY KEY, author_id TEXT, vault_id TEXT);
+             INSERT INTO notes VALUES ('n1', 'main-agent', 'main');
+             INSERT INTO notes VALUES ('n2', 'acp-claude', 'main');
+             INSERT INTO notes VALUES ('n3', 'main-agent', 'main');",
+        )
+        .expect("semer les notes");
+    }
+    let before = vault_notes_snapshot(&index_db);
+
+    // Act : reset confirmé.
+    let out = run_reset_cli(root, &["--execute", "--confirm-prefixes", &a.prefix]);
+    assert!(
+        out.status.success(),
+        "reset doit réussir, code : {:?}, stderr : {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Assert : registre muté (clé révoquée) MAIS vault intact.
+    let store = open_store_at_cli_path(root).await;
+    assert!(
+        store
+            .list(false, None)
+            .await
+            .expect("list active")
+            .is_empty(),
+        "précondition : le reset a bien muté le registre"
+    );
+    let after = vault_notes_snapshot(&index_db);
+    assert_eq!(
+        before, after,
+        "R7 : le reset ne doit toucher que le registre, jamais le vault (notes/attributions)"
+    );
+}
+
+/// (5) Sans confirmation explicite (`--execute` seul) → refus, aucune mutation.
+#[tokio::test]
+async fn reset_execute_without_confirmation_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+
+    let store = open_store_at_cli_path(root).await;
+    store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create");
+    drop(store);
+
+    // Act : --execute sans --confirm-prefixes.
+    let out = run_reset_cli(root, &["--execute"]);
+    assert!(
+        !out.status.success(),
+        "un reset sans confirmation doit être refusé, code : {:?}",
+        out.status.code()
+    );
+
+    // Aucune mutation.
+    let store = open_store_at_cli_path(root).await;
+    let active = store.list(false, None).await.expect("list active");
+    assert_eq!(active.len(), 1, "un refus ne doit rien révoquer");
+}
+
+/// (5b) Une confirmation qui ne correspond pas à la liste prévisualisée → refus.
+///
+/// C'est le cœur de la sûreté : l'écho doit être EXACT. Un préfixe bidon ne passe pas.
+#[tokio::test]
+async fn reset_execute_with_mismatched_confirmation_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+
+    let store = open_store_at_cli_path(root).await;
+    store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create");
+    drop(store);
+
+    // Act : confirmation erronée.
+    let out = run_reset_cli(root, &["--execute", "--confirm-prefixes", "ak_deadbeef"]);
+    assert!(
+        !out.status.success(),
+        "une confirmation qui ne matche pas doit être refusée, code : {:?}",
+        out.status.code()
+    );
+
+    let store = open_store_at_cli_path(root).await;
+    let active = store.list(false, None).await.expect("list active");
+    assert_eq!(active.len(), 1, "un refus ne doit rien révoquer");
+}
+
+/// (6) Aucun drapeau de contournement n'existe — le booléen aveugle est interdit.
+///
+/// Un `--yes`/`--force`/`--non-interactive` réintroduirait exactement ce que l'écho
+/// de liste vise à empêcher. clap doit rejeter chacun (argument inconnu), et aucune
+/// clé ne doit être révoquée au passage.
+#[tokio::test]
+async fn reset_has_no_blind_bypass_flag() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+
+    let store = open_store_at_cli_path(root).await;
+    store
+        .create(
+            &AgentId::new("engine"),
+            vec!["write".into()],
+            "main".into(),
+            None,
+        )
+        .await
+        .expect("arrange : create");
+    drop(store);
+
+    for flag in ["--yes", "--force", "--non-interactive", "--confirm-all"] {
+        let out = run_reset_cli(root, &["--execute", flag]);
+        assert!(
+            !out.status.success(),
+            "aucun drapeau de contournement ne doit exister : {flag} devrait être rejeté"
+        );
+    }
+
+    // Aucun bypass n'a pu révoquer.
+    let store = open_store_at_cli_path(root).await;
+    let active = store.list(false, None).await.expect("list active");
+    assert_eq!(active.len(), 1, "aucun bypass ne doit révoquer la clé");
 }

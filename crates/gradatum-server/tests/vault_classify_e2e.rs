@@ -211,7 +211,7 @@ async fn vault_classify_heuristic_returns_200() {
 async fn vault_classify_unauthenticated_returns_401() {
     // App sans vault réel — l'erreur 401 survient avant la lecture du vault.
     let (app, _token) = build_app_without_vault().await;
-    let fake_id = Ulid::new().to_string();
+    let fake_id = Ulid::generate().to_string();
 
     let req = Request::builder()
         .uri("/api/v1/vault_classify")
@@ -238,7 +238,7 @@ async fn vault_classify_unauthenticated_returns_401() {
 async fn vault_classify_unknown_note_returns_404() {
     // App sans vault réel — DefaultVault retourne NoteNotFound sur tout read.
     let (app, token) = build_app_without_vault().await;
-    let absent_id = Ulid::new().to_string();
+    let absent_id = Ulid::generate().to_string();
 
     let req = Request::builder()
         .uri("/api/v1/vault_classify")

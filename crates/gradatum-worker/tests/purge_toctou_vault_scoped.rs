@@ -102,7 +102,7 @@ fn make_scoped_purge_job(vault_id: &str) -> GradatumJob {
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Purge(PurgeSpec {
                     mode: PurgeMode::Lifecycle,

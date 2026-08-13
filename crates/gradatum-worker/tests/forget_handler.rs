@@ -39,7 +39,7 @@ fn make_forget_job(spec: ForgetSpec, mode: JobMode) -> GradatumJob {
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Forget(spec),
                 class,
@@ -235,7 +235,7 @@ async fn fail_closed_note_not_in_index_excluded() {
     let fixture = make_fixture().await;
 
     // ULID fantôme : jamais inséré dans l'index.
-    let phantom_ulid = Ulid::new().to_string();
+    let phantom_ulid = Ulid::generate().to_string();
 
     // Scope Locus : cible un préfixe qui pourrait théoriquement matcher l'ULID fantôme.
     // En pratique, list_notes_by_locus_prefix ne le trouvera pas (absent de l'index),

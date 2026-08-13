@@ -55,13 +55,11 @@ fn make_app(config: WardenConfig) -> Router {
 /// (1) IP dans le CIDR allow → 200 OK.
 #[tokio::test]
 async fn ip_filter_allow_cidr_match() {
-    let config = WardenConfig {
-        ip_allow: vec!["192.0.2.0/24".parse().unwrap()],
-        ip_deny: vec![],
-        bypass_loopback: false,
-        rate_limit_burst: 100,
-        ..WardenConfig::default()
-    };
+    // WardenConfig is #[non_exhaustive] (API freeze v2.0.0): build from Default + assign.
+    let mut config = WardenConfig::default();
+    config.ip_allow = vec!["192.0.2.0/24".parse().unwrap()];
+    config.bypass_loopback = false;
+    config.rate_limit_burst = 100;
     let app = make_app(config);
     let resp = app
         .oneshot(req(EXTERNAL_IP))
@@ -73,13 +71,10 @@ async fn ip_filter_allow_cidr_match() {
 /// (2) IP dans le CIDR deny → 403.
 #[tokio::test]
 async fn ip_filter_deny_cidr_match() {
-    let config = WardenConfig {
-        ip_allow: vec![],
-        ip_deny: vec!["192.0.2.0/24".parse().unwrap()],
-        bypass_loopback: false,
-        rate_limit_burst: 100,
-        ..WardenConfig::default()
-    };
+    let mut config = WardenConfig::default();
+    config.ip_deny = vec!["192.0.2.0/24".parse().unwrap()];
+    config.bypass_loopback = false;
+    config.rate_limit_burst = 100;
     let app = make_app(config);
     let resp = app
         .oneshot(req(EXTERNAL_IP))
@@ -95,12 +90,10 @@ async fn ip_filter_deny_cidr_match() {
 /// (3) N hits dans le burst → tous 200 OK.
 #[tokio::test]
 async fn rate_limit_burst_within_limit() {
-    let config = WardenConfig {
-        bypass_loopback: false,
-        rate_limit_per_minute: 600,
-        rate_limit_burst: 10,
-        ..WardenConfig::default()
-    };
+    let mut config = WardenConfig::default();
+    config.bypass_loopback = false;
+    config.rate_limit_per_minute = 600;
+    config.rate_limit_burst = 10;
     let app = make_app(config);
 
     for i in 1u32..=10 {
@@ -121,12 +114,10 @@ async fn rate_limit_burst_within_limit() {
 /// (4) (burst+1)e hit après épuisement → 429.
 #[tokio::test]
 async fn rate_limit_burst_exceeded() {
-    let config = WardenConfig {
-        bypass_loopback: false,
-        rate_limit_per_minute: 600,
-        rate_limit_burst: 10,
-        ..WardenConfig::default()
-    };
+    let mut config = WardenConfig::default();
+    config.bypass_loopback = false;
+    config.rate_limit_per_minute = 600;
+    config.rate_limit_burst = 10;
     let app = make_app(config);
 
     // Vider le burst.
@@ -162,12 +153,10 @@ async fn rate_limit_burst_exceeded() {
 /// et appelle le handler inner (body réel, pas Body::empty synthétique).
 #[tokio::test]
 async fn bypass_loopback_skips_rate_limit() {
-    let config = WardenConfig {
-        bypass_loopback: true,
-        rate_limit_per_minute: 60,
-        rate_limit_burst: 1, // Burst très bas — sans bypass, la 2e requête serait 429.
-        ..WardenConfig::default()
-    };
+    let mut config = WardenConfig::default();
+    config.bypass_loopback = true;
+    config.rate_limit_per_minute = 60;
+    config.rate_limit_burst = 1; // Burst très bas — sans bypass, la 2e requête serait 429.
     let app = make_app(config);
 
     for i in 1u32..=10 {
@@ -214,12 +203,10 @@ async fn connect_info_absent_is_rejected() {
 /// (6) bypass_loopback=false + loopback + burst saturé → 429.
 #[tokio::test]
 async fn bypass_loopback_disabled_applies_rate_limit() {
-    let config = WardenConfig {
-        bypass_loopback: false,
-        rate_limit_per_minute: 60,
-        rate_limit_burst: 1,
-        ..WardenConfig::default()
-    };
+    let mut config = WardenConfig::default();
+    config.bypass_loopback = false;
+    config.rate_limit_per_minute = 60;
+    config.rate_limit_burst = 1;
     let app = make_app(config);
 
     // Premier jeton : OK.

@@ -22,8 +22,8 @@ use gradatum_core::{
     identity::NoteId,
     index::{FileChecksumEntry, NoteRecord, TemporalEntry},
     index_store::{
-        AuthorRow, CodeScopeEntryRaw, CodeSelector, LessonHitRaw, Lineage, ReviewQueueRow,
-        SearchHitRaw,
+        AuthorRow, CodeScopeEntryRaw, CodeSelector, CuratedLinks, LessonHitRaw, Lineage,
+        ReviewQueueRow, SearchHitRaw,
     },
     metric_sample::MetricSamplePoint,
     scheduled_health::{ScheduledTaskHealth, TaskOutcome},
@@ -665,7 +665,7 @@ impl IndexStore for SqliteIndex {
         note_id: &NoteId,
         title: &str,
         temporal: Option<&TemporalEntry>,
-        links: &[(String, String)],
+        links: CuratedLinks<'_>,
         trust: Option<f32>,
         vault_id: &str,
     ) -> Result<(), GradatumError> {
@@ -710,9 +710,35 @@ impl IndexStore for SqliteIndex {
             .map_err(|e| GradatumError::Storage(format!("persist_curated_index_atomic: write_temporal_entry: {e}")))?;
         }
 
-        // 3. Links — INSERT OR IGNORE (idempotent, FK sur src_note_id → rollback si inexistant).
+        // 3. Links.
+        //
+        // F-147 : les arêtes sortantes d'une note doivent REFLÉTER son corps courant, pas
+        // s'accumuler. Sous `links_authoritative`, on efface d'abord toutes les arêtes
+        // sortantes de cette note (scopé `src_note_id` + `vault_id`, même durcissement que
+        // l'UPDATE titre/trust ci-dessus — une suppression non scopée par vault serait une
+        // fuite inter-locataires), puis on réinsère la liste courante, dans la MÊME
+        // transaction (atomicité déjà acquise). Le DELETE porte sur `note_id`, qui EST le
+        // `src` de toutes les arêtes de `links` (invariant `resolve_wikilinks*`).
+        //
+        // Absent `links_authoritative` (défaut sûr : chemins qui NE recalculent PAS les liens
+        // — reclassification titre/section/statut, downgrade), aucune suppression : simple
+        // upsert idempotent, comportement historique préservé. Une liste vide + autorité est
+        // légitime (note dont le corps n'a plus aucun lien) et nettoie les arêtes périmées ;
+        // une liste vide SANS autorité ne touche rien.
         let now_ms = Utc::now().timestamp_millis();
-        for (src, dst) in links {
+        if links.authoritative {
+            // `note_id_str` : réutilise la résolution faite en tête de fonction (upsert titre).
+            tx.execute(
+                "DELETE FROM note_links WHERE src_note_id = ?1 AND vault_id = ?2",
+                rusqlite::params![note_id_str, vault_id],
+            )
+            .map_err(|e| {
+                GradatumError::Storage(format!(
+                    "persist_curated_index_atomic: delete stale links ({note_id_str}): {e}"
+                ))
+            })?;
+        }
+        for (src, dst) in links.edges {
             tx.execute(
                 "INSERT OR IGNORE INTO note_links (src_note_id, dst_note_id, vault_id, created_at)                  VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![src, dst, vault_id, now_ms],

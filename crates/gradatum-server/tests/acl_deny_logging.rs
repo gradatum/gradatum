@@ -133,21 +133,8 @@ fn assert_forbidden<T: std::fmt::Debug>(res: Result<T, GradatumError>) {
 async fn effective_read_vault_logs_the_denied_identity_and_locus() {
     let st = state(true);
     let trust = engine_trust();
-    let req = gradatum_dto::VaultSearchRequest {
-        tenant_id: None,
-        query: "peu importe".into(),
-        section: Some("decisions".into()),
-        status: None,
-        limit: None,
-        include_downgraded: false,
-        locus: None,
-        vault_id: None,
-        include_scores: false,
-        include_corpus_count: false,
-        from_ms: None,
-        to_ms: None,
-        compact: false,
-    };
+    let mut req = gradatum_dto::VaultSearchRequest::new("peu importe".into());
+    req.section = Some("decisions".into());
 
     let (res, logs) = capture(|| logic::vault_search_impl(&st, &trust, req)).await;
 
@@ -170,14 +157,8 @@ async fn effective_read_vault_logs_the_denied_identity_and_locus() {
 async fn lessons_recall_logs_the_denied_identity_and_locus() {
     let st = state(false);
     let trust = engine_trust();
-    let params = gradatum_dto::LessonsRecallRequest {
-        class: "deploy".into(),
-        limit: Some(3),
-        rank: None,
-        semantic: None,
-        query: None,
-        compact: false,
-    };
+    let mut params = gradatum_dto::LessonsRecallRequest::new("deploy".into());
+    params.limit = Some(3);
 
     let (res, logs) = capture(|| logic::lessons_recall_impl(&st, &trust, params)).await;
 
@@ -203,17 +184,8 @@ async fn lessons_recall_logs_the_denied_identity_and_locus() {
 async fn vault_write_logs_the_denied_identity_and_locus() {
     let st = state(false);
     let trust = engine_trust();
-    let req = gradatum_dto::VaultWriteRequest {
-        title: "Titre".into(),
-        body: "Corps.".into(),
-        author: None,
-        tags: Vec::new(),
-        section_hint: Some("decisions".into()),
-        tenant_id: None,
-        expected_sha256: None,
-        note_id: None,
-        occurred_at: None,
-    };
+    let mut req = gradatum_dto::VaultWriteRequest::new("Titre".into(), "Corps.".into());
+    req.section_hint = Some("decisions".into());
 
     let (res, logs) = capture(|| {
         logic::vault_write_impl(
@@ -256,14 +228,8 @@ async fn an_allowed_request_emits_no_denial_line() {
         tenant_id: TenantId::new("main"),
         jti: None,
     };
-    let params = gradatum_dto::LessonsRecallRequest {
-        class: "deploy".into(),
-        limit: Some(3),
-        rank: None,
-        semantic: None,
-        query: None,
-        compact: false,
-    };
+    let mut params = gradatum_dto::LessonsRecallRequest::new("deploy".into());
+    params.limit = Some(3);
 
     let (_res, logs) = capture(|| logic::lessons_recall_impl(&st, &trust, params)).await;
 

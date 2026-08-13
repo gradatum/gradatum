@@ -48,9 +48,9 @@ async fn count_basic_n_matches() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_a = ulid::Ulid::new().to_string();
-    let id_b = ulid::Ulid::new().to_string();
-    let id_c = ulid::Ulid::new().to_string();
+    let id_a = ulid::Ulid::generate().to_string();
+    let id_b = ulid::Ulid::generate().to_string();
+    let id_c = ulid::Ulid::generate().to_string();
 
     idx.seed_note_with_fts(
         &id_a,
@@ -83,7 +83,7 @@ async fn count_zero_no_match() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_a = ulid::Ulid::new().to_string();
+    let id_a = ulid::Ulid::generate().to_string();
     idx.seed_note_with_fts(&id_a, "decisions", "gradatum vault rust backend")
         .await
         .unwrap();
@@ -106,7 +106,7 @@ async fn byte_compat_method_returns_exact_count() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_a = ulid::Ulid::new().to_string();
+    let id_a = ulid::Ulid::generate().to_string();
     idx.seed_note_with_fts(&id_a, "decisions", "corpus byte compat gradatum")
         .await
         .unwrap();
@@ -129,9 +129,9 @@ async fn scope_section_counts_filtered_only() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_a = ulid::Ulid::new().to_string();
-    let id_b = ulid::Ulid::new().to_string();
-    let id_other_vault = ulid::Ulid::new().to_string();
+    let id_a = ulid::Ulid::generate().to_string();
+    let id_b = ulid::Ulid::generate().to_string();
+    let id_other_vault = ulid::Ulid::generate().to_string();
 
     // Note dans section "decisions" (main)
     idx.seed_note_with_fts(&id_a, "decisions", "scope section archivage filtrage")
@@ -190,8 +190,8 @@ async fn scope_locus_and_downgraded_excluded() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_live_council = ulid::Ulid::new().to_string();
-    let id_other_locus = ulid::Ulid::new().to_string();
+    let id_live_council = ulid::Ulid::generate().to_string();
+    let id_other_locus = ulid::Ulid::generate().to_string();
 
     // Note LIVE dans locus council/2026
     idx.seed_note_with_fts_vault(
@@ -217,7 +217,7 @@ async fn scope_locus_and_downgraded_excluded() {
 
     // Note downgraded dans locus council/2026 : seed via seed_note_with_fts_vault
     // (qui gère FTS + locus), puis downgrade via downgrade_note avec NoteId parsé.
-    let id_downgraded_str = ulid::Ulid::new().to_string();
+    let id_downgraded_str = ulid::Ulid::generate().to_string();
     idx.seed_note_with_fts_vault(
         &id_downgraded_str,
         "main",
@@ -289,7 +289,7 @@ async fn invariant_r2_count_bm25_only() {
     let vault = VaultId::new("main");
 
     // Note avec FTS indexé
-    let id_fts = ulid::Ulid::new().to_string();
+    let id_fts = ulid::Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &id_fts,
         "decisions",
@@ -305,7 +305,7 @@ async fn invariant_r2_count_bm25_only() {
     // Solution : seed une note qui ne matche PAS le terme cherché — elle sera présente
     // dans notes_fts mais ne matchera pas 'bm25only'. Cela valide que COUNT ne compte
     // que les vrais matches FTS5, pas toutes les notes.
-    let id_no_match = ulid::Ulid::new().to_string();
+    let id_no_match = ulid::Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &id_no_match,
         "decisions",
@@ -339,7 +339,7 @@ async fn cap_logic_uncapped_small_corpus() {
     let vault = VaultId::new("main");
 
     for i in 0..5u32 {
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         idx.seed_note_with_fts(
             &id,
             "decisions",
@@ -367,7 +367,7 @@ async fn count_downgraded_excluded_by_default() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_live = ulid::Ulid::new().to_string();
+    let id_live = ulid::Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &id_live,
         "decisions",
@@ -421,7 +421,7 @@ async fn parity_count_equals_nonsemantic_results() {
 
     // 2 notes LIVE dans section="council", locus="2026/..." → matchent la query
     for i in 0..2u32 {
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         idx.seed_note_with_fts_vault(
             &id,
             "main",
@@ -434,7 +434,7 @@ async fn parity_count_equals_nonsemantic_results() {
     }
 
     // 1 note LIVE dans section="council", locus="2025/..." → exclue par filtre locus "2026"
-    let id_other_locus = ulid::Ulid::new().to_string();
+    let id_other_locus = ulid::Ulid::generate().to_string();
     idx.seed_note_with_fts_vault(
         &id_other_locus,
         "main",
@@ -446,7 +446,7 @@ async fn parity_count_equals_nonsemantic_results() {
     .unwrap();
 
     // 1 note LIVE dans section="decisions" → exclue par filtre section "council"
-    let id_other_section = ulid::Ulid::new().to_string();
+    let id_other_section = ulid::Ulid::generate().to_string();
     idx.seed_note_with_fts_vault(
         &id_other_section,
         "main",
@@ -458,7 +458,7 @@ async fn parity_count_equals_nonsemantic_results() {
     .unwrap();
 
     // 1 note DOWNGRADED dans section="council", locus="2026/down" → exclue par downgraded=false
-    let id_down = ulid::Ulid::new().to_string();
+    let id_down = ulid::Ulid::generate().to_string();
     idx.seed_note_with_fts_vault(
         &id_down,
         "main",

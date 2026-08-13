@@ -1,9 +1,15 @@
 # Windows User & Contributor Guide
 
-> **DEFERRED (2026-06-05)**: Windows is no longer a supported target. gradatum is
-> Linux-only. This document is archived for historical reference.
+> **UPDATED (2026-08-10)**: Windows is supported again, but **via Docker only** — see
+> [Guide A — Docker quickstart § Windows](guides/A-docker-quickstart.md#windows). Everything
+> below describes the historical **native** Windows path (bare-metal `.exe`, MSVC/mingw
+> toolchain), which remains unsupported and stays archived for historical reference. Platform
+> support: [docs/DEPLOYMENT.md § Platform support](DEPLOYMENT.md#platform-support).
 
-> ~~Status: Windows is a **secondary-tier** platform for Gradatum. See [RFC-0002](RFC/RFC-0002-cross-platform-support.md) for the full support model. This guide is the operational reference for users running Gradatum on Windows and contributors testing Windows compatibility.~~
+> ~~Status: Windows is a **secondary-tier** platform for Gradatum. See RFC-0002 (retired — see
+> [`GOVERNANCE.md`](../GOVERNANCE.md) § Structural change tracking) for the full support model.
+> This guide is the operational reference for users running Gradatum on Windows and
+> contributors testing Windows compatibility.~~
 
 ---
 
@@ -115,7 +121,6 @@ Before each major tag (`v0.1.0-beta`, `v0.1.0`, `v0.2.0`+), the following manual
 [ ] gradatum.exe init C:\vault-test -> creates vault directory + config files.
 [ ] HTTP sanity: curl -I http://your-llm-host:8432/health (or equivalent endpoint) -> returns 200.
 [ ] cargo test --workspace --target x86_64-pc-windows-gnu (skip gradatum-engine, fastembed-cpu features) -> expected core tests PASS.
-[ ] No tracing::warn! "nfs_check skipped" pollutes WARN-level logs. (Acceptable in DEBUG.)
 [ ] PATH_MAX warning visible at vault boot if LongPathsEnabled = 0 OR vault path > 200 chars.
 [ ] SQLite operations under load (insert 1000 notes via CLI) complete without SQLITE_BUSY errors. (R12 + R-X7 mitigation.)
 ```
@@ -132,7 +137,9 @@ See [`KNOWN_ISSUES-WINDOWS.md`](KNOWN_ISSUES-WINDOWS.md) (created upon first rep
 
 ## 7. References
 
-- [`RFC/RFC-0002-cross-platform-support.md`](RFC/RFC-0002-cross-platform-support.md) — full tiered support model and portability rules.
+- RFC-0002 — full tiered support model and portability rules; retired along with `docs/RFC/`,
+  no longer in the repository (see [`../GOVERNANCE.md`](../GOVERNANCE.md) § Structural change
+  tracking).
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — cross-platform PR checklist.
 
 ---

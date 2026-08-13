@@ -27,7 +27,7 @@
 #   `index.db` (vault, cible des migrations rusqlite de gradatum-index) est
 #   sauvegardé ailleurs, et c'est délibéré : les deux units systemd portent
 #   `ExecStartPre=/usr/local/bin/gradatum-pre-migration-backup`
-#   (source : scripts/gradatum-pre-migration-backup), exécuté à CHAQUE
+#   (source : packaging/systemd/gradatum-pre-migration-backup), exécuté à CHAQUE
 #   démarrage — donc juste avant que le runner de migrations touche le schéma.
 #   Ce point de garde est strictement plus couvrant que l'étape 2 :
 #     - il couvre TOUS les chemins qui migrent (ce script, un `systemctl restart`
@@ -71,7 +71,12 @@ UNITS_STOP_ORDER=("gradatum-worker" "gradatum-server")
 UNITS_START_ORDER=("gradatum-server" "gradatum-worker")
 
 # Binaires à déployer (liste de base ; engine ajouté dynamiquement si --engine)
-BINARIES=("gradatum-server" "gradatum-worker")
+# gradatum-admin est une CLI opérateur (pas un service) : elle n'a ni unit systemd
+# ni sonde de santé. Elle est présente ici pour être BUILDÉE (0c), contrôlée par
+# build_sha (0d), sauvegardée (2) et installée (4) au même titre que les services —
+# les listes UNITS_STOP_ORDER/UNITS_START_ORDER et le health check restent, eux,
+# strictement server+worker et ne la concernent pas.
+BINARIES=("gradatum-server" "gradatum-worker" "gradatum-admin")
 INSTALL_DIR="/usr/bin"
 ENGINE_INSTALL_DIR="/opt/gradatum/bin"
 
@@ -224,10 +229,11 @@ fi
 if $FLAG_BUILD; then
     info "Build release demandé..."
 
-    # Build principal (server + worker)
+    # Build principal (server + worker + admin CLI)
     dry cargo build --release \
         -p gradatum-server \
         -p gradatum-worker \
+        -p gradatum-admin \
         --manifest-path "${PROJECT_DIR}/Cargo.toml"
 
     # Build engine (séparé — nécessite le feature 'serve')

@@ -2,6 +2,16 @@
 
 Fichiers unit systemd pour `gradatum-server`, `gradatum-worker`, `gradatum-engine` et `gradatum-gateway`.
 
+> **Ces fichiers ne sont livrés dans aucune archive de release.** Les deux archives
+> binaires du chemin GitHub (`gradatum-server-*.tar.gz`, `gradatum-llm-*.tar.gz` — voir
+> [`docs/guides/B-install-binaries.md`](../../docs/guides/B-install-binaries.md))
+> ne contiennent que des binaires — ni unit files, ni `sysusers.d`, ni scripts, ni configs
+> d'exemple. Même après une installation par archives pré-compilées, il faut récupérer ce
+> répertoire séparément : `bash scripts/fetch-gradatum-release.sh` (le récupère en même
+> temps que les binaires), `git clone` du dépôt, ou téléchargement HTTPS des fichiers
+> individuels depuis le tag de la release. Sans systemd (conteneur, par exemple), voir
+> "Running without systemd" dans `docs/DEPLOYMENT.md` §8.
+
 ## Fichiers
 
 | Fichier | Rôle |
@@ -10,6 +20,7 @@ Fichiers unit systemd pour `gradatum-server`, `gradatum-worker`, `gradatum-engin
 | `gradatum-worker.service` | Worker background curator cascade + job queue — `Type=simple`, `MemoryMax=1G` |
 | `gradatum-engine@.service` | Template superviseur `llama-server` — une instance par modèle (`@curator`, `@embed`, …) — `Type=simple` |
 | `gradatum-gateway-spike.service` | Routeur LLM (alias → provider + circuit-breaker) — `Type=simple` |
+| `gradatum-pre-migration-backup` | Guard ExecStartPre pour `gradatum-server`/`gradatum-worker` — backup atomique des DBs avant toute migration (fail-closed) — installé en `/usr/local/bin/` |
 | `wait-for-port-free.sh` | Guard ExecStartPre pour `gradatum-engine@.service` — attend la libération de `child_port` |
 | `test-wait-for-port-free.sh` | Tests unitaires pour `wait-for-port-free.sh` |
 
@@ -57,14 +68,17 @@ sudo install -m 755 target/release/gradatum-server /usr/bin/
 sudo install -m 755 target/release/gradatum-worker /usr/bin/
 sudo install -m 755 target/release/gradatum-admin /usr/bin/
 
-# 2. Créer l'utilisateur système gradatum (UID 985, GID 985)
+# 2. Créer l'utilisateur système gradatum (UID/GID alloués dynamiquement)
 sudo cp packaging/sysusers.d/gradatum.conf /usr/lib/sysusers.d/
 sudo systemd-sysusers
-id gradatum  # MUST: uid=985(gradatum) gid=985(gradatum)
+id gradatum  # MUST: un user 'gradatum' AVEC un groupe 'gradatum' (numéros alloués dynamiquement)
 
-# 3. Installer les unit files
+# 3. Installer les unit files + le helper ExecStartPre (backup pré-migration)
 sudo cp packaging/systemd/gradatum-server.service /etc/systemd/system/
 sudo cp packaging/systemd/gradatum-worker.service /etc/systemd/system/
+# Helper OBLIGATOIRE : les deux units le déclarent en ExecStartPre SANS préfixe `-`.
+# Son absence fait échouer le démarrage (status=216/GROUP, « No such process »).
+sudo install -m 755 packaging/systemd/gradatum-pre-migration-backup /usr/local/bin/gradatum-pre-migration-backup
 sudo systemctl daemon-reload
 
 # 4. Générer bearer, configs, SQLite — crée tout sous --root
@@ -79,6 +93,18 @@ sudo -u gradatum gradatum-admin init --root /var/lib/gradatum --preset hierarchi
 #   C'est CE fichier qu'il faut sauvegarder — le perdre invalide tous les jetons émis.
 #   init ne génère plus la paire jwt.public.pem / jwt.private.pem : aucun composant
 #   runtime ne la lisait.
+
+# 4b. Fichier d'environnement du worker (OBLIGATOIRE) — il porte GRADATUM_INTERNAL_TOKEN.
+#     init a déposé ce jeton dans config/internal-worker.token.txt (mode 0600). Le worker lit
+#     /etc/gradatum/env (EnvironmentFile SANS `-` : un fichier absent échoue TÔT au niveau
+#     systemd, jamais en crash-loop silencieux avec /health vert). Ce fichier est lu par
+#     systemd (root), pas par le compte de service → propriétaire root:gradatum, mode 0640.
+sudo mkdir -p /etc/gradatum
+printf 'GRADATUM_INTERNAL_URL=http://127.0.0.1:19092\nGRADATUM_INTERNAL_TOKEN=%s\n' \
+    "$(sudo cat /var/lib/gradatum/config/internal-worker.token.txt)" \
+    | sudo tee /etc/gradatum/env >/dev/null
+sudo chown root:gradatum /etc/gradatum/env
+sudo chmod 0640 /etc/gradatum/env
 
 # 5. Démarrer dans l'ordre : server en premier (matérialise les fichiers SQLite restants)
 sudo systemctl enable --now gradatum-server.service
@@ -174,6 +200,9 @@ Voir `docs/DEPLOYMENT.md` §7 pour le détail complet :
 
 ```bash
 # 1. Créer la config (obligatoire — le gateway refuse de démarrer sans)
+# `examples/configs/curator.toml` n'est pas dans l'archive gradatum-llm (2 binaires
+# seulement : gradatum-gateway, gradatum-engine) — provient du dépôt cloné, comme le
+# reste de ce répertoire (voir l'avertissement en tête de fichier).
 sudo cp examples/configs/curator.toml /etc/gradatum/gateway-spike.toml
 sudoedit /etc/gradatum/gateway-spike.toml
 # → Configurer les providers et aliases (voir docs/DEPLOYMENT.md §10)
@@ -212,11 +241,26 @@ sudo systemctl show gradatum-worker -p MemoryCurrent
 
 Compare against the `MemoryMax=1G` budget in the unit file.
 
-## UID/GID statique
+## Compte de service (allocation dynamique)
 
-`gradatum` : UID **985**, GID **985**.
+`gradatum` : compte système dédié, **UID/GID alloués dynamiquement** par
+`systemd-sysusers` à l'installation (`u gradatum -`). Aucune unité ne référence
+le compte par son numéro — les quatre units déclarent `User=gradatum` /
+`Group=gradatum` **par nom**, résolu à l'exécution.
 
 Rationale:
-- UID 991 initially considered but rejected: already occupied by `sshd` on the reference deployment host (`systemd-sysusers` failure).
-- Audit of UID/GID range 980-999 found 985 as first commonly available entry. Retained for stability (margin below `timesync` 990).
-- Lesson: any static UID/GID assignment must be validated end-to-end via `systemd-sysusers --check` in the CI release gate before tagging.
+- A fixed UID/GID buys nothing here: no unit, script or config refers to the
+  account by number. Only the name is load-bearing.
+- Worse, a fixed number was actively harmful. It was chosen by scanning ID
+  availability on a single reference host, then frozen for every installer. On
+  any host where that GID is already taken (observed: `forgejo-runner` holding
+  the GID), `systemd-sysusers` does not fail — it creates the user, sees the
+  numeric group already exists, and silently attaches the account to that
+  FOREIGN group instead of creating `gradatum`. The install then dies later on
+  `chown gradatum:gradatum` ("invalid group"), half-done.
+- Lesson: a static UID/GID cannot be validated for a host you do not control.
+  A `systemd-sysusers --dry-run` on the build host proves nothing about the
+  operator's machine. Designate the account by NAME and let systemd allocate the
+  number. For a non-standard account name, run
+  `install-gradatum-services.sh --user <name>`: it creates the account with a
+  dynamic UID/GID and applies a systemd drop-in (`User=`/`Group=`) on the units.

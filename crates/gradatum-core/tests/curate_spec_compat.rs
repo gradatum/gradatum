@@ -23,7 +23,7 @@ use ulid::Ulid;
 /// du JSON → `#[serde(default)]` doit produire `None` / `vec![]`.
 #[test]
 fn curate_spec_forward_compat_alpha15_payload() {
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
 
     // Payload minimal alpha.15 : uniquement note_id + tenant_id
     let json = format!(r#"{{"note_id":"{}","tenant_id":"main"}}"#, note_id);
@@ -68,7 +68,7 @@ fn curate_spec_forward_compat_alpha15_payload() {
 /// survit à un cycle serde sans perte.
 #[test]
 fn curate_spec_backward_compat_v020_full_roundtrip() {
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
     let spec = CurateSpec {
         note_id,
         tenant_id: "main".to_string(),
@@ -129,7 +129,7 @@ fn curate_spec_truncated_payload_returns_error_not_panic() {
 /// d'un `JobRecord` en JSON en base (colonne `record` TEXT).
 #[test]
 fn job_curate_with_alpha15_spec_deserializes() {
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
 
     // Format JSON du variant Job::Curate tel que serde le produit avec tag+content
     let json = format!(

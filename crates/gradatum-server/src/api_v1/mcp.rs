@@ -285,7 +285,10 @@ impl GradatumMcpHandler {
             // ── Outils write ──────────────────────────────────────────────────
             "vault_write" => {
                 let req: VaultWriteRequest = deserialize_args(args)?;
-                let request_id = ulid::Ulid::new().to_string();
+                // L'author vient du credential (`trust.subject()`), appliqué par
+                // `effective_author` dans `vault_write_impl` — JAMAIS de l'en-tête
+                // `X-Gradatum-Agent` (v2.0.0, Task 9 : suppression du repli d'en-tête).
+                let request_id = ulid::Ulid::generate().to_string();
                 let res = logic::vault_write_impl(
                     &self.state,
                     &trust,
@@ -299,7 +302,7 @@ impl GradatumMcpHandler {
             }
             "create_feature_card" => {
                 let req: CreateFeatureCardRequest = deserialize_args(args)?;
-                let request_id = ulid::Ulid::new().to_string();
+                let request_id = ulid::Ulid::generate().to_string();
                 let res = logic::create_feature_card_impl(&self.state, &trust, req, &request_id)
                     .await
                     .map_err(gradatum_error_to_mcp)?;
@@ -422,72 +425,32 @@ impl GradatumMcpHandler {
         }
     }
 
-    /// Reads the `X-Gradatum-Agent` request header and returns a normalised, kebab-case agent id.
+    /// Loads the caller's **own** soul body from vault section `identity/<subject>`, if present.
     ///
-    /// Falls back to `"main"` when the header is absent, non-ASCII, empty, oversized
-    /// (> 64 chars) or contains characters outside `[a-z0-9-]` (ADN 1 — no panic on bad input).
+    /// The agent identity is taken **from the credential** — `trust.subject()`, i.e. the JWT
+    /// `sub` / api-key owner, a server-side value — never from a client-supplied header
+    /// (the `X-Gradatum-Agent` header fallback is removed entirely). An unauthenticated caller,
+    /// or one whose trust tier carries no subject (`Studio` / `Mtls`), resolves to **no soul**:
+    /// the service never falls back to a default identity (R2, fail-closed).
     ///
-    /// This is a **defence-in-depth** check: the real authorisation gate is inside
-    /// [`soul_instructions`], which validates the caller's JWT `sub` against the target agent.
-    fn requested_agent(ctx: &RequestContext<rmcp::RoleServer>) -> String {
-        let raw = ctx
-            .extensions
-            .get::<http::request::Parts>()
-            .and_then(|parts| parts.headers.get("x-gradatum-agent"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_lowercase());
-        match raw {
-            Some(v)
-                if !v.is_empty()
-                    && v.len() <= 64
-                    && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') =>
-            {
-                v
-            }
-            _ => "main".to_string(),
-        }
-    }
-
-    /// Loads the soul body for `agent` from vault section `identity/<agent>`, if authorised.
-    ///
-    /// Returns `None` on **any** failure (unauthenticated, ACL-denied, missing note, vault KO)
-    /// so that [`initialize`] degrades gracefully to bootstrap-only without breaking the MCP
-    /// handshake (ADN 1 — never panics, never returns an error to the caller).
+    /// Returns `None` on **any** failure (no subject, missing note, vault KO) so that
+    /// [`initialize`] degrades gracefully to bootstrap-only without breaking the MCP handshake
+    /// (ADN 1 — never panics, never returns an error to the caller).
     ///
     /// The returned body is injected byte-stable into `InitializeResult.instructions` (C8):
-    /// no dynamic field is added — the vault content is returned as-is.
-    ///
-    /// # ACL rules
-    ///
-    /// - Caller `"main-agent"` (privileged owner, api-key exchanged) may read any soul.
-    /// - Any other caller may only read their **own** soul (`sub == agent`).
-    pub(crate) async fn soul_instructions(
-        &self,
-        agent: &str,
-        trust: &TrustContext,
-    ) -> Option<String> {
+    /// no dynamic field is added — the vault content is returned as-is. Reading a caller's own
+    /// soul is always permitted by the identity read guard in [`logic::vault_read_impl`]
+    /// (`caller_sub == target_agent`), so no separate authorisation check is needed here.
+    pub(crate) async fn soul_instructions(&self, trust: &TrustContext) -> Option<String> {
         if !trust.is_authenticated() {
             return None;
         }
-        let caller_sub = trust
-            .subject()
-            .map(gradatum_core::scope::AgentId::as_str)
-            .unwrap_or("");
-        let authorized = caller_sub == logic::SOUL_PRIVILEGED_WRITER || caller_sub == agent;
-        if !authorized {
-            tracing::debug!(
-                caller = %caller_sub,
-                agent  = %agent,
-                "mcp::initialize: soul not authorized — sub does not match target agent"
-            );
-            return None;
-        }
-        let req = VaultReadRequest {
-            path: format!("identity/{agent}"),
-            section: Some("identity".to_string()),
-            tenant_id: Some(gradatum_core::scope::TenantId::new("main")),
-            compact: false,
-        };
+        // L'identité vient du credential — jamais d'un paramètre/en-tête client. Sujet absent
+        // (`Studio` / `Mtls`) → aucune âme, aucun repli sur une identité par défaut (R2).
+        let agent = trust.subject().map(gradatum_core::scope::AgentId::as_str)?;
+        let mut req = VaultReadRequest::new(format!("identity/{agent}"));
+        req.section = Some("identity".to_string());
+        req.tenant_id = Some(gradatum_core::scope::TenantId::new("main"));
         match logic::vault_read_impl(&self.state, trust, req).await {
             Ok(resp) if !resp.content.is_empty() => {
                 tracing::debug!(agent = %agent, "mcp::initialize: soul loaded");
@@ -561,12 +524,13 @@ impl ServerHandler for GradatumMcpHandler {
 
     /// Overrides the default MCP `initialize` handshake to inject the soul (F-34 v0.7.3).
     ///
-    /// Reads `identity/<agent>` from vault section `identity` and sets
+    /// Reads `identity/<subject>` from vault section `identity` — the agent is the credential
+    /// subject, never the `X-Gradatum-Agent` header — and sets
     /// `InitializeResult.instructions` to the body byte-stable (C8).
     ///
     /// # Degraded mode
     ///
-    /// Any failure (unauthenticated, unauthorised, missing note, vault KO) produces
+    /// Any failure (unauthenticated, no subject, missing note, vault KO) produces
     /// `instructions = None` — the agent runs on CLAUDE.md bootstrap alone.
     /// The MCP handshake is **never broken** regardless of vault availability (ADN 1).
     #[instrument(skip(self, context), fields(agent))]
@@ -585,13 +549,17 @@ impl ServerHandler for GradatumMcpHandler {
         info =
             info.with_protocol_version(Self::negotiate_protocol_version(&request.protocol_version));
 
-        // 2. Résoudre l'agent depuis le header `X-Gradatum-Agent` (défaut "main").
-        let agent = Self::requested_agent(&context);
-        tracing::Span::current().record("agent", agent.as_str());
-
-        // 3. Charger l'âme — auth + ACL vérifiés en interne ; toute erreur → None.
+        // 2. L'identité vient du credential (v2.0.0, Task 12) — l'en-tête X-Gradatum-Agent
+        //    n'est plus lu. Le span porte le sujet du token pour l'observabilité.
         let trust = Self::trust_from_ctx(&context);
-        if let Some(soul_body) = self.soul_instructions(&agent, &trust).await {
+        let agent = trust
+            .subject()
+            .map(gradatum_core::scope::AgentId::as_str)
+            .unwrap_or("");
+        tracing::Span::current().record("agent", agent);
+
+        // 3. Charger l'âme du sujet — auth + ACL vérifiés en interne ; toute erreur → None.
+        if let Some(soul_body) = self.soul_instructions(&trust).await {
             info = info.with_instructions(soul_body);
         }
 
@@ -811,8 +779,10 @@ fn gradatum_error_to_mcp(err: GradatumError) -> ErrorData {
         | GradatumError::TomlParse(_)
         | GradatumError::TomlSerialize(_)
         | GradatumError::Config(_)
-        | GradatumError::VaultOnNfs { .. }
-        | GradatumError::Inference(_) => {
+        | GradatumError::Inference(_)
+        // `GradatumError` is `#[non_exhaustive]` (API freeze v2.0.0): any future variant
+        // is masked behind the same generic message — fail-safe, anti-leak default.
+        | _ => {
             tracing::error!(error = %err, "mcp: internal error");
             ErrorData::internal_error("internal error", None)
         }
@@ -1159,19 +1129,22 @@ mod tests {
         );
     }
 
-    // ── Tests soul_instructions (Task 6′, F-34) ────────────────────────────────
+    // ── Tests soul_instructions (Task 6′ F-34 ; Task 12 v2.0.0) ─────────────────
     //
-    // Stratégie : tester `soul_instructions` directement (fn pure testable séparée
-    // de `initialize`) pour éviter de construire un `RequestContext<RoleServer>` complet
-    // (handshake MCP trop lourd en test unitaire). Ce choix est documenté dans le
-    // livrable conformément au plan `2026-06-27-v0.7.3-identity-f50-deport.md`.
+    // Stratégie : tester `soul_instructions` directement (fn testable séparée de
+    // `initialize`) pour éviter de construire un `RequestContext<RoleServer>` complet
+    // (handshake MCP trop lourd en test unitaire). La propriété end-to-end « le sujet du
+    // credential gouverne l'âme, l'en-tête n'a aucun effet » est verrouillée par le test de
+    // frontière `mcp_initialize_serves_soul_from_credential_subject_not_header`
+    // (`tests/mcp_native.rs`) — un test unitaire par fonction ne pouvait pas la prouver.
     //
-    // Cas positif (note présente → instructions = Some(body)) : couvert par le smoke
-    // LIVE après `soul-seed.sh` — nécessite un vault réel avec note seedée.
+    // v2.0.0 (Task 12) : `soul_instructions` ne prend plus d'`agent` — il dérive du
+    // `trust.subject()` (credential). Un sujet inconnu ne peut donc plus être demandé : la
+    // lecture est TOUJOURS celle de sa propre âme.
 
     /// Non authentifié → `soul_instructions` retourne `None`.
     ///
-    /// Vérifie le guard d'authentification avant toute ACL ou lecture vault.
+    /// Vérifie le guard d'authentification avant toute lecture vault.
     #[tokio::test]
     async fn soul_instructions_unauthenticated_returns_none() {
         use crate::state::AppState;
@@ -1179,41 +1152,41 @@ mod tests {
             state: AppState::new(),
         };
         let trust = TrustContext::Unauthenticated;
-        let result = handler.soul_instructions("main", &trust).await;
+        let result = handler.soul_instructions(&trust).await;
         assert!(
             result.is_none(),
             "not authenticated → soul_instructions doit retourner None"
         );
     }
 
-    /// Sub=`frontend` tente de lire l'âme de `main` → `None` (non autorisé, C6).
+    /// Trust authentifié mais SANS sujet (`Studio`) → `None` (fail-closed R2).
     ///
-    /// `caller_sub != "main-agent"` ET `caller_sub != agent` → dégradé bootstrap.
+    /// Prouve qu'aucune identité par défaut n'est servie quand le credential ne porte pas de
+    /// sujet : le service ne se replie sur aucune âme.
     #[tokio::test]
-    async fn soul_instructions_unauthorized_sub_returns_none() {
+    async fn soul_instructions_no_subject_returns_none() {
+        use gradatum_core::trust::StudioScope;
+
         use crate::state::AppState;
         let handler = GradatumMcpHandler {
             state: AppState::new(),
         };
-        let trust = TrustContext::BearerToken {
-            kid: "test-kid".to_string(),
-            aud: "gradatum".to_string(),
-            sub: "frontend".into(),
-            scopes: vec!["read".to_string()],
-            tenant_id: "main".into(),
-            jti: None,
+        // `Studio` est authentifié mais `subject()` == None → aucune âme, aucun repli.
+        let trust = TrustContext::Studio {
+            user: "admin@example".to_string(),
+            scope: StudioScope::Admin,
+            step_up_until: None,
         };
-        // frontend ne peut lire que identity/frontend, pas identity/main.
-        let result = handler.soul_instructions("main", &trust).await;
+        let result = handler.soul_instructions(&trust).await;
         assert!(
             result.is_none(),
-            "sub=frontend lisant soul=main doit retourner None (non autorisé)"
+            "trust sans sujet (Studio) → None : aucun repli sur une identité par défaut (R2)"
         );
     }
 
-    /// `main-agent` autorisé mais note absente → `None` (dégradé bootstrap, ADN 1).
+    /// Sujet présent (`main-agent`) mais note absente → `None` (dégradé bootstrap, ADN 1).
     ///
-    /// Prouve qu'une erreur vault KO ne casse pas le handshake MCP.
+    /// Prouve qu'une lecture vault KO/vide de sa propre âme ne casse pas le handshake MCP.
     #[tokio::test]
     async fn soul_instructions_authorized_note_absent_returns_none() {
         use crate::state::AppState;
@@ -1228,19 +1201,20 @@ mod tests {
             tenant_id: "main".into(),
             jti: None,
         };
-        // main-agent autorisé mais vault vide → KO → None.
-        let result = handler.soul_instructions("main", &trust).await;
+        // main-agent lit identity/main-agent (sa propre âme) mais vault vide → None.
+        let result = handler.soul_instructions(&trust).await;
         assert!(
             result.is_none(),
             "note absente doit retourner None (dégradé bootstrap, jamais panic)"
         );
     }
 
-    /// Agent lisant sa propre âme (`sub == agent`) est autorisé, mais note absente → `None`.
+    /// Un sujet quelconque (`backend`) lit sa propre âme, note absente → `None`.
     ///
-    /// Prouve le code path "own soul authorised" sans le short-circuit "main-agent".
+    /// Prouve que la résolution n'est pas figée sur `main-agent` : l'âme lue est
+    /// `identity/<sujet>`, quel que soit le sujet.
     #[tokio::test]
-    async fn soul_instructions_own_agent_authorised_note_absent_returns_none() {
+    async fn soul_instructions_own_agent_note_absent_returns_none() {
         use crate::state::AppState;
         let handler = GradatumMcpHandler {
             state: AppState::new(),
@@ -1253,8 +1227,8 @@ mod tests {
             tenant_id: "main".into(),
             jti: None,
         };
-        // backend lit identity/backend (sub == agent), autorisé, mais note absente → None.
-        let result = handler.soul_instructions("backend", &trust).await;
+        // backend lit identity/backend (dérivé du sujet), note absente → None.
+        let result = handler.soul_instructions(&trust).await;
         assert!(
             result.is_none(),
             "own-agent soul absente doit retourner None (dégradé bootstrap)"
@@ -1265,7 +1239,7 @@ mod tests {
     ///
     /// Couvre le cas positif différé au smoke LIVE (livrable Tasks 1-4 v0.7.3) :
     /// prouve le chemin complet `soul_instructions` → `vault_read_impl` → `title_lookup`
-    /// (match `body_text LIKE '# identity/main\n%'`) → lecture vault → `Some(body)`.
+    /// (match `body_text LIKE '# identity/main-agent\n%'`) → lecture vault → `Some(body)`.
     ///
     /// Condition nécessaire : le body doit commencer par `# identity/<agent>`.
     /// Sans ce H1, `title_lookup` retourne `Ok(None)` → `soul_instructions` retourne `None`
@@ -1284,7 +1258,8 @@ mod tests {
         use gradatum_vault::{Registry, Vault};
         use tempfile::TempDir;
 
-        // ACL permissive : main-agent lit tout — seule la garde soul (sub/agent) discrimine.
+        // ACL permissive : main-agent lit tout — la lecture d'une âme est ici celle du sujet
+        // lui-même (identity/main-agent), toujours autorisée par la garde read (own soul).
         const ACL: &str = r#"
 [[consumer]]
 identity = "main-agent"
@@ -1321,8 +1296,9 @@ Tu es le Général en Chef. Ton: direct, FR.
         // Partager l'index interne du vault pour que title_lookup voie les notes écrites.
         state.search = vault.index().clone();
 
-        // Seed la note avec H1 canonique : body commence par `# identity/main`.
-        let title = "identity/main";
+        // Seed l'âme du sujet : body commence par `# identity/main-agent` (sub == owner,
+        // lecture de sa propre âme).
+        let title = "identity/main-agent";
         let frontmatter = Frontmatter {
             schema_version: 1,
             vault_id: VaultId::new("main"),
@@ -1362,7 +1338,7 @@ Tu es le Général en Chef. Ton: direct, FR.
             jti: None,
         };
 
-        let result = handler.soul_instructions("main", &trust).await;
+        let result = handler.soul_instructions(&trust).await;
         assert!(
             result.is_some(),
             "soul présente avec H1 doit retourner Some(body) (path résolu via title_lookup)"
@@ -1373,4 +1349,11 @@ Tu es le Général en Chef. Ton: direct, FR.
             "soul_instructions doit retourner un body non vide quand la note existe: body={body:?}"
         );
     }
+
+    // Les tests `author_for_mcp_write_*` ont été RETIRÉS avec la fonction (Task 9,
+    // v2.0.0) : ils asservissaient l'attribution à l'en-tête `X-Gradatum-Agent`, ce que
+    // ce lot supprime. La propriété de remplacement (« le sujet du credential gagne sur
+    // l'en-tête ») est verrouillée end-to-end par le test de frontière
+    // `mcp_vault_write_attributes_author_to_credential_subject_not_header`
+    // (`tests/mcp_native.rs`) — un test unitaire par fonction ne pouvait pas la prouver.
 }

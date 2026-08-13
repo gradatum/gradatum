@@ -76,7 +76,7 @@ async fn build_skill_index_embed_timeout_returns_empty_index() {
     let idx = env._vault_typed.index();
 
     // Seeder 1 note section "skills" — list_notes trouvera cette note avant l'embed.
-    let ulid = Ulid::new().to_string();
+    let ulid = Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &ulid,
         "skills",

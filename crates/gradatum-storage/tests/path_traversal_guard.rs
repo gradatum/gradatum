@@ -9,8 +9,8 @@ use tempfile::TempDir;
 /// Crée un `FileStorage` sur un répertoire temporaire jetable.
 fn make_storage() -> (TempDir, FileStorage) {
     let dir = TempDir::new().expect("TempDir::new() ne doit pas échouer sur un système sain");
-    let storage = FileStorage::new(dir.path())
-        .expect("FileStorage::new() sur un TempDir local ne doit pas retourner VaultOnNfs");
+    let storage =
+        FileStorage::new(dir.path()).expect("FileStorage::new() sur un TempDir local doit reussir");
     (dir, storage)
 }
 

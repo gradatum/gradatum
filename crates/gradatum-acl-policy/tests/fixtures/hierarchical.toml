@@ -1,26 +1,34 @@
-# Gradatum preset — hierarchical
+# Fixture ACL — matrice de test SYNTHÉTIQUE, délibérément réduite.
 #
-# Pattern: human + main agent + typed sub-agents (writers / validators / experts).
-# Mirrors a typical multi-agent pipeline (orchestrator + specialized sub-agents).
+# CE N'EST PAS une copie de crates/gradatum-admin/presets/hierarchical.toml, et ne
+# doit jamais le devenir. Raison technique : AclEngine::from_preset_str ne désérialise
+# que les blocs [[consumer]] concrets — il IGNORE les [[consumer-template]]. Or, dans le
+# preset livré, tout le scoping par sous-arbre (projet, thème) vit UNIQUEMENT dans des
+# templates, donc invisible au moteur. Aligner cette fixture sur le preset livré
+# supprimerait la seule preuve que le matching globset allow/deny par sous-arbre
+# fonctionne (gold.rs t04/t05/t08).
 #
-# Apply with:
-#   gradatum-admin init --preset=hierarchical --projects=projecta,projectb
+# Cette fixture exerce donc, à dessein, une identité concrète par FORME de scoping :
+#   admin        — accès plein, voit personal-classified
+#   main-agent   — accès plein SAUF personal-classified (négation deny-wins)
+#   sub-agent-a  — écriture scopée par projet (allow project-a/**, deny hors périmètre)
+#   validator    — lecture cross-projet, aucune écriture
+#   expert-rust  — lecture scopée par thème (allow rust/**, deny hors thème)
 #
-# The init command materializes consumer-templates into concrete consumers,
-# substituting ${PROJECT}, ${AGENT}, ${THEME} based on --projects flags.
+# Les [[consumer-template]] plus bas sont inertes ici (ignorés par le moteur) : ils
+# documentent la forme du preset livré, ils ne produisent aucun consumer testable.
 #
 # ACL pattern syntax (globset):
-#   "*"                   match all loci
-#   "projecta/*"          match all loci under "projecta/"
-#   "*/briefing"          match any "X/briefing" locus
+#   "*"                    match all loci
+#   "projecta/*"           match all loci under "projecta/"
+#   "*/briefing"           match any "X/briefing" locus
 #   "!personal-classified" exclude (negation)
-#   "${VAR}"              variable substituted at init time
 
-# ─── Human (top of hierarchy) ─────────────────────────────────────────
-# identity="maintainer" — human admin, accès complet, voit personal-classified.
+# ─── Human admin (top of hierarchy) ───────────────────────────────────
+# identity="admin" — administrateur, accès complet, voit personal-classified.
 [[consumer]]
-identity = "maintainer"
-description = "Human owner — full read/write, sees personal-classified"
+identity = "admin"
+description = "Administrator — full vault read/write, sees personal-classified"
 read_patterns  = ["**"]
 write_patterns = ["**"]
 sees_personal_classified = true

@@ -1327,3 +1327,355 @@ async fn initialize_negocie_versions_supportees_et_repli_sur_inconnue() {
         "version inconnue doit produire un repli sur la dernière version servie (LATEST), spec MCP"
     );
 }
+
+// ── Task 9 (v2.0.0) — L'author d'une écriture MCP vient du credential, jamais de l'en-tête ──
+//
+// FRONTIÈRE testée : en-tête HTTP `X-Gradatum-Agent` (canal) vs `sub` du credential.
+// Avant v2.0.0, la branche `vault_write` de `dispatch_tool` posait l'author depuis l'en-tête
+// (`author_for_mcp_write`) — un en-tête fourni par le client pouvait donc USURPER l'attribution.
+// Après v2.0.0, l'author dérive de `trust.subject()` (le `sub` du token, source serveur) via
+// `effective_author`. Ce test traverse toute la chaîne réelle :
+//   HTTP (en-tête divergent) → auth_middleware → StreamableHttpService → call_tool →
+//   dispatch_tool → vault_write_impl → effective_author → enqueue → JobRecord.
+// Il aurait été ROUGE avant la suppression du repli d'en-tête (author = "usurpateur-canal") et
+// verrouille la propriété « le sujet gagne » que des tests unitaires par fonction ne pouvaient
+// pas prouver (chacun vert de son côté, aucun ne franchissant la frontière).
+
+/// Démarre un serveur MCP de test capable d'ENQUEUE réellement une écriture : ACL permissive
+/// pour le SUJET `"agent-credential"` + `SqliteQueueStore` in-memory partagé (relu après coup
+/// pour inspecter l'author porté par le `JobRecord`). Le `TempDir` du vault est renvoyé pour
+/// rester en vie le temps du test.
+async fn start_write_capable_mcp_server() -> (
+    SocketAddr,
+    String,
+    std::sync::Arc<gradatum_db_sqlite::SqliteQueueStore>,
+    tempfile::TempDir,
+) {
+    use std::sync::Arc;
+
+    use axum::{Router, middleware};
+    use gradatum_acl_policy::AclEngine;
+    use gradatum_auth::jwt::JwtService;
+    use gradatum_core::scope::VaultId;
+    use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
+    use gradatum_server::api_v1::mcp::build_mcp_service;
+    use gradatum_vault::Vault;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tempfile::TempDir;
+
+    // ACL : le SUJET du credential ("agent-credential") peut écrire partout. L'en-tête
+    // divergent ("usurpateur-canal") n'est VOLONTAIREMENT pas déclaré : s'il gouvernait
+    // encore l'attribution, l'écriture serait attribuée à une identité inconnue.
+    const PRESET: &str = r#"
+[[consumer]]
+identity = "agent-credential"
+read_patterns = ["**"]
+write_patterns = ["**"]
+"#;
+
+    let jwt = JwtService::new_ephemeral();
+    let acl = AclEngine::from_preset_str(PRESET).expect("preset ACL valide — invariant de test");
+
+    // Vault réel (le worker n'est pas lancé — on n'inspecte que le JobRecord enfilé).
+    let tmp = TempDir::new().expect("TempDir vault task9");
+    let vault = Arc::new(
+        Vault::create(&tmp.path().join("vault"), VaultId::new("main"))
+            .await
+            .expect("Vault::create task9"),
+    );
+
+    let jobs_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("jobs pool in-memory — invariant test task9");
+    run_migrations(&jobs_pool)
+        .await
+        .expect("migrations gradatum_jobs — invariant test task9");
+    let job_store = Arc::new(SqliteQueueStore::new(jobs_pool.clone()));
+
+    let state = AppState::with_jwt_and_acl(jwt, acl)
+        .with_job_store(
+            Arc::clone(&job_store) as Arc<dyn gradatum_core::QueueStore>,
+            jobs_pool,
+        )
+        .with_vault_arc(Arc::clone(&vault) as Arc<dyn gradatum_vault::Registry>);
+
+    let token = state
+        .jwt
+        .sign(
+            "agent-credential",
+            &["read".to_string(), "write".to_string()],
+            TokenScope::Service,
+            "main",
+        )
+        .expect("sign JWT de test — clé éphémère AppState task9");
+
+    let (mcp_service, _cancel) = build_mcp_service(state.clone());
+    let mcp_router = Router::new().route_service("/mcp", mcp_service).layer(
+        tower_http::limit::RequestBodyLimitLayer::new(gradatum_server::api_v1::mcp::MCP_BODY_LIMIT),
+    );
+    let authed = Router::new()
+        .nest("/api/v1", api_v1::router())
+        .merge(mcp_router)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+    let app = Router::new().merge(authed).with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind port éphémère task9");
+    let addr = listener.local_addr().expect("addr locale task9");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serveur task9 arrêté proprement");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (addr, token, job_store, tmp)
+}
+
+/// Une écriture MCP dont l'en-tête `X-Gradatum-Agent` diverge du `sub` du credential est
+/// attribuée au **sujet du credential**, jamais à l'en-tête. Preuve end-to-end de la
+/// suppression du repli d'en-tête.
+#[tokio::test]
+async fn mcp_vault_write_attributes_author_to_credential_subject_not_header() {
+    use gradatum_core::QueueStore as _;
+    use gradatum_core::job::Job;
+
+    let (addr, token, job_store, _tmp) = start_write_capable_mcp_server().await;
+    let client = http_client();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
+
+    // tools/call vault_write SANS author dans le corps + en-tête X-Gradatum-Agent DIVERGENT.
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {
+            "name": "vault_write",
+            "arguments": {
+                "title": "Note d'attribution v2.0.0",
+                "body": "Le sujet du credential doit gagner sur l'en-tete de canal."
+            }
+        }
+    });
+
+    let resp = client
+        .post(&mcp_url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", format!("Bearer {token}"))
+        // En-tête HOSTILE, divergent du `sub` du token ("agent-credential").
+        .header("X-Gradatum-Agent", "usurpateur-canal")
+        .json(&body)
+        .send()
+        .await
+        .expect("POST vault_write MCP task9");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "call_tool répond 200 (l'erreur éventuelle est dans le body JSON-RPC)"
+    );
+    let text = resp.text().await.expect("body vault_write task9");
+    let json = parse_sse_json(&text);
+    assert!(
+        json.get("error").is_none(),
+        "vault_write ne doit pas échouer (ACL permissive sur le sujet), got: {json}"
+    );
+
+    // Relire le JobRecord enfilé et extraire l'author réellement porté par le job.
+    let record = job_store
+        .dequeue(None)
+        .await
+        .expect("dequeue task9")
+        .expect("un JobRecord a été enfilé par vault_write");
+    let author = match record.spec.kind {
+        Job::Curate(c) => c.author,
+        other => panic!("job attendu Curate, obtenu {other:?}"),
+    };
+
+    assert_eq!(
+        author.as_deref(),
+        Some("agent-credential"),
+        "l'author DOIT venir du sub du credential, jamais de l'en-tête X-Gradatum-Agent \
+         (divergent = 'usurpateur-canal'). Author obtenu: {author:?}"
+    );
+}
+
+// ── Task 12 (v2.0.0) — L'âme d'un handshake MCP vient du credential, jamais de l'en-tête ──
+//
+// FRONTIÈRE testée : en-tête HTTP `X-Gradatum-Agent` (canal) vs `sub` du credential, sur le
+// chemin `initialize`. Avant v2.0.0, `requested_agent` lisait l'en-tête pour choisir l'âme
+// injectée dans `InitializeResult.instructions` — un en-tête client pouvait donc faire servir
+// l'âme d'un AUTRE agent, ou priver le porteur de la sienne en pointant vers une identité sans
+// âme seedée. Après v2.0.0, l'âme dérive de `trust.subject()` (le `sub` du token, source
+// serveur), et l'en-tête n'est plus lu du tout. Ce test traverse toute la chaîne réelle :
+//   HTTP (en-tête divergent) → auth_middleware → StreamableHttpService → initialize →
+//   soul_instructions → vault_read_impl → InitializeResult.instructions.
+// Il est ROUGE avant la suppression du repli d'en-tête (agent = 'usurpateur-canal', aucune âme
+// seedée → instructions absentes) et verrouille la propriété « le sujet gouverne l'âme » qu'un
+// test unitaire de `soul_instructions` seul ne pouvait pas prouver de bout en bout.
+
+/// Corps soul valide (3 sections + INV-CANARY), avec un marqueur unique dans NARRATIVE pour
+/// prouver *quelle* âme a été servie.
+const SOUL_MARKER: &str = "MARQUEUR-AME-AGENT-CREDENTIAL";
+
+/// Démarre un serveur MCP de test dont le vault contient l'âme `identity/agent-credential`.
+///
+/// ACL permissive pour le SUJET `"agent-credential"`. L'en-tête divergent
+/// (`"usurpateur-canal"`) n'est VOLONTAIREMENT pas déclaré et aucune âme n'est seedée pour lui :
+/// s'il gouvernait encore la résolution, l'âme servie serait absente. Le `TempDir` du vault est
+/// renvoyé pour rester en vie le temps du test.
+async fn start_soul_capable_mcp_server() -> (SocketAddr, String, tempfile::TempDir) {
+    use std::sync::Arc;
+
+    use axum::{Router, middleware};
+    use chrono::Utc;
+    use gradatum_acl_policy::AclEngine;
+    use gradatum_auth::jwt::JwtService;
+    use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
+    use gradatum_core::scope::VaultId;
+    use gradatum_core::section::Section;
+    use gradatum_core::status::NoteStatus;
+    use gradatum_server::api_v1::mcp::build_mcp_service;
+    use gradatum_vault::Vault;
+    use tempfile::TempDir;
+
+    const PRESET: &str = r#"
+[[consumer]]
+identity = "agent-credential"
+read_patterns = ["**"]
+write_patterns = ["**"]
+"#;
+
+    let jwt = JwtService::new_ephemeral();
+    let acl = AclEngine::from_preset_str(PRESET).expect("preset ACL valide — invariant de test");
+
+    let tmp = TempDir::new().expect("TempDir vault task12");
+    let vault = Arc::new(
+        Vault::create(&tmp.path().join("vault"), VaultId::new("main"))
+            .await
+            .expect("Vault::create task12"),
+    );
+
+    // Seed l'âme identity/agent-credential : body avec H1 canonique (résolu par title_lookup)
+    // + le marqueur unique dans NARRATIVE.
+    let title = "identity/agent-credential";
+    let frontmatter = Frontmatter {
+        schema_version: 1,
+        vault_id: VaultId::new("main"),
+        locus: None,
+        section: Section::Identity,
+        status: NoteStatus::Live,
+        status_reason: None,
+        status_changed: None,
+        tags: Default::default(),
+        author: None,
+        created: Utc::now(),
+        updated: None,
+        extra: ExtraFields::empty(),
+        provenance: None,
+        forgotten: None,
+        forgotten_at: None,
+        forgotten_by: None,
+    };
+    let body = format!(
+        "# {title}\n## INVARIANTS\nINV-CANARY | REQUIRED | response.prefix matches ^\\(TODAY\\):\n\
+         ## GATES\nGATE-X | a -> b\n## NARRATIVE\n{SOUL_MARKER}\n"
+    );
+    let note = vault
+        .write_note(frontmatter, body)
+        .await
+        .expect("vault.write_note seed soul task12");
+    let index = vault.index().clone();
+    index
+        .upsert_note_title(note.frontmatter.vault_id.as_str(), &note.id, title)
+        .await
+        .expect("upsert_note_title task12");
+
+    let mut state = AppState::with_jwt_and_acl(jwt, acl)
+        .with_vault_arc(Arc::clone(&vault) as Arc<dyn gradatum_vault::Registry>);
+    state.search = index;
+
+    let token = state
+        .jwt
+        .sign(
+            "agent-credential",
+            &["read".to_string()],
+            TokenScope::Service,
+            "main",
+        )
+        .expect("sign JWT de test task12");
+
+    let (mcp_service, _cancel) = build_mcp_service(state.clone());
+    let mcp_router = Router::new().route_service("/mcp", mcp_service).layer(
+        tower_http::limit::RequestBodyLimitLayer::new(gradatum_server::api_v1::mcp::MCP_BODY_LIMIT),
+    );
+    let authed = Router::new()
+        .nest("/api/v1", api_v1::router())
+        .merge(mcp_router)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+    let app = Router::new().merge(authed).with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind port éphémère task12");
+    let addr = listener.local_addr().expect("addr locale task12");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serveur task12 arrêté proprement");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (addr, token, tmp)
+}
+
+/// Un `initialize` MCP sert l'âme du **sujet du credential**, jamais celle désignée par
+/// l'en-tête `X-Gradatum-Agent`. Preuve end-to-end de la suppression du repli d'en-tête.
+#[tokio::test]
+async fn mcp_initialize_serves_soul_from_credential_subject_not_header() {
+    let (addr, token, _tmp) = start_soul_capable_mcp_server().await;
+    let client = http_client();
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", addr.port());
+
+    // initialize AVEC Bearer valide (sub="agent-credential") + en-tête HOSTILE divergent.
+    let resp = client
+        .post(&mcp_url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", format!("Bearer {token}"))
+        // En-tête HOSTILE : pointe vers une identité sans âme seedée. S'il gouvernait encore la
+        // résolution, l'âme servie serait absente.
+        .header("X-Gradatum-Agent", "usurpateur-canal")
+        .json(&initialize_body("2025-11-25"))
+        .send()
+        .await
+        .expect("POST initialize MCP task12");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "initialize doit retourner 200 (handshake jamais cassé)"
+    );
+    let text = resp.text().await.expect("body initialize task12");
+    let json = parse_sse_json(&text);
+    assert!(
+        json.get("error").is_none(),
+        "initialize ne doit pas retourner d'erreur, got: {json}"
+    );
+    let instructions = json["result"]["instructions"].as_str().unwrap_or("");
+    assert!(
+        instructions.contains(SOUL_MARKER),
+        "les instructions DOIVENT porter l'âme du sujet du credential ('agent-credential'), \
+         jamais celle de l'en-tête divergent ('usurpateur-canal', sans âme). Instructions: {instructions:?}"
+    );
+}

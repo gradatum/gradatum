@@ -72,7 +72,7 @@ For feature work and bug fixes, the standard flow is:
 2. **Fork** the repository and create a topic branch (`fix/X`, `feat/Y`, `docs/Z`).
 3. Implement your change. Keep commits focused; `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings` must pass locally.
 4. **Open a PR** against `main`. Reference the issue in the PR description.
-5. A maintainer will review. Substantial changes (new crates, breaking API changes, schema migrations) require an RFC first — see [`RFC-TEMPLATE.md`](RFC-TEMPLATE.md).
+5. A maintainer will review. Substantial changes (new crates, breaking API changes, schema migrations) are tracked as a project-map feature card once scope is agreed — see [`GOVERNANCE.md` § Structural change tracking](GOVERNANCE.md#structural-change-tracking-project-map).
 6. Once approved, a maintainer merges.
 
 For version history and current roadmap, see [CHANGELOG.md](CHANGELOG.md).
@@ -230,9 +230,10 @@ licensed under [Apache-2.0](LICENSE), subject to the terms of the
 ## Linux-only platform note
 
 gradatum targets **Linux exclusively** as of 2026-06-05. Windows/cross-platform support is
-deferred indefinitely. See [RFC-0002](docs/RFC/RFC-0002-cross-platform-support.md) (superseded)
-for historical context on the prior tiered-support model.
+deferred indefinitely. The prior tiered-support model (Linux primary, Windows secondary,
+macOS future roadmap) and its portability rules (R1–R13) were dropped from the repository along
+with the written-RFC process that documented them (see [`GOVERNANCE.md`](GOVERNANCE.md) §
+Structural change tracking); they are historical record only.
 
 PRs are validated on Linux x86_64 only — no aarch64 and no Windows cross-compile job runs
-in CI. The portability rules from RFC-0002 §5 (R1–R13) are archived; they are no longer
-required in the PR checklist.
+in CI. The portability rules referenced above are no longer required in the PR checklist.

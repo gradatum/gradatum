@@ -24,37 +24,50 @@ The role of `Lead maintainer` is intentionally singular and explicit. It exists 
 |---|---|
 | Bug fix, doc typo, dependency bump within SemVer compatible range | Single maintainer review + merge. |
 | New feature inside an existing crate, no public-API change | One maintainer + one reviewer review. |
-| Structural change (new crate, removed crate, public-API change in `gradatum-core`, schema migration, port change, new dependency) | **RFC required** — see below. |
-| Versioning policy, governance, license, code of conduct | RFC + lazy-consensus 14 days + lead-maintainer ratification. |
-
-**Lazy consensus:** an RFC is accepted if no maintainer raises a sustained objection within the lazy-consensus window. Silence = acceptance. An objection must propose a concrete alternative or a measurable concern — "I disagree" alone is not sufficient.
+| Structural change (new crate, removed crate, public-API change in `gradatum-core`, schema migration, port change, new dependency) | PR + maintainer review, same as above — tracked to completion as a **project-map feature card** (see below), not a written design document. |
+| Versioning policy, governance, license, code of conduct | PR + maintainer review; the lead maintainer breaks a stalled tie. |
 
 ---
 
-## RFC process
+## Structural change tracking (project-map)
 
-Structural changes follow the RFC workflow:
+Gradatum does not run a written-RFC-and-vote process. Structural changes are proposed and
+discussed the same way as any other change — **open an issue first** to align scope (see
+[`CONTRIBUTING.md`](CONTRIBUTING.md)) — and, once scope is agreed, a maintainer tracks the work
+to completion as a **project-map feature card**: a note in the vault's `project-map` section,
+identified by a server-assigned, immutable `[[feature:F-XX]]` link and carrying typed wikilinks
+for the work-lifecycle axis (`[[status:BRAINSTORMING|OPEN|IN_PROGRESS|BLOCKED|DONE|OBSOLETE]]`),
+the kind of change (`[[kind:FEATURE|ENHANCEMENT|FIX|CHORE|SPIKE|TASK]]`), the delivery axis
+(`[[release:roadmap|planned|released|dropped]]`), and, once a version is targeted, that version
+(`[[version:gradatum/x.y.z]]`).
 
-1. **Draft.** Open a PR adding `docs/RFC/RFC-NNNN-short-title.md` based on [`RFC-TEMPLATE.md`](RFC-TEMPLATE.md). See [`docs/RFC/README.md`](docs/RFC/README.md) for the current index.
-2. **Discussion.** Minimum 7 days open for comment. Maintainers and reviewers discuss inline.
-3. **Resolution.** One of: `accepted` (merged with status updated to `accepted`), `postponed` (filed for later), `rejected` (PR closed with rationale).
-4. **Implementation.** A new tracking issue is opened referencing the RFC. The implementation may span multiple PRs; each cross-references the RFC number.
+A maintainer creates the card via the `create_feature_card` MCP tool (equivalently, `POST
+/api/v1/project-map/create-feature`) — the server allocates the `F-XX` number, the caller never
+picks it. This is a maintainer-side tracking mechanism, not a public collaboration surface:
+external contributors track and discuss scope through the issue tracker, the same as before;
+they do not write project-map cards directly. Only `kind:FEATURE` cards are mirrored to the
+public roadmap (`README.md` § Roadmap, gradatum.org); `FIX`/`CHORE`/`SPIKE`/`TASK`/`ENHANCEMENT`
+cards stay in the maintainers' tracking vault.
 
-RFC numbering is monotonic. Numbers are not reused.
+The durable, publicly readable record of what shipped, and why, is **`CHANGELOG.md`** — one
+entry per version. That record does not change with this section; only the mechanism a
+maintainer uses to track work-in-progress between issue and changelog entry does.
 
-### RFC process for `gradatum-core` changes
+Changes to public traits in `gradatum-core` (trait addition, method addition, signature change,
+stability-tier promotion) go through the same PR-plus-feature-card path as any other structural
+change — there is no separate heavier process for this crate specifically. The trait-stability
+tier definitions themselves (what a `stable`/`unstable`/`experimental` tag promises) are policy,
+not process, and live in [`RELEASE-POLICY.md`](RELEASE-POLICY.md) § AM1.
 
-Changes to public traits in `gradatum-core` (trait addition, method addition, signature change, stability-tier promotion) **always require an RFC**, even if logically simple. Reason: trait changes break downstream implementations across the ecosystem. An RFC ensures:
-
-- **Explicit decision-making:** trait changes are discussed openly, not merged silently.
-- **Forward-looking documentation:** future maintainers (or AI agents with limited context) can trace why a trait looks the way it does.
-- **Coordination:** external implementers (users, third-party crates) see the decision window and can raise concerns.
-
-Scope:
-- **Requires RFC:** add public trait, remove public trait, change method signature, change method return type, add supertrait bound, promote `unstable` → `stable`, deprecate/remove method from `stable` trait, split or merge traits.
-- **Does not require RFC:** add method with default impl to sealed trait (minor bump), adjust documentation, adjust internal types, internal refactoring that preserves public surface.
-
-See [`docs/RFC/RFC-0001-versioning-gradatum-core.md`](docs/RFC/RFC-0001-versioning-gradatum-core.md) for the full stability-tier policy, decision matrix, and examples.
+> **Historical note.** This repository formerly ran a written-RFC process
+> (`docs/RFC/RFC-NNNN-*.md`, a `RFC-TEMPLATE.md` skeleton, a 7-day discussion window). It is
+> retired: no change has gone through that process since project-map feature cards were
+> introduced, and this document had drifted into describing a workflow nobody was following.
+> The RFC content that still described current behavior (the single-port, path-prefix HTTP/MCP
+> routing decision) was folded into [`ARCHITECTURE.md`](ARCHITECTURE.md); the rest — including
+> the never-implemented `gradatum-core` trait-stability tagging design and the Windows/macOS
+> portability rules for a platform tier no longer supported — was historical record only and was
+> not carried forward.
 
 ---
 
@@ -72,4 +85,5 @@ This project follows [Contributor Covenant 2.1](CODE_OF_CONDUCT.md). Maintainers
 
 ## Modifying this document
 
-Changes to `GOVERNANCE.md` require an RFC and 14-day lazy-consensus, regardless of how minor they appear.
+Changes to `GOVERNANCE.md` follow the same PR + maintainer review as any structural change (see
+above); there is no separate written-proposal process.

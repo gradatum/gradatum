@@ -24,7 +24,7 @@ COPY crates ./crates
 
 RUN cargo build --release --workspace \
     --bin gradatum-server --bin gradatum-worker \
-    --bin gradatum-admin --bin gradatum-cli \
+    --bin gradatum-admin \
     --bin gradatum-gateway \
     --bin gradatum-engine --features gradatum-engine/serve
 
@@ -43,7 +43,6 @@ RUN groupadd -g 991 gradatum \
 COPY --from=builder /build/target/release/gradatum-server  /usr/local/bin/
 COPY --from=builder /build/target/release/gradatum-worker  /usr/local/bin/
 COPY --from=builder /build/target/release/gradatum-admin   /usr/local/bin/
-COPY --from=builder /build/target/release/gradatum-cli     /usr/local/bin/
 COPY --from=builder /build/target/release/gradatum-gateway /usr/local/bin/
 COPY --from=builder /build/target/release/gradatum-engine  /usr/local/bin/
 

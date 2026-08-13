@@ -14,6 +14,7 @@ categories.workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace      = true
+figment.workspace     = true
 secrecy.workspace     = true
 http.workspace        = true
 serde.workspace       = true

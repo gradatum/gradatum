@@ -646,7 +646,7 @@ mod tests {
     async fn migration_0029_idempotente() {
         // Double open_or_create sur le même fichier temp : le second run ne doit pas échouer
         // (CREATE TABLE IF NOT EXISTS) et préserver les données.
-        let dir = std::env::temp_dir().join(format!("f110_{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("f110_{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("index.db");
 

@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 
 /// JWT error variants.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum JwtError {
     /// Token audience does not match the audience expected by this service.
     #[error("invalid audience")]
@@ -65,6 +66,7 @@ pub enum JwtError {
 
 /// Scope used to select the TTL of a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TokenScope {
     /// Human user or studio session — short TTL (default 3600 s = 1 h).
     Human,
@@ -82,6 +84,7 @@ pub enum TokenScope {
 /// Use `"main"` for the root tenant.
 /// Fine-grained multi-tenancy is planned for a future version.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Claims {
     /// Issuer — identifies the service that minted the token.
     pub iss: String,
@@ -273,7 +276,7 @@ impl JwtService {
             aud: self.audience.clone(),
             iat,
             exp: iat + ttl,
-            jti: ulid::Ulid::new().to_string(),
+            jti: ulid::Ulid::generate().to_string(),
             scopes: scopes.to_vec(),
             tenant_id: tenant_id.to_string(),
         };

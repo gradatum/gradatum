@@ -53,7 +53,7 @@ impl LeaderElection {
     /// The `pool` must already have the `worker_leadership` schema applied
     /// (via [`gradatum_queue::schema::SCHEMA_V1`]).
     pub async fn new(pool: Arc<SqlitePool>, cfg: LeaderConfig) -> anyhow::Result<Self> {
-        let holder = ulid::Ulid::new().to_string();
+        let holder = ulid::Ulid::generate().to_string();
         Ok(Self { pool, holder, cfg })
     }
 

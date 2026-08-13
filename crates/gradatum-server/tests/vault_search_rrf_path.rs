@@ -152,8 +152,8 @@ async fn rrf_path_two_notes_bm25_only_returns_both() {
     let (app, state, idx) = build_app(Arc::new(NoopBackend)).await;
     let token = sign(&state);
 
-    let id_a = Ulid::new().to_string();
-    let id_b = Ulid::new().to_string();
+    let id_a = Ulid::generate().to_string();
+    let id_b = Ulid::generate().to_string();
 
     // seed_note_with_fts : méthode concrète SqliteIndex (hors trait).
     idx.seed_note_with_fts(&id_a, "reference", "alpha gradatum search rrf test note A")
@@ -199,8 +199,8 @@ async fn rrf_path_semantic_only_note_returned() {
     let (app, state, idx) = build_app(fixed).await;
     let token = sign(&state);
 
-    let id_a = Ulid::new().to_string();
-    let id_b = Ulid::new().to_string();
+    let id_a = Ulid::generate().to_string();
+    let id_b = Ulid::generate().to_string();
 
     // A : match BM25 sur "rrfsemonly" — embedding orthogonal.
     // seed_note_with_fts : méthode concrète SqliteIndex (hors trait).
@@ -265,7 +265,7 @@ async fn rrf_path_preserves_title_and_snippet_after_fusion() {
     let (app, state, idx) = build_app(fixed).await;
     let token = sign(&state);
 
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     // seed_note_with_fts : méthode concrète SqliteIndex (hors trait).
     idx.seed_note_with_fts(
         &id,
@@ -326,8 +326,8 @@ async fn rrf_path_semantic_only_hit_enriched_title_section() {
     let (app, state, idx) = build_app(fixed).await;
     let token = sign(&state);
 
-    let id_a = Ulid::new().to_string();
-    let id_b = Ulid::new().to_string();
+    let id_a = Ulid::generate().to_string();
+    let id_b = Ulid::generate().to_string();
 
     // id_a : match BM25, embedding orthogonal (ne sera pas le top semantic).
     idx.seed_note_with_fts(&id_a, "reference", "enrich425 bm25-only note alpha beta")
@@ -410,7 +410,7 @@ async fn rrf_path_score_within_expected_range_k60() {
     let (app, state, idx) = build_app(fixed).await;
     let token = sign(&state);
 
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     // seed_note_with_fts : méthode concrète SqliteIndex (hors trait).
     idx.seed_note_with_fts(
         &id,

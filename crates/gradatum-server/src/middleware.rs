@@ -108,14 +108,14 @@ pub fn build_warden_layer(cfg: &RateLimitConfig) -> Option<WardenLayer> {
     if !cfg.enabled {
         return None;
     }
-    let warden_cfg = WardenConfig {
-        enabled: true,
-        rate_limit_per_minute: cfg.per_minute,
-        rate_limit_burst: cfg.burst,
-        bypass_loopback: cfg.exempt_localhost,
-        ip_allow: vec![],
-        ip_deny: vec![],
-    };
+    // `WardenConfig` is `#[non_exhaustive]` (API freeze, v2.0.0): an out-of-crate struct
+    // literal no longer compiles, so build from `Default` and override the fields we drive.
+    // `ip_allow`/`ip_deny` stay empty (the `Default` value) — this middleware sets no CIDRs.
+    let mut warden_cfg = WardenConfig::default();
+    warden_cfg.enabled = true;
+    warden_cfg.rate_limit_per_minute = cfg.per_minute;
+    warden_cfg.rate_limit_burst = cfg.burst;
+    warden_cfg.bypass_loopback = cfg.exempt_localhost;
     Some(WardenLayer::new(warden_cfg).expect(
         "invalid warden config — per_minute and burst must be > 0, \
          guaranteed by RateLimitConfig::default() (60, 10)",
@@ -224,6 +224,67 @@ fn forbidden(msg: &'static str) -> Response {
         .into_response()
 }
 
+/// Identité d'amorçage à provisionner en premier sur une installation neuve (R5).
+///
+/// Sur un registre vierge le refus nomme cette identité d'amorçage plutôt que
+/// l'identité *demandée* : le contexte est non authentifié, aucun credential valide
+/// n'a été présenté, donc l'identité voulue est inconnue. `main-agent` est l'identité
+/// que l'amorçage (`gradatum-admin init`, tâche 6) frappe en premier.
+const BOOTSTRAP_IDENTITY: &str = "main-agent";
+
+/// Corps JSON du 503 « registre non initialisé » (R5) — message possédé (dynamique,
+/// distinct du [`MiddlewareError`] `&'static str` des 401/403).
+#[derive(Serialize)]
+struct UninitialisedError {
+    error: String,
+}
+
+/// Construit le 503 distinguant un registre vierge d'un credential rejeté (R3+R5).
+///
+/// Le corps porte, dans l'ordre : le refus, l'identité d'amorçage à créer, la commande
+/// de création complète, puis le rappel de reporter la clé émise dans la configuration
+/// MCP du porteur. Il ne contient **jamais** le chemin disque du registre (surface
+/// d'information réduite — garde de sécurité) ; « registre vide » et « registre remis à
+/// zéro » sont donc volontairement indistinguables.
+fn registry_uninitialised() -> Response {
+    let error = format!(
+        "empty API key registry: installation not initialized — no identity can \
+         authenticate until a key is minted. Provision the bootstrap identity, then \
+         report the emitted key into the bearer's MCP configuration: \
+         `gradatum-admin api-key create --owner {BOOTSTRAP_IDENTITY} \
+         --scopes vault_read,vault_search,vault_write,write`."
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(UninitialisedError { error }),
+    )
+        .into_response()
+}
+
+/// Rejette un contexte non authentifié en distinguant l'installation non provisionnée
+/// (registre vierge → 503 actionnable, R5) du credential rejeté (registre peuplé → 401).
+///
+/// Le magasin est interrogé **uniquement ici**, sur le chemin d'échec d'auth — jamais
+/// sur le chemin nominal — et **sans cache** : l'outil d'administration frappe les clés
+/// hors-process, un drapeau mémorisé se périmerait juste après une création.
+///
+/// **Fail-closed** : une erreur de lecture du magasin rend un 401 (jamais un 503) — ne
+/// jamais annoncer « aucune clé, lance la création » quand le magasin est seulement
+/// inaccessible (un incident opérationnel, journalisé au niveau `error`).
+async fn reject_unauthenticated(state: &AppState) -> Response {
+    match state.api_keys.has_any_active().await {
+        Ok(false) => registry_uninitialised(),
+        Ok(true) => unauthorized("authentication required"),
+        Err(e) => {
+            tracing::error!(
+                err = %e,
+                "api-key registry count failed — fail-closed (401, never 503)"
+            );
+            unauthorized("authentication error — retry later")
+        }
+    }
+}
+
 /// Axum middleware that extracts and validates the bearer JWT or api-key, then checks revocation.
 ///
 /// ## Dispatch
@@ -258,9 +319,11 @@ pub async fn auth_middleware(
         if !tenant_is_authorized(&state, &trust).await {
             // Alignement 401/403 (C2, P2-c) : à ON le refus A8 d'un contexte NON
             // AUTHENTIFIÉ est un 401 (credentials absents/invalides), pas un 403 —
-            // parité avec le chemin OFF où le handler aval rend 401.
+            // parité avec le chemin OFF où le handler aval rend 401. R5 :
+            // discrimination registre vierge (503) vs credential rejeté (401), le
+            // magasin n'étant interrogé qu'ici, sur ce chemin d'échec.
             if matches!(trust, gradatum_core::trust::TrustContext::Unauthenticated) {
-                return unauthorized("authentication required");
+                return reject_unauthenticated(&state).await;
             }
             tracing::warn!(
                 tenant = ?trust.tenant_id(),
@@ -318,8 +381,10 @@ pub async fn auth_middleware(
     if !tenant_is_authorized(&state, &trust).await {
         // Alignement 401/403 (C2, P2-c) : Unauthenticated refusé à ON (A8) → 401,
         // parité avec le chemin OFF (handler aval 401). Les autres refus restent 403.
+        // R5 : discrimination registre vierge (503) vs credential rejeté (401), le
+        // magasin n'étant interrogé qu'ici, sur ce chemin d'échec.
         if matches!(trust, gradatum_core::trust::TrustContext::Unauthenticated) {
-            return unauthorized("authentication required");
+            return reject_unauthenticated(&state).await;
         }
         tracing::warn!(
             tenant = ?trust.tenant_id(),
@@ -1032,6 +1097,300 @@ mod tests {
                 .iter()
                 .any(|l| l.contains(&format!(r#"path="{}""#, crate::middleware::OTHER_ROUTE))),
             "les requêtes sans motif tombent dans le bucket `other`, lignes = {lines:?}"
+        );
+    }
+
+    // ── R5 : erreur d'initialisation (503) distincte du refus d'auth (401) ────
+    //
+    // Les deux rejets réels (`l.262-263` chemin api-key, `l.321-322` chemin JWT)
+    // sont sous `if !tenant_is_authorized(...)` + `matches!(trust, Unauthenticated)`.
+    // Pour `Unauthenticated`, `tenant_is_authorized_legacy` (flag OFF) rend `true` :
+    // ces lignes ne sont donc atteintes qu'avec `multi_tenant.enabled = true`
+    // (la configuration LIVE). Les tests de discrimination 503/401 activent ce flag ;
+    // le test de non-régression du chemin nominal reste en legacy OFF (plus simple,
+    // et `has_any_active` n'est de toute façon appelée que sur le chemin d'échec).
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use gradatum_acl_auth::{ApiKey, ApiKeyError, ApiKeyMaterial, ApiKeyStore};
+    use gradatum_core::scope::{AgentId, TenantId};
+
+    /// Comportement de `has_any_active` d'un magasin espion.
+    #[derive(Clone, Copy)]
+    enum RegistryState {
+        /// Registre vierge — aucune clé active (`Ok(false)`).
+        Empty,
+        /// Registre peuplé — au moins une clé active (`Ok(true)`).
+        Populated,
+        /// Magasin inaccessible — erreur de lecture (`Err`).
+        Unreadable,
+    }
+
+    /// Magasin de clés espion : compte les appels à `has_any_active`, reconnaît un
+    /// unique secret valide, et pilote la réponse de `has_any_active` via [`RegistryState`].
+    ///
+    /// `verify` est le seul autre chemin exercé : il rend `Ok(key)` pour le secret
+    /// valide injecté (chemin nominal), `NotFound` sinon (credential rejeté).
+    struct SpyApiKeyStore {
+        /// Nombre d'appels à `has_any_active` — preuve que le magasin n'est interrogé
+        /// QUE sur le chemin d'échec.
+        count: Arc<AtomicUsize>,
+        state: RegistryState,
+        /// Secret reconnu comme valide par `verify` (chemin nominal). `None` = aucun.
+        valid_secret: Option<String>,
+    }
+
+    impl SpyApiKeyStore {
+        fn new(state: RegistryState) -> Self {
+            Self {
+                count: Arc::new(AtomicUsize::new(0)),
+                state,
+                valid_secret: None,
+            }
+        }
+
+        fn with_valid_secret(mut self, secret: &str) -> Self {
+            self.valid_secret = Some(secret.to_owned());
+            self
+        }
+
+        fn counter(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.count)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApiKeyStore for SpyApiKeyStore {
+        async fn create(
+            &self,
+            _owner: &AgentId,
+            _scopes: Vec<String>,
+            _tenant_id: String,
+            _description: Option<String>,
+        ) -> Result<ApiKeyMaterial, ApiKeyError> {
+            Err(ApiKeyError::NotFound)
+        }
+
+        async fn verify(&self, secret: &str) -> Result<ApiKey, ApiKeyError> {
+            match &self.valid_secret {
+                Some(s) if s == secret => Ok(ApiKey {
+                    id: ulid::Ulid::generate(),
+                    prefix: "ak_spy00000".to_owned(),
+                    hash: String::new(),
+                    owner: AgentId::new("some-agent"),
+                    scopes: vec!["admin".to_owned()],
+                    tenant_id: TenantId::new("main"),
+                    created_at: 0,
+                    last_used_at: None,
+                    revoked_at: None,
+                    description: None,
+                }),
+                _ => Err(ApiKeyError::NotFound),
+            }
+        }
+
+        async fn list(
+            &self,
+            _include_revoked: bool,
+            _tenant_filter: Option<&str>,
+        ) -> Result<Vec<ApiKey>, ApiKeyError> {
+            Ok(vec![])
+        }
+
+        async fn revoke(&self, _prefix: &str) -> Result<(), ApiKeyError> {
+            Err(ApiKeyError::NotFound)
+        }
+
+        async fn rotate(&self, _prefix: &str) -> Result<ApiKeyMaterial, ApiKeyError> {
+            Err(ApiKeyError::NotFound)
+        }
+
+        async fn has_any_active(&self) -> Result<bool, ApiKeyError> {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            match self.state {
+                RegistryState::Empty => Ok(false),
+                RegistryState::Populated => Ok(true),
+                RegistryState::Unreadable => Err(ApiKeyError::Sql(sqlx::Error::RowNotFound)),
+            }
+        }
+    }
+
+    /// Construit un `AppState` avec un magasin de clés injecté et le flag
+    /// `multi_tenant` explicite (les rejets l.262/l.321 n'existent qu'à ON).
+    fn state_with_store(store: Arc<dyn ApiKeyStore>, multi_tenant: bool) -> AppState {
+        let mut state = AppState::new();
+        state.api_keys = store;
+        if multi_tenant {
+            let mut cfg = crate::config::ServerConfig::default();
+            cfg.multi_tenant.enabled = true;
+            state.server_config = Arc::new(cfg);
+        }
+        state
+    }
+
+    /// Envoie un GET /test et retourne (statut, corps texte).
+    async fn send_and_read(router: Router, bearer: Option<&str>) -> (StatusCode, String) {
+        let mut builder = Request::builder().method("GET").uri("/test");
+        if let Some(token) = bearer {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        let req = builder
+            .body(Body::empty())
+            .expect("request builder invariant");
+        let resp = router
+            .oneshot(req)
+            .await
+            .expect("le middleware ne doit pas paniquer");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("lecture du corps");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Un préfixe api-key bien formé mais absent du magasin (verify → NotFound).
+    const UNKNOWN_API_KEY: &str =
+        "ak_deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    // ── Cas 1 : magasin vide, chemin api-key → 503 actionnable (l.262-263) ────
+
+    #[tokio::test]
+    async fn empty_store_api_key_path_returns_503_with_provisioning_command() {
+        let spy = SpyApiKeyStore::new(RegistryState::Empty);
+        let counter = spy.counter();
+        let state = state_with_store(Arc::new(spy), true);
+        let router = test_router(state);
+
+        let (status, body) = send_and_read(router, Some(UNKNOWN_API_KEY)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registre vierge → 503, corps = {body}"
+        );
+        assert!(
+            body.contains("main-agent"),
+            "le 503 nomme l'identité d'amorçage, corps = {body}"
+        );
+        assert!(
+            body.contains("api-key create"),
+            "le 503 porte la commande de création, corps = {body}"
+        );
+        // Anti-régression : les scopes conseillés doivent s'aligner sur ceux que
+        // `gradatum-admin init` frappe réellement (BOOTSTRAP_SCOPES : vault_read,
+        // vault_search, vault_write, write). `vault_search` est le scope qu'un ancien
+        // message `--scopes admin` omettait tout en élargissant le privilège — un
+        // conseil incohérent avec le moindre privilège. Le pinner ici l'empêche de
+        // régresser.
+        assert!(
+            body.contains("vault_search"),
+            "le 503 doit conseiller les scopes alignés sur init (dont vault_search), \
+             corps = {body}"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "le magasin est interrogé exactement une fois sur le chemin d'échec"
+        );
+    }
+
+    // ── Cas 1bis : magasin vide, chemin JWT (pas d'en-tête) → 503 (l.321-322) ─
+
+    #[tokio::test]
+    async fn empty_store_jwt_path_returns_503_with_provisioning_command() {
+        let spy = SpyApiKeyStore::new(RegistryState::Empty);
+        let counter = spy.counter();
+        let state = state_with_store(Arc::new(spy), true);
+        let router = test_router(state);
+
+        // Aucun en-tête Authorization → chemin B (JWT), TrustContext::Unauthenticated.
+        let (status, body) = send_and_read(router, None).await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registre vierge (chemin JWT) → 503, corps = {body}"
+        );
+        assert!(
+            body.contains("main-agent") && body.contains("api-key create"),
+            "le 503 du chemin JWT porte identité + commande, corps = {body}"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    // ── Cas 2 : magasin peuplé, clé invalide → 401 ordinaire, SANS la commande ─
+
+    #[tokio::test]
+    async fn populated_store_returns_plain_401_without_command() {
+        let spy = SpyApiKeyStore::new(RegistryState::Populated);
+        let counter = spy.counter();
+        let state = state_with_store(Arc::new(spy), true);
+        let router = test_router(state);
+
+        let (status, body) = send_and_read(router, Some(UNKNOWN_API_KEY)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "registre peuplé + clé invalide → 401, corps = {body}"
+        );
+        assert!(
+            !body.contains("api-key create"),
+            "le 401 ordinaire ne porte JAMAIS la commande de création, corps = {body}"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "le magasin est interrogé sur le chemin d'échec pour discriminer"
+        );
+    }
+
+    // ── Cas 3 : magasin illisible → 401/500, JAMAIS 503 (fail-closed) ─────────
+
+    #[tokio::test]
+    async fn unreadable_store_returns_401_never_503() {
+        let spy = SpyApiKeyStore::new(RegistryState::Unreadable);
+        let state = state_with_store(Arc::new(spy), true);
+        let router = test_router(state);
+
+        let (status, body) = send_and_read(router, None).await;
+
+        assert_ne!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "un magasin illisible ne doit JAMAIS rendre 503 (n'annonce pas « aucune clé »)"
+        );
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "erreur de lecture → 401 fail-closed, corps = {body}"
+        );
+        assert!(
+            !body.contains("api-key create"),
+            "le refus fail-closed ne porte pas la commande, corps = {body}"
+        );
+    }
+
+    // ── Cas 4 : chemin nominal — une requête authentifiée valide ne compte pas ─
+
+    #[tokio::test]
+    async fn valid_credential_never_triggers_active_key_count() {
+        // Legacy OFF : une clé valide (tenant "main") passe `tenant_is_authorized_legacy`
+        // et atteint le handler (200). `has_any_active` n'est appelée que sur le chemin
+        // d'échec — elle ne doit donc pas être touchée ici.
+        const VALID: &str = "ak_00000000cafecafecafecafecafecafecafecafecafecafecafecafecafecafe";
+        let spy = SpyApiKeyStore::new(RegistryState::Empty).with_valid_secret(VALID);
+        let counter = spy.counter();
+        let state = state_with_store(Arc::new(spy), false);
+        let router = test_router(state);
+
+        let (status, _body) = send_and_read(router, Some(VALID)).await;
+
+        assert_eq!(status, StatusCode::OK, "clé valide → 200 (chemin nominal)");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "AUCUNE requête de comptage sur le chemin nominal (non-régression R5)"
         );
     }
 }

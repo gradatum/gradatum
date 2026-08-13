@@ -2,7 +2,7 @@
 
 > JWT verification (Ed25519, audience-scoped, mandatory `kid`), signing-key store, and `jti` revocation.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -24,7 +24,7 @@ combines the two.
 
 ```toml
 [dependencies]
-gradatum-auth = "1.0.0"
+gradatum-auth = "2.0.0"
 ```
 
 ```rust
@@ -33,7 +33,14 @@ use gradatum_auth::jwt::{JwtService, TokenScope, Claims};
 
 // Build a JwtService with an Ed25519 signing key.
 let signing = SigningKey::generate(&mut rand::rngs::OsRng);
-let svc = JwtService::new(signing, "kid-2026".into(), "gradatum".into(), 3600, 86400);
+let svc = JwtService::new(
+    signing,
+    "kid-2026".into(),  // kid
+    "gradatum".into(),  // issuer
+    "gradatum".into(),  // audience
+    3600,               // ttl_human_secs
+    86400,              // ttl_service_secs
+);
 
 // Sign a token.
 let token = svc.sign("consumer-id", &["read".into()], TokenScope::Service, "main")?;

@@ -194,7 +194,7 @@ pub struct ProactiveRecallModeLabel {
 ///
 /// Cardinalité bornée : le champ `rule` est `&'static str` issu de la table
 /// `gradatum_core::write_check::TABLE` (13 catégories finies) — jamais un titre
-/// ou un contenu dynamique (P2 council : zéro alloc hot-path).
+/// ou un contenu dynamique — aucune allocation sur le chemin chaud.
 #[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
 pub struct DriftRuleLabel {
     /// Règle de dérive déclenchée (ex. `"category_section_coherence"`).
@@ -482,11 +482,11 @@ impl AppMetrics {
         let vault_context_embed_fallback: Family<ContextAssemblyLabel, Counter> = Family::default();
         let vault_context_candidates: Family<ContextAssemblyLabel, Histogram> =
             Family::new_with_constructor(|| {
-                Histogram::new([1.0_f64, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0].into_iter())
+                Histogram::new([1.0_f64, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0])
             });
         let vault_context_included: Family<ContextAssemblyLabel, Histogram> =
             Family::new_with_constructor(|| {
-                Histogram::new([1.0_f64, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0].into_iter())
+                Histogram::new([1.0_f64, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0])
             });
 
         // -- Proactive Recall (F-46 Active Recall, v0.7.1) -------------------
@@ -504,12 +504,9 @@ impl AppMetrics {
         let context_dropped_total: Family<ContextEfficiencyLabel, Counter> = Family::default();
         let context_compaction_total: Counter = Counter::default();
         // Buckets : couvrent 0–3 200 tokens économisés (0 à ~16 stubs × 200 tokens/stub).
-        let context_tokens_saved: Histogram = Histogram::new(
-            [
-                0.0_f64, 200.0, 400.0, 600.0, 800.0, 1_200.0, 1_600.0, 3_200.0,
-            ]
-            .into_iter(),
-        );
+        let context_tokens_saved: Histogram = Histogram::new([
+            0.0_f64, 200.0, 400.0, 600.0, 800.0, 1_200.0, 1_600.0, 3_200.0,
+        ]);
 
         // -- Write drift detection (F-36, v0.7.3) ----------------------------
         let write_check: Family<DriftRuleLabel, Counter> = Family::default();

@@ -25,8 +25,8 @@
 //!   masquer la raison du bypass. Laissé dans son module (`code_scope.rs`).
 //! - `vault_classify` : retourne `impl IntoResponse` pour raison de rétrocompat wire —
 //!   extractible mais `501 Not Implemented` figé, extraction sans valeur ajoutée.
-//! - `vault_downgrade` (async) dans `write.rs` : non câblée dans le routeur (dead code
-//!   documenté), remplacée par la version sync dans `notes.rs`.
+//! - `vault_downgrade` : servie par la version sync dans `notes.rs` (la variante async
+//!   par queue a été retirée avec le moteur legacy).
 //! - Jobs, dashboard, review, event_log, session_log : hors scope 21 outils MCP.
 //!
 //! ## Organisation
@@ -46,6 +46,7 @@ use std::time::Instant;
 
 use axum::http::StatusCode;
 use chrono::Utc;
+use gradatum_acl_auth::IDENTITY_WRITE_SCOPE;
 use gradatum_acl_policy::{AclDecision, AclOp};
 use gradatum_core::audit::http::HttpAuditEvent;
 use gradatum_core::error::GradatumError;
@@ -147,6 +148,42 @@ pub(crate) fn locus_for_section(tenant_id: &str, section: Option<&str>) -> Strin
     match section {
         Some(s) => format!("{}/{}", tenant_id, s),
         None => format!("{}/main", tenant_id),
+    }
+}
+
+/// Author effectif d'une note en écriture — **l'identité vient du credential** (v2.0.0).
+///
+/// L'author dérive exclusivement de l'agent authentifié (`trust.subject()` — le `sub` du
+/// credential, source serveur). Il ne se déclare pas côté client et n'a aucun défaut :
+///
+/// - `req_author` `Some` → **REFUS** : l'identité ne se déclare pas (R2). Un client ne peut
+///   pas choisir sous quelle identité sa note est attribuée.
+/// - `req_author` `None` + `subject` `Some(id)` → chemin NOMINAL : l'author est le nom NU
+///   du sujet (jamais préfixé `kind:` — le charset d'`AgentId`, cf. `scope.rs`, interdit le
+///   `:` ; ce nom nu est l'identité résolue, accepté tel quel par `parse_author`).
+/// - `req_author` `None` + `subject` `None` → **REFUS** : aucune identité résolue, jamais une
+///   note sans auteur (R2, fail-closed).
+///
+/// **Locus unique du refus** : cette fonction a un seul appelant de production
+/// ([`vault_write_impl`], qui propage l'erreur) — la garde vit ici et nulle part ailleurs.
+///
+/// # Errors
+///
+/// - [`GradatumError::InvalidInput`] si un `req_author` est fourni (l'identité ne se déclare pas).
+/// - [`GradatumError::Unauthorized`] si aucune identité n'est résolue (ni author, ni sujet).
+pub(crate) fn effective_author(
+    req_author: &Option<String>,
+    subject: Option<&AgentId>,
+) -> Result<String, GradatumError> {
+    if req_author.is_some() {
+        return Err(GradatumError::InvalidInput(
+            "author provided: identity comes from the credential, it is not self-declared (R2)"
+                .into(),
+        ));
+    }
+    match subject {
+        Some(id) => Ok(id.as_str().to_string()),
+        None => Err(GradatumError::Unauthorized),
     }
 }
 
@@ -737,7 +774,7 @@ pub async fn vault_search_impl(
     //
     // Callers autorisés à voir les âmes :
     //   - TrustContext::Studio { .. } — admin UI (observabilité totale).
-    //   - subject() == SOUL_PRIVILEGED_WRITER — propriétaire SSI (main-agent).
+    //   - porteur du scope `identity_write` — privilège d'âme (v2.0.0, par scope, pas par nom).
     // Tout autre caller → exclusion des notes soul.
     //
     // FAIL-CLOSED : le filtre opère sur `hit.section` AVANT le fallback section→"main".
@@ -986,7 +1023,7 @@ pub async fn vault_read_impl(
                         .as_deref()
                         .and_then(|t| t.strip_prefix("identity/"))
                         .unwrap_or("");
-                    let allowed = caller_sub == SOUL_PRIVILEGED_WRITER
+                    let allowed = trust.has_scope(IDENTITY_WRITE_SCOPE)
                         || (!target_agent.is_empty() && caller_sub == target_agent);
                     if !allowed {
                         emit_read_rejection_audit(
@@ -1884,10 +1921,6 @@ pub async fn vault_timeline_impl(
 
 // ── §3 WRITE HANDLER ─────────────────────────────────────────────────────────
 
-/// Privileged writer allowed to write any agent's soul note (`identity/*`).
-/// The api-key owner mapped to this subject bypasses the per-agent write restriction.
-pub(crate) const SOUL_PRIVILEGED_WRITER: &str = "main-agent";
-
 /// Nom canonique de la section réservée aux âmes d'agents (`identity/*`).
 ///
 /// Source de vérité partagée par toutes les surfaces RAG génériques (search,
@@ -1902,15 +1935,14 @@ pub(crate) const IDENTITY_SECTION: &str = "identity";
 /// ne cible pas un agent unique, contrairement à `vault_read_impl` (adressage
 /// nominal `identity/<agent>`). Callers privilégiés :
 ///   - session Studio (admin UI, observabilité totale) ;
-///   - owner SSI [`SOUL_PRIVILEGED_WRITER`] (`main-agent`).
+///   - porteur du scope [`IDENTITY_WRITE_SCOPE`] (`identity_write`).
 ///
 /// Ce prédicat NE remplace PAS le guard read-restrictive par-agent de
 /// `vault_read_impl` — il couvre uniquement les surfaces où aucun agent-cible
 /// n'est adressable (fan-out RRF).
 #[must_use]
 pub(crate) fn is_identity_privileged(trust: &TrustContext) -> bool {
-    matches!(trust, TrustContext::Studio { .. })
-        || trust.subject().map(AgentId::as_str) == Some(SOUL_PRIVILEGED_WRITER)
+    matches!(trust, TrustContext::Studio { .. }) || trust.has_scope(IDENTITY_WRITE_SCOPE)
 }
 
 /// Vrai si une note de section `section` doit être **masquée** à cet appelant sur
@@ -1931,7 +1963,7 @@ pub(crate) fn identity_section_hidden(identity_privileged: bool, section: &str) 
 /// Utilisé par les surfaces qui exposent le corps/section/timeline d'une note ciblée
 /// par ULID **sans** passer par [`vault_read_impl`] : l'historique CoW
 /// (`vault_history`, `vault_history_get`). L'âme d'un agent est privée : seuls son
-/// propriétaire, l'owner privilégié [`SOUL_PRIVILEGED_WRITER`] (`main-agent`) ou une
+/// propriétaire, un porteur du scope [`IDENTITY_WRITE_SCOPE`] (`identity_write`) ou une
 /// session Studio (observabilité admin) peuvent la lire.
 ///
 /// `section` est la section **RÉELLE** de la note, résolue server-side (jamais depuis
@@ -1971,7 +2003,7 @@ async fn enforce_identity_read_guard(
     let target_agent = note_title
         .and_then(|t| t.strip_prefix("identity/"))
         .unwrap_or("");
-    let allowed = caller_sub == SOUL_PRIVILEGED_WRITER
+    let allowed = trust.has_scope(IDENTITY_WRITE_SCOPE)
         || (!target_agent.is_empty() && caller_sub == target_agent);
     if allowed {
         return Ok(());
@@ -2042,7 +2074,7 @@ async fn resolve_title_section_failclosed(
 /// `.md` de l'âme d'un **autre** agent — atteinte d'intégrité de l'identité souveraine.
 ///
 /// **Privilège identique** au guard read [`enforce_identity_read_guard`] et au guard write
-/// inline de [`vault_write_impl`] : Studio (admin) || [`SOUL_PRIVILEGED_WRITER`] (`main-agent`)
+/// inline de [`vault_write_impl`] : Studio (admin) || scope [`IDENTITY_WRITE_SCOPE`]
 /// || `caller == target_agent`. `section`/`note_title` sont résolus **server-side**
 /// (jamais depuis l'input). En cas de refus, un audit `vault_write_rejected`
 /// (`identity_write_denied_foreign_agent`) est émis, symétrique au guard write inline.
@@ -2078,7 +2110,7 @@ async fn enforce_identity_write_guard(
     let target_agent = note_title
         .and_then(|t| t.strip_prefix("identity/"))
         .unwrap_or("");
-    let allowed = caller_sub == SOUL_PRIVILEGED_WRITER
+    let allowed = trust.has_scope(IDENTITY_WRITE_SCOPE)
         || (!target_agent.is_empty() && caller_sub == target_agent);
     if allowed {
         return Ok(());
@@ -2091,7 +2123,7 @@ async fn enforce_identity_write_guard(
         trust,
         tenant,
         &locus,
-        &Ulid::new().to_string(),
+        &Ulid::generate().to_string(),
         "identity_write_denied_foreign_agent",
         Some(note_id.to_string()),
     )
@@ -2141,7 +2173,7 @@ pub enum FeatureWriteAuthority {
 pub async fn vault_write_impl(
     state: &AppState,
     trust: &TrustContext,
-    req: crate::api_v1::dto::VaultWriteRequest,
+    mut req: crate::api_v1::dto::VaultWriteRequest,
     request_id: &str,
     authority: FeatureWriteAuthority,
 ) -> Result<EnqueuedResponseUlid, GradatumError> {
@@ -2252,8 +2284,8 @@ pub async fn vault_write_impl(
     if req.section_hint.as_deref() == Some("identity") {
         // (a) ACL write-restrictive d'abord (fail-fast droits avant traitement du body).
         //     Le target agent-id est extrait du titre côté serveur (jamais paramètre
-        //     client). L'owner privilégié `SOUL_PRIVILEGED_WRITER` (api-key SSI) est
-        //     autorisé à écrire n'importe quelle âme (SSI — Self-Sovereign Identity).
+        //     client). Un porteur du scope `identity_write` (v2.0.0, par scope et non par
+        //     nom) est autorisé à écrire n'importe quelle âme.
         let target_agent = match req.title.strip_prefix("identity/") {
             Some(a) if !a.is_empty() => a,
             _ => {
@@ -2274,7 +2306,7 @@ pub async fn vault_write_impl(
         };
         // `trust.subject()` renvoie `sub` du JWT — jamais dérivé d'un paramètre client.
         let caller_sub = trust.subject().map(AgentId::as_str).unwrap_or("");
-        let is_privileged = caller_sub == SOUL_PRIVILEGED_WRITER;
+        let is_privileged = trust.has_scope(IDENTITY_WRITE_SCOPE);
         if !is_privileged && target_agent != caller_sub {
             emit_write_rejection_audit(
                 state,
@@ -2308,7 +2340,7 @@ pub async fn vault_write_impl(
 
     // Résolution note_id (None → ULID frais, invalide → 400).
     let note_id_prealloc = match req.note_id.as_deref() {
-        None => Ulid::new(),
+        None => Ulid::generate(),
         Some(s) => match Ulid::from_string(s) {
             Ok(id) => id,
             Err(_) => {
@@ -2494,6 +2526,13 @@ pub async fn vault_write_impl(
     {
         return Err(GradatumError::InvalidInput("invalid occurred_at".into()));
     }
+
+    // ── Author = identité du credential (v2.0.0, Task 10) ──────────────────────
+    // L'author dérive du sujet authentifié (`trust.subject()`). Fail-closed : un
+    // `req.author` fourni est REFUSÉ (400) et une absence totale d'identité résolue
+    // est REFUSÉE (401) — jamais de note sans auteur, jamais de déclaration cliente.
+    // Locus unique du refus dans `effective_author` ; on propage.
+    req.author = Some(effective_author(&req.author, trust.subject())?);
 
     let record = build_curate_job_record(&req, note_id_prealloc, &tenant);
     let job_ulid = state
@@ -3425,17 +3464,12 @@ pub async fn create_feature_card_impl(
     let body = format!("{}\n\n[[feature:{feature}]]", req.body);
 
     // (6) Délégation au chemin d'écriture asynchrone existant (re-valide + enqueue).
-    let write_req = crate::api_v1::dto::VaultWriteRequest {
-        title: req.title,
-        body,
-        author: req.author,
-        tags: req.tags,
-        section_hint: Some("project-map".to_string()),
-        tenant_id: Some(gradatum_core::scope::TenantId::new(tenant)),
-        expected_sha256: None,
-        note_id: None,
-        occurred_at: req.occurred_at,
-    };
+    let mut write_req = crate::api_v1::dto::VaultWriteRequest::new(req.title, body);
+    write_req.author = req.author;
+    write_req.tags = req.tags;
+    write_req.section_hint = Some("project-map".to_string());
+    write_req.tenant_id = Some(gradatum_core::scope::TenantId::new(tenant));
+    write_req.occurred_at = req.occurred_at;
     // ServerAllocated : le rôle [[feature:…]] vient d'être injecté après allocation atomique
     // — il est exempté du contrat d'immuabilité (qui, sinon, refuserait toute création portant
     // une identité feature). Voir [`FeatureWriteAuthority`].
@@ -3532,10 +3566,12 @@ pub async fn move_note_locus_impl(
 
 #[cfg(test)]
 mod tests {
+    use gradatum_core::scope::AgentId;
     use gradatum_core::trust::TrustContext;
 
     use super::{
-        KNOWN_DOC_KINDS, LESSONS_SECTION, LESSONS_TENANT, locus_for_section, locus_for_tenant,
+        GradatumError, KNOWN_DOC_KINDS, LESSONS_SECTION, LESSONS_TENANT, effective_author,
+        locus_for_section, locus_for_tenant,
     };
 
     // ── Tests helpers ──────────────────────────────────────────────────────────
@@ -3609,6 +3645,65 @@ mod tests {
         assert!(
             trust.is_authenticated(),
             "BearerToken doit être authentifié"
+        );
+    }
+
+    // ── Test author par défaut = agent authentifié (Task 3 — identité par canal) ──
+
+    /// Construit un `TrustContext::BearerToken` portant le `sub` donné.
+    fn bearer(sub: &str) -> TrustContext {
+        TrustContext::BearerToken {
+            kid: "k".into(),
+            aud: "gradatum".into(),
+            sub: AgentId::new(sub),
+            scopes: vec!["read".into(), "write".into()],
+            tenant_id: "main".into(),
+            jti: None,
+        }
+    }
+
+    #[test]
+    fn effective_author_derives_from_subject_when_no_req_author() {
+        // Chemin NOMINAL : aucun author fourni + sujet présent → author = subject du
+        // credential (un nom NU, sans préfixe `kind:`).
+        let derived = effective_author(&None, bearer("agent-buzz").subject())
+            .expect("un sujet résolu doit produire un author");
+        assert_eq!(derived, "agent-buzz");
+    }
+
+    #[test]
+    fn effective_author_rejects_explicit_req_author() {
+        // Task 10 : `req.author` fourni → REFUS. L'identité vient du credential, elle ne
+        // se déclare pas. (Inverse la sémantique v1.0.2 où `custom` primait.)
+        let err = effective_author(&Some("custom".into()), bearer("agent-buzz").subject())
+            .expect_err("un author fourni par le client doit être refusé");
+        assert!(
+            matches!(err, GradatumError::InvalidInput(_)),
+            "author fourni → InvalidInput (400), obtenu : {err:?}"
+        );
+    }
+
+    #[test]
+    fn effective_author_rejects_when_no_identity_resolved() {
+        // Task 10 : aucun author + aucun sujet → REFUS, jamais une note sans auteur.
+        // (Inverse la sémantique v1.0.2 où l'author restait None — mémoire partagée.)
+        let err = effective_author(&None, None)
+            .expect_err("aucune identité résolue → refus (R2, pas de défaut)");
+        assert!(
+            matches!(err, GradatumError::Unauthorized),
+            "aucune identité résolue → Unauthorized (401), obtenu : {err:?}"
+        );
+    }
+
+    #[test]
+    fn effective_author_rejects_explicit_author_even_without_subject() {
+        // Un author fourni est refusé quelle que soit la présence d'un sujet : le refus
+        // porte sur la DÉCLARATION cliente, pas sur l'absence d'identité serveur.
+        let err = effective_author(&Some("custom".into()), None)
+            .expect_err("un author fourni doit être refusé même sans sujet");
+        assert!(
+            matches!(err, GradatumError::InvalidInput(_)),
+            "author fourni → InvalidInput (400), obtenu : {err:?}"
         );
     }
 }

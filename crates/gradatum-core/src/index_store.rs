@@ -226,6 +226,25 @@ pub struct AnnPartitionDeficit {
     pub indexed: u64,
 }
 
+/// Curated outgoing links of a note, bundled with their authority.
+///
+/// The edge slice and the authority flag are indissociable **by design**: a caller cannot
+/// pass the edges and *forget* the flag, because a single argument carries both. This makes
+/// the destructive case impossible to express by accident: the risk must be inexpressible,
+/// not merely absent from the callers we know today.
+#[derive(Debug, Clone, Copy)]
+pub struct CuratedLinks<'a> {
+    /// `(src_note_id, dst_note_id)` pairs to (re)insert into `note_links`.
+    pub edges: &'a [(String, String)],
+    /// When `true`, `edges` is the **complete, authoritative** outgoing set for the note:
+    /// the store DELETEs every pre-existing outgoing edge of the note (scoped
+    /// `src_note_id` + `vault_id`) inside the same transaction before inserting `edges`, so
+    /// the graph reflects the current body and stale edges are removed. When `false` (the
+    /// safe default for callers that did not recompute links — a title/section/status-only
+    /// rewrite), edges are only upserted and **nothing is deleted**.
+    pub authoritative: bool,
+}
+
 /// Full-text search, override, and checksum storage contract — async, thread-safe.
 ///
 /// Implemented by `gradatum-index::SqliteIndex`.
@@ -1499,7 +1518,12 @@ pub trait IndexStore: Send + Sync {
     /// - `note_id`: identifier of the target note.
     /// - `title`: H1 title extracted from the body (upserted into `notes.title`).
     /// - `temporal`: optional temporal entry (`temporal_index`).
-    /// - `links`: `(src_note_id, dst_note_id)` pairs to insert into `note_links`.
+    /// - `links`: the outgoing edges to (re)insert, bundled with their authority
+    ///   (see [`CuratedLinks`]). When `links.authoritative` is `true` the concrete
+    ///   implementation DELETEs every pre-existing outgoing edge of this note (scoped
+    ///   `src_note_id` + `vault_id`) inside the same transaction before inserting, so the
+    ///   graph reflects the current body; when `false` the edges are only upserted and
+    ///   **nothing is deleted** (historical `INSERT OR IGNORE` behaviour).
     /// - `trust`: optional trust score (`notes.trust`).
     /// - `vault_id`: the tenant — used for `note_links.vault_id` and
     ///   `temporal_index.vault_id`.
@@ -1513,7 +1537,7 @@ pub trait IndexStore: Send + Sync {
         _note_id: &NoteId,
         _title: &str,
         _temporal: Option<&TemporalEntry>,
-        _links: &[(String, String)],
+        _links: CuratedLinks<'_>,
         _trust: Option<f32>,
         _vault_id: &str,
     ) -> Result<(), GradatumError> {

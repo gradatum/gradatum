@@ -1,43 +1,53 @@
-//! Helpers tests partagés — worker B5 wikilinks + worker-flip MockInternalClient.
+//! Helpers tests partagés — worker B5 wikilinks (chemin ACTIF `handle_curate`).
 //!
 //! Pattern TDD : `#[path = "helpers/mod.rs"] mod helpers;` au début de chaque
-//! fichier test d'intégration touchant le worker B5.
+//! fichier test d'intégration touchant les wikilinks du worker.
 //!
 //! Fournit :
 //! - `MockInternalClient` — implémente `InternalClient` en appelant `Vault`/`SqliteIndex`
 //!   directement en local (pas de HTTP). Permet aux tests d'intégration de continuer
 //!   à fonctionner sans un serveur HTTP.
-//! - `test_dispatcher_with_index` — construit un `Dispatcher` complet avec le mock client.
+//! - `test_curate_fixture` — construit Vault + SqliteIndex + client mock + curator +
+//!   `SqliteQueueStore` (le backend JSON du moteur actif Apalis).
+//! - `process_curate` — construit un `GradatumJob::Curate` (title+body) et appelle
+//!   `handle_curate` directement (moteur actif, `apalis_handlers`). Remplace l'ancien
+//!   couple `enqueue_curate_job` + `Dispatcher::run_once` du moteur legacy supprimé.
 //! - Helpers d'encodage et d'assertions B5 wikilinks.
 //!
 //! ## Architecture MockInternalClient
 //!
 //! - `persist_curated` → `vault.write_note_with_id(...)` + boucle sur `req.links` → `idx.upsert_link(...)`
 //! - `persist_embedding` → `idx.insert_note_embedding(...)`
-//! - `title_lookup` → `idx.title_lookup(...)`
+//! - `title_lookup` / `id_lookup` → `idx.title_lookup(...)` / `idx.id_lookup(...)`
 //! - `get_note` → `vault.read_note(...)` + sérialisation vers `NoteReadDto`
-//! - Autres méthodes : `unimplemented!()` (non utilisées par Dispatcher)
+//! - Autres méthodes : `unimplemented!()` (non utilisées par le chemin curate)
 
 #![allow(dead_code)]
 
 use std::sync::Arc;
 
+use apalis::prelude::Data;
 use async_trait::async_trait;
-use bincode::config::standard as bincode_std;
+use chrono::Utc;
 use gradatum_core::VectorStore as _;
 use gradatum_core::identity::NoteId;
 use gradatum_core::scope::VaultId;
+use gradatum_core::{
+    CurateSpec, GradatumJob, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority,
+    JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, QueueStore, TriggerSource,
+};
+use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
 use gradatum_dto::{
     EmbeddingOkResponse, PersistCuratedRequest, PersistDistillRequest, PersistEmbeddingRequest,
-    PersistForgetRequest, PersistOkResponse, VaultWriteRequest,
+    PersistForgetRequest, PersistOkResponse,
 };
 use gradatum_index::SqliteIndex;
-use gradatum_queue::{NewJob, Queue, SqliteQueue};
 use gradatum_vault::Vault;
-use gradatum_worker::dispatch::{Dispatcher, NoopAuditSink};
+use gradatum_worker::apalis_handlers::{HandlerError, MultiTenantCfg, handle_curate};
 use gradatum_worker::internal_client::{
     EmbeddingReadDto, InternalClient, InternalClientError, NoteIdDto, NoteReadDto,
 };
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -46,7 +56,7 @@ use ulid::Ulid;
 /// Mock `InternalClient` pour les tests d'intégration.
 ///
 /// Délègue les mutations directement à `Vault` et `SqliteIndex` en local
-/// (pas de HTTP). Permet au `Dispatcher` d'opérer sans serveur HTTP.
+/// (pas de HTTP). Permet à `handle_curate` d'opérer sans serveur HTTP.
 pub struct MockInternalClient {
     vault: Arc<Vault>,
     index: Arc<SqliteIndex>,
@@ -186,18 +196,18 @@ impl InternalClient for MockInternalClient {
         &self,
         _req: &PersistForgetRequest,
     ) -> Result<PersistOkResponse, InternalClientError> {
-        unimplemented!("MockInternalClient::persist_forget not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::persist_forget not used by curate tests")
     }
 
     async fn persist_distill(
         &self,
         _req: &PersistDistillRequest,
     ) -> Result<PersistOkResponse, InternalClientError> {
-        unimplemented!("MockInternalClient::persist_distill not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::persist_distill not used by curate tests")
     }
 
     async fn delete_note(&self, _vault_id: &str, _ulid: &str) -> Result<(), InternalClientError> {
-        unimplemented!("MockInternalClient::delete_note not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::delete_note not used by curate tests")
     }
 
     // ── Reads ──
@@ -259,11 +269,11 @@ impl InternalClient for MockInternalClient {
         _ulid: &str,
         _embedder_id: &str,
     ) -> Result<EmbeddingReadDto, InternalClientError> {
-        unimplemented!("MockInternalClient::get_note_embedding not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::get_note_embedding not used by curate tests")
     }
 
     async fn get_trust(&self, _vault_id: &str, _ulid: &str) -> Result<f32, InternalClientError> {
-        unimplemented!("MockInternalClient::get_trust not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::get_trust not used by curate tests")
     }
 
     async fn title_lookup(
@@ -299,7 +309,7 @@ impl InternalClient for MockInternalClient {
         _vault: &str,
         _prefix: &str,
     ) -> Result<Vec<NoteIdDto>, InternalClientError> {
-        unimplemented!("MockInternalClient::list_notes_by_locus not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::list_notes_by_locus not used by curate tests")
     }
 
     async fn list_by_status(
@@ -307,7 +317,7 @@ impl InternalClient for MockInternalClient {
         _vault: &str,
         _status: &str,
     ) -> Result<Vec<NoteIdDto>, InternalClientError> {
-        unimplemented!("MockInternalClient::list_by_status not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::list_by_status not used by curate tests")
     }
 
     async fn list_garbage(
@@ -316,7 +326,7 @@ impl InternalClient for MockInternalClient {
         _before_ms: i64,
         _grace_days: u32,
     ) -> Result<Vec<NoteIdDto>, InternalClientError> {
-        unimplemented!("MockInternalClient::list_garbage not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::list_garbage not used by curate tests")
     }
 
     async fn search_fts_for_forget(
@@ -325,7 +335,7 @@ impl InternalClient for MockInternalClient {
         _query: &str,
         _limit: usize,
     ) -> Result<Vec<NoteIdDto>, InternalClientError> {
-        unimplemented!("MockInternalClient::search_fts_for_forget not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::search_fts_for_forget not used by curate tests")
     }
 
     async fn list_notes_by_agent(
@@ -333,37 +343,53 @@ impl InternalClient for MockInternalClient {
         _agent: &str,
         _vaults: &[String],
     ) -> Result<Vec<NoteIdDto>, InternalClientError> {
-        unimplemented!("MockInternalClient::list_notes_by_agent not used by Dispatcher tests")
+        unimplemented!("MockInternalClient::list_notes_by_agent not used by curate tests")
     }
 }
 
-// ── DispatcherFixture ─────────────────────────────────────────────────────────
+// ── CurateFixture ─────────────────────────────────────────────────────────────
 
-/// Bundle retourné par `test_dispatcher_with_index` — garde les ressources vivantes
-/// pour la durée du test (TempDir, Vault, queue, dispatcher, index).
+/// Bundle retourné par `test_curate_fixture` — garde les ressources vivantes
+/// pour la durée du test (TempDir, Vault, index, client, curator, queue).
 ///
 /// Le `TempDir` n'est PAS supprimé tant que le bundle est vivant — sécurité
 /// pour éviter qu'un drop prématuré n'efface la base SQLite avant l'assertion.
-pub struct DispatcherFixture {
-    pub dispatcher: Dispatcher,
-    pub queue: Arc<SqliteQueue>,
+///
+/// `client`/`curator`/`queue` sont les dépendances que `handle_curate` attend
+/// (moteur actif Apalis). Les assertions de tests opèrent directement sur
+/// `vault` et `index` (mêmes `Arc`).
+pub struct CurateFixture {
     pub vault: Arc<Vault>,
     pub index: Arc<SqliteIndex>,
+    pub client: Arc<dyn InternalClient>,
+    pub curator: Arc<dyn gradatum_curator::CuratorProcess + Send + Sync>,
+    pub queue: Arc<dyn QueueStore + Send + Sync>,
     pub _tmp: TempDir,
 }
 
-/// Construit un dispatcher avec vault, queue, curator et mock client partagés.
+/// Crée un `SqliteQueueStore` in-memory avec schéma appliqué (backend JSON actif).
+async fn test_store() -> SqliteQueueStore {
+    let pool = SqlitePool::connect("sqlite::memory:")
+        .await
+        .expect("pool in-memory — invariant test fixture");
+    apply_sqlite_pragmas(&pool)
+        .await
+        .expect("pragmas — invariant test fixture");
+    run_migrations(&pool)
+        .await
+        .expect("migrations — invariant test fixture");
+    SqliteQueueStore::new(pool)
+}
+
+/// Construit une fixture curate active : vault, index, client mock, curator par
+/// défaut et `SqliteQueueStore`.
 ///
-/// Le `MockInternalClient` encapsule `vault` et `index` pour que le `Dispatcher`
+/// Le `MockInternalClient` encapsule `vault` et `index` pour que `handle_curate`
 /// puisse persister sans serveur HTTP. Les assertions de tests opèrent directement
-/// sur `vault` et `index` (même Arc).
-pub async fn test_dispatcher_with_index() -> DispatcherFixture {
+/// sur `vault` et `index` (même `Arc`).
+pub async fn test_curate_fixture() -> CurateFixture {
     let tmp = TempDir::new().expect("TempDir");
-    let queue = Arc::new(
-        SqliteQueue::new(&tmp.path().join("queue.db"))
-            .await
-            .expect("SqliteQueue::new"),
-    );
+    let queue: Arc<dyn QueueStore + Send + Sync> = Arc::new(test_store().await);
     let vault = Arc::new(
         Vault::create(tmp.path().join("vault").as_path(), VaultId::new("main"))
             .await
@@ -371,86 +397,104 @@ pub async fn test_dispatcher_with_index() -> DispatcherFixture {
     );
     let index: Arc<SqliteIndex> = vault.index().clone();
 
-    let mock_client = Arc::new(MockInternalClient::new(vault.clone(), index.clone()));
+    let client: Arc<dyn InternalClient> =
+        Arc::new(MockInternalClient::new(vault.clone(), index.clone()));
+    let curator: Arc<dyn gradatum_curator::CuratorProcess + Send + Sync> =
+        Arc::new(gradatum_curator::CuratorPipeline::new());
 
-    let dispatcher = Dispatcher::new(queue.clone())
-        .with_client(mock_client as Arc<dyn InternalClient>)
-        .with_curator(Arc::new(gradatum_curator::CuratorPipeline::new()))
-        .with_audit(Arc::new(NoopAuditSink));
-
-    DispatcherFixture {
-        dispatcher,
-        queue,
+    CurateFixture {
         vault,
         index,
+        client,
+        curator,
+        queue,
         _tmp: tmp,
     }
 }
 
-// ── Payload helpers ───────────────────────────────────────────────────────────
+// ── Job builder + process ───────────────────────────────────────────────────────
 
-/// Encode un payload `VaultWriteRequest` minimal (titre, body, section_hint).
+/// Construit un `GradatumJob::Curate` (chemin vault_write : title + body présents).
 ///
-/// Utilise le VRAI `gradatum_dto::VaultWriteRequest` (pas de miroir local) — tout
-/// nouveau champ dans le DTO est automatiquement pris en compte ici, évitant la
-/// dérive bincode positionnel qui a causé la régression occurred_at.
+/// Utilise le VRAI `gradatum_core::CurateSpec` (pas de miroir local) — tout nouveau
+/// champ est automatiquement pris en compte, et l'ordre des champs n'a aucun effet
+/// (sérialisation `serde_json`, indexée par nom).
 ///
-/// `tenant_id="main"` codé en dur — cohérent avec le vault `VaultId::new("main")`.
-fn encode_write_payload(title: &str, body: &str, section_hint: Option<&str>) -> Vec<u8> {
-    let req = VaultWriteRequest {
-        title: title.to_string(),
-        body: body.to_string(),
-        author: None,
-        tags: vec![],
-        section_hint: section_hint.map(|s| s.to_string()),
-        tenant_id: Some("main".to_string().into()),
-        expected_sha256: None,
-        note_id: None,
-        occurred_at: None,
-    };
-    bincode::serde::encode_to_vec(&req, bincode_std()).expect("encode VaultWriteRequest bincode")
+/// `note_id` est un ULID frais + `expected_sha256 = None` → branche CREATE de
+/// `handle_curate` (write inconditionnel via `write_note_with_id`).
+fn make_curate_job(title: &str, body: &str) -> GradatumJob {
+    let now = Utc::now();
+    let class = JobClass::Agent;
+    GradatumJob {
+        priority: JobPriority::default_for(&class).as_u8(),
+        record: JobRecord {
+            id: Ulid::generate(),
+            spec: JobSpec {
+                kind: Job::Curate(CurateSpec {
+                    note_id: Ulid::generate(),
+                    tenant_id: "main".to_string(),
+                    title: Some(title.to_string()),
+                    body: Some(body.to_string()),
+                    ..Default::default()
+                }),
+                class,
+                mode: JobMode::Batch,
+                scope: JobScope::VaultWide,
+                priority: JobPriority::High,
+            },
+            scheduling: JobScheduling {
+                trigger: TriggerSource::Demand,
+                scheduled_at: now,
+                await_jobs: vec![],
+                deadline: None,
+                cron_expr: None,
+            },
+            lifecycle: JobLifecycle {
+                status: JobStatus::Running,
+                created_at: now,
+                started_at: Some(now),
+                completed_at: None,
+                lease_until: None,
+                result: None,
+            },
+            retry: JobRetry::default(),
+            lineage: JobLineage {
+                triggered_by: None,
+                parent_job: None,
+                pipeline_id: None,
+                pipeline_step: None,
+                children: vec![],
+                cost_usd: None,
+            },
+        },
+    }
 }
 
-/// Enqueue un job `curate` pour titre + body donnés.
+/// Traite un job `curate` via le moteur ACTIF `handle_curate` (title + body).
 ///
-/// Le worker générera une décision `Admitted` (chemin par défaut sans heuristique
-/// spéciale — le titre n'a pas le préfixe `[DECISIONS]/[BUG]/...` qui forcerait Pending).
-pub async fn enqueue_curate_job(fixture: &DispatcherFixture, title: &str, body: &str) {
-    let payload = encode_write_payload(title, body, None);
-    fixture
-        .queue
-        .enqueue(NewJob {
-            tenant_id: "main".into(),
-            kind: "curate".into(),
-            payload,
-            max_attempts: 5,
-        })
-        .await
-        .expect("enqueue curate");
+/// Remplace l'ancien couple `enqueue_curate_job` + `Dispatcher::run_once`. Le
+/// curator par défaut décide Admitted/Pending selon l'heuristique (préfixe
+/// `[DECISIONS]` → Admitted ; titre court sans préfixe → Pending). Dans les deux
+/// cas les wikilinks `[[...]]` sont résolus et persistés (parité Admitted/Pending).
+///
+/// Retourne le `Result` de `handle_curate` pour que l'appelant assertionne l'issue.
+pub async fn process_curate(
+    fixture: &CurateFixture,
+    title: &str,
+    body: &str,
+) -> Result<gradatum_core::JobOutput, HandlerError> {
+    let job = make_curate_job(title, body);
+    handle_curate(
+        job,
+        Data::new(Arc::clone(&fixture.client)),
+        Data::new(Arc::clone(&fixture.curator)),
+        Data::new(Arc::clone(&fixture.queue)),
+        Data::new(MultiTenantCfg::default()),
+    )
+    .await
 }
 
-/// Enqueue un job `curate` qui produira un `Pending` côté curator.
-///
-/// Mécanisme déclencheur Pending : le titre court (< 10 chars) sans préfixe explicite
-/// + body court → confidence basse → CuratorPipeline défaut renvoie Pending.
-///
-/// Si le curator par défaut ne déclenche jamais Pending, le test peut être marqué
-/// `#[ignore]` ou utiliser un curator stub. Vérifié empiriquement par le test
-/// `curate_pending_outcome_also_upserts_wikilinks` — si le test échoue
-/// avec un Admitted en lieu de Pending, ajuster le mécanisme déclencheur.
-pub async fn enqueue_pending_curate_job(fixture: &DispatcherFixture, title: &str, body: &str) {
-    let payload = encode_write_payload(title, body, None);
-    fixture
-        .queue
-        .enqueue(NewJob {
-            tenant_id: "main".into(),
-            kind: "curate".into(),
-            payload,
-            max_attempts: 5,
-        })
-        .await
-        .expect("enqueue pending curate");
-}
+// ── Assertions helpers ──────────────────────────────────────────────────────────
 
 /// Vérifie qu'une note source pointe vers `dst_id` dans `note_links` (vault `main`).
 ///

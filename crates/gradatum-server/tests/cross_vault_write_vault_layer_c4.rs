@@ -289,7 +289,7 @@ async fn flag_on_move_nonexistent_matches_tiers_to_main_oracle() {
     seed_agent_grants(&env.index_path, &["main", "attacker-research"]);
     seed_research_tenant(&env.index_path);
     let jwt = sign(&env.state, "research");
-    let ghost = Ulid::new();
+    let ghost = Ulid::generate();
 
     let status = request(
         build_router(env.state.clone()),

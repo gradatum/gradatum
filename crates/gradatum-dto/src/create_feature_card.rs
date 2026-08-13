@@ -19,6 +19,7 @@ use gradatum_core::scope::TenantId;
 /// `serde_json`; this struct is only the create-operation wire contract.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CreateFeatureCardRequest {
     /// H1 title of the feature card.
     pub title: String,
@@ -39,6 +40,22 @@ pub struct CreateFeatureCardRequest {
     /// Temporal anchor — event date of the card (ISO 8601 UTC or `YYYY-MM-DD`), optional.
     #[serde(default)]
     pub occurred_at: Option<String>,
+}
+
+impl CreateFeatureCardRequest {
+    /// Constructs a feature-card request with the mandatory `title` and `body`;
+    /// `author`, `tags`, `tenant_id` and `occurred_at` default to their unset values.
+    #[must_use]
+    pub fn new(title: String, body: String) -> Self {
+        Self {
+            title,
+            body,
+            author: None,
+            tags: Vec::new(),
+            tenant_id: None,
+            occurred_at: None,
+        }
+    }
 }
 
 /// Response for `create_feature_card` — the server-assigned number plus the async job handle.

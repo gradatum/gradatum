@@ -12,14 +12,13 @@
 //!
 //! ## Harness
 //!
-//! `handle_curate` directement (worker in-process, sans HTTP ni Dispatcher).
+//! `handle_curate` directement (worker in-process, sans HTTP).
 //! Pattern identique à `curate_embed_chaining.rs` : `TestInternalClient` + `SqliteQueueStore`.
 //!
 //! ## Architecture note
 //!
-//! `vault_write` HTTP → job enqueué dans `SqliteQueueStore` (apalis, JSON) — SÉPARÉ
-//! du `SqliteQueue` legacy que lit `Dispatcher::run_once` (bincode). Les tests E2E
-//! de dispatch DOIVENT appeler `handle_curate` directement — pas via `Dispatcher`.
+//! `vault_write` HTTP → job enqueué dans `SqliteQueueStore` (apalis, JSON). Les tests
+//! E2E de dispatch appellent `handle_curate` directement (le moteur actif).
 
 #[path = "test_internal_client.rs"]
 mod test_internal_client;
@@ -105,10 +104,10 @@ fn make_curate_job_with_occurred_at(
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Curate(CurateSpec {
-                    note_id: Ulid::new(),
+                    note_id: Ulid::generate(),
                     tenant_id: "main".to_string(),
                     title: Some(title.to_string()),
                     body: Some(body.to_string()),
@@ -436,7 +435,7 @@ fn make_vault_write_rmw_job(
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Curate(CurateSpec {
                     note_id,
@@ -497,29 +496,22 @@ async fn seed_note_with_anchor(
     anchor_ms: i64,
 ) {
     let inner = test_internal_client::TestInternalClient::new(Arc::clone(vault), Arc::clone(index));
+    let mut req = PersistCuratedRequest::new(
+        note_id.to_string(),
+        "main".to_string().into(),
+        "C-1 seed note".to_string(),
+        body.to_string(),
+        "decisions".to_string(),
+        "live".to_string(),
+    );
+    req.temporal = Some(TemporalEntryDto {
+        anchor_ms,
+        anchor_src: anchor_src.to_string(),
+        doc_kind: "note".to_string(),
+        valid_until_ms: None,
+    });
     inner
-        .persist_curated(&PersistCuratedRequest {
-            note_id: note_id.to_string(),
-            tenant_id: "main".to_string().into(),
-            title: "C-1 seed note".to_string(),
-            body: body.to_string(),
-            section: "decisions".to_string(),
-            tags: vec![],
-            author: None,
-            status: "live".to_string(),
-            trust: None,
-            expected_sha256: None,
-            temporal: Some(TemporalEntryDto {
-                anchor_ms,
-                anchor_src: anchor_src.to_string(),
-                doc_kind: "note".to_string(),
-                valid_until_ms: None,
-            }),
-            links: vec![],
-            provenance: None,
-            curator_decision: None,
-            target_vault: None,
-        })
+        .persist_curated(&req)
         .await
         .expect("seed_note_with_anchor — invariant test fixture");
 }
@@ -534,7 +526,7 @@ fn make_reclassify_job(note_id: Ulid, occurred_at: Option<&str>) -> GradatumJob 
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Curate(CurateSpec {
                     note_id,
@@ -589,7 +581,7 @@ fn make_reclassify_job(note_id: Ulid, occurred_at: Option<&str>) -> GradatumJob 
 #[tokio::test]
 async fn reclassify_with_occurred_at_uses_occurred_at_anchor() {
     let fixture = CurateFixture::new().await;
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
 
     // Seed : note existante dans le vault avec une ancre Created historique.
     let old_created_ms = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
@@ -662,7 +654,7 @@ async fn reclassify_with_occurred_at_uses_occurred_at_anchor() {
 #[tokio::test]
 async fn reclassify_without_occurred_at_no_clobber_existing_anchor() {
     let fixture = CurateFixture::new().await;
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
 
     let original_anchor_ms = chrono::DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
         .expect("parsing date — invariant test")
@@ -736,7 +728,7 @@ async fn reclassify_without_occurred_at_no_clobber_existing_anchor() {
 #[tokio::test]
 async fn vault_classify_without_occurred_at_preserves_anchor() {
     let fixture = CurateFixture::new().await;
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
 
     let original_anchor_ms = chrono::DateTime::parse_from_rfc3339("2026-03-10T00:00:00Z")
         .expect("parsing date — invariant test")
@@ -810,7 +802,7 @@ async fn vault_classify_without_occurred_at_preserves_anchor() {
 #[tokio::test]
 async fn reclassify_created_only_no_clobber() {
     let fixture = CurateFixture::new().await;
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
 
     // Ancre Created à une date passée précise (pas now()).
     let original_created_ms = chrono::DateTime::parse_from_rfc3339("2024-12-01T10:30:00Z")
@@ -894,7 +886,7 @@ async fn reclassify_created_only_no_clobber() {
 #[tokio::test]
 async fn vault_write_rmw_with_occurred_at_sets_anchor_occurred_at() {
     let fixture = CurateFixture::new().await;
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
 
     // Seed la note (ancre Created initiale quelconque, on va l'écraser via occurred_at)
     let seed_body =
@@ -990,7 +982,7 @@ async fn vault_write_rmw_with_occurred_at_sets_anchor_occurred_at() {
 #[tokio::test]
 async fn vault_write_rmw_without_occurred_at_preserves_existing_anchor() {
     let fixture = CurateFixture::new().await;
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
 
     let original_anchor_ms = chrono::DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
         .expect("parsing date — invariant test")
@@ -1086,7 +1078,7 @@ async fn vault_write_rmw_without_occurred_at_preserves_existing_anchor() {
 #[tokio::test]
 async fn vault_write_rmw_without_occurred_at_no_spurious_created_entry() {
     let fixture = CurateFixture::new().await;
-    let note_id = Ulid::new();
+    let note_id = Ulid::generate();
 
     // Seed la note SANS entrée temporal_index
     let seed_body = "# [DECISIONS] C-1 test — RMW sans occurred_at (pas d'entrée)\n\nNote sans ancre initiale (>20 chars).";
@@ -1094,24 +1086,17 @@ async fn vault_write_rmw_without_occurred_at_no_spurious_created_entry() {
         Arc::clone(&fixture.vault),
         Arc::clone(&fixture.index),
     );
+    // temporal reste None (défaut du constructeur) : pas d'entrée initiale.
+    let seed_req = PersistCuratedRequest::new(
+        note_id.to_string(),
+        "main".to_string().into(),
+        "C-1 seed note (pas de temporal)".to_string(),
+        seed_body.to_string(),
+        "decisions".to_string(),
+        "live".to_string(),
+    );
     inner_seed
-        .persist_curated(&PersistCuratedRequest {
-            note_id: note_id.to_string(),
-            tenant_id: "main".to_string().into(),
-            title: "C-1 seed note (pas de temporal)".to_string(),
-            body: seed_body.to_string(),
-            section: "decisions".to_string(),
-            tags: vec![],
-            author: None,
-            status: "live".to_string(),
-            trust: None,
-            expected_sha256: None,
-            temporal: None, // pas d'entrée initiale
-            links: vec![],
-            provenance: None,
-            curator_decision: None,
-            target_vault: None,
-        })
+        .persist_curated(&seed_req)
         .await
         .expect("seed sans temporal — invariant fixture");
 

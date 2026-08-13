@@ -3,7 +3,7 @@ pub mod gradatum_acl_policy
 pub gradatum_acl_policy::AclDecision::Allow
 pub gradatum_acl_policy::AclDecision::DenyExplicit
 pub gradatum_acl_policy::AclDecision::DenyImplicit
-pub enum gradatum_acl_policy::AclError
+#[non_exhaustive] pub enum gradatum_acl_policy::AclError
 pub gradatum_acl_policy::AclError::Glob(globset::Error)
 pub gradatum_acl_policy::AclError::Toml(toml::de::error::Error)
 #[non_exhaustive] pub enum gradatum_acl_policy::AclOp

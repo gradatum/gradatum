@@ -8,6 +8,8 @@
 //! gradatum-admin api-key list   --root /var/lib/gradatum [--all]
 //! gradatum-admin api-key revoke --root /var/lib/gradatum --prefix ak_abcdef01
 //! gradatum-admin api-key rotate --root /var/lib/gradatum --prefix ak_abcdef01
+//! gradatum-admin api-key reset  --root /var/lib/gradatum                         # aperçu
+//! gradatum-admin api-key reset  --root /var/lib/gradatum --execute --confirm-prefixes "ak_..,ak_.."
 //! ```
 //!
 //! ## Security
@@ -22,6 +24,18 @@
 //!   declares, unless `--allow-unknown-identity` is passed. Same shape as the scope
 //!   guard, same restriction to `create` — the boot-time reconciliation of
 //!   `gradatum-server` covers the keys already persisted
+//! - `create` also enforces R1 — one identity, one active key: it refuses to mint a
+//!   second active key for an `--owner` that already carries one, and points the operator
+//!   at `rotate` (which revokes and replaces atomically). A revoked key does not count,
+//!   so a replacement can always be minted once the previous key is retired
+//! - `reset` implements R6/R7 — a registry-wide wipe by REVOCATION (never row deletion,
+//!   so the audit trail survives). Its scope is the key registry ALONE: it opens only
+//!   `<root>/db/api_keys.sqlite` and never touches the vault. Confirmation follows the
+//!   `vault forget` idiom — a dry-run preview, then execution requires echoing the exact
+//!   active prefixes back via `--confirm-prefixes`. There is deliberately no `--yes`/
+//!   `--force` flag: a blind boolean an alias could carry is exactly what the echo guards
+//!   against. After a reset the registry has no active key, so the server answers 503
+//!   (R5 empty-registry) until it is re-provisioned
 
 use std::path::PathBuf;
 
@@ -42,6 +56,8 @@ pub enum ApiKeyCmd {
     Revoke(ApiKeyRevokeArgs),
     /// Revokes the existing key and atomically generates a replacement.
     Rotate(ApiKeyRotateArgs),
+    /// Resets the registry — revokes EVERY active key (R6). Never touches the vault (R7).
+    Reset(ApiKeyResetArgs),
 }
 
 /// Arguments for `api-key create`.
@@ -145,6 +161,27 @@ pub struct ApiKeyRotateArgs {
     pub prefix: String,
 }
 
+/// Arguments for `api-key reset`.
+#[derive(Debug, Args)]
+pub struct ApiKeyResetArgs {
+    /// Gradatum root directory.
+    #[arg(long)]
+    pub root: PathBuf,
+
+    /// Executes the reset. Without it, `reset` only previews (dry-run).
+    #[arg(long, default_value_t = false)]
+    pub execute: bool,
+
+    /// Confirmation prefixes, comma-separated. Required with `--execute`.
+    ///
+    /// Must match EXACTLY the active-key prefixes returned by the preview — this
+    /// echo-of-the-previewed-list is the ONLY confirmation. There is deliberately no
+    /// `--yes`/`--force` flag: a blind boolean a script or alias could carry without a
+    /// human ever reading the list is precisely what the echo guards against.
+    #[arg(long, value_delimiter = ',')]
+    pub confirm_prefixes: Vec<String>,
+}
+
 /// Entry point for the `api-key` sub-command.
 pub async fn run(cmd: ApiKeyCmd) -> Result<()> {
     match cmd {
@@ -152,6 +189,7 @@ pub async fn run(cmd: ApiKeyCmd) -> Result<()> {
         ApiKeyCmd::List(args) => run_list(args).await,
         ApiKeyCmd::Revoke(args) => run_revoke(args).await,
         ApiKeyCmd::Rotate(args) => run_rotate(args).await,
+        ApiKeyCmd::Reset(args) => run_reset(args).await,
     }
 }
 
@@ -333,6 +371,33 @@ async fn run_create(args: ApiKeyCreateArgs) -> Result<()> {
         store = store.with_non_main_tenants();
     }
 
+    // R1 — one identity, one active key. A second active key for the same owner would
+    // map two secrets to a single `sub` (`api_keys.owner`), which is exactly the state the
+    // v2.0.0 identity model forbids. Checked here, after the store is open: the guard only
+    // fires when a key already exists, so the database is never created by a refused
+    // invocation. The refusal is actionable (R3) — it names the existing key's prefix and
+    // the rotation command, since `rotate` is how the operator replaces a credential
+    // without ever leaving two active keys.
+    let active = store.list(false, None).await.map_err(|e| {
+        anyhow::anyhow!("listing active keys to enforce R1 (one key per identity): {e}")
+    })?;
+    if let Some(existing) = active.iter().find(|k| k.owner == owner) {
+        bail!(
+            "refusing to create a second active key for '{owner}': an active key already \
+             exists (prefix {prefix})\n\
+             \n\
+             One identity carries exactly one active key (R1). To replace the credential \
+             without leaving two active keys, rotate the existing one:\n\
+             \n\
+             gradatum-admin api-key rotate --root {root} --prefix {prefix}\n\
+             \n\
+             `rotate` revokes the old key and mints its replacement atomically. To retire \
+             the identity instead, revoke the key with `api-key revoke`.",
+            prefix = existing.prefix,
+            root = args.root.display(),
+        );
+    }
+
     let material = store
         .create(&owner, scopes, args.tenant, args.description)
         .await
@@ -467,6 +532,106 @@ async fn run_rotate(args: ApiKeyRotateArgs) -> Result<()> {
     eprintln!("New secret (shown ONCE ONLY):");
     eprintln!("  prefix: {}", material.prefix);
     println!("{}", material.secret);
+
+    Ok(())
+}
+
+/// `api-key reset` — revokes EVERY active key in the registry (R6/R7).
+///
+/// **R7 — scope is the key registry ALONE.** This function opens only the api_keys store
+/// (`<root>/db/api_keys.sqlite`) and holds no reference to the vault (`index.db`) or any
+/// note: it cannot touch the vault, by construction. The wipe is by **revocation**, never
+/// by row deletion, so the audit trail survives — `api-key list --all` keeps showing the
+/// retired keys. After a reset the registry has no active key, so the server falls into the
+/// R5 empty-registry state (503, "run api-key create") until it is re-provisioned; the
+/// full default access of `main-agent`/`admin` is then restored by the ACL preset on the
+/// next `init`, not by this command.
+///
+/// Confirmation follows the `vault forget` idiom: a dry-run preview lists the active
+/// prefixes, and execution requires echoing that exact list back via `--confirm-prefixes`.
+/// There is no `--yes`/`--force` flag on purpose — a blind boolean an alias could carry is
+/// exactly what the echo-of-list guards against.
+///
+/// # Errors
+/// Returns an error when the store cannot be opened or listed, when `--confirm-prefixes`
+/// does not match the previewed active set, or when a revocation fails.
+async fn run_reset(args: ApiKeyResetArgs) -> Result<()> {
+    let store = open_store(&args.root).await?;
+
+    let active = store
+        .list(false, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("listing active keys for reset: {e}"))?;
+
+    // Preview — printed in both dry-run and execute, so the operator always sees the exact
+    // set the confirmation must echo back.
+    println!(
+        "=== api-key reset preview ({} active key(s) to revoke) ===",
+        active.len()
+    );
+    if active.is_empty() {
+        println!("No active key.");
+    } else {
+        println!("{:<12}  owner", "prefix");
+        for key in &active {
+            println!("{:<12}  {}", key.prefix, key.owner);
+        }
+    }
+
+    let expected: Vec<String> = active.iter().map(|k| k.prefix.clone()).collect();
+
+    // Dry-run: stop here, echoing the exact command to run next.
+    if !args.execute {
+        println!(
+            "\n[DRY-RUN] To execute, re-run with --execute --confirm-prefixes \"{}\"",
+            expected.join(",")
+        );
+        return Ok(());
+    }
+
+    // Execute: the echoed list must match the previewed active prefixes exactly. Order is
+    // irrelevant, membership is not — same shape as the `vault forget` confirmation.
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort();
+    let mut confirmed_sorted = args.confirm_prefixes.clone();
+    confirmed_sorted.sort();
+    if expected_sorted != confirmed_sorted {
+        bail!(
+            "confirm-prefixes mismatch: {} active key(s) to confirm, {} provided — \
+             re-run without --execute to get the exact list to echo back",
+            expected_sorted.len(),
+            confirmed_sorted.len()
+        );
+    }
+
+    if expected.is_empty() {
+        println!("No active key to revoke — operation cancelled.");
+        return Ok(());
+    }
+
+    // Alert-level log: wiping the whole registry is a high-consequence, rarely legitimate
+    // operation — it must leave a trace even when stdout is discarded.
+    tracing::warn!(
+        active_keys = expected.len(),
+        "api-key reset: revoking EVERY active key in the registry (R6)"
+    );
+
+    for key in &active {
+        store.revoke(&key.prefix).await.map_err(|e| {
+            anyhow::anyhow!(
+                "reset: revoking '{}' (owner {}): {e}",
+                key.prefix,
+                key.owner
+            )
+        })?;
+    }
+
+    eprintln!(
+        "api-key reset: {} key(s) revoked. The registry now has no active key; the server \
+         will answer 503 (empty registry) until you re-provision it with \
+         `gradatum-admin api-key create` (or `gradatum-admin init`).",
+        expected.len()
+    );
 
     Ok(())
 }

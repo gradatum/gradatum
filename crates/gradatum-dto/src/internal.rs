@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 /// and is left deliberately recoverable: the vault write is idempotent, so the caller
 /// re-runs the job and converges.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PersistCuratedRequest {
     /// Note ULID (26 uppercase characters).
     pub note_id: String,
@@ -73,6 +74,25 @@ pub struct PersistCuratedRequest {
     pub temporal: Option<TemporalEntryDto>,
     /// Links to upsert (source → destination, within the same vault).
     pub links: Vec<LinkDto>,
+    /// Whether `links` is the AUTHORITATIVE, complete set of outgoing edges
+    /// for this note, recomputed from the current body.
+    ///
+    /// - `false` (default) → **non-authoritative**: `links` are merely upserted
+    ///   (`INSERT OR IGNORE`); **no existing edge is ever removed**. This preserves
+    ///   the historical behaviour and is the SAFE default — a caller that did not
+    ///   recompute links (a title/section/status-only rewrite such as `classify` or
+    ///   `downgrade`) cannot silently wipe valid edges.
+    /// - `true` → **authoritative**: before inserting, the server DELETEs every
+    ///   existing outgoing edge of this note (scoped `src_note_id` + `vault_id`)
+    ///   inside the same transaction, so the graph reflects the current body and
+    ///   stale edges left by a previous body are removed. It MUST be set **only** by
+    ///   paths that resolved the *complete* link set from the body
+    ///   (`resolve_wikilinks_via_client` reporting `complete == true`).
+    ///
+    /// Additive `#[serde(default)]`: an older worker that omits the field, or a
+    /// non-recomputing path, deserializes to `false` — never destructive by default.
+    #[serde(default)]
+    pub links_authoritative: bool,
     /// Note provenance (for example `"distilled"`, `"human-decision"`).
     pub provenance: Option<String>,
     /// Curator decision that produced this note, used for metrics instrumentation.
@@ -97,6 +117,40 @@ pub struct PersistCuratedRequest {
     pub target_vault: Option<VaultId>,
 }
 
+impl PersistCuratedRequest {
+    /// Constructs a curated-persist request with the mandatory identity/content
+    /// fields. Collections (`tags`, `links`), all `Option` fields and the additive
+    /// flags default to empty/`None`/`false`; set them on the returned value as needed.
+    #[must_use]
+    pub fn new(
+        note_id: String,
+        tenant_id: TenantId,
+        title: String,
+        body: String,
+        section: String,
+        status: String,
+    ) -> Self {
+        Self {
+            note_id,
+            tenant_id,
+            title,
+            body,
+            section,
+            tags: Vec::new(),
+            author: None,
+            status,
+            trust: None,
+            expected_sha256: None,
+            temporal: None,
+            links: Vec::new(),
+            links_authoritative: false,
+            provenance: None,
+            curator_decision: None,
+            target_vault: None,
+        }
+    }
+}
+
 /// A curator decision — its path and its outcome — carried for metrics instrumentation.
 ///
 /// Ferries the two label values of the `gradatum_curator_decisions` metric from the worker,
@@ -112,6 +166,7 @@ pub struct CuratorDecisionDto {
 
 /// Request body for `POST /internal/v1/persist/embedding` — stores one vector.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PersistEmbeddingRequest {
     /// ULID of the target note.
     pub note_id: String,
@@ -129,8 +184,24 @@ pub struct PersistEmbeddingRequest {
     pub vault_id: Option<VaultId>,
 }
 
+impl PersistEmbeddingRequest {
+    /// Constructs an embedding-persist request; `vault_id` defaults to `None`
+    /// (the handler falls back to `"main"`).
+    #[must_use]
+    pub fn new(note_id: String, embedder_id: String, dim: u16, vector: Vec<f32>) -> Self {
+        Self {
+            note_id,
+            embedder_id,
+            dim,
+            vector,
+            vault_id: None,
+        }
+    }
+}
+
 /// Request body for `POST /internal/v1/persist/forget` — marks a note as semantically forgotten.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PersistForgetRequest {
     /// ULID of the note to forget.
     pub note_id: String,
@@ -144,11 +215,26 @@ pub struct PersistForgetRequest {
     pub forgotten_by: Option<String>,
 }
 
+impl PersistForgetRequest {
+    /// Constructs a forget-persist request; `forgotten_by` defaults to `None`.
+    #[must_use]
+    pub fn new(note_id: String, tenant_id: TenantId, body: String, section: String) -> Self {
+        Self {
+            note_id,
+            tenant_id,
+            body,
+            section,
+            forgotten_by: None,
+        }
+    }
+}
+
 /// Request body for `POST /internal/v1/persist/distill` — updates a distilled note.
 ///
 /// Used by the distillation pipeline to rewrite the content of an existing note with a
 /// re-evaluated trust score.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PersistDistillRequest {
     /// ULID of the note to update.
     pub note_id: String,
@@ -191,6 +277,34 @@ pub struct PersistDistillRequest {
     /// Passed through `parse_tags` (normalize + deduplicate).
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+impl PersistDistillRequest {
+    /// Constructs a distill-persist request with the mandatory identity/content
+    /// fields; `trust`, `expected_sha256`, `derived_into`, the flags and collections
+    /// default to their unset/empty values.
+    #[must_use]
+    pub fn new(
+        note_id: String,
+        tenant_id: TenantId,
+        title: String,
+        body: String,
+        section: String,
+    ) -> Self {
+        Self {
+            note_id,
+            tenant_id,
+            title,
+            body,
+            section,
+            trust: None,
+            expected_sha256: None,
+            mark_processed: false,
+            derived_into: None,
+            derived_from: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
 }
 
 /// Inline temporal entry — avoids importing the core `TemporalEntry` type into the DTO layer.

@@ -345,7 +345,7 @@ pub fn build_distill_job_record(
         JobScope::Locus(locus.to_string())
     };
     JobRecord {
-        id: ulid::Ulid::new(),
+        id: ulid::Ulid::generate(),
         spec: JobSpec {
             kind: Job::Distill(DistillSource {
                 scope: JobScope::Locus(locus.to_string()),

@@ -110,7 +110,7 @@ fn build_router(state: AppState) -> Router {
 /// si l'auth passe. Sert à prouver qu'un non-authentifié est arrêté AVANT.
 fn valid_create_body() -> serde_json::Value {
     serde_json::json!({
-        "spec": { "kind": { "type": "Curate", "data": { "note_id": Ulid::new().to_string() } } }
+        "spec": { "kind": { "type": "Curate", "data": { "note_id": Ulid::generate().to_string() } } }
     })
 }
 
@@ -274,7 +274,7 @@ async fn get_job_detail_without_auth_is_401() {
 
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/api/v1/jobs/{}/v2", Ulid::new()))
+        .uri(format!("/api/v1/jobs/{}/v2", Ulid::generate()))
         .body(Body::empty())
         .expect("build GET detail sans bearer");
 
@@ -294,7 +294,7 @@ async fn cancel_job_without_auth_is_401() {
 
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/api/v1/jobs/{}/cancel", Ulid::new()))
+        .uri(format!("/api/v1/jobs/{}/cancel", Ulid::generate()))
         .body(Body::empty())
         .expect("build POST cancel sans bearer");
 
@@ -314,7 +314,7 @@ async fn job_events_without_auth_is_401() {
 
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/api/v1/jobs/{}/events", Ulid::new()))
+        .uri(format!("/api/v1/jobs/{}/events", Ulid::generate()))
         .body(Body::empty())
         .expect("build GET events sans bearer");
 

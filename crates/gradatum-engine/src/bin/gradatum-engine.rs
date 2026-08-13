@@ -132,8 +132,15 @@ async fn main() -> anyhow::Result<()> {
     let config_path = Path::new(&args[1]);
 
     // --- Load config ---
-    let config = EngineConfig::load_local(config_path)
-        .map_err(|e| anyhow::anyhow!("EngineConfig::load_local failed: {e}"))?;
+    // Redaction : figment fuite la valeur fautive dans son `Display` ; `{e}` sur la
+    // `Box<figment::Error>` la propagerait sur stderr via le `Debug` d'anyhow à la
+    // sortie du process. On rebâtit un message sans valeur (garde-fou gradatum-core).
+    let config = EngineConfig::load_local(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "EngineConfig::load_local failed: {}",
+            gradatum_core::config::redact_figment_error(&e)
+        )
+    })?;
 
     // --- Validate config (model_path canonicalization + prefix) ---
     config

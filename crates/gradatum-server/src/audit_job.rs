@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use gradatum_core::config::StorageBackendConfig;
 use gradatum_core::error::GradatumError;
 use gradatum_core::identity::NoteId;
 use gradatum_core::index::Index;
@@ -23,6 +24,7 @@ use gradatum_curator::audit::{
     self, AuditRecord, AuditThresholds, DowngradeAction, IrrelevanceInput,
 };
 use gradatum_index::extract_h1_title;
+use gradatum_storage::build_storage;
 
 use crate::config::{AuditConfig, DowngradeConfig};
 use crate::metrics::{AppMetrics, AuditCategoryLabel};
@@ -99,9 +101,12 @@ impl NoteDowngrader for IndexDowngrader {
 
 /// Exécute un tick d'audit sur un vault. Non-fatal : toute erreur est loggée + comptée.
 ///
-/// Écrit trois artefacts sous `{storage_root}/audit/` (horodatés + alias `-latest`) :
-/// rapport JSON, rapport Markdown, et un script de commandes `gradatum-admin` préparées
-/// (à exécuter par l'opérateur — jamais par un agent).
+/// Écrit trois artefacts sous `audit/` de la racine de stockage (horodatés + alias
+/// `-latest`) : rapport JSON, rapport Markdown, et un script de commandes `gradatum-admin`
+/// préparées (à exécuter par l'opérateur — jamais par un agent). L'écriture passe par la
+/// couche [`Storage`](gradatum_storage::Storage) (fabrique [`build_storage`]) pilotée par
+/// `storage_cfg` — jamais en accès fichier direct : sur un backend objet, les artefacts
+/// suivent le vault au lieu de rester silencieusement en local.
 ///
 /// # Errors
 ///
@@ -115,6 +120,7 @@ pub async fn audit_once(
     downgrade_cfg: &DowngradeConfig,
     usage: Option<&NoteUsageStore>,
     downgrader: Option<&dyn NoteDowngrader>,
+    storage_cfg: &StorageBackendConfig,
     storage_root: &Path,
     vault_id: &str,
     now_ms: i64,
@@ -247,7 +253,7 @@ pub async fn audit_once(
     }
 
     let mut errors = 0usize;
-    if let Err(e) = write_artifacts(storage_root, vault_id, now_ms, &report).await {
+    if let Err(e) = write_artifacts(storage_cfg, storage_root, vault_id, now_ms, &report).await {
         tracing::warn!(error = %e, vault = %vault_id, "audit: report write failed");
         metrics.audit_errors.inc();
         errors += 1;
@@ -273,31 +279,131 @@ pub async fn audit_once(
 }
 
 /// Écrit les 3 artefacts (JSON / Markdown / commandes admin), horodatés + alias `-latest`.
+///
+/// Toutes les écritures passent par la couche [`Storage`](gradatum_storage::Storage)
+/// construite par [`build_storage`] depuis `storage_cfg` (la même configuration que le
+/// vault) et enracinée à `storage_root`.
+/// Les chemins sont **relatifs** à cette racine (contrat du trait : séparateur `/`, ni chemin
+/// absolu ni `..`) : sur un backend `fs`, `audit/<fichier>` se résout en
+/// `<storage_root>/audit/<fichier>` — emplacement identique à l'accès fichier direct
+/// antérieur ; sur un backend objet, le préfixe `audit/` suit le vault dans le même bucket.
+///
+/// # Errors
+///
+/// - [`GradatumError::Storage`] — construction du backend, sérialisation du rapport JSON,
+///   création du répertoire, ou écriture d'un artefact.
 async fn write_artifacts(
+    storage_cfg: &StorageBackendConfig,
     storage_root: &Path,
     vault_id: &str,
     now_ms: i64,
     report: &audit::AuditReport,
-) -> std::io::Result<()> {
-    let dir = storage_root.join("audit");
-    tokio::fs::create_dir_all(&dir).await?;
+) -> Result<(), GradatumError> {
+    // Tire son propre stockage depuis la même configuration que le vault (l'opérateur
+    // OpenDAL est Arc-partagé en interne) — aucun handle à faire circuler.
+    let storage = build_storage(storage_cfg, storage_root)
+        .map_err(|e| GradatumError::Storage(format!("audit storage init: {e}")))?;
+
+    // Répertoire `audit/` (idempotent). Le suffixe `/` est requis par le contrat
+    // `Storage::create_dir` (convention OpenDAL). L'écriture crée déjà les répertoires
+    // intermédiaires ; ce create_dir explicite garde l'arborescence visible même sans
+    // artefact et fait échouer tôt sur un défaut de permission.
+    storage
+        .create_dir("audit/")
+        .await
+        .map_err(|e| GradatumError::Storage(format!("audit create_dir: {e}")))?;
 
     let json = serde_json::to_string_pretty(report)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        .map_err(|e| GradatumError::Storage(format!("audit report serialize: {e}")))?;
     let md = audit::render_markdown(report);
     let cmds = audit::render_admin_commands(report);
 
     // `vault_id` provient de la config (jamais d'entrée utilisateur) — pas de path traversal ici,
     // mais on reste défensif en n'interpolant que des composants de nom de fichier plats.
-    for (suffix, content) in [
-        (format!("audit-report-{vault_id}-{now_ms}.json"), &json),
-        (format!("audit-report-{vault_id}-latest.json"), &json),
-        (format!("audit-report-{vault_id}-{now_ms}.md"), &md),
-        (format!("audit-report-{vault_id}-latest.md"), &md),
-        (format!("audit-commands-{vault_id}-{now_ms}.sh"), &cmds),
-        (format!("audit-commands-{vault_id}-latest.sh"), &cmds),
+    for (name, content) in [
+        (
+            format!("audit-report-{vault_id}-{now_ms}.json"),
+            json.as_str(),
+        ),
+        (
+            format!("audit-report-{vault_id}-latest.json"),
+            json.as_str(),
+        ),
+        (format!("audit-report-{vault_id}-{now_ms}.md"), md.as_str()),
+        (format!("audit-report-{vault_id}-latest.md"), md.as_str()),
+        (
+            format!("audit-commands-{vault_id}-{now_ms}.sh"),
+            cmds.as_str(),
+        ),
+        (
+            format!("audit-commands-{vault_id}-latest.sh"),
+            cmds.as_str(),
+        ),
     ] {
-        tokio::fs::write(dir.join(suffix), content).await?;
+        let rel = format!("audit/{name}");
+        storage
+            .write(&rel, content.as_bytes())
+            .await
+            .map_err(|e| GradatumError::Storage(format!("audit write {rel}: {e}")))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chemin nominal : sur un backend `fs`, les 6 artefacts apparaissent exactement sous
+    /// `<storage_root>/audit/` — emplacement inchangé vs l'accès fichier direct antérieur.
+    /// Prouve aussi la transposition en chemins relatifs (aucun rejet `InvalidPath`).
+    #[tokio::test]
+    async fn write_artifacts_route_via_storage_fs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_root = tmp.path();
+        // Défaut = service "fs" enraciné à `storage_root`.
+        let cfg = StorageBackendConfig::default();
+        let report = audit::build_report("main", 1234, 0, Vec::new(), Vec::new());
+
+        write_artifacts(&cfg, storage_root, "main", 1234, &report)
+            .await
+            .expect("write_artifacts(fs) doit réussir");
+
+        for f in [
+            "audit-report-main-1234.json",
+            "audit-report-main-latest.json",
+            "audit-report-main-1234.md",
+            "audit-report-main-latest.md",
+            "audit-commands-main-1234.sh",
+            "audit-commands-main-latest.sh",
+        ] {
+            let p = storage_root.join("audit").join(f);
+            assert!(p.exists(), "artefact attendu absent: {}", p.display());
+        }
+    }
+
+    /// Garde anti-régression : ce module écrit EXCLUSIVEMENT via la couche `Storage`.
+    /// Toute réintroduction d'un accès fichier direct recrée le défaut corrigé — un chemin
+    /// qui écrit en local pendant que le vault part sur un backend objet, sans erreur ni
+    /// avertissement. Les aiguilles sont construites par `concat!` (jamais présentes
+    /// verbatim en source), donc ce test ne se déclenche pas sur lui-même.
+    #[test]
+    fn aucune_ecriture_fichier_directe() {
+        let src = include_str!("audit_job.rs");
+        for needle in [
+            concat!("tokio::fs", "::write"),
+            concat!("std::fs", "::write"),
+            concat!("tokio::fs", "::create_dir"),
+            concat!("std::fs", "::create_dir"),
+        ] {
+            assert!(
+                !src.contains(needle),
+                "accès fichier direct interdit dans audit_job.rs ({needle:?}) — router via `Storage`"
+            );
+        }
+        // Preuve positive : les artefacts passent bien par la fabrique de stockage.
+        assert!(
+            src.contains("build_storage"),
+            "write_artifacts doit construire son stockage via build_storage"
+        );
+    }
 }

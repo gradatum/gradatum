@@ -1,6 +1,6 @@
 pub mod gradatum_auth
 pub mod gradatum_auth::jwt
-pub enum gradatum_auth::jwt::JwtError
+#[non_exhaustive] pub enum gradatum_auth::jwt::JwtError
 pub gradatum_auth::jwt::JwtError::Expired
 pub gradatum_auth::jwt::JwtError::InvalidAudience
 pub gradatum_auth::jwt::JwtError::InvalidIssuer
@@ -8,10 +8,10 @@ pub gradatum_auth::jwt::JwtError::InvalidKid
 pub gradatum_auth::jwt::JwtError::Malformed(jsonwebtoken::errors::Error)
 pub gradatum_auth::jwt::JwtError::MissingSub
 pub gradatum_auth::jwt::JwtError::Time(std::time::SystemTimeError)
-pub enum gradatum_auth::jwt::TokenScope
+#[non_exhaustive] pub enum gradatum_auth::jwt::TokenScope
 pub gradatum_auth::jwt::TokenScope::Human
 pub gradatum_auth::jwt::TokenScope::Service
-pub struct gradatum_auth::jwt::Claims
+#[non_exhaustive] pub struct gradatum_auth::jwt::Claims
 pub gradatum_auth::jwt::Claims::aud: alloc::string::String
 pub gradatum_auth::jwt::Claims::exp: u64
 pub gradatum_auth::jwt::Claims::iat: u64
@@ -52,7 +52,7 @@ pub fn gradatum_auth::key_store::load(&std::path::Path, u64, u64) -> core::resul
 pub fn gradatum_auth::key_store::load_or_generate(&std::path::Path, u64, u64) -> core::result::Result<gradatum_auth::jwt::JwtService, gradatum_auth::key_store::KeyStoreError>
 pub fn gradatum_auth::key_store::signing_key_path(&std::path::Path) -> std::path::PathBuf
 pub mod gradatum_auth::revocation
-pub enum gradatum_auth::revocation::RevocationError
+#[non_exhaustive] pub enum gradatum_auth::revocation::RevocationError
 pub gradatum_auth::revocation::RevocationError::Sqlite(sqlx_core::error::Error)
 pub gradatum_auth::revocation::RevocationError::Time(std::time::SystemTimeError)
 pub struct gradatum_auth::revocation::InMemoryRevocationStore

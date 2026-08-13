@@ -25,16 +25,17 @@ gradatum-curator.workspace = true
 gradatum-dto.workspace = true
 # gradatum-db-sqlite is publishable (no `publish` key); this dependency does not block
 # publication of gradatum-admin.
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "1.0.0" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.0.0" }
 gradatum-queue.workspace = true
 gradatum-vault.workspace = true
 gradatum-storage.workspace = true
+gradatum-markdown.workspace = true
 gradatum-index.workspace = true
 # Code-ingest pipeline (publish=false, tree-sitter isolé ici).
 # gradatum-admin est le binaire d'ingest multi-langage : toutes les grammaires
 # tree-sitter sont activées ici. Elles restent isolées dans gradatum-ingest
 # (les autres crates, ex. gradatum-server, n'en dépendent pas).
-gradatum-ingest = { path = "../gradatum-ingest", version = "1.0.0", features = [
+gradatum-ingest = { path = "../gradatum-ingest", version = "2.0.0", features = [
     "code-rust",
     "code-python",
     "code-bash",
@@ -68,3 +69,4 @@ tempfile.workspace = true
 rusqlite = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true }
+gradatum-markdown.workspace = true

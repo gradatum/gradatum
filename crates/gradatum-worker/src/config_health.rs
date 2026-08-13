@@ -2,7 +2,7 @@
 //!
 //! Le worker lit son `server.toml` section par section, et chaque section absente ou
 //! malformée le fait retomber sur des valeurs par défaut **sans bloquer le boot** —
-//! comportement voulu, arbitré le 2026-08-01 (`decisions/01KYYV5BHS2XDBXFF2H6Y6FWV6`).
+//! comportement voulu.
 //!
 //! Le danger n'est pas le repli, c'est son **silence**. Une section mal orthographiée
 //! (`[embeds]` au lieu de `[embed]`) et une section volontairement omise produisent le
@@ -30,6 +30,7 @@ use figment::{
     Figment,
     providers::{Format, Toml},
 };
+use gradatum_core::config::redact_figment_error;
 use serde::de::DeserializeOwned;
 use tracing::{error, warn};
 
@@ -210,12 +211,16 @@ where
         }
         Err(e) => {
             health.record(section, Some(FallbackCause::ParseFailed));
+            // Redaction : le `Display` natif de figment embarque la valeur fautive,
+            // qui peut être un secret collé par erreur dans un champ typé. Même
+            // garde-fou que le boot serveur, centralisé dans gradatum-core.
+            let redacted = redact_figment_error(&e);
             error!(
                 config = %config_path.display(),
                 section = section,
                 cause = FallbackCause::ParseFailed.label(),
                 effect = effect,
-                error = %e,
+                error = %redacted,
                 "configuration fallback — section PRESENT but rejected, defaults \
                  applied. A section that is written then ignored is almost always a typo"
             );

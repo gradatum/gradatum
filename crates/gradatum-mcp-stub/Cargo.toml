@@ -10,6 +10,13 @@ description = "Adapter MCP stdio → HTTP gradatum-server (thin proxy)"
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Retiré de la distribution 2.0.0 (Alluvium) : le binaire n'est compilé que pour
+# x86_64-unknown-linux-gnu, or son seul public visé — Claude Desktop — n'existe que
+# sur macOS/Windows ; il ne peut donc pas remplir sa fonction. La SOURCE reste dans
+# le dépôt (réparée, retrait réversible), mais `publish = false` la tient hors de
+# crates.io pour 2.0.0. Elle reste figée en 1.0.0 sur crates.io (composant retiré,
+# comportement attendu — ne pas « corriger »).
+publish = false
 
 [[bin]]
 name = "gradatum-mcp-stub"
@@ -28,6 +35,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+clap = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 tempfile.workspace = true

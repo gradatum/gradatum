@@ -38,12 +38,10 @@ async fn delete_sends_admin_header_and_parses_result() {
         .await;
 
     let client = AdminClient::new(&server.uri(), tf.path()).expect("AdminClient::new");
-    let req = VaultDeleteRequest {
-        note_id: "01HTEST00000000000000000AB".to_string(),
-        dry_run: false,
-        confirm_ulids: vec!["01HTEST00000000000000000AB".to_string()],
-        tenant_id: Some("main".to_string().into()),
-    };
+    let mut req = VaultDeleteRequest::new("01HTEST00000000000000000AB".to_string());
+    req.dry_run = false;
+    req.confirm_ulids = vec!["01HTEST00000000000000000AB".to_string()];
+    req.tenant_id = Some("main".to_string().into());
     let resp = client.delete(&req).await.expect("delete ok");
     assert_eq!(resp["deleted"], true);
     assert_eq!(
@@ -76,18 +74,10 @@ async fn archives_list_parses_typed_response() {
         .await;
 
     let client = AdminClient::new(&server.uri(), tf.path()).expect("AdminClient::new");
+    let mut list_req = VaultArchivesListRequest::default();
+    list_req.tenant_id = Some("main".to_string().into());
     let resp = client
-        .archives_list(&VaultArchivesListRequest {
-            vault_filter: None,
-            section: None,
-            since_ms: None,
-            until_ms: None,
-            include_gc: false,
-            include_restored: false,
-            limit: 50,
-            offset: 0,
-            tenant_id: Some("main".to_string().into()),
-        })
+        .archives_list(&list_req)
         .await
         .expect("archives_list ok");
     assert_eq!(resp.count, 1);
@@ -117,15 +107,9 @@ async fn purge_dry_run_sends_expected_body() {
         .await;
 
     let client = AdminClient::new(&server.uri(), tf.path()).expect("AdminClient::new");
-    let resp = client
-        .archives_purge(&VaultArchivesPurgeRequest {
-            note_id: "01HTEST00000000000000000AB".to_string(),
-            dry_run: true,
-            confirm_ulids: Vec::new(),
-            tenant_id: Some("main".to_string().into()),
-        })
-        .await
-        .expect("purge ok");
+    let mut purge_req = VaultArchivesPurgeRequest::new("01HTEST00000000000000000AB".to_string());
+    purge_req.tenant_id = Some("main".to_string().into());
+    let resp = client.archives_purge(&purge_req).await.expect("purge ok");
     assert!(resp.dry_run);
     assert!(!resp.purged);
 }
@@ -153,13 +137,11 @@ async fn restore_dry_run_sends_expected_body() {
         .await;
 
     let client = AdminClient::new(&server.uri(), tf.path()).expect("AdminClient::new");
+    let mut restore_req =
+        VaultArchivesRestoreRequest::new("01HTEST00000000000000000AB".to_string());
+    restore_req.tenant_id = Some("main".to_string().into());
     let resp = client
-        .archives_restore(&VaultArchivesRestoreRequest {
-            note_id: "01HTEST00000000000000000AB".to_string(),
-            dry_run: true,
-            confirm_ulids: Vec::new(),
-            tenant_id: Some("main".to_string().into()),
-        })
+        .archives_restore(&restore_req)
         .await
         .expect("restore ok");
     assert!(resp.dry_run);
@@ -186,13 +168,13 @@ async fn restore_real_parses_status() {
         .await;
 
     let client = AdminClient::new(&server.uri(), tf.path()).expect("AdminClient::new");
+    let mut restore_req =
+        VaultArchivesRestoreRequest::new("01HTEST00000000000000000AB".to_string());
+    restore_req.dry_run = false;
+    restore_req.confirm_ulids = vec!["01HTEST00000000000000000AB".to_string()];
+    restore_req.tenant_id = Some("main".to_string().into());
     let resp = client
-        .archives_restore(&VaultArchivesRestoreRequest {
-            note_id: "01HTEST00000000000000000AB".to_string(),
-            dry_run: false,
-            confirm_ulids: vec!["01HTEST00000000000000000AB".to_string()],
-            tenant_id: Some("main".to_string().into()),
-        })
+        .archives_restore(&restore_req)
         .await
         .expect("restore ok");
     assert!(resp.restored);
@@ -215,13 +197,10 @@ async fn non_2xx_is_error() {
         .await;
 
     let client = AdminClient::new(&server.uri(), tf.path()).expect("AdminClient::new");
+    let mut del_req = VaultDeleteRequest::new("x".to_string());
+    del_req.tenant_id = Some("main".to_string().into());
     let err = client
-        .delete(&VaultDeleteRequest {
-            note_id: "x".to_string(),
-            dry_run: true,
-            confirm_ulids: Vec::new(),
-            tenant_id: Some("main".to_string().into()),
-        })
+        .delete(&del_req)
         .await
         .expect_err("401 doit être une erreur");
     assert!(

@@ -83,7 +83,7 @@ impl IdentityFixture {
                 .expect("Vault::create"),
         );
         let index = vault.index().clone();
-        let note_id = Ulid::new();
+        let note_id = Ulid::generate();
 
         // Corps d'âme minimal — titre `identity/test-agent`.
         let body =
@@ -135,7 +135,7 @@ fn curate_job_reclassify(note_id: Ulid, tenant_id: &str) -> GradatumJob {
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Curate(CurateSpec {
                     note_id,

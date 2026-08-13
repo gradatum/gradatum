@@ -150,7 +150,7 @@ fn pm_body_dropped(feature: &str, version: &str, title: &str) -> (String, String
 // ── Seed helper ───────────────────────────────────────────────────────────────
 
 async fn seed(idx: &SqliteIndex, body: &str) {
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     idx.seed_note(&id, "project-map", body)
         .await
         .expect("seed note project-map");

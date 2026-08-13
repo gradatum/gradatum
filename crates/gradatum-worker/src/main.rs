@@ -45,12 +45,9 @@ mod distill_cluster;
 // Required by apalis_handlers::handle_validate (F-43 quality gate) — wired via monitor.rs.
 mod internal_client;
 mod quality_score;
-// curator_loader and dispatch retained for integration test compatibility.
-// Not used by the binary — the Apalis Monitor replaces the Dispatcher.
+// curator_loader retained for integration test compatibility (also used by the binary).
 #[allow(dead_code)]
 mod curator_loader;
-#[allow(dead_code)]
-mod dispatch;
 mod leader;
 mod metrics;
 mod monitor;

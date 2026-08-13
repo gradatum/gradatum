@@ -1,7 +1,8 @@
 //! Tests d'intégration C9 — parallélisation title_lookup wikilinks.
 //!
-//! Vérifie que `process_wikilinks_b5` avec `futures::future::join_all` sur les
-//! `title_lookup` produit un résultat identique au comportement série :
+//! Exercent le moteur ACTIF `handle_curate` (via `helpers::process_curate`).
+//! Vérifie que la résolution parallèle (`futures::future::join_all` sur les
+//! `title_lookup`/`id_lookup`) produit un résultat identique au comportement série :
 //! - Tous les wikilinks résolus sont persistés dans `note_links`.
 //! - Un wikilink non résolu (note cible absente) ne bloque pas les autres.
 //! - 0 wikilink → retour immédiat, pas d'appel à l'index.
@@ -14,7 +15,7 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
-use helpers::{count_backlinks, enqueue_curate_job, has_backlink_to, test_dispatcher_with_index};
+use helpers::{count_backlinks, has_backlink_to, process_curate, test_curate_fixture};
 
 use chrono::Utc;
 use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
@@ -25,10 +26,7 @@ use gradatum_core::status::NoteStatus;
 // ── Helper local ──────────────────────────────────────────────────────────────
 
 /// Seed une note cible dans le vault + index, retourne son ULID stringifié.
-///
-/// Même pattern que `wikilinks_post_curate.rs::seed_target_note` — dupliqué
-/// ici pour éviter l'import cross-module entre fichiers de test integration.
-async fn seed_target_note(fixture: &helpers::DispatcherFixture, title: &str, body: &str) -> String {
+async fn seed_target_note(fixture: &helpers::CurateFixture, title: &str, body: &str) -> String {
     let frontmatter = Frontmatter {
         schema_version: 1,
         vault_id: VaultId::new("main"),
@@ -69,7 +67,7 @@ async fn seed_target_note(fixture: &helpers::DispatcherFixture, title: &str, bod
 /// au comportement série. Le set de `dst_id` persisté doit être identique.
 #[tokio::test]
 async fn wikilinks_b5_parallel_persists_all_links() {
-    let fixture = test_dispatcher_with_index().await;
+    let fixture = test_curate_fixture().await;
 
     // Seed N=5 notes cibles
     let targets = [
@@ -90,10 +88,9 @@ async fn wikilinks_b5_parallel_persists_all_links() {
     let body = "# [DECISIONS] Note parallèle multi-liens\n\n\
         Voir [[Note Parallèle A]], [[Note Parallèle B]], [[Note Parallèle C]], \
         [[Note Parallèle D]] et [[Note Parallèle E]] pour les références.";
-    enqueue_curate_job(&fixture, "[DECISIONS] Note parallèle multi-liens", body).await;
-
-    let processed = fixture.dispatcher.run_once().await.unwrap();
-    assert!(processed, "le dispatcher doit traiter le job");
+    process_curate(&fixture, "[DECISIONS] Note parallèle multi-liens", body)
+        .await
+        .expect("handle_curate doit réussir");
 
     // Chaque note cible doit avoir exactement 1 backlink depuis la note source
     for (idx_pos, target_id) in target_ids.iter().enumerate() {
@@ -111,11 +108,11 @@ async fn wikilinks_b5_parallel_persists_all_links() {
 
 /// C9 — wikilink non résolu (cible absente) ne bloque pas les autres.
 ///
-/// Avec `join_all`, un `Ok(None)` sur title_lookup ne doit pas court-circuiter
+/// Avec `join_all`, un `Ok(None)` sur la résolution ne doit pas court-circuiter
 /// les autres futures. Le lien résolu doit être persisté ; le lien non résolu est ignoré.
 #[tokio::test]
 async fn wikilinks_b5_parallel_unresolved_wikilink_does_not_block() {
-    let fixture = test_dispatcher_with_index().await;
+    let fixture = test_curate_fixture().await;
 
     // 1 note cible connue + 1 wikilink vers titre inexistant
     let known_title = "Note Connue Parallèle";
@@ -123,14 +120,11 @@ async fn wikilinks_b5_parallel_unresolved_wikilink_does_not_block() {
 
     let body = "# [DECISIONS] Note mixte lien connu/inconnu\n\n\
         Voir [[Note Connue Parallèle]] et [[Titre Totalement Inexistant XYZ123]] pour le contexte.";
-    enqueue_curate_job(&fixture, "[DECISIONS] Note mixte lien connu/inconnu", body).await;
-
-    let result = fixture.dispatcher.run_once().await;
+    let result = process_curate(&fixture, "[DECISIONS] Note mixte lien connu/inconnu", body).await;
     assert!(
         result.is_ok(),
         "C9 : curate ne doit pas échouer sur wikilink non résolu — err={result:?}"
     );
-    assert!(result.unwrap(), "un job doit avoir été traité");
 
     // Le lien connu est persisté
     assert!(
@@ -151,17 +145,14 @@ async fn wikilinks_b5_parallel_unresolved_wikilink_does_not_block() {
 /// Le job doit être traité avec succès.
 #[tokio::test]
 async fn wikilinks_b5_parallel_empty_returns_immediately() {
-    let fixture = test_dispatcher_with_index().await;
+    let fixture = test_curate_fixture().await;
 
     let body = "# [DECISIONS] Note sans wikilinks\n\nContenu simple sans liens.";
-    enqueue_curate_job(&fixture, "[DECISIONS] Note sans wikilinks", body).await;
-
-    let result = fixture.dispatcher.run_once().await;
+    let result = process_curate(&fixture, "[DECISIONS] Note sans wikilinks", body).await;
     assert!(
         result.is_ok(),
         "C9 : curate sans wikilinks ne doit pas échouer — err={result:?}"
     );
-    assert!(result.unwrap(), "un job doit avoir été traité");
     // Aucun lien créé (table note_links vide pour ce vault)
     // Vérification indirecte : count_backlinks sur un ID fictif = 0
     let count = count_backlinks(&fixture.index, "00000000000000000000000000").await;

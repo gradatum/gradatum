@@ -307,7 +307,7 @@ async fn concurrent_vault_write_produces_distinct_job_ids() {
 async fn vault_classify_returns_404_for_unknown_note() {
     let (addr, bearer) = spawn_write_server().await;
 
-    let fake_note_id = ulid::Ulid::new().to_string();
+    let fake_note_id = ulid::Ulid::generate().to_string();
 
     let resp = client()
         .post(format!("http://{addr}/api/v1/vault_classify"))
@@ -340,7 +340,7 @@ async fn vault_downgrade_returns_202_with_job_id() {
     let (addr, bearer) = spawn_write_server().await;
 
     // Note inexistante en DB — l'handler sync retourne 404 directement (après auth OK).
-    let fake_note_id = ulid::Ulid::new().to_string();
+    let fake_note_id = ulid::Ulid::generate().to_string();
 
     let resp = client()
         .post(format!("http://{addr}/api/v1/vault_downgrade"))

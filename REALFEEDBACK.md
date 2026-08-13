@@ -2,7 +2,10 @@
 
 Field notes from running gradatum's gateway + engine layer against `llama-server` on an **AMD AI HX 395 MAX 128 Go** mini-PC — 128 GB unified LPDDR5X (32 GB system / 96 GB VRAM allocation), 8060S iGPU (RDNA 3.5, gfx1151), Ubuntu. Unified-memory APUs behave differently from a discrete-GPU host on several axes below; the exact numbers are specific to this platform, but the failure modes generalize to any llama.cpp deployment on AMD AI HX 395 MAX 128 Go or similar UMA (unified memory architecture) silicon.
 
-This is a companion to the [README](README.md#example-multi-host-setup) — everything here is a field observation from one real deployment, not a promise about behavior on other hardware.
+This is a companion to the [README](README.md) and to the multi-host topology in
+[docs/DEPLOYMENT.md §2](docs/DEPLOYMENT.md#2-example-topology--multi-host-gpu-serving-with-gateway-routing) —
+everything here is a field observation from one real deployment, not a promise about behavior
+on other hardware.
 
 ## Backend: Vulkan over ROCm
 

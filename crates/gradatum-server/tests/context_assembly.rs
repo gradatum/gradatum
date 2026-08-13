@@ -335,7 +335,7 @@ async fn retrieval_semantic_section_filter_excludes_other_sections() {
     let idx = env._vault_typed.index();
 
     // Seeder une note dans "decisions" avec du contenu FTS-searchable.
-    let ulid_decisions = Ulid::new().to_string();
+    let ulid_decisions = Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &ulid_decisions,
         "decisions",
@@ -350,7 +350,7 @@ async fn retrieval_semantic_section_filter_excludes_other_sections() {
         .expect("upsert_note_title decisions — invariant test");
 
     // Seeder une note dans "reasoning" avec le même contenu lexical.
-    let ulid_reasoning = Ulid::new().to_string();
+    let ulid_reasoning = Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &ulid_reasoning,
         "reasoning",
@@ -540,7 +540,7 @@ async fn retrieval_multi_section_excludes_out_of_set() {
         "# Note multi section\nmulti section retrieval recall parité test query contenu unique";
 
     // Note section sec-alpha.
-    let ulid_a = Ulid::new().to_string();
+    let ulid_a = Ulid::generate().to_string();
     idx.seed_note_with_fts(&ulid_a, "sec-alpha", BODY)
         .await
         .expect("seed sec-alpha — invariant test");
@@ -550,7 +550,7 @@ async fn retrieval_multi_section_excludes_out_of_set() {
         .expect("title sec-alpha");
 
     // Note section sec-beta.
-    let ulid_b = Ulid::new().to_string();
+    let ulid_b = Ulid::generate().to_string();
     idx.seed_note_with_fts(&ulid_b, "sec-beta", BODY)
         .await
         .expect("seed sec-beta — invariant test");
@@ -560,7 +560,7 @@ async fn retrieval_multi_section_excludes_out_of_set() {
         .expect("title sec-beta");
 
     // Note section sec-gamma — doit être exclue.
-    let ulid_c = Ulid::new().to_string();
+    let ulid_c = Ulid::generate().to_string();
     idx.seed_note_with_fts(&ulid_c, "sec-gamma", BODY)
         .await
         .expect("seed sec-gamma — invariant test");
@@ -664,7 +664,7 @@ async fn select_split_inline_then_stub_then_drop() {
     const BODY_SEED: &str =
         "alpha beta gamma alpha beta gamma alpha beta gamma alpha beta gamma alpha beta gamma";
     for i in 0..10u32 {
-        let ulid = Ulid::new().to_string();
+        let ulid = Ulid::generate().to_string();
         let body = format!("# Note split {i}\n{BODY_SEED}");
         idx.seed_note_with_fts(&ulid, "decisions", &body)
             .await
@@ -759,7 +759,7 @@ async fn select_reference_mode_off_parity() {
 
     // Seeder 5 notes avec du contenu unique pour retrieval FTS.
     for i in 0..5u32 {
-        let ulid = Ulid::new().to_string();
+        let ulid = Ulid::generate().to_string();
         let body =
             format!("# Note parité {i}\ncontenu parité parity reference mode off alpha beta");
         idx.seed_note_with_fts(&ulid, "decisions", &body)
@@ -984,7 +984,7 @@ async fn retrieval_sections_none_parity() {
 
     let mut expected_ulids: Vec<String> = Vec::new();
     for section in ["parity-one", "parity-two", "parity-three"] {
-        let ulid = Ulid::new().to_string();
+        let ulid = Ulid::generate().to_string();
         idx.seed_note_with_fts(&ulid, section, BODY)
             .await
             .expect("seed note — invariant test");
@@ -1052,7 +1052,7 @@ async fn session_already_sent_returns_stub() {
     )
     .await;
 
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
     let body = serde_json::json!({
         "query": "alpha session filtre incremental",
         "session_id": session_id,
@@ -1116,7 +1116,7 @@ async fn session_new_note_inline_and_marked() {
     )
     .await;
 
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
     let body = serde_json::json!({
         "query": "mark sent session trace",
         "session_id": session_id,
@@ -1192,7 +1192,7 @@ async fn no_session_id_is_f29_only() {
     // Le store ne doit PAS avoir reçu de mark_sent (pas de session_id → skip total).
     let store = env.state.session_trace.as_ref().expect("store présent");
     // Utiliser un session_id arbitraire pour vérifier que le store est bien vide.
-    let dummy_sid = ulid::Ulid::new().to_string();
+    let dummy_sid = ulid::Ulid::generate().to_string();
     let sent_map = store.get_sent("main", &dummy_sid).await.expect("get_sent");
     assert!(
         sent_map.is_empty(),
@@ -1281,7 +1281,7 @@ async fn sent_stub_uses_frozen_snippet() {
     )
     .await;
 
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
     let now_ms = Utc::now().timestamp_millis();
 
     // Forcer mark_sent avec un snippet custom — délibérément distinct du début du body.
@@ -1371,7 +1371,7 @@ async fn two_calls_same_session_byte_identical_stub() {
     )
     .await;
 
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
 
     // T1 : budget large → note A inline → mark_sent automatique.
     let resp_t1 = call_vault_context_json(
@@ -1470,7 +1470,7 @@ async fn sent_note_also_in_bm25_appears_once() {
     )
     .await;
 
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
     let now_ms = Utc::now().timestamp_millis();
 
     // Forcer mark_sent avec snippet custom distinct du body.
@@ -1563,7 +1563,7 @@ async fn session_store_none_degrades_to_f29() {
     .await;
 
     // session_id valide (26 chars ULID) mais store = None → dégradation F-29-pur.
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
     assert_eq!(session_id.len(), 26, "invariant : ULID doit être 26 chars");
 
     let body = serde_json::json!({
@@ -1612,7 +1612,7 @@ async fn compact_folds_sent_to_stubs() {
 
     let env = build_app_with_session_trace_and_embedder(Arc::new(FakeEmbedder { dim: 1024 })).await;
     let token = sign_token(&env.state);
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
     let now_ms = Utc::now().timestamp_millis();
 
     // Seeder 3 notes avec corps longs (dépassent budget_tokens=25).
@@ -1697,7 +1697,7 @@ async fn compact_preserves_dereferenceability() {
 
     let env = build_app_with_session_trace_and_embedder(Arc::new(FakeEmbedder { dim: 1024 })).await;
     let token = sign_token(&env.state);
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
     let now_ms = Utc::now().timestamp_millis();
 
     // Seeder 3 notes.

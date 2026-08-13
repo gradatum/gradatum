@@ -6,6 +6,7 @@ use gradatum_core::scope::TenantId;
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultReadRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -30,4 +31,18 @@ pub struct VaultReadRequest {
     /// to the historical `VaultReadResponse`. Existing clients are unaffected.
     #[serde(default)]
     pub compact: bool,
+}
+
+impl VaultReadRequest {
+    /// Constructs a read request with the mandatory `path`; `tenant_id`, `section`
+    /// and `compact` default to their unset values.
+    #[must_use]
+    pub fn new(path: String) -> Self {
+        Self {
+            tenant_id: None,
+            path,
+            section: None,
+            compact: false,
+        }
+    }
 }

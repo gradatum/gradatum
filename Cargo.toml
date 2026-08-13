@@ -56,7 +56,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Gradatum Contributors"]
@@ -73,32 +73,31 @@ categories = ["database", "memory-management"]
 # NOTE: versioned pins validated against Cargo.lock baseline (Phase 0bis-bis HEAD~0).
 # serde 1.0.228 is the minimum compatible with toml_edit 0.25.x / toml 1.x.
 # PR-6 Plan bumps: toml 0.8.23→1.1.2 + toml_edit 0.22.27→0.25.11 (MSRV 1.85).
-tokio       = { version = "=1.52.1", features = ["full"] }
-async-trait = "=0.1.89"
+tokio       = { version = "=1.53.0", features = ["full"] }
+async-trait = "=0.1.91"
 
 # Serialization
-serde       = { version = "=1.0.228", features = ["derive"] }
-serde_json  = "=1.0.149"
+serde       = { version = "=1.0.229", features = ["derive"] }
+serde_json  = "=1.0.150"
 serde_norway = "=0.9.42"
 serde_jcs   = "=0.1.0"
-toml        = "=1.1.2"
-toml_edit   = "=0.25.11"
-bincode     = { version = "=2.0.1", features = ["serde"] }
+toml        = "=1.1.3"
+toml_edit   = "=0.25.13"
 
 # Errors
-thiserror   = "=2.0.18"
+thiserror   = "=2.0.19"
 # anyhow 1.0.103 : fix RUSTSEC-2026-0190 (unsound Error::downcast_mut sous Error::context).
-anyhow      = "=1.0.103"
+anyhow      = "=1.0.104"
 
 # Time + IDs
-chrono      = { version = "=0.4.44", features = ["serde"] }
-ulid        = { version = "=1.2.1", features = ["serde"] }
+chrono      = { version = "=0.4.45", features = ["serde"] }
+ulid        = { version = "=3.0.0", features = ["serde"] }
 
 # Hashing
 sha2        = "=0.11.0"
 
 # Perf hints
-smallvec    = { version = "=1.13.2", features = ["serde"] }
+smallvec    = { version = "=1.15.2", features = ["serde"] }
 
 # Schema embedding
 include_dir = "=0.7.4"
@@ -107,8 +106,29 @@ include_dir = "=0.7.4"
 moka        = { version = "=0.12.15", features = ["future"] }
 
 # Database
+# ⛔ F-142 lot 3 (2026-08-08) : rusqlite NE PEUT PAS MONTER, et ce n'est pas un choix de prudence.
+# Blocage mécanique établi par le compilateur : `libsqlite3-sys` porte `links = "sqlite3"`, donc
+# une seule copie est autorisée dans tout le graphe. Or `sqlx-sqlite 0.8.6` exige
+# `libsqlite3-sys ^0.30.1`, tandis que rusqlite 0.33 et au-delà exigent 0.31, 0.32, ... jusqu'à
+# 0.38 pour la 0.40. Les deux contraintes sont inconciliables.
+#
+# **0.32.1 est donc la dernière version de rusqlite compatible avec sqlx 0.8** — vérifié version
+# par version sur le registre, pas déduit.
+#
+# Conséquence à connaître : la montée de sqlx n'est pas seulement une question de fraîcheur, elle
+# **verrouille toute la couche base de données**. Tant que sqlx reste en 0.8, rusqlite reste en
+# 0.32. L'analyse d'API des deux crates prise séparément concluait que rusqlite était montable —
+# c'est faux, elles sont couplées par une bibliothèque native commune que ni l'une ni l'autre ne
+# nomme dans son manifeste.
 rusqlite    = { version = "=0.32.1", features = ["bundled", "chrono"] }
-dashmap     = "=6.1.0"
+dashmap     = "=6.2.1"
+# F-142 lot 3 (2026-08-08) : maintenu en 0.8.6, dernière de la ligne 0.8.x. La 0.9.0 est écartée
+# pour deux raisons indépendantes, chacune suffisante. (1) Elle exige une version minimale de
+# compilateur supérieure à celle que le workspace déclare — la relever est une décision de
+# politique de compatibilité, pas la conséquence mécanique d'une montée. (2) Elle restreint les
+# fonctions `query*()` aux chaînes littérales : `gradatum-db-sqlite/src/queue_store_sqlite.rs`
+# construit sa requête dynamiquement et cesserait de compiler sans une annotation explicite
+# d'innocuité. Adaptable, mais hors du cadre d'une montée de routine.
 sqlx        = { version = "=0.8.6", features = ["sqlite", "runtime-tokio", "macros"] }
 # ANN sqlite-vec extension (v0.5.3 ANN-1) — compile la static lib sqlite_vec0.
 # default-features = false : évite de tirer rusqlite ^0.31 (dev-dep upstream) en conflit
@@ -120,17 +140,13 @@ sqlite-vec  = { version = "=0.1.9", default-features = false }
 # Job queue — Apalis embedded (D-09 ARCH-D15 v0.2.0)
 # Pin exact : D-09 BLOQUANT — toute version majeure/mineure/patch doit être actée council.
 # apalis-cron rc.8 : rc.9 non publié sur crates.io (dernière version disponible = rc.8).
-# apalis-sql rc.9 : crate Diesel compat (apalis-sqlite est le backend SQLite réel via sqlx 0.8).
-# Refs : docs/decisions/ARCH-D15-apalis-embedded.md
 apalis         = { version = "=1.0.0-rc.9", default-features = false, features = ["tracing", "retry", "timeout", "limit", "catch-panic"] }
-apalis-sql     = { version = "=1.0.0-rc.9" }
-apalis-sqlite  = { version = "=1.0.0-rc.8", default-features = false, features = ["migrate", "tokio-comp"] }
 apalis-cron    = { version = "=1.0.0-rc.8" }
 
 # Observability — Prometheus metrics (apalis prometheus feature + gradatum-worker telemetry)
-prometheus        = { version = "=0.13.4", default-features = false }
-# prometheus-client 0.22.3 — utilisé par gradatum-server + gradatum-engine (P0-3 : ajouté au workspace)
-prometheus-client = "=0.22.3"
+prometheus        = { version = "=0.14.0", default-features = false }
+# prometheus-client 0.25.0 — utilisé par gradatum-server + gradatum-engine (P0-3 : ajouté au workspace)
+prometheus-client = "=0.25.0"
 
 # HTTP server / client
 axum        = "=0.8.9"
@@ -140,13 +156,13 @@ axum        = "=0.8.9"
 # ambiguous process-default provider panic.
 axum-server = { version = "=0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 # rustls is a direct dep solely to install the process-default crypto provider at boot.
-# Pinned to the version already resolved transitively (=0.23.40) to avoid duplicates.
+# Pinned to the version already resolved transitively (=0.23.43) to avoid duplicates.
 rustls      = { version = "=0.23.40", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
-http        = "=1.4.0"
-tower       = "=0.5.2"
-tower-http      = { version = "=0.6.10", features = ["cors", "trace", "fs", "set-header", "limit"] }
+http        = "=1.4.2"
+tower       = "=0.5.3"
+tower-http      = { version = "=0.7.0", features = ["cors", "trace", "fs", "set-header", "limit"] }
 governor        = "=0.10.4"
-reqwest     = { version = "=0.13.3", default-features = false, features = ["rustls", "json", "stream", "query"] }
+reqwest     = { version = "=0.13.4", default-features = false, features = ["rustls", "json", "stream", "query"] }
 
 # Storage abstraction
 # 0.58.1 : premier palier exigeant quick-xml >= 0.41 (opendal-core), seuil de correction
@@ -154,20 +170,33 @@ reqwest     = { version = "=0.13.3", default-features = false, features = ["rust
 # `opendal-core` + `opendal-service-*`). 0.58.0 était YANKED (bug ctor macOS, apache/opendal#7923) ;
 # 0.58.1 publiée non yankée 2026-07-31. Emporte un relèvement MSRV workspace -> 1.91.
 opendal     = { version = "=0.58.1", default-features = false }
+# Transport HTTP enfichable d'OpenDAL 0.58 (apache/opendal#7900). Sans lui, tout backend
+# objet (S3/GCS/Azure) échoue AVANT le premier paquet réseau sur `ConfigInvalid: default
+# HTTP transport is not installed`. Variante `rustls-no-provider` DÉLIBÉRÉE : elle n'embarque
+# aucun fournisseur crypto, elle lit le fournisseur process-default que nous installons
+# explicitement (`aws_lc_rs`) — même précédent que `axum-server`/`tls-rustls-no-provider`,
+# pour éviter qu'un second provider (`ring`) soit tiré et rende le défaut de process ambigu.
+# `default-features = false` : miroir exact de la déclaration du même crate dans la façade
+# `opendal` (elle-même `default-features = false`). Version épinglée sur le palier opendal.
+opendal-http-transport-reqwest = { version = "=0.58.1", default-features = false, features = ["rustls-no-provider"] }
 
 # Embeddings (CPU)
 # default-features désactivé pour retirer ort-download-binaries (build-time TLS requis, absent sur ce CI).
 # hf-hub-rustls-tls : téléchargement des fichiers de modèle depuis HuggingFace.
 # Utilisé via feature flag `fastembed-cpu` uniquement dans gradatum-embed.
 # Les tests FastEmbedCpu sont #[ignore] — ORT dylib non requis en CI.
-fastembed   = { version = "=4.6.0", default-features = false, features = ["hf-hub-rustls-tls"] }
+# F-142 lot 3 (2026-08-08) : 4.6.0 -> 4.9.1, dans la même ligne majeure. La 5.x est
+# délibérément écartée : elle épingle `ort =2.0.0-rc.13`, qui épingle à son tour
+# `ort-sys =2.0.0-rc.13` — en conflit exact et non résoluble avec le pin indépendant
+# `ort-sys = "=2.0.0-rc.9"` de `crates/gradatum-search` (feature `onnx-reranker`). La 5.x fait
+# par ailleurs passer `embed` de `&self` à `&mut self`. La 4.9.1 épingle `ort` ET `ort-sys` en
+# rc.9, identiques à nos pins : zéro conflit, et signature d'`embed` inchangée — aucune
+# adaptation dans `gradatum-embed`.
+fastembed   = { version = "=4.9.1", default-features = false, features = ["hf-hub-rustls-tls"] }
 # PR-Z1 fix : ort-sys rc.12 (private mirror) utilise ureq v3 mais le proxy upstream sert ureq v2.
 # Forcer ort-sys =2.0.0-rc.9 (ureq ^2.1 compatible) comme dep directe de gradatum-embed
 # pour contraindre Cargo à choisir rc.9 plutôt que le rc.12 résolu via ^rc.9 d'ort.
 ort-sys     = { version = "=2.0.0-rc.9" }
-
-# UTF-8 decoder — requis par gen.rs FFI (token_to_piece via llama-cpp-2)
-encoding_rs = "=0.8.35"
 
 # Config loading (server config figment — T1)
 figment     = { version = "=0.10.19", features = ["toml", "env"] }
@@ -180,13 +209,13 @@ tracing             = "=0.1.44"
 tracing-subscriber  = { version = "=0.3.23", features = ["env-filter", "json"] }
 
 # Utilities
-clap        = { version = "=4.6.1", features = ["derive"] }
+clap        = { version = "=4.6.2", features = ["derive"] }
 walkdir     = "=2.5.0"
-regex       = "=1.12.3"
+regex       = "=1.13.1"
 once_cell   = "=1.21.4"
-globset     = "=0.4.18"
+globset     = "=0.4.19"
 strsim      = "=0.11.1"
-unicode-segmentation = "=1.13.2"
+unicode-segmentation = "=1.13.3"
 
 # Stability annotations (AM1 — storage-traits unstable tags Étape 0.1+)
 # Version 0.2.1 — MSRV 1.60, compatible MSRV workspace 1.85.
@@ -195,7 +224,7 @@ stability   = "0.2"
 # Secrets — zeroize-on-drop pour les credentials LLM (backends P2.0b)
 secrecy     = "=0.10.3"
 subtle      = "2"
-zeroize     = { version = "=1.8.2", features = ["derive"] }
+zeroize     = { version = "=1.9.0", features = ["derive"] }
 
 # Crypto / auth
 argon2      = "=0.5.3"
@@ -207,46 +236,46 @@ jsonwebtoken  = { version = "=9.3.1", default-features = false }
 pkcs8         = "=0.10.2"
 
 # UNIX syscalls (statfs NFS check — caveat C11; signal: SIGTERM smoke test)
-nix         = { version = "=0.31.2", features = ["fs", "signal", "process"] }
+nix         = { version = "=0.31.3", features = ["fs", "signal", "process"] }
 
 # Tests
 tempfile    = "=3.27.0"
 proptest    = "=1.11.0"
-serde_test  = "=1.0.171"
+serde_test  = "=1.0.177"
 wiremock    = "=0.6.5"
-mockito     = "=1.6.1"
-futures     = "=0.3.32"
-insta       = { version = "=1.42.2", features = ["json"] }
+mockito     = "=1.7.2"
+futures     = "=0.3.33"
+insta       = { version = "=1.48.0", features = ["json"] }
 
 # Bench
-criterion   = "=0.5.1"
+criterion   = "=0.8.2"
 
 # Cross-crate — version= obligatoire pour cargo publish (crates.io refuse les path-only)
 # Toutes ces crates héritent `version.workspace = true` : la valeur déclarée ici doit
 # rester alignée sur `workspace.package.version`.
-gradatum = { path = "crates/gradatum", version = "1.0.0" }
-gradatum-dto = { path = "crates/gradatum-dto", version = "1.0.0" }
-gradatum-warden = { path = "crates/gradatum-warden", version = "1.0.0" }
-schemars = { version = "=1.0.4", features = ["derive"] }
-gradatum-acl-auth = { path = "crates/gradatum-acl-auth", version = "1.0.0" }
-gradatum-acl-policy = { path = "crates/gradatum-acl-policy", version = "1.0.0" }
-gradatum-auth = { path = "crates/gradatum-auth", version = "1.0.0" }
-gradatum-cache = { path = "crates/gradatum-cache", version = "1.0.0" }
-gradatum-chat = { path = "crates/gradatum-chat", version = "1.0.0" }
-gradatum-core = { path = "crates/gradatum-core", version = "1.0.0" }
-gradatum-curator = { path = "crates/gradatum-curator", version = "1.0.0" }
-gradatum-embed = { path = "crates/gradatum-embed", version = "1.0.0" }
-gradatum-engine = { path = "crates/gradatum-engine", version = "1.0.0" }
-gradatum-index = { path = "crates/gradatum-index", version = "1.0.0" }
-gradatum-markdown = { path = "crates/gradatum-markdown", version = "1.0.0" }
-gradatum-queue = { path = "crates/gradatum-queue", version = "1.0.0" }
-gradatum-search = { path = "crates/gradatum-search", version = "1.0.0" }
-gradatum-sdk-rs = { path = "crates/gradatum-sdk-rs", version = "1.0.0" }
-gradatum-storage = { path = "crates/gradatum-storage", version = "1.0.0" }
-gradatum-vault = { path = "crates/gradatum-vault", version = "1.0.0" }
-gradatum-worker = { path = "crates/gradatum-worker", version = "1.0.0" }
-gradatum-db-sqlite = { path = "crates/gradatum-db-sqlite", version = "1.0.0" }
-gradatum-gateway = { path = "crates/gradatum-gateway", version = "1.0.0" }
+gradatum = { path = "crates/gradatum", version = "2.0.0" }
+gradatum-dto = { path = "crates/gradatum-dto", version = "2.0.0" }
+gradatum-warden = { path = "crates/gradatum-warden", version = "2.0.0" }
+schemars = { version = "=1.2.1", features = ["derive"] }
+gradatum-acl-auth = { path = "crates/gradatum-acl-auth", version = "2.0.0" }
+gradatum-acl-policy = { path = "crates/gradatum-acl-policy", version = "2.0.0" }
+gradatum-auth = { path = "crates/gradatum-auth", version = "2.0.0" }
+gradatum-cache = { path = "crates/gradatum-cache", version = "2.0.0" }
+gradatum-chat = { path = "crates/gradatum-chat", version = "2.0.0" }
+gradatum-core = { path = "crates/gradatum-core", version = "2.0.0" }
+gradatum-curator = { path = "crates/gradatum-curator", version = "2.0.0" }
+gradatum-embed = { path = "crates/gradatum-embed", version = "2.0.0" }
+gradatum-engine = { path = "crates/gradatum-engine", version = "2.0.0" }
+gradatum-index = { path = "crates/gradatum-index", version = "2.0.0" }
+gradatum-markdown = { path = "crates/gradatum-markdown", version = "2.0.0" }
+gradatum-queue = { path = "crates/gradatum-queue", version = "2.0.0" }
+gradatum-search = { path = "crates/gradatum-search", version = "2.0.0" }
+gradatum-sdk-rs = { path = "crates/gradatum-sdk-rs", version = "2.0.0" }
+gradatum-storage = { path = "crates/gradatum-storage", version = "2.0.0" }
+gradatum-vault = { path = "crates/gradatum-vault", version = "2.0.0" }
+gradatum-worker = { path = "crates/gradatum-worker", version = "2.0.0" }
+gradatum-db-sqlite = { path = "crates/gradatum-db-sqlite", version = "2.0.0" }
+gradatum-gateway = { path = "crates/gradatum-gateway", version = "2.0.0" }
 
 [profile.release]
 opt-level = 3

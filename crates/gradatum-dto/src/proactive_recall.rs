@@ -24,8 +24,9 @@ use gradatum_core::scope::TenantId;
 /// `#[serde(deny_unknown_fields)]` rejects unrecognised fields — forward-compat
 /// discipline: consumers must stay within the declared contract.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ProactiveRecallRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -100,6 +101,7 @@ pub struct ProactiveRecallResponse {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ProactiveRecallFeedbackRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -113,6 +115,19 @@ pub struct ProactiveRecallFeedbackRequest {
     /// Must be a subset of the ULIDs present in the corresponding
     /// [`ProactiveRecallResponse::items`]. An empty vec is valid (no note accepted).
     pub accepted_ulids: Vec<String>,
+}
+
+impl ProactiveRecallFeedbackRequest {
+    /// Constructs a feedback request correlating `accepted_ulids` with a prior
+    /// `recall_id`; `tenant_id` defaults to `None`. An empty `accepted_ulids` is valid.
+    #[must_use]
+    pub fn new(recall_id: String, accepted_ulids: Vec<String>) -> Self {
+        Self {
+            tenant_id: None,
+            recall_id,
+            accepted_ulids,
+        }
+    }
 }
 
 #[cfg(test)]

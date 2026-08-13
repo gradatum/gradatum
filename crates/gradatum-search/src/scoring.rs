@@ -33,7 +33,7 @@
 //! ### Controlled activation
 //! The trust multiplier is **disableable** via a global flag (`trust_decay_enabled`).
 //! Flag OFF ⇒ `composite_score_with_trust` returns **exactly** `composite_score`
-//! (bit-identical scores to v0.4.3) — non-regression guarantee.
+//! (bit-identical to the pre-trust-factor scores) — non-regression guarantee.
 
 /// Temporal recency decay factor.
 ///
@@ -105,10 +105,10 @@ pub const GAMMA_TRUST: f64 = 0.15;
 /// Runtime trust-decay configuration resolved for scoring.
 ///
 /// Built from server config; consumed by search handlers.
-/// `enabled = false` ⇒ scoring applies no trust factor (v0.4.3 scores).
+/// `enabled = false` ⇒ scoring applies no trust factor (pre-trust-factor scores).
 #[derive(Debug, Clone)]
 pub struct TrustDecayConfig {
-    /// Enables the trust multiplier. `false` = v0.4.3 non-regression mode.
+    /// Enables the trust multiplier. `false` = pre-trust-factor non-regression mode.
     pub enabled: bool,
     /// Half-lives (days) per provenance. Absent provenance = no decay (`None`).
     pub half_life_days: std::collections::HashMap<String, f64>,
@@ -153,7 +153,7 @@ impl TrustDecayConfig {
     ///
     /// Returns `Some((trust, age_days, half_life))` when decay is enabled and
     /// trust is present; otherwise `None` (causing `composite_score_with_trust`
-    /// to neutralise the trust factor → v0.4.3 score).
+    /// to neutralise the trust factor → pre-trust-factor score).
     ///
     /// - `half_life` = `Some(h)` if provenance is in the map; `None` otherwise
     ///   (no decay — non-perishable provenance, e.g. `human-decision`).
@@ -337,12 +337,12 @@ pub fn composite_score_weighted(
 ///
 /// When `trust_params = None`, returns **exactly** the same value as [`composite_score`]
 /// (trust factor = `1.0`, no additional floating-point operation) — bit-identical
-/// scores to v0.4.3. This is the disable lever (`trust_decay_enabled = false`).
+/// to the pre-trust-factor scores. This is the disable lever (`trust_decay_enabled = false`).
 ///
 /// # Parameters
 /// - `rrf_score`, `recency`, `pagerank`: identical to [`composite_score`].
 /// - `trust_params`: `Some((trust, age_days, half_life_days))` to apply decay,
-///   `None` to neutralise (v0.4.3 behaviour).
+///   `None` to neutralise (pre-trust-factor behaviour).
 #[must_use]
 pub fn composite_score_with_trust(
     rrf_score: f64,

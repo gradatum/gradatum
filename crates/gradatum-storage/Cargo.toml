@@ -6,18 +6,30 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Storage trait + OpenDAL backends + NFS reject guard"
+description = "Storage trait + OpenDAL backends (local filesystem, S3 object storage)"
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Ne jamais empaqueter les tests d'intégration : ils ne compilent pas chez le
+# consommateur, alourdissent le package et sont un vecteur récurrent de fuite
+# (marqueurs PII/fixtures). Cf. bloquant publish v1.0.0.
+exclude = ["tests/**"]
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "1.0.0" }
+gradatum-core = { path = "../gradatum-core", version = "2.0.0" }
 async-trait   = { workspace = true }
 opendal       = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { workspace = true }
 tracing       = { workspace = true }
+
+# Backends objet uniquement (feature interne `cloud-http`). Tirés opt-in :
+# - opendal-http-transport-reqwest : le transport HTTP à installer au démarrage (0.58).
+# - rustls (aws_lc_rs) : le fournisseur crypto process-default que le transport
+#   `rustls-no-provider` consomme. Installé AVANT le transport par
+#   `install_object_backend_defaults`.
+opendal-http-transport-reqwest = { workspace = true, optional = true }
+rustls        = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix           = { workspace = true }
@@ -32,7 +44,10 @@ tokio         = { workspace = true, features = ["full"] }
 # Activer les backends cloud via features opt-in (C12 — design spec P2.0).
 default   = ["fs"]
 fs        = ["opendal/services-fs"]
-s3        = ["opendal/services-s3"]
-gcs       = ["opendal/services-gcs"]
-azure     = ["opendal/services-azblob"]
+s3        = ["opendal/services-s3", "cloud-http"]
+gcs       = ["opendal/services-gcs", "cloud-http"]
+azure     = ["opendal/services-azblob", "cloud-http"]
 all-cloud = ["s3", "gcs", "azure"]
+# Feature interne : transport HTTP + fournisseur crypto requis par TOUT backend objet
+# (S3/GCS/Azure passent par HTTP). Activée transitivement par s3/gcs/azure, jamais seule.
+cloud-http = ["dep:opendal-http-transport-reqwest", "dep:rustls"]

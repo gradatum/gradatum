@@ -81,7 +81,7 @@ fn curate_job_vault_write(prealloc: Ulid, body: &str, tenant_id: &str) -> Gradat
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Curate(CurateSpec {
                     note_id: prealloc,
@@ -138,7 +138,7 @@ async fn handle_curate_vault_write_honors_prealloc_note_id() {
     let queue: Arc<dyn gradatum_core::QueueStore + Send + Sync> = Arc::clone(&store) as _;
     let curator = Arc::new(gradatum_curator::CuratorPipeline::new());
 
-    let prealloc = Ulid::new();
+    let prealloc = Ulid::generate();
     let job = curate_job_vault_write(
         prealloc,
         "## Titre\nbody suffisant pour le curator.",

@@ -22,8 +22,8 @@ use serde::Serialize;
 // ── Re-exports depuis gradatum-dto (single source of truth) ───────────────────
 pub use gradatum_dto::{
     CreateFeatureCardRequest, CreateFeatureCardResponse, SessionTraceRequest, SessionTraceResponse,
-    VaultClassifyRequest, VaultClassifyResponse, VaultContextRequest, VaultDowngradeRequest,
-    VaultGraphRequest, VaultLinksRequest, VaultListRequest, VaultReadRequest, VaultSearchRequest,
+    VaultClassifyRequest, VaultClassifyResponse, VaultContextRequest, VaultGraphRequest,
+    VaultLinksRequest, VaultListRequest, VaultReadRequest, VaultSearchRequest,
     VaultTimelineRequest, VaultTraceRequest, VaultWriteRequest,
 };
 
@@ -81,7 +81,7 @@ pub struct ScoreBreakdown {
 /// unique within a vault, so a hit is only unambiguous once both are read.
 ///
 /// `#[non_exhaustive]`: this is a response type, produced by the server and never
-/// constructed by a consumer, so further fields can be added within the `1.x` line
+/// constructed by a consumer, so further fields can be added within the `2.x` line
 /// without a major bump. Downstream code reads it — including through
 /// `serde_json` — which the attribute leaves untouched; only literal construction
 /// and exhaustive destructuring from another crate are forbidden.
@@ -434,20 +434,9 @@ pub struct TagEntry {
 
 // ── DTOs write (P2.0b — async 202 enqueue pattern) ────────────────────────────
 
-/// 202 Accepted response — job enqueued (legacy queue, integer SQLite job ID).
-#[derive(Debug, Serialize)]
-pub struct EnqueuedResponse {
-    /// Job identifier in the legacy queue (auto-incremented SQLite integer).
-    pub job_id: i64,
-    /// Immediate status (`"queued"`).
-    pub status: &'static str,
-    /// Poll URL to track job status (`/api/v1/jobs/<id>`).
-    pub poll_url: String,
-}
-
 /// 202 Accepted response — job enqueued via `gradatum_jobs` (ULID string job ID).
 ///
-/// Used by handlers bridged to `state.job_store`. Unlike [`EnqueuedResponse`],
+/// Used by handlers bridged to `state.job_store`. Contrairement au format hérité retiré avec l'ancienne file,
 /// the `job_id` is a 26-character alphanumeric ULID.
 ///
 /// The `note_id` field is the ULID pre-allocated at enqueue time — it can be used

@@ -159,7 +159,7 @@ mod tests {
         let idx = SqliteIndex::open_in_memory()
             .await
             .expect("open_in_memory ne doit pas échouer");
-        let ulid = Ulid::new();
+        let ulid = Ulid::generate();
 
         // Upsert d'un redirect
         idx.upsert_redirect("main", "ancien-titre", &ulid, 1_700_000_000_000)
@@ -187,8 +187,8 @@ mod tests {
         let idx = SqliteIndex::open_in_memory()
             .await
             .expect("open_in_memory ne doit pas échouer");
-        let ulid1 = Ulid::new();
-        let ulid2 = Ulid::new();
+        let ulid1 = Ulid::generate();
+        let ulid2 = Ulid::generate();
 
         idx.upsert_redirect("main", "titre-a", &ulid1, 1_000)
             .await

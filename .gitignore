@@ -3,6 +3,10 @@ target/
 **/*.rs.bk
 **/Cargo.lock.bak
 
+# Local inference model weights — multi-GB, fetched via scripts/fetch-models.sh
+# (pinned HF revision + sha256). NEVER committed; the compose bind-mounts them.
+/models/
+
 # IDE
 .vscode/
 .idea/

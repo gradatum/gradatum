@@ -48,6 +48,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::ProtocolVersion,
@@ -989,10 +990,57 @@ fn tool_def_no_params(name: &'static str, description: &'static str) -> Tool {
     Tool::new(name, description, gradatum_dto::mcp_empty_params_schema())
 }
 
+// ── CLI ─────────────────────────────────────────────────────────────────────
+
+/// Chaîne rendue par `--version` : la version sémantique **suivie du SHA du commit
+/// de build**.
+///
+/// Le format est stable et garanti extractible par script :
+/// `gradatum-mcp-stub <semver> (build_sha <sha>)` — clap préfixe le nom du binaire,
+/// le reste vient de cette constante. Identique aux 5 autres binaires du workspace
+/// (`gradatum-server`, `gradatum-worker`, `gradatum-gateway`, `gradatum-engine`,
+/// `gradatum-admin`).
+///
+/// `<sha>` est injecté au compile-time par `build.rs` (`cargo:rustc-env=BUILD_SHA`).
+/// Il vaut `unknown` si le SHA n'a pas pu être résolu (pas de `.git`, build depuis un
+/// tarball) — un fallback porté par `build.rs`, qui n'échoue jamais. `env!` est donc
+/// toujours résolvable ici, `build.rs` émettant la variable inconditionnellement.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (build_sha ",
+    env!("BUILD_SHA"),
+    ")"
+);
+
+/// Arguments CLI de `gradatum-mcp-stub`.
+///
+/// Le stub ne prend aucun argument fonctionnel : toute sa configuration passe par
+/// les variables d'environnement (`GRADATUM_SERVER_URL`, `GRADATUM_API_KEY_FILE`,
+/// `GRADATUM_BEARER_TOKEN`). Cette structure n'existe que pour offrir `--version` et
+/// `--help` — traités par clap **avant** toute résolution d'environnement, donc sans
+/// exiger la moindre clé (correctif : `--version` échouait auparavant sur
+/// `StubHandler::from_env`, l'init environnement précédant le traitement des args).
+#[derive(Parser, Debug)]
+#[command(
+    version = VERSION,
+    about = "gradatum-mcp-stub — MCP stdio → HTTP adapter for gradatum-server (thin proxy)",
+    long_about = "MCP stdio → HTTP bridge for gradatum-server.\n\n\
+        No functional arguments: configuration is passed through the environment.\n  \
+        GRADATUM_SERVER_URL    server base URL (default http://127.0.0.1:19090)\n  \
+        GRADATUM_API_KEY_FILE  chmod-600 file holding 'ak_...' (auto-refresh mode, recommended)\n  \
+        GRADATUM_BEARER_TOKEN  static JWT (legacy mode, no refresh)"
+)]
+struct Cli {}
+
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Traitement des arguments AVANT toute résolution d'environnement : `--version`
+    // et `--help` répondent puis sortent (clap, exit 0) sans exiger GRADATUM_*.
+    // C'est le correctif : `from_env()` ne doit jamais être atteint pour ces flags.
+    let Cli {} = Cli::parse();
+
     // Initialisation tracing vers stderr (stdout est réservé au protocole MCP stdio).
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -1040,6 +1088,29 @@ mod tests {
     #[test]
     fn version_is_set() {
         assert!(!env!("CARGO_PKG_VERSION").is_empty());
+    }
+
+    /// La constante `--version` porte la version sémantique PUIS le SHA de build,
+    /// dans le format exact partagé par les autres binaires du workspace :
+    /// `<semver> (build_sha <sha>)`. clap y préfixe le nom du binaire.
+    ///
+    /// Le SHA n'est PAS asserté à une valeur précise (il change à chaque commit et
+    /// vaut `unknown` hors dépôt git) — seule la FORME est une propriété stable et
+    /// extractible par script.
+    #[test]
+    fn version_string_carries_build_sha() {
+        assert!(
+            VERSION.starts_with(env!("CARGO_PKG_VERSION")),
+            "VERSION doit commencer par la version du paquet, trouvé : {VERSION:?}"
+        );
+        assert!(
+            VERSION.contains(" (build_sha "),
+            "VERSION doit contenir le segment ' (build_sha ', trouvé : {VERSION:?}"
+        );
+        assert!(
+            VERSION.ends_with(')'),
+            "VERSION doit se terminer par ')', trouvé : {VERSION:?}"
+        );
     }
 
     #[test]

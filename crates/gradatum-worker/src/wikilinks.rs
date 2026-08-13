@@ -2,7 +2,6 @@
 //!
 //! This module exposes [`resolve_wikilinks_via_client`], used by:
 //! - [`crate::apalis_handlers::handle_curate`] (both `Admitted` and `Pending` branches)
-//! - [`crate::dispatch::Dispatcher`] (integration-test compatibility)
 //!
 //! ## ULID-first resolution strategy
 //!
@@ -41,6 +40,24 @@ use crate::internal_client::InternalClient;
 /// protecting the `/internal` server from overload.
 const WIKILINK_RESOLVE_MAX_IN_FLIGHT: usize = 8;
 
+/// Outcome of resolving a note body's wikilinks into `note_links` edges.
+///
+/// F-147 — `complete` gates the *authoritative* edge replacement on the persist path.
+/// It is `true` only when **every** extracted wikilink reached a definitive verdict:
+/// resolved to an edge, mapped to a reserved synthetic node, or confirmed to have no
+/// live target (`Ok(None)`). A *transient* lookup failure (`Err`) or a resolver task
+/// panic sets it to `false` — the returned list may then be missing an otherwise-valid
+/// edge, so the caller MUST NOT claim link authority (`links_authoritative`), which
+/// would let the authoritative DELETE drop a valid edge. Under `complete == false` the
+/// persist path degrades to the non-destructive upsert and no edge is ever removed.
+pub struct ResolvedLinks {
+    /// Resolved `(src → dst)` edges, ready for `PersistCuratedRequest.links`.
+    pub links: Vec<LinkDto>,
+    /// `true` iff resolution was exhaustive (see type-level docs). Maps directly to
+    /// `PersistCuratedRequest.links_authoritative`.
+    pub complete: bool,
+}
+
 /// Extracts `[[...]]` wikilinks from `body`, resolves them via `client`,
 /// and returns a `Vec<LinkDto>` for inclusion in `PersistCuratedRequest.links`.
 ///
@@ -68,10 +85,15 @@ pub async fn resolve_wikilinks_via_client(
     tenant_id: &str,
     src_note_id: &str,
     body: &str,
-) -> Vec<LinkDto> {
+) -> ResolvedLinks {
     let wikilinks = gradatum_curator::wikilinks::extract_wikilinks(body);
     if wikilinks.is_empty() {
-        return vec![];
+        // Corps sans aucun wikilink : jeu sortant vide ET définitif — autoritatif, pour que
+        // le persist puisse nettoyer d'éventuelles arêtes périmées d'un corps antérieur.
+        return ResolvedLinks {
+            links: vec![],
+            complete: true,
+        };
     }
 
     let mut resolved_links = Vec::with_capacity(wikilinks.len());
@@ -103,10 +125,21 @@ pub async fn resolve_wikilinks_via_client(
         })
         .collect();
 
-    // Si tous les wikilinks étaient des nœuds réservés, rien à résoudre côté réseau.
+    // Si tous les wikilinks étaient des nœuds réservés, rien à résoudre côté réseau —
+    // résolution intégralement déterministe, donc complète.
     if to_resolve.is_empty() {
-        return resolved_links;
+        return ResolvedLinks {
+            links: resolved_links,
+            complete: true,
+        };
     }
+
+    // F-147 : suit la complétude. Un lookup en échec (Err) ou une tâche paniquée rend la
+    // liste potentiellement incomplète → non-autoritatif (aucune suppression côté persist).
+    // Un `Ok(None)` (cible absente/non-live) est un verdict DÉFINITIF « pas d'arête » et ne
+    // dégrade PAS la complétude — sinon une cible durablement absente bloquerait à jamais le
+    // nettoyage des arêtes périmées.
+    let mut complete = true;
 
     // Borne la concurrence : au plus WIKILINK_RESOLVE_MAX_IN_FLIGHT requêtes en vol.
     let sem = Arc::new(Semaphore::new(WIKILINK_RESOLVE_MAX_IN_FLIGHT));
@@ -162,19 +195,26 @@ pub async fn resolve_wikilinks_via_client(
                 );
             }
             Ok((target, Err(e))) => {
+                // Échec transitoire : la liste peut manquer une arête valide → non-autoritatif.
+                complete = false;
                 tracing::warn!(
                     err = %e,
                     target = %target,
-                    "B5 lookup failed — wikilink skipped (non-fatal)"
+                    "B5 lookup failed — wikilink skipped (non-fatal, links non-authoritative)"
                 );
             }
             Err(e) => {
+                // Tâche paniquée : idem, complétude non garantie.
+                complete = false;
                 tracing::warn!(err = %e, "B5 title_lookup task panicked — wikilink skipped");
             }
         }
     }
 
-    resolved_links
+    ResolvedLinks {
+        links: resolved_links,
+        complete,
+    }
 }
 
 #[cfg(test)]
@@ -377,13 +417,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let links = resolve_wikilinks_via_client(&client, "main", "src-note-id", &body).await;
+        let resolved = resolve_wikilinks_via_client(&client, "main", "src-note-id", &body).await;
 
-        // Tous les liens doivent être résolus (résolution totale).
+        // Tous les liens doivent être résolus (résolution totale) → complète.
         assert_eq!(
-            links.len(),
+            resolved.links.len(),
             n_links,
             "tous les {n_links} wikilinks doivent être résolus",
+        );
+        assert!(
+            resolved.complete,
+            "tous les lookups réussissent (Ok(Some)) → résolution complète"
         );
 
         // Le pic de concurrence ne doit pas dépasser la limite.
@@ -415,12 +459,20 @@ mod tests {
             "[[project:gradatum]] [[status:DONE]] [[version:gradatum/0.6.1]] [[decisions:{dep_ulid}]]"
         );
 
-        let links = resolve_wikilinks_via_client(&client, "main", "src-note", &body).await;
+        let resolved = resolve_wikilinks_via_client(&client, "main", "src-note", &body).await;
 
         // 4 arêtes au total (3 réservées + 1 dépendance).
-        assert_eq!(links.len(), 4, "3 nœuds réservés + 1 dépendance ULID");
+        assert_eq!(
+            resolved.links.len(),
+            4,
+            "3 nœuds réservés + 1 dépendance ULID"
+        );
+        assert!(
+            resolved.complete,
+            "3 nœuds réservés (déterministes) + 1 id_lookup Ok(Some) → complète"
+        );
 
-        let dsts: Vec<&str> = links.iter().map(|l| l.dst.as_str()).collect();
+        let dsts: Vec<&str> = resolved.links.iter().map(|l| l.dst.as_str()).collect();
         assert!(dsts.contains(&"project:gradatum"), "arête project réservée");
         assert!(dsts.contains(&"status:DONE"), "arête status réservée");
         assert!(
@@ -458,12 +510,14 @@ mod tests {
         });
 
         // "status:done" (minuscule) n'est pas un nœud réservé → flux titre.
-        let links = resolve_wikilinks_via_client(&client, "main", "src", "[[status:done]]").await;
+        let resolved =
+            resolve_wikilinks_via_client(&client, "main", "src", "[[status:done]]").await;
 
         assert_eq!(title_lookup_calls.load(Ordering::SeqCst), 1);
         assert_eq!(id_lookup_calls.load(Ordering::SeqCst), 0);
         // Le mock title_lookup renvoie un id fictif → 1 arête (pas un nœud réservé).
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].dst, "id-status:done");
+        assert_eq!(resolved.links.len(), 1);
+        assert_eq!(resolved.links[0].dst, "id-status:done");
+        assert!(resolved.complete, "title_lookup Ok(Some) → complète");
     }
 }

@@ -2,7 +2,7 @@
 
 > LLM-powered note curation: heuristic-first section routing with an optional LLM review for low-confidence notes.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -33,12 +33,13 @@ CuratorPipeline::process(note) → CurateOutcome
           → LLM classify → Admitted { section, tags } | Pending | Rejected
 ```
 
-In `1.0.0`, `process` runs section routing plus the optional LLM review only. The
+As of `2.0.0`, `process` runs section routing plus the optional LLM review only. The
 `CuratorDecisions` fields `novelty`, `wikilinks`, and `dedup` always hold fixed defaults
 (`Admitted` / `[]` / `Unique`); `tags` are populated only by the LLM review. Novelty
 detection (SHA-256 + MinHash), TF-IDF tagging, wikilink scoring (Jaro-Winkler), and
-semantic deduplication (cosine over embeddings) are **planned for a post-1.0 release** and
-are not wired into `process`.
+semantic deduplication (cosine over embeddings) are **provided as standalone detectors
+(`novelty`, `dedup` modules) but not wired into `process`** — no release currently
+integrates them into the pipeline.
 
 Routing runs offline: no network call is made unless the optional LLM review is enabled.
 
@@ -46,7 +47,7 @@ Routing runs offline: no network call is made unless the optional LLM review is 
 
 ```toml
 [dependencies]
-gradatum-curator = "1.0.0"
+gradatum-curator = "2.0.0"
 ```
 
 ```rust

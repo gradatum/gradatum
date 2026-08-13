@@ -29,6 +29,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{Router, middleware};
+use gradatum_acl_auth::IDENTITY_WRITE_SCOPE;
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::{JwtService, TokenScope};
 use gradatum_core::index::Index;
@@ -44,8 +45,11 @@ use ulid::Ulid;
 
 // ── Preset ACL ───────────────────────────────────────────────────────────────
 
-/// ACL de test : main-agent et frontend ont tous deux accès Write sur `main/**`.
-/// La garde write-restrictive identity (task 3) différencie les deux, pas l'ACL.
+/// ACL de test : toutes les identités ont accès Read/Write sur `main/**`.
+/// La garde d'âme identity (v2.0.0) discrimine par le **scope** `identity_write`, pas l'ACL :
+/// - `main-agent` et `soul-writer` portent `identity_write` → privilégiés sur toute âme ;
+/// - `frontend` et `admin-only` ne le portent pas → limités à leur propre âme (même
+///   `admin-only`, qui porte pourtant le scope `admin`, reste refusé sur une âme étrangère).
 const TEST_ACL: &str = r#"
 [[consumer]]
 identity = "main-agent"
@@ -59,6 +63,16 @@ write_patterns = ["**"]
 
 [[consumer]]
 identity = "test-identity"
+read_patterns  = ["**"]
+write_patterns = ["**"]
+
+[[consumer]]
+identity = "soul-writer"
+read_patterns  = ["**"]
+write_patterns = ["**"]
+
+[[consumer]]
+identity = "admin-only"
 read_patterns  = ["**"]
 write_patterns = ["**"]
 "#;
@@ -81,7 +95,8 @@ Tu es le Général en Chef. Ton: direct, FR.
 // ── Middlewares d'injection de TrustContext ───────────────────────────────────
 
 /// Injecte `TrustContext` pour `main-agent` (sub="main-agent", tenant="main").
-/// Owner privilégié SSI — autorisé à écrire toute âme.
+/// Porte le scope `identity_write` → privilégié : autorisé à écrire toute âme (v2.0.0, le
+/// privilège vient du SCOPE, plus du nom d'identité).
 async fn inject_main_agent(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -90,7 +105,51 @@ async fn inject_main_agent(
         kid: "test-kid".to_string(),
         aud: "gradatum".to_string(),
         sub: "main-agent".into(),
-        scopes: vec!["read".to_string(), "write".to_string()],
+        scopes: vec![
+            "read".to_string(),
+            "write".to_string(),
+            IDENTITY_WRITE_SCOPE.to_string(),
+        ],
+        tenant_id: "main".into(),
+        jti: None,
+    });
+    next.run(req).await
+}
+
+/// Injecte `TrustContext` pour `soul-writer` (sub distinct de `main-agent`) PORTANT le scope
+/// `identity_write`. Prouve que le privilège d'âme suit le SCOPE, pas le nom : ce sujet n'est
+/// pas `main-agent` mais peut néanmoins écrire une âme étrangère.
+async fn inject_soul_writer(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    req.extensions_mut().insert(TrustContext::BearerToken {
+        kid: "test-kid".to_string(),
+        aud: "gradatum".to_string(),
+        sub: "soul-writer".into(),
+        scopes: vec![
+            "read".to_string(),
+            "write".to_string(),
+            IDENTITY_WRITE_SCOPE.to_string(),
+        ],
+        tenant_id: "main".into(),
+        jti: None,
+    });
+    next.run(req).await
+}
+
+/// Injecte `TrustContext` pour `admin-only` : porte le scope `admin` (donc Write ACL) mais
+/// PAS `identity_write`. Prouve la séparation des scopes : `admin` n'ouvre pas l'écriture des
+/// âmes étrangères (exigence de la revue de sécurité).
+async fn inject_admin_only(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    req.extensions_mut().insert(TrustContext::BearerToken {
+        kid: "test-kid".to_string(),
+        aud: "gradatum".to_string(),
+        sub: "admin-only".into(),
+        scopes: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
         tenant_id: "main".into(),
         jti: None,
     });
@@ -182,6 +241,26 @@ async fn app_frontend() -> Router {
         .with_state(state)
 }
 
+/// App avec TrustContext `soul-writer` (porteur du scope `identity_write`, sub ≠ main-agent).
+async fn app_soul_writer() -> Router {
+    let acl = AclEngine::from_preset_str(TEST_ACL).expect("preset ACL soul-writer");
+    let (state, _idx) = build_base(acl).await;
+    Router::new()
+        .nest("/api/v1", api_v1::router())
+        .layer(middleware::from_fn(inject_soul_writer))
+        .with_state(state)
+}
+
+/// App avec TrustContext `admin-only` (scope `admin`, SANS `identity_write`).
+async fn app_admin_only() -> Router {
+    let acl = AclEngine::from_preset_str(TEST_ACL).expect("preset ACL admin-only");
+    let (state, _idx) = build_base(acl).await;
+    Router::new()
+        .nest("/api/v1", api_v1::router())
+        .layer(middleware::from_fn(inject_admin_only))
+        .with_state(state)
+}
+
 /// App avec TrustContext `test-identity` pour le test forget.
 async fn app_test_identity() -> (Router, Arc<SqliteIndex>) {
     let acl = AclEngine::from_preset_str(TEST_ACL).expect("preset ACL test-identity");
@@ -231,7 +310,6 @@ async fn identity_write_bad_schema_rejected_400() {
         "title": "identity/main",
         "body": "## INVARIANTS\nINV-LANG | x\n## NARRATIVE\nn\n",
         "section_hint": "identity",
-        "author": "main-agent",
         "tenant_id": "main"
     });
     let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
@@ -242,8 +320,11 @@ async fn identity_write_bad_schema_rejected_400() {
     );
 }
 
-/// Soul valide écrite par main-agent sur identity/main → 202 enqueued.
+/// Soul valide écrite sur identity/main par un porteur du scope `identity_write` → 202.
 ///
+/// `main-agent` porte `identity_write` (harnais `inject_main_agent`) : il peut écrire une âme
+/// étrangère (`identity/main`, target `main` ≠ sub `main-agent`). L'author n'est PAS fourni
+/// par le corps (v2.0.0, task 10) — il dérive du sujet du credential.
 /// Vérifie que le chemin happy-path passe le validateur soul et atteint l'enqueue.
 ///
 /// # Note M3 — `doc_kind` not asserted here
@@ -266,14 +347,13 @@ async fn identity_write_good_schema_accepted_202() {
         "title": "identity/main",
         "body": GOOD_SOUL,
         "section_hint": "identity",
-        "author": "main-agent",
         "tenant_id": "main"
     });
     let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
     assert_eq!(
         status,
         StatusCode::ACCEPTED,
-        "soul valide écrite par main-agent doit retourner 202: {json}"
+        "soul valide écrite par un porteur d'identity_write doit retourner 202: {json}"
     );
     assert!(
         json["job_id"].is_string(),
@@ -281,10 +361,11 @@ async fn identity_write_good_schema_accepted_202() {
     );
 }
 
-/// Agent `frontend` tente d'écrire `identity/main` (âme de `main-agent`) → 403.
+/// Agent `frontend` (sans `identity_write`) tente d'écrire `identity/main` → 403.
 ///
-/// Prouve la write-restrictive ACL (C6) : caller_sub="frontend" != target_agent="main".
-/// L'agent privilégié `"main-agent"` est le seul à pouvoir écrire identity/main.
+/// Prouve la garde write-restrictive identity : caller_sub="frontend" ≠ target_agent="main",
+/// et `frontend` ne porte pas `identity_write` → refusé. Seul un porteur du scope peut écrire
+/// une âme étrangère.
 #[tokio::test]
 async fn identity_write_foreign_agent_denied_403() {
     let app = app_frontend().await;
@@ -292,7 +373,6 @@ async fn identity_write_foreign_agent_denied_403() {
         "title": "identity/main",
         "body": GOOD_SOUL,
         "section_hint": "identity",
-        "author": "frontend",
         "tenant_id": "main"
     });
     let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
@@ -313,7 +393,6 @@ async fn identity_write_no_section_hint_with_identity_title_rejected() {
     let body = serde_json::json!({
         "title": "identity/main-agent",
         "body": GOOD_SOUL,
-        "author": "frontend",
         "tenant_id": "main"
     });
     let (status, _json) = post_json(&app, "/api/v1/vault_write", body).await;
@@ -321,6 +400,206 @@ async fn identity_write_no_section_hint_with_identity_title_rejected() {
         status,
         StatusCode::BAD_REQUEST,
         "titre identity/ sans section_hint=identity doit être rejeté 400"
+    );
+}
+
+// ── Tests Task 13 (v2.0.0) — le privilège d'âme passe par le scope `identity_write` ──
+//
+// Ces tests prouvent que le privilège d'écriture/lecture d'une âme ÉTRANGÈRE suit le SCOPE
+// `identity_write`, et NON le nom d'identité (`main-agent`). Deux tests sont discriminants
+// (rouges avant le câblage de `has_scope`, verts après) : ils portent un sujet ≠ `main-agent`
+// mais le scope `identity_write`. Les autres sont des gardes de non-régression sécurité.
+
+/// DISCRIMINANT (test 1 du plan) : un porteur d'`identity_write` dont le sujet n'est PAS
+/// `main-agent` peut écrire une âme étrangère (`identity/main`) → 202.
+///
+/// Rouge avant task 13 (le code testait le nom `main-agent`, pas le scope) → GREEN après.
+#[tokio::test]
+async fn identity_write_scope_grants_foreign_soul_202() {
+    let app = app_soul_writer().await;
+    let body = serde_json::json!({
+        "title": "identity/main",
+        "body": GOOD_SOUL,
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "un porteur d'identity_write (sub='soul-writer' ≠ 'main-agent') doit écrire l'âme \
+         étrangère identity/main — attendu 202: {json}"
+    );
+}
+
+/// Garde de sécurité : un porteur du SEUL scope `admin` (sans
+/// `identity_write`) reste REFUSÉ sur une âme étrangère → 403.
+///
+/// Prouve la séparation stricte des scopes : `admin` ne fait pas hériter le droit d'écrire
+/// l'âme d'un autre agent. Vert avant ET après task 13 (regression guard).
+#[tokio::test]
+async fn identity_write_admin_scope_alone_denied_foreign_403() {
+    let app = app_admin_only().await;
+    let body = serde_json::json!({
+        "title": "identity/main",
+        "body": GOOD_SOUL,
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "le scope 'admin' seul ne doit PAS ouvrir l'écriture d'une âme étrangère — attendu 403: {json}"
+    );
+}
+
+/// Test 2 du plan : un agent SANS `identity_write` peut écrire sa PROPRE âme
+/// (`caller_sub == target_agent`) → 202. La propriété d'identité n'est jamais soumise au scope.
+#[tokio::test]
+async fn identity_write_own_soul_allowed_without_scope() {
+    let app = app_frontend().await;
+    let body = serde_json::json!({
+        "title": "identity/frontend",
+        "body": GOOD_SOUL,
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "frontend (sans identity_write) doit écrire SA PROPRE âme identity/frontend — attendu 202: {json}"
+    );
+}
+
+/// DISCRIMINANT (lecture) : un porteur d'`identity_write` dont le sujet n'est PAS `main-agent`
+/// peut lire une âme étrangère (`identity/main`) → 200.
+///
+/// Rouge avant task 13 (garde read basée sur le nom) → GREEN après.
+#[tokio::test]
+async fn identity_read_scope_grants_foreign_soul_200() {
+    let env = build_read_env().await;
+    let _ulid = seed_soul(&env, "main").await;
+
+    // `soul-writer` est déclaré à l'ACL (read `["**"]`) et n'est PAS `main-agent` : le seul
+    // discriminant restant est la garde identity (scope), pas l'ACL.
+    let token = sign_for_privileged(&env.state, "soul-writer");
+    let (status, json) = post_json_auth(
+        &env.app,
+        "/api/v1/vault_read",
+        &token,
+        serde_json::json!({
+            "path": "identity/main",
+            "section": "identity",
+            "tenant_id": "main"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "un porteur d'identity_write (sub='soul-writer' ≠ 'main-agent') doit lire l'âme \
+         étrangère identity/main — attendu 200: {json}"
+    );
+}
+
+/// Garde de sécurité (lecture) : le scope `admin` seul (sans `identity_write`) reste
+/// REFUSÉ en lecture d'une âme étrangère → 403.
+#[tokio::test]
+async fn identity_read_admin_scope_alone_denied_foreign_403() {
+    let env = build_read_env().await;
+    let _ulid = seed_soul(&env, "main").await;
+
+    let token = sign_for_admin_only(&env.state, "admin-only");
+    let (status, json) = post_json_auth(
+        &env.app,
+        "/api/v1/vault_read",
+        &token,
+        serde_json::json!({
+            "path": "identity/main",
+            "section": "identity",
+            "tenant_id": "main"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "le scope 'admin' seul ne doit PAS ouvrir la lecture d'une âme étrangère — attendu 403: {json}"
+    );
+}
+
+/// Test 4 du plan (recherche) : la visibilité des notes `identity` en recherche suit
+/// `identity_write`. Un porteur du scope (sub ≠ main-agent) LES VOIT ; un porteur du seul
+/// scope `admin` NE LES VOIT PAS. Le premier cas est discriminant (rouge avant task 13).
+#[tokio::test]
+async fn vault_search_identity_visibility_follows_identity_write_scope() {
+    let (app, idx, state) = build_search_env().await;
+
+    let id_identity = Ulid::generate().to_string();
+    let corpus = "gradatum soul invariant canary scope identitywrite discriminant";
+    idx.seed_note_with_fts(&id_identity, "identity", corpus)
+        .await
+        .expect("seed identity scope-follow");
+
+    let query = serde_json::json!({
+        "query": "soul invariant scope identitywrite discriminant",
+        "limit": 10,
+        "tenant_id": "main"
+    });
+    let has_identity = |json: &serde_json::Value| -> bool {
+        json["items"]
+            .as_array()
+            .map(|items| {
+                items.iter().any(|i| {
+                    i["path"]
+                        .as_str()
+                        .map(|p| p.starts_with("identity/"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    };
+
+    // (a) DISCRIMINANT : porteur d'identity_write, sub ≠ main-agent → VOIT l'identity.
+    // `soul-writer` est déclaré à l'ACL (read `["**"]`) et n'est PAS `main-agent`.
+    let token_priv = state
+        .jwt
+        .sign(
+            "soul-writer",
+            &["read".to_string(), IDENTITY_WRITE_SCOPE.to_string()],
+            TokenScope::Service,
+            "main",
+        )
+        .expect("jwt soul-writer search");
+    let (status, json) =
+        post_json_auth(&app, "/api/v1/vault_search", &token_priv, query.clone()).await;
+    assert_eq!(status, StatusCode::OK, "vault_search 200 (priv): {json}");
+    assert!(
+        has_identity(&json),
+        "un porteur d'identity_write (sub='soul-writer' ≠ 'main-agent') DOIT voir les notes identity: {json}"
+    );
+
+    // (b) GARDE : porteur du seul scope admin → NE VOIT PAS l'identity.
+    let token_admin = state
+        .jwt
+        .sign(
+            "admin-only",
+            &["read".to_string(), "admin".to_string()],
+            TokenScope::Service,
+            "main",
+        )
+        .expect("jwt admin-only search");
+    let (status, json) = post_json_auth(&app, "/api/v1/vault_search", &token_admin, query).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "vault_search 200 (admin-only): {json}"
+    );
+    assert!(
+        !has_identity(&json),
+        "le scope 'admin' seul ne doit PAS révéler les notes identity en search: {json}"
     );
 }
 
@@ -339,7 +618,7 @@ async fn identity_forget_blocked_protected() {
     let (app, idx) = app_test_identity().await;
 
     // Générer l'ULID de la note identity et la seeder dans l'index.
-    let identity_ulid = Ulid::new().to_string();
+    let identity_ulid = Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &identity_ulid,
         "identity",
@@ -446,11 +725,40 @@ async fn build_read_env() -> ReadEnv {
 }
 
 /// Signe un JWT `read`-scope pour le `sub` fourni, tenant `main`.
+/// Non privilégié pour les âmes : ne porte PAS `identity_write`.
 fn sign_for(state: &AppState, sub: &str) -> String {
     state
         .jwt
         .sign(sub, &["read".to_string()], TokenScope::Service, "main")
         .expect("sign JWT read-env")
+}
+
+/// Signe un JWT `read` + `identity_write` pour le `sub` fourni : PRIVILÉGIÉ sur toute âme
+/// (v2.0.0, le privilège vient du scope, pas du nom).
+fn sign_for_privileged(state: &AppState, sub: &str) -> String {
+    state
+        .jwt
+        .sign(
+            sub,
+            &["read".to_string(), IDENTITY_WRITE_SCOPE.to_string()],
+            TokenScope::Service,
+            "main",
+        )
+        .expect("sign JWT privileged read-env")
+}
+
+/// Signe un JWT `read` + `admin` (SANS `identity_write`) : prouve que le scope `admin` seul
+/// n'ouvre pas les âmes étrangères.
+fn sign_for_admin_only(state: &AppState, sub: &str) -> String {
+    state
+        .jwt
+        .sign(
+            sub,
+            &["read".to_string(), "admin".to_string()],
+            TokenScope::Service,
+            "main",
+        )
+        .expect("sign JWT admin-only read-env")
 }
 
 /// Seed une âme `identity/<agent>` lisible : écrit le fichier `.md` via
@@ -582,16 +890,18 @@ async fn identity_read_by_ulid_foreign_denied_403() {
     );
 }
 
-/// Chemins nominaux préservés : owner privilégié `main-agent` lit `identity/main`,
-/// et un agent lit sa propre âme → 200 dans les deux cas.
+/// Chemins nominaux préservés : un porteur du scope `identity_write` lit une âme étrangère
+/// (`identity/main`), et un agent sans ce scope lit sa **propre** âme → 200 dans les deux cas.
+/// Le second cas (test 5 du plan) prouve que « voir sa propre âme » reste une propriété
+/// d'identité (`caller_sub == agent`), jamais soumise au scope.
 #[tokio::test]
 async fn identity_read_own_and_owner_ok() {
     let env = build_read_env().await;
     let _ulid_main = seed_soul(&env, "main").await;
     let _ulid_frontend = seed_soul(&env, "frontend").await;
 
-    // (a) Owner privilégié `main-agent` lit identity/main (soul_instructions Task 6′).
-    let token_owner = sign_for(&env.state, "main-agent");
+    // (a) Porteur d'`identity_write` lit une âme étrangère (identity/main).
+    let token_owner = sign_for_privileged(&env.state, "main-agent");
     let (status, json) = post_json_auth(
         &env.app,
         "/api/v1/vault_read",
@@ -606,7 +916,7 @@ async fn identity_read_own_and_owner_ok() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "main-agent (owner privilégié) doit lire identity/main — attendu 200: {json}"
+        "porteur d'identity_write doit lire l'âme étrangère identity/main — attendu 200: {json}"
     );
 
     // (b) Un agent lit sa PROPRE âme.
@@ -652,7 +962,7 @@ async fn identity_soul_with_h1_resolvable_by_path() {
     let env = build_read_env().await;
     let _ulid = seed_soul(&env, "main").await; // body = "# identity/main\n{GOOD_SOUL}"
 
-    let token = sign_for(&env.state, "main-agent");
+    let token = sign_for_privileged(&env.state, "main-agent");
     let (status, json) = post_json_auth(
         &env.app,
         "/api/v1/vault_read",
@@ -747,7 +1057,7 @@ async fn identity_soul_without_h1_unreachable_by_path() {
     // passe 1 colonne title : aucune note (colonne vide) → Ok(None).
     // passe 2 LIKE H1 : aucun match (body commence par ## INVARIANTS) → Ok(None).
     // → resolve_redirect → Ok(None) → Storage("introuvable") → 404.
-    let token = sign_for(&env.state, "main-agent");
+    let token = sign_for_privileged(&env.state, "main-agent");
     let (status, json) = post_json_auth(
         &env.app,
         "/api/v1/vault_read",
@@ -774,8 +1084,9 @@ async fn identity_soul_without_h1_unreachable_by_path() {
 // possède une garde read-restrictive depuis Task 4 (F-34). Parité rétablie : filtrage
 // post-items dans `vault_search_impl` symétrique au guard vault_read_impl (~L671).
 //
-// Callers autorisés : TrustContext::Studio (admin) OU subject == SOUL_PRIVILEGED_WRITER.
-// Callers exclus    : tout autre BearerToken (agents non-privilégiés, ex: "frontend").
+// Callers autorisés : TrustContext::Studio (admin) OU porteur du scope `identity_write`.
+// Callers exclus    : tout autre BearerToken (agents non-privilégiés, ex: "frontend", et même
+//                     un porteur du seul scope `admin` sans `identity_write`).
 
 /// Construit un app JWT + index in-memory pour les tests de recherche identity.
 ///
@@ -808,8 +1119,8 @@ async fn vault_search_excludes_identity_for_non_privileged() {
     let (app, idx, state) = build_search_env().await;
 
     // Seed : une note identity + une note decisions (contrôle), même corpus lexical.
-    let id_identity = Ulid::new().to_string();
-    let id_decisions = Ulid::new().to_string();
+    let id_identity = Ulid::generate().to_string();
+    let id_decisions = Ulid::generate().to_string();
     let corpus = "gradatum soul invariant canary p1b";
     idx.seed_note_with_fts(&id_identity, "identity", corpus)
         .await
@@ -872,7 +1183,7 @@ async fn vault_search_excludes_identity_for_non_privileged() {
     );
 }
 
-/// vault_search : `main-agent` (SOUL_PRIVILEGED_WRITER) → voit les notes identity.
+/// vault_search : `main-agent` (porteur du scope `identity_write`) → voit les notes identity.
 ///
 /// Symétrique : le caller privilégié ne doit PAS être filtré. Ce test garantit
 /// que le post-filtre n'est pas un blackout total de la section identity mais
@@ -881,7 +1192,7 @@ async fn vault_search_excludes_identity_for_non_privileged() {
 async fn vault_search_allows_identity_for_main_agent() {
     let (app, idx, state) = build_search_env().await;
 
-    let id_identity = Ulid::new().to_string();
+    let id_identity = Ulid::generate().to_string();
     let corpus = "gradatum soul invariant canary p1b privileged mainagent";
     idx.seed_note_with_fts(&id_identity, "identity", corpus)
         .await
@@ -891,7 +1202,7 @@ async fn vault_search_allows_identity_for_main_agent() {
         .jwt
         .sign(
             "main-agent",
-            &["read".to_string()],
+            &["read".to_string(), IDENTITY_WRITE_SCOPE.to_string()],
             TokenScope::Service,
             "main",
         )
@@ -927,7 +1238,7 @@ async fn vault_search_allows_identity_for_main_agent() {
     });
     assert!(
         has_identity,
-        "P1-B : 'main-agent' (SOUL_PRIVILEGED_WRITER) DOIT voir les notes identity en search: {json}"
+        "P1-B : 'main-agent' (scope identity_write) DOIT voir les notes identity en search: {json}"
     );
 }
 
@@ -948,8 +1259,8 @@ async fn vault_search_allows_identity_for_main_agent() {
 async fn vault_search_excludes_identity_when_section_empty_non_privileged() {
     let (app, idx, state) = build_search_env().await;
 
-    let id_empty = Ulid::new().to_string();
-    let id_decisions = Ulid::new().to_string();
+    let id_empty = Ulid::generate().to_string();
+    let id_decisions = Ulid::generate().to_string();
     let corpus = "gradatum soul failclosed section vide p1b durci";
     // Note avec section="" simule un hit soul dont la section ne peut être déterminée.
     idx.seed_note_with_fts(&id_empty, "", corpus)
@@ -1013,7 +1324,7 @@ async fn vault_search_excludes_identity_when_section_empty_non_privileged() {
         .jwt
         .sign(
             "main-agent",
-            &["read".to_string()],
+            &["read".to_string(), IDENTITY_WRITE_SCOPE.to_string()],
             TokenScope::Service,
             "main",
         )
@@ -1165,7 +1476,7 @@ async fn vault_history_identity_privileged_ok() {
     let env = build_read_env().await;
     let ulid = seed_soul(&env, "main").await;
 
-    let token = sign_for(&env.state, "main-agent");
+    let token = sign_for_privileged(&env.state, "main-agent");
     let (status, json) = post_json_auth(
         &env.app,
         "/api/v1/vault_history",
@@ -1220,7 +1531,7 @@ async fn vault_history_get_identity_privileged_ok() {
     let env = build_read_env().await;
     let (ulid, ts) = seed_soul_with_history(&env, "main").await;
 
-    let token = sign_for(&env.state, "main-agent");
+    let token = sign_for_privileged(&env.state, "main-agent");
     let (status, json) = post_json_auth(
         &env.app,
         "/api/v1/vault_history_get",
@@ -1252,7 +1563,7 @@ async fn vault_list_excludes_identity_for_non_privileged() {
     let env = build_read_env().await;
     let _ulid_soul = seed_soul(&env, "main").await;
     // Note de contrôle non-identity (section `decisions`) via seed index direct.
-    let id_decisions = Ulid::new().to_string();
+    let id_decisions = Ulid::generate().to_string();
     env.vault
         .index()
         .seed_note_with_fts(&id_decisions, "decisions", "controle listing public")
@@ -1304,7 +1615,7 @@ async fn vault_list_allows_identity_for_privileged() {
     let env = build_read_env().await;
     let _ulid_soul = seed_soul(&env, "main").await;
 
-    let token = sign_for(&env.state, "main-agent");
+    let token = sign_for_privileged(&env.state, "main-agent");
     let (status, json) = post_json_auth(
         &env.app,
         "/api/v1/vault_list",
@@ -1349,8 +1660,8 @@ const CTX_QUERY: &str = "gradatum recall context guardtest";
 async fn vault_context_excludes_identity_all_modes_non_privileged() {
     let (app, idx, state) = build_search_env().await;
 
-    let id_identity = Ulid::new().to_string();
-    let id_decisions = Ulid::new().to_string();
+    let id_identity = Ulid::generate().to_string();
+    let id_decisions = Ulid::generate().to_string();
     idx.seed_note_with_fts(&id_identity, "identity", CTX_IDENTITY_CORPUS)
         .await
         .expect("seed identity vault_context");
@@ -1377,7 +1688,7 @@ async fn vault_context_excludes_identity_all_modes_non_privileged() {
         });
         if mode == "compact" {
             // Compact exige un session_id (ULID).
-            body["session_id"] = serde_json::Value::String(Ulid::new().to_string());
+            body["session_id"] = serde_json::Value::String(Ulid::generate().to_string());
         }
         let (status, json) = post_json_auth(&app, "/api/v1/vault_context", &token, body).await;
 
@@ -1410,7 +1721,7 @@ async fn vault_context_excludes_identity_all_modes_non_privileged() {
 async fn vault_context_allows_identity_for_privileged() {
     let (app, idx, state) = build_search_env().await;
 
-    let id_identity = Ulid::new().to_string();
+    let id_identity = Ulid::generate().to_string();
     idx.seed_note_with_fts(&id_identity, "identity", CTX_IDENTITY_CORPUS)
         .await
         .expect("seed identity vault_context priv");
@@ -1419,7 +1730,7 @@ async fn vault_context_allows_identity_for_privileged() {
         .jwt
         .sign(
             "main-agent",
-            &["read".to_string()],
+            &["read".to_string(), IDENTITY_WRITE_SCOPE.to_string()],
             TokenScope::Service,
             "main",
         )
@@ -1452,8 +1763,8 @@ async fn vault_context_allows_identity_for_privileged() {
 async fn proactive_recall_excludes_identity_for_non_privileged() {
     let (app, idx, state) = build_search_env().await;
 
-    let id_identity = Ulid::new().to_string();
-    let id_decisions = Ulid::new().to_string();
+    let id_identity = Ulid::generate().to_string();
+    let id_decisions = Ulid::generate().to_string();
     idx.seed_note_with_fts(&id_identity, "identity", CTX_IDENTITY_CORPUS)
         .await
         .expect("seed identity proactive");
@@ -1550,7 +1861,7 @@ async fn vault_diff_identity_privileged_ok() {
     let env = build_read_env().await;
     let (ulid, ts) = seed_soul_with_history(&env, "main").await;
 
-    let token = sign_for(&env.state, "main-agent");
+    let token = sign_for_privileged(&env.state, "main-agent");
     let (status, json) = post_json_auth(
         &env.app,
         "/api/v1/vault_diff",
@@ -1606,7 +1917,7 @@ async fn vault_restore_identity_privileged_ok() {
     let env = build_read_env().await;
     let (ulid, ts) = seed_soul_with_history(&env, "main").await;
 
-    let token = sign_for(&env.state, "main-agent");
+    let token = sign_for_privileged(&env.state, "main-agent");
     let (status, json) = post_json_auth(
         &env.app,
         "/api/v1/vault_restore",
@@ -1660,7 +1971,7 @@ async fn vault_timeline_excludes_identity_for_non_privileged() {
     let ulid_soul = seed_soul(&env, "main").await;
     seed_temporal(&env, &ulid_soul, 2_000).await;
     // Note de contrôle non-identity (section decisions) + ancrage temporel.
-    let id_decisions = Ulid::new().to_string();
+    let id_decisions = Ulid::generate().to_string();
     env.vault
         .index()
         .seed_note_with_fts(&id_decisions, "decisions", "controle timeline public")
@@ -1719,7 +2030,7 @@ async fn vault_timeline_excludes_identity_even_for_privileged() {
     let ulid_soul = seed_soul(&env, "main").await;
     seed_temporal(&env, &ulid_soul, 2_000).await;
     // Contrôle : une note decisions temporelle DOIT rester visible (la timeline fonctionne).
-    let id_decisions = Ulid::new().to_string();
+    let id_decisions = Ulid::generate().to_string();
     env.vault
         .index()
         .seed_note_with_fts(&id_decisions, "decisions", "controle timeline priv")
@@ -1727,7 +2038,7 @@ async fn vault_timeline_excludes_identity_even_for_privileged() {
         .expect("seed decisions timeline priv");
     seed_temporal(&env, &id_decisions, 1_000).await;
 
-    let token = sign_for(&env.state, "main-agent");
+    let token = sign_for_privileged(&env.state, "main-agent");
     let (status, json) = post_json_auth(
         &env.app,
         "/api/v1/vault_timeline",
@@ -1803,8 +2114,8 @@ async fn notes_by_status_excludes_identity_for_non_privileged() {
 
     // Corps distinctif de l'âme — s'il apparaît dans la réponse, le snippet a fui.
     let soul_marker = "IDENTITY_SOUL_SECRET_BODY_MARKER";
-    let id_identity = Ulid::new().to_string();
-    let id_decisions = Ulid::new().to_string();
+    let id_identity = Ulid::generate().to_string();
+    let id_decisions = Ulid::generate().to_string();
     idx.seed_note(&id_identity, "identity", soul_marker)
         .await
         .expect("seed identity live (by-status)");
@@ -1859,19 +2170,19 @@ async fn notes_by_status_excludes_identity_for_non_privileged() {
     );
 }
 
-/// `GET /notes/by-status?section=identity` — `main-agent` (SOUL_PRIVILEGED_WRITER)
+/// `GET /notes/by-status?section=identity` — `main-agent` (scope `identity_write`)
 /// → l'âme est visible (guard conditionnel, pas blackout total).
 #[tokio::test]
 async fn notes_by_status_allows_identity_for_main_agent() {
     let (app, idx, state) = build_search_env().await;
 
     let soul_marker = "IDENTITY_SOUL_PRIV_BODY_MARKER";
-    let id_identity = Ulid::new().to_string();
+    let id_identity = Ulid::generate().to_string();
     idx.seed_note(&id_identity, "identity", soul_marker)
         .await
         .expect("seed identity live (by-status priv)");
 
-    let token = sign_for(&state, "main-agent");
+    let token = sign_for_privileged(&state, "main-agent");
     let (status, json) = get_json_auth(
         &app,
         "/api/v1/notes/by-status?status=live&section=identity",
@@ -1902,8 +2213,8 @@ async fn review_queue_excludes_identity_for_non_privileged() {
 
     let (app, idx, state) = build_search_env().await;
 
-    let id_identity = Ulid::new().to_string();
-    let id_decisions = Ulid::new().to_string();
+    let id_identity = Ulid::generate().to_string();
+    let id_decisions = Ulid::generate().to_string();
     idx.seed_note_with_status(
         &id_identity,
         Section::Identity,
@@ -1942,7 +2253,7 @@ async fn review_queue_excludes_identity_for_non_privileged() {
     );
 
     // Privilégié → l'âme est visible (guard conditionnel, pas blackout).
-    let token_priv = sign_for(&state, "main-agent");
+    let token_priv = sign_for_privileged(&state, "main-agent");
     let (status_p, json_p) = get_json_auth(&app, "/api/v1/review?limit=100", &token_priv).await;
     assert_eq!(status_p, StatusCode::OK, "{json_p}");
     let items_p = json_p["items"].as_array().expect("items review (priv)");
@@ -2022,7 +2333,7 @@ async fn vault_trace_identity_seed_privileged_ok() {
     let (app, idx, state) = build_search_env().await;
     let _ulid = seed_soul_index(&idx, &state, "main").await;
 
-    let token = sign_for(&state, "main-agent");
+    let token = sign_for_privileged(&state, "main-agent");
     let (status, json) = post_json_auth(
         &app,
         "/api/v1/vault_trace",
@@ -2042,7 +2353,7 @@ async fn vault_trace_identity_seed_privileged_ok() {
 /// `id_identity` (âme de `main`). Retourne `(id_public, id_identity)`.
 async fn seed_public_to_soul_edge(idx: &Arc<SqliteIndex>, state: &AppState) -> (String, String) {
     let id_identity = seed_soul_index(idx, state, "main").await;
-    let id_public = Ulid::new().to_string();
+    let id_public = Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &id_public,
         "decisions",
@@ -2106,7 +2417,7 @@ async fn vault_graph_allows_identity_node_for_privileged() {
     let (app, idx, state) = build_search_env().await;
     let (id_public, id_identity) = seed_public_to_soul_edge(&idx, &state).await;
 
-    let token = sign_for(&state, "main-agent");
+    let token = sign_for_privileged(&state, "main-agent");
     let (status, json) = post_json_auth(
         &app,
         "/api/v1/vault_graph",
@@ -2174,7 +2485,7 @@ async fn vault_links_allows_identity_node_for_privileged() {
     let (app, idx, state) = build_search_env().await;
     let (_id_public, id_identity) = seed_public_to_soul_edge(&idx, &state).await;
 
-    let token = sign_for(&state, "main-agent");
+    let token = sign_for_privileged(&state, "main-agent");
     let (status, json) = post_json_auth(
         &app,
         "/api/v1/vault_links",

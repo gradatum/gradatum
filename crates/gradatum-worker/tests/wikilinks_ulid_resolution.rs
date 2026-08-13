@@ -1,8 +1,9 @@
 //! Tests e2e B5 — résolution wikilinks par ULID (ULID-first).
 //!
-//! Valide le fix du bug note_links vide en LIVE :
-//! les wikilinks `[[section:ULID]]` doivent être résolus via `id_lookup`
-//! (court-circuit du lookup H1), produisant des arêtes dans `note_links`.
+//! Exercent le moteur ACTIF `handle_curate` (via `helpers::process_curate`).
+//! Valide le fix du bug note_links vide en LIVE : les wikilinks `[[section:ULID]]`
+//! doivent être résolus via `id_lookup` (court-circuit du lookup H1), produisant
+//! des arêtes dans `note_links`.
 //!
 //! ## Cas couverts
 //!
@@ -10,13 +11,13 @@
 //! 2. `[[decisions:ULID-inexistant]]` → 0 arête (pas de lien dangling)
 //! 3. `[[Titre Humain H1]]` → 1 arête (fallback title_lookup — rétrocompat)
 //!
-//! Utilise [`helpers::DispatcherFixture`] et [`helpers::MockInternalClient`] qui
+//! Utilise [`helpers::CurateFixture`] et [`helpers::MockInternalClient`] qui
 //! délèguent à `SqliteIndex::id_lookup` en local.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
 
-use helpers::{count_backlinks, enqueue_curate_job, has_backlink_to, test_dispatcher_with_index};
+use helpers::{count_backlinks, has_backlink_to, process_curate, test_curate_fixture};
 
 /// Cas 1 : `[[section:ULID]]` vers une note existante et live → 1 arête dans note_links.
 ///
@@ -24,7 +25,7 @@ use helpers::{count_backlinks, enqueue_curate_job, has_backlink_to, test_dispatc
 /// Après curate, `note_links` doit contenir l'arête src→dst.
 #[tokio::test]
 async fn wikilink_section_ulid_format_produces_link() {
-    let fixture = test_dispatcher_with_index().await;
+    let fixture = test_curate_fixture().await;
 
     // Seed une note cible — on récupère son ULID.
     let target_id = seed_live_note(&fixture, "Note Cible ULID-First", "Contenu cible.").await;
@@ -34,13 +35,9 @@ async fn wikilink_section_ulid_format_produces_link() {
     let body = format!(
         "# Source ULID-First\n\nVoir [[decisions:{target_id}]] pour la décision originale."
     );
-    enqueue_curate_job(&fixture, "[DECISIONS] Source ULID-First", &body).await;
-
-    let processed = fixture.dispatcher.run_once().await.unwrap();
-    assert!(
-        processed,
-        "le dispatcher doit signaler qu'un job a été traité"
-    );
+    process_curate(&fixture, "[DECISIONS] Source ULID-First", &body)
+        .await
+        .expect("handle_curate doit réussir");
 
     // La note cible doit avoir exactement 1 backlink (arête ULID-first résolue).
     let count = count_backlinks(&fixture.index, &target_id).await;
@@ -60,19 +57,16 @@ async fn wikilink_section_ulid_format_produces_link() {
 /// `id_lookup` doit retourner `None` → lien ignoré, `note_links` reste vide.
 #[tokio::test]
 async fn wikilink_section_ulid_nonexistent_produces_no_link() {
-    let fixture = test_dispatcher_with_index().await;
+    let fixture = test_curate_fixture().await;
 
     // ULID valide mais absent du vault (jamais inséré)
     let ghost_ulid = "01JZZZZZZZZZZZZZZZZZZZZZZ0";
     let body = format!("# Source ULID Ghost\n\nVoir [[decisions:{ghost_ulid}]] — note fantôme.");
-    enqueue_curate_job(&fixture, "[DECISIONS] Source ULID Ghost", &body).await;
-
-    let result = fixture.dispatcher.run_once().await;
+    let result = process_curate(&fixture, "[DECISIONS] Source ULID Ghost", &body).await;
     assert!(
         result.is_ok(),
         "curate ne doit pas échouer sur ULID inexistant — err={result:?}"
     );
-    assert!(result.unwrap(), "un job doit avoir été traité");
 
     // Aucune arête ne doit pointer vers l'ULID fantôme.
     let count = count_backlinks(&fixture.index, ghost_ulid).await;
@@ -88,16 +82,16 @@ async fn wikilink_section_ulid_nonexistent_produces_no_link() {
 /// à fonctionner via `title_lookup`.
 #[tokio::test]
 async fn wikilink_human_title_fallback_still_works() {
-    let fixture = test_dispatcher_with_index().await;
+    let fixture = test_curate_fixture().await;
 
     let title = "Note Cible Titre Humain Alpha99";
     let target_id = seed_live_note(&fixture, title, "Contenu cible humain.").await;
 
     // Wikilink au format titre humain — ne contient pas d'ULID.
     let body = format!("# Source Titre Humain\n\nVoir [[{title}]] — résolution via title_lookup.");
-    enqueue_curate_job(&fixture, "[DECISIONS] Source Titre Humain", &body).await;
-
-    fixture.dispatcher.run_once().await.unwrap();
+    process_curate(&fixture, "[DECISIONS] Source Titre Humain", &body)
+        .await
+        .expect("handle_curate doit réussir");
 
     // L'arête doit exister (fallback title_lookup préservé).
     assert!(
@@ -112,7 +106,7 @@ async fn wikilink_human_title_fallback_still_works() {
 ///
 /// La note est insérée avec `status=Live` et son titre est upsert dans l'index
 /// pour que `title_lookup` puisse aussi la trouver (rétrocompat Cas 3).
-async fn seed_live_note(fixture: &helpers::DispatcherFixture, title: &str, body: &str) -> String {
+async fn seed_live_note(fixture: &helpers::CurateFixture, title: &str, body: &str) -> String {
     use chrono::Utc;
     use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
     use gradatum_core::scope::VaultId;

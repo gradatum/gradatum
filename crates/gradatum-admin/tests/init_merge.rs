@@ -52,11 +52,18 @@ api_key_env = "GRADATUM_LLM_BEARER"
 timeout_ms = 60000
 "#;
 
-    let new_template =
-        generate_server_toml_template(Path::new("/var/lib/gradatum"), "127.0.0.1:19090");
+    let new_template = generate_server_toml_template(
+        Path::new("/var/lib/gradatum"),
+        "127.0.0.1:19090",
+        "test-internal-worker-token-000000000000000000",
+        "test-internal-admin-token-1111111111111111111",
+    );
 
-    // Patch.4 : sémantique BACKUP autoritaire — [curator] et [curator.llm] absents du template
-    // standard DOIVENT être préservés (sections d'extension user).
+    // Sémantique BACKUP autoritaire : les customisations user de [curator]/[curator.llm]
+    // (ici des valeurs volontairement différentes des défauts du template — seuil 0.85,
+    // base_url :8080) DOIVENT gagner sur les valeurs par défaut du template. Le template
+    // émet désormais sa propre section [curator] active (défaut :8000) ; le merge ne doit
+    // jamais l'imposer par-dessus une config LIVE personnalisée.
     let merged = merge_user_config(existing, &new_template).expect("merge ne doit pas échouer");
 
     // Clés standard préservées depuis le backup
@@ -114,8 +121,12 @@ root = "/var/lib/gradatum"
 db_path = "/custom/legacy/index.sqlite"
 "#;
 
-    let new_template =
-        generate_server_toml_template(Path::new("/var/lib/gradatum"), "127.0.0.1:19090");
+    let new_template = generate_server_toml_template(
+        Path::new("/var/lib/gradatum"),
+        "127.0.0.1:19090",
+        "test-internal-worker-token-000000000000000000",
+        "test-internal-admin-token-1111111111111111111",
+    );
 
     let merged = merge_user_config(existing, &new_template).expect("merge");
 
@@ -141,8 +152,12 @@ fn merge_keeps_new_keys_with_defaults() {
 bind = "0.0.0.0:9090"
 "#;
 
-    let new_template =
-        generate_server_toml_template(Path::new("/var/lib/gradatum"), "127.0.0.1:19090");
+    let new_template = generate_server_toml_template(
+        Path::new("/var/lib/gradatum"),
+        "127.0.0.1:19090",
+        "test-internal-worker-token-000000000000000000",
+        "test-internal-admin-token-1111111111111111111",
+    );
 
     let merged = merge_user_config(existing, &new_template).expect("merge");
 
@@ -171,12 +186,15 @@ bind = "0.0.0.0:9090"
     );
 }
 
-/// Reproducer du bug LIVE patch.4 : la section `[curator]` et `[curator.llm]` du backup
-/// doivent être préservées intégralement même si absentes du NEW template.
+/// Reproducer du bug LIVE patch.4 : les customisations `[curator]` / `[curator.llm]` du
+/// backup doivent être préservées intégralement (valeurs backup autoritaires sur les défauts
+/// du template).
 ///
 /// Ce test capture exactement le scénario qui causait gradatum-worker `inactive (dead)` :
-/// `walk_and_merge` (patch.2) itérait sur les keys du NEW template uniquement → curator
-/// jamais visité → absent du résultat → worker ne démarrait pas.
+/// `walk_and_merge` (patch.2) itérait sur les keys du NEW template uniquement → une clé
+/// présente seulement côté backup n'était jamais visitée → absente du résultat → worker ne
+/// démarrait pas. La sémantique backup-autoritaire (patch.4) corrige cela ; le fait que le
+/// template porte lui aussi une section [curator] n'y change rien (backup prime).
 #[test]
 fn merge_preserves_backup_only_sections_curator() {
     let existing = r#"
@@ -201,8 +219,12 @@ api_key_env = "GRADATUM_LLM_BEARER"
 timeout_ms = 60000
 "#;
 
-    let new_template =
-        generate_server_toml_template(Path::new("/var/lib/gradatum"), "127.0.0.1:19090");
+    let new_template = generate_server_toml_template(
+        Path::new("/var/lib/gradatum"),
+        "127.0.0.1:19090",
+        "test-internal-worker-token-000000000000000000",
+        "test-internal-admin-token-1111111111111111111",
+    );
 
     let merged = merge_user_config(existing, &new_template).expect("merge ne doit pas échouer");
 
@@ -295,8 +317,12 @@ model = "extract"
 "#;
 
     // Le template alpha.8-patch.1 inclut maintenant [embed].
-    let new_template =
-        generate_server_toml_template(Path::new("/var/lib/gradatum"), "127.0.0.1:19090");
+    let new_template = generate_server_toml_template(
+        Path::new("/var/lib/gradatum"),
+        "127.0.0.1:19090",
+        "test-internal-worker-token-000000000000000000",
+        "test-internal-admin-token-1111111111111111111",
+    );
 
     // Le template doit contenir [embed] (vérification préalable que le fix est appliqué).
     assert!(
@@ -368,8 +394,12 @@ foo = "bar"
 number = 42
 "#;
 
-    let new_template =
-        generate_server_toml_template(Path::new("/var/lib/gradatum"), "127.0.0.1:19090");
+    let new_template = generate_server_toml_template(
+        Path::new("/var/lib/gradatum"),
+        "127.0.0.1:19090",
+        "test-internal-worker-token-000000000000000000",
+        "test-internal-admin-token-1111111111111111111",
+    );
 
     let merged = merge_user_config(existing, &new_template).expect("merge ne doit pas échouer");
 

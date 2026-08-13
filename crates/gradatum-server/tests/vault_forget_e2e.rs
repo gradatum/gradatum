@@ -110,7 +110,7 @@ async fn trust_all(
 
 /// Insère une note FTS dans l'index (vault_id='main', status='live').
 async fn seed_fts(idx: &SqliteIndex, section: &str, body: &str) -> String {
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     idx.seed_note_with_fts(&id, section, body)
         .await
         .expect("seed_note_with_fts — vault_forget_e2e");
@@ -376,7 +376,7 @@ async fn confirm_ulids_over_limit_returns_400() {
     let (app, _state, _idx) = build_app().await;
 
     // Générer 201 ULIDs fantômes.
-    let too_many: Vec<String> = (0..201).map(|_| Ulid::new().to_string()).collect();
+    let too_many: Vec<String> = (0..201).map(|_| Ulid::generate().to_string()).collect();
 
     let body = serde_json::json!({
         "tenant_id": "main",

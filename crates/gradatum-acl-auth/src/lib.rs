@@ -4,8 +4,8 @@
 //!
 //! ## Stability
 //!
-//! `1.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
-//! additions only within `1.x`, breaking changes deferred to the next major. See
+//! `2.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
+//! additions only within `2.x`, breaking changes deferred to the next major. See
 //! [versioning policy](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md).
 //!
 //! ## Architecture
@@ -43,8 +43,8 @@
 pub mod api_key;
 
 pub use api_key::{
-    ApiKey, ApiKeyError, ApiKeyMaterial, ApiKeyStore, KEY_PREFIX, SECRET_LEN, SqliteApiKeyStore,
-    WRITE_SCOPES, has_write_scope,
+    ApiKey, ApiKeyError, ApiKeyMaterial, ApiKeyStore, IDENTITY_WRITE_SCOPE, KEY_PREFIX, SECRET_LEN,
+    SqliteApiKeyStore, WRITE_SCOPES, has_write_scope,
 };
 
 /// Crate version sourced from `workspace.package.version`.

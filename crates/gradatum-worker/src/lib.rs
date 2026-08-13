@@ -2,12 +2,10 @@
 //!
 //! Exposes internal modules to allow testing from `tests/`.
 //!
-//! The `dispatch` module is retained for compatibility with existing integration tests:
-//! the active binary replaced the dispatcher with the Apalis Monitor.
-//!
-//! `curator_loader` and `leader` are **not** in that category — the active binary uses
-//! both: `main.rs` calls `curator_loader::build_curator_pipeline` to build the curator,
-//! and `leader::LeaderElection::try_acquire` is a **boot gate** (a non-leader exits
+//! `curator_loader` and `leader` are internal service plumbing exposed only for this
+//! crate's integration tests, but the active binary uses both: `main.rs` calls
+//! `curator_loader::build_curator_pipeline` to build the curator, and
+//! `leader::LeaderElection::try_acquire` is a **boot gate** (a non-leader exits
 //! cleanly). Do not treat them as dead code.
 //!
 //! These modules are internal service plumbing, exposed only for this crate's
@@ -15,14 +13,11 @@
 //! are **not** a stable public API (this crate is a service binary, not a
 //! reusable library).
 
-// Modules retained for integration-test backward compatibility
-// (not used by the active binary — dispatcher replaced by Apalis Monitor)
+// Modules exposed for this crate's integration tests
+// (internal service plumbing — not a stable public API)
 #[allow(dead_code)]
 #[doc(hidden)]
 pub mod curator_loader;
-#[allow(dead_code)]
-#[doc(hidden)]
-pub mod dispatch;
 #[allow(dead_code)]
 #[doc(hidden)]
 pub mod leader;

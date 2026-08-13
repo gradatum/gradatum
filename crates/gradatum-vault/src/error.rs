@@ -17,9 +17,8 @@ pub enum VaultError {
     #[error("core: {0}")]
     Core(#[from] gradatum_core::error::GradatumError),
 
-    /// Storage error (OpenDAL, filesystem, NFS check).
+    /// Storage error (OpenDAL, filesystem).
     ///
-    /// Note: `StorageError` may itself wrap `GradatumError::VaultOnNfs`.
     #[error("storage: {0}")]
     Storage(String),
 

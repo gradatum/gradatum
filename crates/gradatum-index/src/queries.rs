@@ -815,7 +815,7 @@ mod backlinks_tests {
     #[tokio::test]
     async fn backlink_count_no_links_returns_zero() {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
-        let note_a = ulid::Ulid::new().to_string();
+        let note_a = ulid::Ulid::generate().to_string();
         seed_note_internal(&idx, "main", &note_a, "# Note A").await;
 
         let count = idx.backlink_count("main", &note_a).await.unwrap();
@@ -826,9 +826,9 @@ mod backlinks_tests {
     #[tokio::test]
     async fn backlink_count_returns_correct_in_degree() {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
-        let dst = ulid::Ulid::new().to_string();
-        let src1 = ulid::Ulid::new().to_string();
-        let src2 = ulid::Ulid::new().to_string();
+        let dst = ulid::Ulid::generate().to_string();
+        let src1 = ulid::Ulid::generate().to_string();
+        let src2 = ulid::Ulid::generate().to_string();
         seed_note_internal(&idx, "main", &dst, "# Cible").await;
         seed_note_internal(&idx, "main", &src1, "# Source 1").await;
         seed_note_internal(&idx, "main", &src2, "# Source 2").await;
@@ -848,9 +848,9 @@ mod backlinks_tests {
     #[tokio::test]
     async fn backlink_count_is_scoped_to_vault_id() {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
-        let dst_a = ulid::Ulid::new().to_string();
-        let dst_b = ulid::Ulid::new().to_string();
-        let src_a = ulid::Ulid::new().to_string();
+        let dst_a = ulid::Ulid::generate().to_string();
+        let dst_b = ulid::Ulid::generate().to_string();
+        let src_a = ulid::Ulid::generate().to_string();
         seed_note_internal(&idx, "vault_a", &dst_a, "# Note X (vault A)").await;
         seed_note_internal(&idx, "vault_b", &dst_b, "# Note X (vault B)").await;
         seed_note_internal(&idx, "vault_a", &src_a, "# Source").await;
@@ -876,7 +876,7 @@ mod backlinks_tests {
     #[tokio::test]
     async fn backlink_count_nonexistent_note_returns_zero() {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
-        let nope = ulid::Ulid::new().to_string();
+        let nope = ulid::Ulid::generate().to_string();
         let count = idx.backlink_count("main", &nope).await.unwrap();
         assert_eq!(count, 0, "note inexistante → 0 backlinks sans erreur");
     }
@@ -886,8 +886,8 @@ mod backlinks_tests {
     async fn get_note_created_and_indegree_returns_correct_values() {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let note_y = ulid::Ulid::new().to_string();
-        let linker = ulid::Ulid::new().to_string();
+        let note_y = ulid::Ulid::generate().to_string();
+        let linker = ulid::Ulid::generate().to_string();
         seed_note_internal(&idx, "main", &note_y, "# Note Y").await;
         seed_note_internal(&idx, "main", &linker, "# Linker").await;
         idx.upsert_link("main", &linker, &note_y).await.unwrap();
@@ -909,7 +909,7 @@ mod backlinks_tests {
     #[tokio::test]
     async fn get_note_created_and_indegree_returns_not_found_on_missing() {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
-        let missing = ulid::Ulid::new().to_string();
+        let missing = ulid::Ulid::generate().to_string();
 
         let res = idx.get_note_created_and_indegree("main", &missing).await;
 
@@ -951,8 +951,8 @@ mod backlinks_tests {
     #[tokio::test]
     async fn get_titles_sections_returns_correct_mapping() {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
-        let id_a = ulid::Ulid::new().to_string();
-        let id_b = ulid::Ulid::new().to_string();
+        let id_a = ulid::Ulid::generate().to_string();
+        let id_b = ulid::Ulid::generate().to_string();
 
         seed_note_with_title(&idx, "main", &id_a, "decisions", Some("Note A titre")).await;
         seed_note_with_title(&idx, "main", &id_b, "reference", None).await;
@@ -992,7 +992,7 @@ mod backlinks_tests {
     #[tokio::test]
     async fn get_titles_sections_missing_id_absent_from_map() {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
-        let missing = ulid::Ulid::new().to_string();
+        let missing = ulid::Ulid::generate().to_string();
         let map = idx
             .get_titles_sections("main", std::slice::from_ref(&missing))
             .await
@@ -1007,8 +1007,8 @@ mod backlinks_tests {
     #[tokio::test]
     async fn get_titles_sections_scoped_to_vault_id() {
         let idx = SqliteIndex::open_in_memory().await.unwrap();
-        let id_vault_a = ulid::Ulid::new().to_string();
-        let id_vault_b = ulid::Ulid::new().to_string();
+        let id_vault_a = ulid::Ulid::generate().to_string();
+        let id_vault_b = ulid::Ulid::generate().to_string();
 
         seed_note_with_title(&idx, "vault_a", &id_vault_a, "decisions", Some("Note A")).await;
         seed_note_with_title(&idx, "vault_b", &id_vault_b, "decisions", Some("Note B")).await;

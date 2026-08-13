@@ -5,9 +5,11 @@
 //!
 //! ## Provided implementations
 //!
-//! - [`crate::FileStorage`] — OpenDAL filesystem backend (feature `fs`, enabled by default).
-//! - S3 / GCS / Azure Blob backends (features `s3`, `gcs`, `azure`) — planned: enabling a feature
-//!   pulls the matching OpenDAL service, but no `Storage` implementation is provided yet.
+//! - [`crate::FileStorage`] — generic OpenDAL wrapper. `FileStorage::new` builds a local
+//!   filesystem backend (feature `fs`, enabled by default).
+//! - S3 object storage (feature `s3`) — served by the same wrapper over an S3 operator,
+//!   built from configuration via [`crate::build_storage`].
+//! - GCS / Azure Blob (features `gcs`, `azure`) — declared, not yet wired in the factory.
 //!
 //! ## Path contract
 //!
@@ -41,7 +43,7 @@ pub struct StorageEntry {
 ///
 /// - Entry absent → `StorageError::NotFound`
 /// - Invalid path → `StorageError::InvalidPath`
-/// - Backend error → `StorageError::Io` or `StorageError::OpenDal`
+/// - Backend error → `StorageError::OpenDal`
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Reads the raw content of the object at relative path `path`.
@@ -49,7 +51,7 @@ pub trait Storage: Send + Sync {
     /// # Errors
     ///
     /// - `StorageError::NotFound` if `path` does not exist.
-    /// - `StorageError::Io` on read error.
+    /// - `StorageError::OpenDal` on read error.
     async fn read(&self, path: &str) -> Result<Vec<u8>, StorageError>;
 
     /// Writes `content` to `path`, creating intermediate directories as needed.
@@ -60,7 +62,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # Errors
     ///
-    /// - `StorageError::Io` on write error or insufficient permissions.
+    /// - `StorageError::OpenDal` on write error or insufficient permissions.
     async fn write(&self, path: &str, content: &[u8]) -> Result<(), StorageError>;
 
     /// Deletes the object at `path`.
@@ -68,7 +70,7 @@ pub trait Storage: Send + Sync {
     /// # Errors
     ///
     /// - `StorageError::NotFound` if `path` does not exist.
-    /// - `StorageError::Io` on deletion error.
+    /// - `StorageError::OpenDal` on deletion error.
     async fn delete(&self, path: &str) -> Result<(), StorageError>;
 
     /// Lists entries whose path starts with `prefix`.
@@ -78,7 +80,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # Errors
     ///
-    /// - `StorageError::Io` on directory read error.
+    /// - `StorageError::OpenDal` on directory read error.
     async fn list(&self, prefix: &str) -> Result<Vec<StorageEntry>, StorageError>;
 
     /// Returns metadata for the object at `path`.
@@ -86,7 +88,7 @@ pub trait Storage: Send + Sync {
     /// # Errors
     ///
     /// - `StorageError::NotFound` if `path` does not exist.
-    /// - `StorageError::Io` on stat error.
+    /// - `StorageError::OpenDal` on stat error.
     async fn stat(&self, path: &str) -> Result<StorageEntry, StorageError>;
 
     /// Returns `true` if an object exists at `path`, `false` otherwise.
@@ -95,7 +97,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # Errors
     ///
-    /// - `StorageError::Io` on unexpected backend error (not NotFound).
+    /// - `StorageError::OpenDal` on unexpected backend error (not NotFound).
     async fn exists(&self, path: &str) -> Result<bool, StorageError>;
 
     /// Creates the directory at relative path `path` (idempotent).
@@ -106,6 +108,6 @@ pub trait Storage: Send + Sync {
     /// # Errors
     ///
     /// - `StorageError::OpenDal` if the backend does not support `create_dir`.
-    /// - `StorageError::Io` on filesystem error (permissions, etc.).
+    /// - `StorageError::OpenDal` on filesystem error (permissions, etc.).
     async fn create_dir(&self, path: &str) -> Result<(), StorageError>;
 }

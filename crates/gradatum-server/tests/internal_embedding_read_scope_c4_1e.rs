@@ -212,7 +212,7 @@ async fn read_vector(env: &Env, uri: &str) -> Vec<f64> {
 #[tokio::test]
 async fn get_embedding_without_vault_id_defaults_main() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     seed(&env, &note_id, "main", [0.1, 0.2, 0.3, 0.4]).await;
 
@@ -234,7 +234,7 @@ async fn get_embedding_without_vault_id_defaults_main() {
 #[tokio::test]
 async fn get_embedding_scopes_by_vault_id_query() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string(); // même ULID, deux vaults
+    let note_id = Ulid::generate().to_string(); // même ULID, deux vaults
 
     seed(&env, &note_id, "main", [0.1, 0.2, 0.3, 0.4]).await;
     seed(&env, &note_id, "vault-b", [0.5, 0.6, 0.7, 0.8]).await;

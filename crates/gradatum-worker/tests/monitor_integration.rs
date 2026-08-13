@@ -64,10 +64,10 @@ async fn test_store() -> SqliteQueueStore {
 fn make_curate_record() -> JobRecord {
     let now = Utc::now();
     JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind: Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 ..Default::default()
             }),

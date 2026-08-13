@@ -2,7 +2,7 @@
 
 > ACL policy engine with globset pattern matching, deny-wins semantics, and personal-classified circuit breaker.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -23,7 +23,7 @@ Patterns use `globset` for efficient compiled matching. Policies are loaded once
 
 ```toml
 [dependencies]
-gradatum-acl-policy = "1.0.0"
+gradatum-acl-policy = "2.0.0"
 ```
 
 ```rust

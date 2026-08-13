@@ -866,7 +866,7 @@ pub async fn call_vault_context(
 /// passent par l'enum ignorent ces notes dans les chemins enum-gated.
 pub async fn seed_skill(env: &TestEnv, title: &str, body: &str) {
     let idx = env._vault_typed.index();
-    let ulid = Ulid::new().to_string();
+    let ulid = Ulid::generate().to_string();
     let full_body = format!("# {title}\n{body}");
     idx.seed_note_with_fts(&ulid, "skills", &full_body)
         .await
@@ -942,7 +942,7 @@ pub async fn call_vault_context_json(
 pub async fn seed_notes(env: &TestEnv, count: usize) {
     let idx = env._vault_typed.index();
     for i in 0..count {
-        let ulid = Ulid::new().to_string();
+        let ulid = Ulid::generate().to_string();
         // Contenu contenant « alpha » et « beta » + numéro pour variété lexicale.
         let body = format!(
             "# Note alpha beta {i}\nalpha beta contenu test retrieval rrf note numéro {i}."

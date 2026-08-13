@@ -23,9 +23,18 @@ use serde::{Deserialize, Serialize};
 /// Vault lifecycle request (create / suspend / soft-delete).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultLifecycleRequest {
     /// Target vault: charset `[a-z0-9-]`, at most 64 bytes, validated by `VaultId::parse`.
     pub vault_id: VaultId,
+}
+
+impl VaultLifecycleRequest {
+    /// Constructs a lifecycle request targeting `vault_id`.
+    #[must_use]
+    pub fn new(vault_id: VaultId) -> Self {
+        Self { vault_id }
+    }
 }
 
 /// Vault lifecycle response.
@@ -55,6 +64,7 @@ pub struct VaultLifecycleResponse {
 /// `remaining > 0`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultPurgeRequest {
     /// Target vault — must already be soft-deleted.
     pub vault_id: VaultId,
@@ -78,6 +88,21 @@ impl VaultPurgeRequest {
     /// Serde default for `limit`: 500, matching the server-side cap.
     fn default_limit() -> usize {
         500
+    }
+
+    /// Constructs a **dry-run** purge request for a soft-deleted `vault_id`.
+    ///
+    /// `dry_run` starts at `true` and `limit` at the server-side default, matching
+    /// deserialization from a minimal JSON body. Set `dry_run = false` and
+    /// `confirm_vault_id = Some(vault_id.clone())` to perform the real purge.
+    #[must_use]
+    pub fn new(vault_id: VaultId) -> Self {
+        Self {
+            vault_id,
+            dry_run: Self::default_dry_run(),
+            confirm_vault_id: None,
+            limit: Self::default_limit(),
+        }
     }
 }
 

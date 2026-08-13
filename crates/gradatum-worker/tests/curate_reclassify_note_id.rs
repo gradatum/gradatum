@@ -90,7 +90,7 @@ fn curate_job_reclassify(existing_note_id: Ulid, tenant_id: &str) -> GradatumJob
     GradatumJob {
         priority: JobPriority::default_for(&class).as_u8(),
         record: JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: Job::Curate(CurateSpec {
                     note_id: existing_note_id,
@@ -151,7 +151,7 @@ async fn handle_curate_reclassify_preserves_note_id() {
 
     // Étape 1 : créer une note dans le vault via vault_write normal
     // Préfixe [DECISIONS] → heuristique confidence ≥ 0.8 → Admitted direct.
-    let prealloc = Ulid::new();
+    let prealloc = Ulid::generate();
     let body = "# [DECISIONS] Titre existant\nContenu à reclassifier.";
     let create_job = {
         let now = Utc::now();
@@ -159,7 +159,7 @@ async fn handle_curate_reclassify_preserves_note_id() {
         GradatumJob {
             priority: JobPriority::default_for(&class).as_u8(),
             record: JobRecord {
-                id: Ulid::new(),
+                id: Ulid::generate(),
                 spec: JobSpec {
                     kind: Job::Curate(CurateSpec {
                         note_id: prealloc,

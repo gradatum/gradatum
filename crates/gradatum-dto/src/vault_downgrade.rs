@@ -4,14 +4,13 @@ use gradatum_core::scope::TenantId;
 
 /// Request body for `vault_downgrade` — downgrades a note.
 ///
-/// The **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.
-/// The bincode serialization (`bincode::serde::encode_to_vec`) is used only by the
-/// legacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.
+/// Serialised via `serde_json`. Consumed synchronously by `notes::vault_downgrade`.
 ///
 /// POST `/api/v1/vault_downgrade`. Idempotent: downgrading an already-downgraded
 /// note returns 200 with the current status.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct VaultDowngradeRequest {
     /// ULID identifier of the note to downgrade.
     pub note_id: String,
@@ -26,6 +25,20 @@ pub struct VaultDowngradeRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub tenant_id: Option<TenantId>,
+}
+
+impl VaultDowngradeRequest {
+    /// Constructs a downgrade request with the mandatory `note_id` and `reason`;
+    /// `replaced_by` and `tenant_id` default to `None`.
+    #[must_use]
+    pub fn new(note_id: String, reason: String) -> Self {
+        Self {
+            note_id,
+            reason,
+            replaced_by: None,
+            tenant_id: None,
+        }
+    }
 }
 
 /// Response for `vault_downgrade`.

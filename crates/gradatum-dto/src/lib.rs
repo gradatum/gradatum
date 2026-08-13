@@ -5,11 +5,11 @@
 //! - `gradatum-mcp-stub`: `inputSchema` generation for MCP tools via the `schemars` feature
 //!
 //! `gradatum-sdk-rs` does **not** depend on this crate — it is a placeholder with no client
-//! surface in `1.0.0`.
+//! surface in `2.0.0`.
 //!
-//! DAG level: **L1** — depends on `gradatum-core` for the `TenantId` and `VaultId`
-//! newtypes. Both are `#[serde(transparent)]`, so the wire stays a bare `String` (JSON and
-//! bincode byte-identical); only the compile-time type is strengthened, separating the
+//! This crate depends only on `gradatum-core` for the `TenantId` and `VaultId`
+//! newtypes. Both are `#[serde(transparent)]`, so the wire stays a bare `String` (a plain
+//! JSON string); only the compile-time type is strengthened, separating the
 //! *principal* axis (`TenantId`) from the *namespace* axis (`VaultId`). Other domain
 //! values — ULIDs, section names — remain flat `String`s.
 //!

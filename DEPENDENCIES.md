@@ -2,7 +2,21 @@
 
 > Arbre de dépendances Cargo. Établi par lecture des `Cargo.toml` du workspace (source de
 > vérité) ; à recouper avec `cargo tree --workspace --depth 1`.
-> Version workspace `1.0.0`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> Version workspace `2.0.0`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> MAJ 2026-08-12 : colonne « Version » de la table des pins régénérée depuis le manifeste
+> (30 cellules divergaient — `ulid` documenté `1.2.1` pour un réel `3.0.0`, idem `criterion`,
+> `prometheus`, `insta`, `tower-http`, `schemars`, `prometheus-client`, `fastembed`…). La
+> justification `prometheus` (« 0.14 breaking connu ») était devenue auto-contradictoire (pin réel
+> `0.14.0`) → neutralisée. Commande de régénération documentée en § *Mise à jour*. Les blocs
+> datés ci-dessous portent des chiffres exacts à leur date : **non modifiés**.
+> MAJ 2026-08-10 : version workspace corrigée `1.0.2` → `2.0.0` (alignement documentaire seul —
+> le graphe de dépendances n'a pas été revérifié dans cette passe, voir l'entrée Updated
+> 2026-08-04 ci-dessous pour le dernier état vérifié).
+> MAJ 2026-08-10 (2) : `gradatum-mcp-stub` bascule `publish = false` (retrait de la distribution
+> `2.0.0`, source conservée — voir `ARCHITECTURE.md` § API surface topology). Décompte publiables
+> **27 → 26** ; groupe *Clients* **3 → 2** ; groupe *Non publiables* **4 → 5**. Le crate gagne
+> `clap` (feature `derive`) pour un flag `--version`, vérifié dans son `Cargo.toml`.
+> MAJ 2026-08-06 : bump 1.0.2 (author=header au write MCP, fix `04589e0e`) — aucune dépendance ajoutée/retirée.
 > Arbres établis au commit `fb0742e5` pour la structure des crates ; le graphe des dépendances
 > externes a évolué depuis — voir l'entrée Updated 2026-07-31 ci-dessous pour le changement tracé.
 >
@@ -10,7 +24,7 @@
 > `publish = false`, licence composite `Apache-2.0 AND OFL-1.1 AND MIT AND ISC` [bundle `dist/`
 > redistribue code + fontes + paquets npm tiers, notices THIRD-PARTY-LICENSES.md],
 > categories web-programming/gui, include allow-list sur le bundle Vite). 4 non-publiables
-> désormais : `gradatum-cli` (déjà 0.7.6 sur crates.io, reportée v2.0.0), `gradatum-bench`,
+> désormais : `gradatum-cli` (déjà 0.7.6 sur crates.io, republication reportée sans version cible), `gradatum-bench`,
 > `index-parity-tests`, `v1-parity-tests`. Structure 31 membres inchangée ; graphe externe inchangé
 > depuis l'entrée 2026-07-31 (re-vérifié au commit `761f9625`).
 >
@@ -42,19 +56,20 @@
 ## Périmètre du workspace
 
 **31 membres** déclarés dans `[workspace] members` (`ls crates/` = 31 répertoires).
-**27 sont publiables** ; 4 portent `publish = false` :
+**26 sont publiables** ; 5 portent `publish = false` :
 
 | Crate | Raison du `publish = false` |
 |---|---|
-| `gradatum-cli` | reportée v2.0.0 (roadmap) — ⚠️ déjà publiée en 0.7.6 sur crates.io |
+| `gradatum-cli` | republication reportée, aucune version cible fixée — ⚠️ déjà publiée en 0.7.6 sur crates.io |
+| `gradatum-mcp-stub` | **retiré de la distribution `2.0.0`** — plus construit ni publié ; dernière version publiée `1.0.0` sur crates.io ; source conservée, retrait réversible (voir `ARCHITECTURE.md` § API surface topology) |
 | `gradatum-bench` | benchmarks internes |
 | `index-parity-tests` | suite de parité backend-agnostique |
 | `v1-parity-tests` | suite de parité v1 |
 
-> ⚠️ Piège de décompte : **27 = crates publiés sur crates.io**, **31 = membres du workspace**.
+> ⚠️ Piège de décompte : **26 = crates publiés sur crates.io**, **31 = membres du workspace**.
 > Les deux chiffres sont corrects et ne se substituent pas.
 
-Répartition fonctionnelle des 31 (3 + 1 + 19 + 1 + 3 + 4) :
+Répartition fonctionnelle des 31 (3 + 1 + 19 + 1 + 2 + 5) :
 
 | Groupe | N | Membres |
 |---|---|---|
@@ -62,8 +77,8 @@ Répartition fonctionnelle des 31 (3 + 1 + 19 + 1 + 3 + 4) :
 | Binaire gateway | 1 | `gradatum-gateway` |
 | Bibliothèques data plane | 19 | `core`, `dto`, `markdown`, `vault`, `storage`, `index`, `search`, `queue`, `db-sqlite`, `cache`, `chat`, `curator`, `embed`, `engine`, `ingest`, `warden`, `acl-policy`, `acl-auth`, `auth` (préfixe `gradatum-`) |
 | Binaire web UI | 1 | `gradatum-studio` (bundle React+TS servi à `/ui/*`, publiable depuis F-131) |
-| Clients | 3 | `gradatum-mcp-stub`, `gradatum-sdk-rs`, `gradatum` (umbrella) |
-| Non publiables | 4 | `gradatum-cli`, `gradatum-bench`, `index-parity-tests`, `v1-parity-tests` |
+| Clients | 2 | `gradatum-sdk-rs`, `gradatum` (umbrella) |
+| Non publiables | 5 | `gradatum-cli`, `gradatum-mcp-stub`, `gradatum-bench`, `index-parity-tests`, `v1-parity-tests` |
 
 ---
 
@@ -93,7 +108,7 @@ gradatum-worker         (consommateur de queue asynchrone)
 ├── apalis + apalis-cron + cron        (Monitor + schedules)
 ├── prometheus                         (exporter :19091)
 ├── axum + tower                       (surface health/metrics)
-├── sqlx + bincode                     (QueueStore + payloads)
+├── sqlx                               (QueueStore + payloads)
 ├── figment + toml + clap + reqwest + secrecy
 └── tokio + tracing + tracing-subscriber
 
@@ -134,8 +149,7 @@ gradatum-core           (primitives partagées : erreurs, ids, scope, sections, 
 gradatum-dto            (DTOs contrats wire — source de vérité unique)
 ├── gradatum-core          ← NOUVEAU 2026-07 : typage TenantId (principal) / VaultId (namespace)
 ├── serde
-├── (feature schemars) schemars + serde_json
-└── (dev) bincode          ← NOUVEAU 2026-07
+└── (feature schemars) schemars + serde_json
 
 gradatum-markdown       (parse/serialize MD + frontmatter + wikilinks)
 ├── gradatum-core
@@ -151,6 +165,7 @@ gradatum-vault          (registre multi-vault + cycle de vie + swap)
 gradatum-storage        (abstraction FS/objet + garde NFS)
 ├── gradatum-core
 ├── opendal                (feature `fs` par défaut ; s3/gcs/azure opt-in)
+├── opendal-http-transport-reqwest  (feature `cloud-http`, optional ; transport HTTP objet, `rustls-no-provider`)
 └── async-trait + thiserror + tokio + tracing
 
 gradatum-index          (SQLite + FTS5 + migrations idempotentes + drift + ANN)
@@ -167,7 +182,7 @@ gradatum-search         (lecteur multi-mode + fusion RRF + scoring composite)
 
 gradatum-queue          (façade GradatumQueue + lease atomique)
 ├── gradatum-core + gradatum-db-sqlite
-├── sqlx + rusqlite + bincode
+├── sqlx + rusqlite
 ├── serde + serde_json + chrono + ulid
 └── async-trait + thiserror + tokio + tracing
 
@@ -186,7 +201,7 @@ gradatum-chat           (trait Chat + OpenAICompat + Heuristic + Noop)
 ├── gradatum-core
 ├── reqwest (rustls-tls par défaut)
 ├── secrecy + regex + once_cell + chrono
-├── (feature windows-native-tls) native-tls via reqwest — OFF par défaut (RFC-0002 §4.6)
+├── (feature windows-native-tls) native-tls via reqwest — OFF par défaut (Windows corporate-proxy/custom-cert rationale, from a since-retired portability RFC)
 └── async-trait + serde + serde_json + thiserror + tokio + tracing
 
 gradatum-curator        (curation : filtrage, routage, tagging, audit/dedup)
@@ -249,12 +264,6 @@ gradatum-auth           (auth JWT/OIDC/API-key + validation de token)
 **Clients** :
 
 ```
-gradatum-mcp-stub       (adapter MCP stdio → HTTP)
-├── gradatum-core + gradatum-dto
-├── rmcp + schemars
-├── reqwest
-└── tokio + tracing + tracing-subscriber + anyhow + async-trait + serde + serde_json
-
 gradatum-sdk-rs         (SDK Rust pour intégration directe)
 ├── gradatum-core
 ├── reqwest
@@ -268,10 +277,17 @@ gradatum                (façade SDK parapluie — re-exports feature-gated)
 **Non publiables** :
 
 ```
-gradatum-cli            (CLI utilisateur — publish=false, reportée v2.0.0, ⚠️ déjà 0.7.6 sur crates.io)
+gradatum-cli            (CLI utilisateur — publish=false, republication reportée sans version cible, ⚠️ déjà 0.7.6 sur crates.io)
 ├── gradatum-core
 ├── reqwest + clap
 └── serde + serde_json + tokio
+
+gradatum-mcp-stub       (adapter MCP stdio → HTTP — RETIRÉ de la distribution 2.0.0, publish=false, source conservée)
+├── gradatum-core + gradatum-dto
+├── rmcp + schemars
+├── reqwest + clap
+└── tokio + tracing + tracing-subscriber + anyhow + async-trait + serde + serde_json
+
 index-parity-tests      (suite de parité backend-agnostique — dev-deps uniquement)
 v1-parity-tests         (suite de parité v1 — dev-deps uniquement)
 gradatum-bench          (criterion + core/cache/chat/curator/embed/index/storage)
@@ -288,55 +304,64 @@ Exceptions non épinglées, volontaires : `stability 0.2`, `subtle 2` (workspace
 
 | Crate | Version | Usage | Justification |
 |---|---|---|---|
-| `tokio` | `=1.52.1` | Runtime async | Standard Rust async |
+| `tokio` | `=1.53.0` | Runtime async | Standard Rust async |
 | `axum` | `=0.8.9` | Serveur HTTP | Léger, performant, ergonomique |
 | `axum-server` | `=0.8.0` | Terminaison TLS native (`[server.tls]`, B-2) | `tls-rustls-no-provider` : provider crypto explicite |
 | `rustls` | `=0.23.40` | Provider crypto process-default | `aws_lc_rs` installé au boot — évite un second provider `ring` ambigu |
-| `tower` / `tower-http` | `=0.5.2` / `=0.6.10` | Middleware | Compose avec axum (`cors`, `trace`, `fs`, `set-header`, `limit`) |
-| `http` | `=1.4.0` | Types HTTP partagés | Contrat commun serveur/warden/gateway |
+| `tower` / `tower-http` | `=0.5.3` / `=0.7.0` | Middleware | Compose avec axum (`cors`, `trace`, `fs`, `set-header`, `limit`) |
+| `http` | `=1.4.2` | Types HTTP partagés | Contrat commun serveur/warden/gateway |
 | `rmcp` | `=1.6.0` | Serveur MCP natif | Lib Rust MCP officielle, pinnée (`transport-streamable-http-server`) |
-| `schemars` | `=1.0.4` | Schémas JSON des outils MCP | Dérivation auto des schémas d'outils |
+| `schemars` | `=1.2.1` | Schémas JSON des outils MCP | Dérivation auto des schémas d'outils |
 | `rusqlite` | `=0.32.1` (bundled) | SQLite + FTS5 | Embarqué, multi-feature |
 | `sqlx` | `=0.8.6` | QueueStore + auth + acl-auth | WAL + `UPDATE … RETURNING` atomique |
 | `sqlite-vec` | `=0.1.9` | Index ANN vec0 | `default-features = false` : évite un rusqlite ^0.31 conflictuel |
-| `globset` | `=0.4.18` | Matching de patterns ACL | Lib pure, simple |
+| `globset` | `=0.4.19` | Matching de patterns ACL | Lib pure, simple |
 | `argon2` | `=0.5.3` | Hachage de clés d'API (OWASP) | Recommandation standard |
 | `moka` | `=0.12.15` | Cache LRU | Performant, thread-safe |
-| `reqwest` | `=0.13.3` (rustls) | Client HTTP | Standard, sans OpenSSL |
+| `reqwest` | `=0.13.4` (rustls) | Client HTTP | Standard, sans OpenSSL |
 | `opendal` | `=0.58.1` | Abstraction de stockage (façade `opendal-core` + `opendal-service-*` depuis 0.56) | `fs` par défaut ; s3/gcs/azure derrière features |
-| `serde` / `serde_json` / `serde_jcs` / `serde_norway` / `toml` | `=1.0.228` / `=1.0.149` / `=0.1.0` / `=0.9.42` / `=1.1.2` | Sérialisation | Frontmatter MD, JSON-RPC, JCS RFC 8785, configs |
-| `toml_edit` | `=0.25.11` | Édition TOML préservant le format | Écriture de config par la CLI |
+| `opendal-http-transport-reqwest` | `=0.58.1` | Transport HTTP enfichable d'OpenDAL 0.58 (apache/opendal#7900) — requis par les backends objet (S3/GCS/Azure) : sans lui, toute opération objet échoue avant le premier paquet réseau (`ConfigInvalid`). Installé au démarrage par `gradatum-storage` (`install_default()`). | `default-features = false`, feature `rustls-no-provider` (aucun provider crypto embarqué ; lit le provider process-default `aws_lc_rs`). Direct sur `gradatum-storage`, `optional`, feature `cloud-http` |
+| `serde` / `serde_json` / `serde_jcs` / `serde_norway` / `toml` | `=1.0.229` / `=1.0.150` / `=0.1.0` / `=0.9.42` / `=1.1.3` | Sérialisation | Frontmatter MD, JSON-RPC, JCS RFC 8785, configs |
+| `toml_edit` | `=0.25.13` | Édition TOML préservant le format | Écriture de config par la CLI |
 | `figment` | `=0.10.19` | Chargement de config | Fusion fichier + env |
-| `bincode` | `=2.0.1` | Payloads de jobs | Sérialisation binaire compacte |
 | `tracing` / `tracing-subscriber` | `=0.1.44` / `=0.3.23` | Logs structurés | Sortie JSON prête pour SIEM |
-| `clap` | `=4.6.1` | Parsing CLI | Derive standard |
-| `ulid` | `=1.2.1` | IDs de notes stables | Triable lexicographiquement, ordonné dans le temps |
-| `chrono` | `=0.4.44` | Dates ISO 8601 | Standard |
+| `clap` | `=4.6.2` | Parsing CLI | Derive standard |
+| `ulid` | `=3.0.0` | IDs de notes stables | Triable lexicographiquement, ordonné dans le temps |
+| `chrono` | `=0.4.45` | Dates ISO 8601 | Standard |
 | `walkdir` | `=2.5.0` | Scan FS | Reindex / migrate (`gradatum-admin`) |
-| `regex` / `once_cell` | `=1.12.3` / `=1.21.4` | Parsing wikilinks, statiques paresseux | Standard |
-| `thiserror` / `anyhow` | `=2.0.18` / `=1.0.103` | Gestion d'erreurs | `anyhow` 1.0.103 = fix RUSTSEC-2026-0190 |
+| `regex` / `once_cell` | `=1.13.1` / `=1.21.4` | Parsing wikilinks, statiques paresseux | Standard |
+| `thiserror` / `anyhow` | `=2.0.19` / `=1.0.104` | Gestion d'erreurs | `anyhow` ≥ 1.0.103 = fix RUSTSEC-2026-0190 |
 | `sha2` | `=0.11.0` | Hachage (drift, content_hash JCS) | — |
-| `secrecy` / `zeroize` / `subtle` | `=0.10.3` / `=1.8.2` / `2` | Secrets zeroize-on-drop, comparaison constante | Credentials LLM + JWT |
+| `secrecy` / `zeroize` / `subtle` | `=0.10.3` / `=1.9.0` / `2` | Secrets zeroize-on-drop, comparaison constante | Credentials LLM + JWT |
 | `ed25519-dalek` / `pkcs8` | `=2.1.1` / `=0.10.2` | Signature JWT EdDSA | Clé Ed25519 persistée chmod 600 |
 | `jsonwebtoken` | `=9.3.1` | Encodage/décodage JWT | ⚠ **maintenu en 9.x** : 10.x exige la feature `rust_crypto` (`sha2 ^0.10.7`), incompatible avec `sha2 =0.11.0` |
-| `governor` / `ipnet` / `dashmap` | `=0.10.4` / `2` / `=6.1.0` | Rate-limit, CIDR, map concurrente | `gradatum-warden`, `gradatum-auth` |
-| `nix` | `=0.31.2` | Syscalls UNIX (`fs`, `signal`, `process`) | Signalisation de groupe de processus (`gradatum-engine`) |
+| `governor` / `ipnet` / `dashmap` | `=0.10.4` / `2` / `=6.2.1` | Rate-limit, CIDR, map concurrente | `gradatum-warden`, `gradatum-auth` |
+| `nix` | `=0.31.3` | Syscalls UNIX (`fs`, `signal`, `process`) | Signalisation de groupe de processus (`gradatum-engine`) |
 | `apalis` | `=1.0.0-rc.9` | Framework de job queue (Monitor multi-worker + layers Timeout/Retry/CatchPanic/LoadShed) | Framework Rust type-safe, crate embarquée à la compilation (pas un service runtime — ARCH-D15 F-24). Pin exact D-09 + caveat C1 RC9→v1.0 |
-| `apalis-sql` | `=1.0.0-rc.9` | Traits backend Apalis | Cohérent avec le pin du core |
-| `apalis-sqlite` | `=1.0.0-rc.8` | Backend SQLite réel (via sqlx 0.8) | rc.9 non publié |
 | `apalis-cron` / `cron` | `=1.0.0-rc.8` / `=0.16.0` | Schedules périodiques | rc.9 non publié pour `apalis-cron` |
-| `prometheus` | `=0.13.4` | Exporter worker (:19091) | Pin exact patch level (0.14 breaking connu) |
-| `prometheus-client` | `=0.22.3` | Metrics serveur + engine | — |
+| `prometheus` | `=0.14.0` | Exporter worker (:19091) | Pin exact minor level |
+| `prometheus-client` | `=0.25.0` | Metrics serveur + engine | — |
 | `ort` / `tokenizers` | `=2.0.0-rc.9` / `0.21` | Reranker cross-encoder ONNX | Optionnels (`onnx-reranker`) |
-| `fastembed` / `ort-sys` | `=4.6.0` / `=2.0.0-rc.9` | Embeddings CPU locaux | Optionnels (`fastembed-cpu`) ; `ort-sys` pinné rc.9 (rc.12 tire ureq v3) |
+| `fastembed` / `ort-sys` | `=4.9.1` / `=2.0.0-rc.9` | Embeddings CPU locaux | Optionnels (`fastembed-cpu`) ; `ort-sys` pinné rc.9 (rc.12 tire ureq v3) |
 | `tree-sitter` (+ `-rust`, `-python`, `-bash`, `-typescript`) | `=0.26.9` (+ `=0.24.2`, `=0.25.0`, `=0.25.1`, `=0.23.2`) | Parsing code-ingest | Optionnels, une feature par langage |
 | `stability` | `0.2` | Annotations `#[stability::unstable]` | Seule dépendance non épinglée à l'exact |
-| `include_dir` / `smallvec` / `strsim` / `unicode-segmentation` / `hex` / `bytes` / `url` / `futures` | `=0.7.4` / `=1.13.2` / `=0.11.1` / `=1.13.2` / `=0.4.3` / `1` / `=2.5.8` / `=0.3.32` | Utilitaires | — |
-| `tempfile` / `proptest` / `serde_test` / `wiremock` / `mockito` / `insta` / `criterion` | `=3.27.0` / `=1.11.0` / `=1.0.171` / `=0.6.5` / `=1.6.1` / `=1.42.2` / `=0.5.1` | Tests + benchs (dev) | Standard |
+| `include_dir` / `smallvec` / `strsim` / `unicode-segmentation` / `hex` / `bytes` / `url` / `futures` | `=0.7.4` / `=1.15.2` / `=0.11.1` / `=1.13.3` / `=0.4.3` / `1` / `=2.5.8` / `=0.3.33` | Utilitaires | — |
+| `tempfile` / `proptest` / `serde_test` / `wiremock` / `mockito` / `insta` / `criterion` | `=3.27.0` / `=1.11.0` / `=1.0.177` / `=0.6.5` / `=1.7.2` / `=1.48.0` / `=0.8.2` | Tests + benchs (dev) | Standard |
 
 > ❗ `tantivy` a été retiré de cette table : il n'a jamais été une dépendance du workspace
 > (aucune occurrence dans les `Cargo.toml`). La ligne « à fixer Phase 3 » était une intention,
 > pas un état.
+>
+> ❗ `apalis-sql` / `apalis-sqlite` retirées de cette table (2026-08-11) : plus aucune occurrence
+> dans les `Cargo.toml` du workspace ni dans `Cargo.lock` (`cargo metadata` résout uniquement
+> `apalis`, `apalis-core` [transitif], `apalis-cron`). La description « Backend SQLite réel (via
+> sqlx 0.8) » d'`apalis-sqlite` décrivait une architecture qui n'existe pas — ne pas la reconduire.
+>
+> ❗ `bincode` retiré de cette table (2026-08-11) : supprimé du dev-dep `gradatum-dto` et des deps
+> `gradatum-worker`/`gradatum-queue` par le commit `48bc72c1` (2026-08-09, suppression de l'ancien
+> moteur de travaux). Ni `Cargo.toml` ni `Cargo.lock` n'en portent plus trace — un `grep -rn
+> bincode crates/*/Cargo.toml` est vide. La ligne 40 ci-dessus (entrée changelog 2026-07-24) est
+> laissée intacte : elle décrivait un état exact à cette date, antérieur au retrait.
 
 ### Crate workspace `gradatum-db-sqlite`
 
@@ -375,7 +400,7 @@ Table établie par lecture des blocs `[features]` de chaque `Cargo.toml`.
 | `gradatum-index` | `sqlite-vec-ann` | — | `sqlite-vec` (index ANN vec0) |
 | `gradatum-search` | `onnx-reranker` | — | `ort` + `tokenizers` (cross-encoder) |
 | `gradatum-embed` | `fastembed-cpu` | — | `fastembed` + `ort-sys` (embeddings CPU locaux) |
-| `gradatum-embed` / `gradatum-chat` | `windows-native-tls` | — | `reqwest/native-tls` (RFC-0002 §4.6) |
+| `gradatum-embed` / `gradatum-chat` | `windows-native-tls` | — | `reqwest/native-tls` (Windows-only feature, vestigial since the project went Linux-only) |
 | `gradatum-bench` / `gradatum-gateway` | `fastembed-cpu` | — | propage `gradatum-embed/fastembed-cpu` |
 | `gradatum-engine` | `serve` | — | toute la surface serveur du superviseur (axum, reqwest, figment, nix, …) |
 | `gradatum-engine` | `test-utils` | — | implique `serve` |
@@ -412,6 +437,23 @@ Régénérer après `cargo build --workspace` :
 cd /path/to/gradatum
 cargo tree --workspace --depth 1 > /tmp/cargo-tree.txt
 # Comparer avec ce fichier, mettre à jour si divergence.
+```
+
+**Régénérer la colonne « Version » de la table des pins** (source = manifeste, pas
+saisie manuelle). La commande ci-dessous produit la liste autoritative
+`nom = pin` du `[workspace.dependencies]` racine plus les pins déclarés au niveau
+crate (`hex`/`bytes`/`url`/`tokenizers`/`cron`/`ipnet`/`tree-sitter*`). La table doit
+en être la lecture directe ; toute cellule qui en diverge est un bug documentaire :
+
+```bash
+cd /path/to/gradatum
+{ awk '/^\[workspace.dependencies\]/{s=1;next} /^\[/{s=0} s' Cargo.toml
+  grep -hE '^[a-zA-Z0-9_-]+ *= *(\{[^}]*version *=|")' crates/*/Cargo.toml
+} | sed -E 's/#.*//' \
+  | grep -oE '^[a-zA-Z0-9_-]+ *= *(\{[^}]*version *= *"[^"]+"|"[^"]+")' \
+  | sed -E 's/ *= *\{[^}]*version *= *"/ = "/; s/([a-zA-Z0-9_-]+) *= *"([^"]+)".*/\1 = \2/' \
+  | sort -u
+# Diffe cette sortie contre les cellules Version de la table ci-dessus.
 ```
 
 Contrôles rapides utiles :

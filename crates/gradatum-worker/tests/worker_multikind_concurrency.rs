@@ -87,10 +87,10 @@ async fn embed_stub(
 fn make_curate_record() -> JobRecord {
     let now = Utc::now();
     JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind: Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 ..Default::default()
             }),
@@ -135,10 +135,10 @@ fn make_curate_record() -> JobRecord {
 fn make_embed_record() -> JobRecord {
     let now = Utc::now();
     JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind: Job::Embed(EmbedSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 force_regenerate: false,
             }),

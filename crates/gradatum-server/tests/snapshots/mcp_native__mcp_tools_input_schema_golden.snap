@@ -1,5 +1,6 @@
 ---
 source: crates/gradatum-server/tests/mcp_native.rs
+assertion_line: 726
 expression: schema_map
 ---
 {
@@ -211,7 +212,7 @@ expression: schema_map
   "vault_classify": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Request body for `vault_classify` — synchronous heuristic re-classification of an existing note.\n\nThe **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.\nThe bincode serialization (`bincode::serde::encode_to_vec`) is used only by the\nlegacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.",
+    "description": "Request body for `vault_classify` — synchronous heuristic re-classification of an existing note.\n\nSerialised via `serde_json`.",
     "properties": {
       "note_id": {
         "description": "ULID identifier of the note to re-classify.",
@@ -398,7 +399,7 @@ expression: schema_map
   },
   "vault_downgrade": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request body for `vault_downgrade` — downgrades a note.\n\nThe **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.\nThe bincode serialization (`bincode::serde::encode_to_vec`) is used only by the\nlegacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.\n\nPOST `/api/v1/vault_downgrade`. Idempotent: downgrading an already-downgraded\nnote returns 200 with the current status.",
+    "description": "Request body for `vault_downgrade` — downgrades a note.\n\nSerialised via `serde_json`. Consumed synchronously by `notes::vault_downgrade`.\n\nPOST `/api/v1/vault_downgrade`. Idempotent: downgrading an already-downgraded\nnote returns 200 with the current status.",
     "properties": {
       "note_id": {
         "description": "ULID identifier of the note to downgrade.",
@@ -1123,7 +1124,7 @@ expression: schema_map
   },
   "vault_write": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request body for `vault_write` — creates a note via the async queue.\n\nThe **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.\nThe bincode serialization (`bincode::serde::encode_to_vec`) is used only by the\nlegacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.",
+    "description": "Request body for `vault_write` — creates a note via the async queue.\n\nThe queue path (`SqliteQueueStore`) serialises this struct via `serde_json`.",
     "properties": {
       "author": {
         "default": null,
@@ -1147,7 +1148,7 @@ expression: schema_map
       },
       "note_id": {
         "default": null,
-        "description": "Pre-allocated ULID — honored by the legacy `SqliteQueue` dispatcher if present\nand parseable as a valid ULID.\n\n`None` = backward-compatible behavior: the dispatcher generates a fresh ULID.\n\n## Bincode field-order invariant\n\nThis field is at **position 8** (last) — AFTER `tenant_id` (pos 6) and\n`expected_sha256` (pos 7). Bincode v2 (`config::standard()`) is positional:\ndeclaration order determines serialization order.\nNever move this field without updating all encoders.",
+        "description": "Pre-allocated ULID — honoured by the active curate worker\n(`handle_curate` → `write_note_with_id`) if present and parseable as a valid ULID.\n\n`None` = backward-compatible behaviour: a fresh ULID is generated at persist time.\n\nField order carries no wire meaning: the struct is serialised via `serde_json`,\nwhich matches fields by name. (The former bincode positional invariant is gone\nwith the legacy dispatcher.)",
         "type": [
           "string",
           "null"

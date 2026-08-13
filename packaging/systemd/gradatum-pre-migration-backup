@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Backup atomique pre-migration des 3 bases SQLite de gradatum (index, queue, api_keys).
+# Couvre index.db EN PRIORITÉ (cible des migrations rusqlite, NON sauvegardé par le deploy script).
+#
+# Exécuté en ExecStartPre par gradatum-server.service et gradatum-worker.service.
+# En cas d'échec : exit non-zero → systemd refuse de démarrer le service (atomicité).
+#
+# Usage direct (test) : sudo -u gradatum /usr/local/bin/gradatum-pre-migration-backup
+set -euo pipefail
+
+VAULT_INDEX="/var/lib/gradatum/vault/.gradatum/index.db"
+QUEUE_DB="/var/lib/gradatum/db/queue.sqlite"
+APIKEYS_DB="/var/lib/gradatum/db/api_keys.sqlite"
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+DEST="/var/lib/gradatum/backups/pre-migration/${TS}"
+
+mkdir -p "$DEST"
+
+checkpoint() {
+    # Flush WAL avant copie pour cohérence (évite un snapshot d'une transaction partielle).
+    local db="$1"
+    [ -f "$db" ] || { echo "WARN: $db absent, skip checkpoint" >&2; return 0; }
+    sqlite3 "$db" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null || {
+        echo "FATAL: wal_checkpoint failed on $db" >&2
+        return 1
+    }
+}
+
+restore_and_die() {
+    # Trap ERR : log l'échec et sort non-zero pour bloquer le démarrage du service.
+    # NE supprime PAS le répertoire de destination partiel — laisser les artefacts pour debug.
+    echo "FATAL: pre-migration backup failed at ${TS} — service startup aborted (DB intacte, rien migré)" >&2
+    logger -t gradatum-pre-migration-backup "backup FAILED at ${TS} — startup aborted" || true
+    exit 1
+}
+trap restore_and_die ERR
+
+# 1. Checkpoint WAL sur chaque DB présente (index.db en priorité).
+checkpoint "$VAULT_INDEX"
+checkpoint "$QUEUE_DB"
+checkpoint "$APIKEYS_DB"
+
+# 2. Archive les 3 DBs + leurs fichiers WAL/SHM résiduels éventuels.
+# tar ignore les fichiers absents grâce au || true sur les optionnels.
+INCLUDE_PATHS=()
+for db in "$VAULT_INDEX" "$QUEUE_DB" "$APIKEYS_DB"; do
+    [ -f "$db" ] && INCLUDE_PATHS+=("${db#/}")
+    for ext in -wal -shm; do
+        [ -f "${db}${ext}" ] && INCLUDE_PATHS+=("${db#/}${ext}")
+    done
+done
+
+if [ ${#INCLUDE_PATHS[@]} -eq 0 ]; then
+    echo "WARN: aucune DB trouvée — backup vide (première installation ?)" >&2
+    logger -t gradatum-pre-migration-backup "backup WARN no DB found at ${TS}" || true
+    trap - ERR
+    exit 0
+fi
+
+tar -czf "${DEST}/dbs.tar.gz" -C / "${INCLUDE_PATHS[@]}"
+
+# 3. Empreinte SHA256 de l'archive (vérification pré-restore).
+sha256sum "${DEST}/dbs.tar.gz" > "${DEST}/SHA256SUMS"
+
+# 4. Ajuster les permissions (le service tourne sous gradatum:gradatum).
+chown -R gradatum:gradatum "$DEST" 2>/dev/null || true
+
+# 5. Rotation : purge des backups pre-migration > 7 jours.
+# Nécessaire car ExecStartPre s'exécute à CHAQUE restart (worker Restart=always/15s).
+# || true : une erreur de purge ne doit pas bloquer le démarrage (backup courant déjà sécurisé).
+find /var/lib/gradatum/backups/pre-migration/ -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+
+trap - ERR
+echo "OK pre-migration backup → ${DEST}/dbs.tar.gz"
+logger -t gradatum-pre-migration-backup "backup OK at ${TS} → ${DEST}" || true

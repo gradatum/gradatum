@@ -10,7 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use gradatum_bench::build_note;
 use gradatum_cache::{CacheKey, EffectiveNoteCache, EffectiveNoteCacheConfig};

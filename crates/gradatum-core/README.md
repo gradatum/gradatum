@@ -2,7 +2,7 @@
 
 > Shared primitives: traits, canonical types, and typed errors. The L0 foundation every other gradatum crate depends on.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -19,7 +19,7 @@ Every gradatum crate that manipulates notes, jobs or storage depends on `gradatu
 
 ```toml
 [dependencies]
-gradatum-core = "1.0.0"
+gradatum-core = "2.0.0"
 ```
 
 ```rust

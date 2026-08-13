@@ -18,16 +18,24 @@ ExecStartPre=/usr/local/bin/gradatum-pre-migration-backup
 # le même helper que gradatum-server. Le passer en dur ne peut que diverger le
 # jour où storage.root change — le worker refuserait alors de démarrer.
 ExecStart=/usr/bin/gradatum-worker --config /var/lib/gradatum/config/server.toml
-# Fichier d'environnement optionnel — absent = ignoré (EnvironmentFile=- préfixe).
-# Créer /etc/gradatum/env avec le contenu suivant :
-#   # URL de l'API interne server (requis pour worker-flip v0.5.3)
-#   GRADATUM_INTERNAL_URL=http://127.0.0.1:19090
-#   # Token d'authentification API interne (requis pour worker-flip v0.5.3)
-#   GRADATUM_INTERNAL_TOKEN=<bearer_token>
-#   # Logs détaillés (optionnel)
+# Fichier d'environnement REQUIS — il porte GRADATUM_INTERNAL_TOKEN, jeton de l'API
+# interne dont le worker a absolument besoin. Sans lui, le worker échoue au boot sur
+# « GRADATUM_INTERNAL_TOKEN must be set » puis boucle Restart=always/15s EN SILENCE
+# (le serveur reste up, /health vert). PAS de préfixe `-` : une absence doit échouer
+# TÔT et clairement au niveau systemd (« EnvironmentFile not found »), jamais dégénérer
+# en crash-loop /health-vert.
+#
+# scripts/install-gradatum-services.sh écrit ce fichier automatiquement après
+# `gradatum-admin init` (jeton lu depuis <root>/config/internal-worker.token.txt).
+# Installation MANUELLE — le créer à la main (root:gradatum 0640) avec :
+#   # Token de l'API interne (OBLIGATOIRE) — valeur produite par `gradatum-admin init`,
+#   # copiée dans <root>/config/internal-worker.token.txt (mode 0600).
+#   GRADATUM_INTERNAL_TOKEN=<contenu de internal-worker.token.txt>
+#   # URL de l'API interne server (optionnel — défaut http://127.0.0.1:19092).
+#   GRADATUM_INTERNAL_URL=http://127.0.0.1:19092
+#   # Logs détaillés (optionnel) — sans RUST_LOG, niveau "info" (défaut init_tracing).
 #   RUST_LOG=gradatum_worker=info,gradatum_curator=info,gradatum_db_sqlite=debug
-# Note : sans RUST_LOG, le worker tourne en niveau "info" (défaut init_tracing).
-EnvironmentFile=-/etc/gradatum/env
+EnvironmentFile=/etc/gradatum/env
 # Restart=always (vs on-failure) — couvre l'exit 0 "pas leader" : si une lease
 # leadership est tenue par un autre worker, l'exit propre est intentionnel mais
 # nécessite un retry périodique pour takeover post-expiration. Sans always, le

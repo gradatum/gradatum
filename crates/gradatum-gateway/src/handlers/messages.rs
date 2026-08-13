@@ -367,7 +367,7 @@ async fn messages_handler_inner(
         // se décide sur l'échec connexion/headers, pas sur le premier token.
         chat_req.stream = Some(true);
 
-        let message_id = format!("msg_{}", ulid::Ulid::new().to_string().to_lowercase());
+        let message_id = format!("msg_{}", ulid::Ulid::generate().to_string().to_lowercase());
         let sse_model = model_name.clone();
 
         // Données possédées par la tâche de dispatch différée (`'static`).

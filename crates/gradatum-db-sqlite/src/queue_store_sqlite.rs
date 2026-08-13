@@ -1952,7 +1952,7 @@ mod tests {
     fn make_record(job: Job, class: JobClass, status: JobStatus) -> JobRecord {
         let now = Utc::now();
         JobRecord {
-            id: Ulid::new(),
+            id: Ulid::generate(),
             spec: JobSpec {
                 kind: job,
                 class,
@@ -2000,7 +2000,7 @@ mod tests {
 
         let record = make_record(
             Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 ..Default::default()
             }),
@@ -2026,7 +2026,7 @@ mod tests {
         let low = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
         let high = make_record(
             Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 ..Default::default()
             }),
@@ -2100,7 +2100,7 @@ mod tests {
 
         let record = make_record(
             Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 ..Default::default()
             }),
@@ -2240,7 +2240,7 @@ mod tests {
         for _ in 0..2 {
             let r = make_record(
                 Job::Curate(CurateSpec {
-                    note_id: Ulid::new(),
+                    note_id: Ulid::generate(),
                     tenant_id: "main".to_string(),
                     ..Default::default()
                 }),
@@ -2552,7 +2552,7 @@ mod tests {
         );
         let embed_record = make_record(
             Job::Embed(EmbedSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 force_regenerate: false,
             }),
@@ -2750,7 +2750,7 @@ mod tests {
         assert_eq!(job_kind_str(&Job::Curate(CurateSpec::default())), "Curate");
         assert_eq!(
             job_kind_str(&Job::Embed(EmbedSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "t".into(),
                 force_regenerate: false,
             })),
@@ -3008,7 +3008,7 @@ mod tests {
         let pool = test_pool().await;
         let store = SqliteQueueStore::new(pool);
 
-        let done_id = Ulid::new();
+        let done_id = Ulid::generate();
         let dep = make_waiting_record_with_dep(done_id);
         let dep_id = dep.id;
         store.enqueue(dep).await.expect("enqueue dépendant");
@@ -3036,7 +3036,7 @@ mod tests {
         store.enqueue(rec).await.expect("enqueue");
 
         let result = store
-            .find_awaiting(Ulid::new())
+            .find_awaiting(Ulid::generate())
             .await
             .expect("find_awaiting doit réussir");
 
@@ -3055,12 +3055,12 @@ mod tests {
 
         // ULIDs de 26 chars — "01AAAAAAAAAAAAAAAAAAAAAA" est différent de "01AAAAAAAAAAAAAAAAAAAAA"
         // On crée un ULID réel et un ULID fictif qui est un préfixe tronqué.
-        let real_dep_id = Ulid::new();
+        let real_dep_id = Ulid::generate();
         let dep = make_waiting_record_with_dep(real_dep_id);
         store.enqueue(dep).await.expect("enqueue dépendant");
 
-        // On cherche avec un Ulid::new() différent — aucun match attendu.
-        let different_id = Ulid::new();
+        // On cherche avec un Ulid::generate() différent — aucun match attendu.
+        let different_id = Ulid::generate();
         let result = store
             .find_awaiting(different_id)
             .await
@@ -3281,7 +3281,7 @@ mod tests {
         store.enqueue(rec).await.expect("enqueue");
 
         // cascade sur un ID arbitraire → aucun job Waiting référence cet ID.
-        let result = store.cascade_check_and_promote(Ulid::new()).await;
+        let result = store.cascade_check_and_promote(Ulid::generate()).await;
 
         assert!(result.is_ok(), "cascade sans dépendant doit retourner OK");
     }
@@ -3457,7 +3457,7 @@ mod tests {
     /// creating the illusion of a dead worker.
     ///
     /// Deterministic test: 3 jobs with ULID timestamps at explicit increasing offsets
-    /// (no dependency on `Ulid::new()` monotonicity or sleeps).
+    /// (no dependency on `Ulid::generate()` monotonicity or sleeps).
     #[tokio::test]
     async fn latest_job_returns_most_recent_not_oldest() {
         use std::time::{Duration as StdDuration, UNIX_EPOCH};
@@ -3864,7 +3864,7 @@ mod tests {
 
         let record = make_record(
             Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 ..Default::default()
             }),
@@ -3938,7 +3938,7 @@ mod tests {
 
         let record = make_record(
             Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 ..Default::default()
             }),
@@ -3976,7 +3976,7 @@ mod tests {
 
         let record = make_record(
             Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "main".to_string(),
                 ..Default::default()
             }),
@@ -4064,7 +4064,7 @@ mod tests {
         // Job tenant A.
         let job_a = make_record(
             Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "alice".to_string(),
                 ..Default::default()
             }),
@@ -4077,7 +4077,7 @@ mod tests {
         // Job tenant B.
         let job_b = make_record(
             Job::Curate(CurateSpec {
-                note_id: Ulid::new(),
+                note_id: Ulid::generate(),
                 tenant_id: "bob".to_string(),
                 ..Default::default()
             }),

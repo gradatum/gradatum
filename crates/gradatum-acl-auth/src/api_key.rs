@@ -78,10 +78,33 @@ pub fn has_write_scope(scopes: &[String]) -> bool {
     scopes.iter().any(|s| WRITE_SCOPES.contains(&s.as_str()))
 }
 
+/// The scope that grants the privilege to write (and read) **any agent's soul note**
+/// (`identity/*`), not merely one's own.
+///
+/// Deliberately **distinct** from every member of [`WRITE_SCOPES`] (`write`/`admin`/`service`):
+/// a key declared "full vault" through `admin` must **not** silently inherit the power to
+/// overwrite another agent's sovereign identity. Soul-write privilege is a separate, explicit
+/// grant.
+///
+/// The disjointness cuts both ways: a key bearing **only** `identity_write` holds no member of
+/// [`WRITE_SCOPES`], so it grants no ordinary write access and is refused on every non-soul
+/// write path. Soul-write must be **combined** with a write scope to write anything besides a
+/// soul note — it never stands alone as a general write credential.
+///
+/// This constant is the **single source of truth** shared by the server (which enforces it on
+/// each identity read/write path via `TrustContext::has_scope`) and by `gradatum-admin
+/// api-key create` (which grants it). Two independent string literals would let a typo
+/// (`identity_write` vs `identity-write`) become a silently non-functional grant.
+///
+/// Owning one's **own** soul is an identity property (`caller_sub == agent`), never gated by
+/// this scope: an agent without it still reads and writes `identity/<its-own-sub>`.
+pub const IDENTITY_WRITE_SCOPE: &str = "identity_write";
+
 // ── Erreurs ────────────────────────────────────────────────────────────────────
 
 /// Errors returned by API key store operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ApiKeyError {
     /// No key matching the given prefix or secret was found.
     #[error("API key not found")]
@@ -176,7 +199,7 @@ pub struct ApiKeyMaterial {
 ///
 /// ## Stability
 ///
-/// Covered by the crate's `1.x` SemVer guarantee — see the [crate-level stability
+/// Covered by the crate's `2.x` SemVer guarantee — see the [crate-level stability
 /// section](crate#stability). Concrete implementations must implement all methods.
 ///
 /// ## argon2id cost
@@ -259,6 +282,38 @@ pub trait ApiKeyStore: Send + Sync {
     /// - `ApiKeyError::AlreadyRevoked` if the source key is already revoked
     /// - `ApiKeyError::Sql` if the transaction fails
     async fn rotate(&self, prefix: &str) -> Result<ApiKeyMaterial, ApiKeyError>;
+
+    /// Returns `true` if the registry holds at least one **active** (non-revoked) key.
+    ///
+    /// Answers a single question: *has this installation ever been provisioned?* It
+    /// lets a caller tell an uninitialised registry (no key at all — the operator
+    /// must run the provisioning step) from a rejected credential (keys exist, this
+    /// one is not among them), so the two can be reported differently instead of
+    /// collapsing into one opaque failure.
+    ///
+    /// ## Scope
+    ///
+    /// Emptiness is measured **globally**, across every tenant: a registry populated
+    /// for another tenant is not an empty registry. The result is a floor, never a
+    /// coverage claim — `true` means *at least one* active key exists, never that
+    /// every declared identity owns one (identities deliberately left without a key
+    /// are a supported state).
+    ///
+    /// ## Default body
+    ///
+    /// Derived from [`ApiKeyStore::list`], so no external implementor breaks: `list`
+    /// with `include_revoked = false` already filters revoked keys out, and a `None`
+    /// tenant filter already spans every tenant. The default loads the whole store
+    /// into memory (each [`ApiKey`] carries an argon2id hash) — implementations
+    /// backed by a queryable store should override it with an existence check.
+    ///
+    /// # Errors
+    /// - Propagates whatever the underlying store fails with — `ApiKeyError::Sql`
+    ///   for the SQLite-backed implementation.
+    #[must_use]
+    async fn has_any_active(&self) -> Result<bool, ApiKeyError> {
+        Ok(!self.list(false, None).await?.is_empty())
+    }
 }
 
 // ── Implémentation SQLite ──────────────────────────────────────────────────────
@@ -468,7 +523,7 @@ impl SqliteApiKeyStore {
         description: Option<String>,
     ) -> ApiKey {
         let scopes: Vec<String> = serde_json::from_str(&scopes_json).unwrap_or_default();
-        let id_ulid = Ulid::from_string(&id).unwrap_or_else(|_| Ulid::new());
+        let id_ulid = Ulid::from_string(&id).unwrap_or_else(|_| Ulid::generate());
         ApiKey {
             id: id_ulid,
             prefix,
@@ -508,7 +563,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         tenant_id: String,
         description: Option<String>,
     ) -> Result<ApiKeyMaterial, ApiKeyError> {
-        // P0 cross-tenant (Lot 6) : refus à la création de toute clé non-main tant
+        // Garde cross-tenant : refus à la création de toute clé non-main tant
         // que le vault est mono-physique. Garde code-level (pas de CHECK SQL — SQLite
         // n'autorise pas ADD CONSTRAINT ; cette garde est réversible et suffisante car
         // `create` est l'UNIQUE chemin d'insertion d'api_keys). Levée contrôlée C3a :
@@ -524,7 +579,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         let secret = Self::generate_secret();
         let prefix = Self::derive_prefix(&secret).to_string();
         let hash = Self::hash_secret(&secret)?;
-        let id = Ulid::new().to_string();
+        let id = Ulid::generate().to_string();
         let scopes_json = serde_json::to_string(&scopes)
             .map_err(|e| ApiKeyError::Crypto(format!("scopes JSON serialization failed: {e}")))?;
         let now = Self::now_epoch();
@@ -567,7 +622,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
                 let secret2 = Self::generate_secret();
                 let prefix2 = Self::derive_prefix(&secret2).to_string();
                 let hash2 = Self::hash_secret(&secret2)?;
-                let id2 = Ulid::new().to_string();
+                let id2 = Ulid::generate().to_string();
                 sqlx::query(
                     "INSERT INTO api_keys (id, prefix, hash, owner, scopes_json, tenant_id, created_at, description) \
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -788,7 +843,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         let new_secret = Self::generate_secret();
         let new_prefix = Self::derive_prefix(&new_secret).to_string();
         let new_hash = Self::hash_secret(&new_secret)?;
-        let new_id = Ulid::new().to_string();
+        let new_id = Ulid::generate().to_string();
         let now = Self::now_epoch();
 
         // Transaction atomique : INSERT new + UPDATE old (P1-5 spec V2).
@@ -837,6 +892,22 @@ impl ApiKeyStore for SqliteApiKeyStore {
             prefix: new_prefix,
         })
     }
+
+    /// Overrides the trait's default body — same answer, without loading the store.
+    ///
+    /// The default derived from `list` materializes EVERY active key in memory, each
+    /// carrying an argon2id hash, only to read whether the set is empty. `EXISTS` stops
+    /// at the first matching row and returns a single integer. The default stays for the
+    /// contract (external implementors); this override is here for the cost.
+    ///
+    /// No `tenant_id` filter: the emptiness measured is global, as in the trait.
+    async fn has_any_active(&self) -> Result<bool, ApiKeyError> {
+        let exists: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_keys WHERE revoked_at IS NULL)")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(exists != 0)
+    }
 }
 
 // ── Tests unitaires ───────────────────────────────────────────────────────────
@@ -878,7 +949,7 @@ mod tests {
         assert!(!key.is_revoked());
     }
 
-    /// C3a (F-45) : l'opt-in `with_non_main_tenants` lève la garde Lot 6 — la clé
+    /// L'opt-in `with_non_main_tenants` lève la garde qui interdit les tenants non-`main` — la clé
     /// est créée avec son tenant propre (l'autorisation d'émission JWT reste en aval).
     #[tokio::test]
     async fn create_non_main_tenant_allowed_with_optin() {
@@ -899,7 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_non_main_tenant_is_refused() {
-        // P0 cross-tenant (Lot 6) : impossible de créer une clé non-main en mono-vault.
+        // Garde cross-tenant : impossible de créer une clé non-main en mono-vault.
         let store = make_store().await;
         let result = store
             .create(
@@ -1205,6 +1276,126 @@ mod tests {
         assert!(
             matches!(result, Err(ApiKeyError::NotFound)),
             "préfixe bien formé inconnu → NotFound (via dummy compare), obtenu : {result:?}"
+        );
+    }
+
+    /// R5 — registre vierge : aucune clé n'a jamais été créée.
+    ///
+    /// C'est l'état « installation non initialisée » que la discrimination 503/401
+    /// doit pouvoir nommer ; il ne doit pas se confondre avec « credential invalide ».
+    #[tokio::test]
+    async fn has_any_active_returns_false_on_empty_store() {
+        let store = make_store().await;
+        let result = store.has_any_active().await.expect("has_any_active");
+        assert!(!result, "magasin vide → false, obtenu : {result}");
+    }
+
+    /// R5 — une clé active suffit : la mesure porte sur l'existence d'AU MOINS une
+    /// clé, jamais sur la couverture de chaque identité déclarée (le registre réel
+    /// porte des identités volontairement sans clé, `admin` par exemple).
+    #[tokio::test]
+    async fn has_any_active_returns_true_with_one_active_key() {
+        let store = make_store().await;
+        store
+            .create(&AgentId::new("owner1"), vec![], "main".to_string(), None)
+            .await
+            .expect("create");
+        let result = store.has_any_active().await.expect("has_any_active");
+        assert!(result, "une clé active → true, obtenu : {result}");
+    }
+
+    /// R5 — cas discriminant : un registre dont l'unique clé a été RÉVOQUÉE est
+    /// vide au sens de la discrimination. Les deux tests précédents passeraient
+    /// avec un `COUNT(*)` naïf ; seul celui-ci prouve que les révoquées sont
+    /// filtrées. La clé est révoquée par le vrai chemin `revoke`, jamais par une
+    /// ligne pré-révoquée insérée à la main — c'est ce chemin qu'on couvre.
+    #[tokio::test]
+    async fn has_any_active_returns_false_when_only_key_is_revoked() {
+        let store = make_store().await;
+        let material = store
+            .create(&AgentId::new("owner1"), vec![], "main".to_string(), None)
+            .await
+            .expect("create");
+        store.revoke(&material.prefix).await.expect("revoke");
+        let result = store.has_any_active().await.expect("has_any_active");
+        assert!(!result, "unique clé révoquée → false, obtenu : {result}");
+    }
+
+    /// R5 — la vacuité mesurée est GLOBALE : une clé appartenant à un autre tenant
+    /// que celui de l'appelant rend le registre non vide. Un registre peuplé pour
+    /// un autre tenant n'est pas un registre vierge.
+    #[tokio::test]
+    async fn has_any_active_ignores_tenant_scoping() {
+        let store = make_store().await.with_non_main_tenants();
+        store
+            .create(&AgentId::new("owner1"), vec![], "autre".to_string(), None)
+            .await
+            .expect("create tenant ≠ main");
+        let result = store.has_any_active().await.expect("has_any_active");
+        assert!(result, "clé d'un autre tenant → true, obtenu : {result}");
+    }
+
+    /// Implémenteur de test qui NE surcharge PAS `has_any_active`.
+    ///
+    /// `SqliteApiKeyStore` surcharge la méthode : les tests ci-dessus exercent donc
+    /// la requête `EXISTS`, jamais le corps par défaut du trait. Or c'est ce corps
+    /// que tout implémenteur externe hérite — c'est lui la promesse SemVer. Ce
+    /// délégué le rend exécutable : il transmet les cinq méthodes requises au
+    /// magasin SQLite et laisse `has_any_active` au défaut dérivé de `list`.
+    struct DefaultBodyStore(SqliteApiKeyStore);
+
+    #[async_trait::async_trait]
+    impl ApiKeyStore for DefaultBodyStore {
+        async fn create(
+            &self,
+            owner: &AgentId,
+            scopes: Vec<String>,
+            tenant_id: String,
+            description: Option<String>,
+        ) -> Result<ApiKeyMaterial, ApiKeyError> {
+            self.0.create(owner, scopes, tenant_id, description).await
+        }
+        async fn verify(&self, secret: &str) -> Result<ApiKey, ApiKeyError> {
+            self.0.verify(secret).await
+        }
+        async fn list(
+            &self,
+            include_revoked: bool,
+            tenant_filter: Option<&str>,
+        ) -> Result<Vec<ApiKey>, ApiKeyError> {
+            self.0.list(include_revoked, tenant_filter).await
+        }
+        async fn revoke(&self, prefix: &str) -> Result<(), ApiKeyError> {
+            self.0.revoke(prefix).await
+        }
+        async fn rotate(&self, prefix: &str) -> Result<ApiKeyMaterial, ApiKeyError> {
+            self.0.rotate(prefix).await
+        }
+        // has_any_active : volontairement NON surchargée — c'est l'objet du test.
+    }
+
+    /// Le corps par défaut du trait rend les mêmes verdicts que la surcharge SQL.
+    ///
+    /// Un seul test pour les trois états car l'assertion logique est unique : la
+    /// PARITÉ entre les deux implémentations. Les états eux-mêmes sont déjà couverts
+    /// un par un ci-dessus, contre la surcharge.
+    #[tokio::test]
+    async fn has_any_active_default_body_matches_sqlite_override() {
+        let store = DefaultBodyStore(make_store().await);
+
+        let empty = store.has_any_active().await.expect("vide");
+        let material = store
+            .create(&AgentId::new("owner1"), vec![], "main".to_string(), None)
+            .await
+            .expect("create");
+        let active = store.has_any_active().await.expect("active");
+        store.revoke(&material.prefix).await.expect("revoke");
+        let revoked = store.has_any_active().await.expect("révoquée");
+
+        assert_eq!(
+            (empty, active, revoked),
+            (false, true, false),
+            "corps par défaut : (vide, une active, une révoquée) attendu (false, true, false)"
         );
     }
 

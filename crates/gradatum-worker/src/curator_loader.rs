@@ -21,6 +21,7 @@ use figment::{
     Figment,
     providers::{Format, Toml},
 };
+use gradatum_core::config::redact_figment_error;
 use gradatum_curator::{CuratorLlmConfig, CuratorPipeline, CuratorPipelineConfig};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -289,12 +290,16 @@ pub fn build_curator_pipeline(
             }
             Err(e) => {
                 health.record("curator", Some(FallbackCause::ParseFailed));
+                // Redaction : le `[curator]`/`[curator.llm]` porte `base_url` et
+                // `model` ; le `Display` natif de figment fuiterait un secret collé
+                // par erreur dans un champ typé. Garde-fou centralisé (gradatum-core).
+                let redacted = redact_figment_error(&e);
                 error!(
                     config = %config_path.display(),
                     section = "curator",
                     cause = FallbackCause::ParseFailed.label(),
                     effect = "offline heuristic curator, no LLM call",
-                    error = %e,
+                    error = %redacted,
                     "configuration fallback — section PRESENT but rejected, defaults \
                      applied. A section that is written then ignored is almost always a typo"
                 );

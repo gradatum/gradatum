@@ -193,7 +193,7 @@ pub(crate) fn apply_reasoning(request: &mut ChatCompletionRequest, reasoning: bo
 ///
 /// Precedence: an explicit caller override wins over the router's decision, which
 /// wins over the server default (no-think). Logged for observability — the routing
-/// (think → no-think) must never be a silent downgrade (council 01KWVXAWB3).
+/// (think → no-think) must never be a silent downgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReasoningSource {
     /// Explicit caller override (e.g. the `X-Reasoning-Mode` header).

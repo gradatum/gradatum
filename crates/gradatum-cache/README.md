@@ -2,7 +2,7 @@
 
 > Moka LRU in-process cache with checksum validation on hit.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -21,7 +21,7 @@ This approach avoids stale reads without requiring write-through coordination.
 
 ```toml
 [dependencies]
-gradatum-cache = "1.0.0"
+gradatum-cache = "2.0.0"
 ```
 
 ```rust

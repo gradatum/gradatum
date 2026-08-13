@@ -356,7 +356,7 @@ async fn admin_internal_archives_purge_confirm_mismatch_400() {
 #[tokio::test]
 async fn admin_internal_archives_purge_absent_is_noop() {
     let env = build_env().await;
-    let unknown = ulid::Ulid::new().to_string();
+    let unknown = ulid::Ulid::generate().to_string();
 
     let (status, json) = admin_post(
         env.internal.clone(),
@@ -474,7 +474,7 @@ async fn admin_internal_archives_restore_confirm_mismatch_400() {
 #[tokio::test]
 async fn admin_internal_archives_restore_absent_404() {
     let env = build_env().await;
-    let unknown = ulid::Ulid::new().to_string();
+    let unknown = ulid::Ulid::generate().to_string();
 
     let (status, _json) = admin_post(
         env.internal.clone(),

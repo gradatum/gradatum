@@ -5,7 +5,7 @@
 //! 2. Evaluates the ACL via `AclEngine::evaluate` (Write, locus = `tenant_id/main`).
 //! 3. Builds a [`gradatum_core::JobRecord`] and enqueues it via `state.job_store.enqueue()`.
 //! 4. Emits an audit event.
-//! 5. Returns 202 Accepted + JSON [`EnqueuedResponse`].
+//! 5. Returns 202 Accepted + JSON [`EnqueuedResponseUlid`].
 //!
 //! `vault_write` uses `state.job_store` (trait [`gradatum_core::QueueStore`],
 //! `gradatum_jobs` table).
@@ -24,10 +24,7 @@
 //! |--------|------|------|
 //! | POST | `/api/v1/vault_write`     | bearer + ACL Write required |
 //! | POST | `/api/v1/vault_classify`  | bearer + ACL Read required  |
-//! | POST | `/api/v1/vault_downgrade` | bearer + ACL Write required |
 //!
-
-use std::time::Instant;
 
 use axum::{
     Extension, Json,
@@ -35,21 +32,15 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::Utc;
-use gradatum_acl_policy::{AclDecision, AclOp};
 use gradatum_core::audit::http::{HttpAuditActor, HttpAuditEvent};
 use gradatum_core::trust::TrustContext;
 use gradatum_core::{
     CurateSpec, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority, JobRecord, JobRetry,
     JobScheduling, JobScope, JobSpec, JobStatus, TriggerSource,
 };
-use gradatum_queue::NewJob;
 use ulid::Ulid;
 
-use crate::api_v1::dto::{
-    EnqueuedResponse, EnqueuedResponseUlid, VaultClassifyRequest, VaultDowngradeRequest,
-    VaultWriteRequest,
-};
-use crate::api_v1::tenant_guard::effective_write_vault;
+use crate::api_v1::dto::{EnqueuedResponseUlid, VaultClassifyRequest, VaultWriteRequest};
 use crate::state::AppState;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -120,7 +111,7 @@ pub(crate) fn build_curate_job_record(
         req.expected_sha256.as_deref().and_then(parse_sha256_hex);
 
     JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind: Job::Curate(CurateSpec {
                 note_id,
@@ -178,7 +169,7 @@ fn extract_request_id(headers: &HeaderMap) -> String {
         .get("X-Request-ID")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| ulid::Ulid::new().to_string())
+        .unwrap_or_else(|| ulid::Ulid::generate().to_string())
 }
 
 /// Builds an `HttpAuditActor` from the `TrustContext`.
@@ -362,7 +353,7 @@ pub(crate) async fn emit_read_rejection_audit(
         content_hash: None,
         outcome: outcome.into(),
         curator: None,
-        request_id: Ulid::new().to_string(),
+        request_id: Ulid::generate().to_string(),
     };
     if let Err(e) = state.audit.record(evt).await {
         tracing::warn!(error = %e, outcome = outcome, "audit emit vault_read_rejected failed");
@@ -438,100 +429,6 @@ pub async fn vault_classify(
         .map_err(|e| crate::api_v1::logic::err_to_status(&e))
 }
 
-// ── vault_downgrade ───────────────────────────────────────────────────────────
-
-/// `POST /api/v1/vault_downgrade` — async queue variant (not routed; superseded by `notes::vault_downgrade`).
-///
-/// Enqueues a note downgrade through the curator pipeline.
-/// Superseded by `notes::vault_downgrade` (synchronous 200) in the `api_v1` router.
-/// Kept for future use (worker-based async downgrade via queue).
-///
-/// # Returns
-///
-/// - **202 Accepted** + JSON [`EnqueuedResponse`].
-/// - **401** / **403** — audit `auth_failure` emitted.
-/// - **500** — see [`vault_write`].
-// Non câblée dans le routeur depuis Phase 2.1.2 — remplacée par notes::vault_downgrade sync.
-// Conservée pour usage futur (async downgrade via queue) — non supprimée intentionnellement.
-// Le lint dead_code se déclenche sur le bin (pas sur la lib car `pub`) — #[allow] justifié.
-#[allow(dead_code)]
-pub async fn vault_downgrade(
-    State(state): State<AppState>,
-    Extension(trust): Extension<TrustContext>,
-    headers: HeaderMap,
-    Json(mut req): Json<VaultDowngradeRequest>,
-) -> Result<(StatusCode, Json<EnqueuedResponse>), StatusCode> {
-    let start = Instant::now();
-    let request_id = extract_request_id(&headers);
-
-    if !trust.is_authenticated() {
-        emit_auth_failure_audit(
-            &state,
-            &trust,
-            req.tenant_id.as_ref().map_or("", |t| t.as_str()),
-            &request_id,
-            "unauthenticated",
-        )
-        .await;
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    // P0 cross-tenant (Lot 3) : tenant dérivé du JWT, refuse body divergent.
-    // C1 (F-63, EX-C1-1/2) : + grant write exigé à flag ON (l'enqueue est une écriture).
-    let tenant = effective_write_vault(&state, &trust, req.tenant_id.as_ref())
-        .await
-        .map_err(|r| r.status())?;
-    let locus = format!("{}/main", tenant);
-    if state.acl.evaluate(&trust, AclOp::Write, &locus) != AclDecision::Allow {
-        emit_auth_failure_audit(&state, &trust, &tenant, &request_id, "acl_deny").await;
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    // Lot A1 : le payload enqueué doit porter le tenant EFFECTIF (résolu du JWT), jamais le
-    // `tenant_id` optionnel du client. On l'injecte avant l'encode bincode — le champ est
-    // ainsi toujours `Some(_)` sur le fil (pas de `skip_serializing_if` déclenché → décodage
-    // positionnel bincode aligné avec le miroir `dispatch.rs`).
-    req.tenant_id = Some(gradatum_core::scope::TenantId::new(&tenant));
-    let payload = bincode::serde::encode_to_vec(&req, bincode::config::standard())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let job_id = state
-        .queue
-        .enqueue(NewJob {
-            tenant_id: tenant.clone(),
-            kind: "downgrade".to_string(),
-            payload,
-            max_attempts: 5,
-        })
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let duration_ms = start.elapsed().as_millis() as i64;
-    let audit_evt = HttpAuditEvent {
-        ts: chrono::Utc::now(),
-        event: "vault_downgrade".into(),
-        actor: actor_from_trust(&trust),
-        tenant_id: tenant.clone(),
-        locus: locus.clone(),
-        note_id: Some(req.note_id.clone()),
-        content_hash: None,
-        outcome: "queued".into(),
-        curator: Some(serde_json::json!({ "job_id": job_id, "duration_ms": duration_ms })),
-        request_id,
-    };
-    if let Err(e) = state.audit.record(audit_evt).await {
-        tracing::warn!(error = %e, "audit emit vault_downgrade failed — non fatal");
-    }
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(EnqueuedResponse {
-            job_id,
-            status: "queued",
-            poll_url: format!("/api/v1/jobs/{job_id}"),
-        }),
-    ))
-}
-
 // ── Tests unitaires ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -540,17 +437,11 @@ mod build_record_tests {
     use gradatum_dto::VaultWriteRequest;
 
     fn minimal_req(note_id: Option<String>) -> VaultWriteRequest {
-        VaultWriteRequest {
-            title: "t".into(),
-            body: "b".into(),
-            author: None,
-            tags: vec![],
-            section_hint: Some("decisions".into()),
-            tenant_id: Some("main".into()),
-            expected_sha256: None,
-            note_id,
-            occurred_at: None,
-        }
+        let mut req = VaultWriteRequest::new("t".into(), "b".into());
+        req.section_hint = Some("decisions".into());
+        req.tenant_id = Some("main".into());
+        req.note_id = note_id;
+        req
     }
 
     #[test]

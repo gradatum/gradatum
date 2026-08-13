@@ -128,8 +128,8 @@ async fn scoping_locus_filters_results() {
     let (app, state, idx) = build_app().await;
     let token = sign(&state);
 
-    let id_council = Ulid::new().to_string();
-    let id_decisions = Ulid::new().to_string();
+    let id_council = Ulid::generate().to_string();
+    let id_decisions = Ulid::generate().to_string();
 
     idx.seed_note_with_fts_vault(
         &id_council,
@@ -182,8 +182,8 @@ async fn scoping_locus_absent_returns_all() {
     let (app, state, idx) = build_app().await;
     let token = sign(&state);
 
-    let id_a = Ulid::new().to_string();
-    let id_b = Ulid::new().to_string();
+    let id_a = Ulid::generate().to_string();
+    let id_b = Ulid::generate().to_string();
 
     idx.seed_note_with_fts_vault(
         &id_a,
@@ -294,7 +294,7 @@ async fn scoping_vault_id_cross_vault_fts() {
     let (app, state, idx) = build_app().await;
     let token = sign(&state);
 
-    let id_secondary = Ulid::new().to_string();
+    let id_secondary = Ulid::generate().to_string();
 
     // Note dans vault "secondary" (ne doit jamais devenir atteignable via cross-read).
     idx.seed_note_with_fts_vault(
@@ -330,7 +330,7 @@ async fn scoping_vault_id_main_explicit_ok() {
     let (app, state, idx) = build_app().await;
     let token = sign(&state);
 
-    let id_main = Ulid::new().to_string();
+    let id_main = Ulid::generate().to_string();
     idx.seed_note_with_fts_vault(
         &id_main,
         "main",
@@ -370,8 +370,8 @@ async fn scoping_locus_prefix_matches_via_http_no_double_escape() {
     let (app, state, idx) = build_app().await;
     let token = sign(&state);
 
-    let id_agent = Ulid::new().to_string();
-    let id_other = Ulid::new().to_string();
+    let id_agent = Ulid::generate().to_string();
+    let id_other = Ulid::generate().to_string();
 
     // Note dans locus "agent/logs/2026"
     idx.seed_note_with_fts_vault(
@@ -429,7 +429,7 @@ async fn scoping_locus_percent_via_http_no_wildcard_match() {
     let (app, state, idx) = build_app().await;
     let token = sign(&state);
 
-    let id_normal = Ulid::new().to_string();
+    let id_normal = Ulid::generate().to_string();
 
     // Note avec locus normal (sans "%")
     idx.seed_note_with_fts_vault(

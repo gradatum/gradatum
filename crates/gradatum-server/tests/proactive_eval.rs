@@ -126,7 +126,7 @@ async fn end_to_end_proactive_cycle_acceptance_rate_above_zero() {
     // `seed_note_with_fts` utilise `chrono::Utc::now()` → timestamp ≈ 1.75e12 ms <
     // timestamp source 3e12 ms → ces notes ne figurent PAS dans `list_recent_notes`
     // (sources toujours en tête de tri). Elles sont donc candidates, pas sources.
-    let cnd_ids: [String; 5] = std::array::from_fn(|_| Ulid::new().to_string());
+    let cnd_ids: [String; 5] = std::array::from_fn(|_| Ulid::generate().to_string());
 
     idx.seed_note_with_fts(
         &cnd_ids[0],
@@ -175,7 +175,7 @@ async fn end_to_end_proactive_cycle_acceptance_rate_above_zero() {
     // dont le corps contient ces mots-clés. Timestamp 3_000_000_000_000 ms ≈ an 2065 →
     // `COALESCE(updated, created) DESC` les place en premier → elles sont les sources.
     // Elles seront exclues de la surface par le filtre `source_set` du refresh.
-    let src_ids: [String; 2] = std::array::from_fn(|_| Ulid::new().to_string());
+    let src_ids: [String; 2] = std::array::from_fn(|_| Ulid::generate().to_string());
 
     for id in &src_ids {
         idx.seed_lesson(
@@ -213,12 +213,8 @@ async fn end_to_end_proactive_cycle_acceptance_rate_above_zero() {
     );
 
     // ── 4. Pull proactive (context=None → lit la surface pré-calculée) ────────
-    let req_proactive = ProactiveRecallRequest {
-        tenant_id: Some("main".into()),
-        context: None,
-        sections: None,
-        limit: None,
-    };
+    let mut req_proactive = ProactiveRecallRequest::default();
+    req_proactive.tenant_id = Some("main".into());
 
     let resp_proactive = proactive_recall(&state, &bearer_main(), req_proactive)
         .await
@@ -241,12 +237,11 @@ async fn end_to_end_proactive_cycle_acceptance_rate_above_zero() {
     //
     // Vérifie que le mode contextuel ne retourne pas d'erreur. Non bloquant pour
     // l'assertion principale (le taux est mesuré sur le mode proactive).
-    let req_contextual = ProactiveRecallRequest {
-        tenant_id: Some("main".into()),
-        context: Some("async rust mémoire pattern".into()),
-        sections: Some(vec!["lessons-learned".into(), "reasoning".into()]),
-        limit: Some(5),
-    };
+    let mut req_contextual = ProactiveRecallRequest::default();
+    req_contextual.tenant_id = Some("main".into());
+    req_contextual.context = Some("async rust mémoire pattern".into());
+    req_contextual.sections = Some(vec!["lessons-learned".into(), "reasoning".into()]);
+    req_contextual.limit = Some(5);
 
     let resp_contextual = proactive_recall(&state, &bearer_main(), req_contextual)
         .await
@@ -259,7 +254,7 @@ async fn end_to_end_proactive_cycle_acceptance_rate_above_zero() {
 
     // ── 6. Feedback : accepter un sous-ensemble de la surface proactive ───────
     //
-    // Les ULIDs surfacés sont ceux des candidates (générés par Ulid::new() →
+    // Les ULIDs surfacés sont ceux des candidates (générés par Ulid::generate() →
     // Crockford base32 valides → parsables par Ulid::from_string dans le handler).
     // Invariant accepted ⊆ surfaced : on accepte le premier item → {first} ⊆ surfaced.
     let surfaced_ulids: Vec<String> = resp_proactive
@@ -276,11 +271,9 @@ async fn end_to_end_proactive_cycle_acceptance_rate_above_zero() {
     // Accepter 1 item (sous-ensemble minimal valide).
     let accepted = vec![surfaced_ulids[0].clone()];
 
-    let feedback_req = ProactiveRecallFeedbackRequest {
-        tenant_id: Some("main".into()),
-        recall_id: resp_proactive.recall_id.clone(),
-        accepted_ulids: accepted.clone(),
-    };
+    let mut feedback_req =
+        ProactiveRecallFeedbackRequest::new(resp_proactive.recall_id.clone(), accepted.clone());
+    feedback_req.tenant_id = Some("main".into());
 
     proactive_recall_feedback(&state, &bearer_main(), feedback_req)
         .await

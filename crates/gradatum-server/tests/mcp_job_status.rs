@@ -91,7 +91,7 @@ fn trust_main() -> TrustContext {
 fn pending_job() -> JobRecord {
     let now = chrono::Utc::now();
     JobRecord {
-        id: Ulid::new(),
+        id: Ulid::generate(),
         spec: JobSpec {
             kind: Job::Curate(CurateSpec {
                 tenant_id: "main".to_string(),
@@ -168,7 +168,7 @@ async fn job_status_pending_then_done_transition() {
         .expect("le job doit être dequeuable");
 
     // Le worker termine le job.
-    let result_note = Ulid::new();
+    let result_note = Ulid::generate();
     env.state
         .job_store
         .complete(
@@ -307,7 +307,7 @@ async fn job_status_bad_id_and_missing() {
     );
 
     // ULID bien formé mais inexistant.
-    let ghost = Ulid::new().to_string();
+    let ghost = Ulid::generate().to_string();
     assert!(
         job_status_mcp(&env.state, &trust, &ghost).await.is_err(),
         "job absent doit échouer (404)"

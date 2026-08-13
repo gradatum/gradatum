@@ -2,7 +2,7 @@
 
 > Web-based operator UI for Gradatum — React + TypeScript, served by `gradatum-server` at `/ui/*`.
 
-**Status**: v1.0.0 — public, `Apache-2.0 AND OFL-1.1 AND MIT AND ISC`. Bundle-only crate: no
+**Status**: v2.0.0 — public, `Apache-2.0 AND OFL-1.1 AND MIT AND ISC`. Bundle-only crate: no
 public Rust API. The crate's own code is Apache-2.0; the shipped `dist/` bundle embeds font
 assets under OFL-1.1 and npm dependencies under MIT and ISC — full notices in
 [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md).

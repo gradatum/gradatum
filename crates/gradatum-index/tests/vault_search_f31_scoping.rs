@@ -32,8 +32,8 @@ async fn locus_filter_fts_restricts_by_prefix() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_council = ulid::Ulid::new().to_string();
-    let id_other = ulid::Ulid::new().to_string();
+    let id_council = ulid::Ulid::generate().to_string();
+    let id_other = ulid::Ulid::generate().to_string();
 
     // Note dans locus council/
     idx.seed_note_with_fts_vault(
@@ -92,8 +92,8 @@ async fn locus_none_returns_all_notes() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_a = ulid::Ulid::new().to_string();
-    let id_b = ulid::Ulid::new().to_string();
+    let id_a = ulid::Ulid::generate().to_string();
+    let id_b = ulid::Ulid::generate().to_string();
 
     idx.seed_note_with_fts_vault(
         &id_a,
@@ -150,7 +150,7 @@ async fn locus_percent_literal_no_match() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_normal = ulid::Ulid::new().to_string();
+    let id_normal = ulid::Ulid::generate().to_string();
 
     // Note avec locus normal (sans `%`)
     idx.seed_note_with_fts_vault(
@@ -186,8 +186,8 @@ async fn locus_underscore_literal() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_a = ulid::Ulid::new().to_string();
-    let id_b = ulid::Ulid::new().to_string();
+    let id_a = ulid::Ulid::generate().to_string();
+    let id_b = ulid::Ulid::generate().to_string();
 
     // Note avec locus "aXb" (X = caractère quelconque)
     idx.seed_note_with_fts_vault(
@@ -245,8 +245,8 @@ async fn locus_backslash_literal() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
     let vault = VaultId::new("main");
 
-    let id_slash = ulid::Ulid::new().to_string();
-    let id_backslash = ulid::Ulid::new().to_string();
+    let id_slash = ulid::Ulid::generate().to_string();
+    let id_backslash = ulid::Ulid::generate().to_string();
 
     idx.seed_note_with_fts_vault(
         &id_slash,
@@ -303,8 +303,8 @@ async fn locus_backslash_literal() {
 async fn vault_id_scoping_fts() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
 
-    let id_main = ulid::Ulid::new().to_string();
-    let id_secondary = ulid::Ulid::new().to_string();
+    let id_main = ulid::Ulid::generate().to_string();
+    let id_secondary = ulid::Ulid::generate().to_string();
 
     // Note dans vault "main"
     idx.seed_note_with_fts_vault(
@@ -352,8 +352,8 @@ async fn vault_id_scoping_fts() {
 async fn locus_filter_semantic() {
     let idx = SqliteIndex::open_in_memory().await.unwrap();
 
-    let id_council_ulid = ulid::Ulid::new();
-    let id_other_ulid = ulid::Ulid::new();
+    let id_council_ulid = ulid::Ulid::generate();
+    let id_other_ulid = ulid::Ulid::generate();
     let id_council = id_council_ulid.to_string();
     let id_other = id_other_ulid.to_string();
 

@@ -7,15 +7,274 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-08-10
+
+> **Public release note — this is a `1.0.0 → 2.0.0` jump.** `1.0.1` and `1.0.2` were never
+> published (no crates.io release, no GitHub release, no public tag), so this version carries
+> the accumulated changes of all three: anyone updating from the last public release, `1.0.0`,
+> receives the `1.0.1` and `1.0.2` deltas together with the ones below. The upgrade guide covers
+> the full path from `1.0.0` — see `docs/UPGRADING-1.0.0-to-2.0.0.md`.
+
+**Identity is carried by the credential.** The owner of the presented API key is the sole
+source of a caller's identity: there is no default identity, no client-declared identity, and
+no silent fallback. A request that cannot be attributed to a credential is refused rather than
+served under a default. See `docs/UPGRADING-1.0.0-to-2.0.0.md` for the migration guide and the
+pre-flight check.
+
+### Breaking changes
+
+- **The `main-agent` bootstrap identity is now an installation prerequisite.** The server
+  requires the `main-agent` identity to hold an active key; without it, it has no identity to
+  serve. `gradatum-admin init` now mints this key while initialising a root, so **new
+  installations need no extra step**. Roots created before 2.0.0 that never held a `main-agent`
+  key must create one:
+  `gradatum-admin api-key create --owner main-agent --scopes vault_read,vault_search,vault_write,write`.
+- **A deployment with no active key stops being served.** Before 2.0.0, a request whose caller
+  could not be resolved fell back to a default agent identity and was still served. That
+  fallback is removed. An installation that never created any API key — and relied on the
+  fallback — now has every request refused until a key is minted. On an initialised multi-tenant
+  server the refusal is the actionable **503** below; otherwise it is a plain **401**.
+- **A client-supplied `author` on a write is refused with 400.** Attribution is derived from the
+  credential only. Any write carrying an explicit `author` is rejected with
+  `400 InvalidInput` ("author provided: identity comes from the credential, it is not
+  self-declared (R2)").
+  This is the one change of the three that can break an integrator **silently**: no in-process
+  caller injects an `author`, and the published `gradatum-sdk-rs` cannot — it is a placeholder
+  with no client surface, so it sends nothing at all. But
+  `gradatum-dto`'s `VaultWriteRequest` still exposes `pub author: Option<String>`
+  (`crates/gradatum-dto/src/vault_write.rs`), so **any hand-written REST client or DTO** that
+  populated that field will start receiving 400. **Migration:** stop sending the `author` field;
+  the identity is taken from the API key that authenticates the request. To act under a distinct
+  identity, present that identity's own key.
+- **`gradatum-storage`: the filesystem-only guard is removed, function and all.**
+  `nfs_check::ensure_local_filesystem` no longer exists, and the `GradatumError` variant it
+  raised, `VaultOnNfs`, is removed with it. Code that called the function, or matched on the
+  variant, fails to compile. See "Changed" below for what replaces the restriction it enforced.
+- **`gradatum-vault`: `Vault::storage()` now returns `&dyn Storage` instead of the concrete
+  `&FileStorage`.** Code that depended on the concrete filesystem type through this accessor
+  fails to compile; migrate to the `Storage` trait, which exposes the same
+  read/write/list/delete/stat operations regardless of backend.
+- **`gradatum-core`'s `GradatumError` and `gradatum-storage`'s `StorageError` are now
+  `#[non_exhaustive]`.** Both error enums carry the attribute from this release on, so every
+  future variant addition is a non-breaking change instead of a major. This lands in the same
+  release that also changes each enum's variant set — `GradatumError::VaultOnNfs` is removed
+  (above) and `StorageError::ConfigInvalid` is added (see "Added" below) — so an exhaustive
+  `match` on either from outside its crate needs updating this release regardless, and must add a
+  `_` arm to stay future-proof. `GradatumError` is the umbrella error of `gradatum-core` and the
+  most widely matched type on the whole public surface: the attribute has to land now, because
+  adding `#[non_exhaustive]` *after* the first publish is itself a breaking change and the window
+  closes for good at the first `cargo publish`.
+- **`gradatum-core`: `IndexStore::persist_curated_index_atomic` changes signature.** The
+  parameter that took a slice of `(source, target)` pairs is replaced by a single `CuratedLinks`
+  value (see "Added"). `IndexStore` is a public trait — **any external implementation of it
+  stops compiling.** The new type carries the edges *and* a flag stating whether they are the
+  authoritative, complete set of outgoing links for the note: passing it means explicitly
+  declaring whether edges missing from the list should be deleted. The non-destructive choice is
+  the one that deletes nothing — `false` keeps the historical upsert-only behaviour, `true` only
+  where the full edge set was actually recomputed from the note's current body.
+- **`gradatum-core`: `VaultConfig` gains a public field, `storage`.** Same shape as the
+  `PersistCuratedRequest` field addition below: `VaultConfig` is not `#[non_exhaustive]`, so a
+  struct literal that lists every field explicitly fails to compile until `storage` is added. The
+  field itself is the one described under "Vault storage on an S3-compatible object backend"
+  below; on the wire it changes nothing — an absent `[storage]` section in `config.toml` still
+  loads and defaults to the local filesystem backend, exactly as before. **Migration:**
+  `VaultConfig` derives `Default`, so `..Default::default()` in any literal that constructs it
+  always compiles; alternatively add `storage: StorageBackendConfig::default()` explicitly.
+- **`gradatum-dto`: `PersistCuratedRequest` gains a public field, `links_authoritative`.** A
+  struct literal that lists this type's fields explicitly — the idiomatic way to construct a
+  public DTO in Rust — fails to compile until the new field is added. **This breaks the Rust
+  construction, not the wire contract**: the field carries `#[serde(default)]`, so a JSON
+  payload from a caller that predates this release, and omits it, still deserializes, defaulting
+  to `false` — the same non-destructive behaviour described above. Add the field to any literal
+  that lists this struct explicitly (or build it with `..Default::default()` / a builder);
+  callers that only serialize or deserialize the type need no change.
+- **`gradatum-dto`: 33 public request structs are now `#[non_exhaustive]`.** Every REST/MCP
+  request DTO in the crate carries the attribute now — among the ones integrators reach for most,
+  `VaultSearchRequest`, `VaultReadRequest`, `VaultWriteRequest`, and `VaultListRequest`. A struct
+  literal built from outside the crate and naming every field — the idiomatic way to construct a
+  public DTO in Rust — no longer compiles, even where the field list itself hasn't changed. This
+  is separate from, and on top of, the field addition to `PersistCuratedRequest` called out above:
+  that type is one of the 33, the other 32 change with no accompanying field addition. **Migration:**
+  29 of the 33 ship their own `::new(...)` constructor for the required fields (e.g.
+  `VaultSearchRequest::new(query)`); the remaining four — `VaultListRequest`, `VaultTimelineRequest`,
+  `VaultArchivesListRequest` and `ProactiveRecallRequest` — expose no `::new` and are built with
+  `..Default::default()` (all four implement `Default`). Code that only serializes or deserializes
+  these types over the wire,
+  rather than constructing them as a Rust literal, is unaffected either way.
+- **`gradatum-auth`: `Claims` is now `#[non_exhaustive]`.** The JWT claims struct — returned by
+  `JwtService::verify` and the payload of every issued token — no longer accepts a struct literal
+  built from outside `gradatum-auth`. Same attribute, same reason as the 33 request DTOs above,
+  applied to the one auth type most likely to gain a field for a *security* reason: a future
+  token-binding claim (e.g. `cnf`) could be added within `2.x` without a further major bump.
+  Adding `#[non_exhaustive]` *after* the first publish would itself be breaking, so it lands now.
+  External consumers never construct `Claims` — they receive it from `verify` — so no wire or
+  in-process caller is affected; the only literal construction was in a downstream integration
+  test, updated in this release to mint-then-verify. **Migration:** obtain `Claims` from
+  `JwtService::sign` + `verify` rather than a struct literal.
+- **`gradatum-server`: `ConfigError` is now `#[non_exhaustive]`.** The boot-time configuration
+  error enum can gain a variant without a major bump for the rest of `2.x` — deliberately, because
+  a new class of configuration leak or fail-closed check is the likely reason it grows, and each
+  such addition would otherwise cost a major. An exhaustive `match` on `ConfigError` from outside
+  `gradatum-server` now needs a `_` arm; matching or constructing a specific known variant is
+  unaffected, and no such external exhaustive match exists in-tree.
+- **Eight more public types across `gradatum-auth`, `gradatum-warden`, `gradatum-acl-auth` and
+  `gradatum-acl-policy` are now `#[non_exhaustive]`.** Same attribute, same reason as `Claims`,
+  `ConfigError` and the two error enums above: the attribute has to be locked in before the first
+  publish, since adding it afterwards is itself a breaking change. The seven enums —
+  `JwtError`, `TokenScope` and `RevocationError` (`gradatum-auth`), `WardenDecision` and
+  `WardenError` (`gradatum-warden`), `ApiKeyError` (`gradatum-acl-auth`), `AclError`
+  (`gradatum-acl-policy`) — now require a `_` arm in any exhaustive `match` from outside their
+  crate; matching or constructing a specific known variant is unaffected. The one struct,
+  `WardenConfig` (`gradatum-warden`), no longer accepts a struct literal from outside the crate —
+  including one that ends in `..Default::default()`, since functional-update syntax is refused on
+  a `#[non_exhaustive]` type across crates just as a full literal is. **Migration:** build it from
+  `WardenConfig::default()` (the type derives `Default`) and assign the public fields you need to
+  override — every field is `pub`. **Tooling note:** all ten additions in this release
+  (`GradatumError`, `StorageError` above, plus these eight) are detected by `cargo-semver-checks`
+  0.50 — the lint `enum_marked_non_exhaustive` catches the nine enums and
+  `struct_marked_non_exhaustive` catches `WardenConfig`, each pointing at the exact definition
+  site. On a `2.0.0` major bump these are expected, allowed changes, so the release-readiness gate
+  records them as informational ruptures rather than failures. This changelog entry is the
+  human-readable record of the same set the tooling verifies.
+- **`gradatum-engine`: `EventLogErrLabels::encode` and `ReqLabels::encode` change signature** —
+  their parameter moves from a by-value `LabelSetEncoder` to `&mut LabelSetEncoder`. This is not
+  a change this project chose: both types derive their `encode` implementation from the
+  `prometheus-client` metrics library, and the new signature simply follows that dependency's
+  own upgrade. Any consumer implementing either trait directly must update to match — a reminder
+  that a dependency bump can move a crate's public surface even when no first-party line of code
+  changed intent.
+- **`gradatum-mcp-stub` is removed from the distribution.** It is no longer built by either
+  release workflow, so it is absent from the release archives (the `gradatum-mcp-*.tar.gz`
+  group no longer exists — see `docs/guides/B-install-binaries.md`) and from the Docker image,
+  where it was already never included. The stub was a stdio→HTTP bridge for MCP hosts that
+  cannot send a custom auth header — chiefly Claude Desktop, which only takes a URL and drives
+  its own auth flow. But the stub was only ever built for `x86_64-unknown-linux-gnu`, a target
+  Claude Desktop does not run on (macOS, Windows only): it could not serve the audience it was
+  maintained for. `gradatum-server`'s native MCP transport (`/mcp`, Streamable HTTP, API key as
+  a `Bearer` credential) is unaffected and is now the only integration path — see
+  [Guide D](docs/guides/D-mcp-and-studio.md). **Migration:** switch the MCP client configuration
+  from a stdio `command` entry to an HTTP `url` entry:
+  ```json
+  {
+    "mcpServers": {
+      "gradatum": {
+        "type": "http",
+        "url": "http://127.0.0.1:19090/mcp",
+        "headers": { "Authorization": "Bearer ak_your_api_key" }
+      }
+    }
+  }
+  ```
+  The `gradatum-mcp-stub` crate itself remains published at its last version, `1.0.0`, on
+  crates.io and is not republished at later tags — the same last-published-version caveat this
+  changelog already documents for `gradatum-cli` (see `RELEASE-POLICY.md` §AM3). If your
+  toolchain resolves `gradatum-mcp-stub = "2.0.0"` or similar, that version does not exist; pin
+  to `1.0.0` only to retrieve the retired binary, and migrate to the native transport above.
+
 ### Added
 
-- **Docker deployment.** Multi-service `docker-compose.yml` with 6 binaries (server, worker,
-  admin, gateway, engine, MCP stub), network isolation (`network_mode: service:` for the
-  worker), token environment injection, and CPU-only llama.cpp configuration for the engine.
-  The `Dockerfile` is a single multi-stage build producing all six binaries from the workspace.
-- **Engine deployment formalisation.** `gradatum-admin install` gains `--with-engine` and
-  `--with-gateway` flags; `scripts/deploy-gradatum-local.sh` gains `--engine` for coordinated
+- **Soul-write privilege gated by the `identity_write` scope.** Writing an agent's soul
+  (`identity/*`) now requires the dedicated `identity_write` scope, distinct from `admin`,
+  `write` and `service`. This narrows soul mutation to explicitly privileged credentials rather
+  than any writer. The bootstrap key does not carry it, and it is never inherited from a write
+  scope — see `docs/UPGRADING-1.0.0-to-2.0.0.md` ("Managing other agents' souls") for how to grant
+  it, and why it stays disjoint.
+- **Key registry reset — `gradatum-admin api-key reset`.** Returns an installation to a clean
+  credential state (revokes every key, leaving the audit trail intact) and brings the server
+  back to the uninitialised state the bootstrap step starts from. It touches the key registry
+  only: notes, their content and their attribution are never affected. Requires explicit
+  confirmation; treat it as a maintenance operation, not a routine one.
+- **One active key per identity.** `api-key create` now refuses an identity that already holds an
+  active key and points to `api-key rotate`, which revokes and mints the replacement atomically
+  while carrying the identity over unchanged. This makes "one identity = one active credential"
+  an enforced invariant.
+- **Distinct 503 for an uninitialised registry.** On an initialised multi-tenant server, an
+  unauthenticated request against a key registry with no active key receives a **503** whose body
+  names the bootstrap identity and the exact `api-key create` command, instead of a bare 401.
+  The body never carries the registry's disk path (see `SECURITY.md`).
+- **Docker deployment.** Multi-service `docker-compose.yml` orchestrating 5 gradatum services
+  (server, worker, init, gateway, engine) alongside 2 external llama.cpp containers, host
+  networking (`network_mode: host` on both server and worker — the server's loopback-only
+  bind fails closed without TLS, so the worker shares its network namespace to reach it on
+  127.0.0.1 instead of through a bridge port), token environment injection, and CPU-only
+  llama.cpp configuration for the embedding and chat containers. The `Dockerfile` is a single
+  multi-stage build producing five binaries from the workspace (server, worker, admin,
+  gateway, engine).
+- **Engine deployment formalisation.** `scripts/install-gradatum-services.sh` gains `--with-engine`
+  and `--with-gateway` flags; `scripts/deploy-gradatum-local.sh` gains `--engine` for coordinated
   engine+server deployment. Engine documentation and usage examples added to `docs/`.
+- **Vault storage on an S3-compatible object backend.** A new `[storage]` configuration section
+  (`StorageBackendConfig`, exposed as `VaultConfig::storage`) chooses the backend: `service =
+  "fs"` — the default, byte-identical to prior behaviour, including when the section is absent
+  entirely — or `service = "s3"` for any S3-compatible provider (AWS, OVH, MinIO, Ceph,
+  Scaleway…) reached through a configurable endpoint. The new `gradatum-storage::build_storage`
+  factory (module `factory`) builds the configured backend; an unknown service name, or one whose
+  Cargo feature isn't enabled in the build, fails at construction with the new
+  `StorageError::ConfigInvalid`, naming what's wrong, instead of falling back silently. Only
+  non-secret connection parameters (endpoint, bucket, region, root) live in configuration —
+  credentials are read exclusively from the process environment via OpenDAL's native credential
+  chain (e.g. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`). `FileStorage` is now exported
+  unconditionally rather than behind a feature-gated path. Note bodies themselves are written to
+  the backend in plaintext, with no encryption applied by gradatum — see
+  [SECURITY.md § Privacy posture](SECURITY.md#privacy-posture).
+- **`gradatum-storage::install_object_backend_defaults()`, a new public function.** Installs,
+  once and in order, the process-wide crypto provider (`aws_lc_rs`) then the OpenDAL HTTP
+  transport (`opendal-http-transport-reqwest`) that every S3/GCS/Azure operation needs — OpenDAL
+  0.58 made the transport pluggable, and a build without one installed rejects every
+  object-backend call before the first network packet with the permanent `StorageError::ConfigInvalid`
+  above, never a silent no-op. `gradatum-server` calls it once at boot, off the TLS path
+  (`[server.tls]` is optional and gates nothing here). Any integrator embedding
+  `gradatum-storage` outside that binary and constructing an S3/GCS/Azure backend via
+  `build_storage` must call it too, before the first operation, or hit that same
+  `ConfigInvalid`. Both installs are first-installed-wins and safe to call repeatedly; a no-op
+  on a build with no object-backend feature enabled (`fs`-only, the default).
+- **`gradatum-admin repair-note-links`**: reconciles a note's recorded links against its current
+  body (see "Fixed" below). Dry-run by default; pass `--execute` to apply.
+- **`gradatum-core`: `CuratedLinks`, a new public type**, bundling a note's outgoing link edges
+  with an `authoritative` flag. It exists to make the breaking signature change of
+  `IndexStore::persist_curated_index_atomic` (above) possible: the edges and the authority flag
+  now travel together in one value, so a caller cannot pass one and forget the other.
+- **`gradatum-admin init` now writes an explicit, commented `[apalis.workers.curate]` section**
+  into the `server.toml` it generates, symmetric with the existing `[embed]` and `[curator]`
+  sections (`crates/gradatum-admin/src/init.rs`). The curate worker's `concurrency` and
+  `timeout_secs` were compiled defaults with no line in any configuration file — a fresh install
+  now sees them, and the comment explains what each one is for. The other worker kinds (`embed`,
+  `reindex`, `purge`, `forget`, `distill`, `validate`) keep their compiled defaults and are not
+  written out; override any of them with a matching `[apalis.workers.<kind>]` table.
+
+### Changed
+
+- **The vault no longer refuses to start on a network filesystem.** Earlier versions ran a
+  startup check and refused to start when the vault's local root was detected on an NFS (or
+  similar network) mount; that check is removed. Where the vault's data lives — and any
+  reliability trade-off a network mount brings — is now the deploying operator's decision, not
+  something the product enforces. The local backend remains the default; see "Vault storage on
+  an S3-compatible object backend" above for the supported alternative.
+- **Dependency refresh across the workspace.** Also removes the worker's legacy processing
+  engine, unused since the current queue backend became the active path, and drops the
+  unmaintained serialization library it pulled in.
+- **The `curate` worker now runs serial by default: `concurrency` 2 → 1, `timeout_secs` 30s →
+  300s** (`WorkersConfig::default_curate`, `crates/gradatum-worker/src/monitor.rs`). This is a
+  compiled default, so it applies to any deployment that does not set `[apalis.workers.curate]`
+  explicitly — before this release, that was every deployment, since `gradatum-admin init` never
+  wrote the section (see "Added" above). The curate worker is LLM-bound: it calls out to the
+  chat endpoint configured under `[curator.llm]` for every job, and the bundled Docker stack runs
+  that endpoint (`llama-chat`) as a single-slot server. Two curate jobs in flight were contending
+  for that one slot, and the previous 30s per-job timeout could fire before a classification call
+  under load returned at all. Serial execution (1 job at a time) removes the contention outright,
+  and the new 300s ceiling leaves margin above the 60s client-side timeout already configured in
+  `[curator.llm]`, so that timeout fires first on a genuinely stuck call. **The trade-off is
+  throughput: curation now processes at most one note at a time, where it previously processed
+  two.** This is deliberate — a concurrency of 1 does not depend on how fast the chat endpoint
+  happens to be on a given machine, where a concurrency of 2 does. The bundled
+  `docker-compose.yml` pins the matching `llama-chat` service to `--parallel 1`, replacing
+  llama.cpp's automatic slot layout (which otherwise split the unified KV cache into multiple
+  narrower slots) with the single full-context slot the now-serial worker actually uses;
+  `--ctx-size` is untouched.
+- **`llm_review_max_tokens` written by `gradatum-admin init` lowered from 1024 to 128**, matching
+  the arbitrated value already documented in `examples/configs/curator.toml` (L-01). This only
+  changes what a fresh `init` generates — an existing `server.toml` keeps whatever value it
+  already has.
 
 ### Fixed
 
@@ -25,6 +284,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stuck. JWT verification now validates `iss` and `sub` claims; revocation is tenant-scoped.
   ApiKey listing filters by tenant. Worker dequeue properly documents tenant attribution via
   `ensure_job_tenant`.
+- **A note's recorded links no longer accumulate stale entries.** They were append-only: once a
+  link's target changed, the old target stayed recorded indefinitely, so the graph reflected a
+  note's history rather than its current body. `gradatum-admin repair-note-links` (see "Added"
+  above) backfills existing notes; new writes reconcile automatically.
+- **A malformed configuration value no longer leaks into the startup log.** A secret placed in
+  the wrong configuration field could previously appear in clear text in the error produced when
+  configuration loading failed. Configuration-loading errors are now redacted before being
+  logged or returned to the caller.
+- **Audit-pass artifacts now go through the storage layer.** They previously wrote to the local
+  filesystem directly; on a deployment using the object storage backend (above), they would have
+  stayed on local disk while the vault's notes moved elsewhere. They now write through the same
+  `Storage` backend and configuration as the vault itself.
+- **Studio: `react-router-dom` migrated to its next major version.** No route-level API changes
+  for consumers of the Studio UI.
+- **Two engine settings documented themselves as active when they were not.** `[engine].max_tokens`
+  described itself as a per-request generation cap "clamped by the binary", and `[engine].warm_up`
+  as an `eager`/`lazy` strategy. Neither was ever read: generation length is not capped by
+  `max_tokens`, and warm-up is always eager. Both are now documented as accepted-but-not-enforced
+  and annotated as such in the source. **If you relied on `max_tokens` as a safety limit, you did
+  not have one** — pass `--n-predict` through `[engine].extra_args`, which the child process does
+  honour. The fields are kept so existing configuration files keep loading; wiring them is a
+  deliberate behavioural change deferred to a later version rather than slipped into a patch.
+
+## [1.0.2] — 2026-08-06
+
+### Fixed
+
+- **MCP vault_write : author par défaut = agent du header `X-Gradatum-Agent`.** Le
+  `trust.subject()` (sub du token JWT) est partagé pour tous les canaux MCP partageant
+  la même api-key — il ne reflète PAS le canal. Le handler MCP résout désormais l'author
+  depuis le header `X-Gradatum-Agent` (identité par canal), avec chute sur le
+  `trust.subject()` conservée pour le chemin REST. Version LOCALE interne — non publiée
+  (pas de crates.io, pas de tag public, pas de GitHub).
+
+## [1.0.1] — 2026-08-05
+
+### Fixed
+
+- **Engine: `--chat-template-kwargs` autorisé en `extra_args`.** Le flag
+  `--chat-template-kwargs '{"enable_thinking":false}'` (désactivation du mode thinking des
+  modèles Qwen3.6-35B-A3B — économise ~400-1600 tokens de raisonnement/requête) est désormais
+  accepté par l'allow-list `ALLOWED_EXTRA_FLAGS` du superviseur `gradatum-engine`. La valeur
+  JSON est passée telle quelle en argv direct (pas d'interprétation shell), et le flag est
+  sûr car sa valeur est contrôlée par la configuration engine, sans ouverture réseau ni
+  lecture/écriture de chemin arbitraire. Version LOCALE interne — non publiée (pas de
+  crates.io, pas de tag public, pas de GitHub).
 
 ## [1.0.0] — 2026-08-04
 
@@ -363,8 +668,9 @@ full workspace (27 publishable crates) to `1.0.0`.
   a trait, so an out-of-tree crate that **implemented** `AclPolicy` to supply its own policy
   has **no supported way to do so on `1.x`** — third-party rules engines are not currently
   pluggable. `AclOp` moreover carries only `Read` and `Write`: `allow_delete` has no
-  equivalent at all. Whether external policy implementations come back is deferred to
-  RFC-0002 (RFC-0001 §12, Q4), which is not resolved. The module was removed rather than
+  equivalent at all. Whether external policy implementations come back is unresolved
+  (tracked as RFC-0001 §12 Q4 / RFC-0002 at the time; both design notes are since retired —
+  see `GOVERNANCE.md` § Structural change tracking). The module was removed rather than
   frozen because it was dead: its traits documented themselves as the core of access control
   while holding zero implementations, and freezing that for the whole `1.x` line was the
   worse option.
@@ -1421,7 +1727,7 @@ recall. No breaking changes; drop-in upgrade from v0.4.3.
 
 ## [0.4.3] — 2026-06-10
 
-Semantic forget, note lifecycle state machine, configurable history retention, search scoping, and multimodal content support. No breaking changes; drop-in upgrade from v0.4.2.
+Semantic forget, note lifecycle state machine, configurable history retention, search scoping, and multimodal content support. No breaking changes; drop-in upgrade from v0.4.1.
 
 ### Added
 
@@ -2250,8 +2556,9 @@ The LLM tier is an operator TOML option — default is `[curator] backend = "heu
 - **`/health`** endpoint (10 fields)
 - **`/metrics:19091`** sidechannel with cardinality cap
 - Shape parity tests (10 methods + smoke)
-- Cross-platform support: Linux primary, Windows secondary tier
-  ([RFC-0002](docs/RFC/RFC-0002-cross-platform-support.md))
+- Cross-platform support: Linux primary, Windows secondary tier (RFC-0002 — design note
+  retired; the tiered model itself was superseded 2026-06-05 by a Linux-only stance, see
+  `CONTRIBUTING.md` § Linux-only platform note)
 
 ### Drop-in compatibility (legacy vault v1.6.2)
 

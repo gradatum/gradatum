@@ -167,7 +167,7 @@ fn curated(note_id: &str, tenant: &str) -> serde_json::Value {
 #[tokio::test]
 async fn persist_embedding_without_vault_id_defaults_main() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     let resp = env
         .router
@@ -220,7 +220,7 @@ async fn persist_embedding_without_vault_id_defaults_main() {
 #[tokio::test]
 async fn persist_embedding_accepts_vault_id_param() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string(); // même ULID, deux vaults
+    let note_id = Ulid::generate().to_string(); // même ULID, deux vaults
 
     for tenant in ["main", "vault-b"] {
         let resp = env

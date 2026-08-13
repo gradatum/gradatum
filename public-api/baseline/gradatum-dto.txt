@@ -40,13 +40,15 @@ pub gradatum_dto::CodeScopeEntry::qualified_name: alloc::string::String
 pub gradatum_dto::CodeScopeEntry::signature: alloc::string::String
 pub gradatum_dto::CodeScopeEntry::source_path: alloc::string::String
 pub gradatum_dto::CodeScopeEntry::stale: bool
-pub struct gradatum_dto::CodeScopeRequest
+#[non_exhaustive] pub struct gradatum_dto::CodeScopeRequest
 pub gradatum_dto::CodeScopeRequest::body_budget_tokens: core::option::Option<usize>
 pub gradatum_dto::CodeScopeRequest::budget_tokens: core::option::Option<u32>
 pub gradatum_dto::CodeScopeRequest::include_body: bool
 pub gradatum_dto::CodeScopeRequest::include_callers: bool
 pub gradatum_dto::CodeScopeRequest::selector: gradatum_dto::CodeSelectorDto
 pub gradatum_dto::CodeScopeRequest::vault: alloc::string::String
+impl gradatum_dto::CodeScopeRequest
+pub fn gradatum_dto::CodeScopeRequest::new(alloc::string::String, gradatum_dto::CodeSelectorDto) -> Self
 pub struct gradatum_dto::CodeScopeResponse
 pub gradatum_dto::CodeScopeResponse::body_truncated: bool
 pub gradatum_dto::CodeScopeResponse::entries: alloc::vec::Vec<gradatum_dto::CodeScopeEntry>
@@ -55,13 +57,15 @@ pub gradatum_dto::CodeScopeResponse::truncated: bool
 pub struct gradatum_dto::CodeSelectorDto
 pub gradatum_dto::CodeSelectorDto::kind: alloc::string::String
 pub gradatum_dto::CodeSelectorDto::value: alloc::string::String
-pub struct gradatum_dto::CreateFeatureCardRequest
+#[non_exhaustive] pub struct gradatum_dto::CreateFeatureCardRequest
 pub gradatum_dto::CreateFeatureCardRequest::author: core::option::Option<alloc::string::String>
 pub gradatum_dto::CreateFeatureCardRequest::body: alloc::string::String
 pub gradatum_dto::CreateFeatureCardRequest::occurred_at: core::option::Option<alloc::string::String>
 pub gradatum_dto::CreateFeatureCardRequest::tags: alloc::vec::Vec<alloc::string::String>
 pub gradatum_dto::CreateFeatureCardRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 pub gradatum_dto::CreateFeatureCardRequest::title: alloc::string::String
+impl gradatum_dto::CreateFeatureCardRequest
+pub fn gradatum_dto::CreateFeatureCardRequest::new(alloc::string::String, alloc::string::String) -> Self
 pub struct gradatum_dto::CreateFeatureCardResponse
 pub gradatum_dto::CreateFeatureCardResponse::feature: alloc::string::String
 pub gradatum_dto::CreateFeatureCardResponse::job_id: alloc::string::String
@@ -114,21 +118,25 @@ pub gradatum_dto::ForgottenNoteEntry::forgotten_by: core::option::Option<alloc::
 pub gradatum_dto::ForgottenNoteEntry::section: alloc::string::String
 pub gradatum_dto::ForgottenNoteEntry::title: core::option::Option<alloc::string::String>
 pub gradatum_dto::ForgottenNoteEntry::ulid: alloc::string::String
-pub struct gradatum_dto::JobStatusRequest
+#[non_exhaustive] pub struct gradatum_dto::JobStatusRequest
 pub gradatum_dto::JobStatusRequest::job_id: alloc::string::String
+impl gradatum_dto::JobStatusRequest
+pub fn gradatum_dto::JobStatusRequest::new(alloc::string::String) -> Self
 pub struct gradatum_dto::LessonHit
 pub gradatum_dto::LessonHit::anchor_ms: i64
 pub gradatum_dto::LessonHit::snippet: alloc::string::String
 pub gradatum_dto::LessonHit::tags: alloc::vec::Vec<alloc::string::String>
 pub gradatum_dto::LessonHit::title: alloc::string::String
 pub gradatum_dto::LessonHit::ulid: alloc::string::String
-pub struct gradatum_dto::LessonsRecallRequest
+#[non_exhaustive] pub struct gradatum_dto::LessonsRecallRequest
 pub gradatum_dto::LessonsRecallRequest::class: alloc::string::String
 pub gradatum_dto::LessonsRecallRequest::compact: bool
 pub gradatum_dto::LessonsRecallRequest::limit: core::option::Option<u32>
 pub gradatum_dto::LessonsRecallRequest::query: core::option::Option<alloc::string::String>
 pub gradatum_dto::LessonsRecallRequest::rank: core::option::Option<gradatum_dto::RankMode>
 pub gradatum_dto::LessonsRecallRequest::semantic: core::option::Option<bool>
+impl gradatum_dto::LessonsRecallRequest
+pub fn gradatum_dto::LessonsRecallRequest::new(alloc::string::String) -> Self
 pub struct gradatum_dto::LessonsRecallResponse
 pub gradatum_dto::LessonsRecallResponse::items: alloc::vec::Vec<gradatum_dto::LessonHit>
 pub struct gradatum_dto::LinkDto
@@ -139,12 +147,13 @@ pub gradatum_dto::NoteStatusPatch::add_tags: core::option::Option<alloc::vec::Ve
 pub gradatum_dto::NoteStatusPatch::replaced_by: core::option::Option<alloc::string::String>
 pub gradatum_dto::NoteStatusPatch::status: core::option::Option<alloc::string::String>
 pub gradatum_dto::NoteStatusPatch::status_reason: core::option::Option<alloc::string::String>
-pub struct gradatum_dto::PersistCuratedRequest
+#[non_exhaustive] pub struct gradatum_dto::PersistCuratedRequest
 pub gradatum_dto::PersistCuratedRequest::author: core::option::Option<alloc::string::String>
 pub gradatum_dto::PersistCuratedRequest::body: alloc::string::String
 pub gradatum_dto::PersistCuratedRequest::curator_decision: core::option::Option<gradatum_dto::CuratorDecisionDto>
 pub gradatum_dto::PersistCuratedRequest::expected_sha256: core::option::Option<alloc::string::String>
 pub gradatum_dto::PersistCuratedRequest::links: alloc::vec::Vec<gradatum_dto::LinkDto>
+pub gradatum_dto::PersistCuratedRequest::links_authoritative: bool
 pub gradatum_dto::PersistCuratedRequest::note_id: alloc::string::String
 pub gradatum_dto::PersistCuratedRequest::provenance: core::option::Option<alloc::string::String>
 pub gradatum_dto::PersistCuratedRequest::section: alloc::string::String
@@ -155,7 +164,9 @@ pub gradatum_dto::PersistCuratedRequest::temporal: core::option::Option<gradatum
 pub gradatum_dto::PersistCuratedRequest::tenant_id: gradatum_core::scope::TenantId
 pub gradatum_dto::PersistCuratedRequest::title: alloc::string::String
 pub gradatum_dto::PersistCuratedRequest::trust: core::option::Option<f32>
-pub struct gradatum_dto::PersistDistillRequest
+impl gradatum_dto::PersistCuratedRequest
+pub fn gradatum_dto::PersistCuratedRequest::new(alloc::string::String, gradatum_core::scope::TenantId, alloc::string::String, alloc::string::String, alloc::string::String, alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::PersistDistillRequest
 pub gradatum_dto::PersistDistillRequest::body: alloc::string::String
 pub gradatum_dto::PersistDistillRequest::derived_from: alloc::vec::Vec<alloc::string::String>
 pub gradatum_dto::PersistDistillRequest::derived_into: core::option::Option<alloc::string::String>
@@ -167,18 +178,24 @@ pub gradatum_dto::PersistDistillRequest::tags: alloc::vec::Vec<alloc::string::St
 pub gradatum_dto::PersistDistillRequest::tenant_id: gradatum_core::scope::TenantId
 pub gradatum_dto::PersistDistillRequest::title: alloc::string::String
 pub gradatum_dto::PersistDistillRequest::trust: core::option::Option<f32>
-pub struct gradatum_dto::PersistEmbeddingRequest
+impl gradatum_dto::PersistDistillRequest
+pub fn gradatum_dto::PersistDistillRequest::new(alloc::string::String, gradatum_core::scope::TenantId, alloc::string::String, alloc::string::String, alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::PersistEmbeddingRequest
 pub gradatum_dto::PersistEmbeddingRequest::dim: u16
 pub gradatum_dto::PersistEmbeddingRequest::embedder_id: alloc::string::String
 pub gradatum_dto::PersistEmbeddingRequest::note_id: alloc::string::String
 pub gradatum_dto::PersistEmbeddingRequest::vault_id: core::option::Option<gradatum_core::scope::VaultId>
 pub gradatum_dto::PersistEmbeddingRequest::vector: alloc::vec::Vec<f32>
-pub struct gradatum_dto::PersistForgetRequest
+impl gradatum_dto::PersistEmbeddingRequest
+pub fn gradatum_dto::PersistEmbeddingRequest::new(alloc::string::String, alloc::string::String, u16, alloc::vec::Vec<f32>) -> Self
+#[non_exhaustive] pub struct gradatum_dto::PersistForgetRequest
 pub gradatum_dto::PersistForgetRequest::body: alloc::string::String
 pub gradatum_dto::PersistForgetRequest::forgotten_by: core::option::Option<alloc::string::String>
 pub gradatum_dto::PersistForgetRequest::note_id: alloc::string::String
 pub gradatum_dto::PersistForgetRequest::section: alloc::string::String
 pub gradatum_dto::PersistForgetRequest::tenant_id: gradatum_core::scope::TenantId
+impl gradatum_dto::PersistForgetRequest
+pub fn gradatum_dto::PersistForgetRequest::new(alloc::string::String, gradatum_core::scope::TenantId, alloc::string::String, alloc::string::String) -> Self
 pub struct gradatum_dto::PersistOkResponse
 pub gradatum_dto::PersistOkResponse::note_id: alloc::string::String
 pub gradatum_dto::PersistOkResponse::status: alloc::string::String
@@ -188,11 +205,13 @@ pub gradatum_dto::ProactiveHit::section: alloc::string::String
 pub gradatum_dto::ProactiveHit::snippet: alloc::string::String
 pub gradatum_dto::ProactiveHit::title: alloc::string::String
 pub gradatum_dto::ProactiveHit::ulid: alloc::string::String
-pub struct gradatum_dto::ProactiveRecallFeedbackRequest
+#[non_exhaustive] pub struct gradatum_dto::ProactiveRecallFeedbackRequest
 pub gradatum_dto::ProactiveRecallFeedbackRequest::accepted_ulids: alloc::vec::Vec<alloc::string::String>
 pub gradatum_dto::ProactiveRecallFeedbackRequest::recall_id: alloc::string::String
 pub gradatum_dto::ProactiveRecallFeedbackRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
-pub struct gradatum_dto::ProactiveRecallRequest
+impl gradatum_dto::ProactiveRecallFeedbackRequest
+pub fn gradatum_dto::ProactiveRecallFeedbackRequest::new(alloc::string::String, alloc::vec::Vec<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct gradatum_dto::ProactiveRecallRequest
 pub gradatum_dto::ProactiveRecallRequest::context: core::option::Option<alloc::string::String>
 pub gradatum_dto::ProactiveRecallRequest::limit: core::option::Option<u32>
 pub gradatum_dto::ProactiveRecallRequest::sections: core::option::Option<alloc::vec::Vec<alloc::string::String>>
@@ -218,7 +237,7 @@ pub struct gradatum_dto::ScoringWeights
 pub gradatum_dto::ScoringWeights::pagerank: core::option::Option<f64>
 pub gradatum_dto::ScoringWeights::recency: core::option::Option<f64>
 pub gradatum_dto::ScoringWeights::trust: core::option::Option<f64>
-pub struct gradatum_dto::SessionTraceRequest
+#[non_exhaustive] pub struct gradatum_dto::SessionTraceRequest
 pub gradatum_dto::SessionTraceRequest::action_type: alloc::string::String
 pub gradatum_dto::SessionTraceRequest::intent: core::option::Option<alloc::string::String>
 pub gradatum_dto::SessionTraceRequest::outcome: core::option::Option<alloc::string::String>
@@ -227,6 +246,8 @@ pub gradatum_dto::SessionTraceRequest::session_id: core::option::Option<alloc::s
 pub gradatum_dto::SessionTraceRequest::target: core::option::Option<alloc::string::String>
 pub gradatum_dto::SessionTraceRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 pub gradatum_dto::SessionTraceRequest::ts_ms: i64
+impl gradatum_dto::SessionTraceRequest
+pub fn gradatum_dto::SessionTraceRequest::new(i64, alloc::string::String) -> Self
 pub struct gradatum_dto::SessionTraceResponse
 pub gradatum_dto::SessionTraceResponse::id: i64
 pub gradatum_dto::SessionTraceResponse::session_id: alloc::string::String
@@ -238,7 +259,7 @@ pub gradatum_dto::TemporalEntryDto::valid_until_ms: core::option::Option<i64>
 pub struct gradatum_dto::UnforgotResponse
 pub gradatum_dto::UnforgotResponse::status: alloc::string::String
 pub gradatum_dto::UnforgotResponse::ulid: alloc::string::String
-pub struct gradatum_dto::VaultArchivesListRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultArchivesListRequest
 pub gradatum_dto::VaultArchivesListRequest::include_gc: bool
 pub gradatum_dto::VaultArchivesListRequest::include_restored: bool
 pub gradatum_dto::VaultArchivesListRequest::limit: usize
@@ -248,26 +269,32 @@ pub gradatum_dto::VaultArchivesListRequest::since_ms: core::option::Option<i64>
 pub gradatum_dto::VaultArchivesListRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 pub gradatum_dto::VaultArchivesListRequest::until_ms: core::option::Option<i64>
 pub gradatum_dto::VaultArchivesListRequest::vault_filter: core::option::Option<alloc::string::String>
+impl core::default::Default for gradatum_dto::VaultArchivesListRequest
+pub fn gradatum_dto::VaultArchivesListRequest::default() -> Self
 pub struct gradatum_dto::VaultArchivesListResponse
 pub gradatum_dto::VaultArchivesListResponse::count: usize
 pub gradatum_dto::VaultArchivesListResponse::entries: alloc::vec::Vec<gradatum_dto::ArchiveEntryDto>
 pub gradatum_dto::VaultArchivesListResponse::limit: usize
 pub gradatum_dto::VaultArchivesListResponse::offset: usize
-pub struct gradatum_dto::VaultArchivesPurgeRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultArchivesPurgeRequest
 pub gradatum_dto::VaultArchivesPurgeRequest::confirm_ulids: alloc::vec::Vec<alloc::string::String>
 pub gradatum_dto::VaultArchivesPurgeRequest::dry_run: bool
 pub gradatum_dto::VaultArchivesPurgeRequest::note_id: alloc::string::String
 pub gradatum_dto::VaultArchivesPurgeRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
+impl gradatum_dto::VaultArchivesPurgeRequest
+pub fn gradatum_dto::VaultArchivesPurgeRequest::new(alloc::string::String) -> Self
 pub struct gradatum_dto::VaultArchivesPurgeResult
 pub gradatum_dto::VaultArchivesPurgeResult::archive: core::option::Option<gradatum_dto::ArchiveEntryDto>
 pub gradatum_dto::VaultArchivesPurgeResult::dry_run: bool
 pub gradatum_dto::VaultArchivesPurgeResult::note_id: alloc::string::String
 pub gradatum_dto::VaultArchivesPurgeResult::purged: bool
-pub struct gradatum_dto::VaultArchivesRestoreRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultArchivesRestoreRequest
 pub gradatum_dto::VaultArchivesRestoreRequest::confirm_ulids: alloc::vec::Vec<alloc::string::String>
 pub gradatum_dto::VaultArchivesRestoreRequest::dry_run: bool
 pub gradatum_dto::VaultArchivesRestoreRequest::note_id: alloc::string::String
 pub gradatum_dto::VaultArchivesRestoreRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
+impl gradatum_dto::VaultArchivesRestoreRequest
+pub fn gradatum_dto::VaultArchivesRestoreRequest::new(alloc::string::String) -> Self
 pub struct gradatum_dto::VaultArchivesRestoreResult
 pub gradatum_dto::VaultArchivesRestoreResult::archive: core::option::Option<gradatum_dto::ArchiveEntryDto>
 pub gradatum_dto::VaultArchivesRestoreResult::dry_run: bool
@@ -275,16 +302,18 @@ pub gradatum_dto::VaultArchivesRestoreResult::note_id: alloc::string::String
 pub gradatum_dto::VaultArchivesRestoreResult::restored: bool
 pub gradatum_dto::VaultArchivesRestoreResult::restored_path: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultArchivesRestoreResult::status: core::option::Option<alloc::string::String>
-pub struct gradatum_dto::VaultClassifyRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultClassifyRequest
 pub gradatum_dto::VaultClassifyRequest::note_id: alloc::string::String
 pub gradatum_dto::VaultClassifyRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
+impl gradatum_dto::VaultClassifyRequest
+pub fn gradatum_dto::VaultClassifyRequest::new(alloc::string::String) -> Self
 pub struct gradatum_dto::VaultClassifyResponse
 pub gradatum_dto::VaultClassifyResponse::confidence: f32
 pub gradatum_dto::VaultClassifyResponse::current_section: alloc::string::String
 pub gradatum_dto::VaultClassifyResponse::method: alloc::string::String
 pub gradatum_dto::VaultClassifyResponse::note_id: alloc::string::String
 pub gradatum_dto::VaultClassifyResponse::suggested_section: alloc::string::String
-pub struct gradatum_dto::VaultContextRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultContextRequest
 pub gradatum_dto::VaultContextRequest::budget_tokens: core::option::Option<u32>
 pub gradatum_dto::VaultContextRequest::inject_skills: bool
 pub gradatum_dto::VaultContextRequest::max_tokens: core::option::Option<u32>
@@ -296,76 +325,98 @@ pub gradatum_dto::VaultContextRequest::section: core::option::Option<alloc::stri
 pub gradatum_dto::VaultContextRequest::session_id: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultContextRequest::skill_query: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultContextRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
-pub struct gradatum_dto::VaultDeleteRequest
+impl gradatum_dto::VaultContextRequest
+pub fn gradatum_dto::VaultContextRequest::new(alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::VaultDeleteRequest
 pub gradatum_dto::VaultDeleteRequest::confirm_ulids: alloc::vec::Vec<alloc::string::String>
 pub gradatum_dto::VaultDeleteRequest::dry_run: bool
 pub gradatum_dto::VaultDeleteRequest::note_id: alloc::string::String
 pub gradatum_dto::VaultDeleteRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
-pub struct gradatum_dto::VaultDiffRequest
+impl gradatum_dto::VaultDeleteRequest
+pub fn gradatum_dto::VaultDeleteRequest::new(alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::VaultDiffRequest
 pub gradatum_dto::VaultDiffRequest::a: alloc::string::String
 pub gradatum_dto::VaultDiffRequest::b: alloc::string::String
 pub gradatum_dto::VaultDiffRequest::note_id: alloc::string::String
 pub gradatum_dto::VaultDiffRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
+impl gradatum_dto::VaultDiffRequest
+pub fn gradatum_dto::VaultDiffRequest::new(alloc::string::String, alloc::string::String, alloc::string::String) -> Self
 pub struct gradatum_dto::VaultDiffResponse
 pub gradatum_dto::VaultDiffResponse::count: usize
 pub gradatum_dto::VaultDiffResponse::lines: alloc::vec::Vec<alloc::string::String>
-pub struct gradatum_dto::VaultDowngradeRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultDowngradeRequest
 pub gradatum_dto::VaultDowngradeRequest::note_id: alloc::string::String
 pub gradatum_dto::VaultDowngradeRequest::reason: alloc::string::String
 pub gradatum_dto::VaultDowngradeRequest::replaced_by: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultDowngradeRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
+impl gradatum_dto::VaultDowngradeRequest
+pub fn gradatum_dto::VaultDowngradeRequest::new(alloc::string::String, alloc::string::String) -> Self
 pub struct gradatum_dto::VaultDowngradeResponse
 pub gradatum_dto::VaultDowngradeResponse::note_id: alloc::string::String
 pub gradatum_dto::VaultDowngradeResponse::reason: alloc::string::String
 pub gradatum_dto::VaultDowngradeResponse::status: alloc::string::String
 pub gradatum_dto::VaultDowngradeResponse::status_changed: i64
-pub struct gradatum_dto::VaultForgetRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultForgetRequest
 pub gradatum_dto::VaultForgetRequest::confirm_ulids: alloc::vec::Vec<alloc::string::String>
 pub gradatum_dto::VaultForgetRequest::dry_run: bool
 pub gradatum_dto::VaultForgetRequest::forgotten_by: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultForgetRequest::scope: gradatum_dto::ForgetScopeDto
 pub gradatum_dto::VaultForgetRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
-pub struct gradatum_dto::VaultGraphRequest
+impl gradatum_dto::VaultForgetRequest
+pub fn gradatum_dto::VaultForgetRequest::new(gradatum_dto::ForgetScopeDto) -> Self
+#[non_exhaustive] pub struct gradatum_dto::VaultGraphRequest
 pub gradatum_dto::VaultGraphRequest::depth: core::option::Option<u32>
 pub gradatum_dto::VaultGraphRequest::include_backlinks: core::option::Option<bool>
 pub gradatum_dto::VaultGraphRequest::root: alloc::string::String
 pub gradatum_dto::VaultGraphRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
-pub struct gradatum_dto::VaultHistoryGetRequest
+impl gradatum_dto::VaultGraphRequest
+pub fn gradatum_dto::VaultGraphRequest::new(alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::VaultHistoryGetRequest
 pub gradatum_dto::VaultHistoryGetRequest::note_id: alloc::string::String
 pub gradatum_dto::VaultHistoryGetRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 pub gradatum_dto::VaultHistoryGetRequest::ts_ms: i64
+impl gradatum_dto::VaultHistoryGetRequest
+pub fn gradatum_dto::VaultHistoryGetRequest::new(alloc::string::String, i64) -> Self
 pub struct gradatum_dto::VaultHistoryGetResponse
 pub gradatum_dto::VaultHistoryGetResponse::body: alloc::string::String
 pub gradatum_dto::VaultHistoryGetResponse::note_id: alloc::string::String
 pub gradatum_dto::VaultHistoryGetResponse::section: alloc::string::String
 pub gradatum_dto::VaultHistoryGetResponse::ts_ms: i64
-pub struct gradatum_dto::VaultHistoryRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultHistoryRequest
 pub gradatum_dto::VaultHistoryRequest::note_id: alloc::string::String
 pub gradatum_dto::VaultHistoryRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
+impl gradatum_dto::VaultHistoryRequest
+pub fn gradatum_dto::VaultHistoryRequest::new(alloc::string::String) -> Self
 pub struct gradatum_dto::VaultHistoryResponse
 pub gradatum_dto::VaultHistoryResponse::count: usize
 pub gradatum_dto::VaultHistoryResponse::versions: alloc::vec::Vec<i64>
-pub struct gradatum_dto::VaultLifecycleRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultLifecycleRequest
 pub gradatum_dto::VaultLifecycleRequest::vault_id: gradatum_core::scope::VaultId
+impl gradatum_dto::VaultLifecycleRequest
+pub fn gradatum_dto::VaultLifecycleRequest::new(gradatum_core::scope::VaultId) -> Self
 pub struct gradatum_dto::VaultLifecycleResponse
 pub gradatum_dto::VaultLifecycleResponse::changed: bool
 pub gradatum_dto::VaultLifecycleResponse::status: alloc::string::String
 pub gradatum_dto::VaultLifecycleResponse::vault_id: gradatum_core::scope::VaultId
-pub struct gradatum_dto::VaultLinksRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultLinksRequest
 pub gradatum_dto::VaultLinksRequest::include_backlinks: core::option::Option<bool>
 pub gradatum_dto::VaultLinksRequest::path: alloc::string::String
 pub gradatum_dto::VaultLinksRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
-pub struct gradatum_dto::VaultListRequest
+impl gradatum_dto::VaultLinksRequest
+pub fn gradatum_dto::VaultLinksRequest::new(alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::VaultListRequest
 pub gradatum_dto::VaultListRequest::cursor: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::limit: core::option::Option<u32>
 pub gradatum_dto::VaultListRequest::pattern: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::section: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
-pub struct gradatum_dto::VaultPurgeRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultPurgeRequest
 pub gradatum_dto::VaultPurgeRequest::confirm_vault_id: core::option::Option<gradatum_core::scope::VaultId>
 pub gradatum_dto::VaultPurgeRequest::dry_run: bool
 pub gradatum_dto::VaultPurgeRequest::limit: usize
 pub gradatum_dto::VaultPurgeRequest::vault_id: gradatum_core::scope::VaultId
+impl gradatum_dto::VaultPurgeRequest
+pub fn gradatum_dto::VaultPurgeRequest::new(gradatum_core::scope::VaultId) -> Self
 pub struct gradatum_dto::VaultPurgeResponse
 pub gradatum_dto::VaultPurgeResponse::deleted: u64
 pub gradatum_dto::VaultPurgeResponse::dry_run: bool
@@ -373,20 +424,24 @@ pub gradatum_dto::VaultPurgeResponse::eligible: u64
 pub gradatum_dto::VaultPurgeResponse::remaining: u64
 pub gradatum_dto::VaultPurgeResponse::skipped: u64
 pub gradatum_dto::VaultPurgeResponse::vault_id: gradatum_core::scope::VaultId
-pub struct gradatum_dto::VaultReadRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultReadRequest
 pub gradatum_dto::VaultReadRequest::compact: bool
 pub gradatum_dto::VaultReadRequest::path: alloc::string::String
 pub gradatum_dto::VaultReadRequest::section: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultReadRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
-pub struct gradatum_dto::VaultRestoreRequest
+impl gradatum_dto::VaultReadRequest
+pub fn gradatum_dto::VaultReadRequest::new(alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::VaultRestoreRequest
 pub gradatum_dto::VaultRestoreRequest::note_id: alloc::string::String
 pub gradatum_dto::VaultRestoreRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 pub gradatum_dto::VaultRestoreRequest::ts_ms: i64
+impl gradatum_dto::VaultRestoreRequest
+pub fn gradatum_dto::VaultRestoreRequest::new(alloc::string::String, i64) -> Self
 pub struct gradatum_dto::VaultRestoreResponse
 pub gradatum_dto::VaultRestoreResponse::content_hash: alloc::string::String
 pub gradatum_dto::VaultRestoreResponse::note_id: alloc::string::String
 pub gradatum_dto::VaultRestoreResponse::ts_ms: i64
-pub struct gradatum_dto::VaultSearchRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultSearchRequest
 pub gradatum_dto::VaultSearchRequest::compact: bool
 pub gradatum_dto::VaultSearchRequest::from_ms: core::option::Option<i64>
 pub gradatum_dto::VaultSearchRequest::include_corpus_count: bool
@@ -400,7 +455,9 @@ pub gradatum_dto::VaultSearchRequest::status: core::option::Option<alloc::string
 pub gradatum_dto::VaultSearchRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 pub gradatum_dto::VaultSearchRequest::to_ms: core::option::Option<i64>
 pub gradatum_dto::VaultSearchRequest::vault_id: core::option::Option<gradatum_core::scope::VaultId>
-pub struct gradatum_dto::VaultTimelineRequest
+impl gradatum_dto::VaultSearchRequest
+pub fn gradatum_dto::VaultSearchRequest::new(alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::VaultTimelineRequest
 pub gradatum_dto::VaultTimelineRequest::as_of_ms: core::option::Option<i64>
 pub gradatum_dto::VaultTimelineRequest::compact: bool
 pub gradatum_dto::VaultTimelineRequest::cursor: core::option::Option<alloc::string::String>
@@ -411,11 +468,13 @@ pub gradatum_dto::VaultTimelineRequest::limit: core::option::Option<u32>
 pub gradatum_dto::VaultTimelineRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 pub gradatum_dto::VaultTimelineRequest::to_ms: core::option::Option<i64>
 pub gradatum_dto::VaultTimelineRequest::vault_id: core::option::Option<gradatum_core::scope::VaultId>
-pub struct gradatum_dto::VaultTraceRequest
+#[non_exhaustive] pub struct gradatum_dto::VaultTraceRequest
 pub gradatum_dto::VaultTraceRequest::limit: core::option::Option<u32>
 pub gradatum_dto::VaultTraceRequest::query: alloc::string::String
 pub gradatum_dto::VaultTraceRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
-pub struct gradatum_dto::VaultWriteRequest
+impl gradatum_dto::VaultTraceRequest
+pub fn gradatum_dto::VaultTraceRequest::new(alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::VaultWriteRequest
 pub gradatum_dto::VaultWriteRequest::author: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultWriteRequest::body: alloc::string::String
 pub gradatum_dto::VaultWriteRequest::expected_sha256: core::option::Option<alloc::string::String>
@@ -425,6 +484,8 @@ pub gradatum_dto::VaultWriteRequest::section_hint: core::option::Option<alloc::s
 pub gradatum_dto::VaultWriteRequest::tags: alloc::vec::Vec<alloc::string::String>
 pub gradatum_dto::VaultWriteRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 pub gradatum_dto::VaultWriteRequest::title: alloc::string::String
+impl gradatum_dto::VaultWriteRequest
+pub fn gradatum_dto::VaultWriteRequest::new(alloc::string::String, alloc::string::String) -> Self
 pub struct gradatum_dto::WriteConflictDto
 pub gradatum_dto::WriteConflictDto::attempted_sha256: core::option::Option<alloc::string::String>
 pub gradatum_dto::WriteConflictDto::current_sha256: alloc::string::String

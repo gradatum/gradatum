@@ -1,14 +1,16 @@
-//! Tests write E2E synthétiques — T8 steps 3 (tests 11-22).
+//! Tests write E2E synthétiques — T8 steps 3 (tests 11-21).
 //!
 //! # Périmètre
 //!
 //! Tests 11-20 : enqueue write/classify/downgrade + validation structure 202.
-//! Tests 21-22 : concurrent writes (atomic queue) + worker dispatch round-trip.
+//! Test 21 : writes concurrents (unicité des job_id sous charge).
 //!
-//! # Note : tests 16-18 (LLM wiremock) et 22 (leader election)
+//! # Note : tests 16-18 (LLM wiremock) et 22b (leader election)
 //!
-//! Les tests 16-18 (LLM wiremock) et 22b (leader election) nécessitent
-//! wiremock + leader election Dispatcher. Marqués `#[ignore]` avec justification.
+//! Les tests 16-18 (LLM wiremock) et 22b (leader election) sont marqués `#[ignore]`
+//! (infrastructure non câblée). L'ancien test 22 (round-trip du `Dispatcher` legacy) a
+//! été retiré : le traitement curate actif est couvert par
+//! `gradatum-worker/tests/curate_*` (`handle_curate`).
 //!
 
 use std::sync::Arc;
@@ -195,7 +197,7 @@ async fn test_13_write_reasoning_title_enqueues_job() {
 
 /// Test 14 — vault_write avec tags → job enqueued, tags préservés dans payload.
 ///
-/// Le payload bincode transporté dans la queue doit contenir les tags fournis.
+/// Les tags fournis sont transportés dans le `CurateSpec` du job enfilé (gradatum_jobs).
 #[tokio::test]
 async fn test_14_write_with_tags_enqueues_job() {
     let (addr, bearer, _queue) = spawn_write_server().await;
@@ -280,7 +282,7 @@ async fn test_19_downgrade_enqueues_job() {
     let (addr, bearer, queue) = spawn_write_server().await;
 
     // Note inexistante en DB — handler sync retourne 404 (après auth OK).
-    let fake_note_id = ulid::Ulid::new().to_string();
+    let fake_note_id = ulid::Ulid::generate().to_string();
 
     let resp = client()
         .post(format!("http://{addr}/api/v1/vault_downgrade"))
@@ -316,7 +318,7 @@ async fn test_19_downgrade_enqueues_job() {
 async fn test_20_classify_unknown_note_returns_404() {
     let (addr, bearer, queue) = spawn_write_server().await;
 
-    let fake_note_id = ulid::Ulid::new().to_string();
+    let fake_note_id = ulid::Ulid::generate().to_string();
 
     let resp = client()
         .post(format!("http://{addr}/api/v1/vault_classify"))
@@ -398,319 +400,6 @@ async fn test_21_concurrent_writes_produce_distinct_job_ids() {
     assert_eq!(
         depth, 0,
         "test 21 Phase 1.2 : queue legacy vide (10 jobs dans gradatum_jobs)"
-    );
-}
-
-// ── Test 22 : worker dispatch round-trip ────────────────────────────────────
-
-/// Test 22 — worker Dispatcher::run_once traite un job curate → vault persiste.
-///
-/// Valide le round-trip complet : enqueue direct dans SqliteQueue → Dispatcher::run_once
-/// → vault.write_note. Ce test n'utilise pas de serveur HTTP pour isoler le dispatcher.
-///
-/// # Note leader election
-///
-/// Le test de leader election (3 instances Dispatcher + kill leader ≤90s) est
-/// différé — voir `test_22b_leader_election_deferred_phase_2_1`.
-#[tokio::test]
-async fn test_22_worker_run_once_processes_curate_job() {
-    use gradatum_curator::CuratorPipeline;
-    use gradatum_server::api_v1::dto::VaultWriteRequest;
-    use gradatum_vault::Vault;
-    use gradatum_worker::dispatch::{Dispatcher, NoopAuditSink};
-    use tempfile::TempDir;
-
-    // Préparer un vault temporaire.
-    let dir = TempDir::new().expect("tempdir test 22");
-    let vault_path = dir.path().join("vault");
-    let vault = Arc::new(
-        Vault::create(&vault_path, gradatum_core::scope::VaultId::new("main"))
-            .await
-            .expect("Vault::create test 22"),
-    );
-
-    // Queue in-memory directe (pas de serveur HTTP).
-    let queue = Arc::new(
-        SqliteQueue::in_memory()
-            .await
-            .expect("SqliteQueue in-memory test 22"),
-    );
-
-    // Enqueue un job curate directement (bypass HTTP pour isoler le dispatcher).
-    let req = VaultWriteRequest {
-        title: "[DECISIONS] Test worker dispatch round-trip".into(),
-        body: "Ce test valide que Dispatcher::run_once traite bien un job curate.".into(),
-        author: None,
-        tags: vec![],
-        section_hint: None,
-        tenant_id: Some("main".into()),
-        expected_sha256: None,
-        note_id: None,
-        occurred_at: None,
-    };
-    let payload = bincode::serde::encode_to_vec(&req, bincode::config::standard())
-        .expect("encode VaultWriteRequest bincode test 22");
-    let job_id = queue
-        .enqueue(gradatum_queue::NewJob {
-            tenant_id: "main".into(),
-            kind: "curate".into(),
-            payload,
-            max_attempts: 3,
-        })
-        .await
-        .expect("enqueue test 22");
-    assert!(job_id > 0, "test 22 : job_id positif");
-
-    let depth_before = queue.depth().await.expect("depth before dispatch test 22");
-    assert_eq!(depth_before, 1, "test 22 : 1 job pending avant dispatch");
-
-    // Mock InternalClient minimal : persist_curated → vault.write_note_with_id.
-    struct SyntheticTestClient {
-        vault: Arc<gradatum_vault::Vault>,
-    }
-
-    #[async_trait::async_trait]
-    impl gradatum_worker::internal_client::InternalClient for SyntheticTestClient {
-        async fn persist_curated(
-            &self,
-            req: &gradatum_dto::PersistCuratedRequest,
-        ) -> Result<
-            gradatum_dto::PersistOkResponse,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            use chrono::Utc;
-            use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
-            use gradatum_core::identity::NoteId;
-            use gradatum_core::scope::VaultId;
-            use gradatum_core::section::Section;
-            use gradatum_core::status::NoteStatus;
-            use smallvec::SmallVec;
-            use ulid::Ulid;
-
-            let section: Section =
-                serde_json::from_str(&format!("\"{}\"", req.section)).unwrap_or(Section::Reference);
-            let status: NoteStatus =
-                serde_json::from_str(&format!("\"{}\"", req.status)).unwrap_or(NoteStatus::Live);
-            let all_tags: SmallVec<[gradatum_core::tag::Tag; 4]> = req
-                .tags
-                .iter()
-                .filter_map(|t| gradatum_core::tag::Tag::new(t.clone()).ok())
-                .collect();
-            let frontmatter = Frontmatter {
-                schema_version: 1,
-                vault_id: VaultId::new(req.tenant_id.as_str()),
-                locus: None,
-                section,
-                status,
-                status_reason: None,
-                status_changed: None,
-                tags: all_tags,
-                author: None,
-                created: Utc::now(),
-                updated: None,
-                extra: ExtraFields::empty(),
-                provenance: None,
-                forgotten: None,
-                forgotten_at: None,
-                forgotten_by: None,
-            };
-            let note_id = req
-                .note_id
-                .parse::<Ulid>()
-                .map(NoteId)
-                .unwrap_or_else(|_| NoteId::new());
-            let note = self
-                .vault
-                .write_note_with_id(frontmatter, req.body.clone(), note_id)
-                .await
-                .map_err(|e| {
-                    gradatum_worker::internal_client::InternalClientError::ServerError {
-                        status: 500,
-                        body: e.to_string(),
-                    }
-                })?;
-            Ok(gradatum_dto::PersistOkResponse {
-                note_id: note.id.to_string(),
-                status: "ok".to_string(),
-            })
-        }
-
-        async fn persist_embedding(
-            &self,
-            _req: &gradatum_dto::PersistEmbeddingRequest,
-        ) -> Result<
-            gradatum_dto::EmbeddingOkResponse,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-
-        async fn persist_forget(
-            &self,
-            _req: &gradatum_dto::PersistForgetRequest,
-        ) -> Result<
-            gradatum_dto::PersistOkResponse,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-
-        async fn persist_distill(
-            &self,
-            _req: &gradatum_dto::PersistDistillRequest,
-        ) -> Result<
-            gradatum_dto::PersistOkResponse,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-
-        async fn delete_note(
-            &self,
-            _vault_id: &str,
-            _ulid: &str,
-        ) -> Result<(), gradatum_worker::internal_client::InternalClientError> {
-            unimplemented!()
-        }
-
-        async fn get_note(
-            &self,
-            _vault_id: &str,
-            _ulid: &str,
-        ) -> Result<
-            gradatum_worker::internal_client::NoteReadDto,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-
-        async fn get_note_status(
-            &self,
-            _vault_id: &str,
-            _ulid: &str,
-        ) -> Result<Option<String>, gradatum_worker::internal_client::InternalClientError> {
-            unimplemented!()
-        }
-
-        async fn get_note_embedding(
-            &self,
-            _vault_id: &str,
-            _ulid: &str,
-            _embedder_id: &str,
-        ) -> Result<
-            gradatum_worker::internal_client::EmbeddingReadDto,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-
-        async fn get_trust(
-            &self,
-            _vault_id: &str,
-            _ulid: &str,
-        ) -> Result<f32, gradatum_worker::internal_client::InternalClientError> {
-            unimplemented!()
-        }
-
-        async fn title_lookup(
-            &self,
-            _tenant: &str,
-            _title: &str,
-        ) -> Result<Option<String>, gradatum_worker::internal_client::InternalClientError> {
-            Ok(None)
-        }
-
-        async fn id_lookup(
-            &self,
-            _tenant: &str,
-            _note_id: &str,
-        ) -> Result<Option<String>, gradatum_worker::internal_client::InternalClientError> {
-            Ok(None)
-        }
-
-        async fn list_notes_by_locus(
-            &self,
-            _vault: &str,
-            _prefix: &str,
-        ) -> Result<
-            Vec<gradatum_worker::internal_client::NoteIdDto>,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-
-        async fn list_by_status(
-            &self,
-            _vault: &str,
-            _status: &str,
-        ) -> Result<
-            Vec<gradatum_worker::internal_client::NoteIdDto>,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-
-        async fn list_garbage(
-            &self,
-            _vault: &str,
-            _before_ms: i64,
-            _grace_days: u32,
-        ) -> Result<
-            Vec<gradatum_worker::internal_client::NoteIdDto>,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-
-        async fn search_fts_for_forget(
-            &self,
-            _vault: &str,
-            _query: &str,
-            _limit: usize,
-        ) -> Result<
-            Vec<gradatum_worker::internal_client::NoteIdDto>,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-
-        async fn list_notes_by_agent(
-            &self,
-            _agent: &str,
-            _vaults: &[String],
-        ) -> Result<
-            Vec<gradatum_worker::internal_client::NoteIdDto>,
-            gradatum_worker::internal_client::InternalClientError,
-        > {
-            unimplemented!()
-        }
-    }
-
-    // Lancer le dispatcher.
-    let curator = Arc::new(CuratorPipeline::heuristic());
-    let dispatcher = Dispatcher::new(Arc::clone(&queue))
-        .with_client(Arc::new(SyntheticTestClient {
-            vault: Arc::clone(&vault),
-        })
-            as Arc<dyn gradatum_worker::internal_client::InternalClient>)
-        .with_curator(curator)
-        .with_audit(Arc::new(NoopAuditSink));
-
-    let processed = dispatcher
-        .run_once()
-        .await
-        .expect("Dispatcher::run_once test 22");
-    assert!(
-        processed,
-        "test 22 : run_once doit retourner true (job traité)"
-    );
-
-    // Phase 2.1.1 : le job curate chaîne automatiquement un job embed_note.
-    // La queue contient exactement 1 job (embed_note) après run_once du curate.
-    let depth_after = queue.depth().await.expect("depth after dispatch test 22");
-    assert_eq!(
-        depth_after, 1,
-        "test 22 : 1 job embed_note chaîné après run_once du curate"
     );
 }
 

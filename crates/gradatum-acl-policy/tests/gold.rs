@@ -3,7 +3,7 @@ use gradatum_core::trust::{StudioScope, TrustContext};
 
 fn human_admin() -> TrustContext {
     TrustContext::Studio {
-        user: "maintainer".into(),
+        user: "admin".into(),
         scope: StudioScope::Admin,
         step_up_until: None,
     }
@@ -21,7 +21,10 @@ fn agent(sub: &str, scopes: &[&str]) -> TrustContext {
 }
 
 fn preset() -> AclEngine {
-    // Chargé depuis la fixture de test locale — copie de crates/gradatum-admin/presets/hierarchical.toml.
+    // Matrice ACL synthétique locale (fixtures/hierarchical.toml) : PAS une copie du preset
+    // livré — une identité concrète par forme de scoping. Voir l'en-tête de la fixture pour
+    // la raison technique (le moteur ignore les [[consumer-template]], seuls porteurs du
+    // scoping par sous-arbre dans le preset livré).
     AclEngine::from_preset_str(include_str!("fixtures/hierarchical.toml")).unwrap()
 }
 

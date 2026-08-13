@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "1.0.0" }
+gradatum-core = { path = "../gradatum-core", version = "2.0.0" }
 
 async-trait   = { workspace = true }
 chrono        = { workspace = true }

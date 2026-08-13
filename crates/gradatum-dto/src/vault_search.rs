@@ -14,6 +14,7 @@ use gradatum_core::scope::{TenantId, VaultId};
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultSearchRequest {
     /// Tenant (principal) — optional; when omitted the server resolves it from the
     /// credential identity (JWT/API-key), never `"main"` by default.
@@ -112,6 +113,29 @@ pub struct VaultSearchRequest {
     /// to the historical `VaultSearchResponse`. Existing clients are unaffected.
     #[serde(default)]
     pub compact: bool,
+}
+
+impl VaultSearchRequest {
+    /// Constructs a search request with the mandatory `query`; all filters and
+    /// flags default to their unset (`None` / `false`) values.
+    #[must_use]
+    pub fn new(query: String) -> Self {
+        Self {
+            tenant_id: None,
+            query,
+            section: None,
+            status: None,
+            limit: None,
+            include_downgraded: false,
+            locus: None,
+            vault_id: None,
+            include_scores: false,
+            include_corpus_count: false,
+            from_ms: None,
+            to_ms: None,
+            compact: false,
+        }
+    }
 }
 
 /// Escapes SQLite LIKE metacharacters (`%`, `_`, `\`) in a value

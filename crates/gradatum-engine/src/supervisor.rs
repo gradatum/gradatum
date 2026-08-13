@@ -155,6 +155,8 @@ const ALLOWED_EXTRA_FLAGS: &[&str] = &[
     "--reasoning",
     "--reasoning-format",
     "--reasoning-budget",
+    // Chat template kwargs (JSON) — enable_thinking pour les modèles thinking
+    "--chat-template-kwargs",
     // Sampling (standalone parity)
     "--temp",
     "--temperature",
@@ -1124,6 +1126,32 @@ mod tests {
         assert!(
             validate_extra_args(&["--slot-prompt-similarity".into(), "0.8".into()]).is_ok(),
             "--slot-prompt-similarity doit être accepté (allow-list, incident 01KX8D6W9Q)"
+        );
+    }
+
+    #[test]
+    fn extra_args_accepts_chat_template_kwargs_with_json_value() {
+        // --chat-template-kwargs '{"enable_thinking":false}' : désactive le mode thinking
+        // des modèles Qwen3.6-35B-A3B (économise ~400-1600 tokens de raisonnement/requête).
+        // Forme --flag value : la valeur JSON commence par '{', ignorée comme positionnelle.
+        assert!(
+            validate_extra_args(&[
+                "--chat-template-kwargs".into(),
+                r#"{"enable_thinking":false}"#.into()
+            ])
+            .is_ok(),
+            "--chat-template-kwargs '{{\"enable_thinking\":false}}' doit être accepté"
+        );
+    }
+
+    #[test]
+    fn extra_args_accepts_chat_template_kwargs_equals_form() {
+        // Forme --flag=value : la clé est extraite avant le '=', la valeur JSON (avec
+        // guillemets) n'est pas inspectée — elle est passée telle quelle en argv direct.
+        assert!(
+            validate_extra_args(&[r#"--chat-template-kwargs={"enable_thinking":false}"#.into()])
+                .is_ok(),
+            "--chat-template-kwargs={{...}} doit être accepté"
         );
     }
 

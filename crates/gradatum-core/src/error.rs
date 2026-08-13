@@ -15,14 +15,7 @@
 //!
 //! No `Box<dyn Error>` in public library code.
 //! All errors are typed via `thiserror`.
-//!
-//! ## NFS constraint
-//!
-//! `GradatumError::VaultOnNfs` — the vault cannot be mounted on NFS.
-//! Detection via `nix::sys::statfs::statfs` + `STATFS_TYPE == NFS_SUPER_MAGIC`.
-//! Check triggered during `gradatum-vault::VaultConfig::validate()`.
 
-use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::frontmatter::SchemaVersion;
@@ -35,6 +28,7 @@ use crate::status::NoteStatus;
 /// Produced by L0 layers and returned to L1+ consumers.
 /// Each variant maps to a specific architectural layer.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum GradatumError {
     /// Incoming data validation error.
     #[error("validation error: {0}")]
@@ -79,16 +73,6 @@ pub enum GradatumError {
     /// Vault not found in configuration.
     #[error("vault not found: {0:?}")]
     VaultNotFound(VaultId),
-
-    /// Vault mounted on NFS — not supported.
-    ///
-    /// The vault must reside on a local filesystem. Detection uses
-    /// `nix::sys::statfs::statfs` and compares against `NFS_SUPER_MAGIC`.
-    #[error("vault root on NFS (NFS_SUPER_MAGIC), not supported: {path:?}")]
-    VaultOnNfs {
-        /// Vault root path whose `statfs` returned `NFS_SUPER_MAGIC`.
-        path: PathBuf,
-    },
 
     /// Override payload validation error against the schema registry.
     #[error("override schema validation: {0}")]

@@ -36,7 +36,7 @@ pub struct NoteId(pub Ulid);
 impl NoteId {
     /// Generates a new unique `NoteId`.
     pub fn new() -> Self {
-        Self(Ulid::new())
+        Self(Ulid::generate())
     }
 
     /// Returns the ULID timestamp in Unix milliseconds.

@@ -34,7 +34,8 @@ use std::path::PathBuf;
 /// cannot produce false positives in a `LIKE … ESCAPE '\\'` lookup.
 ///
 /// Behaviour matches `gradatum_index::queries::escape_like_pattern` exactly; it is
-/// duplicated here because `gradatum-index` does not export it publicly.
+/// duplicated here because `gradatum-index` does not export it publicly. Shared within the
+/// crate (F-147: reused by [`crate::repair_note_links`]) to avoid a second copy.
 ///
 /// ```text
 /// escape_like_pattern("User%")   → "User\\%"
@@ -42,7 +43,7 @@ use std::path::PathBuf;
 /// escape_like_pattern("a\\b")    → "a\\\\b"
 /// escape_like_pattern("Normal")  → "Normal"
 /// ```
-fn escape_like_pattern(s: &str) -> String {
+pub(crate) fn escape_like_pattern(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

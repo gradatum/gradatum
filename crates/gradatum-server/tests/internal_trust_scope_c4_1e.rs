@@ -161,7 +161,7 @@ fn curated(note_id: &str, tenant: &str, trust: f32) -> serde_json::Value {
 #[tokio::test]
 async fn get_trust_without_vault_id_defaults_main() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     let resp = env
         .router
@@ -194,7 +194,7 @@ async fn get_trust_without_vault_id_defaults_main() {
 #[tokio::test]
 async fn get_trust_scopes_by_vault_id_query() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string(); // même ULID, deux vaults
+    let note_id = Ulid::generate().to_string(); // même ULID, deux vaults
 
     let resp = env
         .router

@@ -98,12 +98,10 @@ fn hit(ulid: &str, section: &str) -> ProactiveHit {
 
 /// Requête proactive (context absent) sur le tenant `main`.
 fn req_proactive(limit: Option<u32>) -> ProactiveRecallRequest {
-    ProactiveRecallRequest {
-        tenant_id: Some("main".into()),
-        context: None,
-        sections: None,
-        limit,
-    }
+    let mut req = ProactiveRecallRequest::default();
+    req.tenant_id = Some("main".into());
+    req.limit = limit;
+    req
 }
 
 // ── Test 1 : mode proactive lit la surface pré-calculée ──────────────────────
@@ -265,12 +263,10 @@ write_patterns = []
     .await
     .expect("seed decisions");
 
-    let req = ProactiveRecallRequest {
-        tenant_id: Some("main".into()),
-        context: Some("rust async memory recall".into()),
-        sections: Some(vec!["lessons-learned".into()]),
-        limit: None,
-    };
+    let mut req = ProactiveRecallRequest::default();
+    req.tenant_id = Some("main".into());
+    req.context = Some("rust async memory recall".into());
+    req.sections = Some(vec!["lessons-learned".into()]);
 
     let resp = proactive_recall(&state, &bearer_main(), req)
         .await
@@ -363,12 +359,9 @@ write_patterns = []
     .await;
 
     // Caractères réservés FTS5 : opérateurs, parenthèses, guillemets, colonnes, étoile.
-    let req = ProactiveRecallRequest {
-        tenant_id: Some("main".into()),
-        context: Some(r#"a:b AND (c*) OR "x y" NEAR(z)"#.into()),
-        sections: None,
-        limit: None,
-    };
+    let mut req = ProactiveRecallRequest::default();
+    req.tenant_id = Some("main".into());
+    req.context = Some(r#"a:b AND (c*) OR "x y" NEAR(z)"#.into());
 
     let resp = proactive_recall(&state, &bearer_main(), req)
         .await
@@ -416,11 +409,12 @@ async fn seed_session(state: &AppState, recall_id: &str, surfaced: &[String]) {
 
 /// Construit une requête de feedback pour le tenant `main`.
 fn req_feedback(recall_id: &str, accepted: &[&str]) -> ProactiveRecallFeedbackRequest {
-    ProactiveRecallFeedbackRequest {
-        tenant_id: Some("main".into()),
-        recall_id: recall_id.into(),
-        accepted_ulids: accepted.iter().map(|s| (*s).to_string()).collect(),
-    }
+    let mut req = ProactiveRecallFeedbackRequest::new(
+        recall_id.into(),
+        accepted.iter().map(|s| (*s).to_string()).collect(),
+    );
+    req.tenant_id = Some("main".into());
+    req
 }
 
 // ── Test 8 : accepted ⊆ surfaced → Ok + record_feedback persiste ─────────────
@@ -640,11 +634,9 @@ write_patterns = []
         tenant_id: "other".into(),
         jti: None,
     };
-    let req = ProactiveRecallFeedbackRequest {
-        tenant_id: Some("other".into()),
-        recall_id: "recall-xt-001".into(),
-        accepted_ulids: vec![ULID_A.to_string()],
-    };
+    let mut req =
+        ProactiveRecallFeedbackRequest::new("recall-xt-001".into(), vec![ULID_A.to_string()]);
+    req.tenant_id = Some("other".into());
 
     let err = proactive_recall_feedback(&state, &bearer_other, req)
         .await
@@ -680,11 +672,8 @@ async fn feedback_too_many_accepted_ulids_rejected() {
     // 65 entrées > MAX_ACCEPTED_ULIDS (64). Le cap rejette avant le parse ULID,
     // donc des valeurs arbitraires suffisent à exercer la borne.
     let accepted: Vec<String> = (0..65).map(|i| format!("entry-{i}")).collect();
-    let req = ProactiveRecallFeedbackRequest {
-        tenant_id: Some("main".into()),
-        recall_id: "recall-cap".into(),
-        accepted_ulids: accepted,
-    };
+    let mut req = ProactiveRecallFeedbackRequest::new("recall-cap".into(), accepted);
+    req.tenant_id = Some("main".into());
 
     let err = proactive_recall_feedback(&state, &bearer_main(), req)
         .await

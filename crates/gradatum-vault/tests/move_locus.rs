@@ -11,7 +11,6 @@ mod common;
 use common::build_minimal_frontmatter;
 
 use gradatum_core::scope::{LocusId, VaultId};
-use gradatum_storage::Storage as _;
 use gradatum_vault::Vault;
 use tempfile::TempDir;
 

@@ -12,6 +12,10 @@
 #   --root DIR       Répertoire racine Gradatum (défaut : /var/lib/gradatum)
 #   --preset NAME    Preset ACL à utiliser (défaut : hierarchical)
 #   --bind ADDR      Adresse d'écoute serveur (défaut : 127.0.0.1:19090)
+#   --user NAME      Compte de service (défaut : gradatum). Créé avec un UID/GID
+#                    DYNAMIQUE s'il n'existe pas ; réutilisé tel quel s'il existe.
+#                    Si != gradatum, un drop-in systemd applique User=/Group= aux units.
+#   -h, --help       Afficher cette aide et quitter
 #   --with-engine    Installer gradatum-engine (superviseur llama-server) + template systemd
 #   --with-gateway   Installer gradatum-gateway (routeur LLM) + service systemd
 #   --cleanup-after  Lancer cargo clean après installation réussie (libère plusieurs GB)
@@ -32,6 +36,9 @@ set -euo pipefail
 ROOT="${ROOT:-/var/lib/gradatum}"
 PRESET="${PRESET:-hierarchical}"
 BIND="${BIND:-127.0.0.1:19090}"
+# Service account. Designated by NAME, never by number (systemd resolves the name
+# at runtime). Created with a dynamic UID/GID if absent, reused as-is if present.
+SVC_USER="${SVC_USER:-gradatum}"
 DO_BUILD=false
 DO_CLEAN=false
 DO_YES=false
@@ -66,6 +73,29 @@ export PATH="${CARGO_BIN_DIR}:${PATH}"
 
 # ─── Parsing des arguments ────────────────────────────────────────────────────
 
+print_usage() {
+    cat <<'USAGE'
+Usage : sudo bash scripts/install-gradatum-services.sh [OPTIONS]
+
+Options :
+  --build          Forcer la compilation Rust avant installation (cargo build --release)
+  --clean          Wiper /var/lib/gradatum avant init (détruit tokens/clés existants)
+  --yes            Mode non-interactif : skip toutes les confirmations
+  --cleanup-after  Lancer cargo clean après installation réussie (libère plusieurs GB)
+  --with-engine    Installer gradatum-engine (superviseur llama-server) + template systemd
+  --with-gateway   Installer gradatum-gateway (routeur LLM) + service systemd
+  --root DIR       Répertoire racine Gradatum (défaut : /var/lib/gradatum)
+  --preset NAME    Preset ACL à utiliser (défaut : hierarchical)
+  --bind ADDR      Adresse d'écoute serveur (défaut : 127.0.0.1:19090)
+  --user NAME      Compte de service (défaut : gradatum). Créé avec un UID/GID
+                   DYNAMIQUE s'il n'existe pas ; réutilisé tel quel s'il existe.
+                   Si != gradatum, un drop-in systemd applique User=/Group= aux units.
+  -h, --help       Afficher cette aide et quitter
+
+Idempotent : peut être relancé sans casser une installation existante.
+USAGE
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --build)         DO_BUILD=true ;;
@@ -77,9 +107,11 @@ while [[ $# -gt 0 ]]; do
         --root)          ROOT="$2";   shift ;;
         --preset)        PRESET="$2"; shift ;;
         --bind)          BIND="$2";   shift ;;
+        --user)          SVC_USER="$2"; shift ;;
+        -h|--help)       print_usage; exit 0 ;;
         *)
             echo "Option inconnue : $1" >&2
-            echo "Usage : sudo bash scripts/install-gradatum-services.sh [--build] [--clean] [--cleanup-after] [--yes] [--with-engine] [--with-gateway] [--root DIR] [--preset NAME] [--bind ADDR]" >&2
+            print_usage >&2
             exit 1
             ;;
     esac
@@ -122,6 +154,29 @@ confirm() {
     fi
 }
 
+# Apply (or remove) the systemd drop-in that overrides User=/Group= for a
+# non-default service account. Packaged units carry User=gradatum inline; a
+# drop-in under /etc/systemd/system/<unit>.d/ overrides them WITHOUT editing the
+# unit file, and survives a package/unit reinstall.
+# When SVC_USER == gradatum, any stale drop-in from a previous --user run is
+# removed so repeated installs converge (idempotence).
+apply_service_user_dropin() {
+    local unit="$1"
+    local dropin_dir="/etc/systemd/system/${unit}.d"
+    local dropin="${dropin_dir}/10-service-user.conf"
+    if [[ "$SVC_USER" == "gradatum" ]]; then
+        if [[ -f "$dropin" ]]; then
+            rm -f "$dropin"
+            echo "  Removed stale service-user drop-in: $dropin"
+        fi
+        return 0
+    fi
+    mkdir -p "$dropin_dir"
+    printf '[Service]\nUser=%s\nGroup=%s\n' "$SVC_USER" "$SVC_USER" > "$dropin"
+    chmod 0644 "$dropin"
+    echo "  Service-user drop-in: $dropin (User=Group=$SVC_USER)"
+}
+
 # ─── En-tête ─────────────────────────────────────────────────────────────────
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -129,6 +184,7 @@ echo "  Gradatum — Installation"
 echo "  ROOT     : $ROOT"
 echo "  PRESET   : $PRESET"
 echo "  BIND     : $BIND"
+echo "  USER     : $SVC_USER"
 echo "  BUILD    : $DO_BUILD"
 echo "  CLEAN    : $DO_CLEAN"
 echo "  ENGINE   : $DO_WITH_ENGINE"
@@ -148,6 +204,13 @@ fi
 ARCH="$(uname -m)"
 if [[ "$ARCH" != "x86_64" ]]; then
     fail "architecture non supportée : $ARCH (attendu : x86_64)"
+fi
+
+# Service account name must match the sysusers.d grammar (man sysusers.d):
+# [a-zA-Z_] first char, then [a-zA-Z0-9_-], at most 31 chars total.
+# Reject early with an actionable message rather than failing mid-install.
+if [[ ! "$SVC_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]{0,30}$ ]]; then
+    fail "invalid --user name '$SVC_USER' (allowed: [a-zA-Z_][a-zA-Z0-9_-]{0,30}, per sysusers.d)"
 fi
 
 # Outils requis
@@ -325,10 +388,21 @@ for src in "${BINARIES[@]}"; do
     fi
 done
 
+# Helper ExecStartPre gradatum-pre-migration-backup → /usr/local/bin/ (TOUJOURS : les units
+# server ET worker le déclarent en ExecStartPre SANS préfixe `-` — son absence fait échouer
+# le démarrage (status=216/GROUP). Backup atomique des DBs avant toute migration de schéma :
+# fail-closed volontaire, jamais `-`, un backup qui échoue doit bloquer, pas passer en silence.
+BACKUP_HELPER_SRC="packaging/systemd/gradatum-pre-migration-backup"
+if [[ ! -f "$BACKUP_HELPER_SRC" ]]; then
+    fail "helper manquant : $BACKUP_HELPER_SRC (requis par ExecStartPre des units server/worker)"
+fi
+install -m 755 "$BACKUP_HELPER_SRC" /usr/local/bin/gradatum-pre-migration-backup
+echo "  gradatum-pre-migration-backup → /usr/local/bin/gradatum-pre-migration-backup"
+
 # Binaires engine/gateway → /opt/gradatum/bin/ (cohérent avec leurs templates systemd)
 if [[ "$DO_WITH_ENGINE" == "true" ]] || [[ "$DO_WITH_GATEWAY" == "true" ]]; then
     mkdir -p /opt/gradatum/bin
-    chown gradatum:gradatum /opt/gradatum/bin 2>/dev/null || true
+    chown "$SVC_USER:$SVC_USER" /opt/gradatum/bin 2>/dev/null || true
     chmod 0755 /opt/gradatum/bin
 fi
 
@@ -369,27 +443,41 @@ ok
 
 # ─── [5/N] Sysusers (user système gradatum) ─────────────────────────────────
 
-step "Création de l'utilisateur système gradatum (UID 985)"
+step "Création du compte de service ($SVC_USER)"
 
-SYSUSERS_SRC="packaging/sysusers.d/gradatum.conf"
-if [[ ! -f "$SYSUSERS_SRC" ]]; then
-    fail "fichier sysusers manquant : $SYSUSERS_SRC"
+if id "$SVC_USER" &>/dev/null; then
+    # Reuse an existing account as-is — no requirement on its numeric UID/GID.
+    echo "  Account '$SVC_USER' already exists — reusing as-is (UID $(id -u "$SVC_USER"))"
+elif [[ "$SVC_USER" == "gradatum" ]]; then
+    # Default account: install the packaged sysusers.d unit (dynamic UID/GID).
+    SYSUSERS_SRC="packaging/sysusers.d/gradatum.conf"
+    if [[ ! -f "$SYSUSERS_SRC" ]]; then
+        fail "fichier sysusers manquant : $SYSUSERS_SRC"
+    fi
+    install -m 644 "$SYSUSERS_SRC" /usr/lib/sysusers.d/gradatum.conf
+    systemd-sysusers /usr/lib/sysusers.d/gradatum.conf
+else
+    # Custom account name: create a system user + matching group with a DYNAMIC
+    # UID/GID, fed to systemd-sysusers on stdin. No persistent sysusers.d file is
+    # installed for a custom name.
+    echo "  Creating system account '$SVC_USER' (dynamic UID/GID)…"
+    printf 'u %s - "Gradatum service" /var/lib/gradatum /sbin/nologin\n' "$SVC_USER" \
+        | systemd-sysusers -
 fi
 
-install -m 644 "$SYSUSERS_SRC" /usr/lib/sysusers.d/gradatum.conf
-systemd-sysusers
-
-# Vérification post-sysusers
-if ! id gradatum &>/dev/null; then
-    fail "l'utilisateur gradatum n'existe pas après systemd-sysusers"
+# Postflight — closes the exact hole that caused the historical mid-install panic.
+# systemd-sysusers can create the user while attaching it to a pre-existing
+# FOREIGN group that already holds the target numeric GID, leaving NO group named
+# "$SVC_USER". A later `chown $SVC_USER:$SVC_USER` would then die with "invalid
+# group" half-way through the install. Fail EARLY and actionably instead.
+if ! id "$SVC_USER" &>/dev/null; then
+    fail "system account '$SVC_USER' does not exist after creation (systemd-sysusers failed)"
+fi
+if ! getent group "$SVC_USER" &>/dev/null; then
+    fail "group '$SVC_USER' is missing: the account exists but no matching group was created (a numeric GID collision likely attached '$SVC_USER' to a foreign group). Resolve the GID conflict, or install under a free name with --user <name>, then re-run."
 fi
 
-ACTUAL_UID="$(id -u gradatum)"
-if [[ "$ACTUAL_UID" != "985" ]]; then
-    fail "UID gradatum = $ACTUAL_UID (attendu : 985) — conflit d'UID possible"
-fi
-
-echo "  id gradatum : $(id gradatum)"
+echo "  id $SVC_USER : $(id "$SVC_USER")"
 ok
 
 # ─── [6/N] Systemd units ─────────────────────────────────────────────────────
@@ -404,6 +492,7 @@ for unit in gradatum-server.service gradatum-worker.service; do
     fi
     install -m 644 "$src" "/etc/systemd/system/$unit"
     echo "  $unit → /etc/systemd/system/$unit"
+    apply_service_user_dropin "$unit"
 done
 
 # Engine template
@@ -414,6 +503,7 @@ if [[ "$DO_WITH_ENGINE" == "true" ]]; then
     fi
     install -m 644 "$src" "/etc/systemd/system/gradatum-engine@.service"
     echo "  gradatum-engine@.service → /etc/systemd/system/gradatum-engine@.service"
+    apply_service_user_dropin "gradatum-engine@.service"
 fi
 
 # Gateway service
@@ -424,6 +514,7 @@ if [[ "$DO_WITH_GATEWAY" == "true" ]]; then
     fi
     install -m 644 "$src" "/etc/systemd/system/gradatum-gateway-spike.service"
     echo "  gradatum-gateway-spike.service → /etc/systemd/system/gradatum-gateway-spike.service"
+    apply_service_user_dropin "gradatum-gateway-spike.service"
 fi
 
 systemctl daemon-reload
@@ -438,7 +529,7 @@ if [[ "$DO_WITH_ENGINE" == "true" ]]; then
 
     # Répertoire conf.d pour les configs engine
     mkdir -p /etc/gradatum/conf.d
-    chown gradatum:gradatum /etc/gradatum/conf.d
+    chown "$SVC_USER:$SVC_USER" /etc/gradatum/conf.d
     chmod 0750 /etc/gradatum/conf.d
     echo "  /etc/gradatum/conf.d/ créé"
 
@@ -448,7 +539,7 @@ if [[ "$DO_WITH_ENGINE" == "true" ]]; then
         dest="/etc/gradatum/conf.d/70-$example_cfg"
         if [[ -f "$src" ]]; then
             if [[ ! -f "$dest" ]]; then
-                install -m 644 -o gradatum -g gradatum "$src" "$dest"
+                install -m 644 -o "$SVC_USER" -g "$SVC_USER" "$src" "$dest"
                 echo "  $example_cfg → $dest"
             else
                 echo "  $dest existe déjà (skip — préserver la config existante)"
@@ -461,7 +552,7 @@ if [[ "$DO_WITH_ENGINE" == "true" ]]; then
     # Répertoire models/
     if [[ ! -d /opt/gradatum/models ]]; then
         mkdir -p /opt/gradatum/models
-        chown gradatum:gradatum /opt/gradatum/models
+        chown "$SVC_USER:$SVC_USER" /opt/gradatum/models
         chmod 0755 /opt/gradatum/models
         echo "  /opt/gradatum/models/ créé (placer vos fichiers GGUF ici)"
     fi
@@ -470,7 +561,7 @@ if [[ "$DO_WITH_ENGINE" == "true" ]]; then
     ENV_FILE="/etc/gradatum/engine-secrets.env"
     if [[ ! -f "$ENV_FILE" ]]; then
         touch "$ENV_FILE"
-        chown gradatum:gradatum "$ENV_FILE"
+        chown "$SVC_USER:$SVC_USER" "$ENV_FILE"
         chmod 0600 "$ENV_FILE"
         echo "  $ENV_FILE créé (vide — ajouter les variables de secret ici)"
     fi
@@ -511,13 +602,13 @@ fi
 
 # Créer le répertoire si absent
 mkdir -p "$ROOT"
-chown gradatum:gradatum "$ROOT"
+chown "$SVC_USER:$SVC_USER" "$ROOT"
 chmod 0750 "$ROOT"
 
 # Init si pas encore fait (ou si --force via --clean)
 BEARER_MARKER="$ROOT/config/admin.bearer.txt"
 INIT_CMD=(
-    sudo -u gradatum gradatum-admin init
+    sudo -u "$SVC_USER" gradatum-admin init
     --root "$ROOT"
     --preset "$PRESET"
     --bind "$BIND"
@@ -534,9 +625,11 @@ if ! "${INIT_CMD[@]}"; then
     fail "gradatum-admin init a échoué"
 fi
 
-# Vérification du résultat
+# Vérification du résultat — liste confrontée au réel d'un `gradatum-admin init` 2.0.0.
+# jwt.private.pem / jwt.public.pem RETIRÉS : init ne les génère plus (le serveur crée
+# lui-même config/jwt-signing-key.secret au 1er boot ; cf packaging/systemd/README.md).
+# Les attendre ici abattait le script juste après un init réussi, sur toute machine.
 for expected in "config/admin.bearer.txt" "config/server.toml" "config/bearer.toml" \
-                "config/jwt.private.pem" "config/jwt.public.pem" \
                 "db/queue.sqlite" "db/revocation.sqlite" "db/api_keys.sqlite"; do
     if [[ ! -f "$ROOT/$expected" ]]; then
         fail "fichier attendu manquant après init : $ROOT/$expected"
@@ -544,6 +637,48 @@ for expected in "config/admin.bearer.txt" "config/server.toml" "config/bearer.to
 done
 
 echo "  Structure $ROOT vérifiée"
+ok
+
+# ─── [9b/N] Fichier d'environnement worker (jeton API interne) ────────────────
+# Le worker lit GRADATUM_INTERNAL_TOKEN depuis /etc/gradatum/env (EnvironmentFile SANS `-`
+# dans l'unit : une absence échoue TÔT au niveau systemd, jamais en crash-loop silencieux).
+# init vient de déposer ce jeton dans <root>/config/internal-worker.token.txt ; sans ce
+# transport, le worker boucle sur « GRADATUM_INTERNAL_TOKEN must be set » pendant que
+# /health reste vert. On complète donc ici le chemin systemd.
+step "Fichier d'environnement worker (/etc/gradatum/env)"
+
+# Nom de variable distinct de l'ENV_FILE de la section engine (engine-secrets.env) pour
+# écarter tout risque de collision/shadowing entre les deux blocs top-level.
+WORKER_ENV_FILE="/etc/gradatum/env"
+WORKER_TOKEN_FILE="$ROOT/config/internal-worker.token.txt"
+mkdir -p /etc/gradatum
+
+if [[ -f "$WORKER_ENV_FILE" ]] && grep -qE '^[[:space:]]*GRADATUM_INTERNAL_TOKEN=' "$WORKER_ENV_FILE"; then
+    # Idempotence : un jeton déjà présent (run précédent OU posé par l'opérateur) n'est
+    # JAMAIS écrasé ni dupliqué. init --force PRÉSERVE le [internal_api].token existant,
+    # donc le jeton du fichier reste valide d'une exécution à l'autre.
+    echo "  $WORKER_ENV_FILE porte déjà GRADATUM_INTERNAL_TOKEN — laissé tel quel (valeur préservée)"
+else
+    # Fail-early actionnable : sans le jeton, le worker bouclerait en silence. On refuse
+    # d'installer un chemin systemd cassé.
+    if [[ ! -f "$WORKER_TOKEN_FILE" ]]; then
+        fail "jeton API interne absent : $WORKER_TOKEN_FILE — lancer 'gradatum-admin init' d'abord. Refus de laisser gradatum-worker en crash-loop silencieux (GRADATUM_INTERNAL_TOKEN must be set)."
+    fi
+    INTERNAL_TOKEN="$(tr -d '\n' < "$WORKER_TOKEN_FILE")"
+    [[ -n "$INTERNAL_TOKEN" ]] || fail "jeton API interne vide dans $WORKER_TOKEN_FILE — re-lancer 'gradatum-admin init'."
+    touch "$WORKER_ENV_FILE"
+    # URL : n'ajouter la ligne que si absente (jamais de doublon ; défaut worker = 19092 si omise).
+    grep -qE '^[[:space:]]*GRADATUM_INTERNAL_URL=' "$WORKER_ENV_FILE" \
+        || printf 'GRADATUM_INTERNAL_URL=http://127.0.0.1:19092\n' >> "$WORKER_ENV_FILE"
+    printf 'GRADATUM_INTERNAL_TOKEN=%s\n' "$INTERNAL_TOKEN" >> "$WORKER_ENV_FILE"
+    # Secret lu par SYSTEMD (root) au démarrage, PAS par le compte de service (le worker
+    # reçoit le jeton via l'environnement injecté). Propriétaire root, groupe = compte de
+    # service ($SVC_USER, suit --user), mode 0640 — cohérent avec engine-secrets.env.
+    chown "root:$SVC_USER" "$WORKER_ENV_FILE"
+    chmod 0640 "$WORKER_ENV_FILE"
+    echo "  $WORKER_ENV_FILE écrit (root:$SVC_USER 0640) — GRADATUM_INTERNAL_TOKEN + URL"
+fi
+
 ok
 
 # ─── [10/N] Enable et démarrage services ─────────────────────────────────────

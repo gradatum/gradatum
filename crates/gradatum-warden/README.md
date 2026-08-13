@@ -2,7 +2,7 @@
 
 > L0 network guard for gradatum: IP CIDR filter, per-IP rate limiting, and loopback bypass.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -12,8 +12,9 @@ It enforces three controls before any handler runs:
 
 1. **IP allowlist** — CIDR-based filter, available via `WardenConfig` (`ip_allow` / `ip_deny`);
    listed ranges are matched and unlisted ones rejected with 403. **Not populated by
-   `gradatum-server` in `1.0.0`**: its only construction site hard-codes both lists to empty,
-   which means allow-all. Consumers wiring `WardenLayer` themselves must fill them.
+   `gradatum-server`**: its only construction site (`build_warden_layer`) hard-codes both
+   lists to empty, which means allow-all. Consumers wiring `WardenLayer` themselves must
+   fill them.
 2. **Per-IP rate limiting** — configurable requests-per-minute with burst allowance.
 3. **Loopback bypass** — requests from `127.0.0.1` / `::1` skip rate limiting entirely,
    letting internal health checks and metrics scrapers pass through without quota impact.
@@ -25,7 +26,7 @@ handler receives the real request body — not a synthetic empty response.
 
 ```toml
 [dependencies]
-gradatum-warden = "1.0.0"
+gradatum-warden = "2.0.0"
 ```
 
 ```rust

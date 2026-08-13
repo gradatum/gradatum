@@ -118,7 +118,7 @@ async fn vault_search_response_includes_title_when_db_has_title() {
         )
         .expect("sign JWT");
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     // seed_note_with_fts : méthode concrète SqliteIndex (hors trait).
     idx.seed_note_with_fts(
         &note_id,
@@ -174,7 +174,7 @@ async fn vault_search_response_title_null_when_no_h1() {
         )
         .expect("sign JWT");
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     // seed_note_with_fts : méthode concrète SqliteIndex (hors trait).
     idx.seed_note_with_fts(&note_id, "reference", "body sans h1 alpha11 patch1 zzz")
         .await
@@ -215,7 +215,7 @@ async fn vault_search_response_preserves_snippet_alongside_title() {
         )
         .expect("sign JWT");
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     // seed_note_with_fts : méthode concrète SqliteIndex (hors trait).
     idx.seed_note_with_fts(
         &note_id,
@@ -275,7 +275,7 @@ async fn vault_search_empty_title_in_db_becomes_null() {
         )
         .expect("sign JWT");
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &note_id,
         "reference",
@@ -330,7 +330,7 @@ async fn vault_search_whitespace_title_in_db_becomes_null() {
         )
         .expect("sign JWT");
 
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &note_id,
         "reference",

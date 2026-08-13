@@ -256,7 +256,7 @@ fn extract_request_id(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .filter(|s| s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic()))
         .map(|s| s.to_owned())
-        .unwrap_or_else(|| Ulid::new().to_string())
+        .unwrap_or_else(|| Ulid::generate().to_string())
 }
 
 /// Builds an `HttpAuditActor` from the `TrustContext`.

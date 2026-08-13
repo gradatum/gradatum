@@ -121,8 +121,8 @@ async fn multifactor_recent_note_outranks_old_note_at_equal_rrf() {
     let token = sign(&state);
     let now_ms = chrono::Utc::now().timestamp_millis();
 
-    let id_a = Ulid::new().to_string();
-    let id_b = Ulid::new().to_string();
+    let id_a = Ulid::generate().to_string();
+    let id_b = Ulid::generate().to_string();
 
     // Note A : créée il y a 1 an (low recency) — seed_note_with_created : méthode concrète.
     idx.seed_note_with_created(
@@ -173,8 +173,8 @@ async fn multifactor_popular_note_outranks_isolated_at_equal_rrf() {
     // Notes datées d'il y a 7 jours pour neutraliser les diff de recency.
     let seven_days_ago = now_ms - 7 * 24 * 3_600_000;
 
-    let id_c = Ulid::new().to_string();
-    let id_d = Ulid::new().to_string();
+    let id_c = Ulid::generate().to_string();
+    let id_d = Ulid::generate().to_string();
 
     // seed_note_with_created : méthode concrète SqliteIndex (hors trait).
     idx.seed_note_with_created(
@@ -197,7 +197,7 @@ async fn multifactor_popular_note_outranks_isolated_at_equal_rrf() {
     // 5 backlinks vers id_d (isolated id_c reste à 0).
     // upsert_link : méthode IndexStore (trait production) → accessible via state.search.
     for i in 0..5 {
-        let linker = Ulid::new().to_string();
+        let linker = Ulid::generate().to_string();
         idx.seed_note_with_created(&linker, "reference", &format!("linker {i}"), seven_days_ago)
             .await
             .expect("seed linker");
@@ -237,8 +237,8 @@ async fn multifactor_scores_are_positive_and_decreasing() {
 
     // 2 notes avec body distinct, dates différentes.
     // seed_note_with_created : méthode concrète SqliteIndex (hors trait).
-    let id1 = Ulid::new().to_string();
-    let id2 = Ulid::new().to_string();
+    let id1 = Ulid::generate().to_string();
+    let id2 = Ulid::generate().to_string();
     idx.seed_note_with_created(&id1, "reference", "keyword unique fresh", now_ms)
         .await
         .expect("seed 1");

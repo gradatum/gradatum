@@ -30,7 +30,6 @@ use gradatum_core::identity::{ContentHash, NoteId, NoteVersion};
 use gradatum_core::DocumentStore as _;
 use gradatum_core::note::{EffectiveNote, Note, NoteBody};
 use gradatum_core::status::NoteStatus;
-use gradatum_storage::Storage as _;
 
 use crate::error::VaultError;
 use crate::registry::Vault;

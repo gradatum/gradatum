@@ -15,7 +15,7 @@ use crate::scope::{AgentId, TenantId};
 /// Passed as `Extension<TrustContext>` to every protected Axum handler.
 /// Extraction from HTTP headers lives in `gradatum-server::middleware`.
 ///
-/// `#[non_exhaustive]`: new variants may be added within the `1.x` line, so downstream
+/// `#[non_exhaustive]`: new variants may be added within the `2.x` line, so downstream
 /// matches must carry a fail-closed `_` arm — a future variant must never be silently
 /// authorised.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -75,7 +75,7 @@ pub enum TrustContext {
 
 /// Access levels for a Studio session (admin UI).
 ///
-/// `#[non_exhaustive]`: new variants may be added within the `1.x` line, so downstream
+/// `#[non_exhaustive]`: new variants may be added within the `2.x` line, so downstream
 /// matches must carry a fail-closed `_` arm (least privilege for any future scope).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
@@ -96,16 +96,18 @@ impl TrustContext {
 
     /// Returns `true` if the bearer token carries the given scope.
     ///
-    /// **Planned capability — not enforced in `1.0.0`.** No caller in this workspace
-    /// invokes this method: it gates nothing, on any request path. Its presence is not
-    /// evidence that a scope is required anywhere.
+    /// **Fine-grained scope enforcement — live since `2.0.0`.** The server enforces the
+    /// soul-write privilege through this method against `gradatum_acl_auth::IDENTITY_WRITE_SCOPE`
+    /// (`"identity_write"`): the identity read/write guards in `gradatum-server::api_v1::logic`
+    /// grant cross-agent soul access to a bearer carrying that scope, and to no other. Non-bearer
+    /// tiers (`Studio`, `Mtls`, `Unauthenticated`) always return `false` here — their privileges,
+    /// where they exist, are decided by an explicit tier match, never by this predicate.
     ///
-    /// The scope check actually enforced today is the coarse read/write split of
-    /// `gradatum_acl_auth::has_write_scope` (constant `WRITE_SCOPES`), applied by the
-    /// server-side tenant guard. This method is the intended primitive for the
-    /// finer-grained, per-endpoint scope control that is **not** implemented yet
-    /// (e.g. requiring a `"write"` scope on write-path endpoints); handlers enforcing
-    /// only authentication today could then be upgraded without signature change.
+    /// The coarse read/write split of `gradatum_acl_auth::has_write_scope` (constant
+    /// `WRITE_SCOPES`) is a **separate** check, applied by the server-side tenant guard;
+    /// `identity_write` is deliberately disjoint from `WRITE_SCOPES` so that `admin` does not
+    /// silently confer soul-write. This method remains the intended primitive for any further
+    /// per-endpoint scope control.
     pub fn has_scope(&self, scope: &str) -> bool {
         matches!(
             self,

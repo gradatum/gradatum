@@ -4,12 +4,11 @@ use gradatum_core::scope::TenantId;
 
 /// Request body for `vault_classify` — synchronous heuristic re-classification of an existing note.
 ///
-/// The **LIVE queue path** (`SqliteQueueStore`) serializes this struct via `serde_json`.
-/// The bincode serialization (`bincode::serde::encode_to_vec`) is used only by the
-/// legacy `dispatch.rs` dispatcher and does not apply to the active job pipeline.
+/// Serialised via `serde_json`.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VaultClassifyRequest {
     /// ULID identifier of the note to re-classify.
     pub note_id: String,
@@ -18,6 +17,17 @@ pub struct VaultClassifyRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub tenant_id: Option<TenantId>,
+}
+
+impl VaultClassifyRequest {
+    /// Constructs a classify request for `note_id`; `tenant_id` defaults to `None`.
+    #[must_use]
+    pub fn new(note_id: String) -> Self {
+        Self {
+            note_id,
+            tenant_id: None,
+        }
+    }
 }
 
 /// Response body for `vault_classify` — result of the offline heuristic classification.

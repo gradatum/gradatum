@@ -13,6 +13,7 @@ use gradatum_core::scope::TenantId;
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SessionTraceRequest {
     /// Tenant (default `"main"`). For explicitness only: ACL identity ALWAYS uses
     /// the `tenant_id` from the JWT. If provided AND different from the JWT → 422
@@ -41,6 +42,24 @@ pub struct SessionTraceRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r#ref: Option<String>,
     // No `agent_id` field: derived from the JWT `sub` claim server-side.
+}
+
+impl SessionTraceRequest {
+    /// Constructs a session-trace request with the mandatory `ts_ms` and
+    /// `action_type`; every optional field defaults to `None`.
+    #[must_use]
+    pub fn new(ts_ms: i64, action_type: String) -> Self {
+        Self {
+            tenant_id: None,
+            session_id: None,
+            ts_ms,
+            action_type,
+            target: None,
+            intent: None,
+            outcome: None,
+            r#ref: None,
+        }
+    }
 }
 
 /// Response for `POST /api/v1/session-log/trace`.

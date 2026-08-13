@@ -1,7 +1,11 @@
 # Known Issues — Windows
 
-> **DEFERRED (2026-06-05)**: Windows is no longer a supported target. gradatum is
-> Linux-only. This document is archived for historical reference.
+> **UPDATED (2026-08-10)**: Windows is supported again, but **via Docker only** (Docker
+> Desktop + WSL2, same `linux/amd64` target as Linux — no native Windows binary). The entries
+> below (empty) predate that change and describe the native-Windows path, which remains
+> unsupported. Platform support:
+> [docs/DEPLOYMENT.md § Platform support](DEPLOYMENT.md#platform-support). This document stays
+> archived for historical reference.
 
 > ~~Status: empty as of `v0.1.0-alpha` Sprint X-1 closure (2026-05-04). New entries appended as they are reported.~~
 

@@ -112,6 +112,7 @@ fi
 # ── Étape 2 : vault_write note synthétique ────────────────────────────────────
 echo "2/7 vault_write synthetic note [DECISIONS] alpha.4 smoke test"
 JOB_ID=""
+NOTE_ID=""
 if ! WRITE_RESP=$(curl -fsS -X POST "$SERVER/api/v1/vault_write" \
         -H "Authorization: Bearer $BEARER" \
         -H "Content-Type: application/json" \
@@ -120,52 +121,62 @@ if ! WRITE_RESP=$(curl -fsS -X POST "$SERVER/api/v1/vault_write" \
     step_fail "vault_write a échoué : $WRITE_RESP"
 else
     JOB_ID=$(printf '%s' "$WRITE_RESP" | jq -r '.job_id // empty')
-    if [[ ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
-        step_fail "job_id invalide ou absent : $WRITE_RESP"
+    # 2.0.0 : job_id ET note_id sont des ULID (26 caractères Crockford base32) renvoyés
+    # directement par vault_write. L'ancien test `^[0-9]+$` rejetait un job_id ULID
+    # parfaitement valide. note_id vient de la réponse d'écriture (plus du poll de job).
+    NOTE_ID=$(printf '%s' "$WRITE_RESP" | jq -r '.note_id // empty')
+    if [[ ! "$JOB_ID" =~ ^[0-9A-Za-z]{26}$ ]]; then
+        step_fail "job_id absent ou non-ULID : $WRITE_RESP"
         JOB_ID=""
     else
-        step_pass "job_id=$JOB_ID"
+        step_pass "job_id=$JOB_ID note_id=$NOTE_ID"
     fi
 fi
 
-# ── Étape 3 : poll statut job (attente max 30s) ───────────────────────────────
-echo "3/7 poll job status (max 30s)"
-NOTE_ID=""
+# ── Étape 3 : poll statut job jusqu'à terminal (attente max 30s) ──────────────
+echo "3/7 poll job status v2 (max 30s)"
 if [[ -z "$JOB_ID" ]]; then
     step_skip "étape 3 non exécutée — pas de job_id (dépend de l'étape 2)"
 else
-    STATUS="pending"
+    STATUS="Pending"
     for i in $(seq 1 30); do
-        JOB_DETAIL=$(curl -fsS --max-time 10 "$SERVER/api/v1/jobs/$JOB_ID" \
-            -H "Authorization: Bearer $BEARER" 2>/dev/null) || JOB_DETAIL='{"status":"error"}'
-        STATUS=$(printf '%s' "$JOB_DETAIL" | jq -r '.status // "error"')
-        if [[ "$STATUS" == "done" ]]; then
-            step_pass "status=done après ${i}s"
-            NOTE_ID=$(printf '%s' "$JOB_DETAIL" | jq -r '.result.note_id // empty')
+        # Endpoint v2 : /api/v1/jobs/{ulid}/v2. Le v1 (/api/v1/jobs/{id}) attend un i64 et
+        # rejette un ULID en HTTP 400. Statut sous .lifecycle.status, valeurs capitalisées
+        # (Done = succès ; DLQ/Cancelled/Conflict = terminal en échec).
+        JOB_DETAIL=$(curl -fsS --max-time 10 "$SERVER/api/v1/jobs/$JOB_ID/v2" \
+            -H "Authorization: Bearer $BEARER" 2>/dev/null) || JOB_DETAIL='{"lifecycle":{"status":"Error"}}'
+        STATUS=$(printf '%s' "$JOB_DETAIL" | jq -r '.lifecycle.status // "Error"')
+        if [[ "$STATUS" == "Done" ]]; then
+            step_pass "status=Done après ${i}s"
             break
+        fi
+        if [[ "$STATUS" == "DLQ" || "$STATUS" == "Cancelled" || "$STATUS" == "Conflict" ]]; then
+            break  # terminal non-Done : inutile de continuer à poller
         fi
         sleep 1
     done
-    if [[ "$STATUS" != "done" ]]; then
-        step_fail "job $JOB_ID non terminé après 30s (status=$STATUS)"
+    if [[ "$STATUS" != "Done" ]]; then
+        step_fail "job $JOB_ID non terminé Done après 30s (status=$STATUS)"
     fi
 fi
 
 # ── Étape 4 : vault_read — confirm note + section assignée ───────────────────
 echo "4/7 vault_read confirm note + section assigned"
 if [[ -z "$NOTE_ID" ]]; then
-    step_skip "étape 4 non exécutée — note_id indisponible (dépend de l'étape 3)"
+    step_skip "étape 4 non exécutée — note_id indisponible (dépend de l'étape 2)"
 else
+    # 2.0.0 : vault_read prend `path` (= l'ULID de la note), plus `note_id` ; la section
+    # assignée vit sous `.metadata.section` (plus `.section`).
     if ! READ_RESP=$(curl -fsS -X POST "$SERVER/api/v1/vault_read" \
             -H "Authorization: Bearer $BEARER" \
             -H "Content-Type: application/json" \
             --max-time 10 \
-            -d "{\"note_id\":\"$NOTE_ID\",\"tenant_id\":\"main\"}" 2>&1); then
-        step_fail "vault_read a échoué pour note_id=$NOTE_ID : $READ_RESP"
+            -d "{\"path\":\"$NOTE_ID\",\"tenant_id\":\"main\"}" 2>&1); then
+        step_fail "vault_read a échoué pour path=$NOTE_ID : $READ_RESP"
     else
-        SECTION=$(printf '%s' "$READ_RESP" | jq -r '.section // empty')
+        SECTION=$(printf '%s' "$READ_RESP" | jq -r '.metadata.section // empty')
         if [[ "$SECTION" == "decisions" ]]; then
-            step_pass "note_id=$NOTE_ID section=decisions"
+            step_pass "note $NOTE_ID section=decisions"
         elif [[ -n "$SECTION" ]]; then
             # Le titre porte [DECISIONS] : une autre section signale une dérive du
             # curator. Non tranchable ici, donc WARN — et un WARN ne fait pas un PASS.
@@ -179,27 +190,34 @@ fi
 # ── Étape 5 : audit JSONL dernière ligne ─────────────────────────────────────
 echo "5/7 audit JSONL last line check"
 TODAY=$(date -u +%Y-%m-%d)
-AUDIT_FILE="/var/log/gradatum/audit.${TODAY}.jsonl"
-if [[ ! -f "$AUDIT_FILE" ]]; then
-    step_skip "fichier audit absent ($AUDIT_FILE) — étape non exécutée, pas un PASS"
+# 2.0.0 : le sink JSONL écrit sous <storage.root>/audit/ (main.rs : with_audit_dir(storage.root/audit)),
+# PAS sous /var/log/gradatum/. Défaut StateDirectory=/var/lib/gradatum → /var/lib/gradatum/audit.
+# Surchargeable via AUDIT_DIR pour un storage.root non standard.
+AUDIT_DIR=${AUDIT_DIR:-/var/lib/gradatum/audit}
+AUDIT_FILE="${AUDIT_DIR}/audit.${TODAY}.jsonl"
+# Fichier 0640 owner gradatum : un compte non privilégié ne peut ni le lire ni parfois le
+# stat. Existence + lecture avec repli sudo -n (facultatif).
+AUDIT_LINE=""
+if [[ -r "$AUDIT_FILE" ]]; then
+    AUDIT_LINE=$(tail -1 "$AUDIT_FILE" 2>/dev/null)
+elif sudo -n test -r "$AUDIT_FILE" 2>/dev/null; then
+    AUDIT_LINE=$(sudo -n tail -1 "$AUDIT_FILE" 2>/dev/null)
+fi
+if [[ -z "$AUDIT_LINE" ]]; then
+    if [[ -e "$AUDIT_FILE" ]] || sudo -n test -e "$AUDIT_FILE" 2>/dev/null; then
+        step_skip "audit vide ou illisible ($AUDIT_FILE) — étape non exécutée"
+    else
+        step_skip "fichier audit absent ($AUDIT_FILE) — étape non exécutée, pas un PASS"
+    fi
+elif printf '%s' "$AUDIT_LINE" | jq -e '.event == "vault_write" and (.outcome == "admitted" or .outcome == "queued")' >/dev/null 2>&1; then
+    # outcome=queued est le cas NOMINAL en 2.0.0 : l'audit HTTP est émis à l'ENQUEUE, avant
+    # le traitement worker. admitted (post-curator) reste accepté. Les deux valident l'audit.
+    OUTCOME=$(printf '%s' "$AUDIT_LINE" | jq -r '.outcome')
+    step_pass "event=vault_write outcome=$OUTCOME"
 else
-    if [[ -r "$AUDIT_FILE" ]]; then
-        AUDIT_LINE=$(tail -1 "$AUDIT_FILE")
-    elif sudo -n true 2>/dev/null; then
-        AUDIT_LINE=$(sudo -n tail -1 "$AUDIT_FILE")
-    else
-        AUDIT_LINE=""
-    fi
-    if [[ -z "$AUDIT_LINE" ]]; then
-        step_skip "audit illisible ou vide ($AUDIT_FILE) — étape non exécutée"
-    elif printf '%s' "$AUDIT_LINE" | jq -e '.event == "vault_write" and .outcome == "admitted"' >/dev/null 2>&1; then
-        step_pass "event=vault_write outcome=admitted"
-    else
-        # outcome peut être "queued" si l'audit est émis avant le traitement worker (T7 pre-queue)
-        OUTCOME=$(printf '%s' "$AUDIT_LINE" | jq -r '.outcome // "?"')
-        EVENT=$(printf '%s' "$AUDIT_LINE" | jq -r '.event // "?"')
-        step_warn "audit last line event=$EVENT outcome=$OUTCOME (attendu vault_write/admitted — voir comportement T7)"
-    fi
+    OUTCOME=$(printf '%s' "$AUDIT_LINE" | jq -r '.outcome // "?"')
+    EVENT=$(printf '%s' "$AUDIT_LINE" | jq -r '.event // "?"')
+    step_fail "audit last line event=$EVENT outcome=$OUTCOME (attendu vault_write/admitted|queued)"
 fi
 
 # ── Étape 6 : cleanup vault_downgrade ────────────────────────────────────────
@@ -223,21 +241,40 @@ fi
 
 # ── Étape 7 : RAM worker post-fastembed cold start (Gate1-réserve1) ──────────
 echo "7/7 worker memory pic post-fastembed cold start (Gate1-réserve1)"
-if ! systemctl is-active --quiet gradatum-worker 2>/dev/null; then
-    step_skip "gradatum-worker non actif — étape non exécutée (deploy T13 requis)"
-else
-    MEM=$(systemctl show gradatum-worker -p MemoryCurrent --value 2>/dev/null || echo "N/A")
+# Le worker peut tourner SOUS systemd (déploiement packagé) OU HORS systemd (install manuel,
+# docker, dev). L'ancien test n'interrogeait que systemd → déclarait le worker "absent"
+# alors qu'un process gradatum-worker tournait. On tente les deux sources.
+MEM_BYTES=""
+MEM_SOURCE=""
+# Voie 1 — worker géré par systemd : MemoryCurrent du cgroup.
+if systemctl is-active --quiet gradatum-worker 2>/dev/null; then
+    MEM=$(systemctl show gradatum-worker -p MemoryCurrent --value 2>/dev/null || echo "")
     if [[ "$MEM" =~ ^[0-9]+$ && "$MEM" != "18446744073709551615" ]]; then
-        MEM_MB=$(( MEM / 1024 / 1024 ))
-        echo "    MemoryCurrent = ${MEM_MB} MB (raw: $MEM)"
-        # Seuil : bge-small-en-v1.5 ~153 MB RAM observé en bench T11 P2.0b.
-        if (( MEM_MB > 600 )); then
-            step_warn "RAM worker ${MEM_MB} MB > 600 MB — vérifier la config fastembed (Gate1-réserve1)"
-        else
-            step_pass "RAM worker ${MEM_MB} MB ≤ 600 MB"
+        MEM_BYTES="$MEM"; MEM_SOURCE="systemd cgroup"
+    fi
+fi
+# Voie 2 — worker hors systemd : RSS du process via /proc (repli sudo si /proc/<pid> restreint).
+if [[ -z "$MEM_BYTES" ]]; then
+    WPID=$(pgrep -x gradatum-worker 2>/dev/null | head -1)
+    [[ -z "$WPID" ]] && WPID=$(pgrep -f '/gradatum-worker( |$)' 2>/dev/null | head -1)
+    if [[ -n "$WPID" ]]; then
+        RSS_KB=$(awk '/^VmRSS:/{print $2}' "/proc/$WPID/status" 2>/dev/null)
+        [[ -z "$RSS_KB" ]] && RSS_KB=$(sudo -n awk '/^VmRSS:/{print $2}' "/proc/$WPID/status" 2>/dev/null)
+        if [[ "$RSS_KB" =~ ^[0-9]+$ ]]; then
+            MEM_BYTES=$(( RSS_KB * 1024 )); MEM_SOURCE="/proc/$WPID VmRSS"
         fi
+    fi
+fi
+if [[ -z "$MEM_BYTES" ]]; then
+    step_skip "aucun gradatum-worker détecté (ni unit systemd active, ni process) — étape non exécutée"
+else
+    MEM_MB=$(( MEM_BYTES / 1024 / 1024 ))
+    echo "    Mémoire worker = ${MEM_MB} MB (source: $MEM_SOURCE, raw: $MEM_BYTES)"
+    # Seuil : bge-small-en-v1.5 ~153 MB RAM observé en bench T11 P2.0b.
+    if (( MEM_MB > 600 )); then
+        step_warn "RAM worker ${MEM_MB} MB > 600 MB — vérifier la config fastembed (Gate1-réserve1)"
     else
-        step_skip "MemoryCurrent illisible ($MEM) — étape non exécutée (cgroup indisponible)"
+        step_pass "RAM worker ${MEM_MB} MB ≤ 600 MB"
     fi
 fi
 

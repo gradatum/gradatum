@@ -2,7 +2,7 @@
 
 > Umbrella SDK facade — re-exports curated subsets of focused crates via Cargo feature flags.
 
-**Status**: v1.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -13,7 +13,7 @@ The core runtime is a structured memory store for AI agents: write Markdown note
 them via LLM, embed them for semantic search, and query them over HTTP or MCP.
 
 Public API under [SemVer 2.0.0](https://semver.org): backward-compatible additions only
-within `1.x`, breaking changes deferred to the next major. Traits documented as unstable or
+within `2.x`, breaking changes deferred to the next major. Traits documented as unstable or
 experimental in their rustdoc (`IndexStore`, `VectorStore`, `DocumentStore` in `gradatum-core`)
 carry a finer-grained tier per
 [RELEASE-POLICY.md](https://github.com/gradatum/gradatum/blob/main/RELEASE-POLICY.md) (AM1).
@@ -31,10 +31,10 @@ carry a finer-grained tier per
 
 ```toml
 [dependencies]
-gradatum = "1.0.0"
+gradatum = "2.0.0"
 ```
 
-Opt out with `gradatum = { version = "1.0.0", default-features = false }`.
+Opt out with `gradatum = { version = "2.0.0", default-features = false }`.
 
 ```rust
 use gradatum::core::error::GradatumError;
@@ -68,7 +68,7 @@ use gradatum::VERSION;
 | [`gradatum-worker`](https://crates.io/crates/gradatum-worker) | Async queue consumer (Apalis-backed) |
 | [`gradatum-admin`](https://crates.io/crates/gradatum-admin) | Operator CLI: init, token, api-key, backfill, jobs, vault lifecycle |
 | [`gradatum-cli`](https://crates.io/crates/gradatum-cli) | End-user CLI — planned, currently a stub that exits 1 |
-| [`gradatum-mcp-stub`](https://crates.io/crates/gradatum-mcp-stub) | MCP stdio adapter forwarding tool calls to the HTTP API |
+| [`gradatum-mcp-stub`](https://crates.io/crates/gradatum-mcp-stub) | **Retired from the distribution in `2.0.0`** (`publish = false`, source kept in-tree, last published version `1.0.0`) — was an MCP stdio adapter forwarding tool calls to the HTTP API. MCP clients now connect directly to `gradatum-server`'s native `/mcp` endpoint. |
 | [`gradatum-sdk-rs`](https://crates.io/crates/gradatum-sdk-rs) | Rust SDK client for the HTTP API (planned — placeholder, no client surface) |
 
 ## License

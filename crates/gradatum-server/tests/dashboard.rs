@@ -115,7 +115,7 @@ async fn dashboard_aggregates_note_counts() {
     // 2 live, 1 pending-review, 1 staging.
     for _ in 0..2 {
         idx.seed_note_with_status(
-            &Ulid::new().to_string(),
+            &Ulid::generate().to_string(),
             Section::Reference,
             "live note",
             NoteStatus::Live,
@@ -125,7 +125,7 @@ async fn dashboard_aggregates_note_counts() {
         .expect("seed live");
     }
     idx.seed_note_with_status(
-        &Ulid::new().to_string(),
+        &Ulid::generate().to_string(),
         Section::Decisions,
         "pr note",
         NoteStatus::PendingReview,
@@ -134,7 +134,7 @@ async fn dashboard_aggregates_note_counts() {
     .await
     .expect("seed pr");
     idx.seed_note_with_status(
-        &Ulid::new().to_string(),
+        &Ulid::generate().to_string(),
         Section::Reference,
         "staging note",
         NoteStatus::Staging,

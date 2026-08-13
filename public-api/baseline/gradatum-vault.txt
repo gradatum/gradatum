@@ -74,7 +74,7 @@ pub async fn gradatum_vault::registry::Vault::create(&std::path::Path, gradatum_
 pub fn gradatum_vault::registry::Vault::index(&self) -> &alloc::sync::Arc<gradatum_index::sqlite::SqliteIndex>
 pub async fn gradatum_vault::registry::Vault::open(&std::path::Path) -> core::result::Result<Self, gradatum_vault::error::VaultError>
 pub fn gradatum_vault::registry::Vault::root(&self) -> &std::path::Path
-pub fn gradatum_vault::registry::Vault::storage(&self) -> &gradatum_storage::file::FileStorage
+pub fn gradatum_vault::registry::Vault::storage(&self) -> &dyn gradatum_storage::storage_trait::Storage
 pub fn gradatum_vault::registry::Vault::vault_id(&self) -> &gradatum_core::scope::VaultId
 pub async fn gradatum_vault::registry::Vault::with_shared_index(&std::path::Path, gradatum_core::scope::VaultId, alloc::sync::Arc<gradatum_index::sqlite::SqliteIndex>) -> core::result::Result<Self, gradatum_vault::error::VaultError>
 impl gradatum_vault::registry::Vault
@@ -183,7 +183,7 @@ pub async fn gradatum_vault::registry::Vault::create(&std::path::Path, gradatum_
 pub fn gradatum_vault::registry::Vault::index(&self) -> &alloc::sync::Arc<gradatum_index::sqlite::SqliteIndex>
 pub async fn gradatum_vault::registry::Vault::open(&std::path::Path) -> core::result::Result<Self, gradatum_vault::error::VaultError>
 pub fn gradatum_vault::registry::Vault::root(&self) -> &std::path::Path
-pub fn gradatum_vault::registry::Vault::storage(&self) -> &gradatum_storage::file::FileStorage
+pub fn gradatum_vault::registry::Vault::storage(&self) -> &dyn gradatum_storage::storage_trait::Storage
 pub fn gradatum_vault::registry::Vault::vault_id(&self) -> &gradatum_core::scope::VaultId
 pub async fn gradatum_vault::registry::Vault::with_shared_index(&std::path::Path, gradatum_core::scope::VaultId, alloc::sync::Arc<gradatum_index::sqlite::SqliteIndex>) -> core::result::Result<Self, gradatum_vault::error::VaultError>
 impl gradatum_vault::registry::Vault

@@ -64,7 +64,7 @@ async fn context_recency_uses_anchor_ms_not_created_ms() {
     let two_years_ago_ms = now_ms - 2 * 365 * 86_400_000_i64;
 
     // Seed la note dans l'index SQLite (created = now via seed_note_with_fts).
-    let ulid = Ulid::new().to_string();
+    let ulid = Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &ulid,
         "reference",
@@ -141,7 +141,7 @@ async fn context_recency_created_anchor_fallback_bit_identical() {
     let now_ms = Utc::now().timestamp_millis();
 
     // Note statique (sans temporal_index) — cas le plus fréquent (99.7% du corpus).
-    let ulid = Ulid::new().to_string();
+    let ulid = Ulid::generate().to_string();
     idx.seed_note_with_fts(
         &ulid,
         "reference",
@@ -212,7 +212,7 @@ async fn context_trust_age_uses_created_ms_not_anchor_ms() {
 
     // Seed avec provenance="distilled" (active le half_life 90j dans TrustDecayConfig).
     // created = now (seed_note_with_status → Utc::now()) → age_days correct ≈ 0.
-    let ulid = Ulid::new().to_string();
+    let ulid = Ulid::generate().to_string();
     idx.seed_note_with_status(
         &ulid,
         Section::Reference,

@@ -106,7 +106,7 @@ fn seed_agent_grants(index_path: &std::path::Path, agents: &[&str]) {
 
 /// Seed une VRAIE note `live` dans le vault tiers `research`. Retourne son ULID.
 fn seed_research_note(index_path: &std::path::Path) -> Ulid {
-    let victim = Ulid::new();
+    let victim = Ulid::generate();
     let conn = rusqlite::Connection::open(index_path).expect("open index.db seed");
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
@@ -213,7 +213,7 @@ async fn flag_on_downgrade_nonexistent_matches_cross_vault_oracle() {
     seed_agent_grants(&env.index_path, &["main", "attacker-main"]);
     let _victim = seed_research_note(&env.index_path);
     let jwt = sign_attacker(&env.state);
-    let ghost = Ulid::new();
+    let ghost = Ulid::generate();
 
     let status = request(
         build_router(env.state.clone()),
@@ -328,7 +328,7 @@ async fn flag_on_restore_cross_vault_does_not_mutate() {
 async fn flag_off_downgrade_own_vault_note_still_succeeds() {
     let env = build_env(false).await;
     // Note dans le vault propre 'main' (seed direct pour un ULID contrôlé).
-    let own = Ulid::new();
+    let own = Ulid::generate();
     {
         let conn = rusqlite::Connection::open(&env.index_path).expect("open");
         let now = chrono::Utc::now().timestamp_millis();

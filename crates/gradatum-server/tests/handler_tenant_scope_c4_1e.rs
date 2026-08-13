@@ -212,7 +212,7 @@ async fn note_present(env: &Env, note_id: &str, vault: &str) -> bool {
 #[tokio::test]
 async fn delete_without_vault_id_defaults_main() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     let resp = env
         .router
@@ -249,7 +249,7 @@ async fn delete_without_vault_id_defaults_main() {
 #[tokio::test]
 async fn delete_scopes_by_vault_id_query_preserves_main() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string(); // même ULID, deux vaults
+    let note_id = Ulid::generate().to_string(); // même ULID, deux vaults
 
     let resp = env
         .router
@@ -312,7 +312,7 @@ async fn delete_scopes_by_vault_id_query_preserves_main() {
 #[tokio::test]
 async fn forget_main_marks_main_index() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     let resp = env
         .router
@@ -350,7 +350,7 @@ async fn forget_main_marks_main_index() {
 #[tokio::test]
 async fn forget_scopes_mark_forgotten_by_tenant() {
     let env = build_env().await;
-    let note_id = Ulid::new().to_string();
+    let note_id = Ulid::generate().to_string();
 
     let resp = env
         .router
