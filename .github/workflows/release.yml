@@ -41,6 +41,21 @@ jobs:
     container: rust:bookworm
     timeout-minutes: 60
 
+    # OBLIGATOIRE dès qu'un job déclare `container:` — GitHub Actions retombe alors sur
+    # `sh -e {0}` comme shell par défaut, et non `bash`. Sur Debian, `sh` est `dash` :
+    # `set -o pipefail` n'y existe pas. Toute étape commençant par `set -euo pipefail`
+    # meurt donc à sa PREMIÈRE LIGNE avec « Illegal option -o pipefail », exit 2, avant
+    # d'avoir rien mesuré.
+    # Constaté le 2026-08-13 sur la release v2.0.0 : le gate « Assert glibc floor
+    # (measured, BLOCKING) », ajouté par 2895f469 pendant la campagne 2.0.0, n'avait
+    # jamais été exécuté — c'était sa première occasion, et il est mort ainsi. Un gate
+    # écrit, relu, cru protecteur, et qui n'a jamais rien mesuré.
+    # Déclaré au niveau du JOB, pas d'une étape : 2 étapes utilisent `pipefail`, et la
+    # prochaine qui en utilisera héritera du correctif sans action.
+    defaults:
+      run:
+        shell: bash
+
     steps:
       # ───────────────────────────────────────────────────────────────────
       # 1. Checkout
