@@ -64,6 +64,27 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # ───────────────────────────────────────────────────────────────────
+      # 1bis. Marquer le checkout comme sûr pour git — OBLIGATOIRE en conteneur
+      #    Le job tourne dans `container:` : l'utilisateur du conteneur (root)
+      #    diffère du propriétaire des fichiers posés par actions/checkout sur
+      #    l'hôte. git refuse alors d'opérer sur le dépôt (« detected dubious
+      #    ownership »), exit 128. L'exception `safe.directory` qu'actions/checkout
+      #    écrit vit dans le HOME temporaire du runner HÔTE, hors du conteneur —
+      #    elle n'y est donc pas visible. On la repose ici, une seule fois, au
+      #    niveau global (HOME du conteneur, persistant pour tous les steps qui
+      #    suivent), pour que TOUTE invocation git ultérieure du job en hérite —
+      #    et non pas inline dans le seul step qui a échoué (SBOM). Deux steps
+      #    invoquent git : « Resolve tag name » (git rev-parse, branche dev-) et
+      #    « Generate SBOM » (git log -1 pour SOURCE_DATE_EPOCH). $GITHUB_WORKSPACE
+      #    plutôt qu'un chemin littéral : c'est le chemin exact du checkout dans
+      #    le conteneur (/__w/<repo>/<repo>), sans le coder en dur.
+      #    Constaté le 2026-08-13 sur la release v2.0.0 (run 31735714123) : le step
+      #    SBOM mourait à `git log -1 --format=%ct` sous `set -euo pipefail`.
+      # ───────────────────────────────────────────────────────────────────
+      - name: Mark checkout as safe for git (container ownership)
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      # ───────────────────────────────────────────────────────────────────
       # 2. Toolchain Rust épinglée (rust-toolchain.toml)
       # ───────────────────────────────────────────────────────────────────
       - name: Install pinned toolchain (rust-toolchain.toml)
