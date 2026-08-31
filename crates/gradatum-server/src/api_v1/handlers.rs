@@ -36,7 +36,11 @@
 //! | GET  | `/api/v1/vault_tags`    | bearer required |
 
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json, extract::State, http::StatusCode};
+use axum::{
+    Extension, Json,
+    extract::{Query, State},
+    http::StatusCode,
+};
 use gradatum_core::error::GradatumError;
 use gradatum_core::trust::TrustContext;
 
@@ -45,7 +49,7 @@ use crate::api_v1::compact::{self, CompactBody};
 use crate::api_v1::dto::{
     VaultAuthorsResponse, VaultContextRequest, VaultContextResponse, VaultGraphRequest,
     VaultGraphResponse, VaultLinksRequest, VaultLinksResponse, VaultListRequest, VaultListResponse,
-    VaultReadRequest, VaultSearchRequest, VaultStatusResponse, VaultTagsResponse,
+    VaultReadRequest, VaultSearchRequest, VaultStatusResponse, VaultTagsRequest, VaultTagsResponse,
     VaultTraceRequest, VaultTraceResponse,
 };
 use crate::state::AppState;
@@ -113,51 +117,67 @@ pub(crate) fn build_snippet(body: &str, max_chars: usize) -> String {
     }
 }
 
-/// Normalises a query for SQLite FTS5, wrapping it in an exact phrase when necessary.
+/// Cite un jeton FTS5 unique lorsqu'il n'est pas sûr tel quel.
 ///
-/// ## Logic
+/// L'échappement se fait au niveau du **jeton**, et c'est cela qui préserve
+/// l'immunité au HTTP 500 : aucun caractère opérateur (`- * : ^ ( ) . , ! ?` …)
+/// ne peut atteindre le parseur FTS5 hors d'une phrase, et chaque `"` est doublé,
+/// donc le compte de guillemets reste toujours pair. Ne PAS réintroduire une liste
+/// noire de caractères opérateurs — c'était le bug pré-existant (`.`, `,`, `'`,
+/// `!`, `?` manquaient → HTTP 500).
 ///
-/// A query is passed as-is to FTS5 if and only if:
-/// - It contains only Unicode alphanumeric characters, underscores, or spaces.
-/// - It contains no reserved FTS5 keywords (`AND`, `OR`, `NOT`, `NEAR`).
-///
-/// In all other cases (presence of `.`, `,`, `-`, `'`, `!`, `?`, `:`, `*`, etc.),
-/// the query is wrapped as an exact phrase: `"<query>"`.
-///
-/// ## Escaping
-///
-/// Inside an FTS5 phrase:
-/// - Internal double-quotes are doubled (`"` → `""`).
-/// - Internal apostrophes are doubled (`'` → `''`) — required by the FTS5 tokeniser
-///   in phrase mode (the default `unicode61` tokeniser treats `'` as a delimiter).
-///
-/// ## Previous anti-pattern
-///
-/// Explicitly listing operator characters (`- * : ^ " ( )`) was incomplete by design:
-/// `.`, `,`, `'`, `!`, `?` were missing, causing HTTP 500 on earlier versions.
-///
-/// ## Visibility
-///
-/// `pub(crate)` for unit tests in this module; not exposed in the public API.
-pub(crate) fn build_fts_query(query: &str) -> String {
-    // Caractères safe pour FTS5 sans guillemets : alphanumériques Unicode, underscore, espace.
-    let is_safe = |c: char| c.is_alphanumeric() || c == '_' || c == ' ';
-
-    // Mots-clés FTS5 réservés — déclenche le wrap même si tous les chars sont alphanumériques.
-    let upper = query.to_uppercase();
-    let has_fts5_keyword = upper
-        .split_whitespace()
-        .any(|t| matches!(t, "AND" | "OR" | "NOT" | "NEAR"));
-
-    let needs_wrap = !query.chars().all(is_safe) || has_fts5_keyword;
-
-    if needs_wrap {
-        // Phrase exacte : guillemets doubles + internes doublés + apostrophes doublées.
-        let escaped = query.replace('"', "\"\"").replace('\'', "''");
-        format!("\"{escaped}\"")
+/// Un jeton entièrement sûr (alphanumérique Unicode + `_`, hors mot-clé) est rendu
+/// nu ; sinon il est enveloppé en phrase exacte, `"` et `'` doublés.
+fn quote_fts_token(token: &str) -> String {
+    let is_safe = |c: char| c.is_alphanumeric() || c == '_';
+    let is_keyword = matches!(token.to_uppercase().as_str(), "AND" | "OR" | "NOT" | "NEAR");
+    if !is_keyword && token.chars().all(is_safe) {
+        token.to_string()
     } else {
-        query.to_string()
+        // Phrase exacte : guillemets internes doublés + apostrophes doublées
+        // (le tokeniseur `unicode61` traite `'` comme délimiteur en mode phrase).
+        let escaped = token.replace('"', "\"\"").replace('\'', "''");
+        format!("\"{escaped}\"")
     }
+}
+
+/// Normalise une requête pour SQLite FTS5 en enveloppant **chaque jeton** au besoin.
+///
+/// ## Logique (rev2, F-162 lot 0 T1)
+///
+/// La requête est découpée sur les espaces ; chaque jeton est traité indépendamment
+/// par [`quote_fts_token`], puis les jetons sont rejoints par un espace — FTS5 y voit
+/// un ET implicite. Un jeton n'est rendu nu que s'il est intégralement sûr
+/// (alphanumérique Unicode ou `_`) et n'est pas un mot-clé réservé (`AND`, `OR`,
+/// `NOT`, `NEAR`) ; sinon il est cité en phrase exacte.
+///
+/// ## Ce que corrige rev2
+///
+/// L'enveloppe de la requête **entière** en une seule phrase (le comportement
+/// précédent) transformait `cargo-semver-checks baseline` en phrase contiguë
+/// `"cargo-semver-checks baseline"` — un seul trait d'union faisait tomber le
+/// décompte à 0 (« absence prouvée »). Désormais chaque jeton est cité seul :
+/// `"cargo-semver-checks" baseline` → ET des deux → correspondances réelles.
+///
+/// ## Neutralisation des opérateurs — documentée, plus silencieuse
+///
+/// `OR`, `NOT`, `NEAR` deviennent des jetons cités, donc des mots littéraux cherchés :
+/// un parseur de requêtes exposant ces opérateurs est hors périmètre (voir T2/T4).
+///
+/// ## Immunité au HTTP 500
+///
+/// Préservée par construction : voir [`quote_fts_token`]. Ne PAS revenir à une
+/// liste noire de caractères opérateurs (bug pré-existant → HTTP 500).
+///
+/// ## Visibilité
+///
+/// `pub(crate)` pour les tests unitaires de ce module ; hors API publique.
+pub(crate) fn build_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(quote_fts_token)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Filters semantic hits by section.
@@ -245,6 +265,52 @@ pub(crate) fn filter_semantic_by_sections(
     }
 }
 
+/// Filters semantic hits OUT of the excluded sections (default-search exclusion).
+///
+/// F-246 — inverse de [`filter_semantic_by_sections`] : garde les hits dont la
+/// section n'est PAS dans `excluded_sections`. Utilisé quand la requête ne porte
+/// aucun filtre de section explicite (`req.section = None`) pour écarter les
+/// sections `Section::DEFAULT_SEARCH_EXCLUDED` (raw capture) du chemin sémantique.
+///
+/// `sec_result` est la valeur de retour de `IndexStore::get_titles_sections` pour
+/// les IDs des hits sémantiques. Sémantique symétrique du filtre inclusif :
+///
+/// - `Ok(map)`: seul un hit dont la section (lue dans `map`) est ABSENTE de
+///   `excluded_sections` est gardé. Un hit absent de la map (section inconnue) est
+///   **exclu** — conservatisme : on ne surface pas un hit dont on ne peut pas vérifier
+///   qu'il n'est pas dans une section exclue par défaut.
+/// - `Err(_)`: **dégradation BM25-only** — vecteur vide. Une fuite de section exclue
+///   serait pire que la perte du signal sémantique : le chemin BM25 reste filtré
+///   (en mémoire dans `vault_search_impl`, au SQL dans `count_fts_matches`), donc la
+///   recherche reste fonctionnelle et sans fuite.
+///
+/// Pure (sans I/O, sans état) — directement testable unitairement, y compris `Err`.
+pub(crate) fn filter_semantic_excluding_sections(
+    semantic_hits: Vec<(gradatum_core::identity::NoteId, f32)>,
+    excluded_sections: &[&str],
+    sec_result: Result<std::collections::HashMap<String, (Option<String>, String)>, GradatumError>,
+) -> Vec<(gradatum_core::identity::NoteId, f32)> {
+    match sec_result {
+        Ok(sec_map) => semantic_hits
+            .into_iter()
+            .filter(|(id, _)| {
+                sec_map
+                    .get(&id.to_string())
+                    .map(|(_, sec)| !excluded_sections.contains(&sec.as_str()))
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                "vault_search: get_titles_sections (semantic default-exclusion filter) failed \
+                 — BM25-only degradation (semantic hits dropped this round)"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Filters semantic hits by status (symmetric to `filter_semantic_by_section`).
 ///
 /// `status_result` is the return value of `IndexStore::get_statuses` (raw SQL status)
@@ -305,10 +371,13 @@ pub(crate) fn filter_semantic_by_status(
 ///
 /// ## Score
 ///
-/// `score` is the **composite RRF** value: `rrf_fuse(BM25, semantic, k=60) ×
-/// (1 + α·recency) × (1 + β·pagerank)`. Upper bound ≈ 0.04 (a hit ranked #1 in
-/// both lists ≈ 2/(60+1) before factors). **This is NOT a [0-1] similarity** —
-/// interpret it as a relative rank (hit order), never via an absolute threshold.
+/// `score` is the **composite hybrid** value: `fusion(BM25, semantic) ×
+/// (1 + α·recency) × (1 + β·pagerank)`, where `fusion` is the weighted normalised
+/// magnitude `0.5·normalize_bm25 + 0.5·normalize_semantic` when both arms respond
+/// (F-162 critère 10), or the responding arm's normalised score at single arm
+/// (critère 6). The magnitude is kept — the upper bound is now ≈ 1.3
+/// (`[0,1]` fusion × composite ≤ 1.32), not the former RRF ceiling ≈ 0.04.
+/// Treat it as a relative ordering signal, not an absolute calibrated similarity.
 ///
 /// ## Errors
 ///
@@ -328,8 +397,11 @@ pub async fn vault_search(
     Extension(trust): Extension<TrustContext>,
     Json(req): Json<VaultSearchRequest>,
 ) -> Result<Response, StatusCode> {
-    // Read the opt-in flag before `req` is moved into the impl.
+    // Read the opt-in flag and capture the query before `req` is moved into the impl.
+    // The query is only needed to render the compact absence hint, so clone it only
+    // on the compact path (avoids a per-request allocation on the default path).
     let want_compact = req.compact;
+    let compact_query = want_compact.then(|| req.query.clone());
     let resp = crate::api_v1::logic::vault_search_impl(&state, &trust, req)
         .await
         .map_err(|e| {
@@ -341,7 +413,7 @@ pub async fn vault_search(
     // `compact=false` returns exactly `Json(resp)` as before → byte-for-byte identical.
     Ok(if want_compact {
         Json(CompactBody {
-            compact: compact::render_search(&resp),
+            compact: compact::render_search(&resp, compact_query.as_deref().unwrap_or_default()),
         })
         .into_response()
     } else {
@@ -619,15 +691,20 @@ pub async fn vault_authors(
 
 /// `GET /api/v1/vault_tags`
 ///
-/// Lists distinct tags in the caller's effective vault with their usage frequency.
-/// Delegates to `vault_tags_impl`, which resolves the tenant-scoped vault
+/// Lists distinct tags in the caller's effective vault with their usage frequency,
+/// **most frequent first** and **bounded by default** (`?limit=` lifts the bound —
+/// F-216). Delegates to `vault_tags_impl`, which resolves the tenant-scoped vault
 /// (JWT-derived when multi-tenant is enabled) and calls
 /// `state.search.distinct_tags(vault_id)`.
+///
+/// `limit` arrive en paramètre de requête (`Query`) : un appel sans query string
+/// reste valide et rend la réponse par défaut bornée (rétrocompatible).
 pub async fn vault_tags(
     State(state): State<AppState>,
     Extension(trust): Extension<TrustContext>,
+    Query(req): Query<VaultTagsRequest>,
 ) -> Result<Json<VaultTagsResponse>, StatusCode> {
-    crate::api_v1::logic::vault_tags_impl(&state, &trust)
+    crate::api_v1::logic::vault_tags_impl(&state, &trust, req)
         .await
         .map(Json)
         .map_err(|e| {
@@ -648,7 +725,7 @@ pub async fn vault_tags(
 mod tests {
     use super::{
         build_fts_query, build_snippet, filter_semantic_by_section, filter_semantic_by_status,
-        validate_search_status,
+        filter_semantic_excluding_sections, validate_search_status,
     };
     use gradatum_core::error::GradatumError;
     use gradatum_core::identity::NoteId;
@@ -718,6 +795,62 @@ mod tests {
         let err = Err(GradatumError::Storage("batch failure simulée".to_string()));
 
         let out = filter_semantic_by_section(hits, "reference", err);
+        assert!(
+            out.is_empty(),
+            "sur Err, AUCUN hit sémantique ne doit passer (dégradation BM25-only, zéro leak)"
+        );
+    }
+
+    /// F-246 — Ok + map complète : les hits des sections exclues sont retirés, les
+    /// autres sont conservés.
+    #[test]
+    fn filter_semantic_excluding_ok_keeps_non_excluded() {
+        let snap = "01HAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "01HBBBBBBBBBBBBBBBBBBBBBBB";
+        let hits = vec![(nid(snap), 0.9f32), (nid(b), 0.8f32)];
+        let mut map = HashMap::new();
+        map.insert(snap.to_string(), (None, "snapshot".to_string()));
+        map.insert(
+            b.to_string(),
+            (Some("Titre B".to_string()), "reference".to_string()),
+        );
+
+        let out = filter_semantic_excluding_sections(hits, &["snapshot"], Ok(map));
+        assert_eq!(out.len(), 1, "seul le hit hors 'snapshot' reste");
+        assert_eq!(out[0].0.to_string(), b);
+    }
+
+    /// F-246 — Ok + map partielle : un hit sans entrée (section inconnue) est exclu
+    /// (on ne surface pas un hit dont on ne peut pas vérifier qu'il n'est pas exclu).
+    #[test]
+    fn filter_semantic_excluding_ok_partial_excludes_unknown() {
+        let snap = "01HAAAAAAAAAAAAAAAAAAAAAAA";
+        let ref_note = "01HBBBBBBBBBBBBBBBBBBBBBBB";
+        let unknown = "01HCCCCCCCCCCCCCCCCCCCCCCC";
+        let hits = vec![
+            (nid(snap), 0.9f32),
+            (nid(ref_note), 0.8f32),
+            (nid(unknown), 0.7f32),
+        ];
+        // map contient snap (section exclue) et ref_note (visible) — unknown a une
+        // section inconnue (absente de la map).
+        let mut map = HashMap::new();
+        map.insert(snap.to_string(), (None, "snapshot".to_string()));
+        map.insert(ref_note.to_string(), (None, "reference".to_string()));
+
+        let out = filter_semantic_excluding_sections(hits, &["snapshot"], Ok(map));
+        assert_eq!(out.len(), 1, "seule la note 'reference' résolue survit");
+        assert_eq!(out[0].0.to_string(), ref_note);
+    }
+
+    /// F-246 — Err (échec batch) : dégradation BM25-only, aucun hit ne fuit.
+    #[test]
+    fn filter_semantic_excluding_err_degrades_to_bm25_only() {
+        let a = "01HAAAAAAAAAAAAAAAAAAAAAAA";
+        let hits = vec![(nid(a), 0.9f32)];
+        let err = Err(GradatumError::Storage("batch failure simulée".to_string()));
+
+        let out = filter_semantic_excluding_sections(hits, &["snapshot"], err);
         assert!(
             out.is_empty(),
             "sur Err, AUCUN hit sémantique ne doit passer (dégradation BM25-only, zéro leak)"
@@ -896,40 +1029,42 @@ mod tests {
         assert_eq!(q, "vault_search", "underscore est safe, pas de wrap");
     }
 
-    /// Mot-clé FTS5 `AND` → wrap phrase (même si que des chars alphanumériques).
+    /// Mot-clé FTS5 `AND` → seul le mot-clé est cité (F-162 rev2 : enveloppe par jeton).
     ///
-    /// Préserve le comportement existant : `AND` opérateur FTS5 → phrase littérale.
+    /// Avant rev2, le mot-clé enveloppait TOUTE la requête en phrase. Désormais
+    /// `AND` devient un jeton cité littéral ; `gradatum` et `notes` restent nus.
     #[test]
     fn build_fts_query_fts5_keyword_and_is_wrapped() {
         let q = build_fts_query("gradatum AND notes");
         assert_eq!(
-            q, r#""gradatum AND notes""#,
-            "AND keyword doit déclencher le wrap phrase"
+            q, r#"gradatum "AND" notes"#,
+            "seul AND est cité — le reste garde l'ET implicite"
         );
     }
 
-    /// Mot-clé FTS5 `NOT` → wrap phrase.
+    /// Mot-clé FTS5 `NOT` → seul le mot-clé est cité (F-162 rev2).
     #[test]
     fn build_fts_query_fts5_keyword_not_is_wrapped() {
         let q = build_fts_query("notes NOT debug");
         assert_eq!(
-            q, r#""notes NOT debug""#,
-            "NOT keyword doit déclencher le wrap phrase"
+            q, r#"notes "NOT" debug"#,
+            "seul NOT est cité — le reste garde l'ET implicite"
         );
     }
 
-    /// Query avec guillemets internes → guillemets doublés dans la phrase FTS5.
+    /// Query avec guillemets internes → guillemets doublés (F-162 rev2 : par jeton).
     ///
-    /// Input : `say "hello"` (11 chars, dont 2 guillemets)
-    /// Après `replace('"', "\"\"")` : `say ""hello""`
-    /// Wrappé en phrase : `"say ""hello"""` — guillemets ouvrant/fermant + doublage interne.
+    /// Input : `say "hello"` → jetons `say` et `"hello"`.
+    /// `say` est sûr → nu. `"hello"` (7 chars, dont 2 guillemets) → non sûr →
+    /// `replace('"', "\"\"")` = `""hello""` → phrase : `"""hello"""`.
+    /// Résultat joint : `say """hello"""`. Le compte de guillemets reste pair.
     #[test]
     fn build_fts_query_internal_quotes_doubled() {
         let q = build_fts_query(r#"say "hello""#);
-        // Valeur attendue : `"say ""hello"""` (ouverture + say + espace + "" + hello + "" + fermeture)
+        // Attendu : `say """hello"""` (say nu + espace + phrase à guillemets doublés).
         assert_eq!(
-            q, r#""say ""hello""""#,
-            "guillemets internes doublés dans la phrase"
+            q, "say \"\"\"hello\"\"\"",
+            "guillemets internes doublés dans le jeton cité"
         );
     }
 
@@ -969,28 +1104,132 @@ mod tests {
         assert_eq!(q, "", "query vide retourne chaîne vide");
     }
 
-    /// C1 — NEAR avec parenthèses → wrappé (parens = unsafe pour FTS5).
+    /// C1/F-162 rev2 — `NEAR(...)` n'est plus enveloppé en une phrase : il est
+    /// découpé sur l'espace en deux jetons ponctués, chacun cité individuellement.
     ///
-    /// La parenthèse `(` déclenche le wrap car `is_alphanumeric()` retourne false.
+    /// `NEAR(gradatum 5)` → jetons `NEAR(gradatum` et `5)` (le `(` et le `)` ne
+    /// sont pas sûrs) → `"NEAR(gradatum" "5)"`. L'ancien nom (`_is_wrapped`) et
+    /// l'ancien assert souple (`starts_with('"') && ends_with('"')`) masquaient ce
+    /// changement de sortie : ils restaient verts sur deux jetons cités. Assertion
+    /// exacte désormais, pour pinner ce que le test prétend tester.
     #[test]
-    fn build_fts_query_near_with_parens_is_wrapped() {
-        let q = build_fts_query("NEAR(gradatum 5)");
-        assert!(
-            q.starts_with('"') && q.ends_with('"'),
-            "NEAR(gradatum 5) doit être wrappé — parens = char spécial FTS5"
+    fn build_fts_query_near_expression_is_split_into_two_quoted_tokens() {
+        assert_eq!(
+            build_fts_query("NEAR(gradatum 5)"),
+            "\"NEAR(gradatum\" \"5)\"",
+            "NEAR(...) est découpé en deux jetons cités, pas enveloppé en une phrase"
         );
     }
 
-    /// C1 — deux-points (frontmatter) → wrappé.
+    /// C1 — deux-points (frontmatter) → seul le jeton porteur du `:` est cité (F-162 rev2).
     ///
-    /// Le `:` après `section` est unsafe FTS5 (opérateur de colonne). Doit être wrappé.
+    /// `section:` porte le `:` (opérateur de colonne FTS5) → cité en phrase.
+    /// `reasoning` est sûr → nu. Attendu : `"section:" reasoning`.
     #[test]
     fn build_fts_query_frontmatter_colon_is_wrapped() {
         let q = build_fts_query("section: reasoning");
-        assert!(
-            q.starts_with('"') && q.ends_with('"'),
-            "deux-points dans la query doivent déclencher le wrap (opérateur de colonne FTS5)"
+        assert_eq!(
+            q, r#""section:" reasoning"#,
+            "seul le jeton porteur du deux-points est cité"
         );
+    }
+
+    // ── F-162 lot 0 T1 — enveloppe PAR JETON (rev2) ──────────────────────────────
+
+    /// F-162 — un jeton ponctué est cité seul, le reste de la requête garde
+    /// l'ET implicite. `cargo-semver-checks baseline` doit devenir
+    /// `"cargo-semver-checks" baseline`, pas une phrase contiguë (qui rendait 0 match).
+    #[test]
+    fn build_fts_query_hyphenated_token_is_quoted_not_whole_query() {
+        assert_eq!(
+            build_fts_query("cargo-semver-checks baseline"),
+            "\"cargo-semver-checks\" baseline"
+        );
+    }
+
+    /// F-162 — une conjonction de versions n'est plus une seule phrase : chaque
+    /// jeton est cité individuellement (le mot-clé `OR` devient un littéral cité).
+    #[test]
+    fn build_fts_query_conjunction_of_versions_is_not_one_phrase() {
+        assert_eq!(
+            build_fts_query("2.0.7 OR 2.0.6"),
+            "\"2.0.7\" \"OR\" \"2.0.6\""
+        );
+    }
+
+    /// F-162 — un jeton ponctué unique reste cité seul (inchangé par le découpage).
+    #[test]
+    fn build_fts_query_single_punctuated_token_unchanged() {
+        assert_eq!(build_fts_query("2.0.7"), "\"2.0.7\"");
+    }
+
+    /// F-162 — immunité HTTP 500 prouvée par EXÉCUTION FTS5 réelle, pas par la forme.
+    ///
+    /// Chaque sonde traverse une vraie table FTS5 (`unicode61`) via `rusqlite`.
+    /// Une régression produisant une chaîne bien formée mais rejetée par le moteur
+    /// serait ici rouge — c'est le motif de faux vert que ce lot supprime.
+    /// Les sondes couvrent : opérateurs isolés/enchâssés, ponctuation pure,
+    /// guillemets/apostrophes déséquilibrés en entrée, requête vide/espaces,
+    /// et Unicode (emoji / CJK / marque combinante).
+    #[test]
+    fn build_fts_query_output_is_always_accepted_by_fts5() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE probe USING fts5(body);
+             INSERT INTO probe(body) VALUES ('gradatum notes 2.0.7 cargo-semver-checks');",
+        )
+        .unwrap();
+
+        for probe in [
+            "a-b",
+            "a*b",
+            "a:b",
+            "a^b",
+            "a\"b",
+            "a(b",
+            "a)b",
+            "a.b",
+            "a,b",
+            "a'b",
+            "a!b",
+            "a?b",
+            "-",
+            "*",
+            "\"",
+            "''",
+            "NEAR(x y)",
+            "",
+            "   ",
+            "2.0.7 OR 2.0.6",
+            "cargo-semver-checks baseline",
+            "🙂 中文 e\u{0301}",
+        ] {
+            let q = build_fts_query(probe);
+            // Seules les sondes vides ou blanches (`""`, `"   "`) ont le droit de
+            // produire une sortie vide. Toute autre sonde qui s'effondre vers vide
+            // est un bug (un jeton non vide perdu au découpage) et DOIT échouer :
+            // l'ancien `continue` muet aurait laissé passer une telle régression.
+            if probe.trim().is_empty() {
+                assert!(
+                    q.trim().is_empty(),
+                    "sonde vide `{probe}` doit produire une sortie vide, obtenu `{q}`"
+                );
+                continue; // sortie vide : pas de MATCH FTS5 (early-return côté appelant)
+            }
+            assert!(
+                !q.trim().is_empty(),
+                "sonde non vide `{probe}` s'est effondrée vers une sortie vide"
+            );
+            let res: Result<i64, _> = conn.query_row(
+                "SELECT COUNT(*) FROM probe WHERE probe MATCH ?1",
+                [&q],
+                |r| r.get(0),
+            );
+            assert!(
+                res.is_ok(),
+                "FTS5 a rejeté `{q}` (sonde `{probe}`) : {res:?}"
+            );
+        }
     }
 
     /// Vérifie que le mapping BM25 → score [0..1] utilisé dans `vault_search` est

@@ -2,7 +2,7 @@
 
 > Umbrella SDK facade — re-exports curated subsets of focused crates via Cargo feature flags.
 
-**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -31,10 +31,10 @@ carry a finer-grained tier per
 
 ```toml
 [dependencies]
-gradatum = "2.0.0"
+gradatum = "2.1.0"
 ```
 
-Opt out with `gradatum = { version = "2.0.0", default-features = false }`.
+Opt out with `gradatum = { version = "2.1.0", default-features = false }`.
 
 ```rust
 use gradatum::core::error::GradatumError;

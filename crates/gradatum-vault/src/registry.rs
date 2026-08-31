@@ -32,6 +32,8 @@ use gradatum_core::scope::VaultId;
 use gradatum_index::SqliteIndex;
 use gradatum_storage::{Storage, build_storage};
 
+use crate::note_write_guard::NoteWriteGuard;
+
 use crate::error::VaultError;
 
 /// Entry point for a Gradatum vault.
@@ -61,7 +63,11 @@ pub struct Vault {
     /// **principal**, which is carried by `TenantId` in the `TrustContext`.
     pub(crate) vault_id: VaultId,
     pub(crate) config: VaultConfig,
-    pub(crate) storage: Box<dyn Storage>,
+    /// Storage backend, wrapped behind the note-write convergence guard: the
+    /// ordinary [`gradatum_storage::Storage::write`] refuses a note `.md` path, so only the
+    /// funnel (via [`NoteWriteGuard::write_note_file`]) can persist a note file — index and
+    /// drift footprint are produced in the same geste.
+    pub(crate) storage: NoteWriteGuard,
     pub(crate) index: Arc<SqliteIndex>,
     pub(crate) cache: Arc<EffectiveNoteCache>,
     /// Cache hit counter — incremented on each return from cache.
@@ -121,7 +127,7 @@ impl Vault {
             root: root.to_path_buf(),
             vault_id,
             config,
-            storage,
+            storage: NoteWriteGuard::new(storage),
             index: Arc::new(index),
             cache: Arc::new(cache),
             cache_hits: Arc::new(AtomicU64::new(0)),
@@ -164,7 +170,7 @@ impl Vault {
             root: root.to_path_buf(),
             vault_id,
             config,
-            storage,
+            storage: NoteWriteGuard::new(storage),
             index: Arc::new(index),
             cache: Arc::new(cache),
             cache_hits: Arc::new(AtomicU64::new(0)),
@@ -227,7 +233,7 @@ impl Vault {
             root: root.to_path_buf(),
             vault_id,
             config,
-            storage,
+            storage: NoteWriteGuard::new(storage),
             // Pool PARTAGÉ — PAS de `SqliteIndex::open` : un seul pool sur `index.db`.
             index,
             cache: Arc::new(cache),
@@ -276,6 +282,9 @@ impl Vault {
     /// location of a `.md` after a relocation operation (`move_locus`).
     /// Read-only — tests do not mutate storage directly.
     pub fn storage(&self) -> &dyn Storage {
-        self.storage.as_ref()
+        // Returns the guarded handle (F-176): reads/exists/delete pass through, but a note
+        // `.md` write is refused. Integration tests use it read-only; no caller writes notes
+        // through it — the funnel owns note writes via the crate-internal privileged channel.
+        &self.storage
     }
 }

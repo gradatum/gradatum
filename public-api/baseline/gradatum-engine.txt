@@ -62,8 +62,18 @@ impl gradatum_engine::error::EngineError
 pub fn gradatum_engine::error::EngineError::kind(&self) -> &'static str
 pub fn gradatum_engine::error::EngineError::status(&self) -> u16
 pub mod gradatum_engine::health
-pub struct gradatum_engine::health::HealthSnapshot
+#[non_exhaustive] pub enum gradatum_engine::health::TelemetryStatus
+pub gradatum_engine::health::TelemetryStatus::Active
+pub gradatum_engine::health::TelemetryStatus::Failed
+pub gradatum_engine::health::TelemetryStatus::NotConfigured
+pub gradatum_engine::health::TelemetryStatus::Unauthorized
+pub gradatum_engine::health::TelemetryStatus::Unreachable
+impl gradatum_engine::health::TelemetryStatus
+pub const fn gradatum_engine::health::TelemetryStatus::is_active(self) -> bool
+pub const fn gradatum_engine::health::TelemetryStatus::label(self) -> &'static str
+#[non_exhaustive] pub struct gradatum_engine::health::HealthSnapshot
 pub gradatum_engine::health::HealthSnapshot::backend: &'static str
+pub gradatum_engine::health::HealthSnapshot::event_log: &'static str
 pub gradatum_engine::health::HealthSnapshot::model: alloc::string::String
 pub gradatum_engine::health::HealthSnapshot::status: &'static str
 pub gradatum_engine::health::HealthSnapshot::warm_up_state: &'static str
@@ -71,6 +81,7 @@ pub struct gradatum_engine::health::HealthState
 impl gradatum_engine::health::HealthState
 pub fn gradatum_engine::health::HealthState::is_ready(&self) -> bool
 pub fn gradatum_engine::health::HealthState::new(&str) -> Self
+pub fn gradatum_engine::health::HealthState::new_with_telemetry(&str, gradatum_engine::health::TelemetryStatus) -> Self
 pub fn gradatum_engine::health::HealthState::set_ready(&self)
 pub fn gradatum_engine::health::HealthState::set_unhealthy(&self)
 pub fn gradatum_engine::health::HealthState::snapshot(&self) -> gradatum_engine::health::HealthSnapshot
@@ -113,12 +124,24 @@ pub fn gradatum_engine::server::EngineServer::metrics_router(alloc::sync::Arc<gr
 pub fn gradatum_engine::server::EngineServer::router(gradatum_engine::server::AppState) -> axum::routing::Router
 pub fn gradatum_engine::server::EngineServer::test_app_with_child(alloc::string::String, u64, usize) -> axum::routing::Router
 pub mod gradatum_engine::sink
+#[non_exhaustive] pub enum gradatum_engine::sink::ExchangeError
+pub gradatum_engine::sink::ExchangeError::HttpStatus
+pub gradatum_engine::sink::ExchangeError::HttpStatus::status: u16
+pub gradatum_engine::sink::ExchangeError::HttpStatus::url: alloc::string::String
+pub gradatum_engine::sink::ExchangeError::MissingToken
+pub gradatum_engine::sink::ExchangeError::MissingToken::url: alloc::string::String
+pub gradatum_engine::sink::ExchangeError::Transport
+pub gradatum_engine::sink::ExchangeError::Transport::source: reqwest::error::Error
+pub gradatum_engine::sink::ExchangeError::Transport::url: alloc::string::String
+pub gradatum_engine::sink::ExchangeError::Unauthorized
+pub gradatum_engine::sink::ExchangeError::Unauthorized::url: alloc::string::String
 pub struct gradatum_engine::sink::HttpEventSink
 impl gradatum_engine::sink::HttpEventSink
 pub fn gradatum_engine::sink::HttpEventSink::new(alloc::string::String, zeroize::Zeroizing<alloc::string::String>, zeroize::Zeroizing<alloc::string::String>, core::option::Option<alloc::string::String>, alloc::sync::Arc<gradatum_engine::metrics::EngineMetrics>) -> Self
 impl gradatum_core::event_sink::EventSink for gradatum_engine::sink::HttpEventSink
 pub fn gradatum_engine::sink::HttpEventSink::emit<'life0, 'async_trait>(&'life0 self, gradatum_core::event_sink::EngineEvent) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub async fn gradatum_engine::sink::exchange_api_key_for_jwt(&zeroize::Zeroizing<alloc::string::String>, &str) -> anyhow::Result<zeroize::Zeroizing<alloc::string::String>>
+pub async fn gradatum_engine::sink::exchange_api_key_for_jwt_typed(&zeroize::Zeroizing<alloc::string::String>, &str) -> core::result::Result<zeroize::Zeroizing<alloc::string::String>, gradatum_engine::sink::ExchangeError>
 pub mod gradatum_engine::supervisor
 pub enum gradatum_engine::supervisor::ChildState
 pub gradatum_engine::supervisor::ChildState::Ready

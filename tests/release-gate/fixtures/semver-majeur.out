@@ -1,0 +1,12 @@
+    Building gradatum-core v2.1.0 (current)
+       Built [   9.117s] (current)
+     Parsing gradatum-core v2.1.0 (current)
+      Parsed [   0.018s] (current)
+    Building gradatum-core v2.0.8 (baseline)
+       Built [   7.264s] (baseline)
+     Parsing gradatum-core v2.0.8 (baseline)
+      Parsed [   0.025s] (baseline)
+    Checking gradatum-core v2.0.8 -> v2.1.0 (assume major change)
+     Checked [   0.000s] 0 checks: 0 pass, 254 skip
+     Summary no semver update required
+    Finished [  16.851s] gradatum-core

@@ -5,10 +5,10 @@
 //! | Method | Path | Description |
 //! |--------|------|-------------|
 //! | GET  | `/api/v1/jobs`             | Paginated list (cursor-based) |
-//! | GET  | `/api/v1/jobs/:id`         | Job detail |
+//! | GET  | `/api/v1/jobs/{id}/v2`     | Job detail |
 //! | POST | `/api/v1/jobs`             | Job creation with `Idempotency-Key` |
-//! | POST | `/api/v1/jobs/:id/cancel`  | Cancellation (409 if Running) |
-//! | GET  | `/api/v1/jobs/:id/events`  | SSE event stream |
+//! | POST | `/api/v1/jobs/{id}/cancel` | Cancellation (409 if Running) |
+//! | GET  | `/api/v1/jobs/{id}/events` | SSE event stream |
 //!
 //! # Auth
 //!
@@ -173,7 +173,7 @@ pub struct CreateJobResponse {
     pub idempotent: bool,
 }
 
-/// Response for `POST /api/v1/jobs/:id/cancel`.
+/// Response for `POST /api/v1/jobs/{id}/cancel`.
 #[derive(Debug, Serialize)]
 pub struct CancelJobResponse {
     /// ULID of the cancelled job.
@@ -331,7 +331,7 @@ pub async fn list_jobs(
     }
 }
 
-/// `GET /api/v1/jobs/:id` — Job detail.
+/// `GET /api/v1/jobs/{id}/v2` — Job detail.
 ///
 /// Returns the full `JobRecord` with the SQL-synchronized status.
 ///
@@ -859,7 +859,7 @@ impl std::fmt::Display for JobSpecError {
     }
 }
 
-/// `POST /api/v1/jobs/:id/cancel` — Cancels a job.
+/// `POST /api/v1/jobs/{id}/cancel` — Cancels a job.
 ///
 /// # Behavior
 ///
@@ -932,7 +932,7 @@ pub async fn cancel_job(
     }
 }
 
-/// `GET /api/v1/jobs/:id/events` — SSE event stream for a job.
+/// `GET /api/v1/jobs/{id}/events` — SSE event stream for a job.
 ///
 /// Returns a `text/event-stream` carrying job events.
 ///

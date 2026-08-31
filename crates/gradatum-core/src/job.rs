@@ -662,7 +662,7 @@ pub struct DistillSource {
     pub mode: DistillMode,
     /// Scope of candidate notes to distill.
     ///
-    /// In real mode: must target a `Locus` or a set of `Notes`
+    /// In real mode: must target a `Section`, a `Locus` or a set of `Notes`
     /// (`VaultWide` is rejected outside dry-run).
     pub scope: JobScope,
     /// Optional time window — consider only notes created/modified within this
@@ -738,7 +738,7 @@ pub struct ValidateSpec {
     pub source_texts: Vec<String>,
     /// Trust of the sources (parallel to `source_ids`) — for the f47 factor.
     pub source_trusts: Vec<f32>,
-    /// Base trust computed by distillation (`compute_distill_trust`).
+    /// Base trust computed by distillation (`gradatum_distill::compute_distill_trust`).
     pub base_trust: f32,
     /// Gate threshold (default 0.75).
     #[serde(default = "ValidateSpec::default_threshold")]
@@ -987,6 +987,13 @@ pub enum JobScope {
     VaultWide,
     /// A specific locus (vault directory).
     Locus(String),
+    /// A canonical section (e.g. `"debug"`, `"experiments"`, `"reference"`).
+    ///
+    /// Carried by the conditional distill cron's `Job::Distill`: the cron
+    /// measures consolidation pressure per section and enqueues a job whose scope is
+    /// that section. Resolved by the distill handler to the section's live,
+    /// non-`processed` notes — the section axis, never the (NULL) `locus` column.
+    Section(String),
     /// A targeted set of notes.
     Notes(Vec<Ulid>),
     /// An agent session (isolated context).

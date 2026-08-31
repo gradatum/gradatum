@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use gradatum_embed::{Embedder, Noop as NoopEmbedder};
 
@@ -26,9 +26,6 @@ use gradatum_core::QueueStore;
 use gradatum_core::audit::http::AuditSink;
 use gradatum_core::error::GradatumError;
 use gradatum_vault::Registry;
-use sqlx::SqlitePool;
-
-use gradatum_queue::{JobId, JobInfo, LeasedJob, NewJob, Queue, QueueError};
 
 use gradatum_core::index::Index;
 use gradatum_index::SqliteIndex;
@@ -88,58 +85,6 @@ fn placeholder_search() -> Arc<dyn Index> {
     .join()
     .expect("thread join placeholder_search — invariant thread");
     Arc::new(idx) as Arc<dyn Index>
-}
-
-/// Queue placeholder for sync constructors (`with_jwt`, `with_jwt_and_acl`).
-///
-/// Replaced immediately by `SqliteQueue` via `with_queue_path` in production
-/// or by `SqliteQueue::in_memory()` via `with_queue` in tests.
-///
-/// Private to `state.rs` — not exposed in the crate's public API.
-/// Allows sync constructors to initialise `AppState` before async injection.
-#[derive(Debug, Clone)]
-struct PlaceholderQueue;
-
-#[async_trait]
-impl Queue for PlaceholderQueue {
-    async fn get(&self, _id: JobId) -> Result<Option<JobInfo>, QueueError> {
-        Ok(None)
-    }
-
-    async fn enqueue(&self, _job: NewJob) -> Result<JobId, QueueError> {
-        // Placeholder : retourne ID 0 — signale l'absence de queue réelle.
-        // En prod, ce chemin est impossible car `with_queue_path` est toujours
-        // appelé avant tout enqueue.
-        Ok(0)
-    }
-
-    async fn lease(
-        &self,
-        _kinds: &[&str],
-        _duration: Duration,
-    ) -> Result<Option<LeasedJob>, QueueError> {
-        Ok(None)
-    }
-
-    async fn complete(&self, _id: JobId) -> Result<(), QueueError> {
-        Ok(())
-    }
-
-    async fn fail(&self, _id: JobId, _err: &str) -> Result<(), QueueError> {
-        Ok(())
-    }
-
-    async fn extend_lease(&self, _id: JobId, _dur: Duration) -> Result<(), QueueError> {
-        Ok(())
-    }
-
-    async fn depth(&self) -> Result<u64, QueueError> {
-        Ok(0)
-    }
-
-    async fn oldest_age_secs(&self) -> Result<u64, QueueError> {
-        Ok(0)
-    }
 }
 
 // ── NoopQueueStore — placeholder QueueStore (F-16) ───────────────────────────
@@ -849,8 +794,6 @@ impl NoteUsageAccumulators {
 /// - `vault`: vault registry — `PlaceholderRegistry` before injection;
 ///   `Vault` in production (via `with_vault_path`).
 /// - `search`: search index — replaced by a real `SqliteIndex` in production.
-/// - `queue`: job queue. `PlaceholderQueue` before injection;
-///   `SqliteQueue` in production (via `with_queue_path`).
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct AppState {
@@ -895,9 +838,6 @@ pub struct AppState {
     /// In production, injected via `with_search_path` (backed by `SqliteIndex`).
     /// In dev/test, an in-memory placeholder.
     pub search: Arc<dyn Index>,
-    /// Async job queue. `PlaceholderQueue` before injection;
-    /// `SqliteQueue` in production via `with_queue_path`.
-    pub queue: Arc<dyn Queue>,
     /// JSONL audit sink. `NoopAuditSink` by default (tests + dev);
     /// `JsonlFileSink` in production via `with_audit_dir`.
     pub audit: Arc<dyn AuditSink>,
@@ -918,18 +858,16 @@ pub struct AppState {
     pub reranker: Arc<dyn gradatum_search::Reranker>,
     /// [`gradatum_core::QueueStore`] for job endpoints.
     ///
-    /// Distinct from `queue` (the deprecated [`Queue`] trait) — both coexist during
-    /// the migration to the new `QueueStore` trait.
-    ///
     /// `NoopQueueStore` by default — wired via `with_job_store` in production.
     /// In production, injected from `GradatumQueue` (via `gradatum-queue`).
+    /// The legacy `queue` field (`Queue` trait, `jobs_v2`) was removed in 2.1.0 (F-177).
     pub job_store: Arc<dyn QueueStore>,
-    /// Shared SQLite pool for the idempotency table (migration 008).
+    /// Shared SQLite database handle for the idempotency table (migration 008).
     ///
     /// `None` by default — wired via `with_job_store_pool` in production.
     /// When `None`, job endpoints return 501 Not Implemented for operations
-    /// that require the pool (Idempotency-Key).
-    pub jobs_pool: Option<sqlx::SqlitePool>,
+    /// that require the database (Idempotency-Key).
+    pub jobs_pool: Option<gradatum_db_sqlite::QueueDb>,
     /// Append-only store for the `event_log` table.
     ///
     /// `None` by default — wired via `with_event_log_path` in production (same `index.db`).
@@ -1087,9 +1025,6 @@ impl AppState {
     /// The ACL is initialised with an empty preset (default deny for everything).
     /// The revocation store is in-memory (development only).
     /// `JwtService` is initialised with an ephemeral key (dev/test — WARN logged at boot).
-    /// The queue is a `PlaceholderQueue` — replaced by `SqliteQueue` via `with_queue_path`.
-    ///
-    /// In production, chain with `.with_queue_path(&queue_path).await?`.
     pub fn new() -> Self {
         // Clé éphémère : acceptable en dev/test uniquement.
         // En production, utiliser `with_jwt(jwt_service)` après chargement PEM.
@@ -1100,7 +1035,6 @@ impl AppState {
     /// Creates a state with an explicit `JwtService` (for production).
     ///
     /// Used in `main.rs` after loading the Ed25519 key from config.
-    /// The queue is a `PlaceholderQueue` — chain with `with_queue_path` immediately.
     pub fn with_jwt(jwt: JwtService) -> Self {
         // Preset vide = aucun consumer → AclEngine retourne DenyImplicit pour tout.
         // Les handlers exigent Allow — tout token sans consumer configuré sera FORBIDDEN.
@@ -1119,7 +1053,6 @@ impl AppState {
             vaults: Arc::new(VaultRegistry::new()),
             shared_index: None,
             search: placeholder_search(),
-            queue: Arc::new(PlaceholderQueue),
             audit: Arc::new(NoopAuditSink),
             api_keys: Arc::new(NoopApiKeyStore),
             embedder: Arc::new(NoopEmbedder::new(384)),
@@ -1152,8 +1085,6 @@ impl AppState {
     /// Used in integration tests to inject an ACL preset that allows the test consumer.
     ///
     /// In production the ACL is loaded from config — use [`AppState::with_jwt`].
-    /// The queue is a `PlaceholderQueue` by default — inject a real queue if needed
-    /// via `with_queue` (e.g. `SqliteQueue::in_memory()`) or `with_queue_path`.
     #[allow(dead_code)] // Utilisé dans v1-parity-tests (crate externe), invisible au dead_code lint binaire.
     pub fn with_jwt_and_acl(jwt: JwtService, acl: AclEngine) -> Self {
         Self {
@@ -1169,7 +1100,6 @@ impl AppState {
             vaults: Arc::new(VaultRegistry::new()),
             shared_index: None,
             search: placeholder_search(),
-            queue: Arc::new(PlaceholderQueue),
             audit: Arc::new(NoopAuditSink),
             api_keys: Arc::new(NoopApiKeyStore),
             embedder: Arc::new(NoopEmbedder::new(384)),
@@ -1195,38 +1125,6 @@ impl AppState {
             server_config: Arc::new(crate::config::ServerConfig::default()),
             context: Arc::new(crate::config::ContextConfig::default()),
         }
-    }
-
-    /// Replaces the queue with a real implementation.
-    ///
-    /// Builder pattern: `AppState::new().with_queue(Arc::new(SqliteQueue::in_memory().await?))`
-    /// Used in integration tests to inject an in-memory queue.
-    #[allow(dead_code)] // API publique — utilisée dans les tests d'intégration.
-    pub fn with_queue(mut self, queue: Arc<dyn Queue>) -> Self {
-        self.queue = queue;
-        self
-    }
-
-    /// Opens a `SqliteQueue` at `path` and injects it into the state (production wiring).
-    ///
-    /// Returns an error if the SQLite database cannot be opened or migrated.
-    /// Used in `main.rs` for production wiring.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use gradatum_server::state::AppState;
-    /// // In an async Tokio context:
-    /// // let state = AppState::new()
-    /// //     .with_queue_path(std::path::Path::new("/var/lib/gradatum/queue.db"))
-    /// //     .await
-    /// //     .expect("queue init failed");
-    /// ```
-    pub async fn with_queue_path(mut self, path: &std::path::Path) -> anyhow::Result<Self> {
-        use gradatum_queue::SqliteQueue;
-        let queue = SqliteQueue::new(path).await?;
-        self.queue = Arc::new(queue);
-        Ok(self)
     }
 
     /// Opens (or creates) a `SqliteIndex` at `path` and injects it into the state (production wiring).
@@ -1842,14 +1740,18 @@ impl AppState {
 
     /// Injects a [`QueueStore`] and its SQLite pool for job endpoints.
     ///
-    /// Builder pattern: `state.with_job_store(Arc::new(SqliteQueueStore::new(pool.clone())), pool)`
+    /// Builder pattern: `state.with_job_store(Arc::new(SqliteQueueStore::new(db.clone())), db)`
     ///
     /// In production, called from `main.rs` after initialising the WAL pool
     /// on `cfg.storage.root/db/queue.sqlite` (same file as the worker).
     /// The pool is required for idempotency operations (table `gradatum_idempotency`).
-    pub fn with_job_store(mut self, store: Arc<dyn QueueStore>, pool: SqlitePool) -> Self {
+    pub fn with_job_store(
+        mut self,
+        store: Arc<dyn QueueStore>,
+        db: gradatum_db_sqlite::QueueDb,
+    ) -> Self {
         self.job_store = store;
-        self.jobs_pool = Some(pool);
+        self.jobs_pool = Some(db);
         self
     }
 

@@ -42,14 +42,13 @@ use gradatum_core::{
     JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, QueueStore, TriggerSource,
     scope::VaultId,
 };
-use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
 use gradatum_index::SqliteIndex;
 use gradatum_vault::Vault;
 use gradatum_worker::apalis_handlers::{HandlerError, handle_curate};
 use gradatum_worker::internal_client::InternalClient;
 use test_internal_client::TestInternalClient;
 
-use sqlx::SqlitePool;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -59,12 +58,10 @@ use ulid::Ulid;
 
 /// Crée un `SqliteQueueStore` in-memory avec schéma appliqué.
 async fn test_queue() -> Arc<SqliteQueueStore> {
-    let pool = SqlitePool::connect("sqlite::memory:")
-        .await
-        .expect("pool in-memory");
-    apply_sqlite_pragmas(&pool).await.expect("pragmas");
-    run_migrations(&pool).await.expect("migrations");
-    Arc::new(SqliteQueueStore::new(pool))
+    let db = QueueDb::open_in_memory().await.expect("pool in-memory");
+    apply_sqlite_pragmas(&db).await.expect("pragmas");
+    run_migrations(&db).await.expect("migrations");
+    Arc::new(SqliteQueueStore::new(db))
 }
 
 /// Fixture : vault + index + curator réels.

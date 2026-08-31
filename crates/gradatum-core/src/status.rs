@@ -84,6 +84,44 @@ impl NoteStatus {
         )
     }
 
+    /// Every `NoteStatus` variant, in a fixed order — the single enumeration roster.
+    ///
+    /// Kept in core so no consumer recopies the variant list just to iterate it. The
+    /// embedding backfill (which repairs) and the drift detector (which alerts) both derive
+    /// their status filter from this roster + [`Self::is_embeddable_default`], so they can
+    /// never disagree on "should have a vector". A compile-time exhaustiveness guard below
+    /// breaks compilation if a variant is added.
+    pub const ALL: [NoteStatus; 6] = [
+        NoteStatus::Draft,
+        NoteStatus::Staging,
+        NoteStatus::PendingReview,
+        NoteStatus::Live,
+        NoteStatus::Deprecated,
+        NoteStatus::Garbage,
+    ];
+
+    /// SQL `IN (...)` quoted list of the statuses embeddable by default, derived from
+    /// [`Self::ALL`] filtered by [`Self::is_embeddable_default`] — e.g.
+    /// `'live', 'pending-review', 'staging'`.
+    ///
+    /// **Single source of "should have a vector".** The embedding backfill and the drift
+    /// detector both call this: a note the backfill would embed is exactly a note the
+    /// detector flags when its vector is missing. Scoping the detector any narrower (e.g.
+    /// `live` only) would leave a repairable-but-unsignalled note — the very blind spot
+    /// the drift scan closes.
+    ///
+    /// Values come from the enum's kebab [`Display`](std::fmt::Display), never a
+    /// hand-written literal — no injection surface.
+    #[must_use]
+    pub fn embeddable_default_sql_list() -> String {
+        Self::ALL
+            .into_iter()
+            .filter(Self::is_embeddable_default)
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Resolves embeddability taking runtime configuration into account.
     ///
     /// Used by `gradatum-worker` in the embedding pipeline.
@@ -121,3 +159,17 @@ impl std::fmt::Display for NoteStatus {
         f.write_str(self.serde_kebab_repr())
     }
 }
+
+// Compile-time guard: if `NoteStatus` gains a variant, this match stops compiling — a
+// signal to update `NoteStatus::ALL`. Anonymous `const _`: always evaluated, never
+// `dead_code`, zero runtime cost.
+const _: () = {
+    match NoteStatus::Live {
+        NoteStatus::Draft
+        | NoteStatus::Staging
+        | NoteStatus::PendingReview
+        | NoteStatus::Live
+        | NoteStatus::Deprecated
+        | NoteStatus::Garbage => {}
+    }
+};

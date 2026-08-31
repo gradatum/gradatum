@@ -33,14 +33,13 @@ use std::time::Duration;
 use gradatum_core::{
     DistillSource, GradatumJob, Job, JobClass, JobFilter, JobLifecycle, JobLineage, JobMode,
     JobPriority, JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, QueueError,
-    QueueEvent, QueueStore, TriggerSource, job_kind_str,
+    QueueEvent, QueueStore, TriggerSource, ValidateSpec, job_kind_str,
 };
+use gradatum_distill::{ClusterSynthesis, DistillSynthesizer, SynthesisError, TemplateSynthesizer};
 use gradatum_embed::{EmbedBackend, EmbedError, Embedder};
 use gradatum_index::SqliteIndex;
 use gradatum_vault::Vault;
-use gradatum_worker::apalis_handlers::{
-    ClusterSynthesis, DistillSynthesizer, SynthesisError, TemplateSynthesizer, handle_distill,
-};
+use gradatum_worker::apalis_handlers::{handle_distill, handle_validate};
 use gradatum_worker::internal_client::InternalClient;
 use test_internal_client::TestInternalClient;
 
@@ -64,6 +63,30 @@ impl Embedder for StubEmbedder {
     }
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
         Ok(vec![vec![0.0; 3]; texts.len()])
+    }
+    fn backend_kind(&self) -> EmbedBackend {
+        EmbedBackend::Noop
+    }
+}
+
+/// Embedder en échec volontaire — force le score neutre dans `handle_validate`
+/// (degraded scoring → pass), évitant tout calcul de similarité sur vecteurs nuls.
+/// La note de synthèse est persistée avec `base_trust` inchangée.
+struct FailingEmbedder;
+
+#[async_trait]
+impl Embedder for FailingEmbedder {
+    fn embedder_id(&self) -> &str {
+        "failing-test"
+    }
+    fn dim(&self) -> u16 {
+        3
+    }
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+        Err(EmbedError::Embed("failing embedder (test)".into()))
+    }
+    async fn embed_batch(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Err(EmbedError::Embed("failing embedder (test)".into()))
     }
     fn backend_kind(&self) -> EmbedBackend {
         EmbedBackend::Noop
@@ -976,4 +999,148 @@ async fn job_output_reports_enqueue_count() {
         out.result_note_md
     );
     assert_eq!(queue.enqueued().len(), 1, "one Job::Validate enqueued");
+}
+
+// ── TEST 3 — critère F-246 : un job Distill produit EFFECTIVEMENT une note ─────
+
+/// Construit un `GradatumJob` portant un `Job::Validate(spec)` (Batch), pour rejouer
+/// la seconde moitié de la chaîne distill → validate.
+fn make_validate_job_from_spec(spec: ValidateSpec) -> GradatumJob {
+    let now = Utc::now();
+    let class = JobClass::System;
+    GradatumJob {
+        priority: JobPriority::default_for(&class).as_u8(),
+        record: JobRecord {
+            id: Ulid::generate(),
+            spec: JobSpec {
+                kind: Job::Validate(spec),
+                class,
+                mode: JobMode::Batch,
+                scope: JobScope::VaultWide,
+                priority: JobPriority::Low,
+            },
+            scheduling: JobScheduling {
+                trigger: TriggerSource::Demand,
+                scheduled_at: now,
+                await_jobs: vec![],
+                deadline: None,
+                cron_expr: None,
+            },
+            lifecycle: JobLifecycle {
+                status: JobStatus::Running,
+                created_at: now,
+                started_at: Some(now),
+                completed_at: None,
+                lease_until: None,
+                result: None,
+            },
+            retry: JobRetry::default(),
+            lineage: JobLineage {
+                triggered_by: None,
+                parent_job: None,
+                pipeline_id: None,
+                pipeline_step: None,
+                children: vec![],
+                cost_usd: None,
+            },
+        },
+    }
+}
+
+/// LE CRITÈRE F-246, constaté par DÉCOMPTE DE PROVENANCE (pas une ligne de journal).
+///
+/// Chaîne COMPLÈTE hors production : `handle_distill` (TemplateSynthesizer déterministe,
+/// AUCUN LLM) → un `Job::Validate` enfilé → `handle_validate` (embedder en échec → score
+/// neutre pass) → `persist_distill` écrit la note de synthèse dans le vault. On prouve
+/// ensuite que la note EXISTE avec `provenance = "distilled"` et `derived-from` portant
+/// les ULIDs sources, et que les sources sont marquées `processed`.
+#[tokio::test]
+async fn distill_job_produces_note_with_provenance() {
+    let fx = make_fixture().await;
+    let a = write_note_with_embedding(&fx, "A", "contenu a", vec![1.0, 0.0, 0.0]).await;
+    let b = write_note_with_embedding(&fx, "B", "contenu b", vec![0.99, 0.01, 0.0]).await;
+
+    let queue = Arc::new(CapturingQueueStore::new());
+    let client = Arc::new(TestInternalClient::new(
+        Arc::clone(&fx.vault),
+        Arc::clone(&fx.index),
+    )) as Arc<dyn InternalClient>;
+
+    // Étape 1 — le job Distill tourne : un cluster → une synthèse, un Job::Validate.
+    let out = handle_distill(
+        make_distill_job(JobScope::Notes(vec![a.0, b.0]), JobMode::Batch),
+        Data::new(Arc::clone(&client)),
+        Data::new(Arc::clone(&fx.embedder)),
+        Data::new(Arc::new(TemplateSynthesizer) as Arc<dyn DistillSynthesizer + Send + Sync>),
+        Data::new(Arc::clone(&queue) as Arc<dyn QueueStore + Send + Sync>),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await
+    .expect("distill mode réel");
+    assert_eq!(out.notes_created.len(), 1, "un cluster → une synthèse");
+    let enqueued = queue.enqueued();
+    assert_eq!(enqueued.len(), 1, "un Job::Validate enfilé");
+    let Job::Validate(spec) = &enqueued[0].spec.kind else {
+        panic!("le job enfilé doit être Job::Validate");
+    };
+    let spec = spec.clone();
+
+    // Étape 2 — le job Validate tourne : persist_distill écrit la note de synthèse.
+    let failing_embedder = Arc::new(FailingEmbedder) as Arc<dyn Embedder + Send + Sync>;
+    let vout = handle_validate(
+        make_validate_job_from_spec(spec),
+        Data::new(Arc::clone(&client)),
+        Data::new(failing_embedder),
+        Data::new(gradatum_worker::apalis_handlers::MultiTenantCfg::default()),
+    )
+    .await
+    .expect("validate persiste la synthèse");
+    assert!(
+        !vout.notes_created.is_empty(),
+        "handle_validate doit créer la note"
+    );
+
+    // Étape 3 — DÉCOMPTE DE PROVENANCE : la note de synthèse existe dans le vault,
+    // provenance `distilled`, `derived-from` = ULIDs sources.
+    let synth_id = NoteId(out.notes_created[0]);
+    let synth = fx
+        .vault
+        .read_note(synth_id)
+        .await
+        .expect("la note de synthèse doit exister dans le vault");
+    assert_eq!(
+        synth.frontmatter.provenance.as_deref(),
+        Some("distilled"),
+        "provenance de la note de synthèse"
+    );
+
+    let derived = synth
+        .frontmatter
+        .extra
+        .get("derived-from")
+        .expect("derived-from présent");
+    let derived_ids: std::collections::HashSet<String> = match derived {
+        toml::Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        other => panic!("derived-from attendu Array, obtenu {other:?}"),
+    };
+    assert!(
+        derived_ids.contains(&a.0.to_string()) && derived_ids.contains(&b.0.to_string()),
+        "derived-from doit porter les deux sources : {derived_ids:?}"
+    );
+
+    // Sources marquées processed (handle_validate le fait) — preuve de consommation.
+    for src in [a, b] {
+        let note = fx.vault.read_note(src).await.expect("read source");
+        assert_eq!(
+            note.frontmatter
+                .extra
+                .get("processed")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "source {src} marquée processed par handle_validate"
+        );
+    }
 }

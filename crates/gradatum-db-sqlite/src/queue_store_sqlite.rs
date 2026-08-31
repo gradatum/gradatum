@@ -1,7 +1,8 @@
 //! SQLite implementation of [`QueueStore`] — `SqliteQueueStore`.
 //!
 //! Stores [`JobRecord`] entries in the `gradatum_jobs` table (migration 006).
-//! Uses async `sqlx` with WAL mode for queue operations.
+//! Uses a single `rusqlite::Connection` under `Arc<tokio::sync::Mutex>` with WAL mode
+//! for queue operations (a sync/async bridge).
 //!
 //! # Guarantees
 //!
@@ -17,12 +18,15 @@
 //!   Planned improvement: native JSON index or a `gradatum_job_deps` join table.
 //! - No `LibsqlQueueStore`.
 
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
-use tokio::sync::broadcast;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha384};
+use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -34,20 +38,159 @@ use gradatum_core::{
 /// Broadcast channel capacity for [`QueueEvent`] — default value.
 const BROADCAST_CAPACITY: usize = 256;
 
+/// Maps any error (rusqlite, driver) to `QueueError::Storage`.
+fn storage_err(e: impl std::fmt::Display) -> QueueError {
+    QueueError::Storage(e.to_string())
+}
+
+/// Blocking-thread failure error (panic or cancellation) — impossible in practice.
+fn blocking_err() -> QueueError {
+    QueueError::Storage("queue blocking thread failed (panic or cancellation)".to_string())
+}
+
+/// Shared handle to the queue's SQLite database.
+///
+/// A single `rusqlite::Connection` under `Arc<tokio::sync::Mutex>`, opened and operated on
+/// blocking threads (`spawn_blocking`), with the `blocking_lock()` held for as short a time
+/// as possible — the same bridge pattern as the server stores (proactive_recall_store /
+/// note_usage_store / read_usage_store).
+#[derive(Clone)]
+pub struct QueueDb {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl QueueDb {
+    /// Opens (or creates) the database at `path` on a blocking thread, with WAL and a 5 s `busy_timeout`.
+    ///
+    /// Aligned with the original sqlx settings (`journal_mode=WAL`, `busy_timeout=5000 ms`).
+    /// `synchronous` stays at the SQLite default (FULL) — not changed here, as the server/worker
+    /// `SqliteConnectOptions` were. `apply_sqlite_pragmas` goes further (`synchronous=NORMAL`,
+    /// `foreign_keys=ON`) for callers that require it.
+    pub async fn open(path: &Path) -> Result<Self, QueueError> {
+        let path = path.to_path_buf();
+        let conn = tokio::task::spawn_blocking(move || -> Result<Connection, QueueError> {
+            let conn = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(storage_err)?;
+            // WAL AVANT toute transaction : SQLite interdit le changement de journal_mode
+            // dans une transaction. `busy_timeout` 5 s conservé (contention WAL multi-process).
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(storage_err)?;
+            conn.pragma_update(None, "busy_timeout", 5000i32)
+                .map_err(storage_err)?;
+            Ok(conn)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Opens an in-memory database (tests) on a blocking thread.
+    pub async fn open_in_memory() -> Result<Self, QueueError> {
+        let conn = tokio::task::spawn_blocking(|| -> Result<Connection, QueueError> {
+            Connection::open_in_memory().map_err(storage_err)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Opens the database at `path` WITHOUT creating it — fails if the file is absent.
+    ///
+    /// sqlx `create_if_missing(false)` parity: used by admin paths that require a pre-existing
+    /// database (fail-fast rather than a spurious creation).
+    /// WAL + a 5 s `busy_timeout` applied, identical to [`QueueDb::open`].
+    pub async fn open_existing(path: &Path) -> Result<Self, QueueError> {
+        let path = path.to_path_buf();
+        let conn = tokio::task::spawn_blocking(move || -> Result<Connection, QueueError> {
+            let conn = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(storage_err)?;
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(storage_err)?;
+            conn.pragma_update(None, "busy_timeout", 5000i32)
+                .map_err(storage_err)?;
+            Ok(conn)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Runs `f` on a blocking thread, holding the `blocking_lock()` for as short a time as possible.
+    ///
+    /// The lock is held only while `f` runs — no async wait under the lock. `rusqlite` errors
+    /// are mapped to `QueueError::Storage`.
+    pub async fn with_conn<T, F>(&self, f: F) -> Result<T, QueueError>
+    where
+        F: FnOnce(&Connection) -> Result<T, rusqlite::Error> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            f(&conn).map_err(storage_err)
+        })
+        .await
+        .map_err(|_| blocking_err())?
+    }
+
+    /// Acquires the blocking lock on the connection — crate-internal use.
+    ///
+    /// Must be called from a blocking thread (`spawn_blocking`) and released as early as possible.
+    /// `with_conn` is the recommended access; this shortcut serves operations that hold the lock
+    /// across several statements (migrations, transactions).
+    pub(crate) fn blocking_lock(&self) -> tokio::sync::MutexGuard<'_, Connection> {
+        self.conn.blocking_lock()
+    }
+}
+
+/// Opens (or creates) the queue database at `path` — alias of [`QueueDb::open`].
+///
+/// Applies WAL and a 5 s `busy_timeout`. `run_migrations` remains a separate call.
+pub async fn open_queue_db(path: &Path) -> Result<QueueDb, QueueError> {
+    QueueDb::open(path).await
+}
+
+/// Opens the queue database at `path` WITHOUT creating it — alias of [`QueueDb::open_existing`].
+///
+/// Fails if the file is absent (sqlx `create_if_missing(false)` parity).
+pub async fn open_queue_db_existing(path: &Path) -> Result<QueueDb, QueueError> {
+    QueueDb::open_existing(path).await
+}
+
+/// Opens an in-memory queue database (tests) — alias of [`QueueDb::open_in_memory`].
+pub async fn open_queue_db_in_memory() -> Result<QueueDb, QueueError> {
+    QueueDb::open_in_memory().await
+}
+
 /// SQLite implementation of [`QueueStore`].
 ///
-/// Constructed from a `sqlx` [`SqlitePool`] (WAL mode required).
+/// Constructed from a [`QueueDb`] (single rusqlite connection, WAL mode).
 /// Use [`SqliteQueueStore::new`] to create an instance.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// let pool = SqlitePool::connect("sqlite:///path/to/gradatum.db?mode=rwc").await?;
-/// let store = SqliteQueueStore::new(pool);
+/// let db = gradatum_db_sqlite::open_queue_db(&path).await?;
+/// gradatum_db_sqlite::run_migrations(&db).await?;
+/// let store = SqliteQueueStore::new(db);
 /// ```
 pub struct SqliteQueueStore {
-    /// Shared `sqlx` pool (WAL mode, `synchronous=NORMAL`).
-    pool: SqlitePool,
+    /// Shared connection to the queue database (sync/async bridge pattern).
+    db: QueueDb,
     /// Sender for the broadcast channel carrying queue events.
     ///
     /// `broadcast::Sender` is `Clone + Send + Sync` — may be cloned for
@@ -56,14 +199,21 @@ pub struct SqliteQueueStore {
 }
 
 impl SqliteQueueStore {
-    /// Creates a new `SqliteQueueStore` from a `sqlx` pool.
+    /// Creates a new `SqliteQueueStore` from a [`QueueDb`].
     ///
-    /// The pool must be configured in WAL mode (`PRAGMA journal_mode=WAL`).
-    /// Migration `006_apalis_bootstrap.sql` must have been applied.
+    /// The connection must be in WAL mode (`PRAGMA journal_mode=WAL`).
+    /// Migrations `006 → 012` must have been applied.
     #[must_use]
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(db: QueueDb) -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        Self { pool, tx }
+        Self { db, tx }
+    }
+
+    /// Returns the shared [`QueueDb`] — direct access to the connection for consumers that must
+    /// run their own SQL (admin replay, leader election, tests).
+    #[must_use]
+    pub fn db(&self) -> &QueueDb {
+        &self.db
     }
 
     /// Publishes an event on the broadcast channel.
@@ -179,20 +329,20 @@ impl SqliteQueueStore {
         let sql = format!(
             "SELECT COUNT(*) as cnt FROM gradatum_jobs WHERE id IN ({placeholders}) AND status = 'Done'"
         );
+        let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
 
-        let mut query = sqlx::query(&sql);
-        for id in ids {
-            query = query.bind(id.to_string());
-        }
-
-        let row = query
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        let done_count: i64 = row
-            .try_get("cnt")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+        let db = self.db.clone();
+        let done_count = tokio::task::spawn_blocking(move || -> Result<i64, QueueError> {
+            let conn = db.blocking_lock();
+            let n = conn
+                .query_row(&sql, rusqlite::params_from_iter(id_strs.iter()), |row| {
+                    row.get(0)
+                })
+                .map_err(storage_err)?;
+            Ok(n)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
 
         Ok(done_count as usize == ids.len())
     }
@@ -212,7 +362,9 @@ impl QueueStore for SqliteQueueStore {
         let kind = job_kind_str(&job.spec.kind);
         // L1 : tenant SERVI par le job, dérivé du spec (source = le spec, pas
         // l'appelant). Estampillé dans la colonne `tenant_id` pour le filtrage.
-        let tenant = gradatum_core::spec_tenant(&job.spec);
+        // `to_string()` : le `&str` emprunte `job.spec` — non `'static`, inutilisable
+        // dans le `spawn_blocking` ci-dessous. La valeur est identique (même affichage).
+        let tenant = gradatum_core::spec_tenant(&job.spec).to_string();
         // P2 audit (SecAuditor #2, décision (a)) : un `Forget::Agent` multi-vault n'élit
         // aucun vault (`forget_scope_vault` → `None`). Depuis A6' l'estampille retombe
         // donc sur le vault porté par le JOB (`JobSpec.scope`, A2-bis) — et `"main"`
@@ -256,28 +408,26 @@ impl QueueStore for SqliteQueueStore {
             )
         };
 
-        sqlx::query(
-            r#"
-            INSERT INTO gradatum_jobs
-                (id, payload, status, priority, class, kind, created_at, scheduled_at, deadline, await_jobs, tenant_id)
-            VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&id_str)
-        .bind(&payload)
-        .bind(status)
-        .bind(priority)
-        .bind(&class)
-        .bind(kind)
-        .bind(&created_at)
-        .bind(&scheduled_at)
-        .bind(&deadline)
-        .bind(&await_jobs)
-        .bind(tenant)
-        .execute(&self.pool)
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), QueueError> {
+            let conn = db.blocking_lock();
+            conn.execute(
+                r#"
+                INSERT INTO gradatum_jobs
+                    (id, payload, status, priority, class, kind, created_at, scheduled_at, deadline, await_jobs, tenant_id)
+                VALUES
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                params![
+                    id_str, payload, status, priority, class, kind, created_at, scheduled_at,
+                    deadline, await_jobs, tenant
+                ],
+            )
+            .map_err(storage_err)?;
+            Ok(())
+        })
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|_| blocking_err())??;
 
         self.publish(QueueEvent::JobInserted(id));
         Ok(id)
@@ -288,73 +438,73 @@ impl QueueStore for SqliteQueueStore {
         // Sélectionne le job de plus haute priorité schedulé maintenant
         let now = Utc::now().to_rfc3339();
         let lease_until = (Utc::now() + chrono::Duration::seconds(300)).to_rfc3339();
+        let tenant_filter = tenant_filter.map(str::to_owned);
+        let db = self.db.clone();
 
         // `BEGIN IMMEDIATE` : voir la justification détaillée dans `dequeue_by_kind`.
         // Transaction read-then-write (SELECT lease + UPDATE) → l'upgrade read→write
         // déféré deadlocke sous contention multi-worker. IMMEDIATE prend le verrou
         // d'écriture en amont et sérialise proprement.
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
+        //
+        // Toute la transaction s'exécute sur un fil bloquant sous le verrou unique :
+        // `BEGIN IMMEDIATE` + SELECT + UPDATE + COMMIT dans la même fermeture, le verrou
+        // `blocking_lock()` n'est relâché qu'en sortie (aucune attente async sous verrou).
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>, QueueError> {
+                let mut conn = db.blocking_lock();
+
+                // Pattern `? IS NULL OR tenant_id = ?` : même que `list()` (L1 isolation).
+                // `None` = sans filtre tenant (backward-compatible single-tenant) ;
+                // `Some(t)` = isole le dequeue à un tenant (multi-tenant ON).
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(storage_err)?;
+
+                let row = tx
+                    .query_row(
+                        r#"
+                        SELECT id, payload
+                        FROM gradatum_jobs
+                        WHERE status = 'Pending'
+                          AND scheduled_at <= ?1
+                          AND (?2 IS NULL OR tenant_id = ?2)
+                        ORDER BY priority DESC, scheduled_at ASC
+                        LIMIT 1
+                        "#,
+                        params![now, tenant_filter],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(storage_err)?;
+
+                let Some((id_str, payload)) = row else {
+                    tx.rollback().map_err(storage_err)?;
+                    return Ok(None);
+                };
+
+                // Mise à jour du lease (atomic dans la même transaction)
+                tx.execute(
+                    r#"
+                    UPDATE gradatum_jobs
+                    SET status = 'Running',
+                        lease_until = ?1,
+                        started_at = ?2,
+                        attempt_count = attempt_count + 1
+                    WHERE id = ?3
+                    "#,
+                    params![lease_until, now, id_str],
+                )
+                .map_err(storage_err)?;
+
+                tx.commit().map_err(storage_err)?;
+                Ok(Some((id_str, payload)))
+            })
             .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+            .map_err(|_| blocking_err())??;
 
-        // Pattern `? IS NULL OR tenant_id = ?` : même que `list()` (L1 isolation).
-        // `None` = sans filtre tenant (backward-compatible single-tenant) ;
-        // `Some(t)` = isole le dequeue à un tenant (multi-tenant ON).
-        let row = sqlx::query(
-            r#"
-            SELECT id, payload
-            FROM gradatum_jobs
-            WHERE status = 'Pending'
-              AND scheduled_at <= ?
-              AND (? IS NULL OR tenant_id = ?)
-            ORDER BY priority DESC, scheduled_at ASC
-            LIMIT 1
-            "#,
-        )
-        .bind(&now)
-        .bind(tenant_filter)
-        .bind(tenant_filter)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        let Some(row) = row else {
-            tx.rollback()
-                .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
+        let Some((_id_str, payload)) = result else {
             return Ok(None);
         };
-
-        let id_str: String = row
-            .try_get("id")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-        let payload: String = row
-            .try_get("payload")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        // Mise à jour du lease (atomic dans la même transaction)
-        sqlx::query(
-            r#"
-            UPDATE gradatum_jobs
-            SET status = 'Running',
-                lease_until = ?,
-                started_at = ?,
-                attempt_count = attempt_count + 1
-            WHERE id = ?
-            "#,
-        )
-        .bind(&lease_until)
-        .bind(&now)
-        .bind(&id_str)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
 
         let mut record = Self::deserialize_record(&payload)?;
         // Synchronise le statut en mémoire avec l'état en base
@@ -376,6 +526,9 @@ impl QueueStore for SqliteQueueStore {
     ) -> Result<Option<JobRecord>, QueueError> {
         let now = Utc::now().to_rfc3339();
         let lease_until = (Utc::now() + chrono::Duration::seconds(300)).to_rfc3339();
+        let kind = kind.to_owned();
+        let tenant_filter = tenant_filter.map(str::to_owned);
+        let db = self.db.clone();
 
         // `BEGIN IMMEDIATE` (et non `BEGIN` déféré, le défaut de sqlx) : ce dequeue
         // est une transaction read-then-write (SELECT puis UPDATE du lease). En
@@ -389,69 +542,66 @@ impl QueueStore for SqliteQueueStore {
         // `BEGIN IMMEDIATE` prend le verrou d'écriture dès le début : les dequeues
         // se sérialisent proprement sans upgrade, plus de deadlock.
         // Reproduit + validé empiriquement par `tests/worker_multikind_concurrency.rs`.
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
+        //
+        // Connexion unique : le verrou du Mutex sérialise déjà les dequeues entre eux
+        // (pas de deux transactions concurrentes sur des connexions distinctes), et
+        // `BEGIN IMMEDIATE` reste appliqué pour la fidélité au comportement historique.
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>, QueueError> {
+                let mut conn = db.blocking_lock();
+
+                // Pattern `? IS NULL OR tenant_id = ?` : même que `list()` (L1 isolation).
+                // `None` = sans filtre tenant (backward-compatible single-tenant) ;
+                // `Some(t)` = isole le dequeue à un tenant (multi-tenant ON).
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(storage_err)?;
+
+                let row = tx
+                    .query_row(
+                        r#"
+                        SELECT id, payload
+                        FROM gradatum_jobs
+                        WHERE status = 'Pending'
+                          AND kind = ?1
+                          AND scheduled_at <= ?2
+                          AND (?3 IS NULL OR tenant_id = ?3)
+                        ORDER BY priority DESC, scheduled_at ASC
+                        LIMIT 1
+                        "#,
+                        params![kind, now, tenant_filter],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(storage_err)?;
+
+                let Some((id_str, payload)) = row else {
+                    tx.rollback().map_err(storage_err)?;
+                    return Ok(None);
+                };
+
+                tx.execute(
+                    r#"
+                    UPDATE gradatum_jobs
+                    SET status = 'Running',
+                        lease_until = ?1,
+                        started_at = ?2,
+                        attempt_count = attempt_count + 1
+                    WHERE id = ?3
+                    "#,
+                    params![lease_until, now, id_str],
+                )
+                .map_err(storage_err)?;
+
+                tx.commit().map_err(storage_err)?;
+                Ok(Some((id_str, payload)))
+            })
             .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+            .map_err(|_| blocking_err())??;
 
-        // Pattern `? IS NULL OR tenant_id = ?` : même que `list()` (L1 isolation).
-        // `None` = sans filtre tenant (backward-compatible single-tenant) ;
-        // `Some(t)` = isole le dequeue à un tenant (multi-tenant ON).
-        let row = sqlx::query(
-            r#"
-            SELECT id, payload
-            FROM gradatum_jobs
-            WHERE status = 'Pending'
-              AND kind = ?
-              AND scheduled_at <= ?
-              AND (? IS NULL OR tenant_id = ?)
-            ORDER BY priority DESC, scheduled_at ASC
-            LIMIT 1
-            "#,
-        )
-        .bind(kind)
-        .bind(&now)
-        .bind(tenant_filter)
-        .bind(tenant_filter)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        let Some(row) = row else {
-            tx.rollback()
-                .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
+        let Some((_id_str, payload)) = result else {
             return Ok(None);
         };
-
-        let id_str: String = row
-            .try_get("id")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-        let payload: String = row
-            .try_get("payload")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        sqlx::query(
-            r#"
-            UPDATE gradatum_jobs
-            SET status = 'Running',
-                lease_until = ?,
-                started_at = ?,
-                attempt_count = attempt_count + 1
-            WHERE id = ?
-            "#,
-        )
-        .bind(&lease_until)
-        .bind(&now)
-        .bind(&id_str)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
 
         let mut record = Self::deserialize_record(&payload)?;
         record.lifecycle.status = JobStatus::Running;
@@ -473,45 +623,53 @@ impl QueueStore for SqliteQueueStore {
         //
         // Colonnes SQL autoritatives : status, attempt_count, last_error, completed_at.
         let id_str = id.to_string();
+        let tenant_filter = tenant_filter.map(str::to_owned);
+        let db = self.db.clone();
 
         // L1 : `None` = SQL actuel (byte-identical) ; `Some(t)` = `AND tenant_id = ?`
         // → un job d'un autre tenant lit `None` (404 anti-disclosure au handler).
-        let sql = match tenant_filter {
+        let sql = match tenant_filter.as_deref() {
             None => "SELECT payload, status, attempt_count, last_error, completed_at \
-                     FROM gradatum_jobs WHERE id = ?"
+                     FROM gradatum_jobs WHERE id = ?1"
                 .to_string(),
             Some(_) => "SELECT payload, status, attempt_count, last_error, completed_at \
-                        FROM gradatum_jobs WHERE id = ? AND tenant_id = ?"
+                        FROM gradatum_jobs WHERE id = ?1 AND tenant_id = ?2"
                 .to_string(),
         };
-        let mut query = sqlx::query(&sql).bind(&id_str);
-        if let Some(t) = tenant_filter {
-            query = query.bind(t);
-        }
-        let row = query
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+
+        let row = tokio::task::spawn_blocking(
+            move || -> Result<Option<(String, String, i64, Option<String>, Option<String>)>, QueueError> {
+                let conn = db.blocking_lock();
+                let mut stmt = conn.prepare(&sql).map_err(storage_err)?;
+                let row = match &tenant_filter {
+                    None => stmt.query_row([&id_str], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    }),
+                    Some(t) => stmt.query_row(params![id_str, t], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    }),
+                };
+                row.optional().map_err(storage_err)
+            },
+        )
+        .await
+        .map_err(|_| blocking_err())??;
 
         match row {
             None => Ok(None),
-            Some(r) => {
-                let payload: String = r
-                    .try_get("payload")
-                    .map_err(|e| QueueError::Storage(e.to_string()))?;
-                let sql_status: String = r
-                    .try_get("status")
-                    .map_err(|e| QueueError::Storage(e.to_string()))?;
-                let sql_attempts: i64 = r
-                    .try_get("attempt_count")
-                    .map_err(|e| QueueError::Storage(e.to_string()))?;
-                let sql_last_error: Option<String> = r
-                    .try_get("last_error")
-                    .map_err(|e| QueueError::Storage(e.to_string()))?;
-                let sql_completed_at: Option<String> = r
-                    .try_get("completed_at")
-                    .map_err(|e| QueueError::Storage(e.to_string()))?;
-
+            Some((payload, sql_status, sql_attempts, sql_last_error, sql_completed_at)) => {
                 let mut record = Self::deserialize_record(&payload)?;
 
                 // Synchronisation colonnes SQL → record (colonnes SQL font autorité).
@@ -538,113 +696,127 @@ impl QueueStore for SqliteQueueStore {
     async fn complete(&self, id: Ulid, result: JobResult) -> Result<(), QueueError> {
         let id_str = id.to_string();
         let now = Utc::now().to_rfc3339();
+        let db = self.db.clone();
+        let result_for_payload = result.clone();
 
         // BEGIN IMMEDIATE : la lecture du payload et l'UPDATE sont dans la même
         // transaction exclusive — évite le double-complete concurrent (deux workers
         // lisant le même job Running avant que l'un ne l'ait marqué Done).
         // Même pattern que dequeue() — justification détaillée dans dequeue_by_kind().
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        // Met à jour le payload avec le résultat et le statut Done
-        // Note : le payload JSON est la source de vérité — on relit, on patche, on réécrit.
         //
-        // P2-6 : le SELECT vérifie `status = 'Running'`. Un `complete()` sur un job
-        // Pending/Done/Failed/Cancelled/DLQ/Conflict échoue immédiatement (NotFound)
-        // plutôt que d'être silencieux — le handler n'a pas de lease valide.
-        let row =
-            sqlx::query(r#"SELECT payload FROM gradatum_jobs WHERE id = ? AND status = 'Running'"#)
-                .bind(&id_str)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?
-                .ok_or(QueueError::NotFound(id))?;
-
-        let payload_str: String = row
-            .try_get("payload")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-        let mut record = Self::deserialize_record(&payload_str)?;
-
-        // F-41 — Garde anti-clobber Conflict→Done.
-        //
-        // Le handler `handle_curate` marque déjà le job `Conflict` via `mark_conflict`
-        // (optimistic-lock périmé : note NON écrite) PUIS retourne `Ok(JobOutput)`.
-        // L'acknowledger apalis interprète tout `Ok` comme un succès et appelle ce
-        // `complete()` — qui, sans cette garde, écraserait `Conflict` par `Done`
-        // (last-writer-wins séquentiel : la transaction `BEGIN IMMEDIATE` sérialise
-        // les deux écritures mais ne les empêche pas, l'isolation ne protège donc pas).
-        // Symptôme LIVE F-41 : l'appelant RMW voyait `Done` au lieu de `Conflict` et ne
-        // pouvait pas distinguer « écrit » de « rejeté-périmé » → no-op silencieux.
-        //
-        // Conflict est un état TERMINAL posé délibérément par le worker : `complete()`
-        // doit le respecter (idempotence sur état terminal — même esprit que la garde
-        // `WHERE status NOT IN ('Done','DLQ','Cancelled','Conflict')` de `cancel()` ;
-        // `fail()` n'a PAS de garde de statut et ne fait PAS partie de ce précédent).
-        // On commit la transaction sans modifier la ligne (le SELECT a déjà pris le
-        // verrou IMMEDIATE) puis on retourne Ok : l'ack est un no-op sur ce job.
-        if record.lifecycle.status == JobStatus::Conflict {
-            tx.commit()
-                .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
-            tracing::debug!(
-                job_id = %id,
-                "complete: job already in terminal state Conflict (F-41) — Done ignored"
-            );
-            return Ok(());
+        // Toute la transaction s'exécute sur un fil bloquant sous le verrou unique.
+        #[derive(Debug)]
+        enum CompleteOutcome {
+            /// Job already in Conflict — commit with no change (no-op).
+            Conflict,
+            /// UPDATE succeeded — commit.
+            Updated,
+            /// UPDATE affected 0 rows (lease expired or status ≠ Running) — rollback.
+            NotLeased,
         }
 
-        record.lifecycle.status = JobStatus::Done;
-        record.lifecycle.completed_at = Some(Utc::now());
-        record.lifecycle.result = Some(result.clone());
-        let new_payload = Self::serialize_record(&record)?;
+        let outcome = tokio::task::spawn_blocking(
+            move || -> Result<CompleteOutcome, QueueError> {
+                let mut conn = db.blocking_lock();
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(storage_err)?;
 
-        // P0-1 — Garde stale-lease : refuse complete si le job n'est pas en
-        // statut 'Running' ou si le lease est expiré. Sans cette garde, un worker
-        // peut marquer `Done` un job dont le lease a expiré et qu'un autre
-        // worker a déjà repris → corruption silencieuse du job.
-        //
-        // Même pattern que `SqliteQueue::complete()` dans `queue.rs:553-574`
-        // (table `jobs_v2`, même logique mais sur `gradatum_jobs`).
-        let rows_affected = sqlx::query(
-            r#"
-            UPDATE gradatum_jobs
-            SET status = 'Done',
-                completed_at = ?,
-                lease_until = NULL,
-                payload = ?
-            WHERE id = ?
-              AND status = 'Running'
-              AND lease_until > ?
-            "#,
+                // Met à jour le payload avec le résultat et le statut Done
+                // Note : le payload JSON est la source de vérité — on relit, on patche, on réécrit.
+                //
+                // P2-6 : le SELECT vérifie `status = 'Running'`. Un `complete()` sur un job
+                // Pending/Done/Failed/Cancelled/DLQ/Conflict échoue immédiatement (NotFound)
+                // plutôt que d'être silencieux — le handler n'a pas de lease valide.
+                let payload_str: String = tx
+                    .query_row(
+                        r#"SELECT payload FROM gradatum_jobs WHERE id = ?1 AND status = 'Running'"#,
+                        [&id_str],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(storage_err)?
+                    .ok_or(QueueError::NotFound(id))?;
+
+                let mut record = Self::deserialize_record(&payload_str)?;
+
+                // F-41 — Garde anti-clobber Conflict→Done.
+                //
+                // Le handler `handle_curate` marque déjà le job `Conflict` via `mark_conflict`
+                // (optimistic-lock périmé : note NON écrite) PUIS retourne `Ok(JobOutput)`.
+                // L'acknowledger apalis interprète tout `Ok` comme un succès et appelle ce
+                // `complete()` — qui, sans cette garde, écraserait `Conflict` par `Done`
+                // (last-writer-wins séquentiel : la transaction `BEGIN IMMEDIATE` sérialise
+                // les deux écritures mais ne les empêche pas, l'isolation ne protège donc pas).
+                // Symptôme LIVE F-41 : l'appelant RMW voyait `Done` au lieu de `Conflict` et ne
+                // pouvait pas distinguer « écrit » de « rejeté-périmé » → no-op silencieux.
+                //
+                // Conflict est un état TERMINAL posé délibérément par le worker : `complete()`
+                // doit le respecter (idempotence sur état terminal — même esprit que la garde
+                // `WHERE status NOT IN ('Done','DLQ','Cancelled','Conflict')` de `cancel()` ;
+                // `fail()` n'a PAS de garde de statut et ne fait PAS partie de ce précédent).
+                // On commit la transaction sans modifier la ligne (le SELECT a déjà pris le
+                // verrou IMMEDIATE) puis on retourne Ok : l'ack est un no-op sur ce job.
+                if record.lifecycle.status == JobStatus::Conflict {
+                    tx.commit().map_err(storage_err)?;
+                    tracing::debug!(
+                        job_id = %id,
+                        "complete: job already in terminal state Conflict (F-41) — Done ignored"
+                    );
+                    return Ok(CompleteOutcome::Conflict);
+                }
+
+                record.lifecycle.status = JobStatus::Done;
+                record.lifecycle.completed_at = Some(Utc::now());
+                record.lifecycle.result = Some(result_for_payload);
+                let new_payload = Self::serialize_record(&record)?;
+
+                // P0-1 — Garde stale-lease : refuse complete si le job n'est pas en
+                // statut 'Running' ou si le lease est expiré. Sans cette garde, un worker
+                // peut marquer `Done` un job dont le lease a expiré et qu'un autre
+                // worker a déjà repris → corruption silencieuse du job.
+                //
+                // Même pattern que l'ancien `SqliteQueue::complete()` (queue.rs, table
+                // `jobs_v2`) — source supprimée en 2.1.0 (F-177), même logique sur `gradatum_jobs`.
+                let rows_affected = tx
+                    .execute(
+                        r#"
+                        UPDATE gradatum_jobs
+                        SET status = 'Done',
+                            completed_at = ?1,
+                            lease_until = NULL,
+                            payload = ?2
+                        WHERE id = ?3
+                          AND status = 'Running'
+                          AND lease_until > ?4
+                        "#,
+                        params![now, new_payload, id_str, now],
+                    )
+                    .map_err(storage_err)?;
+
+                if rows_affected == 0 {
+                    // Le job n'est plus en Running ou le lease a expiré — le worker
+                    // n'a plus de droit d'écriture sur ce job.
+                    tx.rollback().map_err(storage_err)?;
+                    tracing::warn!(
+                        job_id = %id,
+                        "complete: job not leased or lease expired — rejected (P0-1 stale-lease guard)"
+                    );
+                    return Ok(CompleteOutcome::NotLeased);
+                }
+
+                tx.commit().map_err(storage_err)?;
+                Ok(CompleteOutcome::Updated)
+            },
         )
-        .bind(&now)
-        .bind(&new_payload)
-        .bind(&id_str)
-        .bind(&now)
-        .execute(&mut *tx)
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?
-        .rows_affected();
+        .map_err(|_| blocking_err())??;
 
-        if rows_affected == 0 {
-            // Le job n'est plus en Running ou le lease a expiré — le worker
-            // n'a plus de droit d'écriture sur ce job.
-            tx.rollback()
-                .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
-            tracing::warn!(
-                job_id = %id,
-                "complete: job not leased or lease expired — rejected (P0-1 stale-lease guard)"
-            );
-            return Err(QueueError::NotLeased(id));
+        match outcome {
+            CompleteOutcome::Conflict => return Ok(()),
+            CompleteOutcome::NotLeased => return Err(QueueError::NotLeased(id)),
+            CompleteOutcome::Updated => {}
         }
-
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
 
         let status = if result.success {
             JobStatus::Done
@@ -684,88 +856,89 @@ impl QueueStore for SqliteQueueStore {
             err.to_string()
         };
         let now = Utc::now().to_rfc3339();
+        let db = self.db.clone();
 
         // BEGIN IMMEDIATE : lecture + mise à jour atomiques — évite que deux appels
         // fail() concurrents n'écrasent mutuellement leur compteur d'erreurs.
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        // Relit le payload pour mettre à jour les erreurs.
         //
-        // P2-7 : le SELECT vérifie `status = 'Running'`. Un `fail()` sur un job
-        // Pending/Done/Failed/Cancelled/DLQ/Conflict échoue immédiatement (NotFound)
-        // plutôt que d'être silencieux — le handler n'a pas de lease valide.
-        let row =
-            sqlx::query(r#"SELECT payload FROM gradatum_jobs WHERE id = ? AND status = 'Running'"#)
-                .bind(&id_str)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?
+        // Toute la transaction s'exécute sur un fil bloquant sous le verrou unique.
+        // Retour : `true` = UPDATE committé, `false` = rollback (lease expiré).
+        let committed = tokio::task::spawn_blocking(move || -> Result<bool, QueueError> {
+            let mut conn = db.blocking_lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage_err)?;
+
+            // Relit le payload pour mettre à jour les erreurs.
+            //
+            // P2-7 : le SELECT vérifie `status = 'Running'`. Un `fail()` sur un job
+            // Pending/Done/Failed/Cancelled/DLQ/Conflict échoue immédiatement (NotFound)
+            // plutôt que d'être silencieux — le handler n'a pas de lease valide.
+            let payload_str: String = tx
+                .query_row(
+                    r#"SELECT payload FROM gradatum_jobs WHERE id = ?1 AND status = 'Running'"#,
+                    [&id_str],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage_err)?
                 .ok_or(QueueError::NotFound(id))?;
 
-        let payload_str: String = row
-            .try_get("payload")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-        let mut record = Self::deserialize_record(&payload_str)?;
-        record.lifecycle.status = JobStatus::Failed;
-        record.retry.count = attempt;
-        record.retry.last_error = Some(err_truncated.to_string());
-        record.retry.errors.push(JobError {
-            at: Utc::now(),
-            message: err_truncated.to_string(),
-            attempt,
-        });
-        let new_payload = Self::serialize_record(&record)?;
+            let mut record = Self::deserialize_record(&payload_str)?;
+            record.lifecycle.status = JobStatus::Failed;
+            record.retry.count = attempt;
+            record.retry.last_error = Some(err_truncated.clone());
+            record.retry.errors.push(JobError {
+                at: Utc::now(),
+                message: err_truncated.clone(),
+                attempt,
+            });
+            let new_payload = Self::serialize_record(&record)?;
 
-        // P0-2 — Garde stale-lease : refuse fail si le job n'est pas en
-        // statut 'Running' ou si le lease est expiré. Sans cette garde, un worker
-        // peut marquer `Failed` un job dont le lease a expiré et qu'un autre
-        // worker a déjà repris → corruption silencieuse du job.
-        //
-        // Même pattern que `SqliteQueue::fail()` dans `queue.rs:576-602`
-        // (table `jobs_v2`, même logique mais sur `gradatum_jobs`).
-        let rows_affected = sqlx::query(
-            r#"
-            UPDATE gradatum_jobs
-            SET status = 'Failed',
-                lease_until = NULL,
-                last_error = ?,
-                attempt_count = ?,
-                payload = ?
-            WHERE id = ?
-              AND status = 'Running'
-              AND lease_until > ?
-            "#,
-        )
-        .bind(err_truncated.as_str())
-        .bind(attempt as i64)
-        .bind(&new_payload)
-        .bind(&id_str)
-        .bind(&now)
-        .execute(&mut *tx)
+            // P0-2 — Garde stale-lease : refuse fail si le job n'est pas en
+            // statut 'Running' ou si le lease est expiré. Sans cette garde, un worker
+            // peut marquer `Failed` un job dont le lease a expiré et qu'un autre
+            // worker a déjà repris → corruption silencieuse du job.
+            //
+            // Même pattern que l'ancien `SqliteQueue::fail()` (queue.rs, table
+            // `jobs_v2`) — source supprimée en 2.1.0 (F-177), même logique sur `gradatum_jobs`.
+            let rows_affected = tx
+                .execute(
+                    r#"
+                        UPDATE gradatum_jobs
+                        SET status = 'Failed',
+                            lease_until = NULL,
+                            last_error = ?1,
+                            attempt_count = ?2,
+                            payload = ?3
+                        WHERE id = ?4
+                          AND status = 'Running'
+                          AND lease_until > ?5
+                        "#,
+                    params![err_truncated, attempt as i64, new_payload, id_str, now],
+                )
+                .map_err(storage_err)?;
+
+            if rows_affected == 0 {
+                // Le job n'est plus en Running ou le lease a expiré — le worker
+                // n'a plus de droit d'écriture sur ce job.
+                tx.rollback().map_err(storage_err)?;
+                tracing::warn!(
+                    job_id = %id,
+                    "fail: job not leased or lease expired — rejected (P0-2 stale-lease guard)"
+                );
+                return Ok(false);
+            }
+
+            tx.commit().map_err(storage_err)?;
+            Ok(true)
+        })
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?
-        .rows_affected();
+        .map_err(|_| blocking_err())??;
 
-        if rows_affected == 0 {
-            // Le job n'est plus en Running ou le lease a expiré — le worker
-            // n'a plus de droit d'écriture sur ce job.
-            tx.rollback()
-                .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
-            tracing::warn!(
-                job_id = %id,
-                "fail: job not leased or lease expired — rejected (P0-2 stale-lease guard)"
-            );
+        if !committed {
             return Err(QueueError::NotLeased(id));
         }
-
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
 
         self.publish(QueueEvent::JobFailed(id, attempt));
         Ok(())
@@ -775,6 +948,8 @@ impl QueueStore for SqliteQueueStore {
         let id_str = id.to_string();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
+        let tenant_filter = tenant_filter.map(str::to_owned);
+        let db = self.db.clone();
 
         // L1 : `None` = SQL actuel (byte-identical) ; `Some(t)` = `AND tenant_id = ?`
         // sur le SELECT (gate) ET l'UPDATE (defense-in-depth). Un cancel d'un job
@@ -787,70 +962,75 @@ impl QueueStore for SqliteQueueStore {
 
         // BEGIN IMMEDIATE : la vérification du statut courant (SELECT NOT IN terminal)
         // et l'UPDATE sont atomiques — évite qu'un cancel concurrent ne double-écrive.
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+        //
+        // Toute la transaction s'exécute sur un fil bloquant sous le verrou unique.
+        // Retour : `true` = annulé + committé, `false` = déjà terminal (no-op idempotent).
+        let cancelled = tokio::task::spawn_blocking(
+            move || -> Result<bool, QueueError> {
+                let mut conn = db.blocking_lock();
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(storage_err)?;
 
-        // Relit le payload pour synchroniser le statut
-        // F-41 — Conflict ajouté aux états terminaux : un job déjà Conflict (optimistic-lock
-        // périmé, conflict_payload requis pour la résolution RMW) ne doit PAS être écrasé
-        // en Cancelled, ce qui détruirait le payload que l'appelant attend pour retry/abandon.
-        // JobStatus::TERMINAL_SQL — single source of truth for the terminal set.
-        let select_sql = format!(
-            "SELECT payload FROM gradatum_jobs WHERE id = ? AND status NOT IN ({}){}",
-            JobStatus::TERMINAL_SQL,
-            tenant_clause
-        );
-        let mut select_q = sqlx::query(&select_sql).bind(&id_str);
-        if let Some(t) = tenant_filter {
-            select_q = select_q.bind(t);
-        }
-        let row = select_q
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+                // Relit le payload pour synchroniser le statut
+                // F-41 — Conflict ajouté aux états terminaux : un job déjà Conflict (optimistic-lock
+                // périmé, conflict_payload requis pour la résolution RMW) ne doit PAS être écrasé
+                // en Cancelled, ce qui détruirait le payload que l'appelant attend pour retry/abandon.
+                // JobStatus::TERMINAL_SQL — single source of truth for the terminal set.
+                let select_sql = format!(
+                    "SELECT payload FROM gradatum_jobs WHERE id = ?1 AND status NOT IN ({}){}",
+                    JobStatus::TERMINAL_SQL,
+                    tenant_clause
+                );
+                let row: Option<String> = match &tenant_filter {
+                    None => tx
+                        .query_row(&select_sql, [&id_str], |row| row.get(0))
+                        .optional()
+                        .map_err(storage_err)?,
+                    Some(t) => tx
+                        .query_row(&select_sql, params![id_str, t], |row| row.get(0))
+                        .optional()
+                        .map_err(storage_err)?,
+                };
 
-        let Some(row) = row else {
-            // Job déjà terminal ou inexistant — opération idempotente
-            tx.rollback()
-                .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
+                let Some(payload_str) = row else {
+                    // Job déjà terminal ou inexistant — opération idempotente
+                    tx.rollback().map_err(storage_err)?;
+                    return Ok(false);
+                };
+
+                let mut record = Self::deserialize_record(&payload_str)?;
+                record.lifecycle.status = JobStatus::Cancelled;
+                record.lifecycle.completed_at = Some(now);
+                let new_payload = Self::serialize_record(&record)?;
+
+                // JobStatus::TERMINAL_SQL — single source of truth for the terminal set.
+                let update_sql = format!(
+                    "UPDATE gradatum_jobs \
+                         SET status = 'Cancelled', completed_at = ?1, lease_until = NULL, payload = ?2 \
+                         WHERE id = ?3 AND status NOT IN ({}){}",
+                    JobStatus::TERMINAL_SQL,
+                    tenant_clause
+                );
+                match &tenant_filter {
+                    None => tx
+                        .execute(&update_sql, params![now_str, new_payload, id_str])
+                        .map_err(storage_err)?,
+                    Some(t) => tx
+                        .execute(&update_sql, params![now_str, new_payload, id_str, t])
+                        .map_err(storage_err)?,
+                };
+
+                tx.commit().map_err(storage_err)?;
+                Ok(true)
+            },
+        )
+        .await
+        .map_err(|_| blocking_err())??;
+
+        if !cancelled {
             return Ok(());
-        };
-
-        let payload_str: String = row
-            .try_get("payload")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-        let mut record = Self::deserialize_record(&payload_str)?;
-        record.lifecycle.status = JobStatus::Cancelled;
-        record.lifecycle.completed_at = Some(now);
-        let new_payload = Self::serialize_record(&record)?;
-
-        // JobStatus::TERMINAL_SQL — single source of truth for the terminal set.
-        let update_sql = format!(
-            "UPDATE gradatum_jobs \
-                 SET status = 'Cancelled', completed_at = ?, lease_until = NULL, payload = ? \
-                 WHERE id = ? AND status NOT IN ({}){}",
-            JobStatus::TERMINAL_SQL,
-            tenant_clause
-        );
-        let mut update_q = sqlx::query(&update_sql)
-            .bind(&now_str)
-            .bind(&new_payload)
-            .bind(&id_str);
-        if let Some(t) = tenant_filter {
-            update_q = update_q.bind(t);
         }
-        update_q
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
 
         self.publish(QueueEvent::JobCancelled(id));
         Ok(())
@@ -859,51 +1039,72 @@ impl QueueStore for SqliteQueueStore {
     async fn fail_dlq(&self, id: Ulid, err: &str) -> Result<(), QueueError> {
         let id_str = id.to_string();
         let now = Utc::now().to_rfc3339();
-        let err_truncated: String = if err.chars().count() > 2048 {
-            err.chars().take(2048).collect()
-        } else {
-            err.to_string()
-        };
+        let err = err.to_owned();
+        let db = self.db.clone();
 
-        // Relit le payload pour mettre à jour le statut DLQ
-        let row = sqlx::query(r#"SELECT payload FROM gradatum_jobs WHERE id = ?"#)
-            .bind(&id_str)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?
-            .ok_or(QueueError::NotFound(id))?;
+        // Relit le payload pour mettre à jour le statut DLQ.
+        // La lecture + composition + UPDATE s'exécutent sur un fil bloquant sous le verrou.
+        let last_error = tokio::task::spawn_blocking(move || -> Result<String, QueueError> {
+            let conn = db.blocking_lock();
 
-        let payload_str: String = row
-            .try_get("payload")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-        let mut record = Self::deserialize_record(&payload_str)?;
-        record.lifecycle.status = JobStatus::DLQ;
-        record.lifecycle.completed_at = Some(Utc::now());
-        record.retry.last_error = Some(err_truncated.to_string());
-        let new_payload = Self::serialize_record(&record)?;
+            let payload_str: String = conn
+                .query_row(
+                    r#"SELECT payload FROM gradatum_jobs WHERE id = ?1"#,
+                    [&id_str],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage_err)?
+                .ok_or(QueueError::NotFound(id))?;
 
-        sqlx::query(
-            r#"
-            UPDATE gradatum_jobs
-            SET status = 'DLQ',
-                completed_at = ?,
-                lease_until = NULL,
-                last_error = ?,
-                payload = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(&now)
-        .bind(err_truncated.as_str())
-        .bind(&new_payload)
-        .bind(&id_str)
-        .execute(&self.pool)
+            let mut record = Self::deserialize_record(&payload_str)?;
+
+            // F-217 — `err` ne porte que la CONSÉQUENCE (« max_retries atteint (N/M) »
+            // décidée par `promote_retries`), jamais la cause. Le motif réel du dernier
+            // échec vit dans `retry.errors[]` (poussé par `fail()` à chaque tentative).
+            // On préserve ce motif EN TÊTE de `last_error` — c'est la première chose que
+            // l'opérateur lit, et le rendu `jobs dlq` tronque cette colonne à 80 caractères,
+            // donc la cause doit précéder ; puis on conserve la mention d'épuisement en
+            // annexe. Les deux informations coexistent au lieu que la seconde écrase la
+            // première. `retry.errors[]` n'est jamais touché : il reste la source exhaustive.
+            let composed = match record.retry.errors.last() {
+                Some(last) if last.message != err => format!("{} — {err}", last.message),
+                _ => err.clone(),
+            };
+            // Cap DoS (ANSSI R15) : borne le champ à 2048 caractères après composition.
+            let last_error: String = if composed.chars().count() > 2048 {
+                composed.chars().take(2048).collect()
+            } else {
+                composed
+            };
+
+            record.lifecycle.status = JobStatus::DLQ;
+            record.lifecycle.completed_at = Some(Utc::now());
+            record.retry.last_error = Some(last_error.clone());
+            let new_payload = Self::serialize_record(&record)?;
+
+            conn.execute(
+                r#"
+                UPDATE gradatum_jobs
+                SET status = 'DLQ',
+                    completed_at = ?1,
+                    lease_until = NULL,
+                    last_error = ?2,
+                    payload = ?3
+                WHERE id = ?4
+                "#,
+                params![now, last_error, new_payload, id_str],
+            )
+            .map_err(storage_err)?;
+
+            Ok(last_error)
+        })
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|_| blocking_err())??;
 
         warn!(
             job_id = %id,
-            "job sent to DLQ: {err_truncated}"
+            "job sent to DLQ: {last_error}"
         );
         Ok(())
     }
@@ -922,27 +1123,35 @@ impl QueueStore for SqliteQueueStore {
         // sous-ensemble Waiting — acceptable pour < 10k jobs actifs (doc-comment §Limitations).
         let pattern = format!("\"{}\"", job_id);
         let like_pattern = format!("%{pattern}%");
+        let db = self.db.clone();
 
-        let rows = sqlx::query(
-            r#"
-            SELECT payload
-            FROM gradatum_jobs
-            WHERE status = 'Waiting'
-              AND await_jobs LIKE ?
-            "#,
-        )
-        .bind(&like_pattern)
-        .fetch_all(&self.pool)
+        let payloads = tokio::task::spawn_blocking(move || -> Result<Vec<String>, QueueError> {
+            let conn = db.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT payload
+                    FROM gradatum_jobs
+                    WHERE status = 'Waiting'
+                      AND await_jobs LIKE ?1
+                    "#,
+                )
+                .map_err(storage_err)?;
+            let rows = stmt
+                .query_map([&like_pattern], |row| row.get::<_, String>(0))
+                .map_err(storage_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(storage_err)?);
+            }
+            Ok(out)
+        })
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|_| blocking_err())??;
 
-        rows.into_iter()
-            .map(|row| {
-                let payload: String = row
-                    .try_get("payload")
-                    .map_err(|e| QueueError::Storage(e.to_string()))?;
-                Self::deserialize_record(&payload)
-            })
+        payloads
+            .into_iter()
+            .map(|payload| Self::deserialize_record(&payload))
             .collect()
     }
 
@@ -954,19 +1163,24 @@ impl QueueStore for SqliteQueueStore {
         // - 0 rows affected ≠ erreur : l'état cible est déjà atteint ou le job
         //   est dans un état terminal — les deux sont des no-ops corrects.
         let id_str = id.to_string();
+        let db = self.db.clone();
 
-        sqlx::query(
-            r#"
-            UPDATE gradatum_jobs
-            SET status = 'Pending'
-            WHERE id = ?
-              AND status = 'Waiting'
-            "#,
-        )
-        .bind(&id_str)
-        .execute(&self.pool)
+        tokio::task::spawn_blocking(move || -> Result<(), QueueError> {
+            let conn = db.blocking_lock();
+            conn.execute(
+                r#"
+                UPDATE gradatum_jobs
+                SET status = 'Pending'
+                WHERE id = ?1
+                  AND status = 'Waiting'
+                "#,
+                [&id_str],
+            )
+            .map_err(storage_err)?;
+            Ok(())
+        })
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|_| blocking_err())??;
 
         Ok(())
     }
@@ -988,32 +1202,40 @@ impl QueueStore for SqliteQueueStore {
             }
         };
         let threshold = (Utc::now() - chrono_ttl).to_rfc3339();
+        let now_str = Utc::now().to_rfc3339();
+        let db = self.db.clone();
 
-        let rows = sqlx::query(
-            r#"
-            UPDATE gradatum_jobs
-            SET status = 'Pending',
-                lease_until = NULL,
-                scheduled_at = ?
-            WHERE status = 'Running'
-              AND lease_until < ?
-            RETURNING id
-            "#,
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(&threshold)
-        .fetch_all(&self.pool)
+        // `UPDATE … RETURNING id` : requête avec lignes retournées → statement préparé
+        // (rusqlite n'expose pas de rows sur `execute`).
+        let ids = tokio::task::spawn_blocking(move || -> Result<Vec<Ulid>, QueueError> {
+            let conn = db.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    UPDATE gradatum_jobs
+                    SET status = 'Pending',
+                        lease_until = NULL,
+                        scheduled_at = ?1
+                    WHERE status = 'Running'
+                      AND lease_until < ?2
+                    RETURNING id
+                    "#,
+                )
+                .map_err(storage_err)?;
+            let rows = stmt
+                .query_map(params![now_str, threshold], |row| row.get::<_, String>(0))
+                .map_err(storage_err)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let id_str = row.map_err(storage_err)?;
+                if let Ok(ulid) = id_str.parse::<Ulid>() {
+                    ids.push(ulid);
+                }
+            }
+            Ok(ids)
+        })
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        let ids: Vec<Ulid> = rows
-            .into_iter()
-            .filter_map(|row| {
-                row.try_get::<String, _>("id")
-                    .ok()
-                    .and_then(|s| s.parse::<Ulid>().ok())
-            })
-            .collect();
+        .map_err(|_| blocking_err())??;
 
         if !ids.is_empty() {
             debug!(
@@ -1027,30 +1249,37 @@ impl QueueStore for SqliteQueueStore {
     async fn cancel_expired_deadlines(&self, now: DateTime<Utc>) -> Result<Vec<Ulid>, QueueError> {
         let now_str = now.to_rfc3339();
         let completed_at = now.to_rfc3339();
+        let db = self.db.clone();
 
         // JobStatus::TERMINAL_SQL — single source of truth for the terminal set.
-        let rows = sqlx::query(&format!(
+        let sql = format!(
             "UPDATE gradatum_jobs \
-                 SET status = 'Cancelled', completed_at = ? \
-                 WHERE deadline IS NOT NULL AND deadline < ? \
+                 SET status = 'Cancelled', completed_at = ?1 \
+                 WHERE deadline IS NOT NULL AND deadline < ?2 \
                  AND status NOT IN ({}) \
                  RETURNING id",
             JobStatus::TERMINAL_SQL
-        ))
-        .bind(&completed_at)
-        .bind(&now_str)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        );
 
-        let ids: Vec<Ulid> = rows
-            .into_iter()
-            .filter_map(|row| {
-                row.try_get::<String, _>("id")
-                    .ok()
-                    .and_then(|s| s.parse::<Ulid>().ok())
-            })
-            .collect();
+        let ids = tokio::task::spawn_blocking(move || -> Result<Vec<Ulid>, QueueError> {
+            let conn = db.blocking_lock();
+            let mut stmt = conn.prepare(&sql).map_err(storage_err)?;
+            let rows = stmt
+                .query_map(params![completed_at, now_str], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(storage_err)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let id_str = row.map_err(storage_err)?;
+                if let Ok(ulid) = id_str.parse::<Ulid>() {
+                    ids.push(ulid);
+                }
+            }
+            Ok(ids)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
 
         for &id in &ids {
             self.publish(QueueEvent::JobCancelled(id));
@@ -1060,37 +1289,47 @@ impl QueueStore for SqliteQueueStore {
 
     async fn promote_retries(&self, now: DateTime<Utc>) -> Result<Vec<Ulid>, QueueError> {
         let now_str = now.to_rfc3339();
+        let db = self.db.clone();
 
         // Sélectionne les jobs Failed dont scheduled_at <= now.
         // IMPORTANT : on sélectionne aussi `attempt_count` (colonne SQL autoritaire)
         // pour la garde DLQ. Le BLOB `payload` contient retry.count stale (valeur
         // au moment de l'enqueue, non mis à jour après chaque tentative) — utiliser
         // uniquement le BLOB ferait échouer la garde v67 (0 >= 3 = faux → loop infinie).
-        let rows = sqlx::query(
-            r#"
-            SELECT id, payload, attempt_count
-            FROM gradatum_jobs
-            WHERE status = 'Failed'
-              AND scheduled_at <= ?
-            "#,
+        let rows = tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, String, i64)>, QueueError> {
+                let conn = db.blocking_lock();
+                let mut stmt = conn
+                    .prepare(
+                        r#"
+                    SELECT id, payload, attempt_count
+                    FROM gradatum_jobs
+                    WHERE status = 'Failed'
+                      AND scheduled_at <= ?1
+                    "#,
+                    )
+                    .map_err(storage_err)?;
+                let iter = stmt
+                    .query_map([&now_str], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .map_err(storage_err)?;
+                let mut out = Vec::new();
+                for r in iter {
+                    out.push(r.map_err(storage_err)?);
+                }
+                Ok(out)
+            },
         )
-        .bind(&now_str)
-        .fetch_all(&self.pool)
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|_| blocking_err())??;
 
         let mut promoted = Vec::new();
-        for row in rows {
-            let id_str: String = row
-                .try_get("id")
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
-            let payload_str: String = row
-                .try_get("payload")
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
-            // Colonne SQL autoritaire — surcharge le BLOB stale pour la garde DLQ.
-            let sql_attempt_count: i64 = row
-                .try_get("attempt_count")
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
+        for (id_str, payload_str, sql_attempt_count) in rows {
             let mut record = Self::deserialize_record(&payload_str)?;
             // Synchroniser retry.count depuis SQL avant la garde v67.
             record.retry.count = sql_attempt_count as u32;
@@ -1106,20 +1345,25 @@ impl QueueStore for SqliteQueueStore {
                 );
                 self.fail_dlq(id, &err).await?;
             } else {
-                sqlx::query(
-                    r#"
-                    UPDATE gradatum_jobs
-                    SET status = 'Pending',
-                        scheduled_at = ?
-                    WHERE id = ?
-                      AND status = 'Failed'
-                    "#,
-                )
-                .bind(now.to_rfc3339())
-                .bind(&id_str)
-                .execute(&self.pool)
+                let now_rfc = now.to_rfc3339();
+                let db = self.db.clone();
+                tokio::task::spawn_blocking(move || -> Result<(), QueueError> {
+                    let conn = db.blocking_lock();
+                    conn.execute(
+                        r#"
+                        UPDATE gradatum_jobs
+                        SET status = 'Pending',
+                            scheduled_at = ?1
+                        WHERE id = ?2
+                          AND status = 'Failed'
+                        "#,
+                        params![now_rfc, id_str],
+                    )
+                    .map_err(storage_err)?;
+                    Ok(())
+                })
                 .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
+                .map_err(|_| blocking_err())??;
 
                 promoted.push(id);
             }
@@ -1129,22 +1373,27 @@ impl QueueStore for SqliteQueueStore {
 
     async fn schedule_retry(&self, id: Ulid, at: DateTime<Utc>) -> Result<(), QueueError> {
         let id_str = id.to_string();
+        let at_str = at.to_rfc3339();
+        let db = self.db.clone();
 
-        sqlx::query(
-            r#"
-            UPDATE gradatum_jobs
-            SET status = 'Failed',
-                lease_until = NULL,
-                scheduled_at = ?
-            WHERE id = ?
-              AND status = 'Running'
-            "#,
-        )
-        .bind(at.to_rfc3339())
-        .bind(&id_str)
-        .execute(&self.pool)
+        tokio::task::spawn_blocking(move || -> Result<(), QueueError> {
+            let conn = db.blocking_lock();
+            conn.execute(
+                r#"
+                UPDATE gradatum_jobs
+                SET status = 'Failed',
+                    lease_until = NULL,
+                    scheduled_at = ?1
+                WHERE id = ?2
+                  AND status = 'Running'
+                "#,
+                params![at_str, id_str],
+            )
+            .map_err(storage_err)?;
+            Ok(())
+        })
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|_| blocking_err())??;
 
         Ok(())
     }
@@ -1155,11 +1404,15 @@ impl QueueStore for SqliteQueueStore {
         let limit = filter.limit.clamp(1, 500) as i64;
 
         // Option<String> bindée comme NULL SQL désactive le filtre correspondant.
+        // Valeurs possédées : le `spawn_blocking` exige un `'static` — on matérialise
+        // toutes les options en Strings avant la fermeture.
         let class_filter = filter.class.as_ref().map(|c| format!("{c:?}"));
         let status_filter = filter
             .status
             .as_ref()
             .map(|s| Self::status_to_str(s).to_string());
+        let kind_filter = filter.kind.clone();
+        let tenant_filter = filter.tenant.clone();
         let created_after = filter.created_after.as_ref().map(|d| d.to_rfc3339());
         let created_before = filter.created_before.as_ref().map(|d| d.to_rfc3339());
         // Cursor-based pagination : direction du curseur dépend de l'ordre.
@@ -1174,59 +1427,64 @@ impl QueueStore for SqliteQueueStore {
                 r#"
             SELECT payload
             FROM gradatum_jobs
-            WHERE (? IS NULL OR class = ?)
-              AND (? IS NULL OR status = ?)
-              AND (? IS NULL OR kind = ?)
-              AND (? IS NULL OR tenant_id = ?)
-              AND (? IS NULL OR created_at > ?)
-              AND (? IS NULL OR created_at < ?)
-              AND (? IS NULL OR id > ?)
+            WHERE (?1 IS NULL OR class = ?1)
+              AND (?2 IS NULL OR status = ?2)
+              AND (?3 IS NULL OR kind = ?3)
+              AND (?4 IS NULL OR tenant_id = ?4)
+              AND (?5 IS NULL OR created_at > ?5)
+              AND (?6 IS NULL OR created_at < ?6)
+              AND (?7 IS NULL OR id > ?7)
             ORDER BY id ASC
-            LIMIT ?
+            LIMIT ?8
             "#
             }
             JobOrder::CreatedDesc => {
                 r#"
             SELECT payload
             FROM gradatum_jobs
-            WHERE (? IS NULL OR class = ?)
-              AND (? IS NULL OR status = ?)
-              AND (? IS NULL OR kind = ?)
-              AND (? IS NULL OR tenant_id = ?)
-              AND (? IS NULL OR created_at > ?)
-              AND (? IS NULL OR created_at < ?)
-              AND (? IS NULL OR id < ?)
+            WHERE (?1 IS NULL OR class = ?1)
+              AND (?2 IS NULL OR status = ?2)
+              AND (?3 IS NULL OR kind = ?3)
+              AND (?4 IS NULL OR tenant_id = ?4)
+              AND (?5 IS NULL OR created_at > ?5)
+              AND (?6 IS NULL OR created_at < ?6)
+              AND (?7 IS NULL OR id < ?7)
             ORDER BY id DESC
-            LIMIT ?
+            LIMIT ?8
             "#
             }
         };
 
-        let rows = sqlx::query(query_str)
-            .bind(&class_filter)
-            .bind(&class_filter)
-            .bind(&status_filter)
-            .bind(&status_filter)
-            .bind(&filter.kind)
-            .bind(&filter.kind)
-            .bind(&filter.tenant)
-            .bind(&filter.tenant)
-            .bind(&created_after)
-            .bind(&created_after)
-            .bind(&created_before)
-            .bind(&created_before)
-            .bind(&cursor_filter)
-            .bind(&cursor_filter)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+        let db = self.db.clone();
+        let payloads = tokio::task::spawn_blocking(move || -> Result<Vec<String>, QueueError> {
+            let conn = db.blocking_lock();
+            let mut stmt = conn.prepare(query_str).map_err(storage_err)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        class_filter,
+                        status_filter,
+                        kind_filter,
+                        tenant_filter,
+                        created_after,
+                        created_before,
+                        cursor_filter,
+                        limit,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(storage_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(storage_err)?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
 
-        let mut records = Vec::with_capacity(rows.len());
-        for row in rows {
-            let payload: String = row
-                .try_get("payload")
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
+        let mut records = Vec::with_capacity(payloads.len());
+        for payload in payloads {
             let record = Self::deserialize_record(&payload)?;
             records.push(record);
         }
@@ -1246,27 +1504,52 @@ impl QueueStore for SqliteQueueStore {
         let sql = match tenant_filter {
             None => "SELECT status, COUNT(*) AS n FROM gradatum_jobs GROUP BY status".to_string(),
             Some(_) => {
-                "SELECT status, COUNT(*) AS n FROM gradatum_jobs WHERE tenant_id = ? GROUP BY status"
+                "SELECT status, COUNT(*) AS n FROM gradatum_jobs WHERE tenant_id = ?1 GROUP BY status"
                     .to_string()
             }
         };
-        let mut query = sqlx::query(&sql);
-        if let Some(t) = tenant_filter {
-            query = query.bind(t);
-        }
-        let rows = query
-            .fetch_all(&self.pool)
+        let tenant_filter = tenant_filter.map(str::to_owned);
+        let db = self.db.clone();
+
+        let rows =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(String, i64)>, QueueError> {
+                let conn = db.blocking_lock();
+                let mut stmt = conn.prepare(&sql).map_err(storage_err)?;
+                // Les deux bras produisent des `MappedRows` de types de fermeture différents —
+                // on matérialise en `Vec` dans chaque bras pour un type commun.
+                let rows = match &tenant_filter {
+                    None => {
+                        let iter = stmt
+                            .query_map([], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                            })
+                            .map_err(storage_err)?;
+                        let mut out = Vec::new();
+                        for r in iter {
+                            out.push(r.map_err(storage_err)?);
+                        }
+                        out
+                    }
+                    Some(t) => {
+                        let iter = stmt
+                            .query_map([t], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                            })
+                            .map_err(storage_err)?;
+                        let mut out = Vec::new();
+                        for r in iter {
+                            out.push(r.map_err(storage_err)?);
+                        }
+                        out
+                    }
+                };
+                Ok(rows)
+            })
             .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+            .map_err(|_| blocking_err())??;
 
         let mut out = std::collections::HashMap::new();
-        for row in rows {
-            let status_str: String = row
-                .try_get("status")
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
-            let n: i64 = row
-                .try_get("n")
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
+        for (status_str, n) in rows {
             match Self::str_to_status(&status_str) {
                 Ok(st) => {
                     out.insert(st, u64::try_from(n).unwrap_or(0));
@@ -1292,42 +1575,53 @@ impl QueueStore for SqliteQueueStore {
     ///
     /// Returns the number of rows actually deleted.
     async fn delete_dlq_jobs(&self, older_than: Option<DateTime<Utc>>) -> Result<u64, QueueError> {
-        let affected = match older_than {
-            Some(cutoff) => {
-                sqlx::query(r#"DELETE FROM gradatum_jobs WHERE status = 'DLQ' AND created_at < ?"#)
-                    .bind(cutoff.to_rfc3339())
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| QueueError::Storage(e.to_string()))?
-                    .rows_affected()
-            }
-            None => sqlx::query(r#"DELETE FROM gradatum_jobs WHERE status = 'DLQ'"#)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| QueueError::Storage(e.to_string()))?
-                .rows_affected(),
-        };
+        let cutoff = older_than.map(|c| c.to_rfc3339());
+        let db = self.db.clone();
+
+        let affected = tokio::task::spawn_blocking(move || -> Result<u64, QueueError> {
+            let conn = db.blocking_lock();
+            let n = match &cutoff {
+                Some(cutoff) => conn
+                    .execute(
+                        r#"DELETE FROM gradatum_jobs WHERE status = 'DLQ' AND created_at < ?1"#,
+                        [cutoff],
+                    )
+                    .map_err(storage_err)?,
+                None => conn
+                    .execute(r#"DELETE FROM gradatum_jobs WHERE status = 'DLQ'"#, [])
+                    .map_err(storage_err)?,
+            };
+            Ok(n as u64)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
         Ok(affected)
     }
 
     /// Returns a `COUNT(*)` of targeted DLQ jobs, using the same `WHERE` clause as
     /// `delete_dlq_jobs` (faithful dry-run, no `LIMIT` cap).
     async fn count_dlq_jobs(&self, older_than: Option<DateTime<Utc>>) -> Result<u64, QueueError> {
-        let n: i64 = match older_than {
-            Some(cutoff) => sqlx::query_scalar(
-                r#"SELECT COUNT(*) FROM gradatum_jobs WHERE status = 'DLQ' AND created_at < ?"#,
-            )
-            .bind(cutoff.to_rfc3339())
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?,
-            None => {
-                sqlx::query_scalar(r#"SELECT COUNT(*) FROM gradatum_jobs WHERE status = 'DLQ'"#)
-                    .fetch_one(&self.pool)
-                    .await
-                    .map_err(|e| QueueError::Storage(e.to_string()))?
-            }
-        };
+        let cutoff = older_than.map(|c| c.to_rfc3339());
+        let db = self.db.clone();
+
+        let n = tokio::task::spawn_blocking(move || -> Result<i64, QueueError> {
+            let conn = db.blocking_lock();
+            let n = match &cutoff {
+                Some(cutoff) => conn.query_row(
+                    r#"SELECT COUNT(*) FROM gradatum_jobs WHERE status = 'DLQ' AND created_at < ?1"#,
+                    [cutoff],
+                    |row| row.get(0),
+                ),
+                None => conn.query_row(
+                    r#"SELECT COUNT(*) FROM gradatum_jobs WHERE status = 'DLQ'"#,
+                    [],
+                    |row| row.get(0),
+                ),
+            };
+            n.map_err(storage_err)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
@@ -1347,26 +1641,35 @@ impl QueueStore for SqliteQueueStore {
         // Requete utilisant l'index partiel `idx_gradatum_jobs_waiting` (status='Waiting').
         // Filtre `await_jobs != '[]'` elimine les jobs sans contrainte de chaininge.
         // `await_jobs IS NOT NULL` elimine les lignes de migrations anciennes.
-        let rows = sqlx::query(
-            r#"
-            SELECT payload
-            FROM gradatum_jobs
-            WHERE status = 'Waiting'
-              AND await_jobs IS NOT NULL
-              AND await_jobs != '[]'
-            "#,
-        )
-        .fetch_all(&self.pool)
+        let db = self.db.clone();
+        let payloads = tokio::task::spawn_blocking(move || -> Result<Vec<String>, QueueError> {
+            let conn = db.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT payload
+                    FROM gradatum_jobs
+                    WHERE status = 'Waiting'
+                      AND await_jobs IS NOT NULL
+                      AND await_jobs != '[]'
+                    "#,
+                )
+                .map_err(storage_err)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(storage_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(storage_err)?);
+            }
+            Ok(out)
+        })
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|_| blocking_err())??;
 
         let mut promoted: u32 = 0;
 
-        for row in rows {
-            let payload: String = row
-                .try_get("payload")
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
-
+        for payload in payloads {
             let record = Self::deserialize_record(&payload)?;
             let dep_id = record.id;
 
@@ -1410,26 +1713,33 @@ impl QueueStore for SqliteQueueStore {
         let sql = match tenant_filter {
             None => "SELECT payload FROM gradatum_jobs ORDER BY id DESC LIMIT 1".to_string(),
             Some(_) => {
-                "SELECT payload FROM gradatum_jobs WHERE tenant_id = ? ORDER BY id DESC LIMIT 1"
+                "SELECT payload FROM gradatum_jobs WHERE tenant_id = ?1 ORDER BY id DESC LIMIT 1"
                     .to_string()
             }
         };
-        let mut query = sqlx::query(&sql);
-        if let Some(t) = tenant_filter {
-            query = query.bind(t);
-        }
-        let row = query
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+        let tenant_filter = tenant_filter.map(str::to_owned);
+        let db = self.db.clone();
 
-        match row {
-            Some(row) => {
-                let payload: String = row
-                    .try_get("payload")
-                    .map_err(|e| QueueError::Storage(e.to_string()))?;
-                Ok(Some(Self::deserialize_record(&payload)?))
-            }
+        let payload = tokio::task::spawn_blocking(move || -> Result<Option<String>, QueueError> {
+            let conn = db.blocking_lock();
+            let mut stmt = conn.prepare(&sql).map_err(storage_err)?;
+            let row = match &tenant_filter {
+                None => stmt
+                    .query_row([], |row| row.get::<_, String>(0))
+                    .optional()
+                    .map_err(storage_err)?,
+                Some(t) => stmt
+                    .query_row([t], |row| row.get::<_, String>(0))
+                    .optional()
+                    .map_err(storage_err)?,
+            };
+            Ok(row)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
+
+        match payload {
+            Some(payload) => Ok(Some(Self::deserialize_record(&payload)?)),
             None => Ok(None),
         }
     }
@@ -1452,67 +1762,72 @@ impl QueueStore for SqliteQueueStore {
     ) -> Result<(), QueueError> {
         let id_str = id.to_string();
         let now = Utc::now().to_rfc3339();
+        let db = self.db.clone();
 
         // BEGIN IMMEDIATE : lecture + marquage Conflict atomiques — évite qu'un
         // complete() concurrent ne masque le conflit en marquant Done entre le
         // SELECT et l'UPDATE.
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+        //
+        // Toute la transaction s'exécute sur un fil bloquant sous le verrou unique.
+        tokio::task::spawn_blocking(move || -> Result<(), QueueError> {
+            let mut conn = db.blocking_lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage_err)?;
 
-        // Relire le payload pour le patcher.
-        let row = sqlx::query(r#"SELECT payload FROM gradatum_jobs WHERE id = ?"#)
-            .bind(&id_str)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?
-            .ok_or(QueueError::NotFound(id))?;
+            // Relire le payload pour le patcher.
+            let payload_str: String = tx
+                .query_row(
+                    r#"SELECT payload FROM gradatum_jobs WHERE id = ?1"#,
+                    [&id_str],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage_err)?
+                .ok_or(QueueError::NotFound(id))?;
 
-        let payload_str: String = row
-            .try_get("payload")
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
-        let mut record = Self::deserialize_record(&payload_str)?;
+            let mut record = Self::deserialize_record(&payload_str)?;
 
-        // Parser le result_note_md comme JSON pour le stocker dans conflict_payload.
-        let conflict_payload_value: Option<serde_json::Value> =
-            serde_json::from_str(&result_note_md).ok();
+            // Parser le result_note_md comme JSON pour le stocker dans conflict_payload.
+            let conflict_payload_value: Option<serde_json::Value> =
+                serde_json::from_str(&result_note_md).ok();
 
-        // Patcher le lifecycle : Conflict terminal, résultat avec conflict_payload.
-        record.lifecycle.status = JobStatus::Conflict;
-        record.lifecycle.completed_at = Some(Utc::now());
-        record.lifecycle.result = Some(JobResult {
-            success: false,
-            duration_ms,
-            cost_usd: None,
-            result_note: None,
-            conflict_payload: conflict_payload_value,
-        });
-        let new_payload = Self::serialize_record(&record)?;
+            // Patcher le lifecycle : Conflict terminal, résultat avec conflict_payload.
+            record.lifecycle.status = JobStatus::Conflict;
+            record.lifecycle.completed_at = Some(Utc::now());
+            record.lifecycle.result = Some(JobResult {
+                success: false,
+                duration_ms,
+                cost_usd: None,
+                result_note: None,
+                conflict_payload: conflict_payload_value,
+            });
+            let new_payload = Self::serialize_record(&record)?;
 
-        sqlx::query(
-            r#"
-            UPDATE gradatum_jobs
-            SET status = 'Conflict',
-                completed_at = ?,
-                lease_until = NULL,
-                last_error = ?,
-                payload = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(&now)
-        .bind(result_note_md.chars().take(256).collect::<String>())
-        .bind(&new_payload)
-        .bind(&id_str)
-        .execute(&mut *tx)
+            tx.execute(
+                r#"
+                UPDATE gradatum_jobs
+                SET status = 'Conflict',
+                    completed_at = ?1,
+                    lease_until = NULL,
+                    last_error = ?2,
+                    payload = ?3
+                WHERE id = ?4
+                "#,
+                params![
+                    now,
+                    result_note_md.chars().take(256).collect::<String>(),
+                    new_payload,
+                    id_str
+                ],
+            )
+            .map_err(storage_err)?;
+
+            tx.commit().map_err(storage_err)?;
+            Ok(())
+        })
         .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| QueueError::Storage(e.to_string()))?;
+        .map_err(|_| blocking_err())??;
 
         let job_result = JobResult {
             success: false,
@@ -1539,32 +1854,194 @@ impl QueueStore for SqliteQueueStore {
 // Helpers privés — types non exportés
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Applies WAL pragmas on a freshly opened SQLite connection.
-///
-/// Must be called after `SqlitePool::connect` and before any operation.
+/// Applies WAL pragmas on the queue database.
 ///
 /// # Side effects
 ///
 /// - Enables WAL mode (concurrent write performance)
 /// - Sets `synchronous=NORMAL` (durability/performance trade-off)
 /// - Sets `foreign_keys=ON`
-pub async fn apply_sqlite_pragmas(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("PRAGMA journal_mode=WAL;")
-        .execute(pool)
-        .await?;
-    sqlx::query("PRAGMA synchronous=NORMAL;")
-        .execute(pool)
-        .await?;
-    sqlx::query("PRAGMA foreign_keys=ON;").execute(pool).await?;
-    Ok(())
+///
+/// Idempotent. `open_queue_db` already applies WAL + `busy_timeout`; this call adds
+/// `synchronous=NORMAL` and `foreign_keys=ON` for callers that require them
+/// (admin, tests) — exact parity with the original sqlx settings.
+pub async fn apply_sqlite_pragmas(db: &QueueDb) -> Result<(), QueueError> {
+    db.with_conn(|conn| {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(())
+    })
+    .await
 }
 
-/// Applies migrations from the `migrations/` directory.
+// ─────────────────────────────────────────────────────────────────────────────
+// Migrations — honore la table de suivi `_sqlx_migrations` tenue par sqlx (F-145)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Embedded migration — the 7 queue migrations (006 → 012).
 ///
-/// Wrapper around `sqlx::migrate!` with a fixed migration path.
-/// Call during pool initialization in `gradatum-worker`.
-pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::migrate::MigrateError> {
-    sqlx::migrate!("./migrations").run(pool).await
+/// Version and description computed like sqlx:
+///   - version = the numeric prefix of the filename (everything before the first `_`);
+///   - description = the part after the first `_`, `.sql` extension removed, `_` → spaces.
+///
+/// The SQL body is included via `include_str!` — byte-identical to the file on disk, hence to
+/// the SHA-384 checksum sqlx recorded. ⚠️ DO NOT MODIFY these files: an applied migration is
+/// immutable, and modified contents would invalidate the checksum → startup refusal.
+struct EmbeddedMigration {
+    version: i64,
+    description: &'static str,
+    sql: &'static str,
+}
+
+/// Migrations de la file, en ordre de version (l'ordre d'application de sqlx).
+const MIGRATIONS: &[EmbeddedMigration] = &[
+    EmbeddedMigration {
+        version: 6,
+        description: "apalis bootstrap",
+        sql: include_str!("../migrations/006_apalis_bootstrap.sql"),
+    },
+    EmbeddedMigration {
+        version: 7,
+        description: "jobs kind indexed",
+        sql: include_str!("../migrations/007_jobs_kind_indexed.sql"),
+    },
+    EmbeddedMigration {
+        version: 8,
+        description: "idempotency",
+        sql: include_str!("../migrations/008_idempotency.sql"),
+    },
+    EmbeddedMigration {
+        version: 9,
+        description: "jobs v2 drain",
+        sql: include_str!("../migrations/009_jobs_v2_drain.sql"),
+    },
+    EmbeddedMigration {
+        version: 10,
+        description: "backfill kind",
+        sql: include_str!("../migrations/010_backfill_kind.sql"),
+    },
+    EmbeddedMigration {
+        version: 11,
+        description: "jobs tenant scope",
+        sql: include_str!("../migrations/011_jobs_tenant_scope.sql"),
+    },
+    EmbeddedMigration {
+        version: 12,
+        description: "drop jobs v2",
+        sql: include_str!("../migrations/012_drop_jobs_v2.sql"),
+    },
+];
+
+/// Applies the pending migrations, honoring the `_sqlx_migrations` tracking table
+/// kept by sqlx (schema measured in sqlx-sqlite 0.8.6/src/migrate.rs:72-79).
+///
+/// "Already applied" decision: the `version` column (PK) — a version already present is
+/// NEVER replayed. sqlx fidelity (the `Migrate` trait):
+///   - a `success = false` row → dirty database → startup refusal (MigrateError::Dirty);
+///   - an applied migration whose SHA-384 checksum differs from the embedded file →
+///     startup refusal (MigrateError::VersionMismatch);
+///   - an applied migration absent from our embedded list → ignored (like sqlx, which only
+///     iterates its own migrations).
+///
+/// ⚠️ Some queue migrations are NOT idempotent (007/011: `ALTER TABLE ADD COLUMN`). The
+/// no-replay property is therefore a safety guarantee: on an up-to-date database, no migration
+/// is replayed (proven by `init_does_not_replay_migrations_on_production_like_base`).
+///
+/// Returns the number of migrations applied (0 on an up-to-date database).
+pub async fn run_migrations(db: &QueueDb) -> Result<usize, QueueError> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = db.blocking_lock();
+        run_migrations_sync(&mut conn)
+    })
+    .await
+    .map_err(|_| blocking_err())?
+}
+
+/// Synchronous part of `run_migrations`, run on a blocking thread under the lock.
+fn run_migrations_sync(conn: &mut Connection) -> Result<usize, QueueError> {
+    // Schéma exact de sqlx (sqlx-sqlite 0.8.6/src/migrate.rs) — no-op si déjà présente.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            success BOOLEAN NOT NULL,
+            checksum BLOB NOT NULL,
+            execution_time BIGINT NOT NULL
+        );",
+    )
+    .map_err(storage_err)?;
+
+    // Base sale : une migration marquée en échec → refus de démarrage (parité
+    // MigrateError::Dirty). Ne peut survenir que d'une écriture manuelle : l'application
+    // sqlx est transactionnelle (migration + enregistrement dans la même transaction).
+    let dirty: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM _sqlx_migrations WHERE success = false ORDER BY version LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_err)?;
+    if let Some(version) = dirty {
+        return Err(storage_err(format!(
+            "dirty migration base: migration {version} marked as failed (success = false)"
+        )));
+    }
+
+    // Migrations déjà appliquées (version + checksum), comme sqlx list_applied_migrations.
+    let mut applied: Vec<(i64, Vec<u8>)> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+            .map_err(storage_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(storage_err)?;
+        for row in rows {
+            applied.push(row.map_err(storage_err)?);
+        }
+    }
+
+    let mut applied_count = 0;
+    for migration in MIGRATIONS {
+        let checksum = Sha384::digest(migration.sql.as_bytes()).to_vec();
+
+        if let Some((_, stored)) = applied.iter().find(|(v, _)| *v == migration.version) {
+            // Migration déjà appliquée : vérifier que le fichier n'a pas bougé depuis
+            // (immuable post-application). Ne JAMAIS rejouer.
+            if stored != &checksum {
+                return Err(storage_err(format!(
+                    "migration {} already applied but its content changed \
+                     (SHA-384 checksum differs) — refusing startup",
+                    migration.version
+                )));
+            }
+            continue;
+        }
+
+        // Application dans une transaction unique (migration + enregistrement), comme sqlx :
+        // jamais de migration exécutée deux fois. `unchecked_transaction` car la connexion est
+        // dédiée (pas de transaction imbriquée possible).
+        let tx = conn.unchecked_transaction().map_err(storage_err)?;
+        tx.execute_batch(migration.sql).map_err(storage_err)?;
+        tx.execute(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (?1, ?2, TRUE, ?3, -1)",
+            params![migration.version, migration.description, checksum],
+        )
+        .map_err(storage_err)?;
+        tx.commit().map_err(storage_err)?;
+
+        tracing::info!(version = migration.version, "queue migration applied");
+        applied_count += 1;
+    }
+
+    Ok(applied_count)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1580,63 +2057,67 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::migrate::Migr
 ///
 /// - Writes to `gradatum_idempotency`.
 /// - If the key already exists: no-op (`INSERT OR IGNORE`).
-pub async fn idempotency_insert(
-    pool: &SqlitePool,
-    key: &str,
-    job_id: &str,
-) -> Result<bool, QueueError> {
+pub async fn idempotency_insert(db: &QueueDb, key: &str, job_id: &str) -> Result<bool, QueueError> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let rows_affected = sqlx::query(
-        r#"INSERT OR IGNORE INTO gradatum_idempotency (key, job_id, created_at) VALUES (?, ?, ?)"#,
-    )
-    .bind(key)
-    .bind(job_id)
-    .bind(now_ms)
-    .execute(pool)
+    let key = key.to_owned();
+    let job_id = job_id.to_owned();
+    let db = db.clone();
+    let affected = tokio::task::spawn_blocking(move || -> Result<usize, QueueError> {
+        let conn = db.blocking_lock();
+        let n = conn
+            .execute(
+                r#"INSERT OR IGNORE INTO gradatum_idempotency (key, job_id, created_at) VALUES (?1, ?2, ?3)"#,
+                params![key, job_id, now_ms],
+            )
+            .map_err(storage_err)?;
+        Ok(n)
+    })
     .await
-    .map_err(|e| QueueError::Storage(e.to_string()))?
-    .rows_affected();
+    .map_err(|_| blocking_err())??;
 
-    Ok(rows_affected > 0)
+    Ok(affected > 0)
 }
 
 /// Looks up a `job_id` by idempotency key.
 ///
 /// Returns `Some(job_id)` if the key exists, `None` otherwise.
-pub async fn idempotency_lookup(
-    pool: &SqlitePool,
-    key: &str,
-) -> Result<Option<String>, QueueError> {
-    let row = sqlx::query(r#"SELECT job_id FROM gradatum_idempotency WHERE key = ?"#)
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?;
-
-    match row {
-        None => Ok(None),
-        Some(r) => {
-            let job_id: String = r
-                .try_get("job_id")
-                .map_err(|e| QueueError::Storage(e.to_string()))?;
-            Ok(Some(job_id))
-        }
-    }
+pub async fn idempotency_lookup(db: &QueueDb, key: &str) -> Result<Option<String>, QueueError> {
+    let key = key.to_owned();
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || -> Result<Option<String>, QueueError> {
+        let conn = db.blocking_lock();
+        conn.query_row(
+            r#"SELECT job_id FROM gradatum_idempotency WHERE key = ?1"#,
+            [&key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_err)
+    })
+    .await
+    .map_err(|_| blocking_err())?
 }
 
 /// Deletes idempotency entries whose `created_at` is earlier than `before_ms`.
 ///
 /// Used by the `IdempotencyCleanup` cron job (24-hour TTL).
 /// Returns the number of deleted entries.
-pub async fn idempotency_cleanup(pool: &SqlitePool, before_ms: i64) -> Result<u64, QueueError> {
-    let rows_deleted = sqlx::query(r#"DELETE FROM gradatum_idempotency WHERE created_at < ?"#)
-        .bind(before_ms)
-        .execute(pool)
-        .await
-        .map_err(|e| QueueError::Storage(e.to_string()))?
-        .rows_affected();
+pub async fn idempotency_cleanup(db: &QueueDb, before_ms: i64) -> Result<u64, QueueError> {
+    let db = db.clone();
+    let deleted = tokio::task::spawn_blocking(move || -> Result<usize, QueueError> {
+        let conn = db.blocking_lock();
+        let n = conn
+            .execute(
+                r#"DELETE FROM gradatum_idempotency WHERE created_at < ?1"#,
+                [before_ms],
+            )
+            .map_err(storage_err)?;
+        Ok(n)
+    })
+    .await
+    .map_err(|_| blocking_err())??;
 
-    Ok(rows_deleted)
+    Ok(deleted as u64)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1652,49 +2133,39 @@ mod tests {
         JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, JobTrigger, RetryBackoff,
         TriggerCondition, TriggerSource, job_kind_str,
     };
-    use sqlx::SqlitePool;
+    use rusqlite::Connection;
     use ulid::Ulid;
 
-    /// Creates an in-memory SQLite pool for tests.
-    ///
-    /// Applies migrations 006 + 007 + 008 + 009 + 010 directly via `include_str!`
-    /// (`sqlx migrate!` requires files on disk at macro expansion time,
-    /// which is unavailable in in-memory tests).
-    async fn test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:")
+    /// Crée une base SQLite in-memory pour les tests, migrations 006 → 012 appliquées.
+    async fn test_db() -> QueueDb {
+        let db = QueueDb::open_in_memory()
             .await
-            .expect("pool in-memory doit créer");
-        apply_sqlite_pragmas(&pool)
+            .expect("db in-memory doit créer");
+        apply_sqlite_pragmas(&db)
             .await
             .expect("pragmas WAL doivent s'appliquer");
-        sqlx::query(include_str!("../migrations/006_apalis_bootstrap.sql"))
-            .execute(&pool)
+        run_migrations(&db)
             .await
-            .expect("migration 006 doit s'appliquer");
-        sqlx::query(include_str!("../migrations/007_jobs_kind_indexed.sql"))
-            .execute(&pool)
+            .expect("migrations doivent s'appliquer");
+        db
+    }
+
+    /// Exécute une requête (bind d'un id string) sur la base, via la connexion partagée.
+    async fn exec_id(db: &QueueDb, sql: &str, id: &str) {
+        let sql = sql.to_owned();
+        let id = id.to_owned();
+        db.with_conn(move |conn| conn.execute(&sql, [&id]).map(|_| ()))
             .await
-            .expect("migration 007 doit s'appliquer");
-        sqlx::query(include_str!("../migrations/008_idempotency.sql"))
-            .execute(&pool)
+            .expect("sql doit réussir");
+    }
+
+    /// Lit une valeur `String` (première colonne) d'un `SELECT … WHERE id = ?`.
+    async fn select_str(db: &QueueDb, sql: &str, id: &str) -> String {
+        let sql = sql.to_owned();
+        let id = id.to_owned();
+        db.with_conn(move |conn| conn.query_row(&sql, [&id], |row| row.get::<_, String>(0)))
             .await
-            .expect("migration 008 doit s'appliquer");
-        // Migration 009 : drain jobs_v2 pending → failed (Phase 1.2 bridge).
-        // jobs_v2 n'existe pas en in-memory → ignorer l'erreur "no such table".
-        let _ = sqlx::query(include_str!("../migrations/009_jobs_v2_drain.sql"))
-            .execute(&pool)
-            .await;
-        // Migration 010 : backfill colonne `kind` pour les jobs existants.
-        sqlx::query(include_str!("../migrations/010_backfill_kind.sql"))
-            .execute(&pool)
-            .await
-            .expect("migration 010 doit s'appliquer");
-        // Migration 011 : colonne `tenant_id` (L1+L2 isolation jobs par tenant).
-        sqlx::query(include_str!("../migrations/011_jobs_tenant_scope.sql"))
-            .execute(&pool)
-            .await
-            .expect("migration 011 doit s'appliquer");
-        pool
+            .expect("select doit réussir")
     }
 
     /// La migration 011 ajoute `tenant_id TEXT NOT NULL DEFAULT 'main'`
@@ -1702,38 +2173,49 @@ mod tests {
     /// à `'main'` par le DEFAULT (correct : à `multi_tenant` OFF tout est `main`).
     #[tokio::test]
     async fn migration_011_adds_tenant_id_default_main() {
-        let pool = test_pool().await;
+        let db = test_db().await;
 
         // La colonne est présente sur gradatum_jobs.
-        let cols: Vec<String> = sqlx::query("SELECT name FROM pragma_table_info('gradatum_jobs')")
-            .fetch_all(&pool)
+        let cols: Vec<String> = db
+            .with_conn(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT name FROM pragma_table_info('gradatum_jobs')")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r?);
+                }
+                Ok(out)
+            })
             .await
-            .expect("pragma_table_info doit répondre")
-            .iter()
-            .map(|r| r.get::<String, _>("name"))
-            .collect();
+            .expect("pragma_table_info doit répondre");
         assert!(
             cols.contains(&"tenant_id".to_string()),
             "colonne tenant_id absente de gradatum_jobs"
         );
 
         // Un INSERT legacy (sans tenant_id explicite) est backfillé à 'main'.
-        sqlx::query(
-            "INSERT INTO gradatum_jobs (id, payload, status, priority, class, kind, created_at, scheduled_at) \
-             VALUES ('01LEGACY', '{}', 'Pending', 2, 'System', '', ?, ?)",
-        )
-        .bind("2020-01-01T00:00:00Z")
-        .bind("2020-01-01T00:00:00Z")
-        .execute(&pool)
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO gradatum_jobs (id, payload, status, priority, class, kind, created_at, scheduled_at) \
+                 VALUES ('01LEGACY', '{}', 'Pending', 2, 'System', '', ?1, ?2)",
+                params!["2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"],
+            )
+            .map(|_| ())
+        })
         .await
         .expect("insert legacy doit réussir");
 
-        let tenant: String =
-            sqlx::query("SELECT tenant_id FROM gradatum_jobs WHERE id = '01LEGACY'")
-                .fetch_one(&pool)
-                .await
-                .expect("select tenant_id doit répondre")
-                .get::<String, _>("tenant_id");
+        let tenant: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT tenant_id FROM gradatum_jobs WHERE id = '01LEGACY'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("select tenant_id doit répondre");
         assert_eq!(tenant, "main", "job legacy doit être backfillé à 'main'");
     }
 
@@ -1742,7 +2224,7 @@ mod tests {
     /// tenant à `Some(t)`, tout en restant byte-identical à `None`.
     #[tokio::test]
     async fn enqueue_stamps_tenant_from_spec_and_filter_isolates() {
-        let store = SqliteQueueStore::new(test_pool().await);
+        let store = SqliteQueueStore::new(test_db().await);
         let mk = |tenant: &str| {
             make_record(
                 Job::Curate(CurateSpec {
@@ -1757,12 +2239,12 @@ mod tests {
         let jb = store.enqueue(mk("bob")).await.expect("enqueue bob");
 
         // Stamp : la colonne tenant_id reflète le spec (pas le DEFAULT 'main').
-        let ta: String = sqlx::query("SELECT tenant_id FROM gradatum_jobs WHERE id = ?")
-            .bind(ja.to_string())
-            .fetch_one(&store.pool)
-            .await
-            .expect("select tenant alice")
-            .get::<String, _>("tenant_id");
+        let ta: String = select_str(
+            store.db(),
+            "SELECT tenant_id FROM gradatum_jobs WHERE id = ?",
+            &ja.to_string(),
+        )
+        .await;
         assert_eq!(ta, "alice", "enqueue doit estampiller le tenant du spec");
 
         // None = pas de filtre (byte-identical) → voit tout.
@@ -1837,7 +2319,7 @@ mod tests {
     /// texte du log.
     #[tokio::test]
     async fn enqueue_stamps_multi_vault_agent_forget_with_the_job_vault() {
-        let store = SqliteQueueStore::new(test_pool().await);
+        let store = SqliteQueueStore::new(test_db().await);
         let multi_vault_forget = || {
             Job::Forget(gradatum_core::ForgetSpec {
                 scope: gradatum_core::ForgetScope::Agent {
@@ -1848,12 +2330,12 @@ mod tests {
             })
         };
         async fn stamp_of(store: &SqliteQueueStore, id: Ulid) -> String {
-            sqlx::query("SELECT tenant_id FROM gradatum_jobs WHERE id = ?")
-                .bind(id.to_string())
-                .fetch_one(&store.pool)
-                .await
-                .expect("select tenant_id")
-                .get::<String, _>("tenant_id")
+            select_str(
+                store.db(),
+                "SELECT tenant_id FROM gradatum_jobs WHERE id = ?",
+                &id.to_string(),
+            )
+            .await
         }
 
         // Job scopé sur un vault → c'est CE vault qui est estampillé, jamais "main".
@@ -1884,7 +2366,7 @@ mod tests {
     /// notes/vault (`no_cross_vault_leak`) : ici l'axe est `gradatum_jobs.tenant_id`.
     #[tokio::test]
     async fn no_cross_tenant_job_leak() {
-        let store = SqliteQueueStore::new(test_pool().await);
+        let store = SqliteQueueStore::new(test_db().await);
         let mk = |t: &str| {
             make_record(
                 Job::Curate(CurateSpec {
@@ -1995,7 +2477,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_and_get() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(
@@ -2019,7 +2501,7 @@ mod tests {
 
     #[tokio::test]
     async fn dequeue_returns_highest_priority() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Insère un job System (Low=1) puis un Agent (High=3)
@@ -2054,7 +2536,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_job_sets_done() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
@@ -2095,7 +2577,7 @@ mod tests {
     /// cohérence BLOB/SQL.
     #[tokio::test]
     async fn complete_preserves_terminal_conflict() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(
@@ -2173,7 +2655,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_and_dlq() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let mut record = make_record(
@@ -2212,9 +2694,135 @@ mod tests {
         assert_eq!(fetched.lifecycle.status, JobStatus::DLQ);
     }
 
+    /// F-217 — le motif réel du dernier échec survit à la bascule en DLQ.
+    ///
+    /// `fail_dlq` recevait « max_retries atteint (N/M) » (la CONSÉQUENCE, décidée par
+    /// `promote_retries`) et écrasait `retry.last_error` avec ce texte générique,
+    /// masquant la cause. Résultat terrain : 8 morts affichant tous la même ligne.
+    ///
+    /// Ce test prouve, sur deux familles d'échec distinctes, que :
+    ///   1. la cause nommée survit dans `last_error` après passage en DLQ ;
+    ///   2. la mention d'épuisement des tentatives y reste lisible ;
+    ///   3. `retry.errors[]` conserve l'historique complet (source exhaustive intacte) ;
+    ///   4. deux causes différentes restent distinguables sur la colonne `last_error`
+    ///      tronquée à 80 caractères — reproduit le rendu CLI `jobs dlq`
+    ///      (`gradatum-admin/src/jobs_cmd.rs:346-348`).
+    #[tokio::test]
+    async fn fail_dlq_preserves_named_error_after_transition() {
+        let pool = test_db().await;
+        let store = SqliteQueueStore::new(pool);
+
+        // Deux causes réelles distinctes, à l'image des 8 morts LIVE (refus d'écriture
+        // disque vs point d'accès injoignable). Volontairement ≥ 80 octets ASCII : la
+        // troncature à 80 du CLI reste alors dans le préfixe-cause, sans frontière
+        // multi-octet (propriété RÉ-AFFIRMÉE par assertion plus bas, jamais présumée
+        // de la longueur du littéral). Nom d'hôte neutre `example.invalid` (RFC 6761,
+        // ne résout jamais) : le test a besoin d'un point d'accès injoignable, pas du
+        // nom d'une machine réelle.
+        let cause_a = "opendal error: PermissionDenied (os error 13) while writing blob object to local store";
+        let cause_b = "embedding endpoint http://embed.example.invalid/v1/embeddings unreachable: connection refused";
+
+        let mut ids = Vec::new();
+        for cause in [cause_a, cause_b] {
+            let mut record = make_record(
+                Job::Curate(CurateSpec {
+                    note_id: Ulid::generate(),
+                    tenant_id: "main".to_string(),
+                    ..Default::default()
+                }),
+                JobClass::Agent,
+                JobStatus::Pending,
+            );
+            record.retry.max = 3;
+            let id = record.id;
+            store.enqueue(record).await.expect("enqueue");
+            let _ = store.dequeue(None).await.expect("dequeue");
+
+            // Une tentative qui échoue avec la cause nommée : `fail()` la pousse dans
+            // `retry.errors[]` ET `retry.last_error`.
+            store.fail(id, cause, 3).await.expect("fail");
+
+            // Bascule DLQ avec le message générique que produit `promote_retries`.
+            store
+                .fail_dlq(id, "max_retries atteint (4 / 3)")
+                .await
+                .expect("fail_dlq");
+            ids.push((id, cause));
+        }
+
+        // Rendu identique au CLI `jobs dlq` : `last_error` tronqué à 80 octets.
+        let dlq = store
+            .list(JobFilter {
+                status: Some(JobStatus::DLQ),
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .expect("list DLQ");
+        assert_eq!(dlq.len(), 2, "les deux jobs doivent être en DLQ");
+        // Ces découpes à l'octet 80 (miroir de l'ancien rendu CLI) ne sont sûres que
+        // si l'octet 80 tombe sur une frontière de caractère. On l'EXIGE explicitement
+        // — ainsi, si un littéral de cause raccourcit un jour sous 80 octets ASCII, le
+        // test échoue franchement au lieu de paniquer ou de passer pour la mauvaise raison.
+        for r in &dlq {
+            let le = r.retry.last_error.as_deref().unwrap_or("");
+            let cut = le.len().min(80);
+            assert!(
+                le.is_char_boundary(cut),
+                "pré-condition : l'octet {cut} doit être une frontière de caractère (last_error={le})"
+            );
+        }
+        for r in &dlq {
+            let le = r.retry.last_error.as_deref().unwrap_or("(no detail)");
+            println!(
+                "{}  retries={}/{}  last_error={}",
+                r.id,
+                r.retry.count,
+                r.retry.max,
+                &le[..le.len().min(80)]
+            );
+        }
+
+        for (id, cause) in ids {
+            let fetched = store.get(id, None).await.expect("get").expect("job existe");
+            assert_eq!(fetched.lifecycle.status, JobStatus::DLQ);
+            let last_error = fetched.retry.last_error.expect("last_error présent");
+
+            // 1. La cause nommée survit à la bascule.
+            assert!(
+                last_error.contains(cause),
+                "last_error doit conserver la cause réelle « {cause} », obtenu : {last_error}"
+            );
+            // 2. La mention d'épuisement reste lisible.
+            assert!(
+                last_error.contains("max_retries atteint"),
+                "last_error doit conserver la mention d'épuisement, obtenu : {last_error}"
+            );
+            // 3. `retry.errors[]` conserve la cause (source exhaustive non altérée).
+            assert!(
+                fetched.retry.errors.iter().any(|e| e.message == cause),
+                "retry.errors[] doit toujours contenir la cause réelle"
+            );
+        }
+
+        // 4. Les deux causes sont distinguables sur la colonne tronquée à 80.
+        let mut truncated: Vec<String> = dlq
+            .iter()
+            .map(|r| {
+                let le = r.retry.last_error.as_deref().unwrap_or("");
+                le[..le.len().min(80)].to_string()
+            })
+            .collect();
+        truncated.sort();
+        assert_ne!(
+            truncated[0], truncated[1],
+            "deux causes différentes ne doivent PAS rendre la même ligne (défaut F-217)"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_job() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(Job::Audit, JobClass::System, JobStatus::Pending);
@@ -2233,7 +2841,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_with_filter() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Insère 2 jobs Agent et 1 job System
@@ -2286,7 +2894,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_order_desc_returns_newest_first() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
         let ids = seed_four(&store).await; // chrono : ids[0] plus ancien → ids[3] plus récent
 
@@ -2306,7 +2914,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_order_asc_unchanged() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
         let ids = seed_four(&store).await;
 
@@ -2326,7 +2934,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_desc_pagination_no_gap_no_dup() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
         let ids = seed_four(&store).await;
 
@@ -2366,7 +2974,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_created_range_isolates_window() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
         let ids = seed_four(&store).await; // T+0,1,2,3 minutes
 
@@ -2392,7 +3000,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_events_received() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
         let mut rx = store.subscribe();
 
@@ -2406,7 +3014,7 @@ mod tests {
 
     #[tokio::test]
     async fn recover_stale_leases_restores_pending() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
@@ -2415,11 +3023,12 @@ mod tests {
         let _ = store.dequeue(None).await.expect("dequeue doit réussir");
 
         // Simuler lease expirée en patchant directement
-        sqlx::query("UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?")
-            .bind(id.to_string())
-            .execute(&store.pool)
-            .await
-            .expect("patch lease doit réussir");
+        exec_id(
+            store.db(),
+            "UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?",
+            &id.to_string(),
+        )
+        .await;
 
         // TTL de 0 — tout lease expiré est récupéré
         let recovered = store
@@ -2442,7 +3051,7 @@ mod tests {
     /// `enqueue` → `get`: status must be `Pending`.
     #[tokio::test]
     async fn e12_get_after_enqueue_is_pending() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
@@ -2464,7 +3073,7 @@ mod tests {
     /// `enqueue` → `dequeue` → `get`: status must be `Running`, not stale `Pending`.
     #[tokio::test]
     async fn e12_get_after_dequeue_is_running() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
@@ -2498,7 +3107,7 @@ mod tests {
     /// `enqueue` → `dequeue` → `complete` → `get`: status must be `Done`.
     #[tokio::test]
     async fn e12_get_after_complete_is_done() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(Job::Backup, JobClass::System, JobStatus::Pending);
@@ -2542,7 +3151,7 @@ mod tests {
     /// never the Embed. Same isolation in the other direction.
     #[tokio::test]
     async fn dequeue_by_kind_isolates_curate_from_embed() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let curate_record = make_record(
@@ -2600,7 +3209,7 @@ mod tests {
     /// it is the only available job and has priority.
     #[tokio::test]
     async fn dequeue_by_kind_embed_worker_cannot_steal_curate() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Enqueue uniquement un Curate
@@ -2626,7 +3235,7 @@ mod tests {
     /// Without this test, an enqueue without `kind` would silently break routing.
     #[tokio::test]
     async fn enqueue_persists_kind_column() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let curate_record = make_record(
@@ -2638,12 +3247,12 @@ mod tests {
         store.enqueue(curate_record).await.expect("enqueue");
 
         // Lire la colonne `kind` directement depuis SQLite
-        let row = sqlx::query("SELECT kind FROM gradatum_jobs WHERE id = ?")
-            .bind(&id)
-            .fetch_one(&store.pool)
-            .await
-            .expect("row doit exister");
-        let kind: String = row.try_get("kind").expect("colonne kind doit exister");
+        let kind = select_str(
+            store.db(),
+            "SELECT kind FROM gradatum_jobs WHERE id = ?",
+            &id,
+        )
+        .await;
         assert_eq!(
             kind, "Curate",
             "la colonne kind doit valoir 'Curate' après enqueue d'un Job::Curate"
@@ -2654,7 +3263,7 @@ mod tests {
     /// Simulates jobs that were enqueued without the `kind` column (empty string).
     #[tokio::test]
     async fn migration_010_backfills_kind_from_payload() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Insérer un job avec kind='' manuellement (simule l'état pré-fix)
@@ -2668,39 +3277,44 @@ mod tests {
             SqliteQueueStore::serialize_record(&record).expect("sérialisation doit réussir");
         let now = Utc::now().to_rfc3339();
 
-        sqlx::query(
-            "INSERT INTO gradatum_jobs (id, payload, status, priority, class, kind, created_at, scheduled_at) VALUES (?, ?, 'Pending', 3, 'Agent', '', ?, ?)"
-        )
-        .bind(&id_str)
-        .bind(&payload)
-        .bind(&now)
-        .bind(&now)
-        .execute(&store.pool)
-        .await
-        .expect("insert manuel doit réussir");
+        let id_str2 = id_str.clone();
+        store
+            .db()
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO gradatum_jobs (id, payload, status, priority, class, kind, created_at, scheduled_at) VALUES (?1, ?2, 'Pending', 3, 'Agent', '', ?3, ?4)",
+                    params![id_str2, payload, now, now],
+                )
+                .map(|_| ())
+            })
+            .await
+            .expect("insert manuel doit réussir");
 
         // Vérifier que kind est bien '' avant le backfill
-        let row = sqlx::query("SELECT kind FROM gradatum_jobs WHERE id = ?")
-            .bind(&id_str)
-            .fetch_one(&store.pool)
-            .await
-            .expect("row doit exister");
-        let kind_before: String = row.try_get("kind").expect("colonne kind");
+        let kind_before = select_str(
+            store.db(),
+            "SELECT kind FROM gradatum_jobs WHERE id = ?",
+            &id_str,
+        )
+        .await;
         assert_eq!(kind_before, "", "kind doit être vide avant backfill");
 
         // Appliquer la migration 010
-        sqlx::query(include_str!("../migrations/010_backfill_kind.sql"))
-            .execute(&store.pool)
+        store
+            .db()
+            .with_conn(|conn| {
+                conn.execute_batch(include_str!("../migrations/010_backfill_kind.sql"))
+            })
             .await
             .expect("migration 010 doit s'appliquer");
 
         // Vérifier que kind est maintenant rempli
-        let row = sqlx::query("SELECT kind FROM gradatum_jobs WHERE id = ?")
-            .bind(&id_str)
-            .fetch_one(&store.pool)
-            .await
-            .expect("row doit exister");
-        let kind_after: String = row.try_get("kind").expect("colonne kind");
+        let kind_after = select_str(
+            store.db(),
+            "SELECT kind FROM gradatum_jobs WHERE id = ?",
+            &id_str,
+        )
+        .await;
         assert_eq!(
             kind_after, "Curate",
             "migration 010 doit backfiller kind='Curate' depuis le payload JSON"
@@ -2812,7 +3426,7 @@ mod tests {
     /// DLQ when `attempt_count >= retry.max`.
     #[tokio::test]
     async fn promote_retries_uses_sql_attempt_count_for_dlq_guard() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool.clone());
 
         // max=2 — après 2 tentatives le job doit partir en DLQ.
@@ -2882,7 +3496,7 @@ mod tests {
     /// after a replay SQL (same query used by `jobs_cmd::replay_single`).
     #[tokio::test]
     async fn replay_dlq_resets_attempt_count() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool.clone());
 
         let record = make_record(
@@ -2907,35 +3521,36 @@ mod tests {
         assert_eq!(before.lifecycle.status, JobStatus::DLQ);
 
         // Replay SQL — même requête que gradatum-admin/src/jobs_cmd.rs::replay_single.
-        let rows_affected = sqlx::query(
-            r#"
+        let replay_sql = r#"
             UPDATE gradatum_jobs
             SET status        = 'Pending',
                 lease_until   = NULL,
                 scheduled_at  = datetime('now'),
                 attempt_count = 0,
                 last_error    = NULL
-            WHERE id = ?
+            WHERE id = ?1
               AND status = 'DLQ'
-            "#,
-        )
-        .bind(&id_str)
-        .execute(&pool)
-        .await
-        .expect("replay SQL")
-        .rows_affected();
+        "#;
+        let id_for_replay = id_str.clone();
+        let rows_affected = pool
+            .with_conn(move |conn| conn.execute(replay_sql, [&id_for_replay]))
+            .await
+            .expect("replay SQL");
         assert_eq!(rows_affected, 1, "replay doit affecter exactement 1 ligne");
 
         // Vérifier que attempt_count est bien à 0.
-        let row =
-            sqlx::query("SELECT attempt_count, last_error, status FROM gradatum_jobs WHERE id = ?")
-                .bind(&id_str)
-                .fetch_one(&pool)
-                .await
-                .expect("row");
-        let attempt_count: i64 = row.try_get("attempt_count").expect("attempt_count");
-        let last_error: Option<String> = row.try_get("last_error").expect("last_error");
-        let status: String = row.try_get("status").expect("status");
+        let (attempt_count, last_error, status): (i64, Option<String>, String) = {
+            let id_for_read = id_str.clone();
+            pool.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT attempt_count, last_error, status FROM gradatum_jobs WHERE id = ?1",
+                    [&id_for_read],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .await
+            .expect("row")
+        };
 
         assert_eq!(attempt_count, 0, "attempt_count doit être 0 après replay");
         assert!(
@@ -2949,7 +3564,7 @@ mod tests {
     /// `attempt_count < max_retries` (happy path — not regressed by the fix).
     #[tokio::test]
     async fn promote_retries_pending_when_below_max() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let mut record = make_record(
@@ -3005,7 +3620,7 @@ mod tests {
     /// `find_awaiting` returns `Waiting` jobs whose `await_jobs` contains `job_id`.
     #[tokio::test]
     async fn find_awaiting_returns_dependents_when_job_matches() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let done_id = Ulid::generate();
@@ -3028,7 +3643,7 @@ mod tests {
     /// `find_awaiting` returns an empty vec when no job depends on `job_id`.
     #[tokio::test]
     async fn find_awaiting_returns_empty_when_no_dependents() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Seed un job sans await_jobs — ne doit pas être retourné.
@@ -3050,7 +3665,7 @@ mod tests {
     /// matches — a sub-prefix without closing quotes does not match.
     #[tokio::test]
     async fn find_awaiting_no_partial_match() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // ULIDs de 26 chars — "01AAAAAAAAAAAAAAAAAAAAAA" est différent de "01AAAAAAAAAAAAAAAAAAAAA"
@@ -3077,7 +3692,7 @@ mod tests {
     /// `set_pending` transitions a `Waiting` job to `Pending`.
     #[tokio::test]
     async fn set_pending_transitions_waiting_to_pending() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let rec = make_record(Job::Backup, JobClass::System, JobStatus::Waiting);
@@ -3100,7 +3715,7 @@ mod tests {
     /// `set_pending` is idempotent: two successive calls do not return an error.
     #[tokio::test]
     async fn set_pending_is_idempotent_when_already_pending() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let rec = make_record(Job::Backup, JobClass::System, JobStatus::Waiting);
@@ -3125,7 +3740,7 @@ mod tests {
     /// without modifying the status.
     #[tokio::test]
     async fn set_pending_no_op_when_not_waiting() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Crée et complète un job (Done).
@@ -3166,7 +3781,7 @@ mod tests {
     /// Cascade: job B waits on [A], A is Done → B transitions to Pending.
     #[tokio::test]
     async fn cascade_promotes_when_all_deps_done() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Job A en Done.
@@ -3214,7 +3829,7 @@ mod tests {
     /// Cascade: job B waits on [A, C], A is Done but C is Pending → B remains Waiting.
     #[tokio::test]
     async fn cascade_does_not_promote_when_dep_not_done() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Job A en Done.
@@ -3273,7 +3888,7 @@ mod tests {
     /// Cascade inertia: no dependants → no mutations, returns `Ok`.
     #[tokio::test]
     async fn cascade_inertia_no_deps() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Job sans dépendants enqueued.
@@ -3297,7 +3912,7 @@ mod tests {
     /// without losing data.
     #[tokio::test]
     async fn c1_concurrent_complete_no_double_write() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = std::sync::Arc::new(SqliteQueueStore::new(pool));
 
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
@@ -3350,7 +3965,7 @@ mod tests {
     /// `Failed` (not `Pending` or another corrupted state).
     #[tokio::test]
     async fn c1_concurrent_fail_no_corruption() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = std::sync::Arc::new(SqliteQueueStore::new(pool));
 
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
@@ -3385,7 +4000,7 @@ mod tests {
     /// no catastrophic mass-recovery.
     #[tokio::test]
     async fn c3_recover_stale_leases_invalid_ttl_returns_empty() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Enqueuer + déqueuer un job (il passe Running avec lease_until proche).
@@ -3424,7 +4039,7 @@ mod tests {
     /// A valid TTL (0s) continues to work normally (non-regression).
     #[tokio::test]
     async fn c3_recover_stale_leases_valid_ttl_works() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
@@ -3433,11 +4048,12 @@ mod tests {
         let _ = store.dequeue(None).await.expect("dequeue");
 
         // Forcer la lease dans le passé.
-        sqlx::query("UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?")
-            .bind(id.to_string())
-            .execute(&store.pool)
-            .await
-            .expect("patch lease");
+        exec_id(
+            store.db(),
+            "UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?",
+            &id.to_string(),
+        )
+        .await;
 
         let recovered = store
             .recover_stale_leases(Duration::from_secs(0))
@@ -3462,7 +4078,7 @@ mod tests {
     async fn latest_job_returns_most_recent_not_oldest() {
         use std::time::{Duration as StdDuration, UNIX_EPOCH};
 
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Base epoch + offsets croissants → 3 ULID strictement ordonnés.
@@ -3503,7 +4119,7 @@ mod tests {
     /// (the dashboard shows "no last_job" without error).
     #[tokio::test]
     async fn latest_job_empty_returns_none() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let latest = store
@@ -3554,7 +4170,7 @@ mod tests {
     /// under-counted. This test seeds 205 DLQ jobs and asserts an exact count of 205.
     #[tokio::test]
     async fn count_dlq_jobs_exact_above_200() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         for _ in 0..205 {
@@ -3577,7 +4193,7 @@ mod tests {
     /// `COUNT(*)` sees them → prune executes.
     #[tokio::test]
     async fn count_dlq_jobs_older_than_beyond_200() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // 210 jobs DLQ récents (créés ~now) — hors fenêtre du cutoff.
@@ -3614,7 +4230,7 @@ mod tests {
     /// `delete_dlq_jobs(None)` removes all DLQ jobs → 0 remaining.
     #[tokio::test]
     async fn delete_dlq_jobs_prunes_all() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         for _ in 0..3 {
@@ -3650,7 +4266,7 @@ mod tests {
     /// a past cutoff deletes nothing (jobs created at `now`); a future cutoff deletes all.
     #[tokio::test]
     async fn delete_dlq_jobs_respects_older_than() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         for _ in 0..2 {
@@ -3687,7 +4303,7 @@ mod tests {
     /// while A is already `Done` — without going through `cascade_check_and_promote`.
     #[tokio::test]
     async fn promotes_waiting_job_when_all_deps_done() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Job A : Pending → Running → Done.
@@ -3758,7 +4374,7 @@ mod tests {
     /// jobs (no active DAG) → the sweep is a strict no-op.
     #[tokio::test]
     async fn sweep_is_noop_when_no_waiting_jobs() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Job Pending classique -- ne doit pas etre touche.
@@ -3787,7 +4403,7 @@ mod tests {
     /// → B remains Waiting (not all dependencies are Done).
     #[tokio::test]
     async fn does_not_promote_when_dep_not_done() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Job A en Done.
@@ -3859,7 +4475,7 @@ mod tests {
     /// garde-fou ici — le statut SQL est toujours Running).
     #[tokio::test]
     async fn complete_rejected_after_stale_lease_recovered() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(
@@ -3877,19 +4493,20 @@ mod tests {
 
         // Simuler un lease expiré dans le passé, MAIS le statut reste Running
         // (le sweep n'est pas encore passé — on teste la garde lease_until).
-        sqlx::query("UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?")
-            .bind(id.to_string())
-            .execute(&store.pool)
-            .await
-            .expect("patch lease doit réussir");
+        exec_id(
+            store.db(),
+            "UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?",
+            &id.to_string(),
+        )
+        .await;
 
         // Vérifier que le statut SQL est toujours Running (pas Pending).
-        let row = sqlx::query("SELECT status FROM gradatum_jobs WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_one(&store.pool)
-            .await
-            .expect("select status");
-        let sql_status: String = row.try_get("status").expect("colonne status");
+        let sql_status = select_str(
+            store.db(),
+            "SELECT status FROM gradatum_jobs WHERE id = ?",
+            &id.to_string(),
+        )
+        .await;
         assert_eq!(
             sql_status, "Running",
             "précondition : le statut SQL doit être Running (le sweep n'est pas passé)"
@@ -3933,7 +4550,7 @@ mod tests {
     /// ou le job est simplement en état Pending. `fail()` doit être rejeté.
     #[tokio::test]
     async fn fail_rejected_after_lease_expired() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(
@@ -3950,11 +4567,12 @@ mod tests {
         let _ = store.dequeue(None).await.expect("dequeue doit réussir");
 
         // Simuler un lease expiré.
-        sqlx::query("UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?")
-            .bind(id.to_string())
-            .execute(&store.pool)
-            .await
-            .expect("patch lease doit réussir");
+        exec_id(
+            store.db(),
+            "UPDATE gradatum_jobs SET lease_until = '2020-01-01T00:00:00Z' WHERE id = ?",
+            &id.to_string(),
+        )
+        .await;
 
         // fail() avec le lease expiré → NotLeased.
         let err = store
@@ -3971,7 +4589,7 @@ mod tests {
     /// (le job n'est plus Running après le premier complete).
     #[tokio::test]
     async fn double_complete_rejected() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(
@@ -4028,7 +4646,7 @@ mod tests {
     /// `fail()` appelé sur un job Pending (sans lease) → rejeté.
     #[tokio::test]
     async fn fail_on_pending_job_rejected() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         let record = make_record(Job::Summarize, JobClass::System, JobStatus::Pending);
@@ -4058,7 +4676,7 @@ mod tests {
     /// n'a pas d'affiliation à un tenant.
     #[tokio::test]
     async fn shared_pool_dequeue_sees_all_tenants() {
-        let pool = test_pool().await;
+        let pool = test_db().await;
         let store = SqliteQueueStore::new(pool);
 
         // Job tenant A.
@@ -4161,6 +4779,285 @@ mod tests {
         assert!(
             truncated.ends_with('é'),
             "le dernier caractère multi-octets doit être préservé"
+        );
+    }
+
+    // ── Preuve P0 (F-145 sous-lot 3) : non-rejeu des migrations de la file ──────
+    //
+    // La base de la file porte 7 migrations (006 → 012), dont certaines NON idempotentes
+    // (007/011 : `ALTER TABLE ADD COLUMN`). Le remplaçant rusqlite doit honorer la table de
+    // suivi `_sqlx_migrations` tenue par sqlx : une version présente n'est JAMAIS rejouée.
+    // Les tests ci-dessous fabriquent des bases jetables et prouvent le verdict.
+
+    /// P0 — une base portant la table de suivi REMPLIE comme en production (créée par
+    /// `sqlx::migrate!`, versions 6 → 12 enregistrées avec leur checksum SHA-384, table
+    /// `gradatum_jobs` à l'état post-012) ne fait RIEN rejouer par `run_migrations`.
+    ///
+    /// C'est LA preuve exigée par le brief : une seule migration rejouée (ex. 011
+    /// `ALTER TABLE … ADD COLUMN tenant_id`) échouerait sur « duplicate column name » et
+    /// corromprait la base LIVE — ce test prouve que cela ne peut pas arriver.
+    #[tokio::test]
+    async fn init_does_not_replay_migrations_on_production_like_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("queue.sqlite");
+
+        // Fabriquer la base « comme en production » : schéma exact de sqlx
+        // (sqlx-sqlite 0.8.6/src/migrate.rs) + lignes appliquées 6→12 + gradatum_jobs déjà créée.
+        let conn = Connection::open(&path).expect("open fixture base");
+        conn.execute_batch(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            );",
+        )
+        .expect("fixture tracking table");
+        for m in MIGRATIONS {
+            let checksum = Sha384::digest(m.sql.as_bytes()).to_vec();
+            conn.execute(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+                 VALUES (?1, ?2, TRUE, ?3, -1)",
+                params![m.version, m.description, checksum],
+            )
+            .expect("fixture migration row");
+        }
+        // Table gradatum_jobs à l'état post-012 (colonne tenant_id présente).
+        conn.execute_batch(
+            "CREATE TABLE gradatum_jobs (
+                id TEXT NOT NULL PRIMARY KEY,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Pending',
+                priority INTEGER NOT NULL DEFAULT 2,
+                class TEXT NOT NULL DEFAULT 'System',
+                kind TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                scheduled_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                lease_until TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                deadline TEXT,
+                last_error TEXT,
+                await_jobs TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'main'
+            );",
+        )
+        .expect("fixture gradatum_jobs");
+        drop(conn);
+
+        // Lancer le remplaçant (open + run_migrations).
+        let db = QueueDb::open(&path)
+            .await
+            .expect("open base production-like");
+        let applied = run_migrations(&db)
+            .await
+            .expect("run_migrations sur base production-like");
+        assert_eq!(applied, 0, "aucune migration rejouée sur base à jour");
+
+        // La table de suivi n'a toujours que les 7 lignes d'origine.
+        let n: i64 = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM _sqlx_migrations", [], |row| {
+                    row.get(0)
+                })
+            })
+            .await
+            .expect("count");
+        assert_eq!(
+            n,
+            MIGRATIONS.len() as i64,
+            "table de suivi intacte — aucune migration rejouée"
+        );
+    }
+
+    /// Contre-preuve — une base VIERGE reçoit exactement 7 applications (une par migration),
+    /// et le second appel n'applique plus rien. Les migrations non-idempotentes 007/011 ne
+    /// sont donc appliquées qu'une seule fois, jamais rejouées.
+    #[tokio::test]
+    async fn migration_runner_applies_fresh_migrations_then_skips() {
+        let db = test_db().await;
+
+        // `test_db` a déjà appliqué les 7 migrations via `run_migrations`.
+        let n: i64 = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM _sqlx_migrations", [], |row| {
+                    row.get(0)
+                })
+            })
+            .await
+            .expect("count");
+        assert_eq!(
+            n,
+            MIGRATIONS.len() as i64,
+            "base vierge → chaque migration appliquée exactement une fois"
+        );
+
+        // La colonne tenant_id (migration 011) existe — non-idempotente, donc elle
+        // n'aurait PAS survécu à un rejeu.
+        let cols: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('gradatum_jobs') WHERE name = 'tenant_id'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("pragma");
+        assert_eq!(
+            cols, 1,
+            "colonne tenant_id présente (migration 011 appliquée)"
+        );
+
+        // Second appel → rien à rejouer.
+        let applied2 = run_migrations(&db).await.expect("second run");
+        assert_eq!(applied2, 0, "second appel : rien à rejouer");
+    }
+
+    /// Le checksum embarqué correspond aux fichiers sur disque (le même que sqlx lit) :
+    /// la preuve de non-rejeu repose sur l'identité des octets, pas sur une copie dérivée.
+    #[test]
+    fn embedded_migrations_match_disk_files() {
+        for m in MIGRATIONS {
+            let filename = format!("{:03}_{}.sql", m.version, m.description.replace(' ', "_"));
+            let disk = std::fs::read(format!(
+                "{}/migrations/{filename}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("lire la migration sur disque");
+            let disk_checksum = Sha384::digest(&disk).to_vec();
+            let embedded_checksum = Sha384::digest(m.sql.as_bytes()).to_vec();
+            assert_eq!(
+                disk_checksum, embedded_checksum,
+                "le fichier embarqué (include_str!) doit être byte-identique au fichier sur disque ({filename})"
+            );
+        }
+    }
+
+    /// Fidélité sqlx — une base sale (ligne `success = false`) refuse le démarrage.
+    #[tokio::test]
+    async fn migration_runner_refuses_dirty_base() {
+        let db = QueueDb::open_in_memory().await.expect("in-memory");
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE _sqlx_migrations (
+                    version BIGINT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    success BOOLEAN NOT NULL,
+                    checksum BLOB NOT NULL,
+                    execution_time BIGINT NOT NULL
+                );",
+            )?;
+            conn.execute(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+                 VALUES (?1, ?2, FALSE, x'00', -1)",
+                params![6i64, "apalis bootstrap"],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("fixture");
+
+        let err = run_migrations(&db).await.expect_err("base sale → refus");
+        assert!(
+            matches!(err, QueueError::Storage(_)),
+            "refus de démarrage attendu, obtenu : {err:?}"
+        );
+    }
+
+    /// Fidélité sqlx — une migration appliquée dont le fichier a changé (checksum différent)
+    /// refuse le démarrage : une migration appliquée est immuable.
+    #[tokio::test]
+    async fn migration_runner_refuses_modified_applied_migration() {
+        let db = QueueDb::open_in_memory().await.expect("in-memory");
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE _sqlx_migrations (
+                    version BIGINT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    success BOOLEAN NOT NULL,
+                    checksum BLOB NOT NULL,
+                    execution_time BIGINT NOT NULL
+                );",
+            )?;
+            conn.execute(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+                 VALUES (?1, ?2, TRUE, x'00', -1)",
+                params![6i64, "apalis bootstrap"],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("fixture");
+
+        let err = run_migrations(&db)
+            .await
+            .expect_err("checksum différent → refus");
+        assert!(
+            matches!(err, QueueError::Storage(_)),
+            "refus de démarrage attendu, obtenu : {err:?}"
+        );
+    }
+
+    // ── Preuve P0 (F-145 sous-lot 3) : format sérialisé des travaux intouché ────
+
+    /// 🔴 P0 — le format sérialisé de la charge utile des travaux NE DOIT PAS CHANGER.
+    ///
+    /// Le payload stocké dans `gradatum_jobs.payload` est `serde_json::to_string(&JobRecord)`
+    /// — indépendant du pilote SQLite (sqlx → rusqlite). Ce test fige le JSON exact d'un
+    /// JobRecord représentatif, puis prouve que `enqueue` écrit ce JSON VERBATIM dans la
+    /// colonne `payload` : le format est byte-identique à l'avant-port.
+    #[tokio::test]
+    async fn serialized_job_payload_format_is_pinned_and_stored_verbatim() {
+        let store = SqliteQueueStore::new(test_db().await);
+
+        let record = make_record(
+            Job::Curate(CurateSpec {
+                note_id: Ulid::generate(),
+                tenant_id: "main".to_string(),
+                ..Default::default()
+            }),
+            JobClass::Agent,
+            JobStatus::Pending,
+        );
+        let golden = SqliteQueueStore::serialize_record(&record).expect("sérialisation");
+
+        // Le JSON a la structure documentée : spec.kind taggé "type"/"data", lifecycle, retry.
+        let v: serde_json::Value = serde_json::from_str(&golden).expect("JSON valide");
+        assert_eq!(v["spec"]["kind"]["type"], "Curate", "tag serde(tag=type)");
+        assert!(
+            v["spec"]["kind"]["data"]["note_id"].is_string(),
+            "contenu data du variant Curate"
+        );
+        assert!(v["lifecycle"]["status"].is_string());
+        assert!(v["retry"]["max"].is_number());
+        assert!(v["id"].is_string());
+
+        let id = store.enqueue(record).await.expect("enqueue");
+
+        // Le payload en colonne est byte-identique au JSON produit par serialize_record :
+        // le pilote n'altère PAS le format — c'est la propriété qui a fait écarter une autre
+        // option d'architecture sur F-248.
+        let id_str = id.to_string();
+        let raw: String = store
+            .db()
+            .with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT payload FROM gradatum_jobs WHERE id = ?1",
+                    [&id_str],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("read payload");
+        assert_eq!(
+            raw, golden,
+            "le format sérialisé des travaux est intouché (F-145)"
         );
     }
 }

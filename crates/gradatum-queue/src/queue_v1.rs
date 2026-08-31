@@ -1,7 +1,7 @@
 //! [`LegacyQueue`] — SQLite-backed with atomic claim via `UPDATE…RETURNING`.
 //!
 //! Synchronous rusqlite implementation preserved for backward compatibility.
-//! For current code, use [`crate::SqliteQueue`] (sqlx-based, async).
+//! For current code, use [`crate::GradatumQueue`] (rusqlite-based, async, live `gradatum_jobs`).
 //!
 //! ## Guarantees
 //!
@@ -48,7 +48,7 @@ pub enum LegacyQueueError {
 /// Use [`LegacyQueue::open`] for a persistent database or
 /// [`LegacyQueue::open_in_memory`] for tests.
 ///
-/// Prefer [`crate::SqliteQueue`] (sqlx-based, async) for current code.
+/// Prefer [`crate::GradatumQueue`] (rusqlite-based, async) for current code.
 pub struct LegacyQueue {
     /// Single connection serialized by a tokio Mutex.
     /// Hold the lock for the shortest time possible (never across an `.await`).

@@ -936,7 +936,8 @@ fn init_sqlite_dbs(root: &Path) -> Result<()> {
     // --- api_keys.sqlite ---
     //
     // Initialized via rusqlite directly (consistent with the other DBs initialized in this
-    // sync function). The DB will be reopened by SqliteApiKeyStore via sqlx at runtime.
+    // sync function). The DB will be reopened by SqliteApiKeyStore via rusqlite at runtime,
+    // which then records the migration in `_sqlx_migrations` (honored, never replayed).
     // Schema identical to `gradatum-acl-auth/migrations/V0001__create_api_keys.sql`.
     let api_keys_path = root.join("db/api_keys.sqlite");
     let conn = Connection::open(&api_keys_path)

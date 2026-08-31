@@ -3,7 +3,7 @@
 //! **Vrai chemin, aucun mock** : HTTP → `auth_middleware` réel → handler → `vault_write_impl`
 //! / `create_feature_card_impl`, avec un **vrai `Vault`** (TempDir) — la carte existante est
 //! réellement écrite sur disque puis relue par la garde d'immuabilité via `read_note_by_id` —,
-//! une **vraie `SqliteQueue`** et un **vrai `SqliteQueueStore`** pour l'enqueue.
+//! un **vrai `SqliteQueueStore`** (file LIVE `gradatum_jobs`) pour l'enqueue.
 //!
 //! Le piège évité : un harnais sans vault réel lirait `NoteNotFound` sur toute cible, ce qui
 //! ferait passer une mise à jour préservant le rôle pour une création (identité vide) et la
@@ -62,11 +62,9 @@ fn feature_card_body(feature: &str) -> String {
 /// binding renvoyé.
 async fn start_server() -> (SocketAddr, Arc<Vault>, String, TempDir) {
     use axum::{Router, middleware, routing::get};
-    use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-    use gradatum_queue::SqliteQueue;
+    use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
     use gradatum_server::api_v1;
     use gradatum_server::state::AppState;
-    use sqlx::sqlite::SqlitePoolOptions;
 
     let dir = TempDir::new().expect("TempDir project_map_feature_identity_e2e");
     let vault = Arc::new(
@@ -75,14 +73,7 @@ async fn start_server() -> (SocketAddr, Arc<Vault>, String, TempDir) {
             .expect("Vault::create — invariant test"),
     );
 
-    let queue = Arc::new(
-        SqliteQueue::in_memory()
-            .await
-            .expect("SqliteQueue in-memory"),
-    );
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory");
     run_migrations(&jobs_pool).await.expect("migrations jobs");
@@ -90,7 +81,6 @@ async fn start_server() -> (SocketAddr, Arc<Vault>, String, TempDir) {
 
     let mut state = AppState::new()
         .with_vault_arc(Arc::clone(&vault) as Arc<dyn Registry>)
-        .with_queue(queue as Arc<dyn gradatum_queue::Queue>)
         .with_job_store(job_store as Arc<dyn QueueStore>, jobs_pool);
     state.acl = Arc::new(AclEngine::from_preset_str(ACL_ALLOW).expect("preset ACL valide"));
 

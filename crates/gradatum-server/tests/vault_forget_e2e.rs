@@ -52,8 +52,7 @@ write_patterns = ["main/*", "main/main"]
 /// Retourne `(Router, AppState, Arc<SqliteIndex>)`.
 async fn build_app() -> (Router, AppState, Arc<SqliteIndex>) {
     use gradatum_auth::jwt::JwtService;
-    use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-    use sqlx::sqlite::SqlitePoolOptions;
+    use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 
     let idx = Arc::new(
         SqliteIndex::open_in_memory()
@@ -61,9 +60,7 @@ async fn build_app() -> (Router, AppState, Arc<SqliteIndex>) {
             .expect("SqliteIndex::open_in_memory — vault_forget_e2e"),
     );
 
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory — vault_forget_e2e");
     run_migrations(&jobs_pool)

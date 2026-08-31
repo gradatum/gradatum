@@ -1,6 +1,5 @@
 ---
 source: crates/gradatum-server/tests/mcp_native.rs
-assertion_line: 726
 expression: schema_map
 ---
 {
@@ -381,7 +380,7 @@ expression: schema_map
         "type": "string"
       },
       "note_id": {
-        "description": "Note ULID.",
+        "description": "Note reference — bare ULID, prefixed `\"section/ULID\"` (the form `vault_search`\nreturns in its `path` field), exact note title, or redirect slug.\n\nResolved at parity with `vault_read`. A reference resolving to no note is a\n`400 Bad Request` naming the received value, never a `500`.",
         "type": "string"
       },
       "tenant_id": {
@@ -603,7 +602,7 @@ expression: schema_map
     "description": "Request body for `vault_history` — lists the copy-on-write snapshots of a note.\n\nReturns the Unix millisecond timestamps of snapshots stored in\n`.history/<note_id>/` for the note identified by `note_id`.",
     "properties": {
       "note_id": {
-        "description": "Note ULID (e.g. `\"01JTEXAMPLE\"`).",
+        "description": "Note reference — bare ULID, prefixed `\"section/ULID\"` (the form `vault_search`\nreturns in its `path` field), exact note title, or redirect slug.\n\nResolved at parity with `vault_read`. A reference resolving to no note is a\n`400 Bad Request` naming the received value, never a `500`.",
         "type": "string"
       },
       "tenant_id": {
@@ -623,7 +622,7 @@ expression: schema_map
     "description": "Request body for `vault_history_get` — reads a specific historical snapshot.\n\nReturns the note content at the time of snapshot `ts_ms`.\n`ts_ms` must be a timestamp obtained from `vault_history`.",
     "properties": {
       "note_id": {
-        "description": "Note ULID.",
+        "description": "Note reference — bare ULID, prefixed `\"section/ULID\"` (the form `vault_search`\nreturns in its `path` field), exact note title, or redirect slug.\n\nResolved at parity with `vault_read`. A reference resolving to no note is a\n`400 Bad Request` naming the received value, never a `500`.",
         "type": "string"
       },
       "tenant_id": {
@@ -770,6 +769,20 @@ expression: schema_map
           "null"
         ]
       },
+      "role_kind": {
+        "description": "Filter on the `kind` role of a project-map card (`FIX`, `FEATURE`,\n`ENHANCEMENT`, `TASK`). Absent or `null`: no filter — the routing to\n`list_notes` is unchanged. The value is the canonical SCREAMING_SNAKE wire form.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "role_status": {
+        "description": "Filter on the `status` role of a project-map card (`OPEN`, `IN_PROGRESS`, `BLOCKED`,\n`DONE`, `OBSOLETE`, `BRAINSTORMING`). Not to be confused with the note's lifecycle\nstatus (`live`, `downgraded`): two distinct notions, two distinct columns.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "section": {
         "description": "Section to list (optional — if absent, lists all sections).",
         "type": [
@@ -890,7 +903,7 @@ expression: schema_map
     "description": "Request body for `vault_restore` — restores a note from a snapshot.\n\nWrites snapshot `ts_ms` as the new current version.\nTriggers a copy-on-write (the previous current version is saved to `.history/`).\nReturns the SHA-256 hex hash of the restored version.",
     "properties": {
       "note_id": {
-        "description": "ULID of the note to restore.",
+        "description": "Note reference — bare ULID, prefixed `\"section/ULID\"` (the form `vault_search`\nreturns in its `path` field), exact note title, or redirect slug.\n\nResolved at parity with `vault_read`. A reference resolving to no note is a\n`400 Bad Request` naming the received value, never a `500`.",
         "type": "string"
       },
       "tenant_id": {
@@ -917,7 +930,7 @@ expression: schema_map
     "properties": {
       "compact": {
         "default": false,
-        "description": "If `true`, the server returns a **compact** rendering instead of the full\n`VaultSearchResponse`: an object `{ \"compact\": \"<text>\" }` where the text lists\neach hit as `<ulid> [<score>]` plus the `corpus_match_count` absence-proof hint.\n\nOptimises token cost for LLM consumers (the compaction is a product feature,\nnot transport). Preserves the lexical-absence reasoning: when\n`corpus_match_count == 0`, the rendering states the results are semantic\nneighbours only (absence proven).\n\nOpt-in (default `false`): when absent, the response is **byte-for-byte identical**\nto the historical `VaultSearchResponse`. Existing clients are unaffected.",
+        "description": "If `true`, the server returns a **compact** rendering instead of the full\n`VaultSearchResponse`: an object `{ \"compact\": \"<text>\" }` where the text lists\neach hit as `<ulid> [<score>]` plus the `corpus_match_count` absence-proof hint.\n\nOptimises token cost for LLM consumers (the compaction is a product feature,\nnot transport). Preserves the lexical-absence reasoning with the three-state\ndistinction of the `include_corpus_count` field: a proven *lexical* absence\n(which does not disprove the returned results) is rendered differently from a\ncount that is *not applicable* to a punctuation-only query.\n\nOpt-in (default `false`): when absent, the response is **byte-for-byte identical**\nto the historical `VaultSearchResponse`. Existing clients are unaffected.",
         "type": "boolean"
       },
       "from_ms": {
@@ -931,7 +944,7 @@ expression: schema_map
       },
       "include_corpus_count": {
         "default": false,
-        "description": "If `true`, includes in the response the total count of notes matching\nthe **FTS5/BM25 lexical** query within the filtered scope, unbounded by K.\n\nAllows distinguishing \"topic absent from the corpus\" (`corpus_match_count == 0`)\nfrom \"notes present but ranked below K\" (`corpus_match_count > len(results)`).\n\nDoes NOT indicate semantic ANN hit count.\nOpt-in (default `false`): zero overhead when absent — no COUNT is executed.",
+        "description": "If `true`, includes in the response the total count of notes matching\nthe **FTS5/BM25 lexical** query within the filtered scope, unbounded by K.\n\nThe count distinguishes three states (surfaced verbatim in the compact hint):\n\n1. `corpus_match_count > 0` — lexical matches exist (some may rank below K).\n2. `corpus_match_count == 0` on a query whose form **could** match — the\n   *lexical* absence of the term in the filtered surface is proven. This is\n   scoped to the lexical arm only and does **not** disprove the semantic\n   relevance of the results that were returned.\n3. `corpus_match_count == 0` on a query whose form **cannot** match (a\n   punctuation-only query, see the `query` field) — the count is *not\n   applicable* to the query form; the zero is an artefact of the query, not a\n   corpus property, and is never a proven absence.\n\nDoes NOT indicate semantic ANN hit count.\nOpt-in (default `false`): zero overhead when absent — no COUNT is executed.",
         "type": "boolean"
       },
       "include_downgraded": {
@@ -961,7 +974,7 @@ expression: schema_map
         ]
       },
       "query": {
-        "description": "Full-text or semantic search query.",
+        "description": "Full-text or semantic search query.\n\n## FTS5 operators are NOT interpreted (known, accepted degradation)\n\nThe lexical arm quotes each token individually before handing it to FTS5.\nAs a result the FTS5 operators `OR`, `NOT` and `NEAR` are **not** parsed as\noperators — they are searched as the literal words `or`, `not`, `near`.\nWriting `a OR b` therefore matches an implicit AND of the three terms\n`a`, `or`, `b`, not a boolean disjunction. No FTS5 query parser is in scope;\nthis behaviour is deliberate and stable, not a bug.\n\n## Punctuation-only queries cannot match lexically\n\nA query made solely of punctuation, symbols or whitespace (e.g. `-`, `...`,\n`- -`) has every token normalise to empty under the `unicode61` tokenizer.\nThe resulting FTS5 query is syntactically valid but can match no document,\nwhatever the corpus. For such a query, `corpus_match_count == 0` is reported\nas *not applicable to the query form* — never as a proven absence.",
         "type": "string"
       },
       "section": {
@@ -1010,7 +1023,21 @@ expression: schema_map
     "type": "object"
   },
   "vault_tags": {
-    "properties": {},
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request body for `vault_tags`.\n\nWithout a bound, `vault_tags` returns the full tag list of the vault — up to\n~135 KB in a single response, enough to saturate the context budget of agent\ncallers. This structure makes the response **bounded by default** and lets the\ncaller lift the bound **explicitly** via [`limit`](Self::limit).\n\nAll fields are optional: an absent body (or `{}`) produces the default bounded\nresponse — the addition is therefore strictly additive (no existing caller is\nbroken).\n\n`vault_tags` is an **own-vault** READ (the effective vault is derived from the\ncredential, never from a parameter): it therefore exposes **no** `tenant_id`,\nunlike the other read requests (a deliberate parity with the former\nparameter-less contract — see `authors_tags_tenant_scope`).",
+    "properties": {
+      "limit": {
+        "description": "Maximum number of tags returned, **most frequent first**.\n\n`None` (default) → server bound (`DEFAULT_TAGS_LIMIT`). Setting an explicit\nvalue lifts the bound — passing a very large value returns the full list. The\n`total` field of the response reports how many tags exist in all, which lets a\ncaller detect truncation.",
+        "format": "uint",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "title": "VaultTagsRequest",
     "type": "object"
   },
   "vault_timeline": {

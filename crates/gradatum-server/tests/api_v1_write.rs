@@ -82,29 +82,17 @@ async fn start_write_test_server() -> SocketAddr {
         next.run(req).await
     }
 
-    use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-    use gradatum_queue::SqliteQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
     use std::sync::Arc;
 
     let jwt = JwtService::new_ephemeral();
     let acl = AclEngine::from_preset_str(TEST_ACL_PRESET)
         .expect("preset ACL de test valide — invariant statique");
 
-    // Injecter une SqliteQueue in-memory réelle — nécessaire depuis P2.1 Task 6 :
-    // get_job interroge queue.get(id) et retourne 404 si le job n'existe pas
-    // (PlaceholderQueue retourne toujours Ok(None) → 404 sur poll).
-    let queue = Arc::new(
-        SqliteQueue::in_memory()
-            .await
-            .expect("SqliteQueue::in_memory() — invariant test"),
-    );
-
     // Phase 1.2 : vault_write utilise state.job_store (gradatum_jobs) — câbler un
     // SqliteQueueStore in-memory pour que les tests de write retournent 202 (pas 500).
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    // La queue legacy `jobs_v2` est supprimée (F-177) — plus d'injection legacy.
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory — invariant test");
     run_migrations(&jobs_pool)
@@ -113,7 +101,6 @@ async fn start_write_test_server() -> SocketAddr {
     let job_store = Arc::new(SqliteQueueStore::new(jobs_pool.clone()));
 
     let state = AppState::with_jwt_and_acl(jwt, acl)
-        .with_queue(queue as Arc<dyn gradatum_queue::Queue>)
         .with_job_store(job_store as Arc<dyn gradatum_core::QueueStore>, jobs_pool);
 
     let app = Router::new()
@@ -269,12 +256,11 @@ async fn vault_write_ignores_x_gradatum_wait_header() {
     );
 }
 
-// ── Test 4 : GET /api/v1/jobs/<id> → 200 + statut JSON ───────────────────────
+// ── Test 4 : GET <poll_url> (/api/v1/jobs/{ulid}/v2) → 200 + JobRecord ───────
 
-/// `GET /api/v1/jobs/<id>` → 200 OK + JSON JobStatusResponse.
+/// `GET <poll_url>` → 200 OK + JSON JobRecord (`get_job_v2`).
 ///
-/// Vérifie la structure de la réponse de poll jobs.
-/// En T3 (stub), retourne toujours `status: "pending"`.
+/// Vérifie la structure de la réponse de poll jobs depuis `vault_write`.
 #[tokio::test]
 async fn jobs_poll_returns_status() {
     let addr = start_write_test_server().await;

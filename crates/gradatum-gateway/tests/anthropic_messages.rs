@@ -514,6 +514,75 @@ async fn multi_turn_conversation_forwarded() {
     assert_eq!(body["content"][0]["text"], "Madrid.");
 }
 
+/// F-170 — un message de rôle `system` DANS le tableau `messages` est forwardé
+/// au backend en conservant le rôle `system`, pas rétrogradé en `user`.
+///
+/// Preuve sur la requête RÉELLE reçue par le backend (pas seulement le test
+/// unitaire) : le corps forwardé doit contenir un message `role:"system"` portant
+/// le contenu de cadrage. Domaine isolé : `req.system` (paramètre top-level) est
+/// absent, donc la seule source possible d'un `role:"system"` forwardé est le
+/// message du tableau — ce qui exerce la règle F-170 seule.
+#[tokio::test]
+async fn system_role_message_in_array_forwarded_as_system() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_response("ok")))
+        .expect(1)
+        .mount(&backend)
+        .await;
+
+    let config = test_config_with_default_alias(&backend.uri());
+    let state = AppState::for_test(config);
+    let app = build_router(state);
+
+    // Pas de `system` top-level : le rôle system ne peut venir que du tableau.
+    let req_body = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 256,
+        "messages": [
+            {"role": "system", "content": "Tu ne réponds qu'en JSON."},
+            {"role": "user", "content": "Bonjour"}
+        ]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Inspection du corps réellement forwardé au backend.
+    let received = backend
+        .received_requests()
+        .await
+        .expect("wiremock enregistre les requêtes reçues");
+    assert_eq!(received.len(), 1, "une requête forwardée au backend");
+    let forwarded: Value = serde_json::from_slice(&received[0].body).unwrap();
+    let messages = forwarded["messages"]
+        .as_array()
+        .expect("messages[] présent dans le corps forwardé");
+
+    let roles: Vec<&str> = messages.iter().filter_map(|m| m["role"].as_str()).collect();
+    assert!(
+        roles.contains(&"system"),
+        "le rôle system doit être préservé dans le corps forwardé, obtenu: {roles:?}"
+    );
+
+    let system_msg = messages
+        .iter()
+        .find(|m| m["role"] == "system")
+        .expect("un message system dans le corps forwardé");
+    assert_eq!(
+        system_msg["content"], "Tu ne réponds qu'en JSON.",
+        "le contenu de cadrage doit être porté par le message system"
+    );
+}
+
 /// I7 — [Slice B] Requête avec tools + backend retournant tool_calls → ResponseBlock::ToolUse.
 ///
 /// Vérifie le round-trip complet :

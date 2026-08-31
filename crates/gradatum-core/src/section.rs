@@ -1,4 +1,4 @@
-//! The 13 canonical sections of Gradatum.
+//! The 14 canonical sections of Gradatum.
 //!
 //! These sections form the semantic hierarchy of the store. Each note is assigned
 //! to exactly one section. The set is stable: adding a section requires updating
@@ -8,17 +8,20 @@
 //! The `ProjectMap` variant (12th) tracks traceable work units carrying a
 //! typed-wikilink schema (`[[project:…]]` + `[[status:…]]` + `[[kind:…]]`).
 //! The `Identity` variant (13th) stores agent soul notes (persona/governance).
+//! The `Snapshot` variant (14th) stores raw session event-capture lines.
 
 use serde::{Deserialize, Serialize};
 
 /// Canonical section of a Gradatum note.
 ///
-/// 13 fixed sections representing the semantic categories of the knowledge store.
+/// 14 fixed sections representing the semantic categories of the knowledge store.
 /// Serialised as `kebab-case` in YAML frontmatters and APIs.
 ///
-// Extension requires a governance review (anti-incremental-drift).
+// Extension remains subject to a project-side governance review, but no longer
+// breaks downstream consumers (`#[non_exhaustive]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum Section {
     /// Architectural decisions, trade-offs, and technical choices.
     Decisions,
@@ -55,7 +58,8 @@ pub enum Section {
     /// (source of truth for versions/todos) and are protected from semantic
     /// forget (see [`Section::PROTECTED_FORGET`]).
     ///
-    // Extension requires a governance review (anti-incremental-drift).
+    // Extension remains subject to a project-side governance review, but no longer
+    // breaks downstream consumers.
     ProjectMap,
     /// Identity: declarative agent soul (persona/governance) — soul notes.
     ///
@@ -63,8 +67,17 @@ pub enum Section {
     /// schema), and are protected from semantic forget (see [`Section::PROTECTED_FORGET`]).
     /// Write access is ACL-restricted: an agent may only write its own soul note.
     ///
-    // Extension requires a governance review (anti-incremental-drift).
+    // Extension remains subject to a project-side governance review, but no longer
+    // breaks downstream consumers.
     Identity,
+    /// Snapshot: raw session event-capture lines, written without interpretation,
+    /// destined for downstream processing by distillation.
+    ///
+    /// Excluded from the default search scope (see [`Section::DEFAULT_SEARCH_EXCLUDED`]).
+    ///
+    // Extension remains subject to a project-side governance review, but no longer
+    // breaks downstream consumers.
+    Snapshot,
 }
 
 impl Section {
@@ -115,6 +128,18 @@ impl Section {
         Section::Reasoning,
     ];
 
+    /// Sections excluded from the **default** search scope.
+    ///
+    /// Notes in these sections carry raw, uninterpreted material that search
+    /// should not surface unless explicitly requested. This constant is the
+    /// inventory only — applying it to the search paths is a separate piece.
+    ///
+    /// # Invariant
+    ///
+    /// `Snapshot` alone is excluded by default; any future raw-capture section
+    /// must be added here.
+    pub const DEFAULT_SEARCH_EXCLUDED: &'static [Section] = &[Section::Snapshot];
+
     /// Returns `true` if `name` (kebab-case section) can never be hard-deleted.
     ///
     /// Single source of truth for the [`Section::PROTECTED_DELETE`] membership
@@ -149,8 +174,9 @@ impl Section {
 
     /// All canonical sections, in declaration order.
     ///
-    // Extension requires a governance review (anti-incremental-drift).
-    pub const ALL: [Section; 13] = [
+    // Extension remains subject to a project-side governance review, but no longer
+    // breaks downstream consumers.
+    pub const ALL: [Section; 14] = [
         Section::Decisions,
         Section::Architecture,
         Section::Debug,
@@ -164,6 +190,7 @@ impl Section {
         Section::Council,
         Section::ProjectMap,
         Section::Identity,
+        Section::Snapshot,
     ];
 
     /// Parse a kebab-case string into a `Section`.
@@ -204,6 +231,7 @@ impl Section {
             Section::Council => "council",
             Section::ProjectMap => "project-map",
             Section::Identity => "identity",
+            Section::Snapshot => "snapshot",
         }
     }
 }
@@ -228,13 +256,13 @@ pub fn is_protected_downgrade(section: &str) -> bool {
 // These functions capture CoALA metadata without modifying any search/scoring
 // behaviour (composite α/β unchanged).
 //
-// The SQL backfill (migrations 0008 + 0011 + 0021) MUST produce the same values
-// for all 12 enum sections — see tests `c_kind_matches_backfill_sql` below.
+// The SQL backfill (migrations 0008 + 0011 + 0021 + 0024) MUST produce the same values
+// for all 14 enum sections — see tests `c_kind_matches_backfill_sql` below.
 
 /// Deterministic CoALA cognitive category (4 categories) derived from section.
 ///
 /// Returns `"episodic"`, `"semantic"`, `"procedural"`, or `"reflective"`.
-/// The match is exhaustive over all 13 [`Section`] variants — there is no runtime
+/// The match is exhaustive over all 14 [`Section`] variants — there is no runtime
 /// fallback. Adding a new variant requires updating this function (the compiler
 /// will enforce it via an exhaustiveness error).
 ///
@@ -259,6 +287,8 @@ pub const fn section_to_c_kind(section: &Section) -> &'static str {
         Section::ProjectMap => "procedural",
         // Identity : gouvernance/comportement agent → procedural (F-34 v0.7.6)
         Section::Identity => "procedural",
+        // Snapshot : lignes de capture d'événements de session, datées → episodic (F-246)
+        Section::Snapshot => "episodic",
     }
 }
 
@@ -266,7 +296,7 @@ pub const fn section_to_c_kind(section: &Section) -> &'static str {
 ///
 /// Returns `"Event"` (dated incident, point in time) or `"Static"`
 /// (stable knowledge, durable reference).
-/// The match is exhaustive over all 13 [`Section`] variants — there is no runtime
+/// The match is exhaustive over all 14 [`Section`] variants — there is no runtime
 /// fallback. Adding a new variant requires updating this function (the compiler
 /// will enforce it via an exhaustiveness error).
 ///
@@ -277,6 +307,8 @@ pub const fn section_to_doc_kind(section: &Section) -> &'static str {
     match section {
         Section::Debug => "Event",
         Section::AgentIssues => "Event",
+        // Snapshot : lignes de capture d'événements de session, datées → Event (F-246)
+        Section::Snapshot => "Event",
         // Toutes les autres sections : connaissance stable
         // ProjectMap : entité mutée par RMW (carte = work-status piloté), pas
         // un événement immuable → Static (spec §16 B1).
@@ -296,11 +328,132 @@ pub const fn section_to_doc_kind(section: &Section) -> &'static str {
     }
 }
 
+/// Base per-section trust score — authority of the content, independent of age.
+///
+/// The trust factor of the composite score (`1 + γ·trust_decayed`) was strictly neutral
+/// over the whole corpus (12,450 notes, a single value 0.5). The chosen design is to
+/// **feed** the factor using the section as the base-value axis. Each value is justified
+/// by the repo's documented semantics — never by analogy or a plausible default:
+///
+/// - **TIER A — decision & governance (0.95)**: `council` ("multi-expert governance
+///   verdicts and arbitrations", `Section::Council`) · `decisions` ("architectural decisions,
+///   trade-offs, and technical choices", target of `gov-save-decision`, `PROTECTED_DELETE`) ·
+///   `project-map` ("source of truth for versions/todos", `Section::ProjectMap`,
+///   `PROTECTED_FORGET`) · `identity` ("declarative agent soul", `Section::Identity`,
+///   `PROTECTED_FORGET`). Content that DECIDES or GOVERNS the system — the top level of the
+///   repo's already-calibrated, documented trust scale (`human-decision` = 0.95,
+///   `provenance.rs`).
+/// - **TIER B — durable memory (0.75)**: `lessons-learned`, `architecture`,
+///   `retrospectives`, `feedback` (all in `PROTECTED_DOWNGRADE`: "durable-memory sections
+///   that must never lose trust just because they went quiet") + `reasoning` (ReasoningBank,
+///   `PROTECTED_DELETE`). Codified durable knowledge — the "interaction-validated event" level
+///   of the documented scale (`qa-event` = 0.75).
+/// - **TIER C — referenced records (0.60)**: `reference` ("stable fact, purely
+///   informational, no narrative", curator-classifier v1) · `agent-issues` ("tracked issue
+///   about agent behaviour", `Section::AgentIssues`, forget-protected but operational).
+///   Records rather than decisions — the synthesis level (`distilled` = 0.60).
+/// - **TIER D — raw material (0.40)**: `debug` ("post-mortems, root-cause analysis",
+///   dated) · `experiments` ("prototypes, proofs of concept", exploratory). No protection
+///   scope. Below the neutral 0.50 — the least authoritative content.
+/// - **Unknown (0.50)**: any off-canon section falls back to 0.50, the corpus's current
+///   neutral — consistent with the repo's default for unknown provenance (`agent-log` 0.50).
+///
+/// The decay axis (`doc_kind`, `Event` vs `Static`) is handled separately by
+/// [`section_str_to_doc_kind`] and the half-lives table in `gradatum-search`.
+pub const SECTION_TRUST_SCORES: &[(&str, f64)] = &[
+    // PALIER A — décision & gouvernance
+    ("council", 0.95),
+    ("decisions", 0.95),
+    ("project-map", 0.95),
+    ("identity", 0.95),
+    // PALIER B — mémoire durable
+    ("lessons-learned", 0.75),
+    ("architecture", 0.75),
+    ("retrospectives", 0.75),
+    ("feedback", 0.75),
+    ("reasoning", 0.75),
+    // PALIER C — enregistrements référencés
+    ("reference", 0.60),
+    ("agent-issues", 0.60),
+    // PALIER D — matière première
+    ("debug", 0.40),
+    ("experiments", 0.40),
+];
+
+/// Sections whose trust **never** decays — tier A of [`SECTION_TRUST_SCORES`].
+///
+/// Doctrine of this vault: **an enacted decision is not re-judged** — an act (a `council`
+/// governance verdict, a `decisions` decision, a `project-map` work unit, a declarative
+/// `identity` soul) does not lose its authority as it ages.
+///
+/// The exemption applies to the **section**, not to `doc_kind`: on the measured corpus
+/// (vault `main`, 13 sections), `doc_kind` is a deterministic function of `section` — it is
+/// not a second independent lever. `council` stays `Event` (CoALA temporal axis: a dated
+/// one-off verdict) but does not decay — two distinct concepts.
+pub const TRUST_NON_DECAYING_SECTIONS: &[&str] =
+    &["council", "decisions", "project-map", "identity"];
+
+/// `true` if the section (kebab-case) is exempt from trust-factor decay.
+///
+/// Tier A of [`SECTION_TRUST_SCORES`] — see [`TRUST_NON_DECAYING_SECTIONS`] for the doctrine.
+/// An unknown section → `false` (falls back to the `doc_kind` axis).
+#[must_use]
+pub fn is_trust_non_decaying(section: &str) -> bool {
+    TRUST_NON_DECAYING_SECTIONS.contains(&section)
+}
+
+/// Base trust score of a canonical section, `0.5` (neutral) for an unknown section.
+///
+/// Derives the base trust-factor value from the section — see
+/// [`SECTION_TRUST_SCORES`] for the justification of each value.
+#[must_use]
+pub const fn trust_for_section(section: &Section) -> f64 {
+    match section {
+        Section::Council | Section::Decisions | Section::ProjectMap | Section::Identity => 0.95,
+        Section::LessonsLearned
+        | Section::Architecture
+        | Section::Retrospectives
+        | Section::Feedback
+        | Section::Reasoning => 0.75,
+        Section::Reference | Section::AgentIssues => 0.60,
+        Section::Debug | Section::Experiments => 0.40,
+        // Snapshot : matière première brute (lignes de capture non interprétées) → palier D (F-246)
+        Section::Snapshot => 0.40,
+    }
+}
+
+/// Base trust score of a section by its kebab-case name, `0.5` (neutral) if unknown.
+///
+/// Entry point for the scoring paths that carry only a section string (`hit.section`).
+/// An off-canon section (e.g. `"notes"` from the synthetic corpus, or the 21 real vault
+/// sections, 8 of which are outside the enum) falls back to the neutral 0.50.
+#[must_use]
+pub fn trust_for_section_str(section: &str) -> f64 {
+    match Section::from_canonical_str(section) {
+        Some(s) => trust_for_section(&s),
+        None => 0.50,
+    }
+}
+
+/// `doc_kind` (CoALA temporal axis) derived from a section by its kebab-case name.
+///
+/// The trust-factor decay axis is `doc_kind` — `Event` decays, `Static` does not.
+/// Delegates to [`section_to_doc_kind`] for canonical sections; an unknown section falls
+/// back to `"Static"` (non-perishable), consistent with the repo's SQL default
+/// (`COALESCE(n.doc_kind, 'Static')`, `queries.rs`).
+#[must_use]
+pub fn section_str_to_doc_kind(section: &str) -> &'static str {
+    match Section::from_canonical_str(section) {
+        Some(s) => section_to_doc_kind(&s),
+        None => "Static",
+    }
+}
+
 #[cfg(test)]
 mod from_canonical_str_tests {
     use super::*;
 
-    /// Toutes les 13 sections sont reconnues par from_canonical_str.
+    /// Toutes les 14 sections sont reconnues par from_canonical_str.
     #[test]
     fn accepts_all_canonical_sections() {
         for section in Section::ALL {
@@ -375,8 +528,8 @@ mod from_canonical_str_tests {
             Some(Section::Identity)
         );
         assert_eq!(Section::Identity.as_str(), "identity");
-        // 13 canonical sections total.
-        assert_eq!(Section::ALL.len(), 13);
+        // 14 canonical sections total.
+        assert_eq!(Section::ALL.len(), 14);
         // doc_kind = "Static" (âme stable, mutée par RMW — A4 F-34).
         assert_eq!(section_to_doc_kind(&Section::Identity), "Static");
         // c_kind = "procedural" (gouvernance/comportement — F-34 v0.7.3).
@@ -432,6 +585,23 @@ mod from_canonical_str_tests {
         assert!(!Section::is_protected_delete("bogus-section"));
     }
 
+    /// F-246 — l'inventaire `DEFAULT_SEARCH_EXCLUDED` contient exactement `Snapshot`.
+    ///
+    /// Seule la section de capture brute est hors périmètre de recherche par défaut ;
+    /// aucune autre section canonique n'y figure.
+    #[test]
+    fn default_search_excluded_exact_perimeter() {
+        assert!(Section::DEFAULT_SEARCH_EXCLUDED.contains(&Section::Snapshot));
+        assert_eq!(Section::DEFAULT_SEARCH_EXCLUDED.len(), 1);
+        for sec in Section::ALL {
+            assert_eq!(
+                Section::DEFAULT_SEARCH_EXCLUDED.contains(&sec),
+                sec == Section::Snapshot,
+                "section {sec} incohérente avec DEFAULT_SEARCH_EXCLUDED"
+            );
+        }
+    }
+
     // F-111 : protégées = 4 PROTECTED_FORGET + 4 mémoire durable + architecture (GO du mainteneur 2026-07-16)
     #[test]
     fn protected_downgrade_covers_forget_set_plus_durable_memory() {
@@ -463,7 +633,7 @@ mod from_canonical_str_tests {
 mod cognitive_kind_tests {
     use super::*;
 
-    /// Vérifie que section_to_c_kind produit les valeurs attendues pour les 13 sections.
+    /// Vérifie que section_to_c_kind produit les valeurs attendues pour les 14 sections.
     #[test]
     fn c_kind_all_sections() {
         let cases = [
@@ -480,6 +650,7 @@ mod cognitive_kind_tests {
             (Section::Council, "episodic"),
             (Section::ProjectMap, "procedural"),
             (Section::Identity, "procedural"),
+            (Section::Snapshot, "episodic"),
         ];
         for (section, expected) in cases {
             assert_eq!(
@@ -490,7 +661,7 @@ mod cognitive_kind_tests {
         }
     }
 
-    /// Vérifie que section_to_doc_kind produit les valeurs attendues pour les 13 sections.
+    /// Vérifie que section_to_doc_kind produit les valeurs attendues pour les 14 sections.
     #[test]
     fn doc_kind_all_sections() {
         let cases = [
@@ -507,6 +678,7 @@ mod cognitive_kind_tests {
             (Section::Council, "Event"),
             (Section::ProjectMap, "Static"),
             (Section::Identity, "Static"),
+            (Section::Snapshot, "Event"),
         ];
         for (section, expected) in cases {
             assert_eq!(
@@ -563,11 +735,12 @@ mod cognitive_kind_tests {
         );
     }
 
-    /// Verifies consistency between the Rust constants and the SQL backfill (migrations 0008 + 0011).
+    /// Verifies consistency between the Rust constants and the SQL backfill (migrations 0008 + 0011 + 0021 + 0024).
     ///
     /// The SQL backfill uses a CASE expression on the `section` column (string).
     /// This test simulates the SQL CASE and compares the result with the Rust constants
-    /// for all enum sections (the 13 canonical ones, including `Identity` added in v0.7.3).
+    /// for all enum sections (the 14 canonical ones, including `Identity` added in v0.7.3
+    /// and `Snapshot` added in F-246).
     /// Any mismatch means existing DB rows will have different values than new rows
     /// written via `upsert_note`.
     #[test]
@@ -594,6 +767,9 @@ mod cognitive_kind_tests {
                 "project-map" => "procedural",
                 // identity → procedural (migration 0024, F-34 v0.7.3)
                 "identity" => "procedural",
+                // snapshot → episodic (pas encore de migration SQL dédiée — mapping
+                // cible F-246, à refléter dans le futur backfill).
+                "snapshot" => "episodic",
                 _ => "semantic",
             }
         }
@@ -605,6 +781,8 @@ mod cognitive_kind_tests {
                 "debug" => "Event",
                 "agent-issues" => "Event",
                 "council" => "Event",
+                // snapshot → Event (lignes de capture datées — F-246)
+                "snapshot" => "Event",
                 "project-map" => "Static",
                 _ => "Static",
             }
@@ -625,6 +803,115 @@ mod cognitive_kind_tests {
                 "DIVERGENCE doc_kind pour section '{s}' : Rust={} SQL={}",
                 section_to_doc_kind(&section),
                 sql_doc_kind(s),
+            );
+        }
+    }
+
+    /// F-261 — les 14 sections canoniques ont toutes une valeur de confiance définie,
+    /// dans [0, 1], et l'ordre des paliers est strictement décroissant du palier A au D.
+    #[test]
+    fn trust_for_section_all_sections_in_zero_one() {
+        for section in Section::ALL {
+            let t = trust_for_section(&section);
+            assert!(
+                (0.0..=1.0).contains(&t),
+                "trust_for_section({section}) = {t} hors [0,1]"
+            );
+        }
+        // Paliers : A > B > C > D (autorité strictement décroissante).
+        let tier_a = ["council", "decisions", "project-map", "identity"];
+        let tier_b = [
+            "lessons-learned",
+            "architecture",
+            "retrospectives",
+            "feedback",
+            "reasoning",
+        ];
+        let tier_c = ["reference", "agent-issues"];
+        let tier_d = ["debug", "experiments"];
+        let val = |s: &str| trust_for_section_str(s);
+        for a in tier_a {
+            for b in tier_b {
+                assert!(val(a) > val(b), "{a} ({}) doit > {b} ({})", val(a), val(b));
+            }
+        }
+        for b in tier_b {
+            for c in tier_c {
+                assert!(val(b) > val(c), "{b} ({}) doit > {c} ({})", val(b), val(c));
+            }
+        }
+        for c in tier_c {
+            for d in tier_d {
+                assert!(val(c) > val(d), "{c} ({}) doit > {d} ({})", val(c), val(d));
+            }
+        }
+        // Aucune valeur ne retombe sur le neutre 0.5 (les paliers sont tous décalés).
+        for s in tier_a
+            .iter()
+            .chain(tier_b.iter())
+            .chain(tier_c.iter())
+            .chain(tier_d.iter())
+        {
+            assert_ne!(val(s), 0.5, "{s} ne doit pas retomber sur le neutre 0.5");
+        }
+    }
+
+    /// F-261 — section inconnue (hors canon, ex. `"notes"`) → neutre 0.5 et doc_kind "Static".
+    #[test]
+    fn trust_for_section_unknown_falls_back_to_neutral() {
+        assert_eq!(trust_for_section_str("notes"), 0.5);
+        assert_eq!(trust_for_section_str(""), 0.5);
+        assert_eq!(trust_for_section_str("bogus-section"), 0.5);
+        assert_eq!(section_str_to_doc_kind("notes"), "Static");
+        assert_eq!(section_str_to_doc_kind(""), "Static");
+    }
+
+    /// F-261 — section_str_to_doc_kind est cohérente avec section_to_doc_kind sur les 14 sections.
+    #[test]
+    fn section_str_to_doc_kind_matches_typed() {
+        for section in Section::ALL {
+            assert_eq!(
+                section_str_to_doc_kind(section.as_str()),
+                section_to_doc_kind(&section),
+                "section_str_to_doc_kind({section}) doit égaler section_to_doc_kind"
+            );
+        }
+    }
+
+    /// F-261 (2026-08-25) — l'exemption de décroissance couvre **exactement** le palier A.
+    ///
+    /// `council`, `decisions`, `project-map`, `identity` (0.95) ne décroissent jamais ;
+    /// toute autre section — y compris `Event` hors palier A (`debug`, `agent-issues`) —
+    /// n'est pas exemptée. Invariant : exemption ⇔ trust == 0.95 (palier A).
+    #[test]
+    fn trust_non_decaying_is_exactly_tier_a() {
+        for s in ["council", "decisions", "project-map", "identity"] {
+            assert!(
+                is_trust_non_decaying(s),
+                "{s} doit être exempté de décroissance"
+            );
+            assert_eq!(
+                trust_for_section_str(s),
+                0.95,
+                "{s} doit être palier A (0.95)"
+            );
+        }
+        for s in [
+            "debug",
+            "agent-issues",
+            "reference",
+            "architecture",
+            "notes",
+            "",
+        ] {
+            assert!(!is_trust_non_decaying(s), "{s} ne doit pas être exempté");
+        }
+        for section in Section::ALL {
+            let name = section.as_str();
+            assert_eq!(
+                is_trust_non_decaying(name),
+                trust_for_section(&section) == 0.95,
+                "exemption doit coïncider avec le palier A pour {name}"
             );
         }
     }

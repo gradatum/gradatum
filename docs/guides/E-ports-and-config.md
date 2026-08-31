@@ -54,7 +54,9 @@ separator (`Env::prefixed("GRADATUM_").split("__")`), so the variable name mirro
 
 `gradatum-gateway` and `gradatum-engine` are separate binaries with their own config files;
 `gradatum-engine` reads its config path as a **positional** argument
-(`gradatum-engine <config-path>`), and layers env under the `GRADATUM_ENGINE_` prefix.
+(`gradatum-engine <config-path>`) and takes **no** environment override — its TOML file is
+its only configuration source (F-190). The `GRADATUM_ENGINE_` prefix names one thing only,
+the event-log credential `GRADATUM_ENGINE_API_KEY`.
 Full `[engine]` field reference: [docs/DEPLOYMENT.md §4](../DEPLOYMENT.md#4-configuration-reference).
 
 **Bind safety (`gradatum-server`):** two fail-closed guards, both detailed in

@@ -6,19 +6,20 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "SQLite queue store: SqliteQueueStore — Apalis-backed async job queue for gradatum"
+description = "SQLite queue store: SqliteQueueStore — rusqlite QueueStore implementation (WAL, atomic leases)"
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "2.0.0" }
+gradatum-core = { path = "../gradatum-core", version = "2.1.0" }
 
 async-trait   = { workspace = true }
 chrono        = { workspace = true }
+rusqlite      = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
-sqlx          = { workspace = true, features = ["sqlite", "runtime-tokio", "macros", "chrono"] }
+sha2          = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { workspace = true }
 tracing       = { workspace = true }

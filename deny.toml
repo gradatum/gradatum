@@ -88,30 +88,39 @@ ignore = [
 #
 # DÉLIBÉRÉMENT ABSENT de la liste `ignore` ci-dessus. Ce n'est pas un oubli.
 #
-# Chemins (re-mesurés `cargo audit`, 2026-07-31 — post bump opendal 0.51.0 -> 0.58.1) :
-#   rsa 0.9.10 → sqlx-mysql 0.8.6 → sqlx-macros-core → sqlx-macros → sqlx 0.8.6 → 8 crates du workspace
+# Chemin résiduel (re-mesuré `cargo tree --all-features -i rsa`, 2026-08-29) :
 #   rsa 0.9.10 → reqsign-google 3.0.3 / reqsign-core 3.2.0 / reqsign-azure-storage 3.1.1
-#              → opendal-service-{gcs,s3,azblob} 0.58.1 → opendal 0.58.1 → gradatum-storage
-#   (l'ancien libellé « reqsign 0.16.5 → opendal 0.51.0 » est PÉRIMÉ : reqsign monolithique a
-#    disparu avec le bump ; il est éclaté en reqsign-core + reqsign-{google,aws-v4,azure-storage,
-#    file-read-tokio}, dont trois — google, core, azure-storage — déclarent rsa en dépendance.)
+#              → opendal-service-{gcs,azblob} 0.58.1 → opendal 0.58.1 → gradatum-storage
+#   Le backend `s3` n'est PAS concerné : `opendal-service-s3` ne tire que reqsign-aws-v4 +
+#   reqsign-core, sans activer la dépendance `rsa` de ce dernier — une feature optionnelle
+#   de reqsign-core, tirée seulement par les backends `gcs`/`azure`.
+#   (L'ancien second chemin — rsa → sqlx-mysql → sqlx-macros-core → sqlx-macros → sqlx 0.8.6
+#    → 8 crates du workspace — est PÉRIMÉ : `sqlx` est sorti du graphe résolu dans son
+#    ensemble le 2026-08-25 (montée rusqlite =0.40.2, cf. Cargo.toml) ; il n'y a plus de
+#    chemin sqlx à invalider, il n'y a plus de sqlx du tout.)
 #
-# Motif d'inatteignabilité — les DEUX chemins passent par une feature non sélectionnée :
-# `sqlx` est tiré avec le driver sqlite seul (jamais `mysql`), et `reqsign` n'arrive que par
-# les features cloud d'opendal. `cargo tree -i rsa@0.9.10 --target all` rend « nothing to
-# print » : la crate n'est dans AUCUN graphe résolu, toutes cibles et tous types d'arêtes
-# confondus. Elle n'existe que comme ligne de Cargo.lock, que `cargo audit` scanne à plat.
+# Motif d'inatteignabilité — le chemin restant passe par une feature non sélectionnée :
+# `reqsign-core` est tiré inconditionnellement par `opendal-core` (présent même en
+# configuration `fs`-only par défaut), mais sa dépendance optionnelle vers `rsa` n'est
+# activée que par les backends `gcs`/`azure` d'opendal, jamais compilés par défaut ni par
+# la CI (`cargo deny check`, sans `--all-features`). `cargo tree -i rsa@0.9.10 --target all`
+# rend désormais « error: package ID specification `rsa@0.9.10` did not match any packages »
+# (le libellé a changé depuis la mesure précédente — « nothing to print » — le constat reste
+# identique : la crate n'est dans AUCUN graphe résolu par défaut, toutes cibles et tous types
+# d'arêtes confondus). Elle n'existe que comme ligne de Cargo.lock, que `cargo audit` scanne
+# à plat.
 #
 # Pourquoi PAS une entrée `ignore` — vérifié empiriquement le 2026-07-28 : l'ajouter produit
 # `warning[advisory-not-detected]: no crate matched advisory criteria` (entrée morte), et
-# surtout elle DÉSARMERAIT le gate pour l'avenir. Aujourd'hui, activer la feature `mysql` de
-# sqlx ou un backend cloud ferait entrer rsa dans le graphe résolu et `cargo deny check`
+# surtout elle DÉSARMERAIT le gate pour l'avenir. Aujourd'hui, activer un backend cloud
+# `gcs`/`azure` d'opendal ferait entrer rsa dans le graphe résolu et `cargo deny check`
 # passerait FAILED — exactement le signal qu'on veut. Un `ignore` le supprimerait en silence,
 # pour une vuln sans correctif amont. La justification vit donc ici, pas dans `ignore`.
 #
 # Conséquence assumée : `cargo audit` (Cargo.lock à plat) et `cargo deny check` (graphe résolu)
 # DIVERGENT sur cette entrée — 1 vuln remontée vs 0. C'est le comportement correct des deux
-# outils, pas une régression. Revisiter si un correctif rsa paraît, ou si `mysql`/cloud est activé.
+# outils, pas une régression. Revisiter si un correctif rsa paraît, ou si un backend cloud
+# `gcs`/`azure` d'opendal est activé.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [licenses] — SPDX license allow-list

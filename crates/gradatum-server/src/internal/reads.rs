@@ -604,12 +604,76 @@ pub(crate) async fn handle_notes_by_locus(
     }
 }
 
-/// `GET /internal/v1/notes/count-unprocessed?vault=<v>&locus=<l>&min=<n>` —
-/// compte les notes `live` non-`processed` d'un locus (pression de consolidation F-112).
+/// `GET /internal/v1/notes/by-section?vault=<v>&section=<s>` — notes d'une section canonique.
+///
+/// Résout un scope `JobScope::Section` pour `handle_distill` (cron F-112) : liste les
+/// notes de la section via [`crate::IndexStore::list_notes_by_section`] — l'équivalent
+/// par section de `by-locus`, même forme `(id, section)`, même filtre `forgotten = 0`.
+///
+/// ## Réponses
+///
+/// - `200` + JSON [`NoteListResponse`].
+/// - `400` si `vault` ou `section` est absent.
+/// - `500` pour toute erreur I/O inattendue.
+pub(crate) async fn handle_notes_by_section(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let vault = match params.get("vault") {
+        Some(v) => v.as_str(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "missing `vault` parameter".to_string(),
+            )
+                .into_response();
+        }
+    };
+    if let Err(r) = validate_param_len(vault, 256, "vault") {
+        return r;
+    }
+    let section = match params.get("section") {
+        Some(s) => s.as_str(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "missing `section` parameter".to_string(),
+            )
+                .into_response();
+        }
+    };
+    if let Err(r) = validate_param_len(section, 512, "section") {
+        return r;
+    }
+
+    match state.search.list_notes_by_section(vault, section).await {
+        Ok(rows) => {
+            let note_ids = rows
+                .into_iter()
+                .map(|(note_id, section)| NoteIdDto { note_id, section })
+                .collect();
+            Json(NoteListResponse { note_ids }).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list_notes_by_section failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /internal/v1/notes/count-unprocessed?vault=<v>&section=<s>&min=<n>` —
+/// compte les notes `live` non-`processed` d'une SECTION (pression de consolidation F-112).
+///
+/// L'axe est la **section canonique**, pas le locus : la colonne `locus` est `NULL` sur
+/// tout le corpus (jamais écrite) et la pression y vaut donc toujours 0 — le défaut que
+/// ce correctif adresse. Les noms configurés (`debug`, `experiments`, `reference`) sont
+/// des sections. La liste par section réutilise [`crate::IndexStore::list_notes_by_section`]
+/// (équivalent par section de `list_notes_by_locus_prefix`, déjà présent dans l'index).
 ///
 /// Réutilise le chemin de récupération de [`handle_notes_by_locus`] (index → IDs de notes)
 /// puis lit le frontmatter de chaque note pour filtrer `status == Live && !processed`
-/// (`processed` vit dans `extra["processed"]`, pas une colonne SQL). Coût `O(N)` par locus
+/// (`processed` vit dans `extra["processed"]`, pas une colonne SQL). Coût `O(N)` par section
 /// (une lecture vault par note) — assumé pour le cron distill hebdomadaire (F-112).
 ///
 /// Le paramètre optionnel `min` plafonne le comptage : dès que `min` notes correspondantes
@@ -620,7 +684,7 @@ pub(crate) async fn handle_notes_by_locus(
 /// ## Réponses
 ///
 /// - `200` + JSON [`CountResponse`].
-/// - `400` si `vault` ou `locus` est absent.
+/// - `400` si `vault` ou `section` est absent.
 /// - `500` pour toute erreur I/O inattendue.
 pub(crate) async fn handle_count_unprocessed(
     State(state): State<AppState>,
@@ -639,28 +703,28 @@ pub(crate) async fn handle_count_unprocessed(
     if let Err(r) = validate_param_len(vault, 256, "vault") {
         return r;
     }
-    let locus = match params.get("locus") {
-        Some(l) => l.as_str(),
+    let section = match params.get("section") {
+        Some(s) => s.as_str(),
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "missing `locus` parameter".to_string(),
+                "missing `section` parameter".to_string(),
             )
                 .into_response();
         }
     };
-    if let Err(r) = validate_param_len(locus, 512, "locus") {
+    if let Err(r) = validate_param_len(section, 512, "section") {
         return r;
     }
     // `min` optionnel : plafond d'early-exit. Absent ou non-parseable → aucun plafond.
     let min: Option<u64> = params.get("min").and_then(|s| s.parse::<u64>().ok());
 
-    let rows = match state.search.list_notes_by_locus_prefix(vault, locus).await {
+    let rows = match state.search.list_notes_by_section(vault, section).await {
         Ok(r) => r,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("list_notes_by_locus_prefix failed: {e}"),
+                format!("list_notes_by_section failed: {e}"),
             )
                 .into_response();
         }

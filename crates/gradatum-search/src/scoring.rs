@@ -24,10 +24,10 @@
 //! α = 0.2 (recency), β = 0.1 (in-degree), γ = 0.15 (trust) — conservative coefficients.
 //!
 //! ### Trust decay
-//! `trust_decayed = trust × 0.5^(age_days / half_life_days)` (per-provenance half-life).
-//! `half_life_days = None` (e.g. `human-decision`) → **no decay** (`trust_decayed = trust`).
-//! The trust factor is applied **only** in the RRF layer (never BM25), **after**
-//! the `forgotten`/`downgraded` SQL short-circuits. Modifier order:
+//! `trust_decayed = trust × 0.5^(age_days / half_life_days)` (per-`doc_kind` half-life).
+//! `half_life_days = None` (e.g. `Static`, or the section-exempted palier A) → **no decay**
+//! (`trust_decayed = trust`). The trust factor is applied **only** in the RRF layer
+//! (never BM25), **after** the `forgotten`/`downgraded` SQL short-circuits. Modifier order:
 //! `forgotten (short-circuit) > downgraded > [RRF × recency × pagerank × trust_decay]`.
 //!
 //! ### Controlled activation
@@ -97,6 +97,64 @@ pub fn composite_score(rrf_score: f64, recency: f64, pagerank: f64) -> f64 {
     rrf_score * (1.0 + ALPHA * recency) * (1.0 + BETA * pagerank)
 }
 
+/// Normalised BM25 score for the single-arm short-circuit (criterion 6).
+///
+/// `1.0 / (1.0 + |bm25|)` maps the negative BM25 score (SQLite FTS5: better
+/// matches are closer to 0) to `(0.0, 1.0]` — a strong match (bm25 near 0)
+/// approaches 1.0, a weak match (bm25 very negative) approaches 0.0. The
+/// mapping is strictly monotone in `bm25`, so the single-arm ordering is
+/// preserved.
+///
+/// This is the canonical BM25 normalisation for the repo (already documented
+/// and tested in `handlers.rs::bm25_score_mapping_is_monotone_decreasing_in_zero_one_range`
+/// — historically described but not applied to the exposed score).
+#[must_use]
+pub fn normalize_bm25(bm25: f64) -> f64 {
+    1.0 / (1.0 + bm25.abs())
+}
+
+/// Normalised semantic (cosine) score for the single-arm short-circuit.
+///
+/// The cosine is already normalised to `[-1, 1]`; clamping to `[0, 1]` removes
+/// the anti-correlation tail — a note anti-correlated with the query cannot be
+/// "more relevant than a non-match". Monotone in `cosine`, so the single-arm
+/// ordering is preserved.
+#[must_use]
+pub fn normalize_semantic(cosine: f32) -> f64 {
+    (cosine as f64).clamp(0.0, 1.0)
+}
+
+/// Weighted fusion score on normalised magnitudes (criterion 10).
+///
+/// Replaces the rank-only fusion (RRF) in the nominal two-arm case: instead of
+/// summing `1/(k + rank)`, the magnitude of each arm is kept and blended as
+/// `w_bm25 × normalize_bm25(bm25) + w_sem × normalize_semantic(cosine)`, with
+/// `w_bm25 = w_sem = 0.5` (both arms equal when both respond).
+///
+/// # Absence semantics
+///
+/// `None` for an arm means the note is **absent** from that arm → contribution
+/// `0.0`. This is distinct from `Some(0.0)` (a present-but-neutral score): for
+/// BM25, `normalize_bm25(0.0) = 1.0` (perfect match), so using `0.0` as a
+/// sentinel for "absent" would silently turn a missing note into the best
+/// lexical match. A note present in only one arm therefore lands at
+/// `0.5 × its-arm-normalised-score` — penalised relative to notes matching both
+/// arms, which is exactly the discriminator the rank fusion was throwing away.
+///
+/// # Guarantees
+///
+/// - `weighted_fusion_score(Some(0.0), Some(1.0)) = 1.0` (both arms maximal).
+/// - Result ∈ `[0.0, 1.0]` (both normalisers are bounded).
+/// - Strictly monotone in each present arm's score.
+#[must_use]
+pub fn weighted_fusion_score(bm25: Option<f64>, semantic: Option<f32>) -> f64 {
+    const W_BM25: f64 = 0.5;
+    const W_SEM: f64 = 0.5;
+    let n_bm25 = bm25.map_or(0.0, normalize_bm25);
+    let n_sem = semantic.map_or(0.0, normalize_semantic);
+    W_BM25 * n_bm25 + W_SEM * n_sem
+}
+
 /// Trust boost coefficient in the composite score (conservative).
 ///
 /// Maximum trust boost (`trust_decayed = 1.0`): `× 1.15` (15 %).
@@ -106,24 +164,42 @@ pub const GAMMA_TRUST: f64 = 0.15;
 ///
 /// Built from server config; consumed by search handlers.
 /// `enabled = false` ⇒ scoring applies no trust factor (pre-trust-factor scores).
+///
+/// Half-lives are indexed by **`doc_kind`** (`Event` decays, `Static` does not), not by
+/// provenance. The base trust value is derived from the section via
+/// `gradatum_core::section::trust_for_section_str` (table `SECTION_TRUST_SCORES`).
 #[derive(Debug, Clone)]
 pub struct TrustDecayConfig {
     /// Enables the trust multiplier. `false` = pre-trust-factor non-regression mode.
     pub enabled: bool,
-    /// Half-lives (days) per provenance. Absent provenance = no decay (`None`).
+    /// Half-lives (days) per `doc_kind`. Absent `doc_kind` = no decay (`None`).
     pub half_life_days: std::collections::HashMap<String, f64>,
 }
 
 /// Default trust-decay half-lives, in days.
 ///
-/// **Single source of truth**: this table is the sole definition of per-provenance
+/// **Single source of truth**: this table is the sole definition of the decay
 /// half-lives. `gradatum-server::config::ScoringConfig` consumes it via
 /// [`default_half_lives`] rather than redefining the literals — values live in
 /// exactly one place.
 ///
-/// A provenance **absent** from this table → **no decay** (`half_life = None`,
-/// non-perishable trust, e.g. `human-decision`).
-pub const DEFAULT_TRUST_HALF_LIVES: &[(&str, f64)] = &[("distilled", 90.0)];
+/// The key is the **`doc_kind`** (CoALA temporal axis), not the provenance:
+/// `Event` (what happened — `debug`, `agent-issues`) decays; `Static` does not.
+/// Exception: **tier A** (`council`, `decisions`, `project-map`, `identity`) is exempt
+/// from decay at the **section** level (`TrustDecayConfig::resolve_for_section`), even
+/// when its `doc_kind` is `Event` — the `council` case: an act of governance does not
+/// lose its authority as it ages. `doc_kind` is a deterministic function of `section` on
+/// the measured corpus: it is not a second independent lever.
+///
+/// The `Event = 90.0` days value reuses the calibration already documented in the repo
+/// for decay-trust: the former `distilled = 90d` default (the table's only entry), and
+/// `session_trace.retention_days` is also 90 days (CHANGELOG v0.4.2). 90 days ≥ the
+/// documented recency half-life (`λ = 0.01` → ≈ 69 days, [`recency_factor`]): decay-trust
+/// stays a gentler side effect than recency, consistent with the composite formula.
+///
+/// A `doc_kind` **absent** from this table → **no decay** (`half_life = None`,
+/// non-perishable trust) — this is the `Static` case.
+pub const DEFAULT_TRUST_HALF_LIVES: &[(&str, f64)] = &[("Event", 90.0)];
 
 /// Builds the default half-life map from [`DEFAULT_TRUST_HALF_LIVES`].
 ///
@@ -139,7 +215,7 @@ pub fn default_half_lives() -> std::collections::HashMap<String, f64> {
 
 impl Default for TrustDecayConfig {
     /// Default: decay enabled, half-lives from [`DEFAULT_TRUST_HALF_LIVES`]
-    /// (`distilled = 90 days`), all other provenances without decay.
+    /// (`Event = 90 days`), `Static` without decay.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -155,20 +231,59 @@ impl TrustDecayConfig {
     /// trust is present; otherwise `None` (causing `composite_score_with_trust`
     /// to neutralise the trust factor → pre-trust-factor score).
     ///
-    /// - `half_life` = `Some(h)` if provenance is in the map; `None` otherwise
-    ///   (no decay — non-perishable provenance, e.g. `human-decision`).
+    /// - `decay_key` is the `doc_kind` (`"Event"` / `"Static"`). `half_life` =
+    ///   `Some(h)` if `decay_key` is in the map; `None` otherwise (no decay —
+    ///   non-perishable, e.g. `Static`).
     #[must_use]
     pub fn resolve(
         &self,
         trust: Option<f32>,
-        provenance: Option<&str>,
+        decay_key: Option<&str>,
         age_days: f64,
     ) -> Option<(f64, f64, Option<f64>)> {
         if !self.enabled {
             return None;
         }
         let trust = trust? as f64;
-        let half_life = provenance.and_then(|p| self.half_life_days.get(p).copied());
+        let half_life = decay_key.and_then(|p| self.half_life_days.get(p).copied());
+        Some((trust, age_days, half_life))
+    }
+
+    /// Resolves the trust parameters of a hit **from the section**.
+    ///
+    /// The base trust is derived from the section (`gradatum_core::section::trust_for_section_str`,
+    /// table `SECTION_TRUST_SCORES`, justified in `section.rs`); the decay axis is the
+    /// `doc_kind` derived from the section (`section_str_to_doc_kind`). An unknown section falls
+    /// back to the neutral `0.5` (the corpus's current behavior) and `Static` (non-perishable).
+    ///
+    /// **Tier A exempt**: `council`, `decisions`, `project-map`, `identity` **never** decay
+    /// (the "an act is not re-judged" doctrine, `section::is_trust_non_decaying`) — even when
+    /// the `doc_kind` is `Event` (the `council` case). The exemption applies to the SECTION,
+    /// not to `doc_kind`: on the measured corpus, `doc_kind` is redundant with `section`
+    /// (`section::TRUST_NON_DECAYING_SECTIONS`). `debug` / `agent-issues` always decay with the
+    /// `Event` half-life (90 d).
+    ///
+    /// Returns `None` when `enabled = false` (neutralises the factor → pre-trust score,
+    /// bit-for-bit identical to `composite_score`).
+    #[must_use]
+    pub fn resolve_for_section(
+        &self,
+        section: &str,
+        age_days: f64,
+    ) -> Option<(f64, f64, Option<f64>)> {
+        if !self.enabled {
+            return None;
+        }
+        let trust = gradatum_core::section::trust_for_section_str(section);
+        // Palier A (council/decisions/project-map/identity) : exemption de décroissance —
+        // un acte ne perd pas son autorité en vieillissant. Portée par la SECTION
+        // (`doc_kind` est redondant avec `section` sur le corpus mesuré, cf. section.rs).
+        let half_life = if gradatum_core::section::is_trust_non_decaying(section) {
+            None
+        } else {
+            let doc_kind = gradatum_core::section::section_str_to_doc_kind(section);
+            self.half_life_days.get(doc_kind).copied()
+        };
         Some((trust, age_days, half_life))
     }
 }
@@ -489,7 +604,7 @@ mod tests {
     }
 
     /// `TrustDecayConfig::default` derives its half-lives from the shared const.
-    /// Non-regression: `distilled = 90d`, no other source.
+    /// F-261 : non-regression — `Event = 90d`, `Static` absent (no decay), no other source.
     #[test]
     fn default_half_lives_match_const_source() {
         let map = default_half_lives();
@@ -499,7 +614,8 @@ mod tests {
         }
         let cfg = TrustDecayConfig::default();
         assert_eq!(cfg.half_life_days, map);
-        assert_eq!(cfg.half_life_days.get("distilled").copied(), Some(90.0));
+        assert_eq!(cfg.half_life_days.get("Event").copied(), Some(90.0));
+        assert!(!cfg.half_life_days.contains_key("Static"));
         assert!(cfg.enabled);
     }
 
@@ -721,15 +837,15 @@ mod tests {
         );
     }
 
-    // ── TrustDecayConfig::resolve ────────────────────────────────────────────
+    // ── TrustDecayConfig::resolve / resolve_for_section ─────────────────────
 
-    // Défaut : decay activé, distilled=90j présent.
+    // Défaut : decay activé, Event=90j présent, Static absent (no decay).
     #[test]
     fn trust_decay_config_default() {
         let cfg = TrustDecayConfig::default();
         assert!(cfg.enabled);
-        assert_eq!(cfg.half_life_days.get("distilled").copied(), Some(90.0));
-        assert!(!cfg.half_life_days.contains_key("human-decision"));
+        assert_eq!(cfg.half_life_days.get("Event").copied(), Some(90.0));
+        assert!(!cfg.half_life_days.contains_key("Static"));
     }
 
     // enabled=false → resolve retourne None (neutralise le facteur trust).
@@ -739,38 +855,131 @@ mod tests {
             enabled: false,
             half_life_days: std::collections::HashMap::new(),
         };
-        assert!(cfg.resolve(Some(0.6), Some("distilled"), 10.0).is_none());
+        assert!(cfg.resolve(Some(0.6), Some("Event"), 10.0).is_none());
+        assert!(cfg.resolve_for_section("decisions", 10.0).is_none());
     }
 
     // trust absent → None (pas de facteur).
     #[test]
     fn resolve_no_trust_returns_none() {
         let cfg = TrustDecayConfig::default();
-        assert!(cfg.resolve(None, Some("distilled"), 10.0).is_none());
+        assert!(cfg.resolve(None, Some("Event"), 10.0).is_none());
     }
 
-    // provenance avec demi-vie → Some avec half_life.
+    // doc_kind Event (avec demi-vie) → Some avec half_life.
     #[test]
-    fn resolve_provenance_with_half_life() {
+    fn resolve_event_with_half_life() {
         let cfg = TrustDecayConfig::default();
-        let r = cfg.resolve(Some(0.6), Some("distilled"), 45.0);
+        let r = cfg.resolve(Some(0.6), Some("Event"), 45.0);
         assert_eq!(r, Some((0.6_f32 as f64, 45.0, Some(90.0))));
     }
 
-    // provenance sans demi-vie (human-decision) → Some avec half_life=None (pas de decay).
+    // doc_kind Static (sans demi-vie) → Some avec half_life=None (pas de decay).
     #[test]
-    fn resolve_provenance_without_half_life_no_decay() {
+    fn resolve_static_no_decay() {
         let cfg = TrustDecayConfig::default();
-        let r = cfg.resolve(Some(0.95), Some("human-decision"), 1000.0);
+        let r = cfg.resolve(Some(0.95), Some("Static"), 1000.0);
         assert_eq!(r, Some((0.95_f32 as f64, 1000.0, None)));
     }
 
-    // provenance None → half_life None (pas de decay).
+    // doc_kind None → half_life None (pas de decay).
     #[test]
-    fn resolve_provenance_none_no_decay() {
+    fn resolve_doc_kind_none_no_decay() {
         let cfg = TrustDecayConfig::default();
         let r = cfg.resolve(Some(0.5), None, 50.0);
         assert_eq!(r, Some((0.5_f32 as f64, 50.0, None)));
+    }
+
+    // ── F-261 : resolve_for_section — trust dérivé de la section, decay par doc_kind ──
+
+    // Section Event (debug) → trust dérivé 0.40 + half_life 90j.
+    #[test]
+    fn resolve_for_section_event_decays() {
+        let cfg = TrustDecayConfig::default();
+        let r = cfg.resolve_for_section("debug", 45.0);
+        assert_eq!(r, Some((0.40_f64, 45.0, Some(90.0))));
+    }
+
+    // Section Static (decisions) → trust dérivé 0.95 + pas de decay.
+    #[test]
+    fn resolve_for_section_static_no_decay() {
+        let cfg = TrustDecayConfig::default();
+        let r = cfg.resolve_for_section("decisions", 1000.0);
+        assert_eq!(r, Some((0.95_f64, 1000.0, None)));
+    }
+
+    // Section inconnue (hors canon) → neutre 0.5 + doc_kind Static (pas de decay).
+    #[test]
+    fn resolve_for_section_unknown_neutral() {
+        let cfg = TrustDecayConfig::default();
+        let r = cfg.resolve_for_section("notes", 50.0);
+        assert_eq!(r, Some((0.50_f64, 50.0, None)));
+    }
+
+    // resolve_for_section ne lit JAMAIS la colonne : le trust est purement dérivé.
+    #[test]
+    fn resolve_for_section_is_pure_function_of_section() {
+        let cfg = TrustDecayConfig::default();
+        for section in [
+            "debug",
+            "council",
+            "agent-issues",
+            "decisions",
+            "notes",
+            "reference",
+        ] {
+            let a = cfg.resolve_for_section(section, 7.0);
+            let b = cfg.resolve_for_section(section, 7.0);
+            assert_eq!(a, b, "déterministe pour {section}");
+        }
+    }
+
+    // F-261 (2026-08-25) : palier A exempté — un verdict council CONSERVE 0.95 à 31/60/180 j.
+    // Avant : 31j→0.75 (sous lessons-learned/architecture), 60j→0.60 (sous reference),
+    // 180j→0.237. La doctrine « un acte ne se rejuge pas » rend ce décroissance absurde.
+    #[test]
+    fn resolve_for_section_council_never_decays() {
+        let cfg = TrustDecayConfig::default();
+        for age in [31.0, 60.0, 180.0] {
+            let r = cfg.resolve_for_section("council", age);
+            assert_eq!(
+                r,
+                Some((0.95_f64, age, None)),
+                "council à {age}j doit ne pas décroître"
+            );
+            let f = trust_decay_factor(0.95, age, None);
+            assert!(
+                (f - 0.95).abs() < 1e-12,
+                "trust_decay_factor(0.95, {age}j, None) doit rester 0.95, got {f}"
+            );
+        }
+    }
+
+    // F-261 (2026-08-25) : le palier A ENTIER (council/decisions/project-map/identity) est
+    // non-décroissant ; debug/agent-issues périment toujours avec la demi-vie Event=90j.
+    #[test]
+    fn resolve_for_section_tier_a_all_non_decaying() {
+        let cfg = TrustDecayConfig::default();
+        for section in ["council", "decisions", "project-map", "identity"] {
+            assert!(
+                gradatum_core::section::is_trust_non_decaying(section),
+                "{section} doit être dans TRUST_NON_DECAYING_SECTIONS"
+            );
+            let r = cfg.resolve_for_section(section, 500.0);
+            assert_eq!(
+                r,
+                Some((0.95_f64, 500.0, None)),
+                "{section} ne doit pas décroître"
+            );
+        }
+        // Contrôle : Event hors palier A périme toujours (demi-vie 90j conservée).
+        // debug = 0.40 (palier D), agent-issues = 0.60 (palier C) — les deux périment.
+        let expected_trust = [("debug", 0.40_f64), ("agent-issues", 0.60_f64)];
+        for (section, trust) in expected_trust {
+            assert!(!gradatum_core::section::is_trust_non_decaying(section));
+            let r = cfg.resolve_for_section(section, 45.0);
+            assert_eq!(r, Some((trust, 45.0, Some(90.0))), "{section} doit périr");
+        }
     }
 
     // ── T6 — ScoringWeights + composite_score_weighted ───────────────────────
@@ -818,5 +1027,73 @@ mod tests {
             (w.trust - GAMMA_TRUST).abs() < 1e-9,
             "trust défaut GAMMA_TRUST={GAMMA_TRUST}"
         );
+    }
+
+    // ── F-162 critère 10 — weighted_fusion_score ─────────────────────────────
+
+    // Deux bras au maximum : 0.5×n_bm25 + 0.5×n_sem = 0.5×1.0 + 0.5×1.0 = 1.0.
+    #[test]
+    fn weighted_fusion_both_arms_maximal_is_one() {
+        let s = weighted_fusion_score(Some(0.0), Some(1.0));
+        assert!((s - 1.0).abs() < 1e-12, "deux bras max → 1.0, got {s}");
+    }
+
+    // Absence d'un bras → contribution 0.0 (pas confondu avec un score neutre).
+    #[test]
+    fn weighted_fusion_absent_arm_contributes_zero() {
+        // BM25 présent, sémantique absente → 0.5 × normalize_bm25(-0.5) = 0.5 × 0.6667.
+        let s = weighted_fusion_score(Some(-0.5), None);
+        let expect = 0.5 * normalize_bm25(-0.5);
+        assert!(
+            (s - expect).abs() < 1e-12,
+            "bras absent → 0.5×n_bm25 seul, got {s} vs {expect}"
+        );
+        // Sémantique présente, BM25 absent → 0.5 × normalize_semantic(0.9).
+        let s2 = weighted_fusion_score(None, Some(0.9));
+        let expect2 = 0.5 * normalize_semantic(0.9);
+        assert!(
+            (s2 - expect2).abs() < 1e-12,
+            "bras absent → 0.5×n_sem seul, got {s2} vs {expect2}"
+        );
+    }
+
+    // Le sentinelle Some(0.0) pour BM25 N'EST PAS l'absence : normalize_bm25(0.0)=1.0.
+    // Absent (None) ≠ présent-neutre (Some(0.0)) — le piège documenté.
+    #[test]
+    fn weighted_fusion_bm25_zero_is_not_absence() {
+        let absent = weighted_fusion_score(None, Some(0.0));
+        let present_zero = weighted_fusion_score(Some(0.0), Some(0.0));
+        assert!(
+            present_zero > absent,
+            "Some(0.0) BM25 = match parfait (1.0) ≠ absent (0.0) : present={present_zero} absent={absent}"
+        );
+    }
+
+    // Une note dans les DEUX bras bat une note dans un seul bras à magnitude égale.
+    #[test]
+    fn weighted_fusion_two_arms_beats_one_arm() {
+        let both = weighted_fusion_score(Some(-0.5), Some(0.9));
+        let only_bm25 = weighted_fusion_score(Some(-0.5), None);
+        assert!(
+            both > only_bm25,
+            "les deux bras additionnent : both={both} only_bm25={only_bm25}"
+        );
+    }
+
+    // Monotonie stricte : un meilleur score d'un bras → fusion strictement supérieure.
+    #[test]
+    fn weighted_fusion_is_strictly_monotone() {
+        let weak = weighted_fusion_score(Some(-10.0), Some(0.3));
+        let strong = weighted_fusion_score(Some(-0.5), Some(0.9));
+        assert!(strong > weak, "monotone : strong={strong} > weak={weak}");
+    }
+
+    // Borne : résultat toujours dans [0, 1].
+    #[test]
+    fn weighted_fusion_bounded_zero_one() {
+        let min = weighted_fusion_score(None, Some(0.0));
+        let max = weighted_fusion_score(Some(0.0), Some(1.0));
+        assert!((0.0..=1.0).contains(&min), "min ∈ [0,1], got {min}");
+        assert!((0.0..=1.0).contains(&max), "max ∈ [0,1], got {max}");
     }
 }

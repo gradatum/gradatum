@@ -20,10 +20,9 @@ use gradatum_core::{
     CurateSpec, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority, JobRecord, JobRetry,
     JobScheduling, JobScope, JobSpec, JobStatus, QueueStore, RetryBackoff, TriggerSource,
 };
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 use gradatum_server::config::{MultiTenantConfig, ServerConfig};
 use gradatum_server::state::AppState;
-use sqlx::sqlite::SqlitePoolOptions;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use ulid::Ulid;
@@ -60,9 +59,7 @@ async fn build_env(enabled: bool) -> Env {
     let jwt = JwtService::new_ephemeral();
     let acl = AclEngine::from_preset_str(TEST_ACL).expect("preset ACL valide");
 
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory");
     run_migrations(&jobs_pool)

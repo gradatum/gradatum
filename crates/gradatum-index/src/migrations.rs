@@ -186,6 +186,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0042_agent_vault_grants",
         include_str!("../migrations/0042_agent_vault_grants.sql"),
     ),
+    (
+        "0043_project_map_roles",
+        include_str!("../migrations/0043_project_map_roles.sql"),
+    ),
 ];
 
 /// Migrations that require a loaded SQLite extension to be applied.
@@ -2410,6 +2414,113 @@ mod tests {
             n, 1,
             "0039 doit apparaître exactement une fois dans le registre"
         );
+    }
+
+    /// Réversibilité 0043 : up → down → up. Le `.down.sql` retire l'index
+    /// `idx_notes_roles` puis les colonnes `role_kind`/`role_status`, et déréférence la
+    /// migration du registre ; le re-up (fichier `0043.sql` direct) les repose. Le runner
+    /// étant forward-only (le `.down` n'est jamais rejoué seul, migrations.rs run()), on le
+    /// charge explicitement via `include_str!` + `execute_batch`, sur le modèle de la
+    /// réversibilité 0039. Ce test exerce la méthode de revert : un chemin de
+    /// rollback non exercé est un chemin mort.
+    #[tokio::test]
+    async fn migration_0043_is_reversible_round_trip() {
+        fn columns(conn: &Connection) -> Vec<String> {
+            conn.prepare("SELECT name FROM pragma_table_info('notes')")
+                .expect("pragma_table_info(notes)")
+                .query_map([], |r| r.get::<_, String>(0))
+                .expect("query_map table_info")
+                .filter_map(std::result::Result::ok)
+                .collect()
+        }
+        fn has_index(conn: &Connection, name: &str) -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .expect("sqlite_master index count")
+                > 0
+        }
+
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().expect("in-memory")));
+
+        // UP : chaîne complète jusqu'à 0043 incluse.
+        run(&conn).await.expect("run() jusqu'à 0043");
+        {
+            let c = conn.lock().await;
+            let cols = columns(&c);
+            assert!(
+                cols.contains(&"role_kind".to_string()),
+                "role_kind absent après up 0043, cols={cols:?}"
+            );
+            assert!(
+                cols.contains(&"role_status".to_string()),
+                "role_status absent après up 0043"
+            );
+            assert!(
+                has_index(&c, "idx_notes_roles"),
+                "idx_notes_roles absent après up 0043"
+            );
+        }
+
+        // DOWN : rollback manuel documenté, chargé explicitement (runner forward-only).
+        {
+            let c = conn.lock().await;
+            c.execute_batch(include_str!(
+                "../migrations/0043_project_map_roles.down.sql"
+            ))
+            .expect("application rollback 0043.down");
+            let cols = columns(&c);
+            assert!(
+                !cols.contains(&"role_kind".to_string()),
+                "role_kind subsiste après down 0043"
+            );
+            assert!(
+                !cols.contains(&"role_status".to_string()),
+                "role_status subsiste après down 0043"
+            );
+            assert!(
+                !has_index(&c, "idx_notes_roles"),
+                "idx_notes_roles subsiste après down 0043"
+            );
+            let still: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version='0043_project_map_roles')",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("check registre 0043 après down");
+            assert!(!still, "0043 doit être retiré du registre après down");
+        }
+
+        // RE-UP : le fichier de migration up direct repose colonnes + index + registre.
+        {
+            let c = conn.lock().await;
+            c.execute_batch(include_str!("../migrations/0043_project_map_roles.sql"))
+                .expect("ré-application 0043 up");
+            let cols = columns(&c);
+            assert!(
+                cols.contains(&"role_kind".to_string()),
+                "role_kind absent après re-up 0043"
+            );
+            assert!(
+                cols.contains(&"role_status".to_string()),
+                "role_status absent après re-up 0043"
+            );
+            assert!(
+                has_index(&c, "idx_notes_roles"),
+                "idx_notes_roles absent après re-up 0043"
+            );
+            let reapplied: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version='0043_project_map_roles')",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("check registre 0043 re-up");
+            assert!(reapplied, "0043 doit être ré-inscrit au registre au re-up");
+        }
     }
 
     /// Non-régression suppression (cœur de l'item) : sur une DB complète (C12

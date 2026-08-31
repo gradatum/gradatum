@@ -30,7 +30,7 @@
 //! - `Data<Arc<dyn CuratorProcess + Send + Sync>>` — curator pipeline
 //! - `Data<Arc<dyn Embedder + Send + Sync>>` — embedding backend
 //! - `Data<Arc<dyn QueueStore + Send + Sync>>` — job queue (enqueue, `mark_conflict`)
-//! - `Data<Arc<dyn DistillSynthesizer + Send + Sync>>` — synthesis producer (distill)
+//! - `Data<Arc<dyn gradatum_distill::DistillSynthesizer + Send + Sync>>` — synthesis producer (distill)
 //! - `Data<MultiTenantCfg>` — multi-tenant config, for vault resolution
 //!
 //! The cron workers additionally receive their own data (DLQ pool, retention,
@@ -81,6 +81,7 @@ use gradatum_core::{
     tag::Tag,
 };
 use gradatum_curator::{CurateOutcome, CuratorProcess};
+use gradatum_distill::DistillSynthesizer;
 use gradatum_dto::{
     PersistCuratedRequest, PersistDistillRequest, PersistEmbeddingRequest, PersistForgetRequest,
     TemporalEntryDto,
@@ -178,6 +179,7 @@ fn scope_label(scope: &gradatum_core::job::JobScope) -> String {
         JobScope::VaultWide => "VaultWide".to_owned(),
         JobScope::Vault(v) => format!("Vault({})", truncate_for_log(v)),
         JobScope::Locus(l) => format!("Locus({})", truncate_for_log(l)),
+        JobScope::Section(s) => format!("Section({})", truncate_for_log(s)),
         JobScope::Notes(ids) => format!("Notes({} ids)", ids.len()),
         JobScope::Session(id) => format!("Session({id})"),
         // `JobScope` est `#[non_exhaustive]` — bras exigé par le compilateur.
@@ -229,7 +231,11 @@ fn resolve_job_vault(
         }
         // Scopes portant un périmètre mais AUCUN vault. À OFF ils désignent le vault
         // unique ; à ON ils sont ambigus → refus terminal, jamais un « main » silencieux.
-        JobScope::VaultWide | JobScope::Locus(_) | JobScope::Notes(_) | JobScope::Session(_) => {
+        JobScope::VaultWide
+        | JobScope::Locus(_)
+        | JobScope::Section(_)
+        | JobScope::Notes(_)
+        | JobScope::Session(_) => {
             if multi_tenant_enabled {
                 Err(HandlerError::Business(format!(
                     "ambiguous job vault: scope {} carries no vault while multi-vault is \
@@ -1701,102 +1707,6 @@ pub async fn handle_forget(
 /// combinatorial explosion and memory pressure).
 pub const MAX_DISTILL_BATCH: usize = 2000;
 
-/// Synthesis output produced for a note cluster.
-///
-/// Produced by a [`DistillSynthesizer`] and written as a `PendingReview` note.
-pub struct ClusterSynthesis {
-    /// Title of the synthesis note.
-    pub title: String,
-    /// Markdown body of the synthesis note.
-    pub body: String,
-}
-
-/// Synthesis error — propagated to mark the job `Failed` cleanly.
-#[derive(Debug, thiserror::Error)]
-pub enum SynthesisError {
-    /// The synthesis service (LLM gateway) is unavailable or failed.
-    #[error("synthesis unavailable: {0}")]
-    Unavailable(String),
-}
-
-/// Cluster synthesis producer.
-///
-/// Abstraction that allows substituting the deterministic implementation (MVP)
-/// with a dedicated LLM gateway backend without touching the handler.
-///
-/// # Contract
-///
-/// - `synthesize` receives the notes of a cluster as `[(title, body)]` (≥ 1 note).
-/// - Returns `Ok(ClusterSynthesis)`: title + body of the `PendingReview` note.
-/// - Returns `Err(SynthesisError::Unavailable)`: the job MUST fail cleanly
-///   (no partial note written — mitigation for gateway-down scenarios).
-#[async_trait::async_trait]
-pub trait DistillSynthesizer: Send + Sync {
-    /// Synthesizes a note cluster into a synthesis note.
-    async fn synthesize(
-        &self,
-        cluster: &[(String, String)],
-    ) -> Result<ClusterSynthesis, SynthesisError>;
-}
-
-/// Deterministic synthesizer — MVP (no LLM call).
-///
-/// Produces a structured synthesis note by concatenation: title derived from the
-/// first cluster element, body listing source notes with an excerpt.
-/// The note is written as `PendingReview` (requires human review) — editorial quality
-/// is the reviewer's responsibility, not the automated step's.
-///
-/// ## Why deterministic at MVP
-///
-/// The worker injects no free-text generation client (the only wired LLM backend is
-/// `gradatum_chat::LlmBackend`, specialised for curator classification — not free
-/// completion). A dedicated `distill-semantic` gateway client is deferred:
-/// the `PendingReview` output combined with the cron disabled by default keeps the step
-/// safe, and the [`DistillSynthesizer`] abstraction allows plugging in an LLM without
-/// refactoring the handler.
-#[derive(Default)]
-pub struct TemplateSynthesizer;
-
-#[async_trait::async_trait]
-impl DistillSynthesizer for TemplateSynthesizer {
-    async fn synthesize(
-        &self,
-        cluster: &[(String, String)],
-    ) -> Result<ClusterSynthesis, SynthesisError> {
-        if cluster.is_empty() {
-            return Err(SynthesisError::Unavailable(
-                "empty cluster — nothing to synthesize".to_string(),
-            ));
-        }
-        // Title: derived from the first non-empty title in the cluster.
-        let lead_title = cluster
-            .iter()
-            .map(|(t, _)| t.trim())
-            .find(|t| !t.is_empty())
-            .unwrap_or("related notes");
-        let title = format!("Distilled synthesis — {lead_title}");
-
-        // Body: header + list of source notes with bounded excerpt.
-        let mut body = format!(
-            "# {title}\n\n\
-             > Distilled synthesis note (F-22) — **pending review**.\n\
-             > Groups {} semantically close note(s).\n\n\
-             ## Distilled sources\n\n",
-            cluster.len()
-        );
-        for (i, (src_title, src_body)) in cluster.iter().enumerate() {
-            let excerpt: String = src_body.trim().chars().take(280).collect();
-            let display_title = if src_title.trim().is_empty() {
-                "(untitled)"
-            } else {
-                src_title.trim()
-            };
-            body.push_str(&format!("### {}. {display_title}\n\n{excerpt}\n\n", i + 1));
-        }
-        Ok(ClusterSynthesis { title, body })
-    }
-}
-
 /// Handler for [`gradatum_core::Job::Distill`] — semantic distillation.
 ///
 /// # Contract
@@ -1827,7 +1737,7 @@ impl DistillSynthesizer for TemplateSynthesizer {
 /// # Required scope in real mode
 ///
 /// `JobScope::VaultWide` is **rejected** outside dry-run (`HandlerError::Business`) —
-/// mitigation against O(n²) clustering. `Locus` or `Notes` scope required.
+/// mitigation against O(n²) clustering. `Section`, `Locus` or `Notes` scope required.
 ///
 /// # Idempotence
 ///
@@ -1891,7 +1801,7 @@ pub async fn handle_distill(
     // ── VaultWide scope guard in real mode ───────────────────────────────────
     if !is_dry_run && matches!(spec.scope, JobScope::VaultWide) {
         return Err(HandlerError::Business(
-            "distill: JobScope::VaultWide rejected outside dry-run — Locus or Notes scope required (R3)"
+            "distill: JobScope::VaultWide rejected outside dry-run — Section, Locus or Notes scope required (R3)"
                 .to_string(),
         ));
     }
@@ -1906,6 +1816,20 @@ pub async fn handle_distill(
         return Err(HandlerError::Business(
             "distill: empty/whitespace JobScope::Locus refused outside dry-run \
                      (would match the whole vault — bypasses R3)"
+                .to_string(),
+        ));
+    }
+
+    // Reject empty / whitespace-only Section in real mode: an empty section name would
+    // resolve to nothing meaningful (no LIKE bypass here, but the same fail-loud
+    // discipline — an accidental `Section("")` must never be silently processed).
+    if !is_dry_run
+        && let JobScope::Section(section) = &spec.scope
+        && section.trim().is_empty()
+    {
+        return Err(HandlerError::Business(
+            "distill: empty/whitespace JobScope::Section refused outside dry-run \
+                     (no consolidation target — bypasses R3)"
                 .to_string(),
         ));
     }
@@ -1980,7 +1904,7 @@ pub async fn handle_distill(
 
     // ── Cosine clustering (connected components, confidence_threshold) ─────────
     let embeddings: Vec<Vec<f32>> = candidates.iter().map(|(_, _, _, e)| e.clone()).collect();
-    let clusters = crate::distill_cluster::cluster_by_cosine(&embeddings, confidence_threshold);
+    let clusters = gradatum_distill::cluster_by_cosine(&embeddings, confidence_threshold);
 
     // ── Dry-run: list clusters without mutation ──────────────────────────────
     if is_dry_run {
@@ -2047,7 +1971,8 @@ pub async fn handle_distill(
         };
 
         // Compute dynamic trust before writing the synthesis note.
-        // Preload source trusts via client (async), then apply synchronous compute_distill_trust.
+        // Preload source trusts via client (async), then apply synchronous
+        // gradatum_distill::compute_distill_trust.
         let mut trust_map: std::collections::HashMap<ulid::Ulid, f32> =
             std::collections::HashMap::with_capacity(source_ids.len());
         for src in &source_ids {
@@ -2061,7 +1986,7 @@ pub async fn handle_distill(
             .map(|n| trust_map.get(&n.0).copied().unwrap_or(0.6))
             .collect();
         let lookup = MapTrustLookup(trust_map);
-        let trust = gradatum_core::provenance::compute_distill_trust(
+        let trust = gradatum_distill::compute_distill_trust(
             &source_ids.iter().map(|n| n.0).collect::<Vec<_>>(),
             &lookup,
             confidence_threshold,
@@ -2116,6 +2041,7 @@ pub async fn handle_distill(
 
 /// Resolves a distillation `JobScope` into a list of candidate `NoteId`s via `InternalClient`.
 ///
+/// - `Section(section)`: notes of a canonical section (the distill cron's scope).
 /// - `Locus(prefix)`: notes whose locus starts with `prefix`.
 /// - `Notes(ids)`: explicit set of note IDs.
 /// - `VaultWide`: all notes in the vault (permitted in dry-run only —
@@ -2133,6 +2059,18 @@ async fn resolve_distill_scope(
                 .await
                 .map_err(|e| {
                     HandlerError::Business(format!("distill: list_notes_by_locus: {e}"))
+                })?;
+            rows.into_iter()
+                .filter_map(|dto| ulid::Ulid::from_string(&dto.note_id).ok().map(NoteId))
+                .map(Ok)
+                .collect()
+        }
+        JobScope::Section(section) => {
+            let rows = client
+                .list_notes_by_section(vault_id, section)
+                .await
+                .map_err(|e| {
+                    HandlerError::Business(format!("distill: list_notes_by_section: {e}"))
                 })?;
             rows.into_iter()
                 .filter_map(|dto| ulid::Ulid::from_string(&dto.note_id).ok().map(NoteId))
@@ -2168,7 +2106,7 @@ async fn resolve_distill_scope(
 
 /// Synchronous `TrustLookup` adapter backed by a preloaded in-memory map.
 ///
-/// `compute_distill_trust` requires a synchronous `&dyn TrustLookup`; `SqliteIndex`
+/// `gradatum_distill::compute_distill_trust` requires a synchronous `&dyn TrustLookup`; `SqliteIndex`
 /// only exposes `get_trust` async. This adapter preloads source trusts
 /// (async I/O) then provides the expected synchronous view.
 struct MapTrustLookup(std::collections::HashMap<ulid::Ulid, f32>);
@@ -3086,6 +3024,7 @@ mod tests {
         for scope in [
             JobScope::VaultWide,
             JobScope::Locus("decisions".into()),
+            JobScope::Section("reference".into()),
             JobScope::Notes(vec![ulid::Ulid::generate()]),
             JobScope::Session(ulid::Ulid::generate()),
         ] {

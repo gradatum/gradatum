@@ -149,8 +149,20 @@ pub fn anthropic_to_chat(
 /// - `role:"user"` with text or images → one `role:user` message
 /// - `role:"assistant"` with blocks → one assistant message, carrying `tool_calls`
 ///   when `tool_use` blocks are present
+/// - `role:"system"` → one `role:system` message, preserving its framing text
 ///
-/// An unrecognized role is logged and handled as `user`.
+/// # `system` in the `messages` array (F-170)
+///
+/// A client following the OpenAI convention may place a `role:"system"` message
+/// inside the `messages` array (in Anthropic, `system` is a top-level parameter
+/// instead). The internal target — OpenAI-compatible — has a distinct `system`
+/// role, so the framing instruction is preserved rather than downgraded to
+/// `user`. Downgrading would silently demote a framing instruction (to which
+/// models give particular weight) into ordinary user content.
+///
+/// A genuinely unrecognized role is still logged and handled as `user`: the
+/// warning must keep firing on real unknowns, it just no longer fires on
+/// `system` (which was a false positive occurring ~183×/day, cf. F-170).
 ///
 /// # Errors
 /// - [`TranslateError::InvalidImageUrl`] if an image block carries a non-HTTPS URL.
@@ -158,6 +170,9 @@ fn translate_message(msg: &AnthropicMessage) -> Result<Vec<Message>, TranslateEr
     match msg.role.as_str() {
         "user" => translate_user_message(&msg.content),
         "assistant" => Ok(vec![translate_assistant_message(&msg.content)]),
+        // F-170 : `system` est un rôle que la cible sait porter — le préserver.
+        // `as_text()` concatène les blocs texte (cohérent avec le param system top-level).
+        "system" => Ok(vec![Message::system(msg.content.as_text())]),
         other => {
             tracing::warn!(role = %other, "unknown Anthropic role — treated as user");
             translate_user_message(&msg.content)
@@ -2288,6 +2303,162 @@ mod tests {
         assert_eq!(
             result["description"],
             "Schéma avec additionalProperties et prefixItems"
+        );
+    }
+
+    // ─── F-170 — rôle `system` dans le tableau `messages` ─────────────────────
+    //
+    // Contexte : un consommateur interne (convention OpenAI) place un message de
+    // rôle `system` DANS le tableau `messages`. La cible interne connaît ce rôle ;
+    // la traduction doit le préserver au lieu de le rétrograder en `user`.
+    //
+    // Recouvrement de règles (piège du lot) : deux règles cohabitent dans
+    // `translate_message` — (S) `system` → `Role::System`, (O) rôle inconnu →
+    // avertissement + repli sur `user`. Chaque test ci-dessous exerce sa règle
+    // dans le domaine où elle est SEULE à pouvoir se déclencher :
+    //   - règle S : rôle littéral `"system"` ;
+    //   - règle O : rôle authentiquement inconnu (`"developer"`), jamais `"system"`.
+    // Tester la règle O avec `"system"` la masquerait après correction (le rôle
+    // ne tomberait plus dans le bras générique) — piège explicitement évité.
+
+    /// Writer de capture des évènements `tracing` vers un tampon partagé.
+    ///
+    /// Permet d'observer (ou de constater l'absence de) l'avertissement émis par
+    /// `translate_message`, sans dépendance de test supplémentaire.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("mutex de capture non empoisonné en test")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Exécute `f` avec un subscriber `tracing` local capturant WARN+ et retourne
+    /// le texte des logs produits pendant l'appel.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = CaptureWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf
+            .lock()
+            .expect("mutex de capture non empoisonné en test")
+            .clone();
+        String::from_utf8(bytes).expect("logs UTF-8 valides")
+    }
+
+    /// Règle S — un message `system` (texte) est traduit en `Role::System`,
+    /// contenu de cadrage préservé. Sans correction, il tombait en `Role::User`.
+    #[test]
+    fn translate_message_system_role_preserved_as_system() {
+        let msg = AnthropicMessage {
+            role: "system".to_string(),
+            content: AnthropicContent::Text("Tu ne réponds qu'en JSON.".to_string()),
+        };
+
+        let result = translate_message(&msg).expect("traduction system doit réussir");
+
+        assert_eq!(result.len(), 1, "un message system → un message");
+        assert_eq!(
+            result[0].role,
+            Role::System,
+            "le rôle system doit être préservé, pas rétrogradé en user"
+        );
+        assert_eq!(
+            result[0].content,
+            MessageContent::Text("Tu ne réponds qu'en JSON.".to_string()),
+            "le contenu de cadrage doit être préservé tel quel"
+        );
+    }
+
+    /// Règle S (forme blocs) — un message `system` porté par des blocs texte est
+    /// concaténé et préservé en `Role::System`.
+    #[test]
+    fn translate_message_system_role_blocks_preserved_as_system() {
+        let msg = AnthropicMessage {
+            role: "system".to_string(),
+            content: AnthropicContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "Cadre. ".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "Suite.".to_string(),
+                },
+            ]),
+        };
+
+        let result = translate_message(&msg).expect("traduction system blocs doit réussir");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, Role::System);
+        assert_eq!(
+            result[0].content,
+            MessageContent::Text("Cadre. Suite.".to_string()),
+            "les blocs texte du system doivent être concaténés"
+        );
+    }
+
+    /// Critère 2 — après correction, un message `system` ne déclenche plus le bras
+    /// générique : aucun avertissement « unknown Anthropic role ».
+    #[test]
+    fn translate_message_system_role_does_not_warn() {
+        let msg = AnthropicMessage {
+            role: "system".to_string(),
+            content: AnthropicContent::Text("Consigne.".to_string()),
+        };
+
+        let logs = capture_logs(|| {
+            let _ = translate_message(&msg);
+        });
+
+        assert!(
+            !logs.contains("unknown Anthropic role"),
+            "system ne doit plus déclencher l'avertissement, logs: {logs}"
+        );
+    }
+
+    /// Critère 3 — un rôle authentiquement inconnu déclenche TOUJOURS
+    /// l'avertissement ET retombe sur `user` (détecteur préservé, repli préservé).
+    /// Domaine isolé : `"developer"` n'est traité par aucune autre règle.
+    #[test]
+    fn translate_message_unknown_role_still_warns_and_falls_back_to_user() {
+        let msg = AnthropicMessage {
+            role: "developer".to_string(),
+            content: AnthropicContent::Text("Contenu.".to_string()),
+        };
+
+        let logs = capture_logs(|| {
+            let result = translate_message(&msg).expect("repli user doit réussir");
+            assert_eq!(result.len(), 1);
+            assert_eq!(
+                result[0].role,
+                Role::User,
+                "un rôle inconnu retombe sur user (repli préservé)"
+            );
+        });
+
+        assert!(
+            logs.contains("unknown Anthropic role"),
+            "un rôle inconnu doit toujours déclencher l'avertissement, logs: {logs}"
         );
     }
 }

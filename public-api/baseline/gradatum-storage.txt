@@ -7,6 +7,7 @@ pub gradatum_storage::error::StorageError::InvalidPath(std::path::PathBuf)
 pub gradatum_storage::error::StorageError::Io(alloc::string::String)
 pub gradatum_storage::error::StorageError::NotFound(alloc::string::String)
 pub gradatum_storage::error::StorageError::OpenDal(alloc::string::String)
+pub gradatum_storage::error::StorageError::WriteRejected(alloc::string::String)
 pub mod gradatum_storage::factory
 pub fn gradatum_storage::factory::build_storage(&gradatum_core::config::StorageBackendConfig, &std::path::Path) -> core::result::Result<alloc::boxed::Box<dyn gradatum_storage::storage_trait::Storage>, gradatum_storage::error::StorageError>
 pub mod gradatum_storage::file
@@ -51,6 +52,7 @@ pub gradatum_storage::StorageError::InvalidPath(std::path::PathBuf)
 pub gradatum_storage::StorageError::Io(alloc::string::String)
 pub gradatum_storage::StorageError::NotFound(alloc::string::String)
 pub gradatum_storage::StorageError::OpenDal(alloc::string::String)
+pub gradatum_storage::StorageError::WriteRejected(alloc::string::String)
 pub struct gradatum_storage::FileStorage
 impl gradatum_storage::file::FileStorage
 pub fn gradatum_storage::file::FileStorage::new(&std::path::Path) -> core::result::Result<Self, gradatum_storage::error::StorageError>

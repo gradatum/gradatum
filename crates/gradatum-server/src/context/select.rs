@@ -33,9 +33,9 @@
 //! ## Lazy body fetch
 //!
 //! Le corps complet (`body_text`) n'est chargé que pour les notes **retenues** après tri
-//! par score — pas pour tous les candidats. Les métadonnées légères
-//! (`created_ms`, `in_degree`, `trust`, `provenance`) are loaded in the scoring step for
-//! composite score computation.
+//! par score — pas pour tous les candidats. Les métadonnées légères (`created_ms`,
+//! `in_degree`) sont chargées au scoring ; le trust de base est **dérivé de la section** du
+//! candidat (F-261, fonction pure — plus de lecture de la colonne `notes.trust`).
 //!
 //! ## Conformité spec v0.7.0 / v0.7.2
 //!
@@ -101,8 +101,9 @@ fn sort_candidates_by_score_then_ulid(scored: &mut [(Candidate, f64)]) {
 ///
 /// **Scoring** (lightweight metadata):
 /// For each `Candidate`, loads `(created_ms, in_degree)` via
-/// `get_note_created_and_indegree` and `(trust, provenance)` via `get_trust_and_provenance`,
-/// computes `composite_score_weighted(rrf_score, recency, pagerank, trust_params, weights)`.
+/// `get_note_created_and_indegree`, derives the trust params from `candidate.section`
+/// (F-261, `TrustDecayConfig::resolve_for_section` — trust de base par section + decay par
+/// `doc_kind`), computes `composite_score_weighted(rrf_score, recency, pagerank, trust_params, weights)`.
 /// Candidates whose metadata fetch fails are silently ignored (warn log).
 ///
 /// **Inline selection** (lazy body fetch):
@@ -160,8 +161,10 @@ pub async fn select_budget_aware(
 ) -> Result<(Vec<Selected>, Vec<Stub>, u32), GradatumError> {
     // ── Phase 1 : calcul du score composite pour chaque candidat ───────────────
     //
-    // On charge les métadonnées légères (created_ms, in_degree, trust, provenance)
-    // pour calculer le score composite. Les notes absentes ou en erreur sont ignorées.
+    // On charge les métadonnées légères (created_ms, in_degree, section) pour calculer
+    // le score composite — le trust de base est dérivé de la section (F-261, fonction
+    // pure, plus de lecture de la colonne `notes.trust`). Les notes absentes ou en
+    // erreur sont ignorées.
     let mut scored: Vec<(Candidate, f64)> = Vec::with_capacity(candidates.len());
 
     // M-1 (fix recency anchor) : récupérer anchor_ms pour tous les candidats en 1 appel
@@ -185,6 +188,26 @@ pub async fn select_budget_aware(
             std::collections::HashMap::new()
         });
 
+    // F-261 : le trust de base est dérivé de la section du candidat (fonction pure) —
+    // plus de lecture de la colonne `notes.trust`. Le `Candidate` ne porte pas la section,
+    // on la charge en 1 appel SQL batch (même pattern que get_titles_sections). Échec =
+    // section vide → neutre 0.5 + doc_kind Static (comportement actuel), jamais bloquant.
+    let section_map = state
+        .search
+        .get_titles_sections(
+            &crate::api_v1::tenant_guard::own_vault_checked(tenant),
+            &candidate_ids,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                err = %e,
+                count = candidate_ids.len(),
+                "select_budget_aware: get_titles_sections failed — trust neutre"
+            );
+            std::collections::HashMap::new()
+        });
+
     for c in candidates {
         // Récupérer created_ms + in_degree (1 appel SQL léger).
         let (created_ms, in_degree) = match state
@@ -203,17 +226,10 @@ pub async fn select_budget_aware(
             }
         };
 
-        // Récupérer trust + provenance pour le decay trust (default impl retourne (None, None)).
-        let (trust_opt, provenance_opt) = state
-            .search
-            .get_trust_and_provenance(tenant, &c.note_id)
-            .await
-            .unwrap_or((None, None));
-
         // Calculer les facteurs de scoring.
         // M-1 : recency basée sur anchor_ms (date d'événement) avec fallback created_ms.
         // PARITÉ vault_search (F-17) — trust age_days RESTE sur created_ms (concept distinct :
-        // âge d'ingestion pour le decay de provenance, indépendant de la fraîcheur d'événement).
+        // âge d'ingestion pour le decay, indépendant de la fraîcheur d'événement).
         let anchor_ms_for_recency = anchor_ms_map.get(&c.note_id).copied().unwrap_or(created_ms);
         let recency = recency_factor(anchor_ms_for_recency, now_ms);
         let pagerank = pagerank_factor(in_degree);
@@ -221,10 +237,13 @@ pub async fn select_budget_aware(
         // Age en jours pour le decay trust.
         let age_days = ((now_ms - created_ms).max(0) as f64) / 86_400_000.0;
 
-        // Résoudre trust_params depuis la configuration de scoring de l'app.
-        let trust_params = state
-            .scoring
-            .resolve(trust_opt, provenance_opt.as_deref(), age_days);
+        // F-261 : trust dérivé de la section (lookup batch `section_map` ci-dessus). Section
+        // inconnue/vide → neutre 0.5 + doc_kind Static (comportement actuel de la population).
+        let section = section_map
+            .get(&c.note_id)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
+        let trust_params = state.scoring.resolve_for_section(&section, age_days);
 
         // Score composite pondéré (P0-2 : forme multiplicative, parité bit-pour-bit avec défauts).
         let score = composite_score_weighted(c.rrf_score, recency, pagerank, trust_params, weights);

@@ -78,6 +78,9 @@ nix               = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio      = { workspace = true, features = ["full"] }
+# F-190 : tests/env_is_not_a_config_source.rs écrit une config de fixture dans un
+# répertoire temporaire supprimé au drop.
+tempfile.workspace = true
 serde_json.workspace = true
 axum.workspace = true
 tower      = { workspace = true, features = ["util"] }

@@ -52,6 +52,63 @@ async fn write_note_upserts_content_hash_in_index() {
     );
 }
 
+/// F-165 — le chemin d'écriture d'une note DOIT alimenter `file_checksums`,
+/// seule source d'énumération du scan de dérive (`scan_phase_a`). Sans cet upsert
+/// la table reste vide et la détection de drift est inerte (régression v1.0.0).
+///
+/// Oracle indépendant : on relit les bytes réellement écrits sur disque et on
+/// recalcule taille + SHA-256 (préfixe 4 Ko et complet) avec `sha2` directement —
+/// sans réutiliser les helpers du code testé (anti test auto-référentiel).
+#[tokio::test]
+async fn write_note_upserts_file_checksum_in_index() {
+    use sha2::Digest as _;
+
+    let dir = TempDir::new().unwrap();
+    let vault = Vault::create(dir.path(), VaultId::new("main"))
+        .await
+        .unwrap();
+
+    let fm = build_minimal_frontmatter();
+    let note = vault
+        .write_note(fm, "body drift checksum".into())
+        .await
+        .unwrap();
+
+    // Chemin relatif on-disk du .md sans locus : <tenant>/<id>.md
+    let rel_path = format!("main/{}.md", note.id);
+
+    // Oracle : bytes réellement persistés sur disque.
+    let md_bytes = std::fs::read(dir.path().join(&rel_path)).unwrap();
+    let expected_size = md_bytes.len() as u64;
+    let expected_full: [u8; 32] = sha2::Sha256::digest(&md_bytes).into();
+    let prefix_len = md_bytes.len().min(4096);
+    let expected_prefix: [u8; 32] = sha2::Sha256::digest(&md_bytes[..prefix_len]).into();
+
+    let entries = vault.index().list_file_checksums().await.unwrap();
+    let entry = entries
+        .iter()
+        .find(|e| e.relative_path == rel_path)
+        .expect("file_checksums doit contenir une entrée pour la note écrite (F-165)");
+
+    assert_eq!(
+        entry.file_kind,
+        gradatum_core::index::FileKind::Note,
+        "file_kind doit être Note"
+    );
+    assert_eq!(
+        entry.expected_size, expected_size,
+        "expected_size doit être la taille du .md sur disque"
+    );
+    assert_eq!(
+        entry.expected_hash, expected_full,
+        "expected_hash doit être le SHA-256 complet du .md sur disque"
+    );
+    assert_eq!(
+        entry.expected_hash_prefix_4kb, expected_prefix,
+        "expected_hash_prefix_4kb doit être le SHA-256 des 4 premiers Ko"
+    );
+}
+
 #[tokio::test]
 async fn write_note_content_hash_integrity() {
     let dir = TempDir::new().unwrap();

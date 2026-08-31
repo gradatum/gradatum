@@ -36,9 +36,8 @@ use axum::http::{Request, StatusCode};
 use axum::{Router, middleware};
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::TokenScope;
-use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
 use gradatum_server::{api_v1, middleware::auth_middleware, state::AppState};
-use sqlx::SqlitePool;
 use std::sync::Arc;
 use tower::ServiceExt;
 use ulid::Ulid;
@@ -94,17 +93,17 @@ fn test_token(state: &AppState) -> String {
 ///
 /// Distinct de `test_pool()` dans `queue_store_sqlite.rs` — ce helper est
 /// public pour être partagé entre les tests d'intégration du crate server.
-async fn make_test_pool() -> SqlitePool {
-    let pool = SqlitePool::connect("sqlite::memory:")
+async fn make_test_db() -> QueueDb {
+    let db = QueueDb::open_in_memory()
         .await
-        .expect("pool in-memory invariant");
-    apply_sqlite_pragmas(&pool)
+        .expect("db in-memory invariant");
+    apply_sqlite_pragmas(&db)
         .await
         .expect("pragmas WAL invariant");
-    run_migrations(&pool)
+    run_migrations(&db)
         .await
         .expect("migrations 006+007+008 invariant");
-    pool
+    db
 }
 
 /// Construit un `AppState` de test avec `SqliteQueueStore` in-memory + auth de test.
@@ -112,17 +111,17 @@ async fn make_test_pool() -> SqlitePool {
 /// Injecte `job_store` et `jobs_pool` via `with_job_store`, puis remplace l'ACL
 /// deny-all par le preset autorisant `jobs-tester` (fix authz F-16).
 async fn build_state_with_job_store() -> AppState {
-    let pool = make_test_pool().await;
-    let store = Arc::new(SqliteQueueStore::new(pool.clone()));
-    with_test_auth(AppState::new().with_job_store(store, pool))
+    let db = make_test_db().await;
+    let store = Arc::new(SqliteQueueStore::new(db.clone()));
+    with_test_auth(AppState::new().with_job_store(store, db))
 }
 
 /// Construit un `AppState` de test avec un store déjà câblé + auth de test.
 ///
 /// Variante de [`build_state_with_job_store`] pour les tests qui pré-remplissent
 /// le store (enqueue/dequeue) avant de construire le state.
-fn state_with_store(store: Arc<SqliteQueueStore>, pool: SqlitePool) -> AppState {
-    with_test_auth(AppState::new().with_job_store(store, pool))
+fn state_with_store(store: Arc<SqliteQueueStore>, db: QueueDb) -> AppState {
+    with_test_auth(AppState::new().with_job_store(store, db))
 }
 
 /// Construit le routeur de test avec `auth_middleware` actif.
@@ -351,8 +350,8 @@ async fn cancel_job_not_found() {
 async fn cancel_job_conflict_running() {
     use gradatum_core::QueueStore;
 
-    let pool = make_test_pool().await;
-    let store = Arc::new(SqliteQueueStore::new(pool.clone()));
+    let db = make_test_db().await;
+    let store = Arc::new(SqliteQueueStore::new(db.clone()));
 
     // Enqueue un job puis le dequeue (le met en Running)
     let record = make_test_job();
@@ -372,7 +371,7 @@ async fn cancel_job_conflict_running() {
         "job doit être Running après dequeue"
     );
 
-    let state = state_with_store(store, pool);
+    let state = state_with_store(store, db);
     let token = test_token(&state);
     let router = build_router(state);
 
@@ -402,8 +401,8 @@ async fn cancel_job_conflict_running() {
 async fn e12_regression_get_after_dequeue() {
     use gradatum_core::QueueStore;
 
-    let pool = make_test_pool().await;
-    let store = Arc::new(SqliteQueueStore::new(pool.clone()));
+    let db = make_test_db().await;
+    let store = Arc::new(SqliteQueueStore::new(db.clone()));
 
     let record = make_test_job();
     let job_id = store.enqueue(record).await.expect("enqueue E-12 test");
@@ -411,7 +410,7 @@ async fn e12_regression_get_after_dequeue() {
     // Dequeue met le statut SQL en Running MAIS le payload BLOB reste Pending (optimisation)
     let _ = store.dequeue(None).await.expect("dequeue E-12 test");
 
-    let state = state_with_store(store, pool);
+    let state = state_with_store(store, db);
     let token = test_token(&state);
     let router = build_router(state);
 
@@ -448,8 +447,8 @@ async fn e12_regression_get_after_dequeue() {
 async fn list_jobs_cursor_pagination() {
     use gradatum_core::QueueStore;
 
-    let pool = make_test_pool().await;
-    let store = Arc::new(SqliteQueueStore::new(pool.clone()));
+    let db = make_test_db().await;
+    let store = Arc::new(SqliteQueueStore::new(db.clone()));
 
     // Insère 5 jobs
     let mut ids = Vec::new();
@@ -461,7 +460,7 @@ async fn list_jobs_cursor_pagination() {
         ids.push(id);
     }
 
-    let state = state_with_store(store, pool);
+    let state = state_with_store(store, db);
     let token = test_token(&state);
     let router = build_router(state);
 
@@ -527,8 +526,8 @@ async fn list_jobs_cursor_pagination() {
 async fn list_jobs_filter_status() {
     use gradatum_core::{JobResult, QueueStore};
 
-    let pool = make_test_pool().await;
-    let store = Arc::new(SqliteQueueStore::new(pool.clone()));
+    let db = make_test_db().await;
+    let store = Arc::new(SqliteQueueStore::new(db.clone()));
 
     // Insère 3 jobs Pending
     for _ in 0..3 {
@@ -553,7 +552,7 @@ async fn list_jobs_filter_status() {
             .expect("complete filter test");
     }
 
-    let state = state_with_store(store, pool);
+    let state = state_with_store(store, db);
     let token = test_token(&state);
     let router = build_router(state);
 
@@ -593,8 +592,8 @@ async fn list_jobs_filter_status() {
 
     // Note : router consommé par oneshot — créer un nouveau pool pour ce sous-test
     // (le state a déjà été consommé, tester via le store directement)
-    let pool2 = make_test_pool().await;
-    let store2 = Arc::new(SqliteQueueStore::new(pool2.clone()));
+    let db2 = make_test_db().await;
+    let store2 = Arc::new(SqliteQueueStore::new(db2.clone()));
     // Réinsère et complète pour ce sous-test
     for _ in 0..2 {
         store2
@@ -621,7 +620,7 @@ async fn list_jobs_filter_status() {
         .await
         .expect("complete done test");
 
-    let state2 = state_with_store(store2, pool2);
+    let state2 = state_with_store(store2, db2);
     let token2 = test_token(&state2);
     let router2 = build_router(state2);
     let req_done = with_bearer(
@@ -663,8 +662,8 @@ async fn list_jobs_order_desc_newest_first() {
     use chrono::{Duration, Utc};
     use gradatum_core::QueueStore;
 
-    let pool = make_test_pool().await;
-    let store = Arc::new(SqliteQueueStore::new(pool.clone()));
+    let db = make_test_db().await;
+    let store = Arc::new(SqliteQueueStore::new(db.clone()));
 
     // 7 jobs à T+0..6 minutes → ids[6] le plus récent.
     let base = Utc::now() - Duration::hours(1);
@@ -675,7 +674,7 @@ async fn list_jobs_order_desc_newest_first() {
         store.enqueue(r).await.expect("enqueue order desc");
     }
 
-    let state = state_with_store(store, pool);
+    let state = state_with_store(store, db);
     let token = test_token(&state);
     let router = build_router(state);
 
@@ -720,8 +719,8 @@ async fn list_jobs_created_range() {
     use chrono::{Duration, Utc};
     use gradatum_core::QueueStore;
 
-    let pool = make_test_pool().await;
-    let store = Arc::new(SqliteQueueStore::new(pool.clone()));
+    let db = make_test_db().await;
+    let store = Arc::new(SqliteQueueStore::new(db.clone()));
 
     // 4 jobs à T+0,1,2,3 minutes.
     let base = Utc::now() - Duration::hours(2);
@@ -735,7 +734,7 @@ async fn list_jobs_created_range() {
         store.enqueue(r).await.expect("enqueue range");
     }
 
-    let state = state_with_store(store, pool);
+    let state = state_with_store(store, db);
     let token = test_token(&state);
     let router = build_router(state);
 

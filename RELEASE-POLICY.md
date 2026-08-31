@@ -21,11 +21,11 @@
 
 **SemVer alignment:** every published crate follows SemVer 2.0.0. The umbrella `gradatum` crate aligns with the highest-precedence breaking change among its re-exports.
 
-**In this concrete instance, the `1.x` LTS branch was closed early.** Rather than following
-the quarterly-minor / monthly-patch cadence in the table above, `1.x` receives a single final
-security fix, `1.0.3`, and is then closed — see [`SECURITY.md`](SECURITY.md) § Supported
+**In this concrete instance, the `1.x` LTS branch was closed early, without a final security
+fix.** Rather than following the quarterly-minor / monthly-patch cadence in the table above,
+`1.x` was closed directly after `1.0.0` — see [`SECURITY.md`](SECURITY.md) § Supported
 versions. The cadence above is the general policy for an LTS branch that is kept open; it was
-not exercised past `1.0.3` for `1.x`.
+never exercised for `1.x`.
 
 ### Codename triggers (`2.0+`)
 
@@ -41,6 +41,25 @@ A codename is assigned only when at least one of the following objective signals
 
 Codenames are taken from a published list in `CODENAMES.md` (created once `1.0` ships).
 
+
+### Tag namespaces
+
+Two disjoint tag namespaces exist in this repository.
+
+- **Public release tags** — `v{version}` (e.g. `v2.0.0`). Pushing one is an *event*, not a
+  label: it starts both release pipelines, including the one that emits the CycloneDX SBOM and
+  the SLSA build provenance attestation. Never create a `v*` tag for anything that is not going
+  to the public repository and crates.io.
+- **Internal milestones** — `internal/{version}` (e.g. `internal/2.0.6`). These name an
+  increment deployed on the maintainer's own fleet without publishing it. They match no `v*`
+  trigger, so they start no pipeline, and they are never pushed to the public repository.
+
+**Why the two must stay disjoint.** A CI consistency check rejects any `vX.Y.Z` cited anywhere
+in the documentation that has neither a `## [X.Y.Z]` CHANGELOG section nor a matching git tag —
+either one suffices. Its comparison is a whole-line match, so an `internal/` tag never satisfies
+it on behalf of a `v` version: an internal milestone cannot make an unpublished version look
+shipped. That is the property this check exists to hold, and tagging an unpublished version
+`vX.Y.Z` would silently destroy it.
 ---
 
 ## Anti-fragility measures (AM1–AM4)
@@ -74,6 +93,28 @@ signatures changed in a breaking way, directly, without a tracked feature card o
 cycle, because none of them carries a posted tier. Once a trait is tagged
 `#[stability::stable]`, breaking it is held to the full promise — major, feature card, and one
 full cycle of deprecation before removal.
+
+> **Dérogation, actée le 2026-08-22.** La ligne 2.x tolère une rupture de surface publique en
+> version **mineure** aux trois conditions cumulatives suivantes : (1) le symbole rompu figure
+> nommément dans `semver_deviations` du manifeste de release, avec sa carte d'origine ; (2) le
+> guide de migration de la version le documente ; (3) le journal des changements l'énumère. Une
+> rupture qui ne remplit pas les trois est refusée par la chaîne, quel que soit le rang. Sur un
+> rang de **correctif**, aucune dérogation n'est admise. Le rang est dérivé et croisé par
+> `scripts/internal/resolve-release-rank.sh` ; l'appariement rupture <-> inventaire par
+> `scripts/internal/check-deviation-match.py` (couple `lint`+`rendered`).
+
+> **Dérogation, actée le 2026-08-23 : refus de préavis machine `#[deprecated]`.** Les symboles
+> retirés en `2.1.0` ne reçoivent **aucun préavis machine** `#[deprecated]` dans une version
+> antérieure — en particulier, aucune version `2.0.10` de dépréciations n'est publiée pour ce
+> jalon. Raison retenue : publier un préavis exigerait un cycle de release public complet (les
+> 10 portes de `safety-release-guard`, sur les 26 crates publiées) pour un avertissement
+> compilateur qui ne bénéficie qu'au consommateur exécutant `cargo update` dans l'intervalle
+> entre les deux versions — le coût opérationnel excède le bénéfice pour cette rupture précise.
+> Compensation actée en échange, et qui reste **obligatoire** pour `2.1.0` : le guide et le
+> script de migration publics (carte F-249). Cette dérogation s'ajoute aux trois conditions
+> cumulatives ci-dessus, elle ne les remplace pas — un symbole retiré sans préavis machine doit
+> toujours figurer nommément dans `semver_deviations`, dans le guide de migration, et dans
+> `CHANGELOG.md`.
 
 **Detailed decision-matrix rules, deprecation-cycle examples, and Cargo-feature mechanics for
 this tiering scheme** were drafted in a design RFC that predates project-map feature-card
@@ -109,8 +150,9 @@ Two caveats apply to that list:
 - `gradatum-cli` is **no longer published from this workspace** — it carries
   `publish = false`. The name stays reserved and its last published version remains on
   crates.io; the crate is not part of the release train.
-- `gradatum-studio` is published only as a `0.0.2` placeholder. The real crate is built and
-  served from this workspace but has not yet been released to crates.io.
+- `gradatum-studio` is published on crates.io. The early `0.0.x` versions were placeholders;
+  the crate now ships the real, built UI bundle, with its published version tracking the
+  workspace release.
 - `gradatum-mcp-stub` is **retired from the distribution as of `2.0.0`** — `publish = false`,
   no longer built or shipped. Its last published crates.io version remains `1.0.0`. The name
   stays reserved; source is kept in-tree (see [`ARCHITECTURE.md`](ARCHITECTURE.md) § API

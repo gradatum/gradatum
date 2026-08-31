@@ -34,11 +34,10 @@ use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::{JwtService, TokenScope};
 use gradatum_core::index::Index;
 use gradatum_core::trust::TrustContext;
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 use gradatum_index::SqliteIndex;
 use gradatum_server::{api_v1, state::AppState};
 use http_body_util::BodyExt;
-use sqlx::sqlite::SqlitePoolOptions;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use ulid::Ulid;
@@ -203,9 +202,7 @@ async fn build_base(acl: AclEngine) -> (AppState, Arc<SqliteIndex>) {
             .expect("SqliteIndex::open_in_memory — identity_section"),
     );
 
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory — identity_section");
     run_migrations(&jobs_pool)

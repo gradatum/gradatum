@@ -273,11 +273,18 @@ gradatum_url = "http://127.0.0.1:19090"
 extra_args = []
 ```
 
-Environment variable overrides are supported with the prefix `GRADATUM_ENGINE_`:
+**The TOML file is the only configuration source.** `gradatum-engine` reads nothing
+from the environment: there is no `GRADATUM_ENGINE_*` override for any `[engine]` field.
+To change a port, a model path or a flag, edit the TOML file and restart the unit.
 
-```bash
-GRADATUM_ENGINE_GPU_LAYERS=99 GRADATUM_ENGINE_N_THREADS=16 gradatum-engine /etc/gradatum/conf.d/70-engine-chat.toml
-```
+> Earlier revisions of this page advertised a `GRADATUM_ENGINE_` override prefix. It never
+> worked — no variable of that prefix ever reached a field — and it was removed in
+> 2026-08 (F-190) rather than wired: the prefix is already carrying a credential
+> (`GRADATUM_ENGINE_API_KEY`, delivered by the unit's `EnvironmentFile=`), and giving it a
+> second meaning would route a secret through the configuration parser. If you have such
+> variables set anywhere, they are inert for configuration — except
+> `GRADATUM_ENGINE_API_KEY`, which is read directly by the binary as the event-log
+> credential.
 
 Note: unlike `gradatum-server`/`gradatum-worker` (which take `--config PATH`),
 `gradatum-engine` takes the config path as a **positional** argument — there is

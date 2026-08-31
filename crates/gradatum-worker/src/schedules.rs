@@ -24,7 +24,8 @@ use std::time::Duration;
 use apalis::prelude::{BoxDynError, Data};
 use apalis_cron::Tick;
 use chrono::Utc;
-use sqlx::SqlitePool;
+use gradatum_db_sqlite::{QueueDb, idempotency_cleanup};
+use rusqlite::params;
 use tracing::{error, info, warn};
 
 use gradatum_core::{
@@ -32,7 +33,6 @@ use gradatum_core::{
     JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, QueueError, QueueStore,
     TriggerSource,
 };
-use gradatum_db_sqlite::idempotency_cleanup;
 
 use crate::internal_client::InternalClient;
 use crate::metrics::WorkerMetrics;
@@ -109,6 +109,13 @@ where
 /// **Off by default**: with `enabled = false` the cron worker is not registered at all
 /// (see `build_monitor`) AND the handler is a no-op — two independent defences. Turning it
 /// on at runtime is a separate operator decision.
+///
+/// **Inert without `sections`**: the section list defaults to **empty**. An empty list is
+/// a legitimate state — "no section targeted, cron inert" — and must never fall back to a
+/// hard-coded section set: a default pointing at real sections would flip the pressure
+/// from 0 to a live value on the first deploy and enqueue jobs that write to the
+/// production vault, without any human deciding it. An operator who wants the cron to act
+/// must configure `sections = ["…"]` explicitly.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct DistillCronConfig {
     /// Enables the cron. Defaults to `false`: no job emitted, no count call issued.
@@ -124,10 +131,17 @@ pub struct DistillCronConfig {
     /// Defaults to `"0 0 4 * * Sun"` — weekly, Sunday at 04:00.
     #[serde(default = "DistillCronConfig::default_cron")]
     pub cron: String,
-    /// Consolidatable sections, in consolidation priority order.
-    #[serde(default = "DistillCronConfig::default_loci")]
-    pub loci: Vec<String>,
-    /// Minimum pressure (live, non-`processed` notes per locus) that triggers a
+    /// Canonical sections targeted for consolidation, in priority order.
+    ///
+    /// **Defaults to empty** — the cron is then registered but **inert**: it performs no
+    /// count call and enqueues nothing (an explicit, logged no-op). This is the safe
+    /// default: the values that used to ship here (`debug`, `experiments`, `reference`)
+    /// are live section names, and silently defaulting to them would make the first
+    /// deploy measure real pressure and enqueue production-writing jobs without an
+    /// operator decision. `sections = ["…"]` is an explicit opt-in.
+    #[serde(default = "DistillCronConfig::default_sections")]
+    pub sections: Vec<String>,
+    /// Minimum pressure (live, non-`processed` notes per section) that triggers a
     /// `Job::Distill`. Must be 1 or more.
     #[serde(default = "DistillCronConfig::default_pressure_min")]
     pub pressure_min: u64,
@@ -141,12 +155,8 @@ impl DistillCronConfig {
         "0 0 4 * * Sun".to_string()
     }
 
-    fn default_loci() -> Vec<String> {
-        vec![
-            "debug".to_string(),
-            "experiments".to_string(),
-            "reference".to_string(),
-        ]
+    fn default_sections() -> Vec<String> {
+        vec![]
     }
 
     fn default_pressure_min() -> u64 {
@@ -174,11 +184,15 @@ impl DistillCronConfig {
     /// Fail-loud configuration validation, called from `build_monitor` and propagated
     /// with `?` — an invalid TOML prevents the worker from booting.
     ///
+    /// An **empty** `sections` list is valid: it is the legitimate "cron inert, no section
+    /// targeted" state (the safe default). The other rules stay strict: unparseable cron,
+    /// `pressure_min = 0`, `max_jobs_per_tick = 0`, or a `sections` list containing a
+    /// duplicate are refused.
+    ///
     /// # Errors
     ///
     /// A message describing the first invalid field: unparseable cron,
-    /// `pressure_min = 0`, `max_jobs_per_tick = 0`, or a `loci` list that is empty or
-    /// contains a duplicate.
+    /// `pressure_min = 0`, `max_jobs_per_tick = 0`, or a duplicate section.
     pub fn validate(&self) -> Result<(), String> {
         self.schedule()?;
         if self.pressure_min == 0 {
@@ -187,13 +201,10 @@ impl DistillCronConfig {
         if self.max_jobs_per_tick == 0 {
             return Err("max_jobs_per_tick must be ≥ 1".to_string());
         }
-        if self.loci.is_empty() {
-            return Err("loci must not be empty".to_string());
-        }
         let mut seen = std::collections::HashSet::new();
-        for locus in &self.loci {
-            if !seen.insert(locus.as_str()) {
-                return Err(format!("loci contient un doublon : {locus:?}"));
+        for section in &self.sections {
+            if !seen.insert(section.as_str()) {
+                return Err(format!("sections contient un doublon : {section:?}"));
             }
         }
         Ok(())
@@ -205,7 +216,7 @@ impl Default for DistillCronConfig {
         Self {
             enabled: false,
             cron: Self::default_cron(),
-            loci: Self::default_loci(),
+            sections: Self::default_sections(),
             pressure_min: Self::default_pressure_min(),
             max_jobs_per_tick: Self::default_max_jobs_per_tick(),
         }
@@ -214,19 +225,23 @@ impl Default for DistillCronConfig {
 
 /// Pure tick planning for the conditional distill cron.
 ///
-/// `pressures` = measured pressure per locus in CONFIG order (`None` = count failed,
-/// skipped best-effort). `busy_loci` = loci with a Distill job already queued/running.
-/// Returns the loci to enqueue, config order, capped at `max_jobs_per_tick`.
+/// `pressures` = measured pressure per section in CONFIG order (`None` = count failed,
+/// skipped best-effort). `busy_sections` = sections with a Distill job already
+/// queued/running. Returns the sections to enqueue, config order, capped at
+/// `max_jobs_per_tick`.
 #[must_use]
 pub fn plan_distill_tick(
     pressures: &[(String, Option<u64>)],
-    busy_loci: &[String],
+    busy_sections: &[String],
     cfg: &DistillCronConfig,
 ) -> Vec<String> {
     pressures
         .iter()
-        .filter(|(locus, _)| !busy_loci.contains(locus))
-        .filter_map(|(locus, p)| p.filter(|&n| n >= cfg.pressure_min).map(|_| locus.clone()))
+        .filter(|(section, _)| !busy_sections.contains(section))
+        .filter_map(|(section, p)| {
+            p.filter(|&n| n >= cfg.pressure_min)
+                .map(|_| section.clone())
+        })
         .take(cfg.max_jobs_per_tick)
         .collect()
 }
@@ -242,8 +257,8 @@ pub fn plan_distill_tick(
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct CronHandlerCtx {
-    /// SQLite pool for cleanup operations.
-    pub pool: Arc<SqlitePool>,
+    /// SQLite database handle for cleanup operations.
+    pub db: QueueDb,
     /// DLQ retention in days.
     pub dlq_retention_days: u32,
 }
@@ -274,26 +289,27 @@ pub struct CronHandlerCtx {
 /// to `Duration::days`. Treat this value as a destructive configuration knob.
 pub async fn handle_cleanup_dlq(
     _tick: Tick<Utc>,
-    pool: Data<Arc<SqlitePool>>,
+    db: Data<QueueDb>,
     retention: Data<u32>,
 ) -> Result<(), BoxDynError> {
     let cutoff = Utc::now() - chrono::Duration::days(*retention as i64);
     let cutoff_str = cutoff.to_rfc3339();
 
-    let result = sqlx::query(
-        r#"
-        DELETE FROM gradatum_jobs
-        WHERE status = 'DLQ'
-          AND COALESCE(completed_at, created_at) < ?
-        "#,
-    )
-    .bind(&cutoff_str)
-    .execute(pool.as_ref())
-    .await;
+    let result = db
+        .with_conn(move |conn| {
+            conn.execute(
+                r#"
+                DELETE FROM gradatum_jobs
+                WHERE status = 'DLQ'
+                  AND COALESCE(completed_at, created_at) < ?1
+                "#,
+                params![cutoff_str],
+            )
+        })
+        .await;
 
     match result {
-        Ok(res) => {
-            let deleted = res.rows_affected();
+        Ok(deleted) => {
             if deleted > 0 {
                 info!(
                     deleted = deleted,
@@ -319,22 +335,22 @@ pub async fn handle_cleanup_dlq(
 
 /// Builds a [`JobRecord`] for a conditional distill cron enqueue.
 ///
-/// - `Job::Distill(DistillSource { mode: Semantic, scope: Locus(locus), .. })` —
+/// - `Job::Distill(DistillSource { mode: Semantic, scope: Section(section), .. })` —
 ///   batch defaults (`batch_limit = 500`, `confidence_threshold = 0.75`) reused as-is.
 /// - `JobClass::System` + `JobPriority::Low` — autonomous background cron that must
 ///   never block agent jobs.
-/// - `JobSpec.scope = Locus(locus)` too: the `Locus`-only rule (never `VaultWide`) holds
+/// - `JobSpec.scope = Section(section)` too: a section-scoped job (never `VaultWide`)
 ///   on BOTH the internal `DistillSource.scope` and the outer `JobSpec.scope`.
 /// - `JobMode::Batch`, `await_jobs` empty (no cascade dependency).
 ///
 /// When `multi_tenant_enabled` is `true`, the OUTER `JobSpec.scope` instead carries
 /// `Vault(tenant_id)`, since the distill handler resolves its vault from that scope; the
-/// locus stays on `DistillSource.scope`, which is what both the handler and the
+/// section stays on `DistillSource.scope`, which is what both the handler and the
 /// `read_busy_distill_loci` dedup read. When the flag is off, the outer scope remains
-/// `Locus(locus)`, byte-for-byte identical to the single-vault behaviour.
+/// `Section(section)`, byte-for-byte identical to the single-vault behaviour.
 #[must_use]
 pub fn build_distill_job_record(
-    locus: &str,
+    section: &str,
     tenant_id: &str,
     multi_tenant_enabled: bool,
 ) -> JobRecord {
@@ -342,13 +358,13 @@ pub fn build_distill_job_record(
     let outer_scope = if multi_tenant_enabled {
         JobScope::Vault(tenant_id.to_string())
     } else {
-        JobScope::Locus(locus.to_string())
+        JobScope::Section(section.to_string())
     };
     JobRecord {
         id: ulid::Ulid::generate(),
         spec: JobSpec {
             kind: Job::Distill(DistillSource {
-                scope: JobScope::Locus(locus.to_string()),
+                scope: JobScope::Section(section.to_string()),
                 ..DistillSource::default()
             }),
             class: JobClass::System,
@@ -385,13 +401,14 @@ pub fn build_distill_job_record(
     }
 }
 
-/// Lists loci that already have an in-flight (`Pending`/`Running`/`Waiting`) `Distill`
+/// Lists sections that already have an in-flight (`Pending`/`Running`/`Waiting`) `Distill`
 /// job, for the distill cron dedup.
 ///
-/// The locus is read from the INTERNAL `DistillSource.scope` (`Job::Distill(src) →
+/// The section is read from the INTERNAL `DistillSource.scope` (`Job::Distill(src) →
 /// src.scope`) — the field the distill handler actually consumes — never
-/// `JobSpec.scope`. Non-`Locus` scopes (e.g. `Notes`, `VaultWide`) carry no single
-/// locus and are ignored for dedup.
+/// `JobSpec.scope`. Both `Section(s)` and (legacy) `Locus(l)` scopes are recognised, so a
+/// job enqueued before or after the section switch dedups against the same axis; scopes
+/// carrying no single consolidation target (e.g. `Notes`, `VaultWide`) are ignored.
 ///
 /// # Errors
 ///
@@ -409,6 +426,10 @@ async fn read_busy_distill_loci(store: &dyn QueueStore) -> Result<Vec<String>, Q
         };
         for record in store.list(filter).await? {
             if let Job::Distill(src) = &record.spec.kind
+                && let JobScope::Section(section) = &src.scope
+            {
+                busy.push(section.clone());
+            } else if let Job::Distill(src) = &record.spec.kind
                 && let JobScope::Locus(locus) = &src.scope
             {
                 busy.push(locus.clone());
@@ -421,18 +442,19 @@ async fn read_busy_distill_loci(store: &dyn QueueStore) -> Result<Vec<String>, Q
 /// Core logic of the distill cron tick, decoupled from apalis `Data` injection
 /// for testability (I/O provided as closures).
 ///
-/// Flow: `enabled=false` → no-op · read busy loci (**fail-CLOSED**: read error aborts
-/// the whole tick) · measure pressure per locus (best-effort: a `None` count skips the
-/// locus) · [`plan_distill_tick`] decides · enqueue each retained locus · `on_enqueued`
-/// per successful enqueue.
+/// Flow: `enabled=false` → no-op · `sections` empty → no-op journalisé (cron inerte) ·
+/// read busy sections (**fail-CLOSED**: read error aborts the whole tick) · measure
+/// pressure per section (best-effort: a `None` count skips the section) ·
+/// [`plan_distill_tick`] decides · enqueue each retained section · `on_enqueued` per
+/// successful enqueue.
 ///
 /// The `enabled=false` no-op is defence in depth — the worker is not even registered
 /// when disabled (see `build_monitor`).
 async fn distill_cron_tick<FB, RB, FC, RC, FE, RE, FM>(
     cfg: &DistillCronConfig,
     read_busy: FB,
-    count_locus: FC,
-    enqueue_locus: FE,
+    count_section: FC,
+    enqueue_section: FE,
     on_enqueued: FM,
 ) where
     FB: FnOnce() -> RB,
@@ -448,25 +470,35 @@ async fn distill_cron_tick<FB, RB, FC, RC, FE, RE, FM>(
         return;
     }
 
-    // 1. Dédup fail-CLOSED (P1-2) : échec de lecture des loci occupés ⇒ tick abandonné.
-    let busy_loci = match read_busy().await {
-        Ok(loci) => loci,
+    // Une liste de sections VIDE est un état légitime — « aucune section visée, cron
+    // inerte ». No-op explicite ET journalisé : un vide silencieux se relirait comme une
+    // panne six mois plus tard (exactement le défaut diagnostiqué sur le locus NULL).
+    if cfg.sections.is_empty() {
+        info!(
+            "distill_pressure cron: no section targeted (empty sections) — cron inert, tick no-op"
+        );
+        return;
+    }
+
+    // 1. Dédup fail-CLOSED (P1-2) : échec de lecture des sections occupées ⇒ tick abandonné.
+    let busy_sections = match read_busy().await {
+        Ok(sections) => sections,
         Err(()) => {
-            warn!("distill_pressure cron: busy-loci read failed — tick aborted (fail-closed)");
+            warn!("distill_pressure cron: busy-sections read failed — tick aborted (fail-closed)");
             return;
         }
     };
 
-    // 2. Pression par locus (best-effort : comptage en échec ⇒ None ⇒ locus ignoré).
-    let mut pressures: Vec<(String, Option<u64>)> = Vec::with_capacity(cfg.loci.len());
-    for locus in &cfg.loci {
-        let pressure = count_locus(locus.clone()).await;
-        pressures.push((locus.clone(), pressure));
+    // 2. Pression par section (best-effort : comptage en échec ⇒ None ⇒ section ignorée).
+    let mut pressures: Vec<(String, Option<u64>)> = Vec::with_capacity(cfg.sections.len());
+    for section in &cfg.sections {
+        let pressure = count_section(section.clone()).await;
+        pressures.push((section.clone(), pressure));
     }
 
     // 3. Décision pure (seuil, cap, dédup) puis enqueue.
-    for locus in plan_distill_tick(&pressures, &busy_loci, cfg) {
-        if enqueue_locus(locus).await.is_ok() {
+    for section in plan_distill_tick(&pressures, &busy_sections, cfg) {
+        if enqueue_section(section).await.is_ok() {
             on_enqueued();
         }
     }
@@ -474,8 +506,8 @@ async fn distill_cron_tick<FB, RB, FC, RC, FE, RE, FM>(
 
 /// Cron handler for the conditional distill pressure sweep.
 ///
-/// Wires `distill_cron_tick` to the injected [`InternalClient`] (per-locus count),
-/// [`QueueStore`] (busy-loci read + enqueue) and [`WorkerMetrics`] (enqueue counter).
+/// Wires `distill_cron_tick` to the injected [`InternalClient`] (per-section count),
+/// [`QueueStore`] (busy-sections read + enqueue) and [`WorkerMetrics`] (enqueue counter).
 ///
 /// Vault iteration follows the multi-vault flag: when it is off, the single vault
 /// `"main"` is swept with no network call; when it is on, the handler iterates over the
@@ -519,34 +551,34 @@ pub async fn handle_distill_cron(
             cfg_ref,
             || async {
                 read_busy_distill_loci(queue_ref).await.map_err(|e| {
-                    warn!(error = %e, "distill_pressure cron: busy-loci read failed");
+                    warn!(error = %e, "distill_pressure cron: busy-sections read failed");
                 })
             },
-            |locus| async move {
+            |section| async move {
                 match client_ref
-                    .count_unprocessed(vault_id, &locus, cfg_ref.pressure_min)
+                    .count_unprocessed(vault_id, &section, cfg_ref.pressure_min)
                     .await
                 {
                     Ok(n) => Some(n),
                     Err(e) => {
-                        warn!(locus = %locus, error = %e,
-                        "distill_pressure cron: count failed — skipping locus (best-effort)");
+                        warn!(section = %section, error = %e,
+                        "distill_pressure cron: count failed — skipping section (best-effort)");
                         None
                     }
                 }
             },
-            |locus| async move {
+            |section| async move {
                 match queue_ref
-                    .enqueue(build_distill_job_record(&locus, vault_id, multi_enabled))
+                    .enqueue(build_distill_job_record(&section, vault_id, multi_enabled))
                     .await
                 {
                     Ok(job_id) => {
-                        info!(locus = %locus, vault_id = %vault_id, job_id = %job_id,
+                        info!(section = %section, vault_id = %vault_id, job_id = %job_id,
                         "distill_pressure cron: Distill job enqueued");
                         Ok(())
                     }
                     Err(e) => {
-                        warn!(locus = %locus, error = %e,
+                        warn!(section = %section, error = %e,
                         "distill_pressure cron: enqueue failed (best-effort)");
                         Err(())
                     }
@@ -584,7 +616,7 @@ pub async fn handle_distill_cron(
 pub async fn run_sweep_once(
     store: &(impl QueueStore + ?Sized),
     lease_ttl: Duration,
-    pool: Option<&SqlitePool>,
+    db: Option<&QueueDb>,
 ) {
     let now = Utc::now();
 
@@ -631,15 +663,15 @@ pub async fn run_sweep_once(
     // 5. Idempotency cleanup (TTL 24h).
     // Purges `gradatum_idempotency` entries older than now - 24h.
     // Without this cleanup the table grows unboundedly (one row per POST /api/v1/jobs).
-    match pool {
-        Some(p) => {
+    match db {
+        Some(db) => {
             let cutoff_ms = (now - chrono::Duration::hours(24)).timestamp_millis();
-            if let Err(e) = idempotency_cleanup(p, cutoff_ms).await {
+            if let Err(e) = idempotency_cleanup(db, cutoff_ms).await {
                 warn!(error = %e, "sweep: idempotency_cleanup failed — table may grow");
             }
         }
         None => {
-            warn!("sweep: pool unavailable — idempotency_cleanup skipped (table may grow)");
+            warn!("sweep: db unavailable — idempotency_cleanup skipped (table may grow)");
         }
     }
 }
@@ -737,7 +769,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_once_calls_all_three_methods() {
         let store = MockStore::new();
-        // pool=None : idempotency_cleanup ignoré en test unitaire (table non disponible).
+        // db=None : idempotency_cleanup ignoré en test unitaire (table non disponible).
         run_sweep_once(&store, Duration::from_secs(300), None).await;
         assert_eq!(*store.stale_calls.lock().unwrap(), 1);
         assert_eq!(*store.deadline_calls.lock().unwrap(), 1);
@@ -747,17 +779,39 @@ mod tests {
     // ── Tests F-112 — DistillCronConfig + plan_distill_tick ──────────────────
 
     #[test]
-    fn distill_cron_config_defaults_off_with_spec_values() {
+    fn distill_cron_config_defaults_off_with_empty_sections() {
         let c = DistillCronConfig::default();
         assert!(!c.enabled);
         // Écart plan assumé : format natif crate `cron` (secondes + DOW 1=Sun),
         // même sémantique que le "0 4 * * 0" crontab de la spec (dimanche 04:00).
         // Le format 5 champs ne parse PAS avec cron 0.16 (cf. validation fail-loud).
         assert_eq!(c.cron, "0 0 4 * * Sun");
-        assert_eq!(c.loci, vec!["debug", "experiments", "reference"]);
+        // CRITIQUE : le défaut est VIDE — « aucune section visée, cron inerte ». Un
+        // défaut pointant des sections réelles enfilerait des jobs qui écrivent en prod.
+        assert!(
+            c.sections.is_empty(),
+            "le défaut sections DOIT être vide (cron inerte), obtenu {:?}",
+            c.sections
+        );
         assert_eq!(c.pressure_min, 20);
         assert_eq!(c.max_jobs_per_tick, 2);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_sections_validation_passes_enabled_true_no_list() {
+        // Config `enabled = true` SANS clé de liste : le défaut `sections = []` s'applique
+        // et doit être VALIDE — un refus ferait échouer le démarrage du worker en
+        // production après déploiement (P0 fabriqué par la correction elle-même).
+        let c = DistillCronConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(c.sections.is_empty());
+        assert!(
+            c.validate().is_ok(),
+            "sections vide doit être un état valide"
+        );
     }
 
     #[test]
@@ -796,17 +850,18 @@ mod tests {
             .validate()
             .is_err()
         );
+        // sections VIDE = état légitime « cron inerte » — PAS une erreur.
         assert!(
             DistillCronConfig {
-                loci: vec![],
+                sections: vec![],
                 ..Default::default()
             }
             .validate()
-            .is_err()
+            .is_ok()
         );
         assert!(
             DistillCronConfig {
-                loci: vec!["debug".into(), "debug".into()],
+                sections: vec!["debug".into(), "debug".into()],
                 ..Default::default()
             }
             .validate()
@@ -822,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_tick_at_threshold_emits_locus() {
+    fn plan_tick_at_threshold_emits_section() {
         let cfg = DistillCronConfig::default();
         let out = plan_distill_tick(&[("debug".into(), Some(20))], &[], &cfg);
         assert_eq!(out, vec!["debug"]);
@@ -859,7 +914,7 @@ mod tests {
     // ── Tests F-112 Task 3 — builder + handler (no-op / fail-closed / happy) ──
 
     #[test]
-    fn build_distill_job_record_is_batch_locus_semantic() {
+    fn build_distill_job_record_is_batch_section_semantic() {
         use gradatum_core::DistillMode;
         let rec = build_distill_job_record("debug", "main", false);
         match &rec.spec.kind {
@@ -867,8 +922,8 @@ mod tests {
                 assert_eq!(src.mode, DistillMode::Semantic);
                 assert_eq!(src.batch_limit, 500);
                 match &src.scope {
-                    JobScope::Locus(l) => assert_eq!(l, "debug"),
-                    other => panic!("DistillSource.scope doit être Locus, obtenu {other:?}"),
+                    JobScope::Section(s) => assert_eq!(s, "debug"),
+                    other => panic!("DistillSource.scope doit être Section, obtenu {other:?}"),
                 }
             }
             other => panic!("kind doit être Job::Distill, obtenu {other:?}"),
@@ -877,8 +932,8 @@ mod tests {
         assert_eq!(rec.spec.class, JobClass::System);
         assert_eq!(rec.spec.priority, JobPriority::Low);
         match &rec.spec.scope {
-            JobScope::Locus(l) => assert_eq!(l, "debug"),
-            other => panic!("JobSpec.scope doit être Locus, obtenu {other:?}"),
+            JobScope::Section(s) => assert_eq!(s, "debug"),
+            other => panic!("JobSpec.scope doit être Section, obtenu {other:?}"),
         }
         assert!(rec.scheduling.await_jobs.is_empty());
     }
@@ -910,7 +965,10 @@ mod tests {
             || {},
         )
         .await;
-        assert!(!busy.get(), "enabled=false ⇒ lecture busy_loci interdite");
+        assert!(
+            !busy.get(),
+            "enabled=false ⇒ lecture busy_sections interdite"
+        );
         assert!(!counted.get(), "enabled=false ⇒ comptage interdit");
         assert!(!enqueued.get(), "enabled=false ⇒ enqueue interdit");
     }
@@ -920,13 +978,14 @@ mod tests {
         use std::cell::Cell;
         let cfg = DistillCronConfig {
             enabled: true,
+            sections: vec!["debug".to_string()],
             ..Default::default()
         };
         let counted = Cell::new(false);
         let enqueued = Cell::new(false);
         distill_cron_tick(
             &cfg,
-            || async { Err::<Vec<String>, ()>(()) }, // lecture busy_loci en échec
+            || async { Err::<Vec<String>, ()>(()) }, // lecture busy_sections en échec
             |_locus: String| async {
                 counted.set(true);
                 Some(50u64)
@@ -940,22 +999,22 @@ mod tests {
         .await;
         assert!(
             !counted.get(),
-            "échec busy_loci ⇒ fail-closed, aucun comptage"
+            "échec busy_sections ⇒ fail-closed, aucun comptage"
         );
         assert!(
             !enqueued.get(),
-            "échec busy_loci ⇒ fail-closed, aucun enqueue"
+            "échec busy_sections ⇒ fail-closed, aucun enqueue"
         );
     }
 
     #[tokio::test]
-    async fn distill_cron_enqueues_planned_loci_and_increments_metric() {
+    async fn distill_cron_enqueues_planned_sections_and_increments_metric() {
         use std::cell::{Cell, RefCell};
         let cfg = DistillCronConfig {
             enabled: true,
             pressure_min: 20,
             max_jobs_per_tick: 2,
-            loci: vec!["debug".to_string(), "experiments".to_string()],
+            sections: vec!["debug".to_string(), "experiments".to_string()],
             ..Default::default()
         };
         let enqueued: RefCell<Vec<String>> = RefCell::new(Vec::new());
@@ -964,11 +1023,11 @@ mod tests {
         let met = &metric;
         distill_cron_tick(
             &cfg,
-            || async { Ok::<Vec<String>, ()>(vec![]) }, // aucun locus occupé
+            || async { Ok::<Vec<String>, ()>(vec![]) }, // aucune section occupée
             // debug ≥ seuil (20) → émis ; experiments < seuil → ignoré.
-            |locus: String| async move { Some(if locus == "debug" { 50u64 } else { 10 }) },
-            move |locus: String| async move {
-                enq.borrow_mut().push(locus);
+            |section: String| async move { Some(if section == "debug" { 50u64 } else { 10 }) },
+            move |section: String| async move {
+                enq.borrow_mut().push(section);
                 Ok::<(), ()>(())
             },
             move || met.set(met.get() + 1),
@@ -976,5 +1035,141 @@ mod tests {
         .await;
         assert_eq!(*enqueued.borrow(), vec!["debug".to_string()]);
         assert_eq!(metric.get(), 1, "un seul enqueue réussi ⇒ métrique = 1");
+    }
+
+    // ── Tests exigés — correctif F-246 seuil par section ─────────────────────
+
+    /// Subscriber de test : collecte les champs `message` des événements INFO/WARN,
+    /// pour prouver qu'une branche no-op est EFFECTIVEMENT journalisée.
+    #[derive(Default)]
+    struct CapturingSubscriber {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::INFO
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(Vec<String>);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut visitor = Visitor(Vec::new());
+            event.record(&mut visitor);
+            self.messages.lock().unwrap().extend(visitor.0);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// TEST 1 — config `enabled = true` SANS liste : la validation passe, le tick
+    /// est un no-op (aucun comptage, aucun enqueue) ET le journal le dit.
+    #[test]
+    fn empty_sections_tick_is_noop_and_logged() {
+        use std::cell::Cell;
+
+        let cfg = DistillCronConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            cfg.sections.is_empty(),
+            "le défaut sections doit être vide dans ce scénario"
+        );
+        assert!(cfg.validate().is_ok());
+
+        let busy = Cell::new(false);
+        let counted = Cell::new(false);
+        let enqueued = Cell::new(false);
+
+        let subscriber = CapturingSubscriber::default();
+        let messages = std::sync::Arc::clone(&subscriber.messages);
+        tracing::subscriber::with_default(subscriber, || {
+            futures::executor::block_on(distill_cron_tick(
+                &cfg,
+                || async {
+                    busy.set(true);
+                    Ok::<Vec<String>, ()>(vec![])
+                },
+                |_section: String| async {
+                    counted.set(true);
+                    Some(0u64)
+                },
+                |_section: String| async {
+                    enqueued.set(true);
+                    Ok::<(), ()>(())
+                },
+                || {},
+            ));
+        });
+
+        // No-op comportemental : ni lecture busy, ni comptage, ni enqueue.
+        assert!(
+            !busy.get(),
+            "sections vide ⇒ lecture busy_sections interdite"
+        );
+        assert!(!counted.get(), "sections vide ⇒ comptage interdit");
+        assert!(!enqueued.get(), "sections vide ⇒ enqueue interdit");
+
+        // Le journal le dit : le no-op est explicite, jamais silencieux.
+        let logs = messages.lock().unwrap().join(" | ");
+        assert!(
+            logs.contains("no section targeted"),
+            "le tick doit journaliser le no-op inerte, logs : {logs}"
+        );
+    }
+
+    /// TEST 2 — config avec une liste de sections dont la pression dépasse le seuil :
+    /// un job `Distill` (scope `Section`) est effectivement enfilé.
+    #[tokio::test]
+    async fn sections_over_threshold_enqueues_distill_job() {
+        use std::cell::RefCell;
+
+        let cfg = DistillCronConfig {
+            enabled: true,
+            pressure_min: 20,
+            max_jobs_per_tick: 2,
+            sections: vec!["debug".to_string(), "experiments".to_string()],
+            ..Default::default()
+        };
+        // debug (50) ≥ seuil → enfilé ; experiments (10) < seuil → ignoré.
+        let enqueued: RefCell<Vec<JobRecord>> = RefCell::new(Vec::new());
+        let enq = &enqueued;
+        distill_cron_tick(
+            &cfg,
+            || async { Ok::<Vec<String>, ()>(vec![]) }, // aucune section occupée
+            |section: String| async move { Some(if section == "debug" { 50u64 } else { 10 }) },
+            move |section: String| async move {
+                enq.borrow_mut()
+                    .push(build_distill_job_record(&section, "main", false));
+                Ok::<(), ()>(())
+            },
+            || {},
+        )
+        .await;
+
+        let jobs = enq.borrow();
+        assert_eq!(jobs.len(), 1, "une seule section au-dessus du seuil");
+        match &jobs[0].spec.kind {
+            Job::Distill(src) => match &src.scope {
+                JobScope::Section(s) => assert_eq!(s, "debug"),
+                other => panic!("scope doit être Section(\"debug\"), obtenu {other:?}"),
+            },
+            other => panic!("kind doit être Job::Distill, obtenu {other:?}"),
+        }
     }
 }

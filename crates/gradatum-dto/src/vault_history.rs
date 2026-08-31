@@ -16,7 +16,11 @@ pub struct VaultHistoryRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub tenant_id: Option<TenantId>,
-    /// Note ULID (e.g. `"01JTEXAMPLE"`).
+    /// Note reference — bare ULID, prefixed `"section/ULID"` (the form `vault_search`
+    /// returns in its `path` field), exact note title, or redirect slug.
+    ///
+    /// Resolved at parity with `vault_read`. A reference resolving to no note is a
+    /// `400 Bad Request` naming the received value, never a `500`.
     pub note_id: String,
 }
 
@@ -45,7 +49,11 @@ pub struct VaultHistoryGetRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub tenant_id: Option<TenantId>,
-    /// Note ULID.
+    /// Note reference — bare ULID, prefixed `"section/ULID"` (the form `vault_search`
+    /// returns in its `path` field), exact note title, or redirect slug.
+    ///
+    /// Resolved at parity with `vault_read`. A reference resolving to no note is a
+    /// `400 Bad Request` naming the received value, never a `500`.
     pub note_id: String,
     /// Unix ms timestamp of the snapshot (obtained from `vault_history`).
     pub ts_ms: i64,
@@ -79,7 +87,11 @@ pub struct VaultRestoreRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub tenant_id: Option<TenantId>,
-    /// ULID of the note to restore.
+    /// Note reference — bare ULID, prefixed `"section/ULID"` (the form `vault_search`
+    /// returns in its `path` field), exact note title, or redirect slug.
+    ///
+    /// Resolved at parity with `vault_read`. A reference resolving to no note is a
+    /// `400 Bad Request` naming the received value, never a `500`.
     pub note_id: String,
     /// Unix ms timestamp of the snapshot to restore.
     pub ts_ms: i64,
@@ -113,7 +125,11 @@ pub struct VaultDiffRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub tenant_id: Option<TenantId>,
-    /// Note ULID.
+    /// Note reference — bare ULID, prefixed `"section/ULID"` (the form `vault_search`
+    /// returns in its `path` field), exact note title, or redirect slug.
+    ///
+    /// Resolved at parity with `vault_read`. A reference resolving to no note is a
+    /// `400 Bad Request` naming the received value, never a `500`.
     pub note_id: String,
     /// Version A: Unix ms timestamp or `"current"`.
     pub a: String,
@@ -147,7 +163,7 @@ pub struct VaultHistoryResponse {
 /// Response for `vault_history_get` — content of a snapshot.
 #[derive(Debug, Serialize)]
 pub struct VaultHistoryGetResponse {
-    /// Note ULID.
+    /// Note ULID — the **resolved** identifier, in canonical bare form.
     pub note_id: String,
     /// Unix ms timestamp of the snapshot.
     pub ts_ms: i64,
@@ -160,7 +176,7 @@ pub struct VaultHistoryGetResponse {
 /// Response for `vault_restore`.
 #[derive(Debug, Serialize)]
 pub struct VaultRestoreResponse {
-    /// Note ULID.
+    /// Note ULID — the **resolved** identifier, in canonical bare form.
     pub note_id: String,
     /// Unix ms timestamp of the restored snapshot.
     pub ts_ms: i64,

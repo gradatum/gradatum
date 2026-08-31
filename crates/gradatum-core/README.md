@@ -2,13 +2,13 @@
 
 > Shared primitives: traits, canonical types, and typed errors. The L0 foundation every other gradatum crate depends on.
 
-**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
 
 `gradatum-core` is the dependency floor of the gradatum workspace. It defines the canonical
-types (`NoteId`, `ContentHash`, `NoteVersion`), the 13 canonical vault sections (`Section`
+types (`NoteId`, `ContentHash`, `NoteVersion`), the 14 canonical vault sections (`Section`
 enum), the three storage traits (`DocumentStore`, `IndexStore`, `VectorStore`), and the
 top-level `GradatumError` enum (typed with `thiserror`, no `Box<dyn Error>`).
 
@@ -19,7 +19,7 @@ Every gradatum crate that manipulates notes, jobs or storage depends on `gradatu
 
 ```toml
 [dependencies]
-gradatum-core = "2.0.0"
+gradatum-core = "2.1.0"
 ```
 
 ```rust
@@ -36,7 +36,7 @@ use gradatum_core::section::Section;
 | `error` | `GradatumError` — typed error enum (thiserror, no `Box<dyn Error>`) |
 | `note` | `Note`, `NoteBody`, `EffectiveNote` |
 | `identity` | `NoteId` (ULID newtype), `ContentHash`, `NoteVersion` |
-| `section` | `Section` — 13 canonical sections (kebab-case, serde) |
+| `section` | `Section` — 14 canonical sections (kebab-case, serde) |
 | `tag` | `Tag` — normalized kebab-case note tag |
 | `author` | `AuthorKind`, `AuthorRef` — note authorship |
 | `status` | `NoteStatus` — note lifecycle state machine |

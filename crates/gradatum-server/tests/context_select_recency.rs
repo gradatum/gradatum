@@ -16,8 +16,9 @@
 //!    Note sans `temporal_index` → fallback created_ms → score ≈ 1.2 (inchangé avant/après fix).
 //!
 //! 3. `context_trust_age_uses_created_ms_not_anchor_ms` — régression guard.
-//!    Note trust/provenance="distilled" + anchor 2 ans + created récent → age_days ≈ 0 →
-//!    trust decay quasi-nulle → score > 1.1. Si age_days bascule sur anchor_ms → score < 1.1.
+//!    Note section `debug` (doc_kind Event, F-261 trust dérivé = 0.40) + anchor 2 ans +
+//!    created récent → age_days ≈ 0 → trust decay quasi-nulle → score > 1.05.
+//!    Si age_days bascule sur anchor_ms → score < 1.05.
 //!
 //! ## Architecture du harness
 //!
@@ -27,7 +28,6 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use gradatum_core::identity::NoteId;
 use gradatum_core::index::{AnchorSrc, TemporalEntry};
 use gradatum_core::section::Section;
 use gradatum_core::status::NoteStatus;
@@ -118,13 +118,16 @@ async fn context_recency_uses_anchor_ms_not_created_ms() {
     let score = selected[0].score;
 
     // Post-fix : recency = recency_factor(anchor_ms = 2 ans, now) ≈ 0.0007
-    // → score = 1.0 × (1 + 0.2 × 0.0007) × 1.0 ≈ 1.00014 → PASSE.
+    // → facteur recency (1 + 0.2 × 0.0007) ≈ 1.00014.
+    // F-261 : la note est en section "reference" → trust dérivé = 0.60, doc_kind Static
+    // (pas de decay) → facteur trust (1 + 0.15 × 0.60) = 1.09.
+    // → score = 1.0 × 1.00014 × 1.09 ≈ 1.09015 < 1.2 → PASSE.
     // Avant fix (RED) : recency = recency_factor(created_ms = now, now) = 1.0
-    // → score ≈ 1.2 → ÉCHOUE (score < 1.01 = false).
+    // → score ≈ 1.2 × 1.09 ≈ 1.308 → ÉCHOUE (score < 1.2 = false).
     assert!(
-        score < 1.01,
-        "M-1 : recency doit être basée sur anchor_ms (2 ans) → score ≈ 1.00014 \
-         (got {score:.6}). Score ≈ 1.2 indique que created_ms (récent) est encore \
+        score < 1.2,
+        "M-1 : recency doit être basée sur anchor_ms (2 ans) → score ≈ 1.09015 \
+         (got {score:.6}). Score ≈ 1.3 indique que created_ms (récent) est encore \
          utilisé — bug pré-fix M-1."
     );
 }
@@ -191,18 +194,21 @@ async fn context_recency_created_anchor_fallback_bit_identical() {
 
 /// Test 3 (régression guard) — `trust age_days` reste sur `created_ms`, pas `anchor_ms`.
 ///
-/// Setup :
-/// - Note avec `provenance = "distilled"` (half_life 90j), `trust = 0.9`.
+/// Setup (F-261 — trust dérivé de la section, decay par doc_kind) :
+/// - Note en section `debug` (doc_kind `Event` → half_life 90j), `trust` dérivé = 0.40.
 /// - `created_ms` ≈ now (recent ingestion via `seed_note_with_status`).
-/// - `anchor_ms` = 2 ans dans le passé.
+/// - `anchor_ms` = 2 ans dans le passé (anchor ≠ created → scénario M-1).
 ///
 /// Attendu (correct) :
 /// `age_days` = `(now - created_ms) / 86_400_000` ≈ 0 jours → decay quasi-nulle →
-/// `trust_decayed` ≈ 0.9 → facteur trust `(1 + 0.15 × 0.9)` = 1.135 → `score > 1.1`.
+/// `trust_decayed` ≈ 0.40 → facteur trust `(1 + 0.15 × 0.40)` = 1.06.
+/// La recency, elle, suit l'ancre (2 ans) → `(1 + 0.2 × recency_factor(2ans))` ≈ 1.00014.
+/// → score ≈ 1.0 × 1.00014 × 1.06 ≈ 1.0601 > 1.05.
 ///
 /// Régression (si `age_days` utilisait `anchor_ms`) :
-/// `age_days` = 730 jours → `trust_decayed = 0.9 × 0.5^(730/90)` ≈ 0.0032 →
-/// facteur trust ≈ 1.0005 → `score < 1.1` → test ÉCHOUE → détecte la régression.
+/// `age_days` = 730 jours → `trust_decayed = 0.40 × 0.5^(730/90)` ≈ 0.00145 →
+/// facteur trust ≈ 1.0002 → score ≈ 1.00014 × 1.0002 ≈ 1.00034 < 1.05 →
+/// test ÉCHOUE → détecte la régression.
 #[tokio::test]
 async fn context_trust_age_uses_created_ms_not_anchor_ms() {
     let env = build_app_with_embedder(Arc::new(FakeEmbedder { dim: 8 })).await;
@@ -210,26 +216,20 @@ async fn context_trust_age_uses_created_ms_not_anchor_ms() {
     let now_ms = Utc::now().timestamp_millis();
     let two_years_ago_ms = now_ms - 2 * 365 * 86_400_000_i64;
 
-    // Seed avec provenance="distilled" (active le half_life 90j dans TrustDecayConfig).
+    // Seed en section debug → doc_kind "Event" → half_life 90j activé.
     // created = now (seed_note_with_status → Utc::now()) → age_days correct ≈ 0.
+    // trust dérivé de la section = trust_for_section(Debug) = 0.40 (pas de set_note_trust :
+    // F-261 le scoring ignore la colonne `notes.trust`).
     let ulid = Ulid::generate().to_string();
     idx.seed_note_with_status(
         &ulid,
-        Section::Reference,
+        Section::Debug,
         "corps trust age test m1.",
         NoteStatus::Live,
-        Some("distilled"),
+        None,
     )
     .await
     .expect("seed_note_with_status — invariant test M-1 trust");
-
-    // Fixer trust = 0.9 via trait IndexStore (délégué à SqliteIndex).
-    let nid = NoteId(Ulid::from_string(&ulid).expect("ULID parse — invariant test M-1 trust"));
-    env.state
-        .search
-        .set_note_trust("main", &nid, 0.9)
-        .await
-        .expect("set_note_trust — invariant test M-1 trust");
 
     // Anchor 2 ans dans le passé (anchor ≠ created → scénario M-1).
     let entry = TemporalEntry {
@@ -274,18 +274,19 @@ async fn context_trust_age_uses_created_ms_not_anchor_ms() {
     let score = selected[0].score;
 
     // Correct (age_days sur created_ms = now → age_days ≈ 0) :
-    //   trust_decayed = 0.9 × 0.5^(0/90) = 0.9
-    //   facteur trust = (1 + 0.15 × 0.9) = 1.135
-    //   score ≈ 1.00014 × 1.135 ≈ 1.1353 > 1.1 → PASSE.
+    //   trust_decayed = 0.40 × 0.5^(0/90) = 0.40
+    //   facteur trust = (1 + 0.15 × 0.40) = 1.06
+    //   recency (ancre 2 ans) → (1 + 0.2 × 0.0007) ≈ 1.00014
+    //   score ≈ 1.00014 × 1.06 ≈ 1.0601 > 1.05 → PASSE.
     //
     // Régression (age_days sur anchor_ms = 730j) :
-    //   trust_decayed = 0.9 × 0.5^(730/90) ≈ 0.0032
-    //   facteur trust ≈ 1.000478
-    //   score ≈ 1.00014 × 1.000478 ≈ 1.0006 < 1.1 → ÉCHOUE.
+    //   trust_decayed = 0.40 × 0.5^(730/90) ≈ 0.00145
+    //   facteur trust ≈ 1.0002
+    //   score ≈ 1.00014 × 1.0002 ≈ 1.00034 < 1.05 → ÉCHOUE.
     assert!(
-        score > 1.1,
+        score > 1.05,
         "M-1 trust : age_days basé sur created_ms (recent → 0j) → trust decay quasi-nulle → \
-         score > 1.1 (got {score:.6}). Score < 1.1 indique que age_days utilise anchor_ms \
+         score > 1.05 (got {score:.6}). Score < 1.05 indique que age_days utilise anchor_ms \
          (régression — trust âge doit rester sur created_ms)."
     );
 }

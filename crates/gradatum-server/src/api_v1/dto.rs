@@ -23,7 +23,7 @@ use serde::Serialize;
 pub use gradatum_dto::{
     CreateFeatureCardRequest, CreateFeatureCardResponse, SessionTraceRequest, SessionTraceResponse,
     VaultClassifyRequest, VaultClassifyResponse, VaultContextRequest, VaultGraphRequest,
-    VaultLinksRequest, VaultListRequest, VaultReadRequest, VaultSearchRequest,
+    VaultLinksRequest, VaultListRequest, VaultReadRequest, VaultSearchRequest, VaultTagsRequest,
     VaultTimelineRequest, VaultTraceRequest, VaultWriteRequest,
 };
 
@@ -232,7 +232,14 @@ pub struct VaultStatusResponse {
     pub total_size_bytes: u64,
     /// Index schema version (e.g. `"v1"`).
     pub index_version: String,
-    /// Timestamp of the last re-index run (ISO 8601 UTC).
+    /// Timestamp of the most recently indexed live note (ISO 8601 UTC) —
+    /// `MAX(COALESCE(updated, created))` over the live corpus, i.e. the freshest content
+    /// observable in the index.
+    ///
+    /// `None` **only** when the live corpus is empty (nothing indexed yet); it is never a
+    /// silent fallback on failure — a storage error surfaces as an error response, not a
+    /// misleading `null`. A consumer can thus read `null` as "empty vault" and a
+    /// timestamp as "last content change", never as an ambiguous "never indexed".
     pub last_indexed_at: Option<String>,
     /// Vault health (`"healthy"` / `"degraded"` / `"offline"`).
     pub health: String,
@@ -416,11 +423,16 @@ pub struct AuthorEntry {
 
 // ── vault_tags ────────────────────────────────────────────────────────────────
 
-/// Response for `vault_tags` (GET, no request body).
+/// Response for `vault_tags`.
 #[derive(Debug, Serialize)]
 pub struct VaultTagsResponse {
-    /// Distinct tags with their usage frequency.
+    /// Distinct tags with their usage frequency, **most frequent first**, bounded
+    /// by the request `limit` (default `DEFAULT_TAGS_LIMIT`).
     pub tags: Vec<TagEntry>,
+    /// Total number of distinct tags in the vault **before** the `limit` bound.
+    /// Lets the caller detect truncation (`total > tags.len()`) and request more
+    /// explicitly (F-216).
+    pub total: u64,
 }
 
 /// Tag entry.
@@ -458,19 +470,6 @@ pub struct EnqueuedResponseUlid {
     /// Format: 26-char alphanumeric ULID (e.g. `"01HZ..."`).
     /// Guaranteed to match the `note_id` stored by the worker.
     pub note_id: String,
-}
-
-/// Response for `GET /api/v1/jobs/<id>` — job status.
-#[derive(Debug, Serialize)]
-pub struct JobStatusResponse {
-    /// Job identifier.
-    pub job_id: i64,
-    /// Current status (`"pending"` | `"leased"` | `"done"` | `"dead"`).
-    pub status: String,
-    /// Number of attempts made so far.
-    pub attempts: i32,
-    /// Last error message, absent if none.
-    pub last_error: Option<String>,
 }
 
 #[cfg(test)]

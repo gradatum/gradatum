@@ -13,9 +13,10 @@
 //! `/api/v1/*` (sous middleware JWT). C'est la même topologie que `main.rs`.
 //! L'ACL autorise le consumer dont l'identité = `key.owner` à écrire sur `main/*`.
 //!
-//! Le worker curator n'est pas câblé dans ce test — la queue utilise `SqliteQueue::in_memory()`.
-//! `GET /api/v1/jobs/<id>` retourne `status: "pending"`.
-//! Ce comportement est intentionnel : ce test valide la couche auth, pas le pipeline curator.
+//! Le worker curator n'est pas câblé dans ce test — la file LIVE `gradatum_jobs`
+//! (via `SqliteQueueStore` in-memory) reçoit le job ; le poll `/api/v1/jobs/{ulid}/v2`
+//! retourne le JobRecord. Ce comportement est intentionnel : ce test valide la couche auth,
+//! pas le pipeline curator.
 //!
 
 use std::sync::Arc;
@@ -25,11 +26,9 @@ use axum::http::{Request, StatusCode};
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::JwtService;
 use gradatum_core::scope::AgentId;
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-use gradatum_queue::SqliteQueue;
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 use gradatum_server::auth_routes::ExchangeResponse;
 use gradatum_server::state::AppState;
-use sqlx::sqlite::SqlitePoolOptions;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -50,7 +49,7 @@ write_patterns = ["main/*", "main/main"]
 
 /// Construit un `AppState` de test complet :
 /// - `SqliteApiKeyStore` réel sur fichier temporaire
-/// - `SqliteQueue` in-memory
+/// - `SqliteQueueStore` in-memory (file LIVE `gradatum_jobs`)
 /// - `AclEngine` avec `TEST_ACL_E2E`
 /// - `JwtService` éphémère (clé Ed25519 générée à chaque test — isolation totale)
 ///
@@ -63,16 +62,8 @@ async fn build_e2e_state() -> (AppState, TempDir) {
     let acl = AclEngine::from_preset_str(TEST_ACL_E2E)
         .expect("preset ACL e2e valide — invariant statique");
 
-    let queue = Arc::new(
-        SqliteQueue::in_memory()
-            .await
-            .expect("SqliteQueue::in_memory() — invariant test"),
-    );
-
     // Phase 1.2 : vault_write utilise state.job_store — câbler un SqliteQueueStore in-memory.
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory — invariant test");
     run_migrations(&jobs_pool)
@@ -81,7 +72,6 @@ async fn build_e2e_state() -> (AppState, TempDir) {
     let job_store = Arc::new(SqliteQueueStore::new(jobs_pool.clone()));
 
     let state = AppState::with_jwt_and_acl(jwt, acl)
-        .with_queue(queue as Arc<dyn gradatum_queue::Queue>)
         .with_job_store(job_store as Arc<dyn gradatum_core::QueueStore>, jobs_pool)
         .with_api_keys_path(&api_keys_path)
         .await

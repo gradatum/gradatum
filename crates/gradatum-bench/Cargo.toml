@@ -18,6 +18,9 @@ gradatum-curator   = { path = "../gradatum-curator" }
 gradatum-embed     = { path = "../gradatum-embed" }
 gradatum-index     = { path = "../gradatum-index" }
 gradatum-storage   = { path = "../gradatum-storage" }
+# F-145 (jalon 2.1.0) : banc AVANT/APRÈS de la montée rusqlite — mesure le cycle
+# complet enqueue → dequeue → complete sur `SqliteQueueStore` (la file réelle).
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite" }
 # sqlite-vec pour enregistrement extension dans ann_recall bin (unsafe dans main()).
 sqlite-vec         = { workspace = true }
 rusqlite           = { workspace = true }
@@ -49,6 +52,12 @@ path = "src/bin/search_golden.rs"
 # Pas de #![forbid(unsafe_code)] sur ce binary.
 name = "ann_recall"
 path = "src/bin/ann_recall.rs"
+
+[[bin]]
+# Générateur du corpus synthétique F-162 lot 0 (Task 2) — produit les fixtures
+# commitées corpus-synthetique-v1.jsonl + expected-counts-v1.json (aucun aléa).
+name = "gen_synthetic_corpus"
+path = "src/bin/gen_synthetic_corpus.rs"
 
 [dev-dependencies]
 criterion          = { workspace = true, features = ["async_tokio"] }
@@ -97,4 +106,9 @@ harness = false
 
 [[bench]]
 name = "b08b_curator_mixed"
+harness = false
+
+[[bench]]
+# F-145 (jalon 2.1.0) — file de travaux : cycle complet enqueue → dequeue → complete.
+name = "b11_queue_cycle"
 harness = false

@@ -1,8 +1,15 @@
 pub mod gradatum_db_sqlite
 pub mod gradatum_db_sqlite::queue_store_sqlite
+pub struct gradatum_db_sqlite::queue_store_sqlite::QueueDb
+impl gradatum_db_sqlite::queue_store_sqlite::QueueDb
+pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::open(&std::path::Path) -> core::result::Result<Self, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::open_existing(&std::path::Path) -> core::result::Result<Self, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::open_in_memory() -> core::result::Result<Self, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::with_conn<T, F>(&self, F) -> core::result::Result<T, gradatum_core::job::QueueError> where F: core::ops::function::FnOnce(&rusqlite::Connection) -> core::result::Result<T, rusqlite::error::Error> + core::marker::Send + 'static, T: core::marker::Send + 'static
 pub struct gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore
 impl gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore
-pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::new(sqlx_sqlite::SqlitePool) -> Self
+pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::db(&self) -> &gradatum_db_sqlite::queue_store_sqlite::QueueDb
+pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::new(gradatum_db_sqlite::queue_store_sqlite::QueueDb) -> Self
 impl gradatum_core::job::QueueStore for gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::cancel<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::cancel_expired_deadlines<'life0, 'async_trait>(&'life0 self, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<ulid::Ulid>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -26,14 +33,24 @@ pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::recover_stale_l
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::schedule_retry<'life0, 'async_trait>(&'life0 self, ulid::Ulid, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::set_pending<'life0, 'async_trait>(&'life0 self, ulid::Ulid) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::subscribe(&self) -> tokio::sync::broadcast::Receiver<gradatum_core::job::QueueEvent>
-pub async fn gradatum_db_sqlite::queue_store_sqlite::apply_sqlite_pragmas(&sqlx_sqlite::SqlitePool) -> core::result::Result<(), sqlx_core::error::Error>
-pub async fn gradatum_db_sqlite::queue_store_sqlite::idempotency_cleanup(&sqlx_sqlite::SqlitePool, i64) -> core::result::Result<u64, gradatum_core::job::QueueError>
-pub async fn gradatum_db_sqlite::queue_store_sqlite::idempotency_insert(&sqlx_sqlite::SqlitePool, &str, &str) -> core::result::Result<bool, gradatum_core::job::QueueError>
-pub async fn gradatum_db_sqlite::queue_store_sqlite::idempotency_lookup(&sqlx_sqlite::SqlitePool, &str) -> core::result::Result<core::option::Option<alloc::string::String>, gradatum_core::job::QueueError>
-pub async fn gradatum_db_sqlite::queue_store_sqlite::run_migrations(&sqlx_sqlite::SqlitePool) -> core::result::Result<(), sqlx_core::migrate::error::MigrateError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::apply_sqlite_pragmas(&gradatum_db_sqlite::queue_store_sqlite::QueueDb) -> core::result::Result<(), gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::idempotency_cleanup(&gradatum_db_sqlite::queue_store_sqlite::QueueDb, i64) -> core::result::Result<u64, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::idempotency_insert(&gradatum_db_sqlite::queue_store_sqlite::QueueDb, &str, &str) -> core::result::Result<bool, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::idempotency_lookup(&gradatum_db_sqlite::queue_store_sqlite::QueueDb, &str) -> core::result::Result<core::option::Option<alloc::string::String>, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::open_queue_db(&std::path::Path) -> core::result::Result<gradatum_db_sqlite::queue_store_sqlite::QueueDb, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::open_queue_db_existing(&std::path::Path) -> core::result::Result<gradatum_db_sqlite::queue_store_sqlite::QueueDb, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::open_queue_db_in_memory() -> core::result::Result<gradatum_db_sqlite::queue_store_sqlite::QueueDb, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::run_migrations(&gradatum_db_sqlite::queue_store_sqlite::QueueDb) -> core::result::Result<usize, gradatum_core::job::QueueError>
+pub struct gradatum_db_sqlite::QueueDb
+impl gradatum_db_sqlite::queue_store_sqlite::QueueDb
+pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::open(&std::path::Path) -> core::result::Result<Self, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::open_existing(&std::path::Path) -> core::result::Result<Self, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::open_in_memory() -> core::result::Result<Self, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::with_conn<T, F>(&self, F) -> core::result::Result<T, gradatum_core::job::QueueError> where F: core::ops::function::FnOnce(&rusqlite::Connection) -> core::result::Result<T, rusqlite::error::Error> + core::marker::Send + 'static, T: core::marker::Send + 'static
 pub struct gradatum_db_sqlite::SqliteQueueStore
 impl gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore
-pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::new(sqlx_sqlite::SqlitePool) -> Self
+pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::db(&self) -> &gradatum_db_sqlite::queue_store_sqlite::QueueDb
+pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::new(gradatum_db_sqlite::queue_store_sqlite::QueueDb) -> Self
 impl gradatum_core::job::QueueStore for gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::cancel<'life0, 'life1, 'async_trait>(&'life0 self, ulid::Ulid, core::option::Option<&'life1 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::cancel_expired_deadlines<'life0, 'async_trait>(&'life0 self, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<ulid::Ulid>, gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -58,8 +75,11 @@ pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::schedule_retry<
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::set_pending<'life0, 'async_trait>(&'life0 self, ulid::Ulid) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::job::QueueError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::subscribe(&self) -> tokio::sync::broadcast::Receiver<gradatum_core::job::QueueEvent>
 pub const gradatum_db_sqlite::VERSION: &str
-pub async fn gradatum_db_sqlite::apply_sqlite_pragmas(&sqlx_sqlite::SqlitePool) -> core::result::Result<(), sqlx_core::error::Error>
-pub async fn gradatum_db_sqlite::idempotency_cleanup(&sqlx_sqlite::SqlitePool, i64) -> core::result::Result<u64, gradatum_core::job::QueueError>
-pub async fn gradatum_db_sqlite::idempotency_insert(&sqlx_sqlite::SqlitePool, &str, &str) -> core::result::Result<bool, gradatum_core::job::QueueError>
-pub async fn gradatum_db_sqlite::idempotency_lookup(&sqlx_sqlite::SqlitePool, &str) -> core::result::Result<core::option::Option<alloc::string::String>, gradatum_core::job::QueueError>
-pub async fn gradatum_db_sqlite::run_migrations(&sqlx_sqlite::SqlitePool) -> core::result::Result<(), sqlx_core::migrate::error::MigrateError>
+pub async fn gradatum_db_sqlite::apply_sqlite_pragmas(&gradatum_db_sqlite::queue_store_sqlite::QueueDb) -> core::result::Result<(), gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::idempotency_cleanup(&gradatum_db_sqlite::queue_store_sqlite::QueueDb, i64) -> core::result::Result<u64, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::idempotency_insert(&gradatum_db_sqlite::queue_store_sqlite::QueueDb, &str, &str) -> core::result::Result<bool, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::idempotency_lookup(&gradatum_db_sqlite::queue_store_sqlite::QueueDb, &str) -> core::result::Result<core::option::Option<alloc::string::String>, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::open_queue_db(&std::path::Path) -> core::result::Result<gradatum_db_sqlite::queue_store_sqlite::QueueDb, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::open_queue_db_existing(&std::path::Path) -> core::result::Result<gradatum_db_sqlite::queue_store_sqlite::QueueDb, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::open_queue_db_in_memory() -> core::result::Result<gradatum_db_sqlite::queue_store_sqlite::QueueDb, gradatum_core::job::QueueError>
+pub async fn gradatum_db_sqlite::run_migrations(&gradatum_db_sqlite::queue_store_sqlite::QueueDb) -> core::result::Result<usize, gradatum_core::job::QueueError>

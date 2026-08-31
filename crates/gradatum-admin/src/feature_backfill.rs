@@ -76,7 +76,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 use crate::changelog_backfill::{HttpVaultClient, VaultWriteClient};
-use crate::project_map_card::VaultWriteCard;
+use crate::project_map_card::{VaultWriteCard, build_title_index, normalize_title};
 
 /// Number of features `features.ts` is expected to declare.
 ///
@@ -137,6 +137,13 @@ pub struct BackfillFeaturesReport {
     pub created: usize,
     /// Apply mode only: number of cards skipped because they already existed.
     pub skipped: usize,
+    /// Apply mode only: number of cards refused because a card already carried the same
+    /// title, under the normal form of [`crate::project_map_card::normalize_title`].
+    ///
+    /// Distinct from [`Self::skipped`], which counts the source-marker match: this axis
+    /// catches a duplicate the marker misses — typically a card imported from another
+    /// source under the same name.
+    pub skipped_title: usize,
 }
 
 /// One feature parsed out of `features.ts`.
@@ -648,6 +655,19 @@ pub async fn run_backfill_features<C: VaultWriteClient>(
         ..Default::default()
     };
 
+    // Index des titres déjà présents, chargé une seule fois avant toute écriture.
+    // Vide en dry-run : aucun appel réseau n'y est fait.
+    let mut title_index = if args.apply {
+        build_title_index(
+            client
+                .existing_titles()
+                .await
+                .context("loading the existing project-map titles")?,
+        )
+    } else {
+        std::collections::HashMap::new()
+    };
+
     for spec in &specs {
         let card = render_card_spec(spec);
         let marker = feature_marker(&spec.ref_label);
@@ -664,15 +684,29 @@ pub async fn run_backfill_features<C: VaultWriteClient>(
                 .await
                 .with_context(|| format!("idempotency check marker={marker}"))?;
 
+            let normalized = normalize_title(&card.title);
+
             if exists {
                 report.skipped += 1;
                 tracing::debug!(%marker, "feature-map already exists — skip");
+            } else if let Some(existing) = title_index.get(&normalized) {
+                // Une carte est insupprimable par conception : la garde refuse d'écrire
+                // et nomme celle qui occupe déjà le titre, elle n'efface jamais.
+                report.skipped_title += 1;
+                tracing::warn!(
+                    %marker,
+                    title = %card.title,
+                    existing = %existing,
+                    "a card already carries this title — refusing to write a duplicate"
+                );
             } else {
-                client
+                let locus = client
                     .vault_write(&card)
                     .await
                     .with_context(|| format!("vault_write for marker={marker}"))?;
                 report.created += 1;
+                // Alimenter l'index au fil de l'eau ferme aussi la collision intra-run.
+                title_index.insert(normalized, locus);
                 tracing::info!(%marker, "feature-map created");
             }
         }
@@ -707,8 +741,12 @@ mod tests {
     // ── Mock client ──────────────────────────────────────────────────────────
 
     /// Mock sans appel réseau.
+    ///
+    /// Mémorise les cartes écrites : rejouer un run sur la MÊME instance rend visibles,
+    /// via `existing_titles`, les titres produits au run précédent.
     pub struct MockVaultClient {
         existing_markers: Vec<String>,
+        preexisting_titles: Vec<String>,
         created: Arc<Mutex<Vec<VaultWriteCard>>>,
         write_count: Arc<Mutex<usize>>,
     }
@@ -717,6 +755,17 @@ mod tests {
         pub fn new(existing: Vec<&str>) -> Self {
             Self {
                 existing_markers: existing.into_iter().map(str::to_string).collect(),
+                preexisting_titles: Vec::new(),
+                created: Arc::new(Mutex::new(Vec::new())),
+                write_count: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        /// Mock dont le vault porte déjà ces titres, sans le marqueur correspondant.
+        pub fn with_preexisting_titles(titles: Vec<&str>) -> Self {
+            Self {
+                existing_markers: Vec::new(),
+                preexisting_titles: titles.into_iter().map(str::to_string).collect(),
                 created: Arc::new(Mutex::new(Vec::new())),
                 write_count: Arc::new(Mutex::new(0)),
             }
@@ -736,11 +785,29 @@ mod tests {
             Ok(self.existing_markers.iter().any(|m| m == marker))
         }
 
+        async fn existing_titles(&self) -> Result<Vec<(String, String)>> {
+            let mut out: Vec<(String, String)> = self
+                .preexisting_titles
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("project-map/pre-{i}"), t.clone()))
+                .collect();
+            let guard = self.created.lock().expect("mutex non-empoisonné en test");
+            out.extend(
+                guard
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (format!("project-map/mock-{i}"), c.title.clone())),
+            );
+            Ok(out)
+        }
+
         async fn vault_write(&self, card: &VaultWriteCard) -> Result<String> {
             let mut guard = self.created.lock().expect("mutex non-empoisonné en test");
+            let locus = format!("project-map/mock-{}", guard.len());
             guard.push(card.clone());
             *self.write_count.lock().expect("mutex") += 1;
-            Ok("mock-ulid".to_string())
+            Ok(locus)
         }
     }
 
@@ -927,6 +994,85 @@ const groups = [
         assert_eq!(report.skipped, 1, "F-06 devrait être sautée");
         assert_eq!(report.created, 68, "les 68 autres doivent être créées");
         assert_eq!(client.write_count(), 68);
+    }
+
+    // ── Rejeu : la garde du titre rattrape un marqueur aveugle ─────────────
+    //
+    // Reproduit le mode de défaillance de juin 2026 : `marker_exists` répondait
+    // toujours `false` (bug `results` → `items`, commit 58f334b3), et chaque rejeu
+    // recréait l'intégralité des cartes. Ici le marqueur est tout aussi aveugle ;
+    // le second run ne crée pourtant rien, et c'est l'axe du titre qui l'en empêche.
+
+    #[tokio::test]
+    async fn replay_creates_nothing_when_the_marker_is_blind() {
+        let full_ts = make_full_fixture_ts();
+        let (_dir, mut args) = make_args_from_str(&full_ts, true, 69);
+        args.api_key = "test-api-key".to_string();
+
+        // `existing_markers` vide ⇒ `marker_exists` est constamment faux.
+        let client = MockVaultClient::new(vec![]);
+
+        let first = run_backfill_features(&args, &client)
+            .await
+            .expect("premier run");
+        assert_eq!(first.created, 69, "le premier run crée les 69 cartes");
+        assert_eq!(
+            first.skipped_title, 0,
+            "aucun titre préexistant au premier run"
+        );
+
+        let second = run_backfill_features(&args, &client)
+            .await
+            .expect("second run");
+        assert_eq!(second.created, 0, "le rejeu ne doit créer aucune carte");
+        assert_eq!(
+            second.skipped, 0,
+            "le marqueur reste aveugle : ce n'est pas lui qui bloque"
+        );
+        assert_eq!(
+            second.skipped_title, 69,
+            "les 69 sont refusées sur l'axe du titre"
+        );
+        assert_eq!(
+            client.write_count(),
+            69,
+            "aucune écriture supplémentaire au second run"
+        );
+    }
+
+    // ── La garde n'est pas plus stricte que la mesure ───────────────────────
+    //
+    // Le nettoyage du registre a compté les doublons en minuscules et espaces
+    // réduits. Une garde sensible à la casse laisserait repasser ce que la mesure
+    // avait compté : le titre préexistant est ici crié et sur-espacé.
+
+    #[tokio::test]
+    async fn title_guard_folds_case_and_whitespace() {
+        let full_ts = make_full_fixture_ts();
+        let (_dir, mut args) = make_args_from_str(&full_ts, true, 69);
+        args.api_key = "test-api-key".to_string();
+
+        let features = parse_features(&full_ts, 69).expect("parse fixture");
+        let specs = apply_amendment_overlay(features.iter().map(FeatureCardSpec::from).collect())
+            .expect("overlay");
+        let first_title = render_card_spec(&specs[0]).title;
+        let shouted = format!("   {}   ", first_title.to_uppercase().replace(' ', "     "));
+        assert_ne!(
+            shouted, first_title,
+            "la fixture doit bien différer littéralement"
+        );
+
+        let client = MockVaultClient::with_preexisting_titles(vec![&shouted]);
+
+        let report = run_backfill_features(&args, &client)
+            .await
+            .expect("run avec titre préexistant");
+
+        assert_eq!(
+            report.skipped_title, 1,
+            "casse et espaces ne doivent pas masquer le doublon"
+        );
+        assert_eq!(report.created, 68, "les 68 autres cartes restent créées");
     }
 
     // ── Test 3 : dry-run — 0 write, would_create == 69 (avec overlay) ───────

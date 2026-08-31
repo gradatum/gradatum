@@ -21,6 +21,10 @@ pub mod admin_cmd;
 pub mod api_key_cmd;
 #[doc(hidden)]
 pub mod backfill_authors;
+/// Sub-command `backfill-checksums` — retro-fills `file_checksums` drift footprints for
+/// on-disk notes written before F-165 (F-174 geste 2).
+#[doc(hidden)]
+pub mod backfill_checksums;
 #[doc(hidden)]
 pub mod backfill_embeddings;
 #[doc(hidden)]
@@ -39,6 +43,9 @@ pub mod changelog_parse;
 pub mod code_cmd;
 #[doc(hidden)]
 pub mod downgrade_from_vault_trash;
+/// Sub-command `drift-scan` — runs the coherence drift scan and alerts above zero (F-174).
+#[doc(hidden)]
+pub mod drift_scan;
 /// Bulk creation of vault project-map feature cards from a `features.ts` catalogue.
 #[doc(hidden)]
 pub mod feature_backfill;
@@ -58,6 +65,10 @@ pub mod project_map_render;
 /// Read-only summary view of a single project, read straight from the SQLite index.
 #[doc(hidden)]
 pub mod project_map_scope;
+/// Sub-command `reindex-orphans` — re-indexes notes present on disk but absent from the
+/// index, converging with the write funnel (index + `file_checksums` + embed job) (F-166).
+#[doc(hidden)]
+pub mod reindex_orphans;
 /// Sub-command `repair-note-links` — reconciles note_links against current bodies (F-147).
 #[doc(hidden)]
 pub mod repair_note_links;
@@ -74,6 +85,8 @@ pub mod vault_rename;
 #[doc(hidden)]
 pub use backfill_authors::{BackfillAuthorsArgs, BackfillAuthorsReport};
 #[doc(hidden)]
+pub use backfill_checksums::{BackfillChecksumsArgs, BackfillChecksumsReport};
+#[doc(hidden)]
 pub use backfill_embeddings::{BackfillArgs, backfill};
 #[doc(hidden)]
 pub use backfill_note_links::{BackfillNoteLinksArgs, BackfillNoteLinksReport};
@@ -84,7 +97,11 @@ pub use downgrade_from_vault_trash::{
     DowngradeFromTrashArgs, DowngradeStats, run as downgrade_from_vault_trash,
 };
 #[doc(hidden)]
+pub use drift_scan::{DriftScanCliArgs, DriftScanCliReport};
+#[doc(hidden)]
 pub use init::{generate_server_toml_template, materialize_preset, merge_user_config};
+#[doc(hidden)]
+pub use reindex_orphans::{ReindexOrphansArgs, ReindexOrphansReport};
 #[doc(hidden)]
 pub use repair_note_links::{RepairNoteLinksArgs, RepairNoteLinksReport};
 #[doc(hidden)]

@@ -22,26 +22,24 @@
 //! | GET  `/jobs/:id/v2`  | Read  | **401** | (200/404) | — |
 //! | POST `/jobs/:id/cancel` | Write | **401** | — | — |
 //! | GET  `/jobs/:id/events` | Read  | **401** | — | — |
-//! | GET  `/jobs/:id` (legacy i64) | Read | **401** | (404 si absent) | 403 |
 //!
 //! Le scénario nominal (202/200 avec auth) est couvert en détail dans
 //! `jobs_api_integration.rs` ; ici on cible la **fermeture du trou** : 401/403.
 //!
-//! # Fix C1 F-16 — route legacy `GET /api/v1/jobs/{id}` (i64)
+//! # F-177 — la route legacy `GET /api/v1/jobs/{id}` (i64) est SUPPRIMÉE
 //!
-//! La dernière route jobs non-sécurisée : elle recevait `trust` mais l'ignorait
-//! (`let _ = &trust;`), exposant le statut d'un job à quiconque connaissait un
-//! `i64` AUTOINCREMENT (devinable). C'est le `poll_url` de `vault_downgrade` —
-//! sécurisée (pas supprimée). Tests legacy ci-dessous.
+//! La route legacy lisait `state.queue` (file `jobs_v2`), retirée en 2.1.0
+//! (F-177) avec sa table. Le polling passe par `/jobs/{ulid}/v2` (`poll_url` de
+//! `vault_write`/`vault_downgrade`). Les tests legacy qui
+//! couvraient 401/403/404 sur cette route ont été retirés avec elle.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{Router, middleware};
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::TokenScope;
-use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
 use gradatum_server::{api_v1, middleware::auth_middleware, state::AppState};
-use sqlx::SqlitePool;
 use std::sync::Arc;
 use tower::ServiceExt;
 use ulid::Ulid;
@@ -66,22 +64,22 @@ read_patterns  = []
 write_patterns = []
 "#;
 
-async fn make_test_pool() -> SqlitePool {
-    let pool = SqlitePool::connect("sqlite::memory:")
+async fn make_test_db() -> QueueDb {
+    let db = QueueDb::open_in_memory()
         .await
-        .expect("pool in-memory invariant");
-    apply_sqlite_pragmas(&pool)
+        .expect("db in-memory invariant");
+    apply_sqlite_pragmas(&db)
         .await
         .expect("pragmas WAL invariant");
-    run_migrations(&pool).await.expect("migrations invariant");
-    pool
+    run_migrations(&db).await.expect("migrations invariant");
+    db
 }
 
 /// Construit `(state, token)` avec store SQLite in-memory + preset ACL fourni.
 async fn build_state(acl_preset: &str) -> (AppState, String) {
-    let pool = make_test_pool().await;
-    let store = Arc::new(SqliteQueueStore::new(pool.clone()));
-    let mut state = AppState::new().with_job_store(store, pool);
+    let db = make_test_db().await;
+    let store = Arc::new(SqliteQueueStore::new(db.clone()));
+    let mut state = AppState::new().with_job_store(store, db);
     let acl = AclEngine::from_preset_str(acl_preset).expect("preset ACL valide");
     state.acl = Arc::new(acl);
     let token = state
@@ -323,82 +321,5 @@ async fn job_events_without_auth_is_401() {
         resp.status(),
         StatusCode::UNAUTHORIZED,
         "GET /jobs/:id/events sans bearer → 401 (avant 404)"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Fix C1 F-16 — route legacy `GET /api/v1/jobs/{id}` (i64, poll_url downgrade).
-//
-// La route legacy lit `state.queue` (queue legacy), pas `state.job_store`.
-// Le harness ici n'injecte pas de queue réelle → `PlaceholderQueue::get` renvoie
-// `Ok(None)` → 404 quand l'auth passe. Cela suffit pour discriminer 401/403/404 :
-// - sans bearer → 401 AVANT lecture queue (trou C1 fermé) ;
-// - bearer valide + ACL deny → 403 ;
-// - bearer valide + ACL ok → 404 (preuve que l'auth ne bloque pas un légitime).
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// GET `/jobs/{id}` legacy SANS bearer → 401 (fix C1 — avant toute lecture queue).
-#[tokio::test]
-async fn legacy_get_job_without_auth_is_401() {
-    let (state, _token) = build_state(ACL_ALLOW).await;
-    let router = build_router(state);
-
-    let req = Request::builder()
-        .method("GET")
-        .uri("/api/v1/jobs/42")
-        .body(Body::empty())
-        .expect("build GET legacy sans bearer");
-
-    let resp = router.oneshot(req).await.expect("service");
-    assert_eq!(
-        resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "GET /jobs/{{id}} legacy sans bearer → 401 (trou C1 F-16 fermé)"
-    );
-}
-
-/// GET `/jobs/{id}` legacy avec bearer valide mais ACL Read refusée → 403.
-#[tokio::test]
-async fn legacy_get_job_with_auth_but_acl_deny_is_403() {
-    let (state, token) = build_state(ACL_DENY).await;
-    let router = build_router(state);
-
-    let req = Request::builder()
-        .method("GET")
-        .uri("/api/v1/jobs/42")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .expect("build GET legacy acl-deny");
-
-    let resp = router.oneshot(req).await.expect("service");
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "GET /jobs/{{id}} legacy authentifié mais ACL Read refusée → 403"
-    );
-}
-
-/// GET `/jobs/{id}` legacy avec bearer valide + ACL Read OK → 404 (job absent).
-///
-/// Preuve que l'auth ne bloque pas un consommateur légitime : la requête traverse
-/// l'authz et atteint la lecture queue (`PlaceholderQueue` → None → 404). Le
-/// comportement nominal 200 est couvert par `poll_job_real::poll_pending_returns_pending`.
-#[tokio::test]
-async fn legacy_get_job_with_auth_ok_reaches_queue_404() {
-    let (state, token) = build_state(ACL_ALLOW).await;
-    let router = build_router(state);
-
-    let req = Request::builder()
-        .method("GET")
-        .uri("/api/v1/jobs/42")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .expect("build GET legacy authed");
-
-    let resp = router.oneshot(req).await.expect("service");
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "GET /jobs/{{id}} legacy authentifié + ACL Read → atteint la queue → 404 (job absent)"
     );
 }

@@ -17,19 +17,26 @@
 # c'est `cargo deny` qui partirait ROUGE. La détection reste armée là où elle
 # compte.
 #
-# Inatteignabilité — re-mesurée le 2026-07-31 :
-#   cargo tree -i rsa -e normal                        -> « nothing to print »
-#   cargo tree -i rsa --target all -e normal,build,dev -> « nothing to print »
+# Inatteignabilité — re-mesurée le 2026-08-29 (après le retrait complet de sqlx du
+# graphe le 2026-08-25, montée rusqlite =0.40.2 — cf. Cargo.toml) :
+#   cargo tree -i rsa -e normal                        -> « error: package ID
+#     specification `rsa` did not match any packages »
+#   cargo tree -i rsa --target all -e normal,build,dev -> idem
 #   grep -rn '"mysql"' --include=Cargo.toml .          -> aucune activation
-# rsa n'est dans AUCUN graphe résolu, toutes cibles et tous types d'arêtes
-# confondus. Les deux chemins que `cargo audit` exhibe passent par une feature
-# non sélectionnée :
-#   rsa 0.9.10 → sqlx-mysql 0.8.6 → sqlx-macros-core → … → sqlx 0.8.6 (driver
-#     sqlite seul ; la feature `mysql` de sqlx n'est jamais activée) ;
+# (le libellé de sortie a changé depuis la mesure précédente — « nothing to print » —
+# le constat reste identique : rsa n'est dans AUCUN graphe résolu par défaut, toutes
+# cibles et tous types d'arêtes confondus.)
+# Un seul chemin reste possible, et il passe par une feature non sélectionnée :
 #   rsa 0.9.10 → reqsign-google 3.0.3 / reqsign-core 3.2.0 / reqsign-azure-storage
-#     3.1.1 → opendal-service-{gcs,s3,azblob} 0.58.1 → opendal 0.58.1 →
-#     gradatum-storage (backends cloud d'opendal, non activés — seul le service
-#     local est utilisé).
+#     3.1.1 → opendal-service-{gcs,azblob} 0.58.1 → opendal 0.58.1 →
+#     gradatum-storage (backends cloud `gcs`/`azure` d'opendal, non activés par défaut
+#     ni par la CI — seul le service local `fs` est utilisé). Le backend `s3` n'est
+#     PAS concerné : `opendal-service-s3` ne tire que reqsign-aws-v4 + reqsign-core,
+#     sans la dépendance `rsa` de ce dernier, qui n'est qu'une feature optionnelle
+#     activée uniquement par `gcs`/`azure`.
+#   L'ancien second chemin — rsa → sqlx-mysql → … → sqlx 0.8.6 → 8 crates du
+#     workspace — est PÉRIMÉ : `sqlx` est sorti du graphe résolu dans son ensemble ;
+#     il n'y a plus de chemin sqlx à invalider, il n'y a plus de sqlx du tout.
 #
 # Absence de correctif amont : advisory ouverte depuis 2023-11 avec `patched = []`,
 # aucun `rsa` corrigé publié, aucune date annoncée. `cargo audit` rend
@@ -38,12 +45,12 @@
 # job rouge permanent finit par masquer les rouges qui, eux, comptent.
 #
 # Condition de revisite (fait vérifiable, pas intention) — retirer cette entrée dès
-# que L'UN de ces trois faits est vrai :
+# que L'UN de ces deux faits est vrai (le troisième critère historique — activation de
+# la feature `mysql` de `sqlx` — a disparu avec sqlx lui-même, sorti du graphe résolu) :
 #   1. un `rsa` corrigé (advisory `patched` non vide) paraît en amont ;
-#   2. la feature `mysql` de `sqlx` est activée dans un Cargo.toml du workspace ;
-#   3. `cargo tree -i rsa --target all -e normal,build,dev` cesse de rendre
-#      « nothing to print » (rsa entre dans le graphe résolu, p.ex. activation
-#      d'un backend cloud opendal).
+#   2. `cargo tree -i rsa --target all -e normal,build,dev` cesse de rendre
+#      « error: package ID specification `rsa` did not match any packages » (rsa entre
+#      dans le graphe résolu, p.ex. activation d'un backend cloud `gcs`/`azure` d'opendal).
 # Dans ces cas, `cargo deny` partira rouge de lui-même : c'est le signal attendu.
 [advisories]
 ignore = ["RUSTSEC-2023-0071"]

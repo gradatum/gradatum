@@ -1938,3 +1938,82 @@ async fn cache_breakpoint_threshold_defaults() {
         "T10-3 : cache_breakpoint_hint doit toujours être présent dans la réponse. resp={resp}"
     );
 }
+
+// ── P0 régression — garde Noop du chemin contexte (F-162 critère 10) ─────────
+
+/// Sous embedder **Noop**, `retrieve_candidates` doit fusionner par RANG (`rrf_fuse`),
+/// pas par magnitude BM25 (`rrf_fuse_short_circuit`, cas bras-unique).
+///
+/// # Le défaut couvert
+///
+/// Le commit `574c1838` a fait basculer `retrieval.rs` de `rrf_fuse` (fusion par rang)
+/// vers `rrf_fuse_short_circuit` **inconditionnellement**, sans reproduire la garde Noop
+/// de `logic.rs:536` (`if backend_kind() != Noop { short_circuit } else { rrf_fuse }`).
+/// Le CHANGELOG (critère 10) affirme pourtant : « Le chemin Noop (embedder éteint) reste
+/// sur `rrf_fuse` pur, bit-à-bit inchangé. » Le code ne l'honorait pas.
+///
+/// # Pourquoi ce test est ROUGE sans la garde
+///
+/// Sous Noop, `sem_for_rrf` est toujours vide. Les deux fonctions divergent alors :
+/// - `rrf_fuse` (correct) : le top BM25 (rang 0) reçoit `1/(k+0) + 1/(k+sem_n+1)` =
+///   `1/60 + 1/61 ≈ 0.03306`. La magnitude BM25 est jetée → **constante de rang**,
+///   indépendante de la valeur BM25 réelle.
+/// - `rrf_fuse_short_circuit` (bug, cas bras-unique lexical) : rend
+///   `normalize_bm25(bm25) = 1/(1+|bm25|)` — une magnitude sur l'échelle BM25.
+///   Pour qu'elle égale `0.03306`, il faudrait `|bm25| ≈ 29.25`, impossible pour un
+///   unique hit FTS (BM25 ≈ quelques unités). Donc l'égalité exacte ci-dessous
+///   distingue les deux chemins de façon déterministe.
+///
+/// La bascule d'échelle (~0,033 → [0,1]) modifie ensuite le poids relatif de la
+/// pertinence dans `composite_score_weighted` (`select.rs`), donc le classement du
+/// contexte injecté en mode embedder éteint — ce n'est pas qu'un changement d'ordre.
+#[tokio::test]
+async fn noop_embedder_context_uses_rank_fusion_not_bm25_magnitude() {
+    use gradatum_core::scope::{AclCheckedVaultId, VaultId};
+    use gradatum_server::context::retrieval::retrieve_candidates;
+    use ulid::Ulid;
+
+    // `build_app()` → `NoopBackend` (`backend_kind() == Noop`) : chemin BM25-only.
+    let env = helpers::build_app().await;
+    let idx = env._vault_typed.index();
+
+    // Une seule note → un seul candidat BM25 → rang 0 sans ambiguïté.
+    let ulid = Ulid::generate().to_string();
+    idx.seed_note_with_fts(
+        &ulid,
+        "decisions",
+        "# Note P0 garde noop\nzylotron reweighting garde noop contexte fusion rang",
+    )
+    .await
+    .expect("seed_note_with_fts — invariant test");
+
+    let vault_id = AclCheckedVaultId::for_system_task(VaultId::new("main"));
+    let outcome = retrieve_candidates(&env.state, &vault_id, "zylotron", None, 20, 5_000)
+        .await
+        .expect("retrieve_candidates — invariant test");
+
+    let cand = outcome
+        .candidates
+        .iter()
+        .find(|c| c.note_id == ulid)
+        .unwrap_or_else(|| {
+            panic!(
+                "la note seedée doit être candidate BM25 — candidates={:?}",
+                outcome
+                    .candidates
+                    .iter()
+                    .map(|c| &c.note_id)
+                    .collect::<Vec<_>>()
+            )
+        });
+
+    // Score de rang `rrf_fuse` : rang 0 BM25 + pénalité sémantique (sem_n+1 = 1), k = 60.
+    let expected_rank_score = 1.0_f64 / 60.0 + 1.0_f64 / 61.0;
+    assert!(
+        (cand.rrf_score - expected_rank_score).abs() < 1e-9,
+        "sous Noop, le chemin contexte doit rendre le score de rang `rrf_fuse` \
+         ({expected_rank_score}), pas une magnitude `normalize_bm25` (court-circuit non gardé). \
+         got rrf_score={}",
+        cand.rrf_score
+    );
+}

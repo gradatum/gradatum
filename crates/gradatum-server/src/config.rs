@@ -265,10 +265,10 @@ pub struct ScoringConfig {
     /// `false` = bit-identical scores to the pre-decay baseline (golden-set gate).
     #[serde(default = "ScoringConfig::default_trust_decay_enabled")]
     pub trust_decay_enabled: bool,
-    /// Decay half-lives (in days) per provenance.
+    /// Decay half-lives (in days) per `doc_kind` (F-261).
     ///
-    /// A provenance **absent** from this map → **no decay** (`half_life = None`,
-    /// non-perishable trust, e.g. `human-decision`). Default: `distilled = 90`.
+    /// A `doc_kind` **absent** from this map → **no decay** (`half_life = None`,
+    /// non-perishable trust — le cas `Static`). Default: `Event = 90`.
     #[serde(default = "ScoringConfig::default_half_lives")]
     pub half_life_days: std::collections::HashMap<String, f64>,
 }
@@ -278,7 +278,7 @@ impl ScoringConfig {
         true
     }
 
-    /// Default half-lives: `distilled = 90 d`. `human-decision` absent = no decay.
+    /// Default half-lives: `Event = 90 d`. `Static` absent = no decay.
     ///
     /// Single source of truth: delegates to `gradatum_search::default_half_lives` —
     /// literals are defined only in `gradatum-search::scoring`.
@@ -1415,10 +1415,9 @@ mod scoring_defaults_tests {
             from_config, from_scoring,
             "demi-vies config != scoring : la source unique D2.2 a divergé"
         );
-        // Valeur de référence du gate v0.4.4 : distilled = 90j.
-        assert_eq!(from_config.get("distilled").copied(), Some(90.0));
-        // human-decision absent = pas de decay (trust non périssable).
-        assert!(!from_config.contains_key("human-decision"));
+        // F-261 : clé = doc_kind — Event = 90j (calibration reprise de distilled), Static absent.
+        assert_eq!(from_config.get("Event").copied(), Some(90.0));
+        assert!(!from_config.contains_key("Static"));
     }
 }
 

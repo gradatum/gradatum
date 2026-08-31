@@ -38,14 +38,13 @@ use gradatum_core::{
     identity::{ContentHash, NoteId},
     scope::VaultId,
 };
-use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
 use gradatum_index::SqliteIndex;
 use gradatum_vault::Vault;
 use gradatum_worker::apalis_handlers::handle_curate;
 use gradatum_worker::internal_client::InternalClient;
 use test_internal_client::TestInternalClient;
 
-use sqlx::SqlitePool;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -55,12 +54,12 @@ use ulid::Ulid;
 
 /// Crée un `SqliteQueueStore` in-memory avec schéma appliqué.
 async fn test_store() -> SqliteQueueStore {
-    let pool = SqlitePool::connect("sqlite::memory:")
+    let db = QueueDb::open_in_memory()
         .await
         .expect("pool in-memory F-41");
-    apply_sqlite_pragmas(&pool).await.expect("pragmas F-41");
-    run_migrations(&pool).await.expect("migrations F-41");
-    SqliteQueueStore::new(pool)
+    apply_sqlite_pragmas(&db).await.expect("pragmas F-41");
+    run_migrations(&db).await.expect("migrations F-41");
+    SqliteQueueStore::new(db)
 }
 
 /// Fixture vault + index.

@@ -25,6 +25,17 @@ async fn health_endpoint_reports_ready() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    // F-205 : le champ `event_log` est sérialisé jusqu'à la surface HTTP. Le helper de
+    // test câble une télémétrie active → "active".
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        json["event_log"], "active",
+        "/health doit exposer l'état de la télémétrie (event_log) : {json}"
+    );
 }
 
 /// C2 — /metrics absent du router principal (port LAN) : doit retourner 404.

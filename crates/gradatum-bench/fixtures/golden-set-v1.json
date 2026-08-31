@@ -1,0 +1,266 @@
+{
+  "schema": "gradatum-bench/golden-set/v1",
+  "_avertissement": "Banc F-162 sous fake-embedder.py (sac-de-mots blake2b DÉTERMINISTE, cos=0.0000 exactement entre textes disjoints). Ce jeu prouve que le pipeline RÉPOND de façon stable ; il ne mesure AUCUNE qualité sémantique. Vert = « le pipeline répond », jamais « la pertinence est préservée ». La production tourne sous bge-m3 (qui généralise) ; ce jeu NE transpose PAS à bge-m3. expected_top5 est CAPTURÉ PUIS GELÉ, jamais dérivé : comparer par APPARTENANCE (set), pas par ordre (les ex-æquo sont départagés par récence, non reproductible).",
+  "corpus": "corpus-synthetique-v1.jsonl",
+  "corpus_sha256": "aea4cc26b7efd02e420809230ea969833432420ac03d0d72797c0c2f68dc0678",
+  "captured": {
+    "at_utc": "2026-08-25T01:12:08Z",
+    "mode": "hybrid",
+    "server_version": "2.0.9",
+    "build_sha": "927a25cb",
+    "embedder": "fake-embedder.py (blake2b sac-de-mots, déterministe)",
+    "limit": 5
+  },
+  "stabilite": {
+    "cle": "ULID du corpus (champ id, pré-alloué) = note_id serveur, invariant entre ingestions",
+    "comparaison": "appartenance (set) des expected_top5 au top-5 serveur — PAS l'ordre",
+    "ordre_non_garanti": "ex-æquo de score départagés par récence (anchor_ms=temps d'ingestion), non reproductible",
+    "limit_gate": "interroger au MÊME limit=5 : la fusion hybride est sensible au limit (reclasse/re-note selon le pool)",
+    "reproductibilite": "set-membership validé empiriquement par seconde ingestion, pas par frontière de score"
+  },
+  "lexical": {
+    "grandeur": "expected_corpus_match_count = décompte lexical BM25 (FTS5) rendu par include_corpus_count, CAPTURÉ par requête puis gelé — jamais dérivé",
+    "purete": "corpus_match_count est PUR lexical : le bras sémantique (ANN) ne l'affecte pas — c'est le signal BM25 seul, sans seconde passe",
+    "role": "c'est LUI qui tombait à 0 sous le bug F-162 (« absence prouvée ») alors que le top-5 hybride restait non vide (masquage sémantique). Le gate doit l'ASSERTER en plus du top-5.",
+    "discriminants": "g08/g09 (multi-jetons ponctués) discriminent pré/post-fix : corpus_match_count 6→0 et 15→0 sous le bug (mesuré). g10 (disjonction) discrimine aussi : l'ET implicite des trois jetons « 2.0.7 »+« or »+« 2.0.6 » rend 8 post-fix, 0 pré-fix (phrase contiguë). Les 7 premières requêtes — mono-jeton ponctué ou zéro lexical légitime — ne discriminent PAS (mesuré)."
+  },
+  "queries": [
+    {
+      "id": "g01",
+      "kind": "ponctuee-colon-slash",
+      "query": "version:gradatum/2.1.0",
+      "rationale": "Requête ponctuée (deux-points, slash, point) — la forme qui rendait « absence prouvée » : build_fts_query l'enveloppe en phrase contiguë. Cas central F-162.",
+      "expected_top5": [
+        "00000000000000000000000023",
+        "0000000000000000000000001V",
+        "0000000000000000000000001Y",
+        "0000000000000000000000001X",
+        "00000000000000000000000021"
+      ],
+      "expected_corpus_match_count": 15,
+      "_scores_capture": [
+        0.430881,
+        0.426671,
+        0.415467,
+        0.407065,
+        0.407065
+      ],
+      "_tied_scores": [
+        0.407065
+      ]
+    },
+    {
+      "id": "g02",
+      "kind": "ponctuee-hyphen",
+      "query": "cargo-semver-checks",
+      "rationale": "Ponctuation par tiret — « un seul tiret fait passer 6 notes à absence prouvée ». Variante hyphen du même défaut.",
+      "expected_top5": [
+        "0000000000000000000000001B",
+        "0000000000000000000000001A",
+        "00000000000000000000000019",
+        "0000000000000000000000001D",
+        "00000000000000000000000018"
+      ],
+      "expected_corpus_match_count": 6,
+      "_scores_capture": [
+        0.333846,
+        0.328164,
+        0.321527,
+        0.321527,
+        0.312678
+      ],
+      "_tied_scores": [
+        0.321527
+      ]
+    },
+    {
+      "id": "g03",
+      "kind": "ponctuee-dot",
+      "query": "2.0.7",
+      "rationale": "Jeton versionné à points — ponctuation interne typique d'un identifiant de version.",
+      "expected_top5": [
+        "0000000000000000000000001F",
+        "0000000000000000000000001K",
+        "0000000000000000000000001J",
+        "0000000000000000000000001E",
+        "0000000000000000000000001H"
+      ],
+      "expected_corpus_match_count": 8,
+      "_scores_capture": [
+        0.410891,
+        0.410891,
+        0.404772,
+        0.400102,
+        0.39201
+      ],
+      "_tied_scores": [
+        0.410891
+      ]
+    },
+    {
+      "id": "g04",
+      "kind": "multi-jetons",
+      "query": "build recherche graphe banc",
+      "rationale": "Requête à plusieurs jetons discriminants (frontière 5/6 franche vérifiée) — exerce le chemin FTS multi-termes.",
+      "expected_top5": [
+        "00000000000000000000000056",
+        "00000000000000000000000027",
+        "0000000000000000000000002B",
+        "00000000000000000000000026",
+        "0000000000000000000000003M"
+      ],
+      "expected_corpus_match_count": 0,
+      "_scores_capture": [
+        0.22895,
+        0.2285,
+        0.2285,
+        0.2225,
+        0.218146
+      ],
+      "_tied_scores": [
+        0.2285
+      ]
+    },
+    {
+      "id": "g05",
+      "kind": "operateurs-or-not-litteraux",
+      "query": "build OR recherche NOT corpus",
+      "rationale": "OR/NOT deviennent des JETONS littéraux (et non des opérateurs FTS) : exerce le cas F-162 des mots-clés d'opérateur avalés dans la requête.",
+      "expected_top5": [
+        "0000000000000000000000001K",
+        "0000000000000000000000001J",
+        "0000000000000000000000001E",
+        "0000000000000000000000001H",
+        "00000000000000000000000056"
+      ],
+      "expected_corpus_match_count": 0,
+      "_scores_capture": [
+        0.129259,
+        0.128759,
+        0.125865,
+        0.123319,
+        0.10239
+      ],
+      "_tied_scores": []
+    },
+    {
+      "id": "g06",
+      "kind": "operateur-near-litteral",
+      "query": "graphe NEAR banc",
+      "rationale": "NEAR devient un jeton littéral — variante NEAR du cas opérateur.",
+      "expected_top5": [
+        "0000000000000000000000000V",
+        "0000000000000000000000002Q",
+        "0000000000000000000000002J",
+        "0000000000000000000000000P",
+        "00000000000000000000000015"
+      ],
+      "expected_corpus_match_count": 0,
+      "_scores_capture": [
+        0.264597,
+        0.263849,
+        0.256921,
+        0.253425,
+        0.251725
+      ],
+      "_tied_scores": []
+    },
+    {
+      "id": "g07",
+      "kind": "mono-jeton-temoin",
+      "query": "synthétique",
+      "rationale": "Mono-jeton présent dans les 200 notes : requête TÉMOIN sur un sujet connu non vide. C'est elle qui, dans F-162, révèle un faux zéro par contraste.",
+      "expected_top5": [
+        "0000000000000000000000005Z",
+        "00000000000000000000000063",
+        "00000000000000000000000067",
+        "0000000000000000000000005Y",
+        "00000000000000000000000062"
+      ],
+      "expected_corpus_match_count": 200,
+      "_scores_capture": [
+        0.685498,
+        0.685498,
+        0.685498,
+        0.667498,
+        0.667498
+      ],
+      "_tied_scores": [
+        0.667498,
+        0.685498
+      ]
+    },
+    {
+      "id": "g08",
+      "kind": "ponctuee-multijeton-publication",
+      "query": "cargo-semver-checks publication",
+      "rationale": "DISCRIMINANT F-162 (mesuré) : jeton ponctué à tiret + mot non adjacent de la même note. Pré-fix build_fts_query → phrase contiguë « cargo-semver-checks publication » → corpus_match_count=0. Post-fix → « cargo-semver-checks » publication → 6. Le bras sémantique garde un top-5 non vide dans les deux cas (masquage) : seul corpus_match_count tranche.",
+      "expected_top5": [
+        "0000000000000000000000001B",
+        "0000000000000000000000001A",
+        "00000000000000000000000019",
+        "0000000000000000000000001D",
+        "00000000000000000000000018"
+      ],
+      "expected_corpus_match_count": 6,
+      "_scores_capture": [
+        0.285845,
+        0.281901,
+        0.276199,
+        0.276199,
+        0.268597
+      ],
+      "_tied_scores": [
+        0.276199
+      ]
+    },
+    {
+      "id": "g09",
+      "kind": "ponctuee-multijeton-cardinalite",
+      "query": "version:gradatum/2.1.0 cardinalité",
+      "rationale": "DISCRIMINANT F-162 (mesuré) : jeton ponctué (deux-points, slash, point) + mot non adjacent. Pré-fix → 0. Post-fix → 15. Même logique que g08 : le décompte lexical est la grandeur qui porte le symptôme.",
+      "expected_top5": [
+        "00000000000000000000000023",
+        "0000000000000000000000001V",
+        "0000000000000000000000001Y",
+        "0000000000000000000000001X",
+        "00000000000000000000000021"
+      ],
+      "expected_corpus_match_count": 15,
+      "_scores_capture": [
+        0.36433,
+        0.359718,
+        0.350273,
+        0.343189,
+        0.343189
+      ],
+      "_tied_scores": [
+        0.343189
+      ]
+    },
+    {
+      "id": "g10",
+      "kind": "operateurs-or-disjonction",
+      "query": "2.0.7 OR 2.0.6",
+      "rationale": "CRITÈRE 4 (forme disjonction) : le jeton `or` devient un littéral cité — post-fix « \"2.0.7\" \"OR\" \"2.0.6\" » = ET implicite des TROIS jetons. Attendu NON NUL (8) : le mot `or` est planté littéralement dans les notes [46,54) qui portent aussi 2.0.7 ET 2.0.6 (génération corpus v1, mesuré). Pré-fix (phrase contiguë) → 0.",
+      "expected_top5": [
+        "0000000000000000000000001F",
+        "0000000000000000000000001K",
+        "0000000000000000000000001J",
+        "0000000000000000000000001E",
+        "0000000000000000000000001H"
+      ],
+      "expected_corpus_match_count": 8,
+      "_scores_capture": [
+        0.323603,
+        0.323603,
+        0.320471,
+        0.315105,
+        0.308733
+      ],
+      "_tied_scores": [
+        0.323603
+      ]
+    }
+  ]
+}

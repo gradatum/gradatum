@@ -272,16 +272,13 @@ async fn exchange_non_main_tenant_key_returns_403() {
         .expect("create api key");
 
     // Muter le tenant en SQL direct pour simuler une clé non-main legacy.
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect(&format!("sqlite://{}", api_keys_path.display()))
-        .await
-        .expect("open api_keys sqlite");
-    sqlx::query("UPDATE api_keys SET tenant_id = 'evil' WHERE prefix = ?")
-        .bind(&material.prefix)
-        .execute(&pool)
-        .await
-        .expect("mutate tenant to evil");
-    pool.close().await;
+    let conn = rusqlite::Connection::open(&api_keys_path).expect("open api_keys sqlite");
+    conn.execute(
+        "UPDATE api_keys SET tenant_id = ?1 WHERE prefix = ?2",
+        rusqlite::params!["evil", material.prefix],
+    )
+    .expect("mutate tenant to evil");
+    drop(conn);
 
     let router = build_test_router(state);
 
@@ -475,17 +472,13 @@ async fn create_key_with_tenant(state: &AppState, dir: &TempDir, tenant: &str) -
         .await
         .expect("create api key");
     let api_keys_path = dir.path().join("api_keys.sqlite");
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect(&format!("sqlite://{}", api_keys_path.display()))
-        .await
-        .expect("open api_keys sqlite");
-    sqlx::query("UPDATE api_keys SET tenant_id = ? WHERE prefix = ?")
-        .bind(tenant)
-        .bind(&material.prefix)
-        .execute(&pool)
-        .await
-        .expect("mutate tenant");
-    pool.close().await;
+    let conn = rusqlite::Connection::open(&api_keys_path).expect("open api_keys sqlite");
+    conn.execute(
+        "UPDATE api_keys SET tenant_id = ?1 WHERE prefix = ?2",
+        rusqlite::params![tenant, material.prefix],
+    )
+    .expect("mutate tenant");
+    drop(conn);
     material.secret
 }
 

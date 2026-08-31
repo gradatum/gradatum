@@ -24,7 +24,13 @@
 //!
 //! Le dataset de requêtes ET le rapport baseline contiennent des données du vault
 //! personnel (ULIDs, titres). Ils vivent dans `crates/gradatum-bench/datasets/*.json`
-//! (gitignore `*.json` + `*.jsonl`) et ne sont JAMAIS commités. Seul ce CODE l'est.
+//! et ne sont JAMAIS commités. Seul ce CODE l'est.
+//!
+//! ⚠️ Portée exacte du `.gitignore` : les motifs `*.json` / `*.jsonl` / `*.csv` ne
+//! sont ignorés que **sous `crates/gradatum-bench/datasets/`**, PAS globalement. Un
+//! fichier de même extension ailleurs (p. ex. `crates/gradatum-bench/fixtures/`)
+//! N'est PAS ignoré — les fixtures synthétiques de F-162 y sont donc bien commitées,
+//! ce qui exige qu'elles ne contiennent aucune donnée du vault (contrainte C2).
 //!
 //! ## Format dataset (`SEARCH_GOLDEN_DATASET`, défaut datasets/search-golden-queries-v0.4.4.json)
 //!

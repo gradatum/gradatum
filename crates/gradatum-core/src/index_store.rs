@@ -866,6 +866,33 @@ pub trait IndexStore: Send + Sync {
         Ok((Vec::new(), 0))
     }
 
+    /// Lists notes filtered by their typed **project-map roles** (`kind` / `status`).
+    ///
+    /// Follows [`Self::list_notes`] (excludes `downgraded`, same pagination) and adds two
+    /// optional equality filters on the `role_kind` / `role_status` columns. `None` on a filter
+    /// means "no constraint on that axis": `list_notes_filtered(v, s, None, None, …)` returns
+    /// exactly what [`Self::list_notes`] returns.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok((vec![], 0))` — only the real SQLite index produces results; test mocks
+    /// inherit the default unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    async fn list_notes_filtered(
+        &self,
+        _vault_id: &str,
+        _section: Option<&str>,
+        _role_kind: Option<&str>,
+        _role_status: Option<&str>,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        Ok((Vec::new(), 0))
+    }
+
     /// Lists the `k` most recently active notes in a vault.
     ///
     /// **"Recently active"** is defined as `ORDER BY COALESCE(updated, created) DESC`:
@@ -894,6 +921,35 @@ pub trait IndexStore: Send + Sync {
     ///
     /// Returns `GradatumError::Storage` if the SQLite query fails.
     async fn total_body_size_bytes(&self, vault_id: &str) -> Result<u64, GradatumError>;
+
+    /// Timestamp (Unix epoch **milliseconds**) of the most recently indexed live note
+    /// in a vault — `MAX(COALESCE(updated, created))` over `status = 'live'`, non-sentinel
+    /// notes. Powers `vault_status.last_indexed_at`.
+    ///
+    /// Every note write is an indexation event (`created` on insert, `updated` on
+    /// mutation); their maximum is the freshest content observable in the index. The
+    /// per-row `COALESCE(updated, created)` matches `vault_list.modified_at`: `updated`
+    /// is `NULL` until a note is first mutated, so a once-written note's indexation
+    /// instant is its `created`.
+    ///
+    /// An implementer that tracks indexation returns `Ok(None)` **only** when the live
+    /// corpus is empty (nothing indexed yet) — never as a silent fallback on failure.
+    /// A storage error is propagated so the field is never a misleading `null`.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` — an implementer that does not track the indexation date
+    /// reports the freshness as **unknown**, never as fresh. A caller must treat `None`
+    /// as **unknown** (backend without support, or empty corpus) — never as proof that
+    /// the index is fresh. The default must never let a consumer believe the data is
+    /// fresh when it may not be. `SqliteIndex` overrides with the real read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the query fails.
+    async fn last_indexed_at(&self, _vault_id: &str) -> Result<Option<i64>, GradatumError> {
+        Ok(None)
+    }
 
     /// Inserts or ignores a wikilink between two notes.
     ///
@@ -1102,6 +1158,32 @@ pub trait IndexStore: Send + Sync {
         vault_id: &str,
         prefix: &str,
     ) -> Result<Vec<(String, String)>, GradatumError>;
+
+    /// Lists notes of a canonical section — `(id, section)`, `forgotten = 0`.
+    ///
+    /// The per-section counterpart of [`Self::list_notes_by_locus_prefix`]: resolves a
+    /// `JobScope::Section` scope for the conditional distill cron and feeds the
+    /// per-section pressure count (`handle_count_unprocessed`). The section axis is used
+    /// because the `locus` column is `NULL` on the whole corpus (never populated); the
+    /// canonical section names (`debug`, `experiments`, `reference`, …) are the actual
+    /// consolidation targets. Like the locus variant, this is a listing, not a count —
+    /// the caller applies the `live && !processed` filter on top.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(vec![])` — only the real SQLite index produces results; test mocks
+    /// inherit the default unchanged (same pattern as [`Self::list_notes_by_status`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    async fn list_notes_by_section(
+        &self,
+        _vault_id: &str,
+        _section: &str,
+    ) -> Result<Vec<(String, String)>, GradatumError> {
+        Ok(Vec::new())
+    }
 
     /// Resolves an Agent scope via `author_id` for semantic forget.
     ///

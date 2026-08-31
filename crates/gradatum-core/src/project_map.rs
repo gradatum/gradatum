@@ -21,13 +21,10 @@
 //! | kind | `[[kind:FIX]]` | [`ProjectMapLink::Kind`] |
 //! | version | `[[version:gradatum/0.6.1]]` | [`ProjectMapLink::Version`] |
 //! | annex | `[[spec:…]]` `[[plan:…]]` `[[context:…]]` | [`ProjectMapLink::Annex`] |
-// scan-fr-strings: allow-jargon F-37 — exemple de SYNTAXE du wikilink `feature:`, pas un renvoi à un ticket
-//! | feature | `[[feature:F-37]]` | [`ProjectMapLink::Feature`] |
+//! | feature | `[[feature:F-<n>]]` | [`ProjectMapLink::Feature`] |
 //! | release | `[[release:planned]]` | [`ProjectMapLink::Release`] |
-// scan-fr-strings: allow-jargon F-12 — exemple de SYNTAXE du wikilink `supersedes:`, pas un renvoi à un ticket
-//! | supersedes | `[[supersedes:F-12]]` | [`ProjectMapLink::Supersedes`] |
-// scan-fr-strings: allow-jargon F-31 — exemple de SYNTAXE du wikilink `parent:`, pas un renvoi à un ticket
-//! | parent | `[[parent:F-31]]` | [`ProjectMapLink::Parent`] |
+//! | supersedes | `[[supersedes:F-<n>]]` | [`ProjectMapLink::Supersedes`] |
+//! | parent | `[[parent:F-<n>]]` | [`ProjectMapLink::Parent`] |
 //! | dependency | `[[decisions:01K…]]` | [`ProjectMapLink::Dep`] |
 //!
 //! ## Feature cards
@@ -77,8 +74,15 @@ pub enum StatusKind {
 impl StatusKind {
     /// Parse the SCREAMING_SNAKE wire value of a `[[status:…]]` wikilink.
     ///
+    /// Inverse of [`StatusKind::as_wire`]: it maps a raw wire value back to its
+    /// variant, or `None` when the value is not part of the status vocabulary.
+    /// Exposed so callers (e.g. the `project-map scope` counters) can classify a
+    /// wire status against the authoritative vocabulary rather than re-hardcoding
+    /// the list of accepted values.
+    ///
     /// Matching is case-sensitive: `"DONE"` is accepted; `"done"` and `"Done"` are rejected.
-    fn from_wire(value: &str) -> Option<Self> {
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
         match value {
             "BRAINSTORMING" => Some(Self::Brainstorming),
             "OPEN" => Some(Self::Open),
@@ -106,9 +110,12 @@ impl StatusKind {
 
 /// Nature of a project-map work unit — drives CHANGELOG categorisation.
 ///
-/// Wire values are SCREAMING_SNAKE-cased. `CHORE` and `SPIKE` are provided as
-/// distinct kinds so that `TASK` does not become a catch-all that degrades
-/// Keep-a-Changelog grouping.
+/// Wire values are SCREAMING_SNAKE-cased. `TASK` is the deliberate catch-all
+/// (maintenance, tooling, bounded exploration, uncategorised work): no CHANGELOG
+/// section distinguishes those sub-kinds, so splitting below `TASK` would add
+/// vocabulary without adding a grouping. Separately — and orthogonally — only
+/// `kind:FEATURE` reaches the public website (see [`validate_links`] and the
+/// mirror-site filter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KindKind {
@@ -118,11 +125,12 @@ pub enum KindKind {
     Enhancement,
     /// Bug fix (CHANGELOG "Fixed").
     Fix,
-    /// Maintenance or tooling — usually kept out of the public changelog.
-    Chore,
-    /// Bounded exploration or prototype.
-    Spike,
-    /// Generic task — the deliberate catch-all.
+    /// Generic task — the deliberate catch-all (maintenance, tooling, exploration).
+    ///
+    /// Absorbs the retired `CHORE` / `SPIKE` vocabulary: those wire values have been
+    /// removed for good — `KindKind::from_wire` returns `None` for them, and the
+    /// `Chore` / `Spike` Rust variants no longer exist. Categorise former
+    /// chore/spike work as [`KindKind::Task`].
     Task,
 }
 
@@ -133,8 +141,6 @@ impl KindKind {
             "FEATURE" => Some(Self::Feature),
             "ENHANCEMENT" => Some(Self::Enhancement),
             "FIX" => Some(Self::Fix),
-            "CHORE" => Some(Self::Chore),
-            "SPIKE" => Some(Self::Spike),
             "TASK" => Some(Self::Task),
             _ => None,
         }
@@ -147,8 +153,6 @@ impl KindKind {
             Self::Feature => "FEATURE",
             Self::Enhancement => "ENHANCEMENT",
             Self::Fix => "FIX",
-            Self::Chore => "CHORE",
-            Self::Spike => "SPIKE",
             Self::Task => "TASK",
         }
     }
@@ -299,7 +303,7 @@ pub enum SchemaError {
 
     /// A `[[kind:…]]` value outside the taxonomy.
     #[error(
-        "invalid kind {0:?} (expected SCREAMING_SNAKE ∈ FEATURE/ENHANCEMENT/FIX/CHORE/SPIKE/TASK)"
+        "invalid kind {0:?} (expected SCREAMING_SNAKE ∈ FEATURE/ENHANCEMENT/FIX/TASK — CHORE and SPIKE were removed on 2026-08-19, use TASK)"
     )]
     InvalidKind(String),
 
@@ -408,9 +412,7 @@ fn validate_ident(prefix: &str, value: &str) -> Result<(), SchemaError> {
 ///
 /// The format is exact — an uppercase `F`, a hyphen, then 2 or 3 ASCII digits — and
 /// needs a dedicated parser rather than [`validate_ident`], which would reject the
-// scan-fr-strings: allow-jargon F-37 — valeur d'exemple du contrat de `validate_feature_ident`
-// scan-fr-strings: allow-jargon F-061 — valeur d'exemple du contrat de `validate_feature_ident`
-/// uppercase `F`. Valid: `F-37`, `F-061`. Invalid: `f-37`, `F-1`, `F-1234`, `feature37`.
+/// uppercase `F`. Valid: e.g. `F-` followed by `37` or `061`. Invalid: `f-37`, `F-1`, `F-1234`, `feature37`.
 ///
 /// The check is done character by character, so the crate needs no `regex` dependency.
 ///
@@ -572,7 +574,7 @@ fn parse_dep(section: &str, ulid: &str, raw: &str) -> Result<ProjectMapLink, Sch
 /// **Feature cards**: as soon as one `Feature` link is present, exactly 1 `Feature`,
 /// 1 `Release`, 1 `Version` and one `kind` are required. Every [`KindKind`] value is
 /// accepted; only `kind:FEATURE` is exported to the public website, the other kinds
-/// (`FIX`/`CHORE`/`SPIKE`/`TASK`/`ENHANCEMENT`) stay vault-only. Without a `Feature`
+/// (`FIX`/`TASK`/`ENHANCEMENT`) stay vault-only. Without a `Feature`
 /// link (a plain changelog card), no `Release` link is allowed and `Kind` is
 /// unconstrained — the original validation rules are unchanged.
 ///
@@ -638,7 +640,7 @@ pub fn validate_links(links: &[ProjectMapLink]) -> Result<(), SchemaError> {
         // exactement 1 version (sentinel gradatum/backlog admis) + kind ∈ enum.
         // Ordre : feature → release → version (cohérent avec §10e).
         // Note : seul kind:FEATURE est exporté vers le site (export T2 S2) ;
-        // les autres kinds sont vault-only (FIX/CHORE/SPIKE/TASK/ENHANCEMENT).
+        // les autres kinds sont vault-only (FIX/TASK/ENHANCEMENT).
         if feature_count != 1 {
             return Err(SchemaError::FeatureCardinality(feature_count));
         }
@@ -788,8 +790,7 @@ pub fn reserved_node_target(raw: &str) -> Option<String> {
 /// `GET /api/v1/project-map/export-features`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureEntry {
-    // scan-fr-strings: allow-jargon F-37 — valeur d'exemple du champ `feature`, pas un renvoi à un ticket
-    /// Identifier of the feature card (e.g. `"F-37"`).
+    /// Identifier of the feature card, of the form `F-<n>`.
     pub feature: String,
     /// Lowercase wire delivery status (`"roadmap"` | `"planned"` | `"released"` | `"dropped"`).
     pub release: String,
@@ -817,10 +818,8 @@ pub struct ExportOptions {
 
 /// Sort key ordering `F-XX` identifiers numerically on their `\d{2,3}` part.
 ///
-// scan-fr-strings: allow-jargon F-37 — valeur d'exemple illustrant la clé de tri
-// scan-fr-strings: allow-jargon F-061 — valeur d'exemple illustrant la clé de tri (zéro non significatif)
-/// `"F-37"` → 37, `"F-061"` → 61. Invalid identifiers map to 0, which keeps the sort
-/// stable rather than panicking.
+/// The `F-` prefix is stripped and the digits parsed (`061` → 61). Invalid identifiers
+/// map to 0, which keeps the sort stable rather than panicking.
 fn feature_sort_key(id: &str) -> u32 {
     id.strip_prefix("F-")
         .and_then(|digits| digits.parse().ok())
@@ -841,9 +840,7 @@ fn feature_sort_key(id: &str) -> u32 {
 /// number that is still referenced by a live card whose target feature card was removed —
 /// a strictly safer, monotone floor at negligible cost.
 ///
-// scan-fr-strings: allow-jargon F-37 — valeur d'exemple illustrant l'extraction du numéro
-// scan-fr-strings: allow-jargon F-061 — valeur d'exemple (zéro non significatif), pas un renvoi à un ticket
-/// `F-37` → 37, `F-061` → 61. Returns `None` when the body references no feature number.
+/// The `F-` prefix is stripped and the digits parsed (`061` → 61). Returns `None` when the body references no feature number.
 ///
 /// The scan is char-safe and allocation-free beyond the parse; no `regex` dependency.
 #[must_use]
@@ -945,7 +942,7 @@ pub fn project_map_feature_entries(
         }
 
         // Filtrage miroir-site S2 : seul kind:FEATURE alimente le site (export T2).
-        // Les cartes kind:FIX/CHORE/SPIKE/TASK/ENHANCEMENT sont vault-only.
+        // Les cartes kind:FIX/TASK/ENHANCEMENT sont vault-only.
         // `include_dropped` = mode audit complet : lève le filtre kind pour
         // inclure toutes les cartes-feature quelle que soit leur taxonomie.
         if !opts.include_dropped && !matches!(kind_wire, Some(KindKind::Feature)) {
@@ -985,6 +982,46 @@ fn extract_wikilink_targets(body: &str) -> Vec<String> {
         }
     }
     result
+}
+
+/// Typed roles (`kind`, `status`) extracted from a card body, for filterable indexing.
+///
+/// Each field carries the **canonical wire form** produced by [`KindKind::as_wire`] /
+/// [`StatusKind::as_wire`] (SCREAMING_SNAKE), or `None` when the role is absent — which is
+/// the case for any note outside `project-map`, and is legitimate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProjectMapRoles {
+    /// Wire form of `[[kind:…]]` (e.g. `"FIX"`), or `None`.
+    pub kind: Option<&'static str>,
+    /// Wire form of `[[status:…]]` (e.g. `"OPEN"`), or `None`.
+    pub status: Option<&'static str>,
+}
+
+/// Extracts the `kind`/`status` roles from a project-map card body.
+///
+/// **Single source of semantics**: the `[[…]]` targets are parsed by [`parse_link`],
+/// the same parser as [`validate_links_from_targets`]. No substring matching:
+/// prose, an identifier containing `FIX`, or an off-taxonomy value (`status:done`)
+/// produce no role. The **first** well-formed `kind`/`status` wins; a valid card
+/// carries only one in any case (guaranteed by the cardinality enforced by
+/// [`validate_links_from_targets`] at write time).
+#[must_use]
+pub fn roles_of_body(body: &str) -> ProjectMapRoles {
+    let mut roles = ProjectMapRoles::default();
+    for target in extract_wikilink_targets(body) {
+        match parse_link(&target) {
+            Ok(ProjectMapLink::Kind(k)) if roles.kind.is_none() => roles.kind = Some(k.as_wire()),
+            Ok(ProjectMapLink::Status(s)) if roles.status.is_none() => {
+                roles.status = Some(s.as_wire());
+            }
+            _ => {}
+        }
+        if roles.kind.is_some() && roles.status.is_some() {
+            break;
+        }
+    }
+    roles
 }
 
 #[cfg(test)]
@@ -1473,16 +1510,30 @@ mod parse_tests {
     }
 
     #[test]
-    fn kind_chore_and_spike_are_accepted() {
-        // Spec §15 A5 : CHORE + SPIKE ajoutés à la taxonomie.
+    fn kind_chore_and_spike_are_rejected() {
+        // CHORE + SPIKE retirés de la taxonomie (absorbés par TASK). Un corps qui les
+        // porte encore n'est plus lisible par son propre validateur — d'où l'ordre de
+        // migration : les cartes CHORE/SPIKE doivent être migrées vers TASK AVANT que
+        // ce code n'atteigne la production.
         assert_eq!(
             parse_link("kind:CHORE"),
-            Ok(ProjectMapLink::Kind(KindKind::Chore))
+            Err(SchemaError::InvalidKind("CHORE".to_string()))
         );
         assert_eq!(
             parse_link("kind:SPIKE"),
-            Ok(ProjectMapLink::Kind(KindKind::Spike))
+            Err(SchemaError::InvalidKind("SPIKE".to_string()))
         );
+    }
+
+    #[test]
+    fn kind_from_wire_directly_rejects_chore_and_spike() {
+        // Garde anti-réouverture (F-220) : les variantes KindKind::Chore /
+        // KindKind::Spike sont retirées pour de bon en 2.1.0. Le vocabulaire réseau
+        // "CHORE"/"SPIKE" ne doit jamais être ré-accepté. `from_wire` est le seul
+        // point d'entrée wire → variante ; on le teste ici directement (pas seulement
+        // via parse_link) pour prouver qu'aucun chemin détourné ne l'accepte.
+        assert_eq!(KindKind::from_wire("CHORE"), None);
+        assert_eq!(KindKind::from_wire("SPIKE"), None);
     }
 
     #[test]
@@ -1676,8 +1727,6 @@ mod parse_tests {
             KindKind::Feature,
             KindKind::Enhancement,
             KindKind::Fix,
-            KindKind::Chore,
-            KindKind::Spike,
             KindKind::Task,
         ] {
             assert_eq!(KindKind::from_wire(k.as_wire()), Some(k));
@@ -2153,7 +2202,7 @@ mod feature_card_tests {
     //
     // Slice 1 S1 : la contrainte `kind == FEATURE` sur les cartes-feature est
     // levée. Seul `kind:FEATURE` est exporté vers le site (export T2) ; les
-    // autres kinds (FIX/CHORE/SPIKE/TASK/ENHANCEMENT) restent vault-only.
+    // autres kinds (FIX/TASK/ENHANCEMENT) restent vault-only.
 
     #[test]
     fn feature_card_with_kind_fix_is_accepted() {
@@ -2216,12 +2265,12 @@ mod feature_card_tests {
             "kind:FIX doit être accepté sur une carte-feature"
         );
 
-        // kind:CHORE — mapping gov-todo chore→CHORE.
-        let links_chore = vec![
+        // kind:TASK — le catch-all qui absorbe l'ex-CHORE (mapping gov-todo chore→TASK).
+        let links_task = vec![
             ProjectMapLink::Feature("F-84".to_string()),
             ProjectMapLink::Project("gradatum".to_string()),
             ProjectMapLink::Status(StatusKind::Open),
-            ProjectMapLink::Kind(KindKind::Chore),
+            ProjectMapLink::Kind(KindKind::Task),
             ProjectMapLink::Release(ReleaseKind::Roadmap),
             ProjectMapLink::Version {
                 project: "gradatum".to_string(),
@@ -2229,9 +2278,9 @@ mod feature_card_tests {
             },
         ];
         assert_eq!(
-            validate_links(&links_chore),
+            validate_links(&links_task),
             Ok(()),
-            "kind:CHORE doit être accepté sur une carte-feature"
+            "kind:TASK doit être accepté sur une carte-feature"
         );
     }
 
@@ -2474,5 +2523,46 @@ mod parent_tests {
     #[test]
     fn parent_invalid_maps_to_none() {
         assert_eq!(reserved_node_target("parent:f-31"), None);
+    }
+}
+
+#[cfg(test)]
+mod roles_of_body_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_kind_and_status_from_body() {
+        let body = "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]\n\n## Objet\nrien";
+        let roles = roles_of_body(body);
+        assert_eq!(roles.kind, Some("FIX"));
+        assert_eq!(roles.status, Some("OPEN"));
+    }
+
+    #[test]
+    fn body_without_roles_yields_none() {
+        let roles = roles_of_body("## Objet\nune note ordinaire, sans wikilink typé");
+        assert_eq!(roles.kind, None);
+        assert_eq!(roles.status, None);
+    }
+
+    #[test]
+    fn prose_mentioning_a_type_is_not_a_role() {
+        // Le mot FIX en prose, ou un [[decisions:…]] : parse_link ne les prend pas
+        // pour des rôles. C'est exactement ce que le substring ratait.
+        let body = "On corrige le bug (FIX) — voir [[decisions:01KVBTMYNK4XXZJAKWMTB4AM9K]].";
+        let roles = roles_of_body(body);
+        assert_eq!(roles.kind, None, "FIX en prose n'est pas un rôle");
+        assert_eq!(roles.status, None);
+    }
+
+    #[test]
+    fn malformed_reserved_value_is_ignored() {
+        // [[status:done]] (minuscule) est rejeté par parse_link → aucun status.
+        let roles = roles_of_body("[[kind:FIX]] [[status:done]]");
+        assert_eq!(roles.kind, Some("FIX"));
+        assert_eq!(
+            roles.status, None,
+            "status:done minuscule rejeté par la taxonomie"
+        );
     }
 }

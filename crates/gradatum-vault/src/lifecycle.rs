@@ -26,6 +26,7 @@ use gradatum_core::error::GradatumError;
 use gradatum_core::frontmatter::Frontmatter;
 use gradatum_core::history::sha256_for_history;
 use gradatum_core::identity::{ContentHash, NoteId, NoteVersion};
+use gradatum_storage::Storage; // trait in scope: `self.storage` is the concrete NoteWriteGuard (F-176)
 // DocumentStore : write_note, get_content_hash, get_note, list_by_status (Étape 0.1).
 use gradatum_core::DocumentStore as _;
 use gradatum_core::note::{EffectiveNote, Note, NoteBody};
@@ -286,17 +287,52 @@ impl Vault {
         let md_content = gradatum_markdown::write(&note)
             .map_err(|e| GradatumError::Markdown(format!("md serialization: {e}")))?;
 
-        // Persistance sur disque via OpenDAL FileStorage
+        // Persistance sur disque via le canal PRIVILÉGIÉ du garde de convergence (F-176).
+        // `write_note_file` contourne le refus `is_note_path` de `Storage::write` : c'est la
+        // SEULE voie sanctionnée d'écriture d'un `.md` de note, et elle n'est atteignable que
+        // d'ici (funnel), donc la ligne d'index et l'empreinte de dérive ci-dessous sont
+        // produites dans le même geste. Un appelant externe passant par `storage().write()`
+        // sur ce chemin échouerait franchement au lieu de créer un orphelin.
         self.storage
-            .write(&md_path, md_content.as_bytes())
+            .write_note_file(&md_path, md_content.as_bytes())
             .await
             .map_err(|e| VaultError::Storage(format!("write md {md_path}: {e}")))?;
 
         // Upsert dans l'index SQLite (FTS5 + note_overrides).
-        // `file_checksums` n'est PAS touchée ici : aucun appel à `upsert_file_checksum`
-        // sur le chemin d'écriture, donc la détection de drift reste inerte (v1.0.0).
         // Étape 0.1 : upsert_note est devenu write_note via DocumentStore trait.
         self.index.write_note(&note).await?;
+
+        // ── F-165 — Alimentation de `file_checksums` (source du scan de dérive) ────
+        // `file_checksums` est la SEULE table énumérée par `scan_phase_a`. On y
+        // enregistre le checksum du .md qu'on vient d'écrire, avec les mêmes primitives
+        // de hachage que le scanner (`gradatum_index::drift::*`) pour garantir la parité
+        // producteur/consommateur — sans quoi chaque fichier apparaîtrait « dérivé ».
+        //
+        // Fail-open délibéré (comme F-40 CoW et enqueue_embed) : un échec ici est
+        // journalisé mais ne fait JAMAIS échouer l'écriture de la note. Perdre un
+        // checksum (drift indétecté pour cette note jusqu'à la prochaine écriture)
+        // vaut mieux que perdre la note elle-même.
+        let md_bytes = md_content.as_bytes();
+        // mtime approximé au temps d'écriture : `scan_phase_a` s'appuie sur size + hash,
+        // pas sur mtime (champ conservé pour compat schéma / évolutions futures).
+        let now_secs = Utc::now().timestamp();
+        let checksum_entry = gradatum_core::index::FileChecksumEntry {
+            relative_path: md_path,
+            file_kind: gradatum_core::index::FileKind::Note,
+            expected_size: md_bytes.len() as u64,
+            expected_hash_prefix_4kb: gradatum_index::drift::compute_prefix_4kb_bytes(md_bytes),
+            expected_hash: gradatum_index::drift::compute_full_sha256_bytes(md_bytes),
+            expected_mtime: now_secs,
+            last_verified: now_secs,
+        };
+        if let Err(e) = self.index.upsert_file_checksum(&checksum_entry).await {
+            tracing::warn!(
+                id = %note.id,
+                relative_path = %checksum_entry.relative_path,
+                err = %e,
+                "F-165 drift: upsert_file_checksum failed — checksum skipped (note write preserved)"
+            );
+        }
 
         Ok(note)
     }

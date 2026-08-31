@@ -2,7 +2,19 @@
 
 > Arbre de dépendances Cargo. Établi par lecture des `Cargo.toml` du workspace (source de
 > vérité) ; à recouper avec `cargo tree --workspace --depth 1`.
-> Version workspace `2.0.0`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> Version workspace `2.1.0`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> MAJ 2026-08-23 (delta `c942cb15..687b7ac5`, 9 commits sur les manifestes — paliers 2.0.2→2.0.9) :
+> **aucune dépendance ajoutée, retirée ni repinnée**. Seul changement réel de l'arbre : la crate
+> `nix` gagne la feature `user` (`fs, signal, process` → `fs, signal, process, user`). Le reste des
+> diffs de manifeste n'est que la version du workspace `2.0.1` → `2.0.9`. Vérifié par diff des
+> `Cargo.toml`, pas supposé.
+>
+> MAJ 2026-08-18 : version workspace `2.0.1` → **`2.0.4`**. Deux dépendances **transitives**
+> ont bougé le même jour et ne figurent pas dans l'arbre ci-dessous, qui n'énumère que les
+> dépendances directes du workspace : `h2` `0.4.14` → `0.4.16` (levée de RUSTSEC-2026-0258,
+> chemin de requête du serveur) et `spin` `0.9.8` retiré → `0.9.9`. **Aucune dépendance directe
+> ajoutée, retirée ni repinnée** ; le verrou `links=sqlite3` est intact. Arbre non revérifié
+> dans cette passe.
 > MAJ 2026-08-12 : colonne « Version » de la table des pins régénérée depuis le manifeste
 > (30 cellules divergaient — `ulid` documenté `1.2.1` pour un réel `3.0.0`, idem `criterion`,
 > `prometheus`, `insta`, `tower-http`, `schemars`, `prometheus-client`, `fastembed`…). La

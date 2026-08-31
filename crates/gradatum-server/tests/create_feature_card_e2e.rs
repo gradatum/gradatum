@@ -40,10 +40,8 @@ const VALID_BODY: &str = "[[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] 
 /// pour inspecter le record réellement enqueué.
 async fn start_server() -> (SocketAddr, Arc<dyn QueueStore>) {
     use axum::{Router, middleware, routing::get};
-    use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-    use gradatum_queue::SqliteQueue;
+    use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
     use gradatum_server::api_v1;
-    use sqlx::sqlite::SqlitePoolOptions;
 
     async fn trust_stub(
         mut req: axum::http::Request<axum::body::Body>,
@@ -73,14 +71,7 @@ async fn start_server() -> (SocketAddr, Arc<dyn QueueStore>) {
     let jwt = JwtService::new_ephemeral();
     let acl = AclEngine::from_preset_str(TEST_ACL_PRESET).expect("preset ACL valide");
 
-    let queue = Arc::new(
-        SqliteQueue::in_memory()
-            .await
-            .expect("SqliteQueue in-memory"),
-    );
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory");
     run_migrations(&jobs_pool).await.expect("migrations jobs");
@@ -88,7 +79,6 @@ async fn start_server() -> (SocketAddr, Arc<dyn QueueStore>) {
     let inspect: Arc<dyn QueueStore> = job_store.clone();
 
     let state = AppState::with_jwt_and_acl(jwt, acl)
-        .with_queue(queue as Arc<dyn gradatum_queue::Queue>)
         .with_job_store(job_store as Arc<dyn QueueStore>, jobs_pool);
 
     let app = Router::new()

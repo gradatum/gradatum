@@ -45,7 +45,8 @@ pub(crate) mod vector_store_impl;
 pub use archive::{ARCHIVE_LIST_MAX, ArchiveEntry, ArchiveListFilter};
 pub use queries::{AuthorRow, Lineage, NoteRecord, extract_h1_title};
 pub use sqlite::{
-    CodeSymbolMeta, DerivedNote, Freshness, IndexStatusSnapshot, SqliteIndex, fts5_quote_query,
+    BackfillReport, CodeSymbolMeta, DerivedNote, Freshness, IndexStatusSnapshot, SqliteIndex,
+    fts5_quote_query,
 };
 // SearchHitRaw / LessonHitRaw / Code* are defined in gradatum-core — re-exported here for compatibility.
 pub use gradatum_core::index_store::{CodeScopeEntryRaw, CodeSelector, LessonHitRaw, SearchHitRaw};

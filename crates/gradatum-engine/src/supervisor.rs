@@ -935,10 +935,10 @@ fn is_connection_refused(e: &reqwest::Error) -> bool {
         let m = msg.to_lowercase();
         m.contains("connection refused") || m.contains("os error 111")
     }
-    if let Some(source) = e.source() {
-        if hit(&source.to_string()) {
-            return true;
-        }
+    if let Some(source) = e.source()
+        && hit(&source.to_string())
+    {
+        return true;
     }
     hit(&e.to_string())
 }
@@ -1437,7 +1437,10 @@ mod tests {
                 let config = make_test_config();
                 let supervisor = LlamaServerSupervisor::new(config)
                     .expect("supervisor construction must succeed");
-                let health = HealthState::new("test-model");
+                let health = HealthState::new_with_telemetry(
+                    "test-model",
+                    crate::health::TelemetryStatus::Active,
+                );
 
                 // Spawn a real child that exits immediately with a non-zero status —
                 // stands in for llama-server's "couldn't bind HTTP server socket" exit.
@@ -1513,7 +1516,7 @@ mod tests {
 
             let supervisor =
                 LlamaServerSupervisor::new(config).expect("supervisor construction must succeed");
-            let health = Arc::new(HealthState::new("test-model"));
+            let health = Arc::new(HealthState::new_with_telemetry("test-model", crate::health::TelemetryStatus::Active));
 
             // Mirrors main(): initial spawn + wait_ready before supervise_loop.
             supervisor

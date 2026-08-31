@@ -3,10 +3,12 @@ pub mod gradatum_acl_auth::api_key
 #[non_exhaustive] pub enum gradatum_acl_auth::api_key::ApiKeyError
 pub gradatum_acl_auth::api_key::ApiKeyError::AlreadyRevoked
 pub gradatum_acl_auth::api_key::ApiKeyError::ArgonHash(alloc::string::String)
+pub gradatum_acl_auth::api_key::ApiKeyError::Blocking
 pub gradatum_acl_auth::api_key::ApiKeyError::Crypto(alloc::string::String)
 pub gradatum_acl_auth::api_key::ApiKeyError::InvalidTenant(alloc::string::String)
+pub gradatum_acl_auth::api_key::ApiKeyError::Migration(alloc::string::String)
 pub gradatum_acl_auth::api_key::ApiKeyError::NotFound
-pub gradatum_acl_auth::api_key::ApiKeyError::Sql(sqlx_core::error::Error)
+pub gradatum_acl_auth::api_key::ApiKeyError::Sql(rusqlite::error::Error)
 pub struct gradatum_acl_auth::api_key::ApiKey
 pub gradatum_acl_auth::api_key::ApiKey::created_at: i64
 pub gradatum_acl_auth::api_key::ApiKey::description: core::option::Option<alloc::string::String>
@@ -56,10 +58,12 @@ pub fn gradatum_acl_auth::api_key::has_write_scope(&[alloc::string::String]) -> 
 #[non_exhaustive] pub enum gradatum_acl_auth::ApiKeyError
 pub gradatum_acl_auth::ApiKeyError::AlreadyRevoked
 pub gradatum_acl_auth::ApiKeyError::ArgonHash(alloc::string::String)
+pub gradatum_acl_auth::ApiKeyError::Blocking
 pub gradatum_acl_auth::ApiKeyError::Crypto(alloc::string::String)
 pub gradatum_acl_auth::ApiKeyError::InvalidTenant(alloc::string::String)
+pub gradatum_acl_auth::ApiKeyError::Migration(alloc::string::String)
 pub gradatum_acl_auth::ApiKeyError::NotFound
-pub gradatum_acl_auth::ApiKeyError::Sql(sqlx_core::error::Error)
+pub gradatum_acl_auth::ApiKeyError::Sql(rusqlite::error::Error)
 pub struct gradatum_acl_auth::ApiKey
 pub gradatum_acl_auth::ApiKey::created_at: i64
 pub gradatum_acl_auth::ApiKey::description: core::option::Option<alloc::string::String>

@@ -53,7 +53,8 @@ pub fn gradatum_auth::key_store::load_or_generate(&std::path::Path, u64, u64) ->
 pub fn gradatum_auth::key_store::signing_key_path(&std::path::Path) -> std::path::PathBuf
 pub mod gradatum_auth::revocation
 #[non_exhaustive] pub enum gradatum_auth::revocation::RevocationError
-pub gradatum_auth::revocation::RevocationError::Sqlite(sqlx_core::error::Error)
+pub gradatum_auth::revocation::RevocationError::Blocking
+pub gradatum_auth::revocation::RevocationError::Sqlite(rusqlite::error::Error)
 pub gradatum_auth::revocation::RevocationError::Time(std::time::SystemTimeError)
 pub struct gradatum_auth::revocation::InMemoryRevocationStore
 impl gradatum_auth::revocation::InMemoryRevocationStore

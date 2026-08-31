@@ -635,7 +635,14 @@ impl ServerHandler for StubHandler {
                 // GET endpoints (sans body)
                 "vault_status" => self.forward_get("vault_status").await?,
                 "vault_authors" => self.forward_get("vault_authors").await?,
-                "vault_tags" => self.forward_get("vault_tags").await?,
+                // vault_tags accepte un `limit` optionnel (F-216) — propagé en query GET.
+                "vault_tags" => {
+                    let endpoint = match body.get("limit").and_then(serde_json::Value::as_u64) {
+                        Some(limit) => format!("vault_tags?limit={limit}"),
+                        None => "vault_tags".to_string(),
+                    };
+                    self.forward_get(&endpoint).await?
+                }
                 // Write endpoints — POST async 202 Accepted
                 "vault_write" => self.forward_post("vault_write", body).await?,
                 // Création de carte-feature — POST, numéro attribué par le serveur
@@ -819,7 +826,8 @@ fn tool_catalogue() -> Vec<Tool> {
         VaultClassifyRequest, VaultContextRequest, VaultDiffRequest, VaultDowngradeRequest,
         VaultForgetRequest, VaultGraphRequest, VaultHistoryGetRequest, VaultHistoryRequest,
         VaultLinksRequest, VaultListRequest, VaultReadRequest, VaultRestoreRequest,
-        VaultSearchRequest, VaultTimelineRequest, VaultTraceRequest, VaultWriteRequest,
+        VaultSearchRequest, VaultTagsRequest, VaultTimelineRequest, VaultTraceRequest,
+        VaultWriteRequest,
     };
 
     vec![
@@ -841,7 +849,10 @@ fn tool_catalogue() -> Vec<Tool> {
              filterable by doc_kind and anchor_ms window. Cursor pagination. For replay / recency.",
         ),
         tool_def_no_params("vault_authors", "List the vault's authors"),
-        tool_def_no_params("vault_tags", "List the vault's tags with frequencies"),
+        tool_def::<VaultTagsRequest>(
+            "vault_tags",
+            "List the vault's tags with frequencies (most frequent first, bounded; raise with `limit`)",
+        ),
         // ── Write tools — queue async 202 Accepted ────────────────────
         tool_def::<VaultWriteRequest>(
             "vault_write",

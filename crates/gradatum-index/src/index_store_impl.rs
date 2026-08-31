@@ -302,6 +302,12 @@ impl IndexStore for SqliteIndex {
         self.live_note_count(vault_id).await
     }
 
+    /// Most recent live-note indexation timestamp — delegates to
+    /// `SqliteIndex::last_indexed_at`.
+    async fn last_indexed_at(&self, vault_id: &str) -> Result<Option<i64>, GradatumError> {
+        self.last_indexed_at(vault_id).await
+    }
+
     /// Allow-list grants of a tenant — delegates to `SqliteIndex::tenant_grants`,
     /// overriding the fail-closed default provided by the trait.
     async fn tenant_grants(
@@ -391,6 +397,22 @@ impl IndexStore for SqliteIndex {
         cursor: Option<&str>,
     ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
         self.list_notes_by_status(vault_id, statuses, section, limit, cursor)
+            .await
+    }
+
+    /// Role-filtered note listing — delegates to the inherent
+    /// `SqliteIndex::list_notes_filtered` (inherent method takes priority over this trait
+    /// method, so this is delegation, not recursion — same shape as `list_notes_by_status`).
+    async fn list_notes_filtered(
+        &self,
+        vault_id: &str,
+        section: Option<&str>,
+        role_kind: Option<&str>,
+        role_status: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        self.list_notes_filtered(vault_id, section, role_kind, role_status, limit, cursor)
             .await
     }
 
@@ -493,6 +515,15 @@ impl IndexStore for SqliteIndex {
         prefix: &str,
     ) -> Result<Vec<(String, String)>, GradatumError> {
         self.list_notes_by_locus_prefix(vault_id, prefix).await
+    }
+
+    /// Delegates to `SqliteIndex::list_notes_by_section`.
+    async fn list_notes_by_section(
+        &self,
+        vault_id: &str,
+        section: &str,
+    ) -> Result<Vec<(String, String)>, GradatumError> {
+        self.list_notes_by_section(vault_id, section).await
     }
 
     /// Delegates to `SqliteIndex::list_notes_by_agent`.

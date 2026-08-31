@@ -2,18 +2,19 @@
 //!
 //! SQLite-backed queue with lease semantics and atomic claim.
 //!
-//! ## sqlx-based API
+//! ## Live API
 //!
-//! - [`Queue`]: async trait for queue operations
-//! - [`SqliteQueue`]: sqlx WAL implementation, atomic `UPDATE...RETURNING`
-//! - [`NewJob`] / [`LeasedJob`] / [`JobId`]: data types
-//! - [`QueueError`]: sqlx-based errors
-//! - [`JobStatus`]: job states (`Pending`/`Leased`/`Done`/`Dead`)
+//! - [`GradatumQueue`]: `QueueStore` facade over `gradatum_db_sqlite`
+//!   (the live `gradatum_jobs` table, drained by the worker).
 //!
 //! ## Legacy API (rusqlite-based, backward compatibility)
 //!
 //! - [`LegacyQueue`]: synchronous rusqlite struct (preserved for backward compatibility)
 //! - [`LegacyQueueError`]: rusqlite-based errors
+//!
+//! The rusqlite-based `SqliteQueue`/`Queue` (which read the legacy `jobs_v2` table)
+//! has been removed: `jobs_v2` is dropped by migration 012 and is no longer
+//! part of [`schema::SCHEMA_V1`].
 //!
 //! ## Guarantees
 //!
@@ -35,19 +36,11 @@
 // Modules internes
 pub mod gradatum_queue;
 mod job;
-pub mod queue;
 mod queue_v1;
 pub mod schema;
 
 // API v0.2.0 — GradatumQueue façade Apalis (ARCH-D15)
 pub use gradatum_queue::GradatumQueue;
-
-// API P2.0b — sqlx-based (exports primaires)
-#[deprecated(
-    since = "0.2.0",
-    note = "Replaced by GradatumQueue (ARCH-D15). Scheduled for removal in a future major version."
-)]
-pub use queue::{JobId, JobInfo, JobStatus, LeasedJob, NewJob, Queue, QueueError, SqliteQueue};
 
 // API legacy — rusqlite-based (rétrocompatibilité)
 pub use job::Job;

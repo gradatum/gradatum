@@ -43,7 +43,7 @@ async fn dynamic_trust_preserved_when_provenance_unchanged() {
         "trust statique distilled attendu 0.60, got {t0}"
     );
 
-    // F-22 : pose un trust DYNAMIQUE 0.42 (compute_distill_trust).
+    // F-22 : pose un trust DYNAMIQUE 0.42 (gradatum_distill::compute_distill_trust).
     idx.set_note_trust("main", &id, 0.42)
         .await
         .expect("set_note_trust");

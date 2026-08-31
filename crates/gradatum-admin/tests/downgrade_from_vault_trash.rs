@@ -3,9 +3,12 @@
 //! Stratégie :
 //! - Créer une arborescence TempDir mimant le layout de production (profondeur 4).
 //! - Structure `.vault-trash/<date>/dedup/<section>/<file>.md`.
-//! - Initialiser le schéma DB via `SqliteIndex::open` + `SqliteQueue::new` (migrations appliquées).
+//! - Initialiser le schéma DB via `SqliteIndex::open` + `create_queue_db` (layout production).
 //! - Insérer des notes directement via rusqlite (INSERT minimal).
 //! - Appeler `downgrade_from_vault_trash()` et vérifier stats + état DB.
+//!
+//! F-177 : la file legacy `SqliteQueue` (`jobs_v2`) est supprimée. `db/queue.sqlite`
+//! est initialisé avec le schéma `jobs` de la file rusqlite — miroir de `gradatum-admin init`.
 
 use gradatum_admin::{DowngradeFromTrashArgs, downgrade_from_vault_trash};
 use gradatum_index::SqliteIndex;
@@ -82,6 +85,19 @@ fn create_trash_md_legacy(legacy_vault: &std::path::Path, date: &str, name: &str
     fs::write(dir.join(format!("{name}.md")), body).expect("write trash .md legacy");
 }
 
+/// Crée `db/queue.sqlite` avec le schéma `jobs` de la file rusqlite (LegacyQueue).
+///
+/// F-177 : `SqliteQueue` (`jobs_v2`) est supprimé ; `gradatum-admin init` crée
+/// toujours `db/queue.sqlite` avec la table `jobs` — ce helper en est le miroir.
+fn create_queue_db(root: &std::path::Path) {
+    let queue_path = root.join("db/queue.sqlite");
+    let conn = rusqlite::Connection::open(&queue_path).expect("open queue.sqlite");
+    conn.execute_batch(gradatum_queue::schema::CREATE_JOBS_TABLE)
+        .expect("create jobs table");
+    conn.execute_batch(gradatum_queue::schema::CREATE_IDX_JOBS_STATUS_LEASE)
+        .expect("create jobs index");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 
@@ -98,9 +114,7 @@ async fn empty_trash_returns_zero_stats() {
     SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
     fs::create_dir_all(vault.join(".vault-trash")).expect("mkdir .vault-trash");
 
     let args = DowngradeFromTrashArgs {
@@ -135,9 +149,7 @@ async fn match_and_downgrade_existing_note() {
     SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
 
     // Body assez long (>200 chars) pour que l'heuristique substr 200 soit non-ambiguë
     let body = "Acme example agent runtime documentation primary embedded host infrastructure \
@@ -193,9 +205,7 @@ async fn dry_run_does_not_modify_db() {
     SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
 
     let body = "Acme example agent runtime documentation primary embedded host infrastructure \
                 Phase 2 avec déclencheurs Subagent-Driven Development pipeline et my-project \
@@ -254,9 +264,7 @@ async fn test_scan_depth_4_levels_dedup_structure() {
     SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
 
     let body = "Note de test profondeur 4 niveaux — structure dedup réelle \
                 avec chemin vault-trash date dedup section fichier point md \
@@ -301,9 +309,7 @@ async fn test_scan_depth_mixed_legacy_and_new() {
     SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
 
     let body_legacy = "Note legacy structure un niveau dans date du vault-trash \
                        pour compatibilité ascendante scan récursif migration admin \
@@ -357,9 +363,7 @@ async fn test_scan_with_other_extensions_ignored() {
     SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
 
     // Créer le répertoire vault-trash avec des fichiers parasites
     let trash = vault.join(".vault-trash");
@@ -409,9 +413,7 @@ async fn test_dry_run_with_real_structure() {
     SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
 
     let body_decisions = "Note decisions council Art 19 gradatum legacy-vault migration \
                           downgrade-from-legacy-vault-trash dry-run Phase 2.2 patch 1 test \
@@ -479,9 +481,7 @@ async fn test_run_with_no_vault_trash_dir_returns_empty_stats_ok() {
     SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
     // legacy-vault existe mais SANS .vault-trash — situation post-cleanup
     fs::create_dir_all(&vault).expect("mkdir vault");
     // .vault-trash N'EST PAS créé intentionnellement
@@ -527,9 +527,7 @@ async fn downgrade_from_trash_ten_files_prepare_outside_loop() {
     gradatum_index::SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
 
     // Seed 10 notes en DB et 10 fichiers dans .vault-trash
     for i in 0..10usize {
@@ -586,9 +584,7 @@ async fn downgrade_from_trash_unreadable_file_does_not_decrement_scanned() {
     gradatum_index::SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
 
     // Créer 2 fichiers : 1 illisible (permissions 000) + 1 lisible
     let trash_dir = vault
@@ -647,9 +643,7 @@ async fn test_idempotent_already_downgraded() {
     SqliteIndex::open(&index_path)
         .await
         .expect("SqliteIndex::open");
-    gradatum_queue::SqliteQueue::new(&root.join("db/queue.sqlite"))
-        .await
-        .expect("SqliteQueue::new");
+    create_queue_db(&root);
 
     let body = "Note déjà downgraded en DB pour test idempotence migrated from legacy-vault \
                 vault-trash structure quatre niveaux dedup section fichier md gradatum \

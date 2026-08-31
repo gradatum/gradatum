@@ -49,7 +49,6 @@ use gradatum_core::{
 };
 use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
 use gradatum_worker::apalis_backend::build_gradatum_backend;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use ulid::Ulid;
 
 /// Handler no-op : compte les jobs traités. Jamais d'échec (`Infallible`).
@@ -165,20 +164,11 @@ fn worker_repolls_after_drain() {
         // est nettoyé par l'OS ; évite que le drop ferme le fichier sous le pool.
         let path = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        let opts = SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect_with(opts)
-            .await
-            .expect("pool");
-        apply_sqlite_pragmas(&pool).await.expect("pragmas");
-        run_migrations(&pool).await.expect("migrations");
+        let db = gradatum_db_sqlite::open_queue_db(&path).await.expect("db");
+        apply_sqlite_pragmas(&db).await.expect("pragmas");
+        run_migrations(&db).await.expect("migrations");
 
-        let store: Arc<dyn QueueStore + Send + Sync> =
-            Arc::new(SqliteQueueStore::new(pool.clone()));
+        let store: Arc<dyn QueueStore + Send + Sync> = Arc::new(SqliteQueueStore::new(db.clone()));
         let counter = Arc::new(AtomicUsize::new(0));
         let (backend, ack) = build_gradatum_backend(Arc::clone(&store), "Curate").expect("backend");
         (store, counter, backend, ack)

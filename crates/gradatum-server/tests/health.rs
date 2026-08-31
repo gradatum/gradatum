@@ -1,6 +1,6 @@
 //! Tests d'intégration — GET /health (T10).
 //!
-//! Vérifie que le handler retourne un payload JSON complet avec les 10 champs
+//! Vérifie que le handler retourne un payload JSON complet avec les 12 champs
 //! sans authentification (RFC-0003 §8 — endpoint unauthenticated).
 //!
 //! # Pattern de test
@@ -91,7 +91,7 @@ async fn health_no_auth_required() {
     );
 }
 
-/// GET /health — payload JSON avec les 10 champs D1 présents et typés correctement.
+/// GET /health — payload JSON avec les 12 champs présents et typés correctement.
 #[tokio::test]
 async fn health_returns_full_payload() {
     let addr = start_health_server().await;
@@ -200,6 +200,22 @@ async fn health_returns_full_payload() {
     assert!(
         queue_oldest.is_u64() || queue_oldest.is_number(),
         "'queue_oldest_age_secs' doit être un entier non-négatif"
+    );
+
+    // ── Champs F-204/F-206 : dlq_depth + dlq_oldest_age_secs ──────────────────
+    let dlq_depth = body
+        .get("dlq_depth")
+        .expect("champ 'dlq_depth' présent dans /health");
+    assert!(
+        dlq_depth.is_u64() || dlq_depth.is_number(),
+        "'dlq_depth' doit être un entier non-négatif"
+    );
+    let dlq_oldest = body
+        .get("dlq_oldest_age_secs")
+        .expect("champ 'dlq_oldest_age_secs' présent dans /health");
+    assert!(
+        dlq_oldest.is_u64() || dlq_oldest.is_number(),
+        "'dlq_oldest_age_secs' doit être un entier non-négatif"
     );
 
     // ── Champ 9 : sqlite_wal_size_bytes ───────────────────────────────────────
@@ -313,10 +329,10 @@ async fn health_build_sha_is_not_unknown_placeholder() {
 
 /// Mock `QueueStore` qui simule un job Pending créé il y a 600 secondes.
 ///
-/// DT-OBS-1 : `queue_oldest_age_secs` est maintenant calculé depuis `job_store`
-/// (trait `QueueStore`, table `gradatum_jobs`) au lieu de `AppState.queue`
-/// (trait `Queue` legacy, table `jobs_v2` drainée). Ce mock valide le câblage
-/// du handler `/health` sur la source unifiée.
+/// DT-OBS-1 : `queue_oldest_age_secs` est calculé depuis `job_store`
+/// (trait `QueueStore`, table `gradatum_jobs`). L'ancien second bras
+/// (`AppState.queue`, trait `Queue` legacy, table `jobs_v2`) est supprimé en
+/// 2.1.0 (F-177). Ce mock valide le câblage du handler `/health` sur la source unifiée.
 struct SlowJobStore;
 
 impl SlowJobStore {
@@ -536,5 +552,270 @@ async fn health_queue_oldest_age_secs_reflects_real_age() {
     assert_eq!(
         status, "degraded",
         "status doit être \"degraded\" quand queue_oldest_age_secs=600 > 300"
+    );
+}
+
+// ── F-204 / F-206 : signal DLQ (compte + ancienneté) ──────────────────────────
+
+/// Store simulant une DLQ non vide : 1 job mort, `created_at` ancré 48 h dans le passé.
+///
+/// Reproduit le défaut F-204/F-206 : un travail dont les tentatives sont épuisées
+/// gît en DLQ sans que rien ne le signale. Le seuil `/health` (`DLQ_MAX_AGE_SECS = 24 h`)
+/// doit être dépassé → `degraded`, et `dlq_depth` doit compter le job.
+struct DlqJobStore;
+
+impl DlqJobStore {
+    /// `JobRecord` en statut `DLQ`, `lifecycle.created_at` ancré 48 h dans le passé
+    /// (> seuil 24 h) pour valider le passage en `degraded` sur l'ANCIENNETÉ.
+    fn make_old_dlq_job() -> JobRecord {
+        let old_created_at = Utc::now() - chrono::Duration::hours(48);
+        let now = Utc::now();
+        JobRecord {
+            id: Ulid::generate(),
+            spec: JobSpec {
+                kind: Job::Backup,
+                class: JobClass::System,
+                mode: JobMode::Batch,
+                scope: gradatum_core::job::JobScope::VaultWide,
+                priority: JobPriority::default_for(&JobClass::System),
+            },
+            scheduling: JobScheduling {
+                trigger: TriggerSource::Demand,
+                scheduled_at: now,
+                await_jobs: vec![],
+                deadline: None,
+                cron_expr: None,
+            },
+            lifecycle: JobLifecycle {
+                status: JobStatus::DLQ,
+                created_at: old_created_at,
+                started_at: None,
+                completed_at: Some(now),
+                lease_until: None,
+                result: None,
+            },
+            retry: JobRetry {
+                count: 3,
+                max: 3,
+                backoff: RetryBackoff::Exponential { base: 5, max: 120 },
+                last_error: Some("max_retries atteint (3 / 3)".to_string()),
+                errors: vec![],
+            },
+            lineage: JobLineage {
+                triggered_by: None,
+                parent_job: None,
+                pipeline_id: None,
+                pipeline_step: None,
+                children: vec![],
+                cost_usd: None,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl QueueStore for DlqJobStore {
+    async fn enqueue(&self, _job: JobRecord) -> Result<Ulid, QueueError> {
+        Err(QueueError::Storage("DlqJobStore stub".into()))
+    }
+
+    async fn dequeue(&self, _tenant_filter: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
+        Ok(None)
+    }
+
+    async fn get(&self, _id: Ulid, _tenant: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
+        Ok(None)
+    }
+
+    async fn complete(&self, _id: Ulid, _result: JobResult) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    async fn fail(&self, _id: Ulid, _err: &str, _attempt: u32) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    async fn cancel(&self, _id: Ulid, _tenant: Option<&str>) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    async fn fail_dlq(&self, _id: Ulid, _err: &str) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    async fn find_awaiting(&self, _job_id: Ulid) -> Result<Vec<JobRecord>, QueueError> {
+        Ok(vec![])
+    }
+
+    async fn set_pending(&self, _id: Ulid) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    async fn recover_stale_leases(
+        &self,
+        _ttl: std::time::Duration,
+    ) -> Result<Vec<Ulid>, QueueError> {
+        Ok(vec![])
+    }
+
+    async fn cancel_expired_deadlines(&self, _now: DateTime<Utc>) -> Result<Vec<Ulid>, QueueError> {
+        Ok(vec![])
+    }
+
+    async fn promote_retries(&self, _now: DateTime<Utc>) -> Result<Vec<Ulid>, QueueError> {
+        Ok(vec![])
+    }
+
+    async fn schedule_retry(&self, _id: Ulid, _at: DateTime<Utc>) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    /// Retourne le job DLQ ancien uniquement pour `list(DLQ, CreatedAsc)`.
+    async fn list(&self, filter: JobFilter) -> Result<Vec<JobRecord>, QueueError> {
+        if filter.status == Some(JobStatus::DLQ) && filter.order == JobOrder::CreatedAsc {
+            Ok(vec![Self::make_old_dlq_job()])
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// 1 job en DLQ (aucun Pending) — `dlq_depth = 1`, `queue_depth = 0`.
+    async fn count_jobs_by_status(
+        &self,
+        _tenant_filter: Option<&str>,
+    ) -> Result<std::collections::HashMap<JobStatus, u64>, QueueError> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(JobStatus::DLQ, 1u64);
+        Ok(m)
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<QueueEvent> {
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        drop(tx);
+        rx
+    }
+}
+
+/// Démarre un serveur de test avec `DlqJobStore` injecté sur `job_store`.
+async fn start_health_server_with_dlq() -> SocketAddr {
+    use axum::{Router, middleware, routing::get};
+    use gradatum_server::{api_v1, health};
+
+    async fn trust_stub(
+        mut req: axum::http::Request<axum::body::Body>,
+        next: middleware::Next,
+    ) -> axum::response::Response {
+        use gradatum_core::trust::TrustContext;
+        req.extensions_mut().insert(TrustContext::Unauthenticated);
+        next.run(req).await
+    }
+
+    // Même contrainte que `start_health_server_with_slow_queue` : pas de constructeur de
+    // test sans `SqlitePool`, la mutation directe reste la plus économique (ADN 3).
+    #[expect(clippy::field_reassign_with_default)]
+    let state = {
+        let mut s = AppState::default();
+        s.job_store = Arc::new(DlqJobStore);
+        s
+    };
+    let app = Router::new()
+        .route("/health", get(health::handler))
+        .nest("/api/v1", api_v1::router())
+        .layer(middleware::from_fn(trust_stub))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind port éphémère — doit réussir sur localhost");
+    let addr = listener
+        .local_addr()
+        .expect("obtenir l'adresse locale — listener actif");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serveur de test /health (DLQ) doit tourner");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+/// GET /health — un travail tombé en DLQ est COMPTABILISÉ (`dlq_depth`) et VISIBLE,
+/// et son ancienneté (48 h > seuil 24 h) fait passer le status à `degraded`.
+///
+/// Couvre F-204/F-206 critère : « un travail tombé en DLQ est comptabilisé et visible
+/// par la surface choisie » + « le signal se déclenche sur l'ancienneté ».
+#[tokio::test]
+async fn health_dlq_aged_job_is_counted_and_degrades() {
+    let addr = start_health_server_with_dlq().await;
+    let resp = client()
+        .get(format!("http://{}/health", addr))
+        .send()
+        .await
+        .expect("requête GET /health avec DLQ");
+
+    assert_eq!(resp.status(), StatusCode::OK, "/health doit retourner 200");
+
+    let body: Value = resp.json().await.expect("corps JSON valide depuis /health");
+
+    // Le compte DLQ est visible.
+    let dlq_depth = body
+        .get("dlq_depth")
+        .expect("champ 'dlq_depth' présent")
+        .as_u64()
+        .expect("'dlq_depth' convertible en u64");
+    assert_eq!(
+        dlq_depth, 1,
+        "`dlq_depth` doit compter le job mort, obtenu : {dlq_depth}"
+    );
+
+    // L'ancienneté reflète les 48 h.
+    let dlq_age = body
+        .get("dlq_oldest_age_secs")
+        .expect("champ 'dlq_oldest_age_secs' présent")
+        .as_u64()
+        .expect("'dlq_oldest_age_secs' convertible en u64");
+    assert!(
+        dlq_age > 24 * 60 * 60,
+        "`dlq_oldest_age_secs` doit dépasser 24 h pour un job mort depuis 48 h, obtenu : {dlq_age}"
+    );
+
+    // C'est l'ancienneté DLQ (et non le Pending, ici absent) qui déclenche `degraded`.
+    let status = body["status"].as_str().expect("'status' string");
+    assert_eq!(
+        status, "degraded",
+        "status doit être \"degraded\" quand un job DLQ dépasse le seuil d'ancienneté"
+    );
+}
+
+/// GET /health — une DLQ vide n'altère rien : `dlq_depth = 0` et status `ok`.
+///
+/// Garde anti-faux-positif : le seuil d'ancienneté (strictement positif) ne se
+/// déclenche jamais sur `dlq_oldest_age_secs = 0`.
+#[tokio::test]
+async fn health_empty_dlq_stays_ok() {
+    // AppState::default() câble un NoopQueueStore → toutes les méthodes renvoient vide.
+    let addr = start_health_server().await;
+    let resp = client()
+        .get(format!("http://{}/health", addr))
+        .send()
+        .await
+        .expect("requête GET /health");
+
+    let body: Value = resp.json().await.expect("corps JSON valide depuis /health");
+
+    assert_eq!(
+        body.get("dlq_depth").and_then(Value::as_u64),
+        Some(0),
+        "`dlq_depth` doit être 0 sans DLQ"
+    );
+    assert_eq!(
+        body.get("dlq_oldest_age_secs").and_then(Value::as_u64),
+        Some(0),
+        "`dlq_oldest_age_secs` doit être 0 sans DLQ"
+    );
+    assert_eq!(
+        body["status"].as_str(),
+        Some("ok"),
+        "status doit rester \"ok\" quand la DLQ est vide"
     );
 }

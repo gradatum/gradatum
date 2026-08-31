@@ -24,7 +24,8 @@ gradatum-core.workspace = true
 gradatum-dto.workspace = true
 # gradatum-db-sqlite is publishable (no `publish` key); this dependency does not block
 # publication of gradatum-worker.
-gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "2.0.0" }
+gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "2.1.0" }
+gradatum-distill.workspace = true
 gradatum-embed.workspace = true
 gradatum-queue.workspace = true
 gradatum-curator.workspace = true
@@ -33,7 +34,7 @@ anyhow.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
 clap = { workspace = true, features = ["derive"] }
-sqlx = { workspace = true, features = ["sqlite", "runtime-tokio"] }
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["full", "signal"] }
 thiserror.workspace = true
 tracing.workspace = true
@@ -60,7 +61,7 @@ tempfile.workspace = true
 smallvec.workspace = true
 async-trait.workspace = true
 # Tests d'intégration worker_repoll : drive un VRAI Monitor Apalis (non-régression
-# worker-hang). apalis/futures/sqlx/tokio/gradatum-* sont déjà des deps non-dev,
+# worker-hang). apalis/futures/tokio/gradatum-* sont déjà des deps non-dev,
 # re-déclarées ici pour être visibles depuis tests/.
 apalis        = { workspace = true }
 futures       = { workspace = true }
@@ -76,8 +77,8 @@ gradatum-vault.workspace = true
 # worker loader (curator_loader::build_curator_pipeline), proving the produced default config
 # enters LLM mode rather than heuristic. Acyclic: gradatum-admin does not depend on the worker.
 gradatum-admin = { path = "../gradatum-admin" }
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-sqlx = { workspace = true, features = ["sqlite", "runtime-tokio"] }
 ulid.workspace = true
 chrono.workspace = true
 walkdir.workspace = true

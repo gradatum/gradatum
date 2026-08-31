@@ -22,6 +22,23 @@ pub struct VaultSearchRequest {
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub tenant_id: Option<TenantId>,
     /// Full-text or semantic search query.
+    ///
+    /// ## FTS5 operators are NOT interpreted (known, accepted degradation)
+    ///
+    /// The lexical arm quotes each token individually before handing it to FTS5.
+    /// As a result the FTS5 operators `OR`, `NOT` and `NEAR` are **not** parsed as
+    /// operators — they are searched as the literal words `or`, `not`, `near`.
+    /// Writing `a OR b` therefore matches an implicit AND of the three terms
+    /// `a`, `or`, `b`, not a boolean disjunction. No FTS5 query parser is in scope;
+    /// this behaviour is deliberate and stable, not a bug.
+    ///
+    /// ## Punctuation-only queries cannot match lexically
+    ///
+    /// A query made solely of punctuation, symbols or whitespace (e.g. `-`, `...`,
+    /// `- -`) has every token normalise to empty under the `unicode61` tokenizer.
+    /// The resulting FTS5 query is syntactically valid but can match no document,
+    /// whatever the corpus. For such a query, `corpus_match_count == 0` is reported
+    /// as *not applicable to the query form* — never as a proven absence.
     pub query: String,
     /// Section filter (optional).
     pub section: Option<String>,
@@ -72,8 +89,17 @@ pub struct VaultSearchRequest {
     /// If `true`, includes in the response the total count of notes matching
     /// the **FTS5/BM25 lexical** query within the filtered scope, unbounded by K.
     ///
-    /// Allows distinguishing "topic absent from the corpus" (`corpus_match_count == 0`)
-    /// from "notes present but ranked below K" (`corpus_match_count > len(results)`).
+    /// The count distinguishes three states (surfaced verbatim in the compact hint):
+    ///
+    /// 1. `corpus_match_count > 0` — lexical matches exist (some may rank below K).
+    /// 2. `corpus_match_count == 0` on a query whose form **could** match — the
+    ///    *lexical* absence of the term in the filtered surface is proven. This is
+    ///    scoped to the lexical arm only and does **not** disprove the semantic
+    ///    relevance of the results that were returned.
+    /// 3. `corpus_match_count == 0` on a query whose form **cannot** match (a
+    ///    punctuation-only query, see the `query` field) — the count is *not
+    ///    applicable* to the query form; the zero is an artefact of the query, not a
+    ///    corpus property, and is never a proven absence.
     ///
     /// Does NOT indicate semantic ANN hit count.
     /// Opt-in (default `false`): zero overhead when absent — no COUNT is executed.
@@ -105,9 +131,10 @@ pub struct VaultSearchRequest {
     /// each hit as `<ulid> [<score>]` plus the `corpus_match_count` absence-proof hint.
     ///
     /// Optimises token cost for LLM consumers (the compaction is a product feature,
-    /// not transport). Preserves the lexical-absence reasoning: when
-    /// `corpus_match_count == 0`, the rendering states the results are semantic
-    /// neighbours only (absence proven).
+    /// not transport). Preserves the lexical-absence reasoning with the three-state
+    /// distinction of the `include_corpus_count` field: a proven *lexical* absence
+    /// (which does not disprove the returned results) is rendered differently from a
+    /// count that is *not applicable* to a punctuation-only query.
     ///
     /// Opt-in (default `false`): when absent, the response is **byte-for-byte identical**
     /// to the historical `VaultSearchResponse`. Existing clients are unaffected.

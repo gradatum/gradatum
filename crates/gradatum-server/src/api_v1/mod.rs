@@ -59,12 +59,6 @@
 //! | POST | `/proactive_recall`          | Read | [`proactive_recall_handlers::proactive_recall`] |
 //! | POST | `/proactive_recall/feedback` | Read | [`proactive_recall_handlers::proactive_recall_feedback`] |
 //!
-//! # Legacy job poll route
-//!
-//! | Method | Path | Handler |
-//! |--------|------|---------|
-//! | GET | `/jobs/{id}` | [`jobs::get_job`] (deprecated — use `/jobs/v2/{id}`) |
-//!
 //! # Job routes
 //!
 //! | Method | Path | Handler |
@@ -85,10 +79,12 @@ pub mod dashboard;
 pub mod delete;
 pub mod dto;
 pub mod event_log;
+// F-246 — point d'entrée de capture. `pub(crate)` : handler interne, la surface
+// publique de la crate ne bouge pas (un endpoint HTTP n'est pas une API publique).
+pub(crate) mod capture;
 pub mod forget;
 pub mod handlers;
 pub mod history;
-pub mod jobs;
 pub mod jobs_v2;
 pub mod lessons;
 pub mod logic;
@@ -264,6 +260,15 @@ pub fn router() -> Router<AppState> {
             post(event_log::post_event_log)
                 .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)),
         )
+        // ── F-246 capture — ingestion de lignes brutes en notes `snapshot` ──────
+        //
+        // Gabarit miroir d'event-log : append-only, par lot, bornée. Body limité à
+        // 2MB avant parsing JSON (anti-DOS). 1000 lignes × ~200 octets nominal.
+        .route(
+            "/capture",
+            post(capture::post_capture)
+                .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
         // ── session-log Tier 1 (council Art.15bis 2026-06-12) — append-only ──
         //
         // Body limit 4 KiB : payload nominal <1 KB (intent≤200, target≤512, refs
@@ -278,12 +283,8 @@ pub fn router() -> Router<AppState> {
         // ── F-16 Jobs API (Phase 3 v0.2.0) ──────────────────────────────────
         // Règle fixed-before-parametric : GET/POST /jobs (fixe) avant /jobs/{id} (paramétrique).
         .route("/jobs", get(jobs_v2::list_jobs).post(jobs_v2::create_job))
-        // Route legacy jobs poll (T3 P2.0b) — conservée pour rétrocompat
-        // GET /jobs/{id} → jobs::get_job (ancien handler, i64 ID)
         // GET /jobs/{id}/v2 → jobs_v2::get_job_v2 (nouveau handler, ULID, fix E-12)
         .route("/jobs/{id}/v2", get(jobs_v2::get_job_v2))
         .route("/jobs/{id}/cancel", post(jobs_v2::cancel_job))
         .route("/jobs/{id}/events", get(jobs_v2::job_events))
-        // Legacy : GET /jobs/{id} (ancien handler i64 — conservé pour rétrocompat P2.0b)
-        .route("/jobs/{id}", get(jobs::get_job))
 }

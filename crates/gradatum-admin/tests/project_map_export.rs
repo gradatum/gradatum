@@ -389,7 +389,7 @@ fn feature_with_null_title_returns_empty_string() {
 
 /// S2 — Export miroir-site exclut les cartes-feature dont `kind != FEATURE`.
 ///
-/// Les cartes avec `kind:FIX`/CHORE/SPIKE/TASK/ENHANCEMENT sont vault-only ;
+/// Les cartes avec `kind:FIX`/TASK/ENHANCEMENT sont vault-only ;
 /// seul `kind:FEATURE` alimente le site (export T2, Slice 1 S2).
 ///
 /// - F-99 `kind:FIX` roadmap/backlog → exclu du miroir-site (include_dropped=false).

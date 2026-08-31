@@ -84,8 +84,8 @@ use crate::{
         compact::{self, CompactBody},
         dto::{
             VaultContextRequest, VaultGraphRequest, VaultLinksRequest, VaultListRequest,
-            VaultReadRequest, VaultSearchRequest, VaultTimelineRequest, VaultTraceRequest,
-            VaultWriteRequest,
+            VaultReadRequest, VaultSearchRequest, VaultTagsRequest, VaultTimelineRequest,
+            VaultTraceRequest, VaultWriteRequest,
         },
         forget::vault_forget_mcp_impl,
         logic,
@@ -184,7 +184,8 @@ impl GradatumMcpHandler {
                 to_mcp_content(res)
             }
             "vault_tags" => {
-                let res = logic::vault_tags_impl(&self.state, &trust)
+                let req: VaultTagsRequest = deserialize_args(args)?;
+                let res = logic::vault_tags_impl(&self.state, &trust, req)
                     .await
                     .map_err(gradatum_error_to_mcp)?;
                 to_mcp_content(res)
@@ -193,12 +194,18 @@ impl GradatumMcpHandler {
             "vault_search" => {
                 let req: VaultSearchRequest = deserialize_args(args)?;
                 let want_compact = req.compact;
+                // Capture the query before `req` is moved — only on the compact path,
+                // where it feeds the absence-hint form check.
+                let compact_query = want_compact.then(|| req.query.clone());
                 let res = logic::vault_search_impl(&self.state, &trust, req)
                     .await
                     .map_err(gradatum_error_to_mcp)?;
                 if want_compact {
                     to_mcp_content(CompactBody {
-                        compact: compact::render_search(&res),
+                        compact: compact::render_search(
+                            &res,
+                            compact_query.as_deref().unwrap_or_default(),
+                        ),
                     })
                 } else {
                     to_mcp_content(res)
@@ -653,7 +660,10 @@ fn tool_catalog() -> Vec<Tool> {
         tool_def::<VaultContextRequest>("vault_context", "Extended context of a note"),
         tool_def::<VaultTimelineRequest>("vault_timeline", "Notes timeline"),
         tool_def_no_params("vault_authors", "List vault authors"),
-        tool_def_no_params("vault_tags", "List vault tags"),
+        tool_def::<VaultTagsRequest>(
+            "vault_tags",
+            "List vault tags (most frequent first, bounded; raise with `limit`)",
+        ),
         tool_def::<VaultWriteRequest>("vault_write", "Write or update a note (async 202)"),
         tool_def::<CreateFeatureCardRequest>(
             "create_feature_card",
@@ -956,6 +966,47 @@ mod tests {
         );
     }
 
+    /// GARDE D'INSTRUMENTATION (F-234) — tout outil déclaré dans `tool_catalog()`
+    /// (la surface réellement servie par `list_tools`) DOIT avoir une entrée de
+    /// compteur dans [`crate::mcp_usage::MCP_TOOL_KEYS`], et réciproquement.
+    ///
+    /// Compare **DEUX SOURCES DE PRODUCTION** — la surface d'outils et la table
+    /// d'instrumentation — jamais un cardinal gravé. Un compte en dur (ce dépôt en
+    /// portait deux occurrences : `list_tools_count_is_25` disparu, et
+    /// `assert_eq!(MCP_TOOL_KEYS.len(), N)`) dérive au premier ajout et reste vert
+    /// sur un renommage à effectif constant. Ici, une capacité exposée mais non
+    /// comptée, une clé de compteur orpheline OU un renommage désaligné font
+    /// rougir, et le message nomme le delta des deux côtés.
+    ///
+    /// Rend la dérive IMPOSSIBLE sans ouvrir la map fermée : le bornage de
+    /// cardinalité Prometheus (map pré-peuplée, `record` no-op sur nom inconnu)
+    /// reste intact — ce qui est prouvé ici est la **parité des deux ensembles
+    /// statiques**, au moment du test, pas une mutation runtime de la map.
+    ///
+    /// Une exclusion délibérée (outil exposé volontairement non compté) est
+    /// possible, mais DOIT être matérialisée par une allow-list explicite ici avec
+    /// justification écrite — jamais une omission silencieuse. Aujourd'hui : aucune
+    /// exclusion (les 26 outils sont comptés).
+    #[test]
+    fn every_declared_tool_is_instrumented() {
+        let declared: BTreeSet<String> =
+            tool_catalog().iter().map(|t| t.name.to_string()).collect();
+        let instrumented: BTreeSet<String> = crate::mcp_usage::MCP_TOOL_KEYS
+            .iter()
+            .map(|(tool, _key)| (*tool).to_string())
+            .collect();
+
+        let uninstrumented: Vec<&String> = declared.difference(&instrumented).collect();
+        let orphan_keys: Vec<&String> = instrumented.difference(&declared).collect();
+        assert!(
+            uninstrumented.is_empty() && orphan_keys.is_empty(),
+            "parité instrumentation/surface MCP rompue — outils exposés SANS compteur \
+             (à ajouter dans MCP_TOOL_KEYS, ou à exclure via allow-list justifiée) : \
+             {uninstrumented:?} ; clés de compteur orphelines (aucun outil déclaré) : \
+             {orphan_keys:?}"
+        );
+    }
+
     /// Les erreurs Storage ne fuient pas de détails (anti-fuite chemin/stockage).
     #[test]
     fn error_mapping_storage_returns_generic_message() {
@@ -1002,7 +1053,7 @@ mod tests {
     /// zod de Claude Code comme non-conforme → toute la liste des 21 outils ignorée.
     #[test]
     fn tool_def_no_params_schema_is_mcp_compliant() {
-        for name in ["vault_status", "vault_authors", "vault_tags"] {
+        for name in ["vault_status", "vault_authors"] {
             let tool = tool_def_no_params(name, "description de test");
             assert_eq!(
                 tool.input_schema.get("type").and_then(|v| v.as_str()),

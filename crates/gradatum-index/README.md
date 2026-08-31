@@ -2,7 +2,7 @@
 
 > SQLite + FTS5 index layer — implements `DocumentStore`, `IndexStore`, and `VectorStore` traits with three-level drift detection.
 
-**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -47,7 +47,7 @@ Key features:
 
 ```toml
 [dependencies]
-gradatum-index = "2.0.0"
+gradatum-index = "2.1.0"
 ```
 
 ```rust

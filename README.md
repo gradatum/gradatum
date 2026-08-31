@@ -6,7 +6,7 @@
 [![Status: Stable](https://img.shields.io/badge/Status-Stable-brightgreen.svg)](CHANGELOG.md)
 [![Website](https://img.shields.io/badge/Website-gradatum.org-brightgreen)](https://gradatum.org)
 
-**[Quickstart](#quickstart)** · **[Architecture](ARCHITECTURE.md)** · **[Docs](#documentation)** · **[Changelog](CHANGELOG.md)** · **[Upgrading 1.0.0→2.0.0](docs/UPGRADING-1.0.0-to-2.0.0.md)** · **[crates.io](https://crates.io/crates/gradatum)** · **[gradatum.org](https://gradatum.org)**
+**[Quickstart](#quickstart)** · **[Architecture](ARCHITECTURE.md)** · **[Docs](#documentation)** · **[Changelog](CHANGELOG.md)** · **[Upgrading 2.0→2.1](docs/UPGRADING-2.0.0-to-2.1.0.md)** · **[Upgrading 1.0→2.0](docs/UPGRADING-1.0.0-to-2.0.0.md)** · **[crates.io](https://crates.io/crates/gradatum)** · **[gradatum.org](https://gradatum.org)**
 
 A self-hosted, embedded memory backbone for multi-agent AI systems. Rust + SQLite. Zero external services required.
 
@@ -78,7 +78,7 @@ Gradatum is built on these open-source foundations:
 | [**Axum**](https://github.com/tokio-rs/axum) | HTTP server (REST endpoints + studio `ServeDir`) |
 | [**Tower**](https://github.com/tower-rs/tower) / **tower-http** | Middleware stack — rate-limiting, CORS, auth, body limits |
 | [**rmcp**](https://github.com/modelcontextprotocol/rust-sdk) | Native MCP server over Streamable HTTP — tool surface at `/mcp` |
-| [**SQLx**](https://github.com/launchbadge/sqlx) | Async SQLite driver — vault index, job queue, sessions |
+| [**rusqlite**](https://github.com/rusqlite/rusqlite) | SQLite driver (bundled) — vault index, job queue, sessions |
 | [**Apalis**](https://github.com/geofmureithi/apalis) | Background job queue (SQLite-backed, DLQ, per-kind routing, monitoring) |
 | [**OpenDAL**](https://github.com/apache/opendal) | Storage abstraction — local FS (default) or S3 object storage, selected by configuration; GCS/Azure planned |
 | [**tree-sitter**](https://github.com/tree-sitter/tree-sitter) | Deterministic code parsing for the code index (Rust, Python, Bash, TS, TSX) — zero LLM |
@@ -245,6 +245,7 @@ detail, including every breaking change and deprecation.
 | [C — crates.io & build from source](docs/guides/C-build-from-source.md) | Library use, or arm64/macOS/Windows. |
 | [D — MCP & Studio](docs/guides/D-mcp-and-studio.md) | Connect an MCP client, API keys, Studio login. |
 | [E — Ports & configuration](docs/guides/E-ports-and-config.md) | Port matrix, config field reference. |
+| [Upgrading 2.0.0 → 2.1.0](docs/UPGRADING-2.0.0-to-2.1.0.md) | Breaking-change migration guide — **read this if your build broke after adopting 2.1.0**. |
 | [Upgrading 1.0.0 → 2.0.0](docs/UPGRADING-1.0.0-to-2.0.0.md) | Breaking-change migration guide. |
 
 ### Governance and process

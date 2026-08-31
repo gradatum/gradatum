@@ -57,10 +57,8 @@ fn seed_fm() -> Frontmatter {
 /// tests de la garde hybride phantom-write.
 async fn spawn(seed: Option<(&str, &str)>) -> (SocketAddr, Arc<Vault>) {
     use axum::{Router, middleware};
-    use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-    use gradatum_queue::SqliteQueue;
+    use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
     use gradatum_server::api_v1;
-    use sqlx::sqlite::SqlitePoolOptions;
 
     let tmp = TempDir::new().unwrap();
     let vault = Arc::new(
@@ -77,23 +75,13 @@ async fn spawn(seed: Option<(&str, &str)>) -> (SocketAddr, Arc<Vault>) {
     }
     std::mem::forget(tmp); // garder le TempDir vivant pour la durée du serveur
 
-    let queue = Arc::new(
-        SqliteQueue::new(&std::env::temp_dir().join(format!("fixb-q-{}.db", Ulid::generate())))
-            .await
-            .unwrap(),
-    );
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
+    let jobs_pool = QueueDb::open_in_memory().await.unwrap();
     run_migrations(&jobs_pool).await.unwrap();
     let job_store = Arc::new(SqliteQueueStore::new(jobs_pool.clone()));
 
     let jwt = JwtService::new_ephemeral();
     let acl = AclEngine::from_preset_str(ACL_PRESET).unwrap();
     let state = AppState::with_jwt_and_acl(jwt, acl)
-        .with_queue(queue as Arc<dyn gradatum_queue::Queue>)
         .with_job_store(job_store as Arc<dyn gradatum_core::QueueStore>, jobs_pool)
         .with_vault_arc(vault.clone() as Arc<dyn Registry>);
 

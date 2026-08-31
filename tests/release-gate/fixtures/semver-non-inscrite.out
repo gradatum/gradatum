@@ -1,0 +1,60 @@
+# FIXTURE CONSTRUITE — lire ceci avant de la « corriger ».
+#
+# Role : prouver qu'au rang MINEUR une rupture NON INSCRITE a RELEASE-MANIFEST.yaml
+# fait BLOQUER le garde. C'est la seule epreuve de ce regime, et 2.1.0 est taguee
+# sous ce regime precis.
+#
+# Le symbole `__FixtureNeverInventoried::Synthetic` est SYNTHETIQUE A DESSEIN :
+# il n'appartient a aucune crate du projet et ne figure sur aucune feuille de route,
+# donc il ne pourra JAMAIS etre inscrit a l'inventaire.
+#
+# Pourquoi : cette fixture citait auparavant `variant KindKind::Task 5 -> 3`, une
+# rupture REELLE du projet. Le lot 2.1.0 l'a legitimement inscrite au manifeste
+# (F-220, corollaire du retrait de Chore/Spike) — l'appariement a donc reussi, le
+# classificateur a rendu PASS, et l'epreuve a cesse de prouver quoi que ce soit
+# SANS QUE RIEN NE CASSE VISIBLEMENT ailleurs. Une eprouvette dont la validite depend
+# de l'etat de la feuille de route n'est pas une eprouvette.
+#
+# INVARIANT : ne jamais remplacer ce symbole par une rupture reelle, meme « pas encore
+# inscrite » — toute rupture reelle est destinee a etre inscrite un jour, ce qui
+# reproduirait exactement le meme faux vert.
+#
+# Le reste du fichier est une sortie reelle de cargo-semver-checks 0.50 (vs
+# internal/2.0.8, 2026-08-23), inchangee a l'octet pres : le lint, la forme du bloc
+# `Failed in:` et le suffixe volatil " in /<chemin>:<ligne>" restent authentiques,
+# de sorte que l'extraction et le strip sont eprouves pour de vrai.
+     Cloning internal/2.0.8
+    Building gradatum-core v2.0.8 (current)
+       Built [   1.014s] (current)
+     Parsing gradatum-core v2.0.8 (current)
+      Parsed [   0.027s] (current)
+    Building gradatum-core v2.0.8 (baseline)
+       Built [   0.970s] (baseline)
+     Parsing gradatum-core v2.0.8 (baseline)
+      Parsed [   0.018s] (baseline)
+    Checking gradatum-core v2.0.8 -> v2.0.8 (assume minor change)
+     Checked [   0.037s] 196 checks: 194 pass, 2 fail, 0 warn, 58 skip
+
+--- failure enum_no_repr_variant_discriminant_changed: enum variant had its discriminant change value ---
+
+Description:
+The enum's variant had its discriminant value change. This breaks downstream code that used its value via a numeric cast like `as isize`.
+        ref: https://doc.rust-lang.org/reference/items/enumerations.html#assigning-discriminant-values
+       impl: https://github.com/obi1kenobi/cargo-semver-checks/tree/v0.50.0/src/lints/enum_no_repr_variant_discriminant_changed.ron
+
+Failed in:
+  variant __FixtureNeverInventoried::Synthetic 5 -> 3 in /REPO/crates/__fixture__/src/never_inventoried.rs:1
+
+--- failure enum_variant_missing: pub enum variant removed or renamed ---
+
+Description:
+A publicly-visible enum has at least one variant that is no longer available under its prior name. It may have been renamed or removed entirely.
+        ref: https://doc.rust-lang.org/cargo/reference/semver.html#item-remove
+       impl: https://github.com/obi1kenobi/cargo-semver-checks/tree/v0.50.0/src/lints/enum_variant_missing.ron
+
+Failed in:
+  variant KindKind::Chore, previously in file /REPO/target/semver-checks/git-internal_2_0_8/65091e7559f591740b700494d5ebced61a24e91a/crates/gradatum-core/src/project_map.rs:142
+  variant KindKind::Spike, previously in file /REPO/target/semver-checks/git-internal_2_0_8/65091e7559f591740b700494d5ebced61a24e91a/crates/gradatum-core/src/project_map.rs:153
+
+     Summary semver requires new major version: 2 major and 0 minor checks failed
+    Finished [   2.523s] gradatum-core

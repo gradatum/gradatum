@@ -36,7 +36,7 @@ gradatum-storage.workspace = true
 gradatum-index = { workspace = true, features = ["sqlite-vec-ann"] }
 gradatum-search.workspace = true
 gradatum-queue.workspace = true
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.0.0" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.1.0" }
 gradatum-acl-policy.workspace = true
 gradatum-acl-auth.workspace = true
 gradatum-auth.workspace = true
@@ -61,7 +61,6 @@ thiserror.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 prometheus-client.workspace = true
-sqlx.workspace = true
 ulid.workspace = true
 async-trait.workspace = true
 secrecy.workspace     = true
@@ -101,3 +100,6 @@ secrecy.workspace = true
 toml.workspace = true
 http-body-util = "0.1"
 insta.workspace = true
+# `Data` (apalis) exigé pour piloter handle_curate/handle_embed dans le test E2E
+# capture → curate → embed → search (crates/gradatum-server/tests/capture_semantic_retrieval.rs).
+apalis = { workspace = true }

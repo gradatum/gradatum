@@ -20,9 +20,11 @@
 //!
 //! ## What each renderer preserves (faithful to the removed L0 wrappers)
 //!
-//! - **search**: `<ulid> [<score>]` per hit, plus the `corpus_match_count` absence-proof
-//!   hint — when `corpus_match_count == 0`, the results are semantic neighbours only, so
-//!   the absence of a lexical match is *proven* (reasoning surfaced, not dropped).
+//! - **search**: `<ulid> [<score>]` per hit, plus the `corpus_match_count` hint with a
+//!   three-state distinction (see `corpus_hint`): `count > 0`, a proven *lexical*
+//!   absence (count `0` on a matchable query form — which never disproves the returned
+//!   results), or a count *not applicable* to the query form (count `0` on a
+//!   punctuation-only query whose tokens all normalise to empty).
 //! - **read**: `path`, optional `section`, optional `title`, `sha256` (needed for a later
 //!   in-place update) and the note `content`. Drops only `metadata` and `size_bytes`.
 //! - **timeline**: `<anchor_ms> | <doc_kind> | <note_id> — <title>` per entry. Drops
@@ -59,15 +61,54 @@ fn ulid_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Returns `true` when the query's *form* could produce a lexical (FTS5) match.
+///
+/// A query made only of punctuation, symbols or whitespace (`"-"`, `"..."`, `"- -"`)
+/// tokenises to nothing under the `unicode61` tokenizer: after `build_fts_query`
+/// every token normalises to empty, so the FTS5 query — while syntactically valid —
+/// can match no document, whatever the corpus. A zero count on such a query is an
+/// artefact of the query form, not a property of the corpus.
+///
+/// The predicate is `char::is_alphanumeric`, which mirrors the Unicode letter/number
+/// classes `unicode61` keeps as token characters. It is deliberately conservative:
+/// it never labels a punctuation-only query as matchable.
+fn query_form_can_match(query: &str) -> bool {
+    query.chars().any(char::is_alphanumeric)
+}
+
 /// Builds the `corpus_match_count` hint appended to the compact search header.
 ///
-/// Empty string when the count is absent (the request did not opt into it). When present,
-/// distinguishes a proven lexical absence (`0`) from matches beyond the K limit.
-fn corpus_hint(resp: &VaultSearchResponse) -> String {
+/// Three states, not two:
+///
+/// 1. **count > 0** — some lexical matches exist (rendered plainly, `+` if capped).
+/// 2. **count == 0 on a matchable query form** — the *lexical* absence of the term in
+///    the filtered surface is proven. This is scoped to the lexical arm only: it does
+///    **not** disprove the semantic relevance of the results that were returned. The
+///    older wording ("absence proven, semantic neighbours only") made two correct
+///    results — one answering the exact question asked — be discarded; hence this
+///    branch never invites dropping the returned hits.
+/// 3. **count == 0 on an unmatchable query form** — a punctuation/operators-only query
+///    whose tokens all normalise to empty (see [`query_form_can_match`]). The zero is
+///    an artefact of the query form, never a corpus property, so the count is reported
+///    as *not applicable*. This branch never claims any absence is proven.
+///
+/// Empty string when the count is absent (the request did not opt into it).
+fn corpus_hint(resp: &VaultSearchResponse, query: &str) -> String {
     match resp.corpus_match_count {
         None => String::new(),
+        Some(0) if query_form_can_match(query) => {
+            // State 2 — matchable form, zero lexical hits: proven lexical absence.
+            " (corpus_match_count=0 -> 0 lexical match: lexical absence of the term in the \
+             filtered surface is proven; the semantic relevance of the returned results is \
+             NOT disproven)"
+                .to_string()
+        }
         Some(0) => {
-            " (corpus_match_count=0 -> 0 lexical match: absence proven, semantic neighbours only)"
+            // State 3 — unmatchable form: the zero is an artefact of the query, not the corpus.
+            " (corpus_match_count=0 -> count not applicable to this query form: every token \
+             normalises to empty (punctuation/operators only), so no document can match \
+             lexically whatever the corpus; the returned results are semantic-only and this \
+             zero says nothing about them)"
                 .to_string()
         }
         Some(n) => {
@@ -78,9 +119,14 @@ fn corpus_hint(resp: &VaultSearchResponse) -> String {
 }
 
 /// Renders a [`VaultSearchResponse`] to its compact text form.
+///
+/// `query` is the original search string. It is needed to distinguish a *lexical
+/// absence* (count `0` on a query whose form could have matched) from a count that
+/// is simply *not applicable* to the query form (a punctuation-only query whose
+/// tokens all normalise to empty). See `corpus_hint`.
 #[must_use]
-pub fn render_search(resp: &VaultSearchResponse) -> String {
-    let hint = corpus_hint(resp);
+pub fn render_search(resp: &VaultSearchResponse, query: &str) -> String {
+    let hint = corpus_hint(resp, query);
     if resp.items.is_empty() {
         return format!("0 relevant notes on this topic{hint}");
     }
@@ -195,26 +241,99 @@ mod tests {
             corpus_match_count: None,
             corpus_count_capped: false,
         };
-        assert_eq!(render_search(&resp), "0 relevant notes on this topic");
+        // No count opted in → no hint regardless of query form.
+        assert_eq!(
+            render_search(&resp, "gradatum"),
+            "0 relevant notes on this topic"
+        );
+    }
+
+    // ── Three states of the corpus-count hint ─────────────────────────────────
+    // State 1: count > 0  → unchanged.
+    // State 2: count == 0 on a query whose FORM could match → proven *lexical* absence.
+    // State 3: count == 0 on a query whose FORM cannot match → count not applicable.
+
+    #[test]
+    fn query_form_can_match_alnum_true_punctuation_false() {
+        // Token characters (letters/digits, incl. CJK, and base of a combining pair).
+        assert!(query_form_can_match("cargo-semver-checks"));
+        assert!(query_form_can_match("2.0.7"));
+        assert!(query_form_can_match("中文"));
+        assert!(query_form_can_match("e\u{0301}"));
+        // Pure punctuation / symbols / whitespace → every token normalises to empty.
+        assert!(!query_form_can_match("-"));
+        assert!(!query_form_can_match("..."));
+        assert!(!query_form_can_match("- -"));
+        assert!(!query_form_can_match(""));
+        assert!(!query_form_can_match("🙂"));
     }
 
     #[test]
-    fn search_absence_proof_when_corpus_zero() {
+    fn search_state1_positive_count_never_mentions_absence() {
+        let resp = VaultSearchResponse {
+            items: vec![hit("s/01A", 0.02)],
+            corpus_match_count: Some(3),
+            corpus_count_capped: false,
+        };
+        let out = render_search(&resp, "cargo-semver-checks");
+        assert!(
+            out.contains("corpus_match_count=3 lexical matches"),
+            "positive count rendered plainly: {out}"
+        );
+        assert!(
+            !out.contains("absence"),
+            "a positive count never speaks of absence: {out}"
+        );
+    }
+
+    #[test]
+    fn search_state2_lexical_absence_when_form_matchable() {
         let resp = VaultSearchResponse {
             items: vec![hit("decisions/01ABC", 0.0167)],
             corpus_match_count: Some(0),
             corpus_count_capped: false,
         };
-        let out = render_search(&resp);
+        // Matchable form (has token characters) → proven *lexical* absence.
+        let out = render_search(&resp, "cargo-semver-checks");
         assert!(
-            out.contains("absence proven"),
-            "must surface the absence reasoning: {out}"
+            out.contains("lexical absence"),
+            "absence must be named as lexical, not generic: {out}"
+        );
+        assert!(
+            out.contains("NOT disproven"),
+            "the semantic relevance of returned results must not be presented as disproven: {out}"
         );
         assert!(
             out.contains("01ABC [0.0167]"),
-            "ulid+score projected: {out}"
+            "the returned result is still projected, never dropped: {out}"
         );
-        assert!(!out.contains('/'), "path reduced to ulid: {out}");
+    }
+
+    #[test]
+    fn search_state3_unmatchable_form_is_not_applicable_never_absence() {
+        let resp = VaultSearchResponse {
+            items: vec![hit("decisions/01ABC", 0.0167)],
+            corpus_match_count: Some(0),
+            corpus_count_capped: false,
+        };
+        // Punctuation-only form → the zero is an artefact of the query, not the corpus.
+        let out = render_search(&resp, "- ...");
+        assert!(
+            out.contains("not applicable to this query form"),
+            "must state the count is not applicable to this form: {out}"
+        );
+        assert!(
+            !out.contains("absence"),
+            "an unmatchable form must never claim any absence: {out}"
+        );
+        assert!(
+            !out.contains("proven"),
+            "an unmatchable form must never claim anything is proven: {out}"
+        );
+        assert!(
+            out.contains("01ABC [0.0167]"),
+            "the semantic result is still projected: {out}"
+        );
     }
 
     #[test]
@@ -224,7 +343,7 @@ mod tests {
             corpus_match_count: Some(10_000),
             corpus_count_capped: true,
         };
-        assert!(render_search(&resp).contains("corpus_match_count=10000+ lexical"));
+        assert!(render_search(&resp, "gradatum").contains("corpus_match_count=10000+ lexical"));
     }
 
     #[test]

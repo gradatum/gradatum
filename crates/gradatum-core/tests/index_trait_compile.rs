@@ -11,7 +11,7 @@
 //!   upsert/list_file_checksums, get_note_created_and_indegree,
 //!   search_fts_with_snippet, title_lookup, live_note_count, distinct_authors,
 //!   distinct_tags, neighbors, backlinks, trace_lineage, list_notes, total_body_size_bytes,
-//!   upsert_link
+//!   last_indexed_at, upsert_link
 //! - `VectorStore` : insert_note_embedding, get_note_embedding, search_semantic
 //!
 //! Note : `seed_note`, `seed_note_with_fts`, `seed_note_with_created` sont des méthodes
@@ -337,6 +337,9 @@ impl IndexStore for MockIndex {
 
     async fn total_body_size_bytes(&self, _vault_id: &str) -> Result<u64, GradatumError> {
         Ok(0)
+    }
+    async fn last_indexed_at(&self, _vault_id: &str) -> Result<Option<i64>, GradatumError> {
+        Ok(None)
     }
 
     async fn upsert_link(

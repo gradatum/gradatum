@@ -66,8 +66,7 @@ impl CreateFeatureCardRequest {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateFeatureCardResponse {
-    // scan-fr-strings: allow-jargon F-135 — valeur d'exemple du format d'identifiant, pas un renvoi à un ticket
-    /// Server-assigned identifier, e.g. `"F-135"` (injected into `[[feature:F-135]]`).
+    /// Server-assigned identifier of the form `F-<n>` (the target of the note's feature wikilink).
     pub feature: String,
     /// Raw allocated number, e.g. `135`.
     pub number: u32,

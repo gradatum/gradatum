@@ -62,14 +62,14 @@ crates/gradatum-bench/datasets/*.jsonl
 crates/gradatum-bench/datasets/*.csv
 crates/gradatum-bench/datasets/*.json
 
-# Stubs crates.io générés (regénérables via scripts/gen-stubs-v*.sh) — pas de code source réel
+# Stubs crates.io générés (regénérables via scripts/internal/gen-stubs-v*.sh) — pas de code source réel
 crates-publish-stubs/
 crates-publish-stubs-v*/
 
 # MCP config sample — généré dynamiquement par scripts/install-gradatum-stub-mcp.sh
 # avec valeurs runtime (--server-url, --api-key-file) et timestamp régénéré à chaque install.
 # Voir scripts/install-gradatum-stub-mcp.sh §5 pour le template heredoc canonique.
-scripts/mcp.json.sample
+scripts/internal/mcp.json.sample
 .gradatum-meta
 .worktrees/
 docs/internal/

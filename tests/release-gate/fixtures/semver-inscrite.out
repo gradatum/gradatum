@@ -1,0 +1,25 @@
+     Cloning internal/2.0.8
+    Building gradatum-core v2.0.8 (current)
+       Built [   1.206s] (current)
+     Parsing gradatum-core v2.0.8 (current)
+      Parsed [   0.026s] (current)
+    Building gradatum-core v2.0.8 (baseline)
+       Built [   1.122s] (baseline)
+     Parsing gradatum-core v2.0.8 (baseline)
+      Parsed [   0.019s] (baseline)
+    Checking gradatum-core v2.0.8 -> v2.0.8 (assume minor change)
+     Checked [   0.047s] 196 checks: 195 pass, 1 fail, 0 warn, 58 skip
+
+--- failure enum_variant_missing: pub enum variant removed or renamed ---
+
+Description:
+A publicly-visible enum has at least one variant that is no longer available under its prior name. It may have been renamed or removed entirely.
+        ref: https://doc.rust-lang.org/cargo/reference/semver.html#item-remove
+       impl: https://github.com/obi1kenobi/cargo-semver-checks/tree/v0.50.0/src/lints/enum_variant_missing.ron
+
+Failed in:
+  variant KindKind::Chore, previously in file /REPO/target/semver-checks/git-internal_2_0_8/65091e7559f591740b700494d5ebced61a24e91a/crates/gradatum-core/src/project_map.rs:142
+  variant KindKind::Spike, previously in file /REPO/target/semver-checks/git-internal_2_0_8/65091e7559f591740b700494d5ebced61a24e91a/crates/gradatum-core/src/project_map.rs:153
+
+     Summary semver requires new major version: 1 major and 0 minor checks failed
+    Finished [   2.757s] gradatum-core

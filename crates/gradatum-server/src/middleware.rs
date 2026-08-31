@@ -867,7 +867,9 @@ mod tests {
     #[async_trait::async_trait]
     impl RevocationStore for AlwaysErrorStore {
         async fn is_revoked(&self, _jti: &str, _tenant_id: &str) -> Result<bool, RevocationError> {
-            Err(RevocationError::Sqlite(sqlx::Error::RowNotFound))
+            Err(RevocationError::Sqlite(
+                rusqlite::Error::QueryReturnedNoRows,
+            ))
         }
 
         async fn revoke(
@@ -1210,7 +1212,9 @@ mod tests {
             match self.state {
                 RegistryState::Empty => Ok(false),
                 RegistryState::Populated => Ok(true),
-                RegistryState::Unreadable => Err(ApiKeyError::Sql(sqlx::Error::RowNotFound)),
+                RegistryState::Unreadable => {
+                    Err(ApiKeyError::Sql(rusqlite::Error::QueryReturnedNoRows))
+                }
             }
         }
     }

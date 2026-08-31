@@ -15,8 +15,7 @@
 //! `rotate()` executes `BEGIN; INSERT new; UPDATE old SET revoked_at=NOW; COMMIT` in a single
 //! SQLite transaction — no partial state is ever visible.
 
-use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::SaltString;
@@ -25,8 +24,9 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use gradatum_core::scope::{AgentId, TenantId};
 use rand::RngCore;
 use rand::rngs::OsRng;
-use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use sha2::{Digest, Sha384};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -120,7 +120,17 @@ pub enum ApiKeyError {
 
     /// Underlying SQLite error.
     #[error("SQLite error: {0}")]
-    Sql(#[from] sqlx::Error),
+    Sql(#[from] rusqlite::Error),
+
+    /// The blocking thread failed (panic or cancellation) — impossible in practice.
+    #[error("api key store blocking thread failed")]
+    Blocking,
+
+    /// Migration state error — the `_sqlx_migrations` tracking table is dirty
+    /// (`success = false`) or an applied migration's SHA-384 checksum differs from
+    /// the embedded file. Refuses startup rather than risking a replay.
+    #[error("api key store migration failed: {0}")]
+    Migration(String),
 
     /// Cryptographic secret generation failed.
     #[error("cryptographic error: {0}")]
@@ -318,13 +328,13 @@ pub trait ApiKeyStore: Send + Sync {
 
 // ── Implémentation SQLite ──────────────────────────────────────────────────────
 
-/// [`ApiKeyStore`] implementation backed by SQLite (sqlx pool).
+/// [`ApiKeyStore`] implementation backed by SQLite (rusqlite connection).
 ///
 /// The database must be initialized via [`SqliteApiKeyStore::init`] before use,
 /// which applies the embedded migrations (including `migrations/V0001__create_api_keys.sql`).
 #[derive(Clone)]
 pub struct SqliteApiKeyStore {
-    pool: SqlitePool,
+    conn: Arc<Mutex<Connection>>,
     /// Allows creating keys for a tenant other than `"main"`.
     ///
     /// `false` by default, which preserves the single-vault invariant. The operator turns
@@ -338,42 +348,64 @@ pub struct SqliteApiKeyStore {
 impl SqliteApiKeyStore {
     /// Opens (or creates) a `SqliteApiKeyStore` at `db_path`.
     ///
-    /// Runs the embedded sqlx migrations at startup (idempotent).
+    /// Runs the embedded migrations at startup, honoring the sqlx `_sqlx_migrations`
+    /// tracking table (an already-applied migration is never replayed).
     /// Logs a WARN if the `api_keys` table already contains rows (non-destructive re-init).
     ///
     /// # Errors
-    /// - `ApiKeyError::Sql` if the connection or migration fails
+    /// - `ApiKeyError::Sql` if the connection fails
+    /// - `ApiKeyError::Migration` if the tracking table is dirty or a checksum mismatches
+    /// - `ApiKeyError::Blocking` if the blocking thread panics
     pub async fn init(db_path: &std::path::Path) -> Result<Self, ApiKeyError> {
-        // Configurer WAL AVANT la migration : sqlx::migrate! exécute chaque migration dans
-        // une transaction implicite. SQLite refuse PRAGMA journal_mode=WAL en transaction
-        // ("cannot change into wal mode from within a transaction"). On applique donc WAL
-        // via SqliteConnectOptions, ce qui le configure au niveau de la connexion avant
-        // toute migration.
-        let connect_options =
-            SqliteConnectOptions::from_str(&format!("sqlite://{}?mode=rwc", db_path.display()))
-                .map_err(|e| ApiKeyError::Sql(sqlx::Error::Configuration(Box::new(e))))?
-                .journal_mode(SqliteJournalMode::Wal)
-                .create_if_missing(true);
+        let path = db_path.to_path_buf();
+        // Connexion rusqlite dédiée — motif de pont synchrone/asynchrone repris des magasins
+        // du serveur (proactive_recall_store / note_usage_store / read_usage_store) et du
+        // sous-lot 1 (base de révocation) : ouverture sur fil bloquant, connexion unique
+        // sous verrou `tokio::sync::Mutex`, verrou `blocking_lock()` tenu au minimum.
+        let conn = tokio::task::spawn_blocking(move || -> Result<Connection, ApiKeyError> {
+            let conn = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
 
-        let pool = SqlitePoolOptions::new()
-            .connect_with(connect_options)
-            .await?;
+            // WAL AVANT toute migration : SQLite interdit PRAGMA journal_mode=WAL dans une
+            // transaction (le runner applique chaque migration dans une transaction, comme
+            // sqlx::migrate!). On applique donc WAL au niveau de la connexion avant.
+            // `busy_timeout` 5 s et `synchronous` au défaut SQLite (FULL) sont conservés,
+            // identiques aux réglages sqlx d'origine.
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "busy_timeout", 5000i32)?;
 
-        // Migrations embarquées dans le répertoire `migrations/` de ce crate.
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|e| {
-                ApiKeyError::Sql(sqlx::Error::Protocol(format!(
-                    "api_keys migration failed: {e}"
-                )))
-            })?;
+            // Migrations embarquées dans le répertoire `migrations/` de ce crate, honorant
+            // la table de suivi sqlx `_sqlx_migrations` (P0 F-145) : une migration déjà
+            // appliquée n'est JAMAIS rejouée.
+            let applied = run_migrations(&conn)?;
+            if applied > 0 {
+                tracing::info!(applied, "api_keys migrations applied");
+            }
+
+            Ok(conn)
+        })
+        .await
+        .map_err(|_| ApiKeyError::Blocking)??;
 
         // Warn log si rows préexistent (A3 — re-init non-destructive).
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys")
-            .fetch_one(&pool)
+        let conn = Arc::new(Mutex::new(conn));
+        let count: i64 = {
+            let conn = Arc::clone(&conn);
+            tokio::task::spawn_blocking(move || -> Result<i64, ApiKeyError> {
+                let conn = conn.blocking_lock();
+                let n = conn
+                    .query_row("SELECT COUNT(*) FROM api_keys", [], |row| row.get(0))
+                    .optional()?
+                    .unwrap_or(0);
+                Ok(n)
+            })
             .await
-            .unwrap_or(0);
+            .map_err(|_| ApiKeyError::Blocking)??
+        };
 
         if count > 0 {
             warn!(
@@ -383,7 +415,7 @@ impl SqliteApiKeyStore {
         }
 
         Ok(Self {
-            pool,
+            conn,
             allow_non_main_tenants: false,
         })
     }
@@ -393,17 +425,19 @@ impl SqliteApiKeyStore {
     /// The database is reset on each call — no persistence.
     #[cfg(test)]
     pub async fn in_memory() -> Result<Self, ApiKeyError> {
-        let pool = SqlitePool::connect("sqlite::memory:").await?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|e| {
-                ApiKeyError::Sql(sqlx::Error::Protocol(format!(
-                    "api_keys migration (in-memory) failed: {e}"
-                )))
-            })?;
+        let conn = tokio::task::spawn_blocking(|| -> Result<Connection, ApiKeyError> {
+            let conn = Connection::open_in_memory()?;
+            let applied = run_migrations(&conn)?;
+            if applied > 0 {
+                tracing::info!(applied, "api_keys migrations applied (in-memory)");
+            }
+            Ok(conn)
+        })
+        .await
+        .map_err(|_| ApiKeyError::Blocking)??;
+
         Ok(Self {
-            pool,
+            conn: Arc::new(Mutex::new(conn)),
             allow_non_main_tenants: false,
         })
     }
@@ -543,6 +577,119 @@ impl SqliteApiKeyStore {
     }
 }
 
+// ── Migrations ────────────────────────────────────────────────────────────────
+
+/// Version of the single embedded migration — the numeric prefix of the filename
+/// `20260506000001_create_api_keys.sql` (same parsing as sqlx: everything before the
+/// first `_` is the version, measured in sqlx-core 0.8.6/src/migrate/source.rs).
+const MIGRATION_VERSION: i64 = 20_260_506_000_001;
+
+/// Description recorded by sqlx for this migration: the part of the name after the first
+/// `_`, with the `.sql` extension removed and `_` replaced by spaces → `create api keys`.
+const MIGRATION_DESCRIPTION: &str = "create api keys";
+
+/// SQL body of the single migration, embedded at compile time.
+///
+/// ⚠️ DO NOT MODIFY `migrations/20260506000001_create_api_keys.sql`: sqlx (and this runner)
+/// compute the SHA-384 checksum of the migration over its exact contents. A change would
+/// invalidate the checksum on databases where it is already applied → startup refusal
+/// (VersionMismatch) — an applied migration is immutable.
+const MIGRATION_SQL: &str = include_str!("../migrations/20260506000001_create_api_keys.sql");
+
+/// Applies the pending migrations, honoring the `_sqlx_migrations` tracking table
+/// kept by sqlx (schema measured in sqlx-sqlite 0.8.6/src/migrate.rs:72-79).
+///
+/// "Already applied" decision: the `version` column (PK) — a version already present is
+/// NEVER replayed. sqlx fidelity (the `Migrate` trait):
+///   - a `success = false` row → dirty database → startup refusal (MigrateError::Dirty);
+///   - an applied migration whose SHA-384 checksum differs from the embedded file →
+///     startup refusal (MigrateError::VersionMismatch).
+///
+/// Returns the number of migrations applied (0 on an up-to-date database).
+fn run_migrations(conn: &Connection) -> Result<usize, ApiKeyError> {
+    // Schéma exact de sqlx (sqlx-sqlite 0.8.6/src/migrate.rs) — no-op si déjà présente.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            success BOOLEAN NOT NULL,
+            checksum BLOB NOT NULL,
+            execution_time BIGINT NOT NULL
+        );",
+    )?;
+
+    // Base sale : une migration marquée en échec → refus de démarrage (parité
+    // MigrateError::Dirty). Ne peut survenir que d'une écriture manuelle : l'application
+    // sqlx est transactionnelle (migration + enregistrement dans la même transaction).
+    let dirty: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM _sqlx_migrations WHERE success = false ORDER BY version LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(version) = dirty {
+        return Err(ApiKeyError::Migration(format!(
+            "dirty migration base: migration {version} marked as failed (success = false)"
+        )));
+    }
+
+    // Migrations déjà appliquées (version + checksum), comme sqlx list_applied_migrations.
+    let mut applied: Vec<(i64, Vec<u8>)> = Vec::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            applied.push(row?);
+        }
+    }
+
+    let checksum = Sha384::digest(MIGRATION_SQL.as_bytes()).to_vec();
+
+    if let Some((_, stored)) = applied.iter().find(|(v, _)| *v == MIGRATION_VERSION) {
+        // Migration déjà appliquée : vérifier que le fichier n'a pas bougé depuis
+        // (immuable post-application). Ne JAMAIS rejouer.
+        if stored != &checksum {
+            return Err(ApiKeyError::Migration(format!(
+                "migration {MIGRATION_VERSION} already applied but its content changed \
+                 (SHA-384 checksum differs) — refusing startup"
+            )));
+        }
+        return Ok(0);
+    }
+
+    // Application dans une transaction unique (migration + enregistrement), comme sqlx :
+    // jamais de migration exécutée deux fois. `unchecked_transaction` car la connexion est
+    // dédiée (pas de transaction imbriquée possible).
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(MIGRATION_SQL)?;
+    tx.execute(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (?1, ?2, TRUE, ?3, -1)",
+        params![MIGRATION_VERSION, MIGRATION_DESCRIPTION, checksum],
+    )?;
+    tx.commit()?;
+
+    tracing::info!(version = MIGRATION_VERSION, "api_keys migration applied");
+    Ok(1)
+}
+
+/// Detects the UNIQUE violation on `api_keys.prefix`.
+///
+/// Extended code SQLITE_CONSTRAINT_UNIQUE = 2067 (19 | (8<<8)). `prefix` is the only
+/// UNIQUE constraint on the table (`id` is PRIMARY KEY, code 1555): a 2067 at INSERT
+/// can only be a prefix collision.
+fn is_prefix_collision(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _) if err.extended_code == 2067
+    )
+}
+
 // ── hex encode helper ─────────────────────────────────────────────────────────
 
 // Micro-helper pour encoder en hex sans dépendance additionnelle.
@@ -576,74 +723,53 @@ impl ApiKeyStore for SqliteApiKeyStore {
             );
             return Err(ApiKeyError::InvalidTenant(tenant_id));
         }
-        let secret = Self::generate_secret();
-        let prefix = Self::derive_prefix(&secret).to_string();
-        let hash = Self::hash_secret(&secret)?;
-        let id = Ulid::generate().to_string();
         let scopes_json = serde_json::to_string(&scopes)
             .map_err(|e| ApiKeyError::Crypto(format!("scopes JSON serialization failed: {e}")))?;
-        let now = Self::now_epoch();
+        let owner = owner.to_string();
+        let conn = Arc::clone(&self.conn);
 
-        // INSERT avec gestion de collision de préfixe (retry si UNIQUE constraint fail).
-        // En pratique, la probabilité de collision sur 32 bits est ~1/4 milliard — log seul.
-        let result = sqlx::query(
-            "INSERT INTO api_keys (id, prefix, hash, owner, scopes_json, tenant_id, created_at, description) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(&prefix)
-        .bind(&hash)
-        .bind(owner.as_str())
-        .bind(&scopes_json)
-        .bind(&tenant_id)
-        .bind(now)
-        .bind(&description)
-        .execute(&self.pool)
-        .await;
+        let material = tokio::task::spawn_blocking(move || -> Result<ApiKeyMaterial, ApiKeyError> {
+            let conn = conn.blocking_lock();
+            // INSERT avec gestion de collision de préfixe (retry si UNIQUE constraint fail).
+            // En pratique, la probabilité de collision sur 32 bits est ~1/4 milliard — log seul.
+            let now = Self::now_epoch();
+            let mut first_attempt = true;
+            loop {
+                let secret = Self::generate_secret();
+                let prefix = Self::derive_prefix(&secret).to_string();
+                let hash = Self::hash_secret(&secret)?; // argon2 sur fil bloquant
+                let id = Ulid::generate().to_string();
 
-        match result {
-            Ok(_) => {
-                debug!(
-                    owner = %owner,
-                    prefix = %prefix,
-                    tenant = %tenant_id,
-                    "API key created"
-                );
-                Ok(ApiKeyMaterial { secret, prefix })
-            }
-            Err(sqlx::Error::Database(db_err))
-                if db_err
-                    .message()
-                    .contains("UNIQUE constraint failed: api_keys.prefix") =>
-            {
-                // Collision de préfixe (P1-1 spec V2) — quasi-impossible en pratique.
-                // Retry avec un nouveau secret.
-                warn!("API key prefix collision detected — retrying generation");
-                let secret2 = Self::generate_secret();
-                let prefix2 = Self::derive_prefix(&secret2).to_string();
-                let hash2 = Self::hash_secret(&secret2)?;
-                let id2 = Ulid::generate().to_string();
-                sqlx::query(
+                let result = conn.execute(
                     "INSERT INTO api_keys (id, prefix, hash, owner, scopes_json, tenant_id, created_at, description) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(&id2)
-                .bind(&prefix2)
-                .bind(&hash2)
-                .bind(owner.as_str())
-                .bind(&scopes_json)
-                .bind(&tenant_id)
-                .bind(now)
-                .bind(&description)
-                .execute(&self.pool)
-                .await?;
-                Ok(ApiKeyMaterial {
-                    secret: secret2,
-                    prefix: prefix2,
-                })
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![id, prefix, hash, owner, scopes_json, tenant_id, now, description],
+                );
+
+                match result {
+                    Ok(_) => {
+                        debug!(
+                            owner = %owner,
+                            prefix = %prefix,
+                            tenant = %tenant_id,
+                            "API key created"
+                        );
+                        return Ok(ApiKeyMaterial { secret, prefix });
+                    }
+                    Err(e) if first_attempt && is_prefix_collision(&e) => {
+                        // Collision de préfixe (P1-1 spec V2) — quasi-impossible en pratique.
+                        // Retry avec un nouveau secret.
+                        warn!("API key prefix collision detected — retrying generation");
+                        first_attempt = false;
+                    }
+                    Err(e) => return Err(ApiKeyError::Sql(e)),
+                }
             }
-            Err(e) => Err(ApiKeyError::Sql(e)),
-        }
+        })
+        .await
+        .map_err(|_| ApiKeyError::Blocking)??;
+
+        Ok(material)
     }
 
     async fn verify(&self, secret: &str) -> Result<ApiKey, ApiKeyError> {
@@ -654,14 +780,36 @@ impl ApiKeyStore for SqliteApiKeyStore {
 
         // Chercher par préfixe display pour limiter la portée de la vérification CT.
         let prefix = Self::derive_prefix(secret);
+        let prefix_owned = prefix.to_owned();
+        let conn = Arc::clone(&self.conn);
 
-        let row = sqlx::query_as::<_, (String, String, String, String, String, String, i64, Option<i64>, Option<i64>, Option<String>)>(
-            "SELECT id, prefix, hash, owner, scopes_json, tenant_id, created_at, last_used_at, revoked_at, description \
-             FROM api_keys WHERE prefix = ?",
-        )
-        .bind(prefix)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = tokio::task::spawn_blocking(move || -> Result<Option<(String, String, String, String, String, String, i64, Option<i64>, Option<i64>, Option<String>)>, ApiKeyError> {
+            let conn = conn.blocking_lock();
+            let row = conn
+                .query_row(
+                    "SELECT id, prefix, hash, owner, scopes_json, tenant_id, created_at, last_used_at, revoked_at, description \
+                     FROM api_keys WHERE prefix = ?1",
+                    params![prefix_owned],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+        .map_err(|_| ApiKeyError::Blocking)??;
 
         let row = match row {
             Some(r) => r,
@@ -702,11 +850,17 @@ impl ApiKeyStore for SqliteApiKeyStore {
 
         // Mise à jour last_used_at (best-effort — pas bloquant si update échoue).
         let now = Self::now_epoch();
-        let _ = sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE prefix = ?")
-            .bind(now)
-            .bind(prefix)
-            .execute(&self.pool)
-            .await;
+        let prefix = prefix.to_owned();
+        let conn = Arc::clone(&self.conn);
+        let _ = tokio::task::spawn_blocking(move || -> Result<(), ApiKeyError> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE api_keys SET last_used_at = ?1 WHERE prefix = ?2",
+                params![now, prefix],
+            )?;
+            Ok(())
+        })
+        .await;
 
         Ok(Self::row_to_api_key(
             id,
@@ -729,25 +883,43 @@ impl ApiKeyStore for SqliteApiKeyStore {
     ) -> Result<Vec<ApiKey>, ApiKeyError> {
         // P1 #4 : filtre tenant_id. `None` = tous les tenants (backward-compat) ;
         // `Some(t)` = isole les clés API au tenant `t`.
-        let rows = if include_revoked {
-            sqlx::query_as::<_, (String, String, String, String, String, String, i64, Option<i64>, Option<i64>, Option<String>)>(
+        let tenant_filter = tenant_filter.map(str::to_owned);
+        let conn = Arc::clone(&self.conn);
+
+        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, String, String, String, String, i64, Option<i64>, Option<i64>, Option<String>)>, ApiKeyError> {
+            let conn = conn.blocking_lock();
+            let sql = if include_revoked {
                 "SELECT id, prefix, hash, owner, scopes_json, tenant_id, created_at, last_used_at, revoked_at, description \
-                 FROM api_keys WHERE (? IS NULL OR tenant_id = ?) ORDER BY created_at DESC",
-            )
-            .bind(tenant_filter)
-            .bind(tenant_filter)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, (String, String, String, String, String, String, i64, Option<i64>, Option<i64>, Option<String>)>(
+                 FROM api_keys WHERE (?1 IS NULL OR tenant_id = ?1) ORDER BY created_at DESC"
+            } else {
                 "SELECT id, prefix, hash, owner, scopes_json, tenant_id, created_at, last_used_at, revoked_at, description \
-                 FROM api_keys WHERE revoked_at IS NULL AND (? IS NULL OR tenant_id = ?) ORDER BY created_at DESC",
-            )
-            .bind(tenant_filter)
-            .bind(tenant_filter)
-            .fetch_all(&self.pool)
-            .await?
-        };
+                 FROM api_keys WHERE revoked_at IS NULL AND (?1 IS NULL OR tenant_id = ?1) ORDER BY created_at DESC"
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let mut out = Vec::new();
+            {
+                let rows = stmt.query_map(params![tenant_filter], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                })?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|_| ApiKeyError::Blocking)??;
 
         Ok(rows
             .into_iter()
@@ -782,28 +954,44 @@ impl ApiKeyStore for SqliteApiKeyStore {
     }
 
     async fn revoke(&self, prefix: &str) -> Result<(), ApiKeyError> {
-        // Chercher la clé pour vérifier son existence et son état actuel.
-        let row =
-            sqlx::query_as::<_, (Option<i64>,)>("SELECT revoked_at FROM api_keys WHERE prefix = ?")
-                .bind(prefix)
-                .fetch_optional(&self.pool)
-                .await?;
+        let conn = Arc::clone(&self.conn);
 
-        match row {
+        // Chercher la clé pour vérifier son existence et son état actuel.
+        let prefix_owned = prefix.to_owned();
+        let revoked_at =
+            tokio::task::spawn_blocking(move || -> Result<Option<Option<i64>>, ApiKeyError> {
+                let conn = conn.blocking_lock();
+                let row = conn
+                    .query_row(
+                        "SELECT revoked_at FROM api_keys WHERE prefix = ?1",
+                        params![prefix_owned],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                Ok(row)
+            })
+            .await
+            .map_err(|_| ApiKeyError::Blocking)??;
+
+        match revoked_at {
             None => return Err(ApiKeyError::NotFound),
-            Some((Some(_),)) => return Err(ApiKeyError::AlreadyRevoked),
-            Some((None,)) => {}
+            Some(Some(_)) => return Err(ApiKeyError::AlreadyRevoked),
+            Some(None) => {}
         }
 
         let now = Self::now_epoch();
-        let affected = sqlx::query(
-            "UPDATE api_keys SET revoked_at = ? WHERE prefix = ? AND revoked_at IS NULL",
-        )
-        .bind(now)
-        .bind(prefix)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let prefix_owned = prefix.to_owned();
+        let conn = Arc::clone(&self.conn);
+        let affected = tokio::task::spawn_blocking(move || -> Result<usize, ApiKeyError> {
+            let conn = conn.blocking_lock();
+            let n = conn.execute(
+                "UPDATE api_keys SET revoked_at = ?1 WHERE prefix = ?2 AND revoked_at IS NULL",
+                params![now, prefix_owned],
+            )?;
+            Ok(n)
+        })
+        .await
+        .map_err(|_| ApiKeyError::Blocking)??;
 
         if affected == 0 {
             // Race condition : révoquée entre le SELECT et l'UPDATE.
@@ -815,15 +1003,27 @@ impl ApiKeyStore for SqliteApiKeyStore {
     }
 
     async fn rotate(&self, prefix: &str) -> Result<ApiKeyMaterial, ApiKeyError> {
-        // Vérifier source : doit exister + non révoquée.
-        let row = sqlx::query_as::<_, (String, String, Option<i64>)>(
-            "SELECT owner, tenant_id, revoked_at FROM api_keys WHERE prefix = ?",
-        )
-        .bind(prefix)
-        .fetch_optional(&self.pool)
-        .await?;
+        let conn = Arc::clone(&self.conn);
 
-        let (owner, tenant_id, revoked_at) = match row {
+        // Vérifier source : doit exister + non révoquée.
+        let prefix_owned = prefix.to_owned();
+        let source = tokio::task::spawn_blocking(
+            move || -> Result<Option<(String, String, Option<i64>)>, ApiKeyError> {
+                let conn = conn.blocking_lock();
+                let row = conn
+                    .query_row(
+                        "SELECT owner, tenant_id, revoked_at FROM api_keys WHERE prefix = ?1",
+                        params![prefix_owned],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                Ok(row)
+            },
+        )
+        .await
+        .map_err(|_| ApiKeyError::Blocking)??;
+
+        let (owner, tenant_id, revoked_at) = match source {
             None => return Err(ApiKeyError::NotFound),
             Some(r) => r,
         };
@@ -833,11 +1033,27 @@ impl ApiKeyStore for SqliteApiKeyStore {
         }
 
         // Copier les scopes de l'ancienne clé.
-        let scopes_json: String =
-            sqlx::query_scalar("SELECT scopes_json FROM api_keys WHERE prefix = ?")
-                .bind(prefix)
-                .fetch_one(&self.pool)
-                .await?;
+        let prefix_owned = prefix.to_owned();
+        let conn = Arc::clone(&self.conn);
+        let scopes_json =
+            tokio::task::spawn_blocking(move || -> Result<Option<String>, ApiKeyError> {
+                let conn = conn.blocking_lock();
+                let s = conn
+                    .query_row(
+                        "SELECT scopes_json FROM api_keys WHERE prefix = ?1",
+                        params![prefix_owned],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                Ok(s)
+            })
+            .await
+            .map_err(|_| ApiKeyError::Blocking)??;
+
+        let scopes_json = match scopes_json {
+            Some(s) => s,
+            None => return Err(ApiKeyError::NotFound),
+        };
 
         // Générer le nouveau secret.
         let new_secret = Self::generate_secret();
@@ -846,51 +1062,50 @@ impl ApiKeyStore for SqliteApiKeyStore {
         let new_id = Ulid::generate().to_string();
         let now = Self::now_epoch();
 
-        // Transaction atomique : INSERT new + UPDATE old (P1-5 spec V2).
-        let mut tx = self.pool.begin().await?;
+        // Transaction atomique : INSERT new + UPDATE old (P1-5 spec V2), le tout sur fil
+        // bloquant sous le verrou unique — le même motif de pont que les autres opérations.
+        let prefix_owned = prefix.to_owned();
+        let conn = Arc::clone(&self.conn);
+        let material =
+            tokio::task::spawn_blocking(move || -> Result<ApiKeyMaterial, ApiKeyError> {
+                let mut conn = conn.blocking_lock();
+                let tx = conn.transaction()?;
 
-        sqlx::query(
-            "INSERT INTO api_keys (id, prefix, hash, owner, scopes_json, tenant_id, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&new_id)
-        .bind(&new_prefix)
-        .bind(&new_hash)
-        .bind(&owner)
-        .bind(&scopes_json)
-        .bind(&tenant_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+                tx.execute(
+                    "INSERT INTO api_keys (id, prefix, hash, owner, scopes_json, tenant_id, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![new_id, new_prefix, new_hash, owner, scopes_json, tenant_id, now],
+                )?;
 
-        let update_result = sqlx::query(
-            "UPDATE api_keys SET revoked_at = ? WHERE prefix = ? AND revoked_at IS NULL",
-        )
-        .bind(now)
-        .bind(prefix)
-        .execute(&mut *tx)
-        .await?;
+                let update_result = tx.execute(
+                    "UPDATE api_keys SET revoked_at = ?1 WHERE prefix = ?2 AND revoked_at IS NULL",
+                    params![now, prefix_owned],
+                )?;
 
-        // Vérifier que la révocation de l'ancienne clé a bien eu lieu.
-        // rows_affected == 0 indique une race condition (révoquée entre le SELECT et l'UPDATE).
-        // Dans ce cas on roll-back la transaction pour éviter d'insérer une nouvelle clé
-        // dont l'ancienne resterait active dans les caches.
-        if update_result.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Err(ApiKeyError::AlreadyRevoked);
-        }
+                // Vérifier que la révocation de l'ancienne clé a bien eu lieu.
+                // update_result == 0 indique une race condition (révoquée entre le SELECT
+                // et l'UPDATE). Dans ce cas on roll-back la transaction pour éviter
+                // d'insérer une nouvelle clé dont l'ancienne resterait active dans les caches.
+                if update_result == 0 {
+                    tx.rollback()?;
+                    return Err(ApiKeyError::AlreadyRevoked);
+                }
 
-        tx.commit().await?;
+                tx.commit()?;
+                Ok(ApiKeyMaterial {
+                    secret: new_secret,
+                    prefix: new_prefix,
+                })
+            })
+            .await
+            .map_err(|_| ApiKeyError::Blocking)??;
 
         debug!(
             old_prefix = prefix,
-            new_prefix = %new_prefix,
+            new_prefix = %material.prefix,
             "API key rotated"
         );
-        Ok(ApiKeyMaterial {
-            secret: new_secret,
-            prefix: new_prefix,
-        })
+        Ok(material)
     }
 
     /// Overrides the trait's default body — same answer, without loading the store.
@@ -902,10 +1117,18 @@ impl ApiKeyStore for SqliteApiKeyStore {
     ///
     /// No `tenant_id` filter: the emptiness measured is global, as in the trait.
     async fn has_any_active(&self) -> Result<bool, ApiKeyError> {
-        let exists: i64 =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_keys WHERE revoked_at IS NULL)")
-                .fetch_one(&self.pool)
-                .await?;
+        let conn = Arc::clone(&self.conn);
+        let exists = tokio::task::spawn_blocking(move || -> Result<i64, ApiKeyError> {
+            let conn = conn.blocking_lock();
+            let n = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE revoked_at IS NULL)",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(n)
+        })
+        .await
+        .map_err(|_| ApiKeyError::Blocking)??;
         Ok(exists != 0)
     }
 }
@@ -1415,5 +1638,178 @@ mod tests {
         assert_eq!(SqliteApiKeyStore::derive_prefix("ak_"), "ak_");
         // Vide : pas de panic.
         assert_eq!(SqliteApiKeyStore::derive_prefix(""), "");
+    }
+
+    // ── Preuve P0 (F-145 sous-lot 2) : non-rejeu des migrations ─────────────────
+    //
+    // La base des clés d'API est la SEULE des trois bases sqlx à porter une table de suivi
+    // de migration (`sqlx::migrate!` → `_sqlx_migrations`). Le remplaçant rusqlite doit
+    // honorer cette table : une migration déjà appliquée (version présente) n'est JAMAIS
+    // rejouée. Les tests ci-dessous fabriquent des bases jetables et prouvent le verdict.
+
+    /// P0 — une base portant la table de suivi REMPLIE comme en production (créée par
+    /// `sqlx::migrate!`, version 20260506000001 enregistrée avec son checksum SHA-384) ne
+    /// fait RIEN rejouer par `SqliteApiKeyStore::init`.
+    #[tokio::test]
+    async fn init_does_not_replay_migrations_on_production_like_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("api_keys.sqlite");
+
+        // Fabriquer la base « comme en production » : schéma exact de sqlx
+        // (sqlx-sqlite 0.8.6/src/migrate.rs) + ligne appliquée + table api_keys déjà créée.
+        let conn = Connection::open(&path).expect("open fixture base");
+        conn.execute_batch(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            );
+            CREATE TABLE api_keys (
+                id TEXT PRIMARY KEY, prefix TEXT NOT NULL UNIQUE, hash TEXT NOT NULL,
+                owner TEXT NOT NULL, scopes_json TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER,
+                description TEXT
+            );",
+        )
+        .expect("fixture schema");
+        let checksum = Sha384::digest(MIGRATION_SQL.as_bytes()).to_vec();
+        conn.execute(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (?1, ?2, TRUE, ?3, -1)",
+            params![MIGRATION_VERSION, MIGRATION_DESCRIPTION, checksum],
+        )
+        .expect("fixture migration row");
+        drop(conn);
+
+        // Lancer le remplaçant (init → run_migrations).
+        let _store = SqliteApiKeyStore::init(&path)
+            .await
+            .expect("init sur base production-like");
+
+        // Rien n'a été rejoué : la table de suivi n'a toujours qu'UNE ligne.
+        let conn = Connection::open(&path).expect("reopen");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _sqlx_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            n, 1,
+            "aucune migration rejouée : la table de suivi est intacte"
+        );
+    }
+
+    /// Contre-preuve — une base VIERGE reçoit exactement une application, et le second
+    /// appel n'applique plus rien.
+    #[test]
+    fn migration_runner_applies_fresh_migration_then_skips() {
+        let conn = Connection::open_in_memory().expect("in-memory");
+
+        let applied = run_migrations(&conn).expect("first run");
+        assert_eq!(
+            applied, 1,
+            "base vierge : la migration est appliquée une fois"
+        );
+
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'api_keys'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("tables");
+        assert_eq!(tables, 1, "la table api_keys existe après la migration");
+
+        let tracked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _sqlx_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("tracked");
+        assert_eq!(
+            tracked, 1,
+            "la migration est enregistrée dans _sqlx_migrations"
+        );
+
+        let applied2 = run_migrations(&conn).expect("second run");
+        assert_eq!(applied2, 0, "second appel : rien à rejouer");
+    }
+
+    /// Fidélité sqlx — une base sale (ligne `success = false`) refuse le démarrage.
+    #[test]
+    fn migration_runner_refuses_dirty_base() {
+        let conn = Connection::open_in_memory().expect("in-memory");
+        conn.execute_batch(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            );",
+        )
+        .expect("schema");
+        conn.execute(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (?1, ?2, FALSE, x'00', -1)",
+            params![MIGRATION_VERSION, MIGRATION_DESCRIPTION],
+        )
+        .expect("dirty row");
+
+        let err = run_migrations(&conn).expect_err("base sale → refus");
+        assert!(
+            matches!(err, ApiKeyError::Migration(_)),
+            "refus de démarrage attendu, obtenu : {err:?}"
+        );
+    }
+
+    /// Le checksum embarqué correspond au fichier sur disque (le même que sqlx lit) :
+    /// la preuve de non-rejeu repose sur l'identité des octets, pas sur une copie dérivée.
+    #[test]
+    fn embedded_migration_matches_disk_file() {
+        let disk = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/20260506000001_create_api_keys.sql"
+        ))
+        .expect("lire la migration sur disque");
+        let disk_checksum = Sha384::digest(&disk).to_vec();
+        let embedded_checksum = Sha384::digest(MIGRATION_SQL.as_bytes()).to_vec();
+        assert_eq!(
+            disk_checksum, embedded_checksum,
+            "le fichier embarqué (include_str!) doit être byte-identique au fichier sur disque"
+        );
+    }
+
+    /// Fidélité sqlx — une migration appliquée dont le fichier a changé (checksum différent)
+    /// refuse le démarrage : une migration appliquée est immuable.
+    #[test]
+    fn migration_runner_refuses_modified_applied_migration() {
+        let conn = Connection::open_in_memory().expect("in-memory");
+        conn.execute_batch(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            );",
+        )
+        .expect("schema");
+        conn.execute(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (?1, ?2, TRUE, x'00', -1)",
+            params![MIGRATION_VERSION, MIGRATION_DESCRIPTION],
+        )
+        .expect("row");
+
+        let err = run_migrations(&conn).expect_err("checksum différent → refus");
+        assert!(
+            matches!(err, ApiKeyError::Migration(_)),
+            "refus de démarrage attendu, obtenu : {err:?}"
+        );
     }
 }

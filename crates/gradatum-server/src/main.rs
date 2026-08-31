@@ -54,8 +54,7 @@ use gradatum_core::paths::{queue_db_path, vault_index_path as canon_vault_index_
 // Import du boot_guard_check (caveat C2 — interdit memory store en bind non-loopback).
 use gradatum_auth::revocation::boot_guard_check;
 // P0-1 Phase 4.2bis : QueueStore v81 pour endpoints F-16.
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use gradatum_db_sqlite::{SqliteQueueStore, open_queue_db, run_migrations};
 
 /// Chaîne rendue par `--version` : version sémantique **suivie du SHA du commit de build**.
 ///
@@ -170,7 +169,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("loading or generating JWT signing key")?;
 
-    // T1 P2.0c : SqliteQueue câblée sur storage.root/db/queue.sqlite.
+    // F-177 : la file legacy `jobs_v2` (SqliteQueue) est supprimée — le serveur ne
+    // câble plus de queue legacy. La file LIVE `gradatum_jobs` est ouverte plus bas
+    // via SqliteQueueStore (P0-1 Phase 4.2bis).
     // T2 P2.0c : Vault câblé sur storage.root/vault/ (créé si absent).
     // AUTH-T6 : SqliteRevocationStore câblé si revocation_store == "sqlite".
     // T10 : SqliteIndex câblé sur cfg.storage.vault_index_path (SSOT — config.toml respectée).
@@ -205,8 +206,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // SSOT : chemin queue via helper canonique (interdit root.join("db/queue.sqlite") direct).
-    let queue_path = queue_db_path(&cfg.storage.root);
     let vault_path = cfg.storage.root.join("vault");
     // F-100 P1-1 — piste d'audit durable : sous-répertoire `audit/` sous la racine storage.
     // Câblé au boot (fail-fast si création impossible) → `state.audit` = JsonlFileSink en prod,
@@ -251,9 +250,6 @@ async fn main() -> anyhow::Result<()> {
     // Construire AppState avec la clé JWT persistante (fix P0).
     // AppState::new() (éphémère) n'est plus utilisé en prod — uniquement via with_jwt().
     let state = AppState::with_jwt(jwt_service)
-        .with_queue_path(&queue_path)
-        .await
-        .context("queue init failed")?
         .with_vault_path(&vault_path, gradatum_core::scope::VaultId::new("main"))
         .await
         .context("vault init failed")?
@@ -480,32 +476,25 @@ async fn main() -> anyhow::Result<()> {
     //
     // v0.2.0 Bronze : endpoints jobs ouverts sans auth conditionnelle (invariant réseau privé).
     // Auth granulaire F-45 multi-user JWT planifiée v1.0.0 Gold.
-    // SSOT : chemin queue via helper canonique (même path que queue_path ci-dessus).
+    // SSOT : chemin de la file LIVE via helper canonique (interdit root.join("db/queue.sqlite") direct).
     let jobs_db_path = queue_db_path(&cfg.storage.root);
     if let Some(parent) = jobs_db_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .with_context(|| format!("creating jobs db directory: {}", parent.display()))?;
     }
-    let jobs_opts = SqliteConnectOptions::new()
-        .filename(&jobs_db_path)
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        // 5s busy_timeout : sans ce réglage, SQLite renvoie SQLITE_BUSY
-        // immédiatement si le worker tient le verrou WAL lors d'un ack
-        // (store.complete/fail). Avec busy_timeout, SQLite réessaie jusqu'à 5s
-        // avant d'échouer — évite les jobs coincés en Running sur contention.
-        .busy_timeout(std::time::Duration::from_secs(5));
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(4)
-        .connect_with(jobs_opts)
+    // 5s busy_timeout : sans ce réglage, SQLite renvoie SQLITE_BUSY
+    // immédiatement si le worker tient le verrou WAL lors d'un ack
+    // (store.complete/fail). Avec busy_timeout, SQLite réessaie jusqu'à 5s
+    // avant d'échouer — évite les jobs coincés en Running sur contention.
+    let jobs_db = open_queue_db(&jobs_db_path)
         .await
-        .context("jobs pool init failed")?;
-    run_migrations(&jobs_pool)
+        .context("jobs db init failed")?;
+    run_migrations(&jobs_db)
         .await
         .context("jobs migrations failed")?;
-    let job_store = Arc::new(SqliteQueueStore::new(jobs_pool.clone()));
-    let state = state.with_job_store(job_store, jobs_pool);
+    let job_store = Arc::new(SqliteQueueStore::new(jobs_db.clone()));
+    let state = state.with_job_store(job_store, jobs_db);
     tracing::info!(
         path = %jobs_db_path.display(),
         "SqliteQueueStore (F-16) ready"
@@ -1419,7 +1408,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    tracing::info!(queue_path = %queue_path.display(), "SqliteQueue ready");
     tracing::info!(vault_path = %vault_path.display(), "Vault ready");
     tracing::info!(search_path = %search_path.display(), "SqliteIndex (FTS5) ready");
     tracing::info!(

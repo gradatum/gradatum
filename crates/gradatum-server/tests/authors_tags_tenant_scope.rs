@@ -39,6 +39,7 @@ use gradatum_core::section::Section;
 use gradatum_core::status::NoteStatus;
 use gradatum_core::tag::Tag;
 use gradatum_core::trust::TrustContext;
+use gradatum_dto::VaultTagsRequest;
 use gradatum_server::api_v1::logic::{vault_authors_impl, vault_tags_impl};
 use gradatum_server::config::{MultiTenantConfig, ServerConfig};
 use gradatum_server::state::{AppState, VaultRegistry};
@@ -234,7 +235,7 @@ async fn vault_tags_scopes_to_effective_tenant_not_main() {
     seed_note(&env, "main", MAIN_AUTHOR, MAIN_TAG).await;
     seed_note(&env, "vault-b", VAULT_B_AUTHOR, VAULT_B_TAG).await;
 
-    let resp = vault_tags_impl(&env.state, &bearer("vault-b"))
+    let resp = vault_tags_impl(&env.state, &bearer("vault-b"), VaultTagsRequest::new())
         .await
         .expect("vault-b → Ok");
 
@@ -255,7 +256,7 @@ async fn vault_tags_main_sees_own_tags() {
     seed_note(&env, "main", MAIN_AUTHOR, MAIN_TAG).await;
     seed_note(&env, "vault-b", VAULT_B_AUTHOR, VAULT_B_TAG).await;
 
-    let resp = vault_tags_impl(&env.state, &bearer("main"))
+    let resp = vault_tags_impl(&env.state, &bearer("main"), VaultTagsRequest::new())
         .await
         .expect("main → Ok");
 

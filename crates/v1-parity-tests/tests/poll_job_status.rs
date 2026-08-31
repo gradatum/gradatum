@@ -3,22 +3,15 @@
 //! # Objectif
 //!
 //! Valider le contrat du pattern async 202 de gradatum :
-//! `vault_write → 202 + {job_id, poll_url}` → `GET /api/v1/jobs/<id> → JobStatusResponse`.
+//! `vault_write → 202 + {job_id, poll_url}` → `GET /api/v1/jobs/{ulid}/v2 → JobRecord`.
 //!
-//! # Périmètre P2.0c
+//! # Périmètre P2.0c → 2.1.0
 //!
-//! Le handler `GET /api/v1/jobs/:id` retourne actuellement `"pending"` pour tout ID
-//! valide (stub documenté — Queue::get(id) non exposé dans le trait Queue).
+//! La route legacy `GET /api/v1/jobs/:id` (i64, queue `jobs_v2`) est supprimée en
+//! 2.1.0 (F-177). Le polling passe par `/api/v1/jobs/{ulid}/v2` (`get_job_v2`).
 //! Ce test valide :
 //! 1. La structure du 202 Accepted (job_id, status="queued", poll_url correct).
-//! 2. La disponibilité du endpoint poll (200 OK + JSON valide).
-//! 3. La structure de la réponse poll (job_id, status, attempts, last_error).
-//!
-//! # Note
-//!
-//! Un futur ajout de `Queue::get_status(id)` dans le trait câblera le handler
-//! pour retourner le vrai statut (`"done"` + `result.note_id` après worker).
-//! Ce test sera amendé pour asserter `status = "done"` à ce moment.
+//! 2. La disponibilité du endpoint poll (200 OK + JobRecord JSON valide).
 //!
 
 use std::sync::Arc;
@@ -26,11 +19,10 @@ use std::time::Duration;
 
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::{JwtService, TokenScope};
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 use gradatum_server::middleware::auth_middleware;
 use gradatum_server::{api_v1, state::AppState};
 use serde_json::Value;
-use sqlx::sqlite::SqlitePoolOptions;
 
 // ── Preset ACL — écriture autorisée pour test-writer ─────────────────────────
 
@@ -48,7 +40,6 @@ write_patterns = ["**"]
 /// Retourne l'adresse et un bearer JWT avec scope write.
 async fn spawn_write_server() -> (std::net::SocketAddr, String) {
     use axum::{Router, middleware};
-    use gradatum_queue::SqliteQueue;
 
     let jwt = JwtService::new_ephemeral();
     let bearer = jwt
@@ -63,15 +54,9 @@ async fn spawn_write_server() -> (std::net::SocketAddr, String) {
     let acl = AclEngine::from_preset_str(TEST_ACL_WRITE)
         .expect("preset ACL write de test toujours valide — invariant statique");
 
-    // Queue legacy jobs_v2 (classify/downgrade).
-    let queue = SqliteQueue::in_memory()
-        .await
-        .expect("SqliteQueue::in_memory pour test E2E poll");
-
     // Phase 1.2 : vault_write bridge vers job_store (gradatum_jobs) — nécessaire pour 202.
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    // F-177 : la queue legacy `jobs_v2` est supprimée — plus de `SqliteQueue`.
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory — invariant test v1-parity");
     run_migrations(&jobs_pool)
@@ -80,7 +65,6 @@ async fn spawn_write_server() -> (std::net::SocketAddr, String) {
     let job_store = Arc::new(SqliteQueueStore::new(jobs_pool.clone()));
 
     let state = AppState::with_jwt_and_acl(jwt, acl)
-        .with_queue(Arc::new(queue))
         .with_job_store(job_store as Arc<dyn gradatum_core::QueueStore>, jobs_pool);
 
     let app = Router::new()
@@ -177,10 +161,9 @@ async fn vault_write_returns_202_with_job_id_and_poll_url() {
     );
 }
 
-/// E2E : GET /api/v1/jobs/<id> retourne 200 + JobStatusResponse valide.
+/// E2E : GET /api/v1/jobs/<ulid>/v2 retourne 200 + JobRecord valide.
 ///
-/// Valide que l'endpoint poll est joignable et retourne un JSON conforme
-/// au DTO JobStatusResponse (job_id, status, attempts, last_error).
+/// Valide que l'endpoint poll est joignable et retourne un JobRecord JSON conforme.
 #[tokio::test]
 async fn poll_endpoint_returns_200_with_valid_job_status_response() {
     let (addr, bearer) = spawn_write_server().await;
@@ -248,8 +231,7 @@ async fn poll_endpoint_returns_200_with_valid_job_status_response() {
 
 /// E2E : 3 vault_write parallèles → 3 job_id distincts.
 ///
-/// Vérifie que l'atomic `INSERT...RETURNING` de SqliteQueue garantit
-/// l'unicité des job_id même sous charge concurrente.
+/// Vérifie que les writes concurrents produisent des job_id (ULID) distincts.
 #[tokio::test]
 async fn concurrent_vault_write_produces_distinct_job_ids() {
     let (addr, bearer) = spawn_write_server().await;
@@ -358,31 +340,6 @@ async fn vault_downgrade_returns_202_with_job_id() {
         resp.status(),
         404,
         "vault_downgrade sync : note inexistante → 404 Not Found (F-1 : bearer requis, note absente)"
-    );
-}
-
-/// E2E : GET /api/v1/jobs/<id> avec id inconnu retourne 404.
-///
-/// Valide que le handler retourne 404 Not Found (et non 200 "pending")
-/// — `Queue::get` retourne `None` pour un id qui n'a jamais été enqueued.
-#[tokio::test]
-async fn poll_unknown_job_id_returns_404() {
-    let (addr, bearer) = spawn_write_server().await;
-
-    // ID arbitraire très grand — jamais enqueued dans cette instance in-memory.
-    let unknown_id: i64 = 999_999_999;
-
-    let resp = client()
-        .get(format!("http://{addr}/api/v1/jobs/{unknown_id}"))
-        .bearer_auth(&bearer)
-        .send()
-        .await
-        .expect("GET /api/v1/jobs/<inconnu> — serveur doit répondre");
-
-    assert_eq!(
-        resp.status(),
-        404,
-        "GET /api/v1/jobs/<id_inconnu> doit retourner 404 Not Found (RT5 fix)"
     );
 }
 

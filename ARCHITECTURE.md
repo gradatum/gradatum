@@ -1,7 +1,11 @@
 # Gradatum — Architecture
 
 > Source of truth for technical design. Updated as the project evolves.
-> Last architectural review : 2026-08-01 — workspace version 1.0.2, Rust edition 2024, MSRV 1.91.
+> Last architectural review : 2026-08-23 — workspace version 2.1.0, Rust edition 2024, MSRV 1.91.
+> Delta since 2026-08-15: no change to the crate graph, the module boundaries or the data model.
+> Increments 2.0.2 through 2.0.9 touched the delivery chain only — CI gates, release manifest and
+> release policy. Notably `2.0.9`: the public-surface gate now derives its escalation regime from
+> the release rank, and the deviation inventory it reads became a list.
 > This header deliberately carries no commit anchor. An anchor written by hand into the
 > very file it dates cannot be kept accurate: making it current requires naming the commit
 > that writes it, which is a fixed point of the hash. For the document's actual position in
@@ -564,9 +568,9 @@ VAULTS          multi-vault first-class (default "main", staging/bench-* on dema
 LOCI            logical subdivisions, isolated by bearer ACL
                 path-like: "human", "main-agent", "projecta/backend", "projectb/tester"
    ↓
-SECTIONS        13 canonical: decisions, architecture, debug, reasoning, feedback,
+SECTIONS        14 canonical: decisions, architecture, debug, reasoning, feedback,
                 lessons-learned, retrospectives, experiments, agent-issues, reference, council,
-                project-map, identity
+                project-map, identity, snapshot
    ↓
 NOTES           Markdown + YAML frontmatter + ULID + checksum_md
 ```
@@ -622,13 +626,28 @@ The core knows nothing about "human", "main-agent", or "sub-agent" — those are
 | Markdown files (`vault/<tenant>/*.md`) | **Source of truth.** Human-readable. Compatible with Obsidian/Logseq. Survives if Gradatum is down. |
 | SQLite index (`vault/.gradatum/index.db`) | Index + cache. Derived from the Markdown files, but **not currently rebuildable from them** — see below. |
 
-**Drift detection is not active in `1.0.0`.** The helper exists (`gradatum-index::drift::scan_phase_a`,
-three-level size → prefix-4 KiB → full SHA-256 against the `file_checksums` table) but
-**`file_checksums` is never populated on the write path**, so no scan has anything to compare and no
-caller invokes it at read time. The `AuditEventType::DriftDetected` variant is defined but never
-emitted. **An out-of-band edit of a `.md` file is silently adopted on the next index write — gradatum
-provides no tamper detection at rest in `1.0.0`.** Wiring the checksum upsert is planned for a `1.x`
-release.
+**Drift detection was inert from `1.0.0` to `2.0.0`; the write path was wired in `2.0.1`.** The
+helper had always existed (`gradatum-index::drift::scan_phase_a`, three-level size → prefix-4 KiB →
+full SHA-256 against the `file_checksums` table), but **`file_checksums` was never populated on the
+write path** — so every scan iterated an empty table and returned all zeros *while exposing its
+metrics*. That is the costly shape of a false green: it does not stay silent, it reassures. The
+condition was documented in the code itself and survived 99 days.
+
+`2.0.1` adds the `upsert_file_checksum` call in `write_note_inner`, **fail-open** (a checksum
+failure logs a warning and preserves the note write). Measured after the first real write:
+`file_checksums` 0 → 1.
+
+**Still missing, tracked as follow-up work** — the scan remains partial and must not be read as
+full coverage:
+1. the 3206 pre-existing files are **not** back-filled, so the scan only sees what was written
+   after the wiring;
+2. `scan_phase_a` enumerates `list_file_checksums()`, i.e. **the index** — it is structurally
+   blind to a file the index ignores, whatever the back-fill does;
+3. a live note with no embedding is drift of the same nature as a diverging hash, and is currently
+   detected by no one.
+
+**Index rebuild remains unavailable**: detection signals, it does not repair — the repair entry
+point stays gated by design.
 
 **Index rebuild is likewise not available in `1.0.0`.** There is no `gradatum-admin reindex`
 subcommand, and the `ReIndex` job kind is a stub: every mode (`FtsOnly`, `MissingOnly`,
@@ -656,7 +675,9 @@ state to back up, not as a derived artefact you can regenerate on demand.
 │   └── jwt-signing-key.secret         (Ed25519 signing seed, chmod 600 — BACK THIS UP)
 │
 ├── db/                                (three distinct databases — not one)
-│   ├── queue.sqlite                   ← queue_db_path(root) — worker job queue
+│   ├── queue.sqlite                   ← queue_db_path(root) — worker job queue;
+│   │                                   holds note bodies (gradatum_jobs.payload,
+│   │                                   jobs.payload_json) — see SECURITY.md
 │   ├── revocation.sqlite              (auth path 2 revocation store)
 │   └── api_keys.sqlite                (ApiKeyStore, argon2id hashes)
 │
@@ -673,7 +694,8 @@ state to back up, not as a derived artefact you can regenerate on demand.
 │
 └── vault/                             ← <vault_root>, singular
     ├── .gradatum/
-    │   ├── index.db                   ← vault_index_path(root) — WAL: notes, embeddings, audit
+    │   ├── index.db                   ← vault_index_path(root) — WAL: notes, embeddings, audit;
+    │   │                               holds note bodies (body_text column) — see SECURITY.md
     │   ├── config.toml                (optional; [history] and [audit] blocks — see SECURITY.md.
     │   │                               Absent by default, in which case defaults apply)
     │   └── overrides/<tenant>/
@@ -688,10 +710,13 @@ state to back up, not as a derived artefact you can regenerate on demand.
     └── <other-tenant>/                (e.g. default, test, code-<project>)
 ```
 
-Three directories hold note bodies in plaintext and are the ones an operator must locate
-before reasoning about data at rest: `vault/<tenant>/` (and its `.history/`),
-`vault/.archive/`, and `<storage.root>/audit/`. See SECURITY.md for the retention and
-erasure semantics of each — in particular, `forget` removes none of them.
+Five locations hold note bodies in plaintext and are the ones an operator must locate
+before reasoning about data at rest: three directories — `vault/<tenant>/` (and its
+`.history/`), `vault/.archive/`, and `<storage.root>/audit/` (delete tombstones only) —
+plus two SQLite files outside this tree, `vault/.gradatum/index.db` (`body_text` column)
+and `<storage.root>/db/queue.sqlite` (`gradatum_jobs.payload` / `jobs.payload_json`
+columns). See SECURITY.md for the complete inventory and the retention and erasure
+semantics of each — in particular, `forget` removes none of them.
 
 ---
 
@@ -848,7 +873,7 @@ CREATE INDEX IF NOT EXISTS idx_notes_c_kind   ON notes(c_kind);
 CREATE INDEX IF NOT EXISTS idx_notes_doc_kind ON notes(doc_kind);
 ```
 
-**Note on section mapping** : the `Section` enum has 13 variants (was 11 before the identity/project-map sections were added). Notes with `section_hint="council"` map to `Section::Council` → stored as `section="council"` → `c_kind="episodic"` (decision-based). Prior versions (v0.3.x) lacked this variant; notes fell back to `Section::Reference` in those older versions.
+**Note on section mapping** : the `Section` enum has 14 variants (was 11 before the identity/project-map and snapshot sections were added). Notes with `section_hint="council"` map to `Section::Council` → stored as `section="council"` → `c_kind="episodic"` (decision-based). Prior versions (v0.3.x) lacked this variant; notes fell back to `Section::Reference` in those older versions.
 
 ### Migration 0004 (`vault_downgrade`)
 
@@ -886,7 +911,7 @@ New `SqliteIndex` methods:
 - `get_note_lineage(vault_id, note_id)` — parents (`note_links` outgoing) + children (incoming).
 - `context_top_notes(vault_id, query, limit)` — top-10 note aggregation for token budget.
 
-### Multi-vault schema migrations (0030 → 0042)
+### Multi-vault schema migrations (0030 → 0043)
 
 The 1.0.0 line makes `vault_id` a **first-class key dimension** rather than a filter column.
 Before this work a single ULID identified at most one row globally; two vaults holding the
@@ -912,6 +937,7 @@ matching `*.down.sql` (the runner itself is forward-only; rollback is manual).
 | 0040 `grants_section_scope` | `tenant_vault_grants` | L3 (F-121, ledger pré-flip) : grant **SECTION-scopé**. `ALTER TABLE ... ADD COLUMN section` nullable — `NULL` = grant vault-entier = sémantique C1 stricte. Rows existing (seed `main↔main`, self-grants `provision_vault`) stay `NULL` → zero data migration. Serveur `tenant_guard` exige que le grant COUVRE la section demandée. PK reste `(tenant_id, vault_id)` — au plus une ligne par (tenant, vault). Inerte à OFF (byte-identical v1.0.0). |
 | 0041 `feature_counter` | `feature_counter` | F-41-adjacent : compteur persistant **per-vault** (`vault_id` PK) pour l'allocation ATOMIQUE des numéros de carte project-map (`[[feature:F-XX]]`). `value` = dernier numéro alloué ; l'allocation rend `max(value, max dérivé des cartes) + 1` (le dérivé recalculé à chaque appel corrige le plancher). Pas de seed en dur. Inerte tant qu'aucune allocation (`allocate_feature_number`). |
 | 0042 `agent_vault_grants` | `agent_vault_grants` | Substrat **agent↔vault** (lot B6, plan v1.0.0) : duplique `tenant_vault_grants` (0030) un cran plus bas — l'agent, pas le tenant. `access ∈ {read, write}` ('write' couvre la lecture), colonne `section` nullable, PK `(agent_id, vault_id)`. Absence de ligne = **REFUS** (fail-closed, invariant 5). Seed idempotent `INSERT OR IGNORE ('main-agent', 'main', 'write')`. Inerte tant qu'aucune consultation — câblée en B7 (identité) + B8 (portée section). |
+| 0043 `project_map_roles` | `notes` (2 colonnes) | F-171, `2.0.2` : `role_kind` / `role_status` **dérivées à l'écriture** du bloc de rôles d'une carte project-map, via l'analyseur `parse_link` de `gradatum-core` — **le même** que le validateur de schéma, source unique du format. Rendues interrogeables par `list_notes_filtered` (index) puis au contrat MCP (`vault_list` accepte les deux filtres). Rétro-remplissage par sous-commande d'administration **idempotente**, en **une seule transaction fail-closed** — un partiel rapporté comme succès y est structurellement impossible ; marche à blanc par transaction annulée. Déployé sur l'index de production le 2026-08-15 : 329 cartes typées, 0 non typable. ⚠️ **Pas de filtre sur la version** : « quelles cartes pour telle version ? » reste sans chemin propre. |
 
 `ON DELETE CASCADE` on 0039 is deliberate: three code paths delete `notes` rows, and only
 `delete_note_from_index` cascades manually. A RESTRICT FK would have broken
@@ -1232,7 +1258,6 @@ version column means the introduction version was not established by this pass �
 | `/api/v1/dashboard` | GET | Aggregated dashboard counters | v0.4.6 |
 | `/api/v1/project-map/export-features` | GET | JSON export of project-map feature cards | v0.6.4 |
 | `/api/v1/jobs` | GET / POST | List jobs / create a job | v0.2.0 |
-| `/api/v1/jobs/{id}` | GET | Legacy job poll (i64 ID) | 0.1.0-alpha |
 | `/api/v1/jobs/{id}/v2` | GET | Job status (ULID) | v0.2.0 |
 | `/api/v1/jobs/{id}/cancel` | POST | Cancel a job | v0.2.0 |
 | `/api/v1/jobs/{id}/events` | GET | Job event stream | v0.2.0 |
@@ -1284,8 +1309,9 @@ for the full graph.
 - **Serde** : `serde 1.0.228` + `serde_json 1.0.149` + `serde_jcs 0.1.0`
   + `serde_norway 0.9.42` (YAML frontmatter; replaced `serde_yml`, itself archived and
   unsound — RUSTSEC-2025-0068/-0067) + `bincode 2.0.1`.
-- **DB** : `rusqlite 0.32.1` (bundled, FTS5) + `sqlx 0.8.6` (pinned to resolve linking
-  conflict) + `sqlite-vec 0.1.9` (ANN, opt-in feature `sqlite-vec-ann`).
+- **DB** : `rusqlite 0.40.2` (bundled, FTS5) + `sqlite-vec 0.1.9` (ANN, opt-in feature
+  `sqlite-vec-ann`). `sqlx` is out of the resolved dependency graph entirely (removed
+  2026-08-25) — `rusqlite` now backs the vault index, the job queue and sessions alike.
 - **Job queue** : `apalis 1.0.0-rc.9` + `apalis-sql 1.0.0-rc.9` + `apalis-sqlite 1.0.0-rc.8`
   + `apalis-cron 1.0.0-rc.8` (rc.9 not published for the latter two).
 - **Observability** : `prometheus 0.13.4` (worker) + `prometheus-client 0.22.3`
@@ -1316,20 +1342,20 @@ vault_write → curate_note → [B5 wikilinks] + [embed_note chained]
 
 ## Published scripts
 
-`scripts/` is **not** shipped as a whole: the public tree carries an explicit allow-list, and
-the table below is that allow-list. It is exhaustive — a script absent from this table is not
-in the published tree, and no wildcard is promised. Any other path under `scripts/` referenced
-elsewhere in this repository is internal tooling that does not ship.
+`scripts/` ships with the product; `scripts/internal/` does not. Membership is decided by
+location, not by a hand-kept list: every file directly under `scripts/` is in the published
+tree, and everything under `scripts/internal/` is operator tooling that stays in the internal
+repository. There is no allow-list to keep in sync, and no wildcard promises a path that does
+not exist yet.
 
-| Script | Role |
-|---|---|
-| `scripts/install-gradatum-services.sh` | Install systemd `gradatum-server` + `gradatum-worker` (Linux x86_64). |
-| `scripts/install-gradatum-stub-mcp.sh` | Install MCP stub binary + API key + sample config. |
-| `scripts/deploy-gradatum-local.sh` | Local deploy: backup, binary swap, restart, health check, rollback on timeout. |
-| `scripts/smoke-alpha-4.sh` | Acceptance test: api-key → JWT exchange, write, curate, RAM ceiling. |
-| `scripts/smoke-alpha-5.sh` | Acceptance test: auth path 2, write → curator → read, audit JSONL. |
-| `scripts/ci-lint-toolchain-pin.sh` | CI gate: single Rust toolchain version across the workspace. |
-| `scripts/scan-fr-strings.sh` | CI gate: no residual French in distributed string literals. |
+The gate `scripts/ci-public-scripts-location.sh` enforces the rule in both directions: a
+script invoked by a published surface must live directly under `scripts/`, and a script that
+only ever runs from internal surfaces must live under `scripts/internal/`.
+
+| Location | Contents | Published |
+|---|---|---|
+| `scripts/` | Install, start, fetch, published acceptance smokes, public CI gates. | yes |
+| `scripts/internal/` | Internal registry publishing, historical data import, leak remediation, name reservation, unpublished smokes, internal CI gates. | no |
 
 **Auth deployment** : API key stored at `/etc/gradatum/gradatum-mcp.api-key` (mode 600) → `POST /auth/exchange` → JWT (24h TTL). MCP stub auto-refreshes when TTL < 30%.
 

@@ -8,7 +8,7 @@
 
 **Do not open a public issue for security vulnerabilities.**
 
-Send a report to `security@gradatum.org` (PGP key fingerprint published on `gradatum.org/security` once the public release ships; until then, reports may be sent in plain text and will be triaged with the same urgency).
+Send a report to `security@gradatum.org`. No PGP key is published; reports may be sent in plain text and are triaged with the same urgency.
 
 Include:
 
@@ -45,22 +45,29 @@ We use [CVSS 3.1](https://www.first.org/cvss/v3.1/specification-document) scorin
 
 ## Supported versions
 
-**Current supported version**: `2.x` (from `2.0.0`). The `1.x` line receives one final
-security fix, `1.0.3`, and is closed after it — no further `1.x` releases follow. All `0.x`
-tags are end-of-life and receive no backports. `1.0.1` and `1.0.2` were never published;
-those numbers are skipped rather than reused.
+**Current supported version**: `2.x` (from `2.0.0`). The `1.x` line is closed and receives no
+final security fix — no `1.x` release follows `1.0.0`. All `0.x` tags are end-of-life and
+receive no backports. `1.0.1` and `1.0.2` were never published; those numbers are skipped
+rather than reused.
 
 | Version | Status | Security fixes |
 |---|---|---|
 | `2.x` | Supported | Yes — ongoing. |
-| `1.x` | Closed after `1.0.3` | `1.0.3` is the last security fix issued for this line. |
+| `1.x` | Closed | None issued for this line. The fix below is reachable only by migrating to `2.x`. |
 | `0.x` | End-of-life at `1.0` | No backports. |
 
 **`1.0.0` is affected by a boot-log secret disclosure.** A secret misplaced in the
 configuration file — an incorrect type, invalid syntax, or an unknown variant — was echoed
-verbatim into the boot log by the configuration error path. The fix is carried by both
-`1.0.3` and `2.0.0`. Operators running `1.0.0` should apply `1.0.3` or migrate directly to
-`2.x`; new deployments should start on `2.x`.
+verbatim into the boot log by the configuration error path. The fix has been present since
+`2.0.0` (published 2026-08-13); no `1.x` release carries it, and none will. Operators running
+`1.0.0` must migrate to `2.x` to receive it — there is no in-place `1.x` patch to apply.
+
+Migrating is not automatic: a dependent pinned to the `1` major (for example `gradatum =
+"1.0"`) keeps resolving within `1.x` and will not pick up this fix on its own — raising the
+pin to `2.x` is a deliberate action the dependent has to take. `1.0.0` itself is not pulled
+from the registry, and will not be: yanking it would not remove the exposure for anyone still
+resolving to it, would break existing lockfiles that reference it, and would not deliver the
+fix. Migrating forward is the only route that does.
 
 ---
 
@@ -95,14 +102,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full security design and caveats.
 
 ## Privacy posture
 
-_As of v2.0.0. Review this section on each minor release._
+_As of v2.1.0. Review this section on each minor release._
 
-Gradatum is designed for local-first, self-hosted deployments. The following data handling properties hold in v2.0.0:
+Gradatum is designed for local-first, self-hosted deployments. The following data handling properties hold in v2.1.0:
 
 - **Data at rest is not encrypted.** The SQLite index (`index.db`), note frontmatter, note body text, and version history snapshots (`.history/`) are stored in plaintext on the configured storage backend. Encryption at rest (e.g. LUKS locally, or server-side encryption on an object store) is the operator's responsibility.
 - **The vault may now leave the local machine entirely.** Since v2.0.0, setting `[storage] service = "s3"` stores the vault — the notes themselves, the primary data — on an object storage provider rather than on local disk. The Markdown bodies are written there **in plaintext**; Gradatum applies no encryption of its own before writing. This is a fourth egress path, and the broadest of them: the LLM, curator and embedding paths send note content for processing, whereas this one *hosts* it. It is opt-in and off by default — the default backend is the local filesystem, and no note leaves the machine unless the operator configures it to. Operators enabling it are responsible for the provider's jurisdiction, access policy, and encryption settings. Note that the SQLite index, the job queue and the **HTTP audit log** remain local regardless of this setting. A separate mechanism also carries the name "audit": the opt-in audit/dedup pass (`[audit] enabled`, off by default) writes its reports through the same `[storage]` backend as the vault, so when both `service = "s3"` and `[audit] enabled = true` are set, those reports follow the vault to the object store instead of staying local. They contain note titles, identifiers, categories and sections — not note bodies.
 - **`body_text` is indexed in `index.db`** (note content indexed for full-text search). This is in addition to the on-disk `.md` files.
-- **`author` is a free-form string field** persisted in `index.db` and in note frontmatter. No identity verification is performed; operators should document their author identifier convention.
+- **`author` is derived from the authenticated credential, not client-supplied.** Since v2.0.0, a write sets `author` to the resolved agent identity (the credential's `sub`) at write time; a request that supplies its own `author` is rejected (`400`, identity is not self-declared), and a request with no identity resolved at all is rejected too (`401`) — a note can never end up attributed to nobody. Persisted in `index.db` and in note frontmatter.
 - **`forgotten_by` is a free-form string field** persisted in `index.db` (column `forgotten_by`), in note frontmatter, and returned verbatim in `GET /api/v1/vault/forgotten` responses. It records the actor identifier that triggered a forget operation. No identity verification is performed; operators should treat this field as potentially containing PII (e.g. usernames, email addresses) and apply the same data-handling policy as for the `author` field.
 - **Note history retention is configurable.** The Copy-on-Write history store (`.history/<note-id>/`) applies a count cap (`[history] max_versions`, default 50) and an optional TTL (`[history] ttl_days`, default: no expiry). Both are read from `<vault_root>/.gradatum/config.toml` (with the default `storage.root`: `/var/lib/gradatum/vault/.gradatum/config.toml`). There is no `gradatum.toml` — setting these keys in any other file has no effect and silently leaves the defaults in place. A note's history is removed when the note is deleted.
 - **LLM backend locality is not enforced.** The gateway does not enforce data locality. Routing to remote endpoints is possible depending on configuration. Configuring a cloud-hosted LLM backend (e.g. Anthropic, OpenAI) will cause note content to be sent to that provider. Operators are responsible for ensuring their backend configuration matches their data residency requirements. Setting `vision_capable = true` on a gateway alias additionally routes image content (base64-encoded) to that backend. **The curator pipeline is an additional egress path:** when `[curator.llm]` is configured with a non-heuristic backend, note body content is sent to that LLM endpoint (local or cloud, depending on the `backend` field) during classification. The *compiled fallback* is heuristic (offline; no network egress) — but that is not what a fresh install runs. `gradatum-admin init` (`crates/gradatum-admin/src/init.rs`, `generate_server_toml_template`) emits a `[curator]` section with `backend = "openai_compat"` and a `[curator.llm]` block with `base_url = "http://localhost:8000"`. Every install created through `init` — which includes the Docker path — therefore curates through that endpoint by default, sending note body content to it. Out of the box that endpoint is a loopback chat server (`llama-chat`, no internet egress), but it is an LLM egress path, not the offline heuristic mode. To keep classification offline, set `[curator] backend = "heuristic"` (or omit the `[curator.llm]` section) so the worker curates in pure heuristic mode and never calls the model.
@@ -116,7 +123,7 @@ Gradatum is designed for local-first, self-hosted deployments. The following dat
 - **`forget` is a relevance signal, not an erasure.** `vault_forget` sets `forgotten = true` (plus `forgotten_at` / `forgotten_by`) in the note frontmatter and index. It performs no physical deletion: the note body remains in plaintext in the `.md` file, in `index.db` (`body_text`), in `.history/`, in the embedding index, and in the job queue (`db/queue.sqlite`, `gradatum_jobs.payload`). No background job removes forgotten notes — the purge job only targets notes in `Garbage` status. For actual removal, use the operator delete path (`gradatum-admin delete`), which archives the note and destroys it after the archive retention window — while leaving the audit tombstone described above.
 - **Delete is archival, not destruction.** An on-demand delete moves the note's `.md` and `.history/` under `<vault_root>/.archive/` — that is `<storage.root>/vault/.archive/`, not `<storage.root>/.archive/` — in a mirror layout, and records a row in `archive_index`. Archived content stays in plaintext on the local filesystem until the retention deadline (`60` days by default, configurable) is reached and the retention GC physically destroys it.
 - **The embedding pipeline is a third egress path.** When `[embed] enabled = true` (the default), note text is POSTed to `[embed] endpoint` — `http://localhost:8436/v1/embeddings` by default, i.e. loopback, no internet egress out of the box. The endpoint accepts any OpenAI-compatible URL: pointing it at a hosted embedding API sends note content to that provider.
-- **Note bodies are also persisted in the job queue.** `vault_write` and `validate` job specs carry the full Markdown body (`JobSpec.body`, `ValidateSpec.body`), serialised into `<storage.root>/db/queue.sqlite` — in the live `gradatum_jobs.payload` column, which is **JSON text, not an opaque blob** (the legacy `jobs_v2.payload` / `jobs.payload_json` columns carry the same field). This copy is a second plaintext location for note content, on a file distinct from `index.db` and from the `.md` files. It is reached by neither `forget`, nor `delete`, nor the archive retention GC. **Completed jobs are never purged**: the only queue GC deletes rows with `status = 'DLQ'` older than 30 days, so the bodies of every successfully processed write remain in `queue.sqlite` indefinitely. Operators must include this file in the same data-handling policy as the vault itself.
+- **Note bodies are also persisted in the job queue.** `vault_write` and `validate` job specs carry the full Markdown body (`JobSpec.body`, `ValidateSpec.body`), serialised into `<storage.root>/db/queue.sqlite` — in the live `gradatum_jobs.payload` column, which is **JSON text, not an opaque blob** (the legacy `jobs.payload_json` column — `LegacyQueue`'s rusqlite-backed table, kept for backward compatibility — carries the same field; the older `jobs_v2` table that once duplicated it was dropped, `DROP TABLE IF EXISTS jobs_v2`, since nothing regenerates it and its payloads outlived every vault-side deletion). This copy is a second plaintext location for note content, on a file distinct from `index.db` and from the `.md` files. It is reached by neither `forget`, nor `delete`, nor the archive retention GC. **Completed jobs are never purged**: the only queue GC deletes rows with `status = 'DLQ'` older than 30 days, so the bodies of every successfully processed write remain in `queue.sqlite` indefinitely. Operators must include this file in the same data-handling policy as the vault itself.
 - **Embeddings derive from note content.** Vectors computed from note bodies are persisted in `index.db` (`note_embeddings`) and in the ANN index. They are not directly readable, but embedding inversion is a published attack class and irreversibility is not a property to rely on: treat them as content-derived data, under the same policy as the note bodies. They outlive a `forget`.
 
 ---

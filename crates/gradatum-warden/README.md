@@ -2,7 +2,7 @@
 
 > L0 network guard for gradatum: IP CIDR filter, per-IP rate limiting, and loopback bypass.
 
-**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -26,7 +26,7 @@ handler receives the real request body — not a synthetic empty response.
 
 ```toml
 [dependencies]
-gradatum-warden = "2.0.0"
+gradatum-warden = "2.1.0"
 ```
 
 ```rust

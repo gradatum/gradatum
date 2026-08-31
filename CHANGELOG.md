@@ -5,7 +5,828 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+> **A note on internal milestones.** Several entries below document internal milestones that
+> were never independently published — no crates.io release, no GitHub release, no public tag.
+> Public releases are the ones that carry a tag; an internal milestone's title line is marked
+> `internal milestone, published in X.Y.Z`, naming the first tagged version above it in this
+> file, the public release that carried its changes forward. That mapping follows the document's
+> order, not a change-by-change diff — see the `[2.0.0]` note below for a case worked out in full.
+
+## [2.1.0] — 2026-08-29
+
+> Cette section liste les changements de comportement mesurés sur ce jalon. À l'exception des cartes
+> F-248 et F-177 (ruptures de surface publique assumées, voir `### Removed` ci-dessous) et de
+> F-145 (sous-lots 1 et 2 : champs de variantes `#[non_exhaustive]` qui changent de type ;
+> sous-lot 3 : la signature des constructeurs et helpers de `gradatum-db-sqlite` change de type
+> de connexion ; lot final : montée de rusqlite `0.32.1` → `0.40.2` — les sous-lots 1 à 3 visibles
+> à `cargo public-api`, invisibles à `cargo-semver-checks`, le lot final ne modifiant AUCUNE
+> signature mais changeant le moteur SQLite embarqué, voir `### Changed` ci-dessous), aucun ne
+> **modifie** une signature d'API Rust publique — le critère
+> 10 **ajoute** deux symboles `gradatum-search`, tous deux additifs, visibles à
+> `cargo public-api` ; les changements de comportement du classement restent, eux, invisibles à
+> `cargo-semver-checks`. Ils sont déclarés ici pour cette raison précise.
+>
+> Suivi : cartes F-162, F-248, F-177, F-145.
+
+### Guide de migration public — 2.0 → 2.1 (F-249)
+
+Une **mineure est adoptée sans aucune action du consommateur** : si votre build casse après
+l'adoption de 2.1.0, lisez d'abord le guide de migration — il inventorie chaque rupture, son
+message d'erreur probable, ce qu'il faut écrire à la place, et un script de migration pour les
+substitutions mécaniques : [`docs/UPGRADING-2.0.0-to-2.1.0.md`](docs/UPGRADING-2.0.0-to-2.1.0.md)
+(script : `scripts/migrate-2.0-to-2.1.sh`).
+
+### Changed — la base de révocation abandonne sqlx pour rusqlite (F-145, sous-lot 1 sur 3)
+
+- **`gradatum-auth` ne dépend plus de sqlx** : `SqliteRevocationStore` passe de
+  `sqlx::SqlitePool` à une connexion `rusqlite::Connection` unique sous verrou
+  `tokio::sync::Mutex`, exécutée sur fil bloquant (`spawn_blocking`) — le même motif de pont
+  synchrone/asynchrone que les magasins du serveur (`proactive_recall_store`,
+  `note_usage_store`, `read_usage_store`). La dépendance `sqlx` est retirée du `Cargo.toml`
+  de `gradatum-auth` ; elle reste dans le graphe pour les bases qui l'utilisent encore (file,
+  clés d'API, index).
+- **Voie de remplacement** : `RevocationError::Sqlite` porte désormais une `rusqlite::Error`
+  au lieu d'une `sqlx_core::error::Error`, et une variante `RevocationError::Blocking` couvre
+  la panne du fil bloquant. L'énumération étant `#[non_exhaustive]`, le changement de type du
+  champ est invisible à `cargo-semver-checks` (mesure F-145 : aucune rupture rendue) mais
+  apparaît dans la baseline `public-api` de `gradatum-auth`.
+- Le schéma reste créé idempotemment (`CREATE TABLE IF NOT EXISTS`), WAL conservé,
+  `busy_timeout` 5 s, `synchronous` au défaut SQLite (FULL) — cette base ne porte aucune
+  table de suivi de migration sqlx, rien à honorer côté rejeu.
+
+### Changed — la base des clés d'API abandonne sqlx pour rusqlite (F-145, sous-lot 2 sur 3)
+
+- **`gradatum-acl-auth` ne dépend plus de sqlx** : `SqliteApiKeyStore` passe de
+  `sqlx::SqlitePool` à une connexion `rusqlite::Connection` unique sous verrou
+  `tokio::sync::Mutex`, exécutée sur fil bloquant (`spawn_blocking`) — le même motif de pont
+  synchrone/asynchrone que le sous-lot 1 et les magasins du serveur (`proactive_recall_store`,
+  `note_usage_store`, `read_usage_store`). La dépendance `sqlx` est retirée du `Cargo.toml`
+  de `gradatum-acl-auth` ; elle reste dans le graphe pour les bases qui l'utilisent encore
+  (file, index).
+- **Voie de remplacement** : `ApiKeyError::Sql` porte désormais une `rusqlite::Error` au lieu
+  d'une `sqlx_core::error::Error`, et deux variantes sont ajoutées — `ApiKeyError::Blocking`
+  (panne du fil bloquant) et `ApiKeyError::Migration` (base de migration sale ou checksum
+  modifié). L'énumération étant `#[non_exhaustive]`, le changement de type du champ est
+  invisible à `cargo-semver-checks` (même mesure qu'au sous-lot 1 : aucune rupture rendue)
+  mais apparaît dans la baseline `public-api` de `gradatum-acl-auth`.
+- **Migrations honorées (piège P0)** : cette base est la seule des trois bases sqlx à porter
+  une table de suivi (`_sqlx_migrations`, `sqlx::migrate!`). Le remplaçant la lit : une
+  migration déjà appliquée (colonne `version`) n'est JAMAIS rejouée, son checksum SHA-384 est
+  vérifié (une migration appliquée est immuable), et une base sale (`success = false`) refuse
+  le démarrage. Prouvé sur base jetable reproduisant l'état de production — tests
+  `init_does_not_replay_migrations_on_production_like_base` et `migration_runner_*`.
+- WAL conservé, `busy_timeout` 5 s, `synchronous` au défaut SQLite (FULL) — identiques aux
+  réglages sqlx d'origine.
+
+### Changed — la file abandonne sqlx pour rusqlite (F-145, sous-lot 3 sur 3)
+
+- **`gradatum-db-sqlite` et `gradatum-queue` ne dépendent plus de sqlx** : `SqliteQueueStore`
+  passe de `sqlx::SqlitePool` à un handle `QueueDb` (connexion `rusqlite::Connection` unique
+  sous `Arc<tokio::sync::Mutex>`, ouverte et opérée sur fil bloquant via `spawn_blocking`,
+  verrou `blocking_lock()` tenu au minimum — le même motif de pont que les sous-lots 1 et 2 et
+  les magasins du serveur). `sqlx` est retiré du **graphe de dépendances entier** : `cargo tree
+  -i sqlx` ne rend plus rien (27 crates, zéro occurrence).
+- **Voie de remplacement** : les signatures publiques de la file changent de type de connexion —
+  `SqliteQueueStore::new(db: QueueDb)`, `apply_sqlite_pragmas(&QueueDb)`,
+  `run_migrations(&QueueDb) -> Result<usize, QueueError>`, helpers `idempotency_*` sur
+  `&QueueDb`. Les constructeurs `open_queue_db` (crée si absente, WAL + `busy_timeout` 5 s),
+  `open_queue_db_existing` (fail-fast si absente, parité `create_if_missing(false)`) et
+  `open_queue_db_in_memory` (tests) remplacent l'ouverture sqlx. Ces changements de signature
+  sont **visibles à `cargo public-api`** (baseline `gradatum-db-sqlite` : 65 → 85 items) mais
+  **invisibles à `cargo-semver-checks`** (faux vert, même mesure qu'aux sous-lots 1 et 2 :
+  aucune rupture rendue) — **AUCUNE dérogation** n'est inscrite à `RELEASE-MANIFEST.yaml`, le
+  présent journal est le seul porteur.
+- **Migrations honorées (piège P0)** : la file porte 7 migrations (006 → 012), dont les
+  **non-idempotentes** 007 et 011 (`ALTER TABLE … ADD COLUMN`). Le remplaçant lit la table de
+  suivi `_sqlx_migrations` : une version présente n'est JAMAIS rejouée, le checksum SHA-384 de
+  chaque migration appliquée est vérifié (une migration appliquée est immuable), une base sale
+  (`success = false`) refuse le démarrage. Prouvé sur base jetable reproduisant l'état de
+  production (7 lignes de suivi, `gradatum_jobs` à l'état post-012) :
+  `init_does_not_replay_migrations_on_production_like_base` rend 0 application, table intacte.
+- **Format sérialisé des travaux intouché (propriété F-248)** : le payload stocké dans
+  `gradatum_jobs.payload` reste `serde_json::to_string(&JobRecord)`, écrit VERBATIM dans la
+  colonne par `enqueue`. Prouvé par
+  `serialized_job_payload_format_is_pinned_and_stored_verbatim` (JSON figé + lecture brute de
+  la colonne). La base de production n'est pas touchée.
+- Les consommateurs (`gradatum-worker`, `gradatum-server`, `gradatum-admin`, tests de parité
+  `v1-parity-tests`) sont portés sur `QueueDb` ; l'élection leader passe sur la même connexion
+  partagée. WAL conservé, `busy_timeout` 5 s, `synchronous` au défaut SQLite (FULL) —
+  identiques aux réglages sqlx d'origine. `rusqlite` restait épinglé à 0.32.1 à ce stade — la
+  montée (lot final, moteur SQLite 3.46.0 → 3.53.2) est documentée dans la section suivante.
+
+### Changed — montée de rusqlite `0.32.1` → `0.40.2` (F-145, lot final)
+
+- **`rusqlite` monte de `=0.32.1` à `=0.40.2`** (workspace `Cargo.toml`), dernier lot de la carte
+  F-145 — celui qui porte le bénéfice de la carte. Le blocage historique qui épinglait 0.32.1
+  (sqlx 0.8 exigeait `libsqlite3-sys ^0.30.1`, inconciliable avec rusqlite 0.33+) est levé depuis
+  que sqlx a été retiré du graphe entier (sous-lots 1-3). **Aucun appel n'a dû être adapté** :
+  `cargo check --workspace --all-targets` passe sur 0.40.2.
+- **Version du moteur SQLite embarqué : `3.46.0` → `3.53.2`** (`libsqlite3-sys` `0.30.1` →
+  `0.38.2`). Mesurée par `SELECT sqlite_version()` via le test `sqlite_engine_version` de
+  `gradatum-db-sqlite` — jamais déduite du numéro de crate. Le moteur **monte**, pas de recul ;
+  un plancher anti-recul `(3, 46, 0)` est désormais asserté dans ce test. ⚠️ Ce changement de
+  moteur touche le format des bases de production (montée de version, pas de régression) —
+  déclaré ici conformément à la vigilance F-145 : une substitution de moteur non déclarée est
+  exactement le défaut qui a fait écarter la tentative précédente.
+- **Mesure de performance AVANT/APRÈS sur la file de travaux** : banc `b11_queue_cycle`
+  (`gradatum-bench`), cycle `enqueue → dequeue → complete` ×500 sur base in-memory
+  (WAL + migrations 006→012), table vidée hors chronométrage. Verdict : **pas de différence
+  mesurable** — protocole entrelacé (4 paires AVANT/APRÈS, binaires exécutés directement, sans
+  rebuild), l'écart (~2–5 % poolé) est sous le bruit de mesure (charge externe load 3–7 ; une
+  même version oscille ±30 %). La montée **ne dégrade pas** la file → **maintien de la montée**
+  (branche « monté » de la carte). Aucune amélioration n'est revendiquée (un écart sous le bruit
+  est un « pas de différence », pas une amélioration). Chiffres et protocole dans le commit.
+- **Recherche vectorielle intacte** : `sqlite-vec 0.1.9` (static lib `sqlite_vec0`, headers
+  embarqués) compile et fonctionne sur le moteur 3.53.2. Validation : `ann_recall` (recall@10 =
+  1.000, seuil 0.90) + nouveau test CI `vec_search_returns_exact_match_with_real_sqlite_vec`
+  (`gradatum-bench`).
+- **Surface publique inchangée** : baseline `public-api` identique (27 crates / 5017 items) —
+  **aucune rupture rendue** ⇒ **aucune dérogation** à `RELEASE-MANIFEST.yaml`, le présent journal
+  porte seul l'avertissement de changement de moteur (règle des sous-lots précédents).
+- **Critère « rapport de rupture NON VIDE »** : honoré par `test-public-surface-break-report.sh`
+  (`tests/release-gate/`), écrit contre le dispositif qui voit réellement la rupture — le diff de
+  baseline de surface publique (`cargo public-api`). `cargo-semver-checks` rend « no semver update
+  required » sur les changements de type portés par une variante `#[non_exhaustive]` (mesure
+  établie 3× le 2026-08-25/26, reproduite sur fixture) — rapport VIDE là où la baseline est
+  NON VIDE. Le test reproduit la classe de rupture sur un fixture autonome et vérifie que le diff
+  de surface est NON VIDE.
+
+### Changed — `HealthSnapshot` et `DriftScanResult` deviennent `#[non_exhaustive]` (F-245)
+
+`gradatum_engine::health::HealthSnapshot` et `gradatum_index::drift::DriftScanResult` portent
+désormais l'attribut `#[non_exhaustive]`.
+
+**Ce que ça casse** : un littéral de construction chez un consommateur ne compile plus
+(`error[E0639]: cannot create non-exhaustive struct using struct expression`). Ces deux structures
+étaient constructibles depuis l'extérieur, et chaque champ ajouté entre `2.0.0` et `2.0.8` était donc
+une rupture majeure à déclarer — trois l'ont été. L'annotation les **absorbe toutes**, mesuré :
+`cargo-semver-checks` rend `struct_marked_non_exhaustive` et **aucun**
+`constructible_struct_adds_field`.
+
+**Ce qu'il faut faire** : passer par le constructeur ou l'API fournie
+(`HealthState::snapshot()`, `scan_phase_a()`, `DriftScanResult::default()` avec
+`..Default::default()`). Détail et cas non automatisables : `docs/UPGRADING-2.0.0-to-2.1.0.md` §7.
+
+**Pourquoi maintenant et pas plus tard** : ajouter `#[non_exhaustive]` *après* une publication est
+soi-même une rupture. La fenêtre se referme au tag de `2.1.0`, qui porte déjà des ruptures assumées
+— le coût marginal pour le consommateur est nul. À partir de cette version, toute addition de champ
+sur ces deux structures est **additive**.
+
+Arbitrage opérateur du 2026-08-26. Inscrit à `semver_deviations` (`RELEASE-MANIFEST.yaml`),
+appariement prouvé dans les deux sens. Inventaire des dérogations : 22 → 21.
+
+Suivi : carte F-245.
+
+### Removed — `compute_distill_trust` retiré de `gradatum_core::provenance` (F-248)
+
+- **`gradatum_core::provenance::compute_distill_trust` est retiré** de la surface publique de
+  `gradatum-core`. La fonction est déplacée telle quelle dans la nouvelle crate
+  **`gradatum-distill`** (`gradatum_distill::compute_distill_trust`) — même signature, même
+  comportement (`mean(trust des sources) × confidence`, clamp `[0,1]`, neutre `0.5` si aucune
+  source connue). Rupture de surface publique assumée, déclarée à `RELEASE-MANIFEST.yaml`
+  (`semver_deviations`, carte F-248).
+- La même carte regroupe dans `gradatum-distill` l'ensemble de la logique de distillation
+  jusqu'alors dispersée : le clustering cosinus (`distill_cluster::cosine_similarity` /
+  `cluster_by_cosine`, ex-`gradatum-worker`) et l'abstraction de synthèse
+  (`DistillSynthesizer` / `TemplateSynthesizer` / `ClusterSynthesis` / `SynthesisError`,
+  ex-`gradatum-worker::apalis_handlers`). Ces derniers symboles étaient `#[doc(hidden)]` dans le
+  worker : leur retrait de là-bas n'est pas une rupture de surface publique supplémentaire.
+- **Migration** : remplacer l'import `gradatum_core::provenance::compute_distill_trust` par
+  `gradatum_distill::compute_distill_trust`. Le trait `TrustLookup` reste dans
+  `gradatum_core::provenance` ; le vocabulaire de job (`DistillMode`, `DistillSource`,
+  `Job::Distill`) reste inchangé dans `gradatum-core::job` (contrats de charge utile, pas de
+  traitement).
+
+### Removed — la file legacy `jobs_v2` et tout le chemin de queue sqlx associé (F-177)
+
+La table `jobs_v2` et le module `queue` de `gradatum-queue` qui la lisait sont
+**supprimés**. La table conservait le contenu complet de notes supprimées (payload
+BLOB) hors de tout cycle de vie du vault : aucune suppression ni purge ne
+l'atteignait — de la **rémanence**, pas de l'historique (2 804 lignes figées depuis
+le 2026-05-29). Retraits nominatifs :
+
+- **`GET /api/v1/jobs/:id`** (route de rétrocompat, handler `jobs::get_job`, lecture
+  de `jobs_v2`) — supprimée. **Voie de remplacement** : `GET /api/v1/jobs/{ulid}/v2`
+  (`jobs_v2::get_job_v2`), le `poll_url` retourné par `vault_write`/`vault_forget`
+  pointe déjà vers cette route depuis Phase 1.2.
+- **Module `gradatum_queue::queue`** (crate publiée) — supprimé : `SqliteQueue`,
+  trait `Queue` async, `NewJob`, `LeasedJob`, `JobInfo`, `JobId`, `QueueError`.
+  **Voie de remplacement** : `GradatumQueue` (implémentation de
+  `gradatum_core::QueueStore`) sur la file LIVE `gradatum_jobs`.
+- **Conversion de statut héritée** `gradatum_queue::JobStatus` (`as_str`/`from_str`,
+  états `Pending`/`Leased`/`Done`/`Dead`) — supprimée avec le module `queue`.
+  **Voie de remplacement** : `gradatum_core::job::JobStatus` (le statut des
+  `JobRecord` de `gradatum_jobs`) et le vocabulaire des handlers `jobs_v2`.
+- **Table `jobs_v2`** — supprimée par la **migration 012** (`DROP TABLE IF EXISTS
+  jobs_v2`, idempotente, sûre sur instance fraîche). La file rusqlite `jobs`
+  (`LegacyQueue`) et `worker_leadership` sont conservées.
+
+Déclarées à `RELEASE-MANIFEST.yaml` (`semver_deviations`, carte F-177) : les 15
+ruptures mesurées de surface publique `gradatum-queue` sous `cargo-semver-checks`
+0.50 en régime mineur vs `internal/2.0.9`.
+
+### Removed — `KindKind::Chore` et `KindKind::Spike` retirés pour de bon (F-220)
+
+Les deux variantes `gradatum_core::project_map::KindKind::Chore` et
+`KindKind::Spike` — retirées par le jalon interne `[2.0.6]`, puis **restaurées en
+dépréciation** au jalon `[2.0.8]` pour laisser aux consommateurs de la `2.0.0`
+publiée le temps de migrer — sont **supprimées pour de bon** en `2.1.0`. C'est la
+version effectivement publiée qui expose enfin la rupture annoncée : l'entrée
+`Removed` du jalon `[2.0.6]` prévoyait explicitement son report ici.
+
+- **Surface Rust** : les deux variantes disparaissent de l'énumération `KindKind`,
+  ainsi que le bras `as_wire` qui les sérialisait. Un consommateur qui nomme
+  `KindKind::Chore` ou `::Spike` ne compile plus — c'est l'échéance annoncée par le
+  `#[deprecated(since = "2.0.8")]` de la `2.0.8`.
+- **Vocabulaire réseau** : inchangé, à quatre valeurs (`FEATURE` / `ENHANCEMENT` /
+  `FIX` / `TASK`). `KindKind::from_wire` retourne `None` pour `"CHORE"` / `"SPIKE"`
+  depuis la `2.0.6`, comportement inchangé ; écrire `[[kind:CHORE]]` ou
+  `[[kind:SPIKE]]` reste **rejeté** par le registre (`SchemaError::InvalidKind`,
+  message de migration inchangé).
+- **Migration** : utiliser `KindKind::Task`, le fourre-tout délibéré qui absorbe la
+  maintenance, l'outillage, l'exploration bornée et le travail non catégorisé.
+- **Corollaire mesuré** : retirer les deux variantes **décale le discriminant
+  implicite** de `KindKind::Task` (mesure `cargo-semver-checks` 0.50 vs
+  `internal/2.0.9` : **5 → 3**). L'énumération n'a pas de `#[repr]` ; seul du code
+  aval castant la variante via `as isize` / `as u8` en serait affecté (aucun
+  consommateur connu).
+- Déclaré à `RELEASE-MANIFEST.yaml` (`semver_deviations`, carte F-220) : les deux
+  ruptures `enum_variant_missing` (`Chore`, `Spike`) **et** la rupture
+  `enum_no_repr_variant_discriminant_changed` (`KindKind::Task`), mesurées en régime
+  mineur vs `internal/2.0.9`.
+
+### Changed — la fusion hybride conserve la magnitude : pondération des scores normalisés, plus RRF pur (F-162, critère 10)
+
+- Quand les **deux bras** (lexical BM25 et sémantique) répondent à `vault_search`, la fusion par
+  **rang** (RRF, `1/(k+rank)`) est remplacée par une **fusion pondérée sur scores normalisés** :
+  `0.5 × normalize_bm25(bm25) + 0.5 × normalize_semantic(cosine)`. La magnitude des signaux
+  cesse d'être jetée dans le cas nominal — elle ne l'était déjà plus à bras unique (critère 6).
+- **Échelle des scores** : le composite plafonnait à ≈ 0.04 (RRF `2/(k+1)` × facteurs ≤ 1.32),
+  avec un écart 1ᵉʳ↔10ᵉ inexploitable de ≈ 8 % en moyenne (6 requêtes à deux bras du banc, mesuré
+  sur le binaire `13765377` pré-critère-10). Après pondération, la fusion ∈ `[0,1]` × composite ≤
+  1.32, et l'écart 1ᵉʳ↔10ᵉ mesuré au même banc passe à **45 %** en moyenne (les requêtes dont les
+  notes sont réellement ex-æquo — ex. `synthétique`, présent dans les 200 notes — descendent à 0 %
+  d'écart : le score dit honnêtement qu'elles sont indistinguables ; les requêtes à notes à zéro
+  (aucun bras) montent à 100 %).
+- **Classement déplacé** (voulu) : une note qui matche fortement les deux bras dépasse une note
+  qui n'en matche qu'un. Mesuré sur le banc : g01/g09 (4 notes remplacées par un meilleur cosine),
+  g03 (2 notes), g07 (ex-æquo massif → top-5 par ordre d'insertion BM25), g02/g08 (même ensemble,
+  ordre interne changé). `expected_corpus_match_count` est **inchangé** sur les 9 requêtes du
+  golden — la fusion ne touche pas au décompte lexical.
+- **Nouveaux symboles publics** (`gradatum-search`, additifs) : `rrf::hybrid_fuse_weighted` et
+  `scoring::weighted_fusion_score`. Le paramètre `k` de `rrf_fuse_short_circuit` est conservé pour
+  compatibilité de signature, **sans effet** dans le cas deux bras (plus de rang).
+- **Propagation au contexte** : le chemin d'assemblage de contexte LLM
+  (`context/retrieval.rs`) bascule de `rrf_fuse` (RRF pur) à `rrf_fuse_short_circuit` — le
+  reweighting s'applique aussi à l'injection de contexte, conformément à la décision opérateur
+  (le court-circuit était, lui, resté scopé à `vault_search`). Le chemin Noop (embedder éteint)
+  reste sur `rrf_fuse` pur, bit-à-bit inchangé.
+
+### Changed — les requêtes multi-mots gagnent en rappel, jamais en le perdant (F-162)
+
+- Une requête `vault_search` (endpoint HTTP `/api/v1/search` et outil MCP équivalent) composée
+  de plusieurs mots séparés par des espaces était auparavant enveloppée **dans son ensemble** en
+  une seule phrase FTS5 contiguë dès qu'un seul de ses caractères sortait de l'alphanumérique et
+  de l'espace (un tiret, un point, une apostrophe…). Un seul caractère de ce type dans toute la
+  requête suffisait à exiger que tous les mots apparaissent **collés, dans cet ordre exact** —
+  la requête `cargo-semver-checks baseline` ne matchait par exemple plus rien, alors que les deux
+  termes existaient séparément dans le corpus.
+- Chaque mot de la requête est désormais cité **indépendamment**, puis les mots sont combinés par
+  un ET implicite entre eux. L'ensemble de résultats obtenu est, pour toute requête donnée, un
+  **sur-ensemble** de l'ancien — il ne peut que s'élargir, jamais se réduire.
+- Ce chemin est partagé par la recherche directe et par l'assemblage automatique de contexte
+  (utilisé notamment pour l'injection de contexte fournie à un LLM) : les deux bénéficient du
+  même élargissement.
+- Rien à faire côté consommateur dans le cas général — c'est une augmentation stricte du rappel.
+  Seul un usage qui dépendait implicitement de l'ancien comportement pour forcer une **phrase
+  exacte contiguë** (mots strictement adjacents, dans cet ordre) doit désormais citer sa requête
+  explicitement entre guillemets pour obtenir ce résultat.
+
+### Changed — `OR`, `NOT`, `NEAR` (et `AND`) sont désormais cherchés comme des mots littéraux (F-162)
+
+- Toujours dans `vault_search`, les mots réservés `AND`, `OR`, `NOT` et `NEAR` — que le moteur de
+  recherche texte intégral interprète normalement comme des opérateurs de requête — sont
+  désormais systématiquement cités, donc **cherchés comme des mots ordinaires**, au même titre
+  que n'importe quel autre terme de la requête.
+- Une requête qui s'appuyait sur ces mots comme opérateurs (par exemple pour une union ou une
+  recherche de proximité) ne produit plus l'effet recherché : le mot-opérateur devient un terme
+  cherché au même titre que les autres, ce qui change les résultats renvoyés.
+- Ce choix est délibéré : gradatum n'a jamais documenté ni garanti de langage de requête à
+  opérateurs pour ses consommateurs. Si votre usage dépendait de ces mots comme opérateurs,
+  aucun substitut n'existe aujourd'hui côté API — pour une union, effectuez deux requêtes
+  séparées.
+
+### Changed — le message accompagnant `corpus_match_count=0` distingue désormais deux cas, plus un troisième (F-162)
+
+- L'indice textuel accolé à `corpus_match_count` en mode `compact: true` (sur `vault_search` et
+  les surfaces équivalentes) accompagnait tout compte `0` du même message, quelle que soit la
+  requête :
+  `(corpus_match_count=0 -> 0 lexical match: absence proven, semantic neighbours only)`.
+  Une requête ne comportant que de la ponctuation (dont aucun mot ne peut structurellement
+  matcher quoi que ce soit dans le corpus) recevait donc le même message qu'une requête d'un
+  vrai mot simplement absent du corpus.
+- Deux messages désormais, selon la forme de la requête, à la place de l'unique message
+  ci-dessus :
+  - Requête comportant au moins un caractère alphanumérique, zéro résultat lexical : l'absence
+    est prouvée, mais **seulement pour la voie lexicale** — le message ne dit plus « semantic
+    neighbours only » et n'invite plus à écarter les résultats sémantiques renvoyés à côté :
+    `(corpus_match_count=0 -> 0 lexical match: lexical absence of the term in the filtered
+    surface is proven; the semantic relevance of the returned results is NOT disproven)`.
+  - Requête faite uniquement de ponctuation ou de mots-opérateurs (aucun caractère
+    alphanumérique) : le message indique que le compte est **sans objet** pour cette forme de
+    requête, et ne prétend prouver aucune absence :
+    `(corpus_match_count=0 -> count not applicable to this query form: every token normalises
+    to empty (punctuation/operators only), so no document can match lexically whatever the
+    corpus; the returned results are semantic-only and this zero says nothing about them)`.
+- La clé JSON `corpus_match_count` (le nombre lui-même) est inchangée. Si votre code parse ce
+  texte d'accompagnement pour distinguer les états, adaptez-le aux deux formulations
+  ci-dessus — l'ancienne chaîne n'est plus émise.
+
+## [2.0.9] — 2026-08-23 — *internal milestone, published in 2.1.0*
+
+### Changed — le gate semver de release escalade par rang et baseline, au lieu d'un littéral (F-162 lot 0)
+
+- Le job `semver` de `release.yml` et le gate G8 ne comparent plus à une version écrite en dur :
+  un **résolveur de rang et de baseline** dérive la baseline du déclencheur (espace `v*` pour le
+  rang), et l'escalade est décidée à partir de ce rang. Le littéral est retiré et le code de
+  retour du gate est désormais **consommé** au lieu d'être traversé.
+- L'inventaire des dérogations passe d'un champ objet à une **liste** de tuples
+  `(crate, symbol, lint, rendered, …)`, et l'appariement entre une rupture rendue par
+  `cargo-semver-checks` et son entrée d'inventaire se fait par le **triplet**
+  `(crate, lint, rendered)` — plus par le seul nom de symbole.
+- Une **clause de dérogation datée** encadre la tolérance sur une mineure sous trois conditions.
+
+### Added — éprouvettes des deux régimes, déterminisme et bout-en-bout
+
+- Éprouvettes couvrant les **deux régimes** du résolveur (rang interne / rang publié) et le
+  **déterminisme** de la sortie.
+- Éprouvette **bout-en-bout** exerçant les vraies sorties de l'outil par le chemin d'extraction
+  (P0-1), plutôt que des fixtures recopiées.
+
+### Fixed — CI
+
+- Le job `semver` **désambiguïse la baseline git** : `rc=101` → 26/26.
+- Les fixtures du gate de release ne portent plus de nom d'utilisateur (**scrub**).
+
+### Measured — surface publique inchangée vs `internal/2.0.8`
+
+- `cargo public-api` sur les **26 crates** : **26/26 clean** face à `internal/2.0.8` — inventaire
+  confirmé, aucune rupture de surface introduite par ce jalon.
+
+## [2.0.8] — 2026-08-21 — *internal milestone, published in 2.1.0*
+
+### Changed — la parité « outil exposé ⇔ usage compté » devient un invariant testé (F-234)
+
+- Le serveur MCP expose une surface d'outils (`tool_catalog()`, ce que renvoie `list_tools`) et
+  compte l'usage d'un sous-ensemble (`MCP_TOOL_KEYS`). Rien ne garantissait que les deux
+  coïncident : un doc-comment le *disait* sans rien empêcher, et trois capacités exposées —
+  `job_status`, `vault_proactive_recall`, `vault_proactive_recall_feedback` — étaient servies
+  sans jamais être comptées. Leur usage était donc invisible à toute sonde d'exploitation.
+- Un garde de test (`every_declared_tool_is_instrumented`) compare désormais les **deux sources
+  de production en ensembles** — jamais un compte en dur. Toute capacité livrée hors compteur
+  fait échouer le test *avant* le merge, au lieu d'être découverte plus tard par une ligne
+  d'audit muette. Les trois capacités ci-dessus sont maintenant instrumentées et comptées.
+- Le cardinal gravé `assert_eq!(MCP_TOOL_KEYS.len(), 23)` est retiré : un compte en dur reste
+  vert sur un renommage à effectif constant et casse au premier ajout. Le garde de parité est
+  désormais seul propriétaire de l'invariant. Le bornage de cardinalité Prometheus (map
+  pré-peuplée, no-op sur nom inconnu) est inchangé.
+
+### Deprecated — `KindKind::Chore` et `KindKind::Spike` restaurées puis dépréciées (F-220, F-225)
+
+- Si votre code nomme `gradatum_core::project_map::KindKind::Chore` ou `::Spike`, il
+  **continue de compiler** en `2.0.8` : les deux variantes, retirées par le jalon interne
+  `[2.0.6]`, sont restaurées. Elles portent désormais `#[deprecated(since = "2.0.8")]` — votre
+  build émet un avertissement nommant `KindKind::Task` comme remplacement. Migrez vers
+  `KindKind::Task` : ces variantes seront **retirées en `2.1.0`**.
+- Pourquoi cette restauration : `2.0.0` est publiée sur crates.io, un consommateur a pu écrire
+  `KindKind::Chore`. Retirer la variante sous un simple incrément de correctif aurait cassé sa
+  compilation sans préavis. La dépréciation lui donne le message et l'échéance ; la rupture
+  définitive part en `2.1.0`.
+- **Le vocabulaire réseau reste à quatre valeurs.** Cette restauration ne touche que l'API de
+  type Rust. Écrire `[[kind:CHORE]]` ou `[[kind:SPIKE]]` reste **refusé** par le registre, avec
+  le message de migration inchangé. Si vous construisez `KindKind::Chore` et le sérialisez, sa
+  valeur wire historique `"CHORE"` **échoue visiblement** à la relecture — elle n'est jamais
+  réécrite silencieusement en `"TASK"`.
+
+### Fixed — les drapeaux « standard » du déploiement de release ne pouvaient jamais déployer un bump (F-239)
+
+- `deploy-gradatum-local.sh` est un **consommateur** de `target/release` (« ce script ne build
+  pas », hors `--build`). Or une release change toujours la version, et le contrôle de fraîcheur
+  (§0d) refuse d'installer un artefact périmé : les drapeaux « standard » ne pouvaient donc
+  jamais déployer un bump sans un build manuel préalable — une dépendance implicite, précisément
+  le cas d'usage du champ. Ils incluent désormais `--build` (`--build --gateway --engine`).
+- `--rebaseline-migrations` quitte les drapeaux standard pour un champ **conditionnel** : un
+  drapeau qui touche les migrations ne doit pas passer systématiquement parce qu'il logeait dans
+  la ligne « standard ». Sa règle d'emploi est conservée, pas perdue.
+
+## [2.0.7] — 2026-08-21 — *internal milestone, published in 2.1.0*
+
+### Fixed — le verdict du registre affichait une alarme sans jamais la faire échouer (F-207)
+
+- `project-map scope` imprimait « NON RÉCONCILIÉ » en cas d'écart entre le total annoncé et
+  la somme des statuts, puis rendait toujours un code de sortie 0 — une ligne d'alarme à
+  laquelle aucun contrôle automatisé ne pouvait s'accrocher.
+- La commande sort désormais en **code 2** sur un écart non réconcilié, dans les deux
+  sens : total supérieur à la somme des statuts (cartes disparues de la ventilation) et
+  somme supérieure au total (cartes comptées deux fois) déclenchent tous deux ce code — les
+  deux formes traduisent le même défaut de comptage.
+- Le code 2 reprend la convention déjà portée par `drift-scan` dans le même binaire pour
+  distinguer « travail fait, verdict négatif » (2) de « le binaire n'a pas pu travailler »
+  (1). La sortie complète, y compris la ligne d'écart, est écrite avant que le code de
+  sortie ne soit rendu.
+
+### Fixed — quatre outils MCP refusaient une forme de référence de note acceptée partout ailleurs (F-215)
+
+- `vault_history`, `vault_history_get`, `vault_restore` et `vault_diff` rejetaient la forme
+  préfixée `section/ULID` que `vault_read` et le reste de l'API acceptent, avec une erreur
+  interne opaque plutôt qu'un refus explicitement nommé.
+- Les quatre outils acceptent désormais exactement les mêmes formes de référence que
+  `vault_read`, avec un rejet nommé citant la valeur en cause pour toute forme non résolue.
+- `vault_classify`, `vault_downgrade` et `vault_write` restent volontairement sur un
+  comportement distinct — chacun pour une raison propre à son usage (cible de mutation
+  résolue par titre = ambiguë pour `vault_downgrade` ; identifiant pré-alloué honoré tel
+  quel pour `vault_write`) — avec un message d'erreur enrichi mais un comportement
+  inchangé. Trois routes REST paramétriques ne sont pas concernées : leur forme d'URL ne
+  peut structurellement pas porter la forme préfixée.
+
+## [2.0.6] — 2026-08-20 — *internal milestone, published in 2.1.0*
+
+### Removed — retrait des variantes `Chore` et `Spike` de `KindKind` (F-220)
+
+- **Deux symboles disparaissent de la surface publique de `gradatum-core`** :
+  `gradatum_core::project_map::KindKind::Chore` et
+  `gradatum_core::project_map::KindKind::Spike`.
+- ⚠️ **Rupture source d'API publique dans une version mineure, délibérée.**
+  `#[non_exhaustive]` protège l'**ajout** de variantes, jamais leur **retrait** : un
+  consommateur qui nomme `KindKind::Chore` ne compile plus. L'écart au SemVer est assumé et
+  a été **arbitré par l'opérateur** (2026-08-19, confirmé le 2026-08-20 avec la cible
+  ramenée de 2.1.0 à ce jalon). Il est consigné ici parce que le CHANGELOG est le registre
+  durable et publiquement lisible de ce qui a été livré — taire une rupture réelle
+  contredirait la gouvernance du projet.
+- ⏳ **Portée réelle à ce jour : nulle côté consommateur.** Les jalons `2.0.x` ne sont pas
+  publiés indépendamment — aucun crate n'en est issu, aucun tag ne les porte. Le retrait
+  n'atteindra un consommateur externe qu'à la **prochaine version effectivement publiée** :
+  cette entrée `Removed` devra alors être **reportée sous cette version-là**, sans quoi la
+  rupture sera livrée sans figurer au changelog de la release qui l'expose.
+- **Migration** : utiliser `KindKind::Task`, le fourre-tout délibéré qui couvre déjà la
+  maintenance, l'outillage, l'exploration bornée et le travail non catégorisé. Côté wire,
+  les valeurs `CHORE` et `SPIKE` sont désormais **rejetées à l'écriture**
+  (`SchemaError::InvalidKind`, dont le message nomme le retrait et la valeur de
+  remplacement).
+- **Registre migré avant le retrait** : les **27 cartes** portant `[[kind:CHORE]]` ou
+  `[[kind:SPIKE]]` ont été basculées vers `[[kind:TASK]]` — **0 carte restante** au moment
+  du retrait.
+
+## [2.0.5] — 2026-08-18 — *internal milestone, published in 2.1.0*
+
+Douze cartes. Le fil commun de 2.0.4 tenait en une phrase : **un dispositif qui rend un
+verdict sur une mesure qu'il n'a pas faite est pire que son absence, parce qu'il supprime la
+question.** 2.0.5 en est la suite directe, et elle est plus dure : les sept cartes d'origine
+venaient d'un audit d'exploitation, et **trois de leurs quatre prémisses se sont révélées
+fausses à la mesure**. Le lot a été construit en corrigeant d'abord les cartes qui le
+décrivaient elles-mêmes. Cinq cartes supplémentaires sont nées de l'instruction des sept
+premières — aucune par revue de code, toutes par usage réel.
+
+### Instruction du lot — prémisses falsifiées
+
+- **F-204 — deux travaux de curation morts en file sur un refus d'écriture disque.** ⚠️
+  **Aucune perte de donnée** : les notes visées existent, dans une version plus avancée que
+  celle que le travail transportait. Le travail a vécu 21 secondes, pas les 9 jours annoncés
+  par la prémisse initiale — falsifiée à la mesure. La cause historique du refus d'écriture
+  reste hors d'atteinte : journaux effacés. Le défaut réel, corrigé ici, est le silence :
+  livré via `/health`.
+- **F-205 — le journal d'événements n'a jamais été drainé, 1637 lignes.** Deux causes,
+  aucune n'était celle annoncée : le consommateur n'a jamais été câblé (`fetch_pending` sans
+  appelant), et les moteurs distants basculent en silence sur un puits inerte après un refus
+  d'identité depuis le 2026-08-08. Livré : `/health` du moteur expose l'état de télémétrie en
+  cinq états, orthogonal au statut de service — un moteur replié sert correctement son trafic
+  et ne doit pas être marqué malade. Le repli au démarrage reste une **bifurcation à sens
+  unique**, établie par le code.
+- **F-206 — moteur d'embedding réputé injoignable 57 jours.** Prémisse falsifiée : les deux
+  points d'accès répondent, vérifié par requête réelle. Le lien présumé avec les unités sans
+  vecteur est infirmé.
+
+### Registre
+
+- **F-207 — le registre ne comptait que quatre statuts sur six ; 123 cartes n'apparaissaient
+  dans aucun.** Livré : tous les statuts comptés, un panier « non classé », et une **ligne de
+  réconciliation nommée** — plus jamais deux nombres non comparables sans le dire.
+- **F-208 — cinq notes annoncées « absentes de l'index, invisibles à toute recherche ».**
+  Prémisse falsifiée : elles sont indexées et cherchables ; il leur manque une empreinte de
+  détection de dérive. Le libellé mesurait une chose et se lisait comme une autre. Livré : le
+  libellé dit ce qu'il mesure. Réparation des cinq empreintes délibérément non exécutée dans
+  ce lot — la cause d'abord.
+- **F-214 — la vue des cartes ouvertes en listait 179 quand il y en avait 96.** Cause : une
+  note downgradée **conserve ses arêtes** dans le graphe de liens ; 84 cartes mortes se
+  faisaient compter comme du travail en attente. Livré : population source restreinte en
+  amont, jamais un filtre en sortie. Parité vérifiée en identité, pas en décompte.
+
+### Outils d'administration et API
+
+- **F-209** (investigation) — quatre capacités sans appel en sept jours. Tranchée en les
+  appelant : deux sont inutilisées parce qu'**inutilisables**. L'audit proposait trois issues ;
+  il en manquait une quatrième.
+- **F-215 — `vault_links` et `vault_graph` rendaient zéro arête, sans erreur, sur la forme de
+  chemin employée par tout le reste de l'API.** Livré : les deux formes acceptées, à parité
+  stricte avec `vault_read`. ⚠️ **Une référence introuvable rend toujours 200 et un graphe
+  vide** — c'est le contrat v1, assumé, pas un défaut résiduel. Le silence n'a pas été fermé.
+  ⚠️ **Périmètre partiel** : seuls `vault_links` et `vault_graph` acceptent la forme préfixée.
+  `vault_history` et `vault_diff` la refusent encore, et leur refus remonte en erreur interne
+  opaque plutôt qu'en entrée invalide.
+- **F-216 — `vault_tags` rendait 135 Ko sans aucun paramètre pour borner.** Livré : borne par
+  défaut, levée sur demande explicite, et un cardinal total qui rend la troncature détectable.
+- **F-217 — un travail mort affichait « max_retries atteint » à la place de la cause qui
+  l'avait tué.** Huit travaux, deux familles, une seule ligne affichée. Livré : la cause
+  survit, **en tête** — l'affichage tronque à 80 caractères, et la conséquence en tête aurait
+  écrasé ce qui distingue. ⚠️ Ce correctif a rendu atteignable un **panic de découpe UTF-8**
+  jusque-là dormant, corrigé dans le même lot. Les huit travaux restent en échec définitif :
+  abandon recommandé, décision opérateur.
+
+### Déploiement et supervision
+
+- **F-210 — un journal sans règle de rotation, une règle sans journal.** Deuxième occurrence
+  du même oubli.
+- **F-218 — le manifeste de release déclarait 2 binaires quand le déploiement en couvre 5 sur
+  8 unités**, et ses drapeaux standards omettaient la passerelle et les moteurs. Sans
+  correction, le correctif F-205 aurait été compilé, versionné, annoncé — et **jamais installé
+  sur les cinq instances qu'il existe pour rendre visibles**.
+
+### Ce que cette version ne fait pas
+
+- **La cause historique du refus d'écriture de F-204 reste hors d'atteinte** — journaux
+  effacés.
+- **La non-reprise des échecs permanents est délibérément écartée** : elle changerait la
+  sémantique de reprise d'un service en production.
+- **La réparation des cinq empreintes de F-208 n'est pas exécutée** — la cause d'abord.
+- **Les huit travaux morts de F-217 ne sont pas repris** — abandon recommandé, décision
+  opérateur.
+
+## [2.0.4] — 2026-08-18 — *internal milestone, published in 2.1.0*
+
+Lot **anti-faux-vert**. Dix cartes. Le fil commun tient en une phrase : **un dispositif qui rend
+un verdict sur une mesure qu'il n'a pas faite est pire que son absence, parce qu'il supprime la
+question.** Chacune des dix a trouvé au moins un cas de cette forme — souvent dans le mécanisme
+de sécurité censé la prévenir.
+
+### Déploiement
+
+- **F-173 — supprimer l'échec plutôt que le rattraper.** Le binaire engine est un fichier
+  *unique partagé* par les moteurs d'un hôte, et n'exposait que son chemin de configuration : un
+  refus de démarrage n'était donc détectable qu'**après le point de non-retour**. Aucun
+  ordonnancement ne pouvait le supprimer. Deux pièces : un mode de validation sans effet de bord
+  sur le binaire (8 causes accumulées, sans lier de port ni lancer le processus supervisé), et
+  une **étape de validation en zone de transit placée avant toute mutation** — dépôt sur l'hôte
+  cible, exécution *sur place* (ce qui prouve le plancher glibc et les bibliothèques réellement
+  présentes, là où une inspection statique ne comparait que des chaînes), validation par
+  configuration. Un seul refus et rien n'a bougé : binaires LIVE byte-identiques, aucun service
+  arrêté, pas même de répertoire de sauvegarde créé. Filet tout-ou-rien pour le résiduel.
+- **F-186 — le repli restaure désormais *en processus*, pas seulement sur disque.** Le repli
+  réinstallait les binaires puis appelait `start` — **no-op sur une unité active**. Le processus
+  continuait donc sur le binaire refusé pendant que l'outil annonçait « rollback effectué ».
+  Silencieux parce qu'installer par-dessus un binaire en exécution **réussit**. La parade descend
+  dans la fonction qui porte le contrat, en trois temps indivisibles ; l'enveloppe qui la
+  dupliquait est supprimée. Et une garde d'appel légitime fondée sur la **pile d'appels** : un
+  marqueur par variable échoue *ouvert* dans son propre cas nominal.
+
+### Registre et surfaces publiques
+
+- **F-180 — registre assaini, 4 critères sur 4.** 224 travaux annoncés ouverts dont 132 sur une
+  version dépassée ; 42 titres dupliqués. La cause des doublons n'était pas une garde absente
+  mais **une garde présente et inopérante** — elle lisait un champ que l'API ne renvoie pas, donc
+  répondait toujours « rien n'existe ». Garde ajoutée sur un second axe, sans implémentation par
+  défaut : un défaut rendant « rien n'existe » aurait reproduit la maladie.
+- **F-192 — le contrôle de synchronisation du site était vert par hasard d'ordre.** Il indexait
+  l'export en gardant la dernière entrée vue, et l'export ne déduplique pas : deux projections de
+  la même donnée rendaient l'ordre inverse. Il détecte désormais la multiplicité et **abandonne
+  la comparaison** plutôt que de choisir. Contrat de sortie porté à trois états — toute cécité
+  emprunte le code « incapable de conclure », y compris l'export vide, qui franchissait la garde
+  en étant *truthy*.
+- **F-183 — les versions affichées sont vérifiées contre la release publiée**, à deux temps : le
+  rendu produit au push, le rendu servi après publication. Marqueur déclaratif plutôt que
+  balayage : aucun scanner ne distingue une prétention courante d'un fait historique.
+- **F-172 — l'appartenance d'un script au dépôt public devient une propriété de son
+  emplacement**, plus une liste tenue à la main. Elle existait en quatre copies, dont une avait
+  déjà divergé.
+
+### Configuration et validation
+
+- **F-190 — la surcharge de configuration par variables d'environnement était documentée et sans
+  effet.** Retirée plutôt que réparée : le préfixe est déjà pris par un secret, et le réparer
+  l'aurait fait transiter par un désérialiseur qui expose la valeur fautive.
+- **F-191 — la validation répond désormais pour l'identité qui fera tourner le service**, non
+  pour celle qui l'invoque. L'écart est asymétrique : un appelant plus capable que le service
+  produit un faux vert qui autorise la bascule que la validation existe pour interdire.
+- Angle mort refermé dans la foulée : un fichier de configuration **illisible** était rendu comme
+  **absent**, avec un message envoyant chercher au mauvais endroit pendant un pré-vol.
+
+### Supervision
+
+- **F-179 — audit d'utilisation à 24 h après chaque mise en production, puis hebdomadaire.** Le
+  rapport est **sans état** : une anomalie de 99 jours y figure au même rang qu'une née ce matin.
+  Un rapport en delta masque par construction ce qui ne bouge pas. Le signal de déploiement
+  n'existait pas — il est dérivé de l'empreinte temporelle des binaires LIVE, lisible
+  rétroactivement même si la sonde était éteinte.
+- **F-182 — sonde d'aptitude à publier.** Le contrôle du site pouvait devenir rouge sans que rien
+  ne le signale : ce n'était pas une panne mais un **piège armé**, dont le coût ne se payait qu'au
+  moment de publier.
+
+### Sécurité
+
+- **RUSTSEC-2026-0258** levé — `h2` 0.4.14 → 0.4.16, sur le chemin de requête du serveur.
+  `spin` 0.9.8 (retiré) → 0.9.9. Le verrou `links=sqlite3` reste intact.
+
+
+## [2.0.3] — 2026-08-17 — *internal milestone, published in 2.1.0*
+
+Lot de correction **déploiement / publication**. Trois cartes livrées. Le fil commun : **des
+surfaces publiques que rien ne relisait, et un outil de déploiement qu'on ne pouvait pas
+inspecter sans l'exécuter.**
+
+Un quatrième défaut, découvert en instruisant le lot, a bloqué toute compilation pendant la
+soirée et méritait d'être réparé avant le reste — il est documenté plus bas.
+
+### Fixed — le jargon interne fuyait dans la documentation générée (F-178)
+
+- Les doc-comments Rust sont rendus par `rustdoc` pour **chaque version publiée**, et cette
+  sortie est **figée par version**. Un lecteur externe y trouvait des identifiants de cartes qui
+  ne renvoient à rien — ni ticket public, ni page, ni contexte.
+- Jargon ramené à **zéro** sur les deux volets du gate anti-jargon, six crates publiées.
+- Les motifs sont **reformulés, jamais supprimés** : « the blind spot F-174 closes » devient
+  « the drift scan closes » ; « trois cartes de reprise » devient « reindexing orphaned files,
+  backfilling vectorless notes, and drift detection ». Plusieurs blocs sont plus clairs qu'avant.
+- Les commentaires d'implémentation `//` ne sont pas touchés : ils ne sont pas rendus, et une
+  référence de carte y éclaire légitimement un choix.
+
+### Fixed — charger le script de déploiement déclenchait une mise en production (F-185)
+
+- `scripts/deploy-gradatum-local.sh` comptait 679 lignes **sans garde de source**. Le charger —
+  pour tester une fonction, réutiliser un helper, l'inspecter — l'exécutait de haut en bas :
+  arrêt de services, construction, installation.
+- La logique passe sous une fonction principale invoquée par une garde de source. Charger le
+  fichier **définit** désormais sans **exécuter**.
+- `set -euo pipefail` devient la première ligne de cette fonction : le laisser au niveau du
+  fichier polluerait les options du shell appelant à chaque chargement. La contrepartie est
+  fermée — les constantes se résolvent en mode permissif, et la fonction principale **valide
+  strictement** que le répertoire projet existe et porte bien le `Cargo.toml` du workspace. Un
+  répertoire quelconque muni d'un `Cargo.toml` est refusé.
+- Vérifié sous huit formes d'invocation, y compris à travers un lien symbolique et depuis `dash`.
+  Le plan `--dry-run --build` est **identique octet pour octet** avant et après.
+
+### Fixed — la documentation générée portait des liens morts (F-188)
+
+- `cargo doc` refusait de documenter deux crates : trois liens pointaient un élément privé depuis
+  une documentation publique, trois ne résolvaient pas.
+- Les six cibles sont des détails d'implémentation — aucune n'a vocation à être cliquable. Le
+  lien est retiré, **la mention conservée**, sauf pour l'entrée du binaire dont la mention ne
+  rendait service à personne.
+- Aucun élément n'a été rendu public pour satisfaire un lien de documentation, aucun lint n'a été
+  désactivé.
+
+### Fixed — le ramasse-miettes du pool de build était arrêté depuis neuf jours
+
+- Le pool de build a saturé à **451 Go sur 451**, bloquant toute compilation : ni tests, ni
+  gates, ni release. Cause : une relaxation des seuils marquée **temporaire** pour une passe de
+  release antérieure, **jamais révoquée**. Le service n'a pas échoué — il ne tournait pas, zéro
+  entrée au journal.
+- Second défaut indépendant : le fichier de protection désignait un artefact qui n'existait plus.
+  Réactiver le ramasse-miettes tel quel l'aurait laissé **refuser toute éviction en silence**
+  jusqu'à la saturation suivante.
+- 347 Go récupérés, seuils remis au nominal, minuterie réarmée.
+
+### Note — pourquoi ces défauts n'étaient pas visibles
+
+Le pool saturé faisait échouer le gate des liens morts **sur une erreur d'écriture disque avant
+toute compilation**. Le scan paraissait rapide parce qu'il ne faisait rien. Une fois le pool
+libéré, il met plus de deux minutes et rend enfin son verdict. Un dispositif qui échoue tôt pour
+une mauvaise raison masque ce qu'il aurait dû mesurer.
+
+## [2.0.2] — 2026-08-16 — *internal milestone, published in 2.1.0*
+
+Lot d'assainissement de la cohérence du vault. Huit cartes livrées, chacune déployée et vérifiée
+en production avant clôture. Un fil commun les relie : **des dispositifs qui rassuraient au-delà
+de ce qu'ils garantissaient.**
+
+### Fixed — la réparation des embarquements enfilait dans une table morte (F-175)
+
+- `backfill-embeddings` déposait ses travaux dans `jobs_v2`, table que plus aucun consommateur
+  ne drainait depuis le 2026-05-29, **tout en rapportant un succès**. C'était l'outil de
+  réparation lui-même qui était silencieusement dégradé : le lancer aurait clos un défaut sur
+  une commande sans effet, en laissant une trace affirmant le contraire.
+- Le compteur est désormais **relu dans la table** que le worker draine, jamais rapporté par la
+  fonction. Un enfilage sans effet échoue franchement.
+- **Garde-fou de volume** : tout tenant autre que le principal exige une borne explicite, et un
+  plafond dur s'applique même à lui. Sans cette garde, le correctif rendait praticable un
+  enfilage de plusieurs milliers de travaux jusque-là inoffensif parce qu'inerte.
+
+### Fixed — 37 notes existaient sur disque sans être indexées (F-166)
+
+- Nouvelle sous-commande `reindex-orphans`. Elle **appelle l'entonnoir d'écriture** au lieu de le
+  réimplémenter : une note ré-indexée obtient donc sa ligne d'index, son empreinte de dérive et
+  son travail d'embarquement dans le même geste.
+- Vérifié en production : les trois compteurs ont progressé d'exactement +37 chacun. Un
+  court-circuit de l'entonnoir aurait produit l'un sans les autres.
+- Ces notes portaient `status: live` et étaient invisibles à toute requête depuis 99 jours.
+
+### Fixed — la détection de dérive ne couvrait que 2,4 % du vault (F-174)
+
+- Rétro-remplissage des empreintes : **80 → 3255 entrées, soit 100 % de couverture**. Le scan
+  rendait « aucune dérive » sur un vault dont il ne regardait qu'un quarantième.
+- Le scan couvre désormais **les deux directions** — il énumérait l'index, donc il ne pouvait par
+  construction pas voir un fichier que l'index ignore — **et les trois représentations**, fichier,
+  index et vecteur.
+- Nouvelle commande `drift-scan`, en lecture seule, qui **sort en code 2** sur dérive et en code 1
+  sur erreur d'exécution : « j'ai trouvé » et « je n'ai pas pu regarder » ne sont pas confondus.
+- Le prédicat d'embarquabilité est désormais **dérivé d'une source unique** dans `gradatum-core`
+  (`NoteStatus::ALL`, `embeddable_default_sql_list`), consommée par le détecteur **et** par le
+  réparateur. Ils divergeaient : le détecteur ne comptait que les notes vivantes, le réparateur
+  couvrait les trois statuts embarquables — une note en revue sans vecteur n'était donc signalée
+  par personne.
+
+### Fixed — la passerelle rétrogradait le rôle `system` en `user` (F-170)
+
+- 183 requêtes par jour voyaient une consigne de cadrage transformée en propos d'utilisateur.
+  La cible interne sait porter ce rôle : la conversion n'était pas un repli faute de mieux, mais
+  une perte d'information là où la représentation existait.
+- Le repli avec avertissement **subsiste** pour les rôles authentiquement inconnus. En sortant
+  `system` de ce chemin, l'avertissement redevient un événement rare et signifiant — émis 183
+  fois par jour, il n'avertissait plus personne.
+
+### Fixed — `last_indexed_at` rendait toujours `null` (F-169)
+
+- Le champ existait au contrat de sortie avec une valeur câblée en dur, ce qui est **plus
+  trompeur qu'une absence** : un consommateur en conclut « jamais indexé ».
+- La source retenue correspond au nom du champ. Une date de vérification d'empreinte était
+  disponible et a été **écartée** : servie sous un nom d'indexation, elle aurait remplacé un nul
+  honnête par une valeur fausse.
+- Le nul ne subsiste que pour une seule raison — corpus vide. Une erreur de stockage est
+  **propagée** et non dégradée en nul, contrairement aux autres champs du même endpoint : un nul
+  sur échec serait indistinguable du défaut corrigé.
+
+### Fixed — l'écriture hors de l'entonnoir était possible (F-176)
+
+- La convergence devient une **propriété imposée** et non une discipline d'appelant. Une garde
+  décore la couche de stockage et refuse tout chemin de note ; l'entonnoir écrit par un canal
+  privilégié visible seulement à l'intérieur du crate.
+- Portée exacte, documentée dans le code : la garde couvre tout écrivain **dans le processus**.
+  Elle ne couvre pas — et ne peut pas couvrir — un écrivain hors processus, qui est le vecteur
+  ayant causé les orphelins ci-dessus. Celui-là reste fermé par politique d'ingestion.
+- Asymétrie assumée : **prévention** pour l'orphelin ici, **détection** pour l'entrée d'index
+  fantôme par le scan de dérive.
+- `StorageError::WriteRejected` ajoutée — extension additive sur une énumération non exhaustive.
+
+### Added — les cartes du plan produit sont interrogeables par leurs rôles (F-171)
+
+- Deux colonnes typées dérivées à l'écriture, exposées au filtrage. La question « quelles cartes
+  de correction sont encore ouvertes ? » n'avait aucune réponse par le chemin prévu.
+- L'oracle de vérification applique **la même sémantique d'extraction que le validateur de
+  schéma**. Mesuré : un oracle par correspondance de sous-chaîne attribue 406 types pour 329
+  cartes ; l'ancré partitionne exactement.
+
+### Investigated — huit travaux en échec définitif, classés sans réparation (F-168)
+
+- Les huit visent des notes absentes de l'index, du disque **et** des archives. Irrécupérables
+  par disparition de la cible ; les rejouer n'aurait aucun effet.
+- Le lien supposé avec les notes dépourvues de vecteur est **écarté** : populations disjointes.
+- Défaut découvert en instruisant : les huit portent le même message, « nombre maximal de
+  tentatives atteint ». La cause première est écrasée par le message d'épuisement — **un travail
+  mort est donc inanalysable**.
+
+### Ce que cette version ne fait pas
+
+- **La file héritée n'est pas supprimée.** L'instruction préalable a montré qu'elle est recréée à
+  chaque démarrage du serveur et du worker, lue par une route de rétrocompatibilité, et recréée
+  par une migration immuable. La retirer franchirait l'API publique d'un crate publié — donc un
+  cycle majeur, pas un correctif. Reportée, avec son argument intact : cette table conserve le
+  contenu de notes supprimées.
+- La séparation des scripts et la couverture de déploiement des composants distants sont
+  reportées à une version dédiée à la publication.
+- Deux commandes livrées ici — `reindex-orphans`, `backfill-checksums` — sont des outils
+  d'administration hors ligne : elles écrivent dans l'index, dont le serveur est le seul writer
+  déclaré, et s'exécutent services arrêtés.
+
+## [2.0.1] — 2026-08-15 — *internal milestone, published in 2.1.0*
+
+### Fixed — la détection de dérive était inerte depuis la v1.0.0 (F-165, geste 1/4)
+
+- `Vault::write_note_inner` alimente désormais `file_checksums` à chaque écriture de note.
+  Cette table est la **seule source d'énumération** du scan de dérive (`scan_phase_a`) ; elle
+  contenait **0 ligne**. Le scan rendait donc un résultat entièrement nul à chaque exécution,
+  tout en exposant des métriques — la forme la plus coûteuse du faux vert, puisqu'elle ne se
+  tait pas, elle rassure. Le dépôt documentait lui-même cette inertie en commentaire.
+- Les trois entrées d'écriture (`write_note`, `write_note_with_id`, `write_if_match`) passent
+  par `write_note_inner` : toutes alimentent la table.
+- **Fail-open délibéré** : un échec du calcul ou de l'écriture du checksum est journalisé et
+  n'interrompt pas l'écriture de la note. Perdre un checksum vaut mieux que perdre une note —
+  même principe que le découplage curate/embed déjà en place.
+- `compute_prefix_4kb_bytes` et `compute_full_sha256_bytes` deviennent publiques dans
+  `gradatum-index`. **Extension purement additive.** Motif : le producteur (chemin d'écriture)
+  et le consommateur (scan) doivent hacher à l'identique — dupliquer la primitive ferait
+  diverger les deux et marquerait chaque fichier comme dérivé.
+
+**Ce que cette version ne fait pas encore**, et qui suit dans le même lot : le rétro-remplissage
+des fichiers antérieurs, l'énumération dans le sens disque → index (sans laquelle un fichier que
+l'index ignore reste invisible), et la dimension vectorielle.
+
 
 ## [2.0.0] — 2026-08-10
 
@@ -1037,7 +1858,7 @@ full workspace (27 publishable crates) to `1.0.0`.
   re-synchronises the index, so a note whose file and index disagree converges rather than
   staying stale.
 
-## [0.8.0] — 2026-07-14
+## [0.8.0] — 2026-07-14 · internal milestone, published in 1.0.0
 
 Train "stability memory vault". On-demand delete is now **archival** (reversible), gated
 behind an operator-only surface; all agent-facing mutations of the archive lifecycle stay
@@ -1078,7 +1899,7 @@ off the public API and MCP. User-facing strings are now English.
 - **Code-map resolution qualified (F-70).** Already shipped LIVE in 0.7.9; recorded here for
   completeness in the public train.
 
-## [0.7.7] — 2026-07-06
+## [0.7.7] — 2026-07-06 · internal milestone, published in 1.0.0
 
 ### Added
 
@@ -1349,7 +2170,7 @@ Synthesized notes now pass through a deterministic scoring gate before being sto
 3038 passed / 0 failed (`cargo nextest --workspace --release`); `clippy --workspace
 --all-targets -- -D warnings` clean.
 
-## [0.6.9] — 2026-06-26
+## [0.6.9] — 2026-06-26 · internal milestone, published in 0.7.6
 
 Consolidates gateway and engine fixes shipped since 0.6.8 — no breaking API or
 configuration changes.
@@ -1372,7 +2193,7 @@ configuration changes.
   `tool_choice: {type: "auto"}` before forwarding to the engine, preventing
   unexpected forced-tool behaviour.
 
-## [0.6.8] — 2026-06-24
+## [0.6.8] — 2026-06-24 · internal milestone, published in 0.7.6
 
 Consolidates versions 0.6.5–0.6.8 (not previously tagged publicly). Drop-in upgrade
 from 0.6.4 — no breaking API or configuration changes.
@@ -1652,7 +2473,7 @@ Two new at-rest data surfaces in `index.db`:
 
 1925 passed / 0 failed (`cargo nextest --workspace --release`); `clippy --workspace --all-targets -- -D warnings` clean.
 
-## [0.4.6] — 2026-06-11
+## [0.4.6] — 2026-06-11 · internal milestone, published in 0.5.2
 
 Introduces a read-mostly operator UI over the vault, along with the backend API surfaces it
 consumes. No breaking changes; drop-in upgrade from v0.4.5.
@@ -1680,7 +2501,7 @@ consumes. No breaking changes; drop-in upgrade from v0.4.5.
 - Workspace tests pass, zero failures; `clippy --workspace --all-targets` clean.
 - New coverage: opt-in score breakdown (rrf ranks, omitted/present, MCP schema), curator status-flip parity + worker observable flip, review queue E2E + non-ULID resilience, dashboard aggregate + health re-check, move-locus E2E (success/400/404/422) + `LocusId::parse` unit, locus preservation on re-upsert, studio router (security headers, SPA fallback, missing-bundle 404).
 
-## [0.4.5] — 2026-06-11
+## [0.4.5] — 2026-06-11 · internal milestone, published in 0.5.2
 
 Multi-backend-readiness for the index (testability + decoupling), without shipping an
 alternative backend yet. No breaking changes; drop-in upgrade from v0.4.4.
@@ -1702,7 +2523,7 @@ alternative backend yet. No breaking changes; drop-in upgrade from v0.4.4.
 - Workspace tests pass, zero failures; `clippy --workspace --all-targets` clean.
 - `index-parity-tests` runs against the sqlite backend via the factory; the `index-backends` CI matrix is extensible to alternative backends.
 
-## [0.4.4] — 2026-06-11
+## [0.4.4] — 2026-06-11 · internal milestone, published in 0.5.2
 
 Adds semantic distillation jobs, trust-decay scoring, a consumable event-log, and lesson
 recall. No breaking changes; drop-in upgrade from v0.4.3.
@@ -1813,7 +2634,7 @@ Vault durable writes — note history, optimistic locking, stable wikilinks, wri
 - **Workspace** : 1178 tests PASS, 0 clippy warnings, 0 regressions.
 - **Known limitations**: history pruning policy and trust-decay scoring are deferred to later releases.
 
-## [0.3.7] — 2026-06-05
+## [0.3.7] — 2026-06-05 · internal milestone, published in 0.4.0
 
 Reliability fixes: search/read/write consistency and wikilink stability.
 
@@ -1824,7 +2645,7 @@ Reliability fixes: search/read/write consistency and wikilink stability.
 ### Changed
 - **vault_search** : score documentation clarified. Score is a composite RRF rank, not a [0–1] similarity value.
 
-## [0.3.6] — 2026-06-05
+## [0.3.6] — 2026-06-05 · internal milestone, published in 0.4.0
 
 Add per-crate README.md for crates.io documentation pages; metadata only, no code changes.
 

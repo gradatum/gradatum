@@ -18,12 +18,10 @@ use std::time::Duration;
 
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::{JwtService, TokenScope};
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-use gradatum_queue::{Queue, SqliteQueue};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 use gradatum_server::middleware::auth_middleware;
 use gradatum_server::{api_v1, state::AppState};
 use serde_json::Value;
-use sqlx::sqlite::SqlitePoolOptions;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -34,8 +32,11 @@ read_patterns = ["**"]
 write_patterns = ["**"]
 "#;
 
-/// Démarre un serveur de test avec write ACL + SqliteQueue in-memory.
-async fn spawn_write_server() -> (std::net::SocketAddr, String, Arc<SqliteQueue>) {
+/// Démarre un serveur de test avec write ACL + job store in-memory.
+///
+/// F-177 : la queue legacy `jobs_v2` (`SqliteQueue`) est supprimée — les writes
+/// ne sont vérifiés que contre `gradatum_jobs`.
+async fn spawn_write_server() -> (std::net::SocketAddr, String) {
     use axum::{Router, middleware};
 
     let jwt = JwtService::new_ephemeral();
@@ -50,16 +51,8 @@ async fn spawn_write_server() -> (std::net::SocketAddr, String, Arc<SqliteQueue>
 
     let acl = AclEngine::from_preset_str(TEST_ACL_WRITE).expect("preset ACL write toujours valide");
 
-    let queue = Arc::new(
-        SqliteQueue::in_memory()
-            .await
-            .expect("SqliteQueue in-memory pour write synthetic"),
-    );
-
     // Phase 1.2 : vault_write bridge vers job_store (gradatum_jobs) — nécessaire pour 202.
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory — invariant test write_synthetic");
     run_migrations(&jobs_pool)
@@ -68,7 +61,6 @@ async fn spawn_write_server() -> (std::net::SocketAddr, String, Arc<SqliteQueue>
     let job_store = Arc::new(SqliteQueueStore::new(jobs_pool.clone()));
 
     let state = AppState::with_jwt_and_acl(jwt, acl)
-        .with_queue(Arc::clone(&queue) as Arc<dyn gradatum_queue::Queue>)
         .with_job_store(job_store as Arc<dyn gradatum_core::QueueStore>, jobs_pool);
 
     let app = Router::new()
@@ -91,7 +83,7 @@ async fn spawn_write_server() -> (std::net::SocketAddr, String, Arc<SqliteQueue>
             .expect("serveur write synthetic arrêté proprement");
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    (addr, bearer, queue)
+    (addr, bearer)
 }
 
 /// Client HTTP avec timeout 5s.
@@ -110,7 +102,7 @@ fn client() -> reqwest::Client {
 /// Le worker (heuristique) assignera "decisions" en mode E2E complet.
 #[tokio::test]
 async fn test_11_write_decisions_title_enqueues_curate_job() {
-    let (addr, bearer, queue) = spawn_write_server().await;
+    let (addr, bearer) = spawn_write_server().await;
 
     let resp = client()
         .post(format!("http://{addr}/api/v1/vault_write"))
@@ -129,19 +121,12 @@ async fn test_11_write_decisions_title_enqueues_curate_job() {
     // Phase 1.2 : job_id est un ULID string (bridge job_store gradatum_jobs).
     let job_id = body["job_id"].as_str().expect("job_id ULID Phase 1.2");
     assert!(!job_id.is_empty(), "job_id ne doit pas être vide");
-
-    // Phase 1.2 : vault_write enfile dans gradatum_jobs — queue legacy jobs_v2 reste vide.
-    let depth = queue.depth().await.expect("depth queue");
-    assert_eq!(
-        depth, 0,
-        "test 11 Phase 1.2 : queue legacy vide (job dans gradatum_jobs)"
-    );
 }
 
 /// Test 12 — vault_write : titre [DEBUG] → job enqueued.
 #[tokio::test]
 async fn test_12_write_debug_title_enqueues_job() {
-    let (addr, bearer, _queue) = spawn_write_server().await;
+    let (addr, bearer) = spawn_write_server().await;
 
     let resp = client()
         .post(format!("http://{addr}/api/v1/vault_write"))
@@ -168,7 +153,7 @@ async fn test_12_write_debug_title_enqueues_job() {
 /// Test 13 — vault_write : titre [REASONING] → job enqueued.
 #[tokio::test]
 async fn test_13_write_reasoning_title_enqueues_job() {
-    let (addr, bearer, _queue) = spawn_write_server().await;
+    let (addr, bearer) = spawn_write_server().await;
 
     let resp = client()
         .post(format!("http://{addr}/api/v1/vault_write"))
@@ -200,7 +185,7 @@ async fn test_13_write_reasoning_title_enqueues_job() {
 /// Les tags fournis sont transportés dans le `CurateSpec` du job enfilé (gradatum_jobs).
 #[tokio::test]
 async fn test_14_write_with_tags_enqueues_job() {
-    let (addr, bearer, _queue) = spawn_write_server().await;
+    let (addr, bearer) = spawn_write_server().await;
 
     let resp = client()
         .post(format!("http://{addr}/api/v1/vault_write"))
@@ -230,7 +215,7 @@ async fn test_14_write_with_tags_enqueues_job() {
 /// On vérifie l'unicité des job_id (ULID unicité garantie par randomness).
 #[tokio::test]
 async fn test_15_sequential_writes_produce_monotonic_job_ids() {
-    let (addr, bearer, _queue) = spawn_write_server().await;
+    let (addr, bearer) = spawn_write_server().await;
     let c = client();
     let mut job_ids = Vec::with_capacity(5);
 
@@ -279,7 +264,7 @@ async fn test_15_sequential_writes_produce_monotonic_job_ids() {
 /// sans bearer → 401, avec bearer + note inexistante → 404.
 #[tokio::test]
 async fn test_19_downgrade_enqueues_job() {
-    let (addr, bearer, queue) = spawn_write_server().await;
+    let (addr, bearer) = spawn_write_server().await;
 
     // Note inexistante en DB — handler sync retourne 404 (après auth OK).
     let fake_note_id = ulid::Ulid::generate().to_string();
@@ -301,13 +286,6 @@ async fn test_19_downgrade_enqueues_job() {
         404,
         "test 19 : vault_downgrade sync → 404 pour note inexistante (F-1 : bearer requis, note absente)"
     );
-
-    // La queue reste vide — aucun job créé par le handler synchrone.
-    let depth = queue.depth().await.expect("depth queue post-downgrade");
-    assert_eq!(
-        depth, 0,
-        "test 19 : queue vide — handler sync n'enqueue pas"
-    );
 }
 
 /// Test 20 — vault_classify avec note absente retourne 404 Not Found.
@@ -316,7 +294,7 @@ async fn test_19_downgrade_enqueues_job() {
 /// du vault. Aucun job n'est enqueued (la classification est synchrone).
 #[tokio::test]
 async fn test_20_classify_unknown_note_returns_404() {
-    let (addr, bearer, queue) = spawn_write_server().await;
+    let (addr, bearer) = spawn_write_server().await;
 
     let fake_note_id = ulid::Ulid::generate().to_string();
 
@@ -336,24 +314,16 @@ async fn test_20_classify_unknown_note_returns_404() {
         404,
         "test 20 : vault_classify avec note absente doit retourner 404"
     );
-
-    // Aucun job ne doit être enqueued (vault_classify est synchrone, heuristique).
-    let depth = queue.depth().await.expect("depth queue post-classify");
-    assert_eq!(
-        depth, 0,
-        "test 20 : vault_classify heuristique ne doit rien enqueue"
-    );
 }
 
 // ── Test 21 : writes concurrents ──────────────────────────────────────────────
 
 /// Test 21 — 10 vault_write parallèles → 10 job_id distincts.
 ///
-/// Vérifie que l'atomic `UPDATE...RETURNING` de SqliteQueue garantit
-/// l'unicité des job_id sous charge concurrente maximale.
+/// Vérifie que les writes concurrents produisent des job_id (ULID) distincts.
 #[tokio::test]
 async fn test_21_concurrent_writes_produce_distinct_job_ids() {
-    let (addr, bearer, queue) = spawn_write_server().await;
+    let (addr, bearer) = spawn_write_server().await;
 
     let futs: Vec<_> = (0..10u32)
         .map(|i| {
@@ -393,13 +363,6 @@ async fn test_21_concurrent_writes_produce_distinct_job_ids() {
         unique.len(),
         10,
         "test 21 : 10 vault_write parallèles doivent produire 10 ULID distincts Phase 1.2: {job_ids:?}"
-    );
-
-    // Phase 1.2 : vault_write enfile dans gradatum_jobs — queue legacy reste vide.
-    let depth = queue.depth().await.expect("depth queue test 21");
-    assert_eq!(
-        depth, 0,
-        "test 21 Phase 1.2 : queue legacy vide (10 jobs dans gradatum_jobs)"
     );
 }
 

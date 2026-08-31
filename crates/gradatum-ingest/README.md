@@ -6,7 +6,7 @@ tree-sitter and derives code symbols stored as notes in the gradatum vault.
 Supports Rust, Python, Bash, TypeScript, and TSX. Symbols are derived deterministically from
 source — zero LLM cost.
 
-**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum)
 
 ## Feature flags
@@ -22,7 +22,7 @@ Language parsers are opt-in. `code-rust` is enabled by default.
 
 ```toml
 [dependencies]
-gradatum-ingest = { version = "2.0.0", features = ["code-rust", "code-python"] }
+gradatum-ingest = { version = "2.1.0", features = ["code-rust", "code-python"] }
 ```
 
 ## Usage

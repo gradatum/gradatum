@@ -288,6 +288,10 @@ async fn second_run_skips_all_existing_markers() {
             Ok(true)
         }
 
+        async fn existing_titles(&self) -> Result<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+
         async fn vault_write(&self, _card: &VaultWriteCard) -> Result<String> {
             self.write_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

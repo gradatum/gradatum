@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use chrono::Utc;
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::{JwtService, TokenScope};
 use gradatum_core::identity::NoteId;
@@ -177,8 +178,12 @@ async fn vault_read_not_found_increments_nothing() {
 ///
 /// Deux states partagent le MÊME vault + index (mêmes ULID) ; seule la présence du
 /// store diffère. L'instrumentation per-note ne touche jamais le chemin de réponse :
-/// les octets doivent être strictement égaux. Les notes sont créées « maintenant »
-/// → `recency_factor ≈ 1.0` (identique en f32 entre les deux requêtes proches).
+/// les octets doivent être strictement égaux. Les notes sont ancrées DANS LE FUTUR
+/// (`created_ms = now + 1 j`) → `recency_factor = 1.0` EXACTEMENT (delta négatif
+/// clampé à 0) et trust age = 0 pour toute requête avant l'ancre : le score composite
+/// est invariant au temps écoulé entre les deux requêtes. Sans cet ancrage, le score
+/// f32 dérive avec `now_ms` et l'octet-identité casse sous charge (régression mesurée :
+/// `score 0.042885248` vs `0.042885244`, 1 ULP, même ordre de résultats).
 #[tokio::test]
 async fn vault_search_response_identical_with_usage_store_wired_or_not() {
     use axum::{Router, middleware};
@@ -195,13 +200,20 @@ async fn vault_search_response_identical_with_usage_store_wired_or_not() {
     let index = vault.index().clone();
 
     // Seed 3 notes partagées (mêmes ULID pour les deux states).
+    //
+    // Ancrage temporel FUTUR : `recency_factor(anchor, now)` et trust age saturent à
+    // leurs constantes (1.0 / 0) pour toute requête avant l'ancre → la réponse est
+    // invariante au temps entre A et B. `seed_note_with_fts` (created = now) laissait
+    // le score f32 du composite dériver entre les deux requêtes (dépendance à now_ms)
+    // et cassait l'octet-identité sous charge parallèle — la cause réelle de l'échec CI.
+    let future_anchor_ms = Utc::now().timestamp_millis() + 86_400_000;
     for i in 0..3 {
         let ulid = Ulid::generate().to_string();
         let body = format!("# Note alpha beta {i}\nalpha beta contenu partagé {i}");
         index
-            .seed_note_with_fts(&ulid, "reference", &body)
+            .seed_note_with_created(&ulid, "reference", &body, future_anchor_ms)
             .await
-            .expect("seed_note_with_fts");
+            .expect("seed_note_with_created");
         let nid = NoteId(Ulid::from_string(&ulid).expect("ULID"));
         index
             .upsert_note_title("main", &nid, &format!("Note alpha beta {i}"))

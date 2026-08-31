@@ -1,0 +1,35 @@
+pub mod gradatum_distill
+pub mod gradatum_distill::distill_cluster
+pub fn gradatum_distill::distill_cluster::cluster_by_cosine(&[alloc::vec::Vec<f32>], f32) -> alloc::vec::Vec<alloc::vec::Vec<usize>>
+pub fn gradatum_distill::distill_cluster::cosine_similarity(&[f32], &[f32]) -> f32
+pub mod gradatum_distill::synthesizer
+pub enum gradatum_distill::synthesizer::SynthesisError
+pub gradatum_distill::synthesizer::SynthesisError::Unavailable(alloc::string::String)
+pub struct gradatum_distill::synthesizer::ClusterSynthesis
+pub gradatum_distill::synthesizer::ClusterSynthesis::body: alloc::string::String
+pub gradatum_distill::synthesizer::ClusterSynthesis::title: alloc::string::String
+pub struct gradatum_distill::synthesizer::TemplateSynthesizer
+impl gradatum_distill::synthesizer::DistillSynthesizer for gradatum_distill::synthesizer::TemplateSynthesizer
+pub fn gradatum_distill::synthesizer::TemplateSynthesizer::synthesize<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 [(alloc::string::String, alloc::string::String)]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_distill::synthesizer::ClusterSynthesis, gradatum_distill::synthesizer::SynthesisError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub trait gradatum_distill::synthesizer::DistillSynthesizer: core::marker::Send + core::marker::Sync
+pub fn gradatum_distill::synthesizer::DistillSynthesizer::synthesize<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 [(alloc::string::String, alloc::string::String)]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_distill::synthesizer::ClusterSynthesis, gradatum_distill::synthesizer::SynthesisError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl gradatum_distill::synthesizer::DistillSynthesizer for gradatum_distill::synthesizer::TemplateSynthesizer
+pub fn gradatum_distill::synthesizer::TemplateSynthesizer::synthesize<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 [(alloc::string::String, alloc::string::String)]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_distill::synthesizer::ClusterSynthesis, gradatum_distill::synthesizer::SynthesisError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub mod gradatum_distill::trust
+pub fn gradatum_distill::trust::compute_distill_trust(&[ulid::Ulid], &dyn gradatum_core::provenance::TrustLookup, f32) -> f32
+pub enum gradatum_distill::SynthesisError
+pub gradatum_distill::SynthesisError::Unavailable(alloc::string::String)
+pub struct gradatum_distill::ClusterSynthesis
+pub gradatum_distill::ClusterSynthesis::body: alloc::string::String
+pub gradatum_distill::ClusterSynthesis::title: alloc::string::String
+pub struct gradatum_distill::TemplateSynthesizer
+impl gradatum_distill::synthesizer::DistillSynthesizer for gradatum_distill::synthesizer::TemplateSynthesizer
+pub fn gradatum_distill::synthesizer::TemplateSynthesizer::synthesize<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 [(alloc::string::String, alloc::string::String)]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_distill::synthesizer::ClusterSynthesis, gradatum_distill::synthesizer::SynthesisError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub const gradatum_distill::VERSION: &str
+pub trait gradatum_distill::DistillSynthesizer: core::marker::Send + core::marker::Sync
+pub fn gradatum_distill::DistillSynthesizer::synthesize<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 [(alloc::string::String, alloc::string::String)]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_distill::synthesizer::ClusterSynthesis, gradatum_distill::synthesizer::SynthesisError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+impl gradatum_distill::synthesizer::DistillSynthesizer for gradatum_distill::synthesizer::TemplateSynthesizer
+pub fn gradatum_distill::synthesizer::TemplateSynthesizer::synthesize<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 [(alloc::string::String, alloc::string::String)]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_distill::synthesizer::ClusterSynthesis, gradatum_distill::synthesizer::SynthesisError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_distill::cluster_by_cosine(&[alloc::vec::Vec<f32>], f32) -> alloc::vec::Vec<alloc::vec::Vec<usize>>
+pub fn gradatum_distill::compute_distill_trust(&[ulid::Ulid], &dyn gradatum_core::provenance::TrustLookup, f32) -> f32
+pub fn gradatum_distill::cosine_similarity(&[f32], &[f32]) -> f32

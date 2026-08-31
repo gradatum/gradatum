@@ -33,6 +33,8 @@ pub mod effective_note;
 pub mod error;
 pub mod history;
 pub mod lifecycle;
+/// Note-write convergence guard — crate-internal.
+mod note_write_guard;
 pub mod overrides;
 pub mod registry;
 pub mod write;

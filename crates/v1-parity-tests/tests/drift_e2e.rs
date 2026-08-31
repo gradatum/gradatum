@@ -39,10 +39,10 @@ async fn drift_no_changes_returns_zero_mismatches() {
 /// Écrit une note, modifie le fichier .md directement sur disque (simulation
 /// éditeur externe), lance drift_check → mismatch détecté.
 ///
-/// Ignoré : `upsert_file_checksum` n'est pas appelé dans `Vault::write_note`,
-/// donc `file_checksums` reste vide et `scan_phase_a` ne trouve aucune entrée à comparer.
+/// Réactivé (F-174) : depuis F-165, `Vault::write_note` alimente `file_checksums` via
+/// `upsert_file_checksum`, donc `scan_phase_a` a une entrée à comparer et détecte le
+/// mismatch. L'ancien `#[ignore]` visait le stub de write_note, désormais câblé.
 #[tokio::test]
-#[ignore = "Phase 2+ : blocked by Vault::write_note stub (upsert_file_checksum not called)"]
 async fn drift_after_external_md_edit_detected() {
     let tmp = TempDir::new().unwrap();
     let vault = Vault::create(tmp.path(), VaultId::new("main"))
@@ -80,11 +80,11 @@ async fn drift_after_external_md_edit_detected() {
 // --- 3. drift_missing_md_file_reported ---
 
 /// Écrit une note, supprime le fichier .md, lance drift_check → fichier signalé
-/// dans DriftScanResult::missing.
+/// dans DriftScanResult::missing (classe « entrée sans fichier », direction index→disque).
 ///
-/// Ignoré : même raison que le test précédent (`upsert_file_checksum` non câblé).
+/// Réactivé (F-174) : même raison que le test précédent — `file_checksums` est alimentée
+/// depuis F-165, donc l'entrée orpheline (fichier supprimé) est détectée.
 #[tokio::test]
-#[ignore = "Phase 2+ : blocked by Vault::write_note stub (upsert_file_checksum not called)"]
 async fn drift_missing_md_file_reported() {
     let tmp = TempDir::new().unwrap();
     let vault = Vault::create(tmp.path(), VaultId::new("main"))

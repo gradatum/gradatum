@@ -71,13 +71,16 @@ fn is_standard_section(section: &str) -> bool {
 
 /// Maps a CHANGELOG section name onto a [`KindKind`].
 ///
-/// Unknown sections map to [`KindKind::Task`] and emit a warning log.
+/// `Removed` and `Deprecated` map to [`KindKind::Task`] — the catch-all that absorbs
+/// the former `Chore` kind. Since only `kind:FEATURE` reaches the public website, this
+/// coarser mapping changes no Keep-a-Changelog grouping. Unknown sections also map to
+/// [`KindKind::Task`], but additionally emit a warning log.
 fn section_to_kind(section: &str) -> KindKind {
     match section {
         "Added" => KindKind::Feature,
         "Changed" | "Performance" => KindKind::Enhancement,
         "Fixed" | "Security" | "Privacy" => KindKind::Fix,
-        "Removed" | "Deprecated" => KindKind::Chore,
+        "Removed" | "Deprecated" => KindKind::Task,
         other => {
             tracing::warn!(
                 section = other,

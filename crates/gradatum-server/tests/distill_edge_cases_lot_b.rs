@@ -19,7 +19,7 @@ use ulid::Ulid;
 ///
 /// Un cluster avec une seule note doit produire une synthèse valide
 /// sans erreur "cluster trop petit". Ce test valide que la structure
-/// `ClusterSynthesis` accepte un cluster vide ou singleton.
+/// `gradatum_distill::ClusterSynthesis` accepte un cluster vide ou singleton.
 #[test]
 fn distill_singleton_cluster_creates_synthesis() {
     // Vérifier que les types existent et sont constructibles.
@@ -181,9 +181,10 @@ async fn distill_trust_decay_disabled_config() {
 fn distill_config_scoring_defaults() {
     let cfg = gradatum_server::config::ScoringConfig::default();
 
-    // Defaults : true pour decay, distilled=90.0.
+    // Defaults : true pour decay, Event=90.0 (F-261 — clé doc_kind, plus provenance).
     assert!(cfg.trust_decay_enabled);
-    assert_eq!(cfg.half_life_days.get("distilled"), Some(&90.0));
+    assert_eq!(cfg.half_life_days.get("Event"), Some(&90.0));
+    assert!(!cfg.half_life_days.contains_key("Static"));
 }
 
 /// Test désactivation trust_decay pour compatibilité v0.4.3.

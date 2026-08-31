@@ -10,10 +10,19 @@
 //!
 //! | Method | Path | ACL | Codes |
 //! |--------|------|-----|-------|
-//! | POST | `/api/v1/vault_history`     | Read  | 200 / 401 / 403 / 404 / 500 |
-//! | POST | `/api/v1/vault_history_get` | Read  | 200 / 401 / 403 / 404 / 500 |
-//! | POST | `/api/v1/vault_restore`     | Write | 200 / 401 / 403 / 404 / 500 |
-//! | POST | `/api/v1/vault_diff`        | Read  | 200 / 401 / 403 / 400 / 404 / 500 |
+//! | POST | `/api/v1/vault_history`     | Read  | 200 / 400 / 401 / 403 / 404 / 500 |
+//! | POST | `/api/v1/vault_history_get` | Read  | 200 / 400 / 401 / 403 / 404 / 500 |
+//! | POST | `/api/v1/vault_restore`     | Write | 200 / 400 / 401 / 403 / 404 / 500 |
+//! | POST | `/api/v1/vault_diff`        | Read  | 200 / 400 / 401 / 403 / 404 / 500 |
+//!
+//! # Formes de référence acceptées (F-215 critère 4)
+//!
+//! Les quatre endpoints partagent le champ `note_id` et le résolvent **à parité avec
+//! `vault_read`** : ULID nu, forme préfixée `section/ULID` (celle que `vault_search`
+//! renvoie dans son champ `path`), titre exact, ou slug de redirection. Une référence
+//! qui ne résout vers aucune note est un **400 nommé** citant la valeur reçue — plus
+//! jamais un 500 « storage error: invalid ULID », qui déguisait un refus d'entrée en
+//! panne interne. Cf. `logic::resolve_note_ref_strict`.
 
 use axum::{Extension, Json, extract::State, http::StatusCode};
 use gradatum_core::trust::TrustContext;
@@ -34,6 +43,7 @@ pub use gradatum_dto::{
 ///
 /// ## Error codes
 ///
+/// - `400`: `note_id` resolves to no note (see the module-level accepted forms).
 /// - `401`: missing or invalid bearer token.
 /// - `403`: ACL Read denied.
 /// - `500`: unexpected error (log emitted).
@@ -54,6 +64,7 @@ pub async fn vault_history(
 ///
 /// ## Error codes
 ///
+/// - `400`: `note_id` resolves to no note (see the module-level accepted forms).
 /// - `401`: missing or invalid bearer token.
 /// - `403`: ACL Read denied.
 /// - `404`: snapshot or note not found.
@@ -80,6 +91,7 @@ pub async fn vault_history_get(
 ///
 /// ## Error codes
 ///
+/// - `400`: `note_id` resolves to no note (see the module-level accepted forms).
 /// - `401`: missing or invalid bearer token.
 /// - `403`: ACL Write denied.
 /// - `404`: snapshot or note not found.
@@ -106,7 +118,8 @@ pub async fn vault_restore(
 ///
 /// ## Error codes
 ///
-/// - `400`: selector `a` or `b` is invalid (neither a timestamp nor `"current"`).
+/// - `400`: selector `a` or `b` is invalid (neither a timestamp nor `"current"`), or
+///   `note_id` resolves to no note (see the module-level accepted forms).
 /// - `401`: missing or invalid bearer token.
 /// - `403`: ACL Read denied.
 /// - `404`: note or snapshot not found.

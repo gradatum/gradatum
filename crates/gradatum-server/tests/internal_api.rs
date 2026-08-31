@@ -1081,36 +1081,46 @@ async fn get_count(env: &InternalTestEnv, uri: &str) -> (StatusCode, serde_json:
     (status, json)
 }
 
-/// F-112 : count-unprocessed — live + !processed seulement, locus filtré.
+/// F-112 : count-unprocessed — live + !processed seulement, SECTION filtrée.
+///
+/// L'axe est la section canonique, PAS le locus : une note `section = debug` mais
+/// `locus = experiments` (n5) est comptée — l'ancien endpoint `locus=debug` ne l'aurait
+/// pas vue. Le locus reste posé sur les fixtures pour prouver que le comptage ignore
+/// l'axe qui était NULL sur tout le corpus.
 #[tokio::test]
-async fn count_unprocessed_counts_live_unprocessed_in_locus() {
+async fn count_unprocessed_counts_live_unprocessed_in_section() {
     let env = build_internal_env().await;
 
-    // n1 : live, processed absent, locus debug → comptée.
+    // n1 : live, processed absent, section debug → comptée.
     seed_note_with_locus(&env, "debug", "live", "debug").await;
-    // n2 : live, processed=true, locus debug → exclue.
+    // n2 : live, processed=true, section debug → exclue.
     // (mark_processed réécrit le .md → poser le locus APRÈS, l'upsert hash-changé
     //  appliquerait excluded.locus=NULL sinon.)
     let n2 = seed_note_with_locus(&env, "debug", "live", "debug").await;
     mark_processed(&env, &n2, "debug").await;
     set_locus(&env, &n2, "debug").await;
-    // n3 : draft (non-live), locus debug → exclue.
+    // n3 : draft (non-live), section debug → exclue.
     seed_note_with_locus(&env, "debug", "draft", "debug").await;
-    // n4 : live, autre locus → exclue.
+    // n4 : live, AUTRE section → exclue.
     seed_note_with_locus(&env, "experiments", "live", "experiments").await;
+    // n5 : live, section debug mais LOCUS experiments → comptée (l'axe est la section).
+    seed_note_with_locus(&env, "debug", "live", "experiments").await;
 
     let (status, json) = get_count(
         &env,
-        "/internal/v1/notes/count-unprocessed?vault=main&locus=debug",
+        "/internal/v1/notes/count-unprocessed?vault=main&section=debug",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["count"], 1, "1 seule note live non-processed : {json}");
+    assert_eq!(
+        json["count"], 2,
+        "n1 + n5 (live, non-processed, section debug) : {json}"
+    );
 }
 
-/// F-112 : paramètre `locus` absent → 400.
+/// F-112 : paramètre `section` absent → 400.
 #[tokio::test]
-async fn count_unprocessed_missing_locus_is_400() {
+async fn count_unprocessed_missing_section_is_400() {
     let env = build_internal_env().await;
     let (status, _) = get_count(&env, "/internal/v1/notes/count-unprocessed?vault=main").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1126,7 +1136,7 @@ async fn count_unprocessed_min_caps_count() {
 
     let (status, json) = get_count(
         &env,
-        "/internal/v1/notes/count-unprocessed?vault=main&locus=debug&min=2",
+        "/internal/v1/notes/count-unprocessed?vault=main&section=debug&min=2",
     )
     .await;
     assert_eq!(status, StatusCode::OK);

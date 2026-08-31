@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use gradatum_core::error::GradatumError;
 use gradatum_core::identity::{NoteId, NoteVersion};
+use gradatum_storage::Storage; // trait in scope: `self.storage` is the concrete NoteWriteGuard (F-176)
 // Note Étape 0.1 : get_content_hash et get_note sont des méthodes publiques sur SqliteIndex.
 // DocumentStore as _ serait nécessaire si on passait par Arc<dyn DocumentStore>.
 use gradatum_core::note::EffectiveNote;

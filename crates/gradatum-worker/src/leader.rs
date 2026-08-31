@@ -12,10 +12,10 @@
 //! If renewal fails (DB unreachable, lost lock), the task terminates
 //! silently — the main worker must monitor the `JoinHandle`.
 
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sqlx::SqlitePool;
+use gradatum_db_sqlite::QueueDb;
+use rusqlite::params;
 
 /// Configuration for leader election.
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ impl Default for LeaderConfig {
 /// dispatch code without duplicating the DB connection.
 #[derive(Clone)]
 pub struct LeaderElection {
-    pool: Arc<SqlitePool>,
+    db: QueueDb,
     /// Unique identifier for this worker (ULID generated at creation).
     holder: String,
     cfg: LeaderConfig,
@@ -50,11 +50,11 @@ pub struct LeaderElection {
 impl LeaderElection {
     /// Creates a new election handle.
     ///
-    /// The `pool` must already have the `worker_leadership` schema applied
+    /// The `db` must already have the `worker_leadership` schema applied
     /// (via [`gradatum_queue::schema::SCHEMA_V1`]).
-    pub async fn new(pool: Arc<SqlitePool>, cfg: LeaderConfig) -> anyhow::Result<Self> {
+    pub async fn new(db: QueueDb, cfg: LeaderConfig) -> anyhow::Result<Self> {
         let holder = ulid::Ulid::generate().to_string();
-        Ok(Self { pool, holder, cfg })
+        Ok(Self { db, holder, cfg })
     }
 
     /// Returns the current timestamp in Unix milliseconds.
@@ -86,34 +86,35 @@ impl LeaderElection {
     pub async fn try_acquire(&self) -> anyhow::Result<bool> {
         let now = Self::now_ms();
         let expires = now + self.cfg.expires_after.as_millis() as i64;
+        let holder = self.holder.clone();
+        let db = self.db.clone();
 
-        // Attempt 1: INSERT OR IGNORE (slot absent → this worker wins).
-        let r = sqlx::query(
-            "INSERT OR IGNORE INTO worker_leadership (slot, holder, expires_at) VALUES (0, ?, ?)",
-        )
-        .bind(&self.holder)
-        .bind(expires)
-        .execute(self.pool.as_ref())
-        .await?;
+        // Les deux tentatives s'exécutent sur un fil bloquant sous le verrou unique
+        // (motif de pont F-145) — pas d'attente async sous verrou.
+        let acquired = db
+            .with_conn(move |conn| {
+                // Attempt 1: INSERT OR IGNORE (slot absent → this worker wins).
+                let inserted = conn.execute(
+                    "INSERT OR IGNORE INTO worker_leadership (slot, holder, expires_at) VALUES (0, ?1, ?2)",
+                    params![holder, expires],
+                )?;
+                if inserted == 1 {
+                    return Ok(true);
+                }
 
-        if r.rows_affected() == 1 {
-            return Ok(true);
-        }
+                // Attempt 2: CAS on the existing slot (leader expired OR already held by us).
+                let updated = conn.execute(
+                    "UPDATE worker_leadership
+                     SET holder = ?1, expires_at = ?2
+                     WHERE slot = 0 AND (expires_at < ?3 OR holder = ?4)",
+                    params![holder, expires, now, holder],
+                )?;
+                Ok(updated == 1)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("leader election try_acquire failed: {e}"))?;
 
-        // Attempt 2: CAS on the existing slot (leader expired OR already held by us).
-        let r = sqlx::query(
-            "UPDATE worker_leadership
-             SET holder = ?, expires_at = ?
-             WHERE slot = 0 AND (expires_at < ? OR holder = ?)",
-        )
-        .bind(&self.holder)
-        .bind(expires)
-        .bind(now)
-        .bind(&self.holder)
-        .execute(self.pool.as_ref())
-        .await?;
-
-        Ok(r.rows_affected() == 1)
+        Ok(acquired)
     }
 
     /// Renews the current leader's lease.
@@ -123,14 +124,20 @@ impl LeaderElection {
     pub async fn renew(&self) -> anyhow::Result<bool> {
         let now = Self::now_ms();
         let expires = now + self.cfg.expires_after.as_millis() as i64;
-        let r = sqlx::query(
-            "UPDATE worker_leadership SET expires_at = ? WHERE slot = 0 AND holder = ?",
-        )
-        .bind(expires)
-        .bind(&self.holder)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(r.rows_affected() == 1)
+        let holder = self.holder.clone();
+        let db = self.db.clone();
+
+        let updated = db
+            .with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE worker_leadership SET expires_at = ?1 WHERE slot = 0 AND holder = ?2",
+                    params![expires, holder],
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("leader election renew failed: {e}"))?;
+
+        Ok(updated == 1)
     }
 
     /// Releases this worker's leadership lease.
@@ -142,13 +149,18 @@ impl LeaderElection {
     /// ## Side effects
     ///
     /// - If the row does not exist (already expired or claimed), this is a no-op.
-    /// - If the DB is unreachable (pool closed, locked), the error propagates —
+    /// - If the DB is unreachable (database locked), the error propagates —
     ///   the caller decides whether it is critical (`.ok()` for best-effort).
     pub async fn release(&self) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM worker_leadership WHERE holder = ?")
-            .bind(&self.holder)
-            .execute(self.pool.as_ref())
-            .await?;
+        let holder = self.holder.clone();
+        let db = self.db.clone();
+
+        db.with_conn(move |conn| {
+            conn.execute("DELETE FROM worker_leadership WHERE holder = ?1", [holder])?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("leader election release failed: {e}"))?;
         Ok(())
     }
 

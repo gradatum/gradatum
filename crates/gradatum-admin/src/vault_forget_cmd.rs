@@ -43,8 +43,9 @@ use gradatum_core::{
     paths::{queue_db_path, vault_index_path},
     section::Section,
 };
-use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
-use sqlx::SqlitePool;
+use gradatum_db_sqlite::{
+    QueueDb, SqliteQueueStore, apply_sqlite_pragmas, open_queue_db, run_migrations,
+};
 use ulid::Ulid;
 
 // ── Protected sections ────────────────────────────────────────────────────────
@@ -587,20 +588,19 @@ fn build_forget_job_record(
 
 // ── Queue pool ────────────────────────────────────────────────────────────────
 
-async fn open_queue_pool(root: &std::path::Path) -> Result<SqlitePool> {
+async fn open_queue_pool(root: &std::path::Path) -> Result<QueueDb> {
     // SSOT : chemin via helper canonique — jamais root.join(...) manuel.
     let db_path = queue_db_path(root);
-    let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    let pool = SqlitePool::connect(&url)
+    let db = open_queue_db(&db_path)
         .await
         .with_context(|| format!("cannot open the SQLite queue: {}", db_path.display()))?;
-    apply_sqlite_pragmas(&pool)
+    apply_sqlite_pragmas(&db)
         .await
         .context("queue WAL pragmas error")?;
-    run_migrations(&pool)
+    run_migrations(&db)
         .await
         .context("queue migrations error")?;
-    Ok(pool)
+    Ok(db)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

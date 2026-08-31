@@ -134,8 +134,7 @@ impl ContentHash {
     /// a strictly IEEE 754 serialiser would produce.
     ///
     /// **Caveat**: if a `toml::Value::Float(f64::NAN)` is inserted into `extra` programmatically
-    // scan-fr-strings: allow-jargon § — citation de la section 3.3 de la RFC TOML, pas un renvoi de spec interne
-    /// (TOML does not parse `NaN` per RFC 3.3 §2.3, but it can be constructed in code),
+    /// (TOML does not parse `NaN` per RFC 3.3 section 2.3, but it can be constructed in code),
     /// `serde_jcs` will serialise it as `null`, potentially producing a hash collision with
     /// a note that has a `null` for that field. Avoid non-finite floats in `extra`.
     pub fn compute(frontmatter: &Frontmatter, body: &str) -> Self {

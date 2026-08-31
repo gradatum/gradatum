@@ -11,7 +11,8 @@ use gradatum_index::SqliteIndex;
 use tempfile::TempDir;
 
 /// Crée l'arborescence TempDir minimale mimant `/var/lib/gradatum` :
-///   - `db/queue.sqlite`  (créé par SqliteQueue::new)
+///   - `db/queue.sqlite`  (schéma `gradatum_jobs` via run_migrations — la file
+///     vivante que backfill enfile et que le worker draine, F-175)
 ///   - `vault/.gradatum/index.db`  (créé par SqliteIndex::open)
 ///
 /// Retourne `(root, TempDir)` — TempDir doit rester alive le temps du test.
@@ -30,12 +31,19 @@ async fn setup_root() -> (std::path::PathBuf, TempDir) {
         .expect("SqliteIndex::open pour init schéma");
     // Le SqliteIndex est droppé ici → verrou WAL libéré
 
-    // Initialiser la queue via SqliteQueue
+    // Initialiser la file `gradatum_jobs` via les migrations (mêmes que le serveur).
+    // Depuis F-175, backfill enfile dans `gradatum_jobs` (créée par migration 006+) ;
+    // la file legacy `jobs_v2` est supprimée depuis 2.1.0 (F-177, migration 012).
+    // Le schéma de test doit donc porter `gradatum_jobs`.
     let queue_path = root.join("db/queue.sqlite");
-    gradatum_queue::SqliteQueue::new(&queue_path)
-        .await
-        .expect("SqliteQueue::new pour init schéma");
-    // Le SqliteQueue est droppé ici
+    {
+        let db = gradatum_db_sqlite::open_queue_db(&queue_path)
+            .await
+            .expect("db queue init");
+        gradatum_db_sqlite::run_migrations(&db)
+            .await
+            .expect("migrations queue (gradatum_jobs)");
+    }
 
     (root, tmp)
 }
@@ -59,7 +67,7 @@ fn insert_note(conn: &rusqlite::Connection, note_id: &str, vault_id: &str, body_
             note_id,
             vault_id,
             "reference",  // section
-            "indexed",    // status
+            "live",       // status (C4/F-175 : seules les notes 'live' sont collectées)
             1i64,         // schema_version
             1_700_000_000_000i64, // created (epoch ms)
             hash,
@@ -112,17 +120,23 @@ async fn backfill_idempotent_re_run_skips_embedded() {
 
     let index_path = root.join("vault/.gradatum/index.db");
 
+    // ULID réels : la colonne notes.id est un ULID et EmbedSpec.note_id: Ulid — le
+    // backfill parse l'id, un placeholder court échouerait au parse.
+    let n1 = ulid::Ulid::generate().to_string();
+    let n2 = ulid::Ulid::generate().to_string();
+    let n3 = ulid::Ulid::generate().to_string();
+
     // Insérer 3 notes dans l'index
     {
         let conn = rusqlite::Connection::open(&index_path).expect("open index");
-        insert_note(&conn, "01AAAA", "main", "Corps de la note 1");
-        insert_note(&conn, "01BBBB", "main", "Corps de la note 2");
-        insert_note(&conn, "01CCCC", "main", "Corps de la note 3");
+        insert_note(&conn, &n1, "main", "Corps de la note 1");
+        insert_note(&conn, &n2, "main", "Corps de la note 2");
+        insert_note(&conn, &n3, "main", "Corps de la note 3");
 
         // Marquer les notes 1 et 2 comme déjà embedded
-        insert_embedding(&conn, "01AAAA", "bge-small");
-        insert_embedding(&conn, "01BBBB", "bge-small");
-        // Note 3 (01CCCC) n'a pas d'embedding
+        insert_embedding(&conn, &n1, "bge-small");
+        insert_embedding(&conn, &n2, "bge-small");
+        // Note 3 (n3) n'a pas d'embedding
     }
 
     // Run 1 : seule la note 3 doit être enqueued
@@ -139,7 +153,7 @@ async fn backfill_idempotent_re_run_skips_embedded() {
     // Marquer la note 3 comme embedded (simuler traitement worker)
     {
         let conn = rusqlite::Connection::open(&index_path).expect("open index");
-        insert_embedding(&conn, "01CCCC", "bge-small");
+        insert_embedding(&conn, &n3, "bge-small");
     }
 
     // Run 2 : toutes les notes sont embedded → 0 jobs

@@ -7,10 +7,13 @@
 //! - Verifies `file_checksums` entries: size + 4 KB prefix, then full SHA-256.
 //! - Returns a `DriftScanResult` with counters and the list of missing files.
 //!
-//! ## Untracked-file detection (phase B)
+//! ## Untracked-file detection (phase B) + vector dimension
 //!
-//! Filesystem walk for `.md` files absent from `file_checksums`, plus reconstruction
-//! (re-parse + re-index + `AuditEvent::DriftFixed`) are deferred.
+//! `scan_phase_a` now also walks the filesystem for `.md` note files absent from
+//! `file_checksums` (`DriftScanResult::untracked`, direction disk → index) and counts
+//! live notes with no embedding (`DriftScanResult::live_notes_without_vector`, vector
+//! dimension). **Detection only** — reconstruction (re-parse + re-index + re-embed) remains
+//! deferred to its dedicated, gated entry point: the scan signals, it never repairs.
 
 use gradatum_core::error::GradatumError;
 use gradatum_index::drift::{DriftScanResult, scan_phase_a};
@@ -35,16 +38,19 @@ impl Vault {
     /// `scan_phase_a` receives `&self.storage` (`FileStorage` OpenDAL) — drift I/O
     /// goes through the `Storage` abstraction.
     ///
-    /// ## Phase B / Phase C
+    /// ## Both directions + vector dimension
     ///
-    /// Detection of untracked files (present on disk, absent from `file_checksums`)
-    /// and reconstruction (re-parse + re-index) are deferred.
+    /// The scan also reports files present on disk but absent from `file_checksums`
+    /// (`untracked`) and live notes without an embedding (`live_notes_without_vector`).
+    /// Reconstruction (re-parse + re-index + re-embed) stays deferred to its dedicated
+    /// gated entry point — the scan detects, it does not repair.
     ///
     /// ## Errors
     ///
     /// - `GradatumError::Storage` if reading checksums from SQLite fails.
     /// - `GradatumError::Storage` if reading an existing file fails (permissions, etc.).
     pub async fn drift_check(&self) -> Result<DriftScanResult, GradatumError> {
-        scan_phase_a(self.storage.as_ref(), &self.index).await
+        // `&self.storage` (NoteWriteGuard) coerces to `&dyn Storage` for the read-only scan.
+        scan_phase_a(&self.storage, &self.index).await
     }
 }

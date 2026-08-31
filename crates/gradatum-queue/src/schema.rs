@@ -2,7 +2,6 @@
 //!
 //! ## Primary schema
 //!
-//! - `jobs_v2`: main queue with expirable lease and dead-letter retry
 //! - `worker_leadership`: single slot for leader election
 //!
 //! ## Legacy schema (backward compatibility)
@@ -32,37 +31,15 @@ pub const CREATE_IDX_JOBS_STATUS_LEASE: &str = "
 CREATE INDEX IF NOT EXISTS idx_jobs_status_lease ON jobs(status, lease_until);
 ";
 
-/// Primary DDL — sqlx-based schema with AUTOINCREMENT, `tenant_id`, and `BLOB` payload.
+/// Primary DDL — schema for the leader-election slot.
 ///
-/// Two tables:
-/// - `jobs_v2`: main queue with expirable lease and dead-letter retry
+/// The legacy `jobs_v2` queue no longer exists: the live job queue
+/// lives in `gradatum_jobs`, owned by `gradatum_db_sqlite`. Only the single-slot
+/// leader election remains.
+///
+/// One table:
 /// - `worker_leadership`: single slot for leader election
-///
-/// Indexes:
-/// - `idx_jobs_v2_pending`: fast filtering on `status='pending'` with FIFO ordering
-/// - `idx_jobs_v2_lease`: harvesting expired leases
 pub const SCHEMA_V1: &str = "
-CREATE TABLE IF NOT EXISTS jobs_v2 (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id    TEXT    NOT NULL DEFAULT 'main',
-    kind         TEXT    NOT NULL,
-    payload      BLOB    NOT NULL,
-    status       TEXT    NOT NULL DEFAULT 'pending',
-    attempts     INTEGER NOT NULL DEFAULT 0,
-    max_attempts INTEGER NOT NULL DEFAULT 5,
-    lease_until  INTEGER,
-    leased_by    TEXT,
-    created_at   INTEGER NOT NULL,
-    updated_at   INTEGER NOT NULL,
-    last_error   TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_jobs_v2_pending
-    ON jobs_v2 (status, created_at) WHERE status = 'pending';
-
-CREATE INDEX IF NOT EXISTS idx_jobs_v2_lease
-    ON jobs_v2 (lease_until) WHERE status = 'leased';
-
 CREATE TABLE IF NOT EXISTS worker_leadership (
     slot       INTEGER PRIMARY KEY,
     holder     TEXT    NOT NULL,

@@ -47,20 +47,21 @@ use tracing::info;
 
 use gradatum_core::QueueStore;
 use gradatum_curator::CuratorProcess;
+use gradatum_db_sqlite::QueueDb;
 use gradatum_embed::Embedder;
-use sqlx::SqlitePool;
 
 use crate::internal_client::InternalClient;
 
 use super::apalis_backend::build_gradatum_backend;
 use super::apalis_handlers::{
-    DistillSynthesizer, MultiTenantCfg, handle_curate, handle_distill, handle_embed, handle_forget,
-    handle_purge, handle_reindex, handle_validate,
+    MultiTenantCfg, handle_curate, handle_distill, handle_embed, handle_forget, handle_purge,
+    handle_reindex, handle_validate,
 };
 use super::metrics::WorkerMetrics;
 use super::schedules::{
     DistillCronConfig, ScheduleConfig, handle_cleanup_dlq, handle_distill_cron,
 };
+use gradatum_distill::DistillSynthesizer;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -270,7 +271,7 @@ pub struct MonitorDeps {
     pub embedder: Arc<dyn Embedder + Send + Sync>,
     /// Cluster synthesiser — distillation (distill worker).
     ///
-    /// Pluggable: `TemplateSynthesizer` (deterministic, default) or an LLM
+    /// Pluggable: `gradatum_distill::TemplateSynthesizer` (deterministic, default) or an LLM
     /// gateway backend swapped in without changing the handler.
     pub distill_synthesizer: Arc<dyn DistillSynthesizer + Send + Sync>,
 }
@@ -280,7 +281,7 @@ pub struct MonitorDeps {
 /// # Parameters
 ///
 /// - `store`: `QueueStore` implementation shared across workers
-/// - `pool`: SQLite pool for cron schedules (`cleanup_dlq_daily`)
+/// - `db`: SQLite database handle for cron schedules (`cleanup_dlq_daily`)
 /// - `deps`: handler dependencies — vault, curator, embedder, index
 /// - `config`: worker and schedule configuration read from TOML
 /// - `distill_cron`: top-level `[distill_cron]` config — validated fail-loud here
@@ -300,7 +301,7 @@ pub struct MonitorDeps {
 )]
 pub fn build_monitor(
     store: Arc<dyn QueueStore + Send + Sync>,
-    pool: Arc<SqlitePool>,
+    db: QueueDb,
     deps: MonitorDeps,
     config: &ApalisConfig,
     distill_cron: DistillCronConfig,
@@ -602,7 +603,7 @@ pub fn build_monitor(
         if sched_cfg.name == "cleanup_dlq_daily" {
             let retention = sched_cfg.retention_days;
             let cron_expr = sched_cfg.cron.clone();
-            let dlq_pool = Arc::clone(&pool);
+            let dlq_db = db.clone();
             // Validate the cron expression before registering.
             Schedule::from_str(&cron_expr).map_err(|e| {
                 anyhow::anyhow!(
@@ -623,8 +624,8 @@ pub fn build_monitor(
                     .expect("cron expression validated before registration — cannot fail here");
                 WorkerBuilder::new("cleanup-dlq-daily")
                     .backend(CronStream::new(schedule))
-                    // Inject pool and retention via Data (apalis::prelude::Data).
-                    .data(Arc::clone(&dlq_pool))
+                    // Inject db and retention via Data (apalis::prelude::Data).
+                    .data(dlq_db.clone())
                     .data(retention)
                     .enable_tracing()
                     .catch_panic()
@@ -650,13 +651,28 @@ pub fn build_monitor(
         let client_dc = Arc::clone(&client);
         let store_dc = Arc::clone(&store);
         let metrics_dc = metrics.clone();
-        info!(
-            cron = %dc.cron,
-            loci = ?dc.loci,
-            pressure_min = dc.pressure_min,
-            max_jobs_per_tick = dc.max_jobs_per_tick,
-            "cron schedule registered: distill_pressure"
-        );
+        // Le registre DISTINGUE « N sections visées » de « AUCUNE section — inerte ».
+        // Un vide silencieux se relirait comme une panne six mois plus tard — exactement
+        // le défaut diagnostiqué sur le locus NULL. `sections = []` est un état légitime.
+        if dc.sections.is_empty() {
+            info!(
+                cron = %dc.cron,
+                sections = 0,
+                pressure_min = dc.pressure_min,
+                max_jobs_per_tick = dc.max_jobs_per_tick,
+                "cron schedule registered: distill_pressure — no section targeted — inert"
+            );
+        } else {
+            info!(
+                cron = %dc.cron,
+                sections = ?dc.sections,
+                section_count = dc.sections.len(),
+                pressure_min = dc.pressure_min,
+                max_jobs_per_tick = dc.max_jobs_per_tick,
+                "cron schedule registered: distill_pressure — {} sections targeted",
+                dc.sections.len()
+            );
+        }
         monitor = monitor.register(move |_idx| {
             // CronStream is not Clone — rebuild the Schedule on each factory call
             // (validated by distill_cron.validate() above → cannot fail here).

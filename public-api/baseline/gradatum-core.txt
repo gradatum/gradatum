@@ -415,6 +415,7 @@ pub fn gradatum_core::index_store::IndexStore::hydrate_lessons_by_ulids<'life0, 
 pub fn gradatum_core::index_store::IndexStore::id_lookup<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<alloc::string::String>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::insert_metric_samples<'life0, 'life1, 'async_trait>(&'life0 self, i64, &'life1 [(alloc::string::String, f64)]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<usize, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::is_note_forgotten<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_core::index_store::IndexStore::last_indexed_at<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<i64>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::list_active_vaults<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::scope::VaultId>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::list_distinct_metric_series<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::string::String>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::list_file_checksums<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::index::FileChecksumEntry>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -422,7 +423,9 @@ pub fn gradatum_core::index_store::IndexStore::list_garbage_older_than<'life0, '
 pub fn gradatum_core::index_store::IndexStore::list_notes<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 str, core::option::Option<&'life2 str>, usize, core::option::Option<&'life3 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(alloc::vec::Vec<gradatum_core::index::NoteRecord>, u64), gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::list_notes_by_agent<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 [alloc::string::String]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<(alloc::string::String, alloc::string::String)>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::list_notes_by_locus_prefix<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<(alloc::string::String, alloc::string::String)>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_core::index_store::IndexStore::list_notes_by_section<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<(alloc::string::String, alloc::string::String)>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::list_notes_by_status<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(&'life0 self, &'life1 str, &'life2 [&'life3 str], core::option::Option<&'life4 str>, usize, core::option::Option<&'life5 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(alloc::vec::Vec<gradatum_core::index::NoteRecord>, u64), gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait, 'life5: 'async_trait
+pub fn gradatum_core::index_store::IndexStore::list_notes_filtered<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(&'life0 self, &'life1 str, core::option::Option<&'life2 str>, core::option::Option<&'life3 str>, core::option::Option<&'life4 str>, usize, core::option::Option<&'life5 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(alloc::vec::Vec<gradatum_core::index::NoteRecord>, u64), gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait, 'life5: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::list_recent_notes<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str, usize) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::index::NoteRecord>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::list_review_queue<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::scope::VaultId, core::option::Option<&'life2 str>, usize) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::index_store::ReviewQueueRow>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn gradatum_core::index_store::IndexStore::list_scheduled_health<'life0, 'async_trait>(&'life0 self, i64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::scheduled_health::ScheduledTaskHealth>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -538,6 +541,7 @@ pub fn gradatum_core::job::JobPriority::default_for(&gradatum_core::job::JobClas
 #[non_exhaustive] pub enum gradatum_core::job::JobScope
 pub gradatum_core::job::JobScope::Locus(alloc::string::String)
 pub gradatum_core::job::JobScope::Notes(alloc::vec::Vec<ulid::Ulid>)
+pub gradatum_core::job::JobScope::Section(alloc::string::String)
 pub gradatum_core::job::JobScope::Session(ulid::Ulid)
 pub gradatum_core::job::JobScope::Vault(alloc::string::String)
 pub gradatum_core::job::JobScope::VaultWide
@@ -871,11 +875,9 @@ pub gradatum_core::project_map::AnnexRole::Spec
 impl gradatum_core::project_map::AnnexRole
 pub const fn gradatum_core::project_map::AnnexRole::prefix(&self) -> &'static str
 #[non_exhaustive] pub enum gradatum_core::project_map::KindKind
-pub gradatum_core::project_map::KindKind::Chore
 pub gradatum_core::project_map::KindKind::Enhancement
 pub gradatum_core::project_map::KindKind::Feature
 pub gradatum_core::project_map::KindKind::Fix
-pub gradatum_core::project_map::KindKind::Spike
 pub gradatum_core::project_map::KindKind::Task
 impl gradatum_core::project_map::KindKind
 pub const fn gradatum_core::project_map::KindKind::as_wire(&self) -> &'static str
@@ -932,6 +934,7 @@ pub gradatum_core::project_map::StatusKind::Obsolete
 pub gradatum_core::project_map::StatusKind::Open
 impl gradatum_core::project_map::StatusKind
 pub const fn gradatum_core::project_map::StatusKind::as_wire(&self) -> &'static str
+pub fn gradatum_core::project_map::StatusKind::from_wire(&str) -> core::option::Option<Self>
 pub struct gradatum_core::project_map::ExportOptions
 pub gradatum_core::project_map::ExportOptions::include_dropped: bool
 pub struct gradatum_core::project_map::FeatureEntry
@@ -939,19 +942,22 @@ pub gradatum_core::project_map::FeatureEntry::feature: alloc::string::String
 pub gradatum_core::project_map::FeatureEntry::release: alloc::string::String
 pub gradatum_core::project_map::FeatureEntry::title: alloc::string::String
 pub gradatum_core::project_map::FeatureEntry::version: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct gradatum_core::project_map::ProjectMapRoles
+pub gradatum_core::project_map::ProjectMapRoles::kind: core::option::Option<&'static str>
+pub gradatum_core::project_map::ProjectMapRoles::status: core::option::Option<&'static str>
 pub fn gradatum_core::project_map::feature_identity_from_targets(&[alloc::string::String]) -> alloc::vec::Vec<alloc::string::String>
 pub fn gradatum_core::project_map::map_version_raw(&str) -> core::option::Option<alloc::string::String>
 pub fn gradatum_core::project_map::max_feature_number(&str) -> core::option::Option<u32>
 pub fn gradatum_core::project_map::parse_link(&str) -> core::result::Result<gradatum_core::project_map::ProjectMapLink, gradatum_core::project_map::SchemaError>
 pub fn gradatum_core::project_map::project_map_feature_entries(&[(alloc::string::String, alloc::string::String)], gradatum_core::project_map::ExportOptions) -> alloc::vec::Vec<gradatum_core::project_map::FeatureEntry>
 pub fn gradatum_core::project_map::reserved_node_target(&str) -> core::option::Option<alloc::string::String>
+pub fn gradatum_core::project_map::roles_of_body(&str) -> gradatum_core::project_map::ProjectMapRoles
 pub fn gradatum_core::project_map::validate_links(&[gradatum_core::project_map::ProjectMapLink]) -> core::result::Result<(), gradatum_core::project_map::SchemaError>
 pub fn gradatum_core::project_map::validate_links_from_targets(&[alloc::string::String]) -> core::result::Result<(), gradatum_core::project_map::SchemaError>
 pub mod gradatum_core::provenance
 pub const gradatum_core::provenance::TRUST_SCORES: &[(&str, f32)]
 pub trait gradatum_core::provenance::TrustLookup
 pub fn gradatum_core::provenance::TrustLookup::get_trust(&self, &ulid::Ulid) -> core::option::Option<f32>
-pub fn gradatum_core::provenance::compute_distill_trust(&[ulid::Ulid], &dyn gradatum_core::provenance::TrustLookup, f32) -> f32
 pub fn gradatum_core::provenance::resolve_provenance(core::option::Option<&str>) -> &'static str
 pub fn gradatum_core::provenance::trust_for(&str) -> core::option::Option<f32>
 pub mod gradatum_core::scheduled_health
@@ -1163,7 +1169,7 @@ pub fn gradatum_core::secrets::EnvSecretsProvider::get(&self, &str) -> core::res
 impl gradatum_core::secrets::SecretsProvider for gradatum_core::secrets::FileSecretsProvider
 pub fn gradatum_core::secrets::FileSecretsProvider::get(&self, &str) -> core::result::Result<gradatum_core::secrets::SecretBytes, gradatum_core::secrets::SecretsError>
 pub mod gradatum_core::section
-pub enum gradatum_core::section::Section
+#[non_exhaustive] pub enum gradatum_core::section::Section
 pub gradatum_core::section::Section::AgentIssues
 pub gradatum_core::section::Section::Architecture
 pub gradatum_core::section::Section::Council
@@ -1177,8 +1183,10 @@ pub gradatum_core::section::Section::ProjectMap
 pub gradatum_core::section::Section::Reasoning
 pub gradatum_core::section::Section::Reference
 pub gradatum_core::section::Section::Retrospectives
+pub gradatum_core::section::Section::Snapshot
 impl gradatum_core::section::Section
-pub const gradatum_core::section::Section::ALL: [gradatum_core::section::Section; 13]
+pub const gradatum_core::section::Section::ALL: [gradatum_core::section::Section; 14]
+pub const gradatum_core::section::Section::DEFAULT_SEARCH_EXCLUDED: &'static [gradatum_core::section::Section]
 pub const gradatum_core::section::Section::PROTECTED_DELETE: &'static [gradatum_core::section::Section]
 pub const gradatum_core::section::Section::PROTECTED_DOWNGRADE: &'static [&'static str]
 pub const gradatum_core::section::Section::PROTECTED_FORGET: &'static [gradatum_core::section::Section]
@@ -1187,9 +1195,15 @@ pub fn gradatum_core::section::Section::from_canonical_str(&str) -> core::option
 pub fn gradatum_core::section::Section::is_protected_delete(&str) -> bool
 impl core::fmt::Display for gradatum_core::section::Section
 pub fn gradatum_core::section::Section::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const gradatum_core::section::SECTION_TRUST_SCORES: &[(&str, f64)]
+pub const gradatum_core::section::TRUST_NON_DECAYING_SECTIONS: &[&str]
 pub fn gradatum_core::section::is_protected_downgrade(&str) -> bool
+pub fn gradatum_core::section::is_trust_non_decaying(&str) -> bool
+pub fn gradatum_core::section::section_str_to_doc_kind(&str) -> &'static str
 pub const fn gradatum_core::section::section_to_c_kind(&gradatum_core::section::Section) -> &'static str
 pub const fn gradatum_core::section::section_to_doc_kind(&gradatum_core::section::Section) -> &'static str
+pub const fn gradatum_core::section::trust_for_section(&gradatum_core::section::Section) -> f64
+pub fn gradatum_core::section::trust_for_section_str(&str) -> f64
 pub mod gradatum_core::soul
 pub enum gradatum_core::soul::SoulSchemaError
 pub gradatum_core::soul::SoulSchemaError::DynamicFieldInBody(alloc::string::String)
@@ -1212,7 +1226,9 @@ pub gradatum_core::status::NoteStatus::Live
 pub gradatum_core::status::NoteStatus::PendingReview
 pub gradatum_core::status::NoteStatus::Staging
 impl gradatum_core::status::NoteStatus
+pub const gradatum_core::status::NoteStatus::ALL: [gradatum_core::status::NoteStatus; 6]
 pub fn gradatum_core::status::NoteStatus::can_transition_to(&self, gradatum_core::status::NoteStatus) -> bool
+pub fn gradatum_core::status::NoteStatus::embeddable_default_sql_list() -> alloc::string::String
 pub fn gradatum_core::status::NoteStatus::is_embeddable(&self, &gradatum_core::config::EmbedConfig) -> bool
 pub fn gradatum_core::status::NoteStatus::is_embeddable_default(&self) -> bool
 pub fn gradatum_core::status::NoteStatus::is_visible_default(&self) -> bool
@@ -1380,6 +1396,7 @@ pub fn gradatum_core::job::JobPriority::default_for(&gradatum_core::job::JobClas
 #[non_exhaustive] pub enum gradatum_core::JobScope
 pub gradatum_core::JobScope::Locus(alloc::string::String)
 pub gradatum_core::JobScope::Notes(alloc::vec::Vec<ulid::Ulid>)
+pub gradatum_core::JobScope::Section(alloc::string::String)
 pub gradatum_core::JobScope::Session(ulid::Ulid)
 pub gradatum_core::JobScope::Vault(alloc::string::String)
 pub gradatum_core::JobScope::VaultWide
@@ -1730,6 +1747,7 @@ pub fn gradatum_core::IndexStore::hydrate_lessons_by_ulids<'life0, 'life1, 'life
 pub fn gradatum_core::IndexStore::id_lookup<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<alloc::string::String>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn gradatum_core::IndexStore::insert_metric_samples<'life0, 'life1, 'async_trait>(&'life0 self, i64, &'life1 [(alloc::string::String, f64)]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<usize, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_core::IndexStore::is_note_forgotten<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_core::IndexStore::last_indexed_at<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<core::option::Option<i64>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_core::IndexStore::list_active_vaults<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::scope::VaultId>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_core::IndexStore::list_distinct_metric_series<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<alloc::string::String>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_core::IndexStore::list_file_checksums<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::index::FileChecksumEntry>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -1737,7 +1755,9 @@ pub fn gradatum_core::IndexStore::list_garbage_older_than<'life0, 'life1, 'async
 pub fn gradatum_core::IndexStore::list_notes<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 str, core::option::Option<&'life2 str>, usize, core::option::Option<&'life3 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(alloc::vec::Vec<gradatum_core::index::NoteRecord>, u64), gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn gradatum_core::IndexStore::list_notes_by_agent<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 [alloc::string::String]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<(alloc::string::String, alloc::string::String)>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn gradatum_core::IndexStore::list_notes_by_locus_prefix<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<(alloc::string::String, alloc::string::String)>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub fn gradatum_core::IndexStore::list_notes_by_section<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<(alloc::string::String, alloc::string::String)>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn gradatum_core::IndexStore::list_notes_by_status<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(&'life0 self, &'life1 str, &'life2 [&'life3 str], core::option::Option<&'life4 str>, usize, core::option::Option<&'life5 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(alloc::vec::Vec<gradatum_core::index::NoteRecord>, u64), gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait, 'life5: 'async_trait
+pub fn gradatum_core::IndexStore::list_notes_filtered<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait>(&'life0 self, &'life1 str, core::option::Option<&'life2 str>, core::option::Option<&'life3 str>, core::option::Option<&'life4 str>, usize, core::option::Option<&'life5 str>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(alloc::vec::Vec<gradatum_core::index::NoteRecord>, u64), gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait, 'life4: 'async_trait, 'life5: 'async_trait
 pub fn gradatum_core::IndexStore::list_recent_notes<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str, usize) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::index::NoteRecord>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_core::IndexStore::list_review_queue<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 gradatum_core::scope::VaultId, core::option::Option<&'life2 str>, usize) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::index_store::ReviewQueueRow>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub fn gradatum_core::IndexStore::list_scheduled_health<'life0, 'async_trait>(&'life0 self, i64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::vec::Vec<gradatum_core::scheduled_health::ScheduledTaskHealth>, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait

@@ -194,12 +194,46 @@ pub async fn render_from_index(
         .await
         .context("backlinks project node")?;
 
+    // Restreindre au périmètre faisant autorité — la MÊME population que
+    // `project-map scope` : cartes vivantes (hors `downgraded`/`garbage`) de la
+    // section `project-map`. Le graphe `note_links` n'est PAS purgé quand une note
+    // est downgradée : un doublon downgradé conserve ses arêtes `status:`/`version:`
+    // et serait sinon rendu comme carte ouverte (F-214). Ce filtrage porte sur la
+    // population source des cartes, en amont de l'extraction de statut et du rendu —
+    // ce n'est pas un filtre posé à la sortie du rendu.
+    //
+    // Deux lectures batch (anti-N+1) sur l'ensemble des cartes candidates :
+    // - `get_statuses`         → statut de cycle de vie (`live`/`downgraded`/`garbage`)
+    // - `get_titles_sections`  → titre + section
+    let lifecycles = index
+        .get_statuses(vault_id, &cards)
+        .await
+        .context("get_statuses (filtre cycle de vie)")?;
+    let titles = index
+        .get_titles_sections(vault_id, &cards)
+        .await
+        .context("get_titles_sections")?;
+
+    let project_map_section = gradatum_core::section::Section::ProjectMap.as_str();
+
     let mut items: Vec<WorkItem> = Vec::new();
-    let mut open_ids: Vec<String> = Vec::new();
-    // Statut/version par carte ouverte (avant résolution du titre, anti-N+1).
+    // Statut/version par carte retenue (résolution du titre déjà en main, anti-N+1).
     let mut staged: Vec<(String, StatusKind, Option<String>)> = Vec::new();
 
     for card_id in &cards {
+        // Garde cycle de vie : exclut `downgraded`/`garbage` (miroir du SQL de scope).
+        // Une carte absente de la table (arête orpheline) est traitée comme morte.
+        match lifecycles.get(card_id).map(String::as_str) {
+            Some("downgraded" | "garbage") | None => continue,
+            Some(_) => {}
+        }
+        // Garde de section : seules les cartes `project-map` composent la vue TODO
+        // (miroir de scope). Écarte le bruit inter-sections (p. ex. notes
+        // `architecture` portant `[[project:…]]` + `[[status:…]]`).
+        if titles.get(card_id).map(|(_, s)| s.as_str()) != Some(project_map_section) {
+            continue;
+        }
+
         let lineage = index
             .trace_lineage(vault_id, card_id)
             .await
@@ -207,16 +241,9 @@ pub async fn render_from_index(
         if let Some((status, version)) = work_status_from_children(&lineage.children)
             && OPEN_STATUSES.contains(&status)
         {
-            open_ids.push(card_id.clone());
             staged.push((card_id.clone(), status, version));
         }
     }
-
-    // Résolution des titres en batch (anti-N+1).
-    let titles = index
-        .get_titles_sections(vault_id, &open_ids)
-        .await
-        .context("get_titles_sections")?;
 
     for (card_id, status, version) in staged {
         // Titre H1 si présent, sinon repli sur l'ULID (carte sans H1).

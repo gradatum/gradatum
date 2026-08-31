@@ -37,6 +37,17 @@ pub enum StorageError {
     #[error("storage config: {0}")]
     ConfigInvalid(String),
 
+    /// Write refused by a storage policy layer.
+    ///
+    /// Emitted by a `Storage` decorator that gates writes — notably the note-write
+    /// convergence guard, which refuses to persist a note `.md` file coming
+    /// from a path that does not converge with the write funnel (index + drift
+    /// footprint). The write **fails outright** rather than succeeding silently and
+    /// producing an orphan file on disk. The message names the rejected path and the
+    /// sanctioned alternative; it **never** contains a credential.
+    #[error("write rejected: {0}")]
+    WriteRejected(String),
+
     /// Error originating from `gradatum-core`.
     #[error("core: {0}")]
     Core(#[from] gradatum_core::error::GradatumError),

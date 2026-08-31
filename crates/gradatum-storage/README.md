@@ -2,7 +2,7 @@
 
 > Storage trait abstraction with an OpenDAL-backed filesystem or S3-compatible object backend.
 
-**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -18,7 +18,7 @@ match arm for either yet — the feature is compiled in, the backend is not sele
 
 ```toml
 [dependencies]
-gradatum-storage = "2.0.0"
+gradatum-storage = "2.1.0"
 ```
 
 ```rust

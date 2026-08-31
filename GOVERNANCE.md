@@ -37,7 +37,7 @@ discussed the same way as any other change — **open an issue first** to align 
 to completion as a **project-map feature card**: a note in the vault's `project-map` section,
 identified by a server-assigned, immutable `[[feature:F-XX]]` link and carrying typed wikilinks
 for the work-lifecycle axis (`[[status:BRAINSTORMING|OPEN|IN_PROGRESS|BLOCKED|DONE|OBSOLETE]]`),
-the kind of change (`[[kind:FEATURE|ENHANCEMENT|FIX|CHORE|SPIKE|TASK]]`), the delivery axis
+the kind of change (`[[kind:FEATURE|ENHANCEMENT|FIX|TASK]]`), the delivery axis
 (`[[release:roadmap|planned|released|dropped]]`), and, once a version is targeted, that version
 (`[[version:gradatum/x.y.z]]`).
 
@@ -46,7 +46,7 @@ A maintainer creates the card via the `create_feature_card` MCP tool (equivalent
 picks it. This is a maintainer-side tracking mechanism, not a public collaboration surface:
 external contributors track and discuss scope through the issue tracker, the same as before;
 they do not write project-map cards directly. Only `kind:FEATURE` cards are mirrored to the
-public roadmap (`README.md` § Roadmap, gradatum.org); `FIX`/`CHORE`/`SPIKE`/`TASK`/`ENHANCEMENT`
+public roadmap (`README.md` § Roadmap, gradatum.org); `FIX`/`TASK`/`ENHANCEMENT`
 cards stay in the maintainers' tracking vault.
 
 The durable, publicly readable record of what shipped, and why, is **`CHANGELOG.md`** — one

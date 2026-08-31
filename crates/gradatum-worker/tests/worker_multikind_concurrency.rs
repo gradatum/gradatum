@@ -52,7 +52,6 @@ use gradatum_core::{
 };
 use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
 use gradatum_worker::apalis_backend::build_gradatum_backend;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use ulid::Ulid;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,21 +206,12 @@ fn embed_does_not_stall_under_curate_load() {
             let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
             let path = tmp.path().to_path_buf();
             std::mem::forget(tmp);
-            let opts = SqliteConnectOptions::new()
-                .filename(&path)
-                .create_if_missing(true)
-                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                .busy_timeout(Duration::from_secs(5));
-            let pool = SqlitePoolOptions::new()
-                .max_connections(8)
-                .connect_with(opts)
-                .await
-                .expect("pool");
-            apply_sqlite_pragmas(&pool).await.expect("pragmas");
-            run_migrations(&pool).await.expect("migrations");
+            let db = gradatum_db_sqlite::open_queue_db(&path).await.expect("db");
+            apply_sqlite_pragmas(&db).await.expect("pragmas");
+            run_migrations(&db).await.expect("migrations");
 
             let store: Arc<dyn QueueStore + Send + Sync> =
-                Arc::new(SqliteQueueStore::new(pool.clone()));
+                Arc::new(SqliteQueueStore::new(db.clone()));
             let curate_done = Arc::new(AtomicUsize::new(0));
             let embed_done = Arc::new(AtomicUsize::new(0));
 

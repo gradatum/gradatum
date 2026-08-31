@@ -1,0 +1,8 @@
+[package]
+name = "surface-break-fx"
+version = "0.1.0"
+edition = "2021"
+
+# Fixture AUTONOME — pas un membre du workspace gradatum : le `[workspace]` vide
+# déclare sa propre racine. Sert au test `test-public-surface-break-report.sh`.
+[workspace]

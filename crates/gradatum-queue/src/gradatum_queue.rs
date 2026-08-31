@@ -146,22 +146,21 @@ impl QueueStore for GradatumQueue {
 mod tests {
     use super::*;
     use gradatum_core::*;
-    use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
-    use sqlx::SqlitePool;
+    use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
     use ulid::Ulid;
 
-    /// Crée un `GradatumQueue` sur un pool SQLite in-memory avec migrations appliquées.
+    /// Crée un `GradatumQueue` sur une base SQLite in-memory avec migrations appliquées.
     async fn make_queue() -> GradatumQueue {
-        let pool = SqlitePool::connect("sqlite::memory:")
+        let db = QueueDb::open_in_memory()
             .await
-            .expect("pool in-memory doit créer");
-        apply_sqlite_pragmas(&pool)
+            .expect("db in-memory doit créer");
+        apply_sqlite_pragmas(&db)
             .await
             .expect("pragmas WAL doivent s'appliquer");
-        run_migrations(&pool)
+        run_migrations(&db)
             .await
             .expect("migrations doivent s'appliquer");
-        GradatumQueue::new(SqliteQueueStore::new(pool))
+        GradatumQueue::new(SqliteQueueStore::new(db))
     }
 
     /// `find_awaiting` délègue à `SqliteQueueStore` : retourne `[]` si aucun job

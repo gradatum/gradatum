@@ -64,10 +64,10 @@ use gradatum_dto::{
 use gradatum_embed::EmbedBackend;
 use gradatum_index::extract_h1_title;
 use gradatum_index::links::title_to_slug;
-use gradatum_search::rrf_fuse;
 use gradatum_search::scoring::{
     composite_score_with_trust, pagerank_factor, recency_factor, trust_decay_factor,
 };
+use gradatum_search::{rrf_fuse, rrf_fuse_short_circuit};
 use ulid::Ulid;
 
 use crate::api_v1::dto::{
@@ -75,11 +75,12 @@ use crate::api_v1::dto::{
     VaultAuthorsResponse, VaultContextRequest, VaultContextResponse, VaultEntry, VaultGraphRequest,
     VaultGraphResponse, VaultLinksRequest, VaultLinksResponse, VaultListRequest, VaultListResponse,
     VaultReadRequest, VaultReadResponse, VaultSearchRequest, VaultSearchResponse,
-    VaultStatusResponse, VaultTagsResponse, VaultTimelineRequest, VaultTraceRequest,
-    VaultTraceResponse,
+    VaultStatusResponse, VaultTagsRequest, VaultTagsResponse, VaultTimelineRequest,
+    VaultTraceRequest, VaultTraceResponse,
 };
 use crate::api_v1::handlers::{
-    build_fts_query, filter_semantic_by_section, filter_semantic_by_status, validate_search_status,
+    build_fts_query, filter_semantic_by_section, filter_semantic_by_status,
+    filter_semantic_excluding_sections, validate_search_status,
 };
 use crate::api_v1::tenant_guard::{effective_read_vault, effective_tenant, effective_write_vault};
 use crate::api_v1::timeline::{TimelineItem, VaultTimelineResponse};
@@ -339,6 +340,19 @@ pub async fn vault_search_impl(
     let limit = req.limit.unwrap_or(10).clamp(1, 50) as usize;
     let fts_query = build_fts_query(query);
 
+    // F-246 : inventaire des sections exclues du périmètre de recherche PAR DÉFAUT.
+    //
+    // Sans filtre de section explicite (`req.section = None`), les sections
+    // `Section::DEFAULT_SEARCH_EXCLUDED` (matière première brute, ex. `snapshot`) sont
+    // écartées des résultats ET du `corpus_match_count`. Avec un filtre de section
+    // explicite — Y COMPRIS `snapshot` lui-même — l'exclusion ne s'applique PAS :
+    // exclusion par défaut ≠ inaccessibilité, une capture reste atteignable.
+    let excluded_sections: &[Section] = if req.section.is_none() {
+        Section::DEFAULT_SEARCH_EXCLUDED
+    } else {
+        &[]
+    };
+
     // Signal BM25.
     let bm25_hits = state
         .search
@@ -354,6 +368,23 @@ pub async fn vault_search_impl(
             req.to_ms,   // F-65 temporal upper bound
         )
         .await?;
+
+    // F-246 : exclusion par défaut sur le bras lexical. `search_fts_with_snippet` reste
+    // section-agnostique à `None` (le filtre sémantique multi-section de vault_context
+    // passe par le même appel puis filtre EN MÉMOIRE sur une section explicite) — on
+    // filtre donc `SearchHitRaw.section` ici, parité avec `retrieve_candidates`.
+    let bm25_hits = if excluded_sections.is_empty() {
+        bm25_hits
+    } else {
+        bm25_hits
+            .into_iter()
+            .filter(|h| {
+                !excluded_sections
+                    .iter()
+                    .any(|s| s.as_str() == h.section.as_str())
+            })
+            .collect()
+    };
 
     // Signal sémantique (dégradation gracieuse si Noop ou erreur).
     let mut semantic_hits: Vec<(gradatum_core::identity::NoteId, f32)> =
@@ -410,6 +441,22 @@ pub async fn vault_search_impl(
             .get_titles_sections(&read_vault, &sem_ids)
             .await;
         semantic_hits = filter_semantic_by_section(semantic_hits, wanted_section, sec_result);
+    }
+
+    // F-246 : exclusion section par défaut sur le chemin sémantique (symétrique C2).
+    // Sans filtre de section explicite, les sections `DEFAULT_SEARCH_EXCLUDED` sont
+    // écartées AUSSI des hits sémantiques — même patron de batch `get_titles_sections`
+    // que le filtre inclusif ci-dessus (les deux bras sont mutuellement exclusifs car
+    // `excluded_sections` n'est non vide que si `req.section` est `None`).
+    if !excluded_sections.is_empty() && !semantic_hits.is_empty() {
+        let excluded_strs: Vec<&str> = excluded_sections.iter().map(Section::as_str).collect();
+        let sem_ids: Vec<String> = semantic_hits.iter().map(|(id, _)| id.to_string()).collect();
+        let sec_result = state
+            .search
+            .get_titles_sections(&read_vault, &sem_ids)
+            .await;
+        semantic_hits =
+            filter_semantic_excluding_sections(semantic_hits, &excluded_strs, sec_result);
     }
 
     // Filtre status sur chemin sémantique (symétrique C2).
@@ -481,7 +528,16 @@ pub async fn vault_search_impl(
         .map(|h| (h.note_id.to_string(), h))
         .collect();
     let rrf_buffer = (limit * 4).clamp(20, 200);
-    let mut fused = rrf_fuse(&bm25_for_rrf, &sem_for_rrf, 60.0, rrf_buffer);
+    // F-162 critère 6 : court-circuit à bras unique. Quand le système est hybride
+    // (embedder actif) et qu'un seul bras répond, la fusion par rang est court-circuitée —
+    // le score normalisé du bras qui répond fait foi (la magnitude n'est plus jetée).
+    // Le chemin BM25-only par configuration (embedder Noop) reste sur la fusion par rang
+    // pure (rétrocompat bit-à-bit — tests snapshot `salience_off` inchangés).
+    let mut fused = if state.embedder.backend_kind() != EmbedBackend::Noop {
+        rrf_fuse_short_circuit(&bm25_for_rrf, &sem_for_rrf, 60.0, rrf_buffer)
+    } else {
+        rrf_fuse(&bm25_for_rrf, &sem_for_rrf, 60.0, rrf_buffer)
+    };
 
     // Enrichir section + snippet + title + status + anchor_ms depuis la map BM25.
     // F-17 : pour les hits semantic-only (absents de bm25_map), enrichir anchor_ms depuis
@@ -499,6 +555,38 @@ pub async fn vault_search_impl(
         } else if hit.anchor_ms.is_none() {
             // Hit semantic-only : peupler anchor_ms depuis sem_anchor_map avant le scoring. (F-17)
             hit.anchor_ms = sem_anchor_map.get(&hit.note_id).copied();
+        }
+    }
+
+    // F-261 : la dérivation du facteur de confiance exige la section de CHAQUE hit au scoring.
+    // Les hits semantic-only (absents de bm25_map) n'ont pas de section ici → lookup batch
+    // (anti-N+1, même pattern que get_titles_sections, ci-dessous en fin de handler) AVANT la
+    // boucle composite. Échec = section vide → trust neutre 0.5 (comportement actuel),
+    // jamais bloquant.
+    let missing_section_ids: Vec<String> = fused
+        .iter()
+        .filter(|h| h.section.is_empty())
+        .map(|h| h.note_id.clone())
+        .collect();
+    if !missing_section_ids.is_empty() {
+        let section_map = state
+            .search
+            .get_titles_sections(&read_vault, &missing_section_ids)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    err = %e,
+                    count = missing_section_ids.len(),
+                    "vault_search_impl: get_titles_sections (pre-scoring) failed — trust neutre"
+                );
+                HashMap::new()
+            });
+        for hit in &mut fused {
+            if hit.section.is_empty()
+                && let Some((_, section)) = section_map.get(&hit.note_id)
+            {
+                hit.section.clone_from(section);
+            }
         }
     }
 
@@ -585,25 +673,12 @@ pub async fn vault_search_impl(
         let pagerank = pagerank_factor(in_degree);
 
         let trust_params = if state.scoring.enabled {
-            let (trust, provenance) = match state
-                .search
-                .get_trust_and_provenance(&tenant, &hit.note_id)
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        err = %e,
-                        note_id = %hit.note_id,
-                        "vault_search_impl: get_trust_and_provenance failed — fallback"
-                    );
-                    (None, None)
-                }
-            };
             let age_days = ((now_ms - created_ms).max(0) as f64) / 86_400_000.0;
-            state
-                .scoring
-                .resolve(trust, provenance.as_deref(), age_days)
+            // F-261 : trust dérivé de la section (fonction pure) — plus de lecture de la colonne
+            // `notes.trust`. Section inconnue/vide → neutre 0.5 + doc_kind Static (non périssable),
+            // soit exactement le comportement actuel de la population. L'âge du decay reste sur
+            // created_ms (invariant M-1, cf. context_select_recency).
+            state.scoring.resolve_for_section(&hit.section, age_days)
         } else {
             None
         };
@@ -1130,15 +1205,31 @@ pub async fn vault_list_impl(
     let _ = req.pattern; // ignoré (T12 pattern filter différé)
     let limit = req.limit.unwrap_or(20).clamp(1, 200) as usize;
 
-    let (records, total) = state
-        .search
-        .list_notes(
-            &tenant,
-            req.section.as_deref(),
-            limit,
-            req.cursor.as_deref(),
-        )
-        .await?;
+    // F-171 : route vers la variante filtrée UNIQUEMENT si un filtre de rôle est présent —
+    // sinon `list_notes` inchangé (rétro-compat octet pour octet, aucun filtre neutre injecté).
+    let (records, total) = if req.role_kind.is_some() || req.role_status.is_some() {
+        state
+            .search
+            .list_notes_filtered(
+                &tenant,
+                req.section.as_deref(),
+                req.role_kind.as_deref(),
+                req.role_status.as_deref(),
+                limit,
+                req.cursor.as_deref(),
+            )
+            .await?
+    } else {
+        state
+            .search
+            .list_notes(
+                &tenant,
+                req.section.as_deref(),
+                limit,
+                req.cursor.as_deref(),
+            )
+            .await?
+    };
 
     // Guard identity (parité `vault_search`/`vault_context`) : un appelant non
     // privilégié ne doit pas découvrir l'existence/ULID/mtime des âmes d'agents via le
@@ -1357,12 +1448,21 @@ pub async fn vault_status_impl(
         .total_body_size_bytes(&tenant)
         .await
         .unwrap_or(0);
+    // Fraîcheur de l'index (F-169) : horodatage de la note live la plus récemment
+    // indexée (`MAX(COALESCE(updated, created))`). L'erreur est PROPAGÉE plutôt que
+    // dégradée en `null` — un `null` sur échec rejouerait exactement le faux « jamais
+    // indexé » que ce correctif supprime. `None` n'apparaît que si le corpus live est
+    // vide. Format ISO 8601 UTC aligné sur `vault_list.modified_at`.
+    let last_indexed_at = state.search.last_indexed_at(&tenant).await?.and_then(|ms| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    });
     Ok(VaultStatusResponse {
         tenant_id: tenant,
         note_count,
         total_size_bytes,
         index_version: "v1".to_string(),
-        last_indexed_at: None,
+        last_indexed_at,
         health: "healthy".to_string(),
     })
 }
@@ -1425,9 +1525,141 @@ async fn filter_identity_nodes(
     Ok(())
 }
 
+/// Normalise une référence de note vers son ULID **nu**.
+///
+/// `note_links` (et donc `neighbors`/`backlinks`) porte des identifiants ULID **nus**,
+/// mais le reste de l'API expose la forme préfixée `section/ULID` : `vault_read`
+/// l'accepte, `vault_search` la renvoie dans son champ `path`. Un appelant qui enchaîne
+/// `vault_search` → `vault_links`/`vault_graph` passe donc naturellement `section/ULID` ;
+/// sans résolution, la comparaison `=` en base échoue silencieusement et rend un graphe
+/// **vide** (F-215 — un `edges: []` muet pris pour « pas de liens »).
+///
+/// La résolution reprend **intégralement** celle de [`vault_read_impl`] : ULID si la
+/// queue en est un (dernier segment `/`-séparé — ni un ULID ni un nom de section ne
+/// contiennent de `/`), sinon repli par titre (`title_lookup`), puis par slug de
+/// redirection (`resolve_redirect`).
+///
+/// **Contrat v1 préservé** : une référence qui ne résout vers **aucune** note n'est PAS
+/// une erreur. Le graphe d'un nœud inconnu est un graphe vide (200), pas un 400 — on
+/// renvoie alors le dernier segment tel quel, qui ne matchera aucun lien. C'est la seule
+/// moitié de `vault_read` qu'on n'imite pas : là où lui rend `NoteNotFound`, la lecture
+/// d'un graphe reste un 200 vide (décision d'API v1 codifiée par les tests de parité).
+///
+/// # Errors
+///
+/// Propage [`GradatumError::Storage`] si l'index échoue (`title_lookup`/`resolve_redirect`).
+async fn resolve_note_ref(
+    state: &AppState,
+    tenant: &str,
+    reference: &str,
+) -> Result<String, GradatumError> {
+    let candidate = reference.rsplit('/').next().unwrap_or(reference);
+    // Référence inconnue → graphe vide (contrat v1), jamais une erreur.
+    Ok(resolve_note_ref_opt(state, tenant, reference)
+        .await?
+        .unwrap_or_else(|| candidate.to_string()))
+}
+
+/// Cœur de résolution partagé par [`resolve_note_ref`] (contrat v1, tolérant) et
+/// [`resolve_note_ref_strict`] (contrat strict, refus nommé).
+///
+/// Rend `Some(ULID nu)` si la référence désigne une note atteignable — ULID nu, forme
+/// préfixée `section/ULID`, titre exact, ou slug de redirection — et `None` si aucune
+/// des trois voies n'aboutit. **Ne décide pas** ce qu'il faut faire d'un `None` : c'est
+/// précisément le point où les deux contrats divergent.
+///
+/// # Errors
+///
+/// Propage [`GradatumError::Storage`] si l'index échoue (`title_lookup`/`resolve_redirect`).
+async fn resolve_note_ref_opt(
+    state: &AppState,
+    tenant: &str,
+    reference: &str,
+) -> Result<Option<String>, GradatumError> {
+    let candidate = reference.rsplit('/').next().unwrap_or(reference);
+    if ulid::Ulid::from_string(candidate).is_ok() {
+        return Ok(Some(candidate.to_string()));
+    }
+    if let Some(found_id) = state.search.title_lookup(tenant, reference).await? {
+        return Ok(Some(found_id));
+    }
+    let slug = title_to_slug(reference);
+    if let Some(ulid) = state.search.resolve_redirect(tenant, &slug).await? {
+        return Ok(Some(ulid.to_string()));
+    }
+    Ok(None)
+}
+
+/// Variante **stricte** de [`resolve_note_ref`] : une référence irrésoluble est une
+/// erreur d'entrée **nommée**, pas un repli silencieux.
+///
+/// Destinée aux surfaces où le contrat v1 « référence inconnue → 200 vide » ne
+/// s'applique PAS — le sous-système d'historique CoW (`vault_history`,
+/// `vault_history_get`, `vault_restore`, `vault_diff`). Avant F-215 critère 4, ces
+/// quatre outils passaient la référence brute à la couche Vault, dont `parse_note_id`
+/// rendait un [`GradatumError::Storage`] (« invalid ULID … invalid length ») → **500
+/// opaque** côté appelant : un refus déguisé en panne interne, classé erreur de
+/// *stockage* alors que la cause est une *entrée* invalide.
+///
+/// Accepte donc exactement ce qu'accepte `vault_read` (parité), et refuse le reste avec
+/// un [`GradatumError::InvalidInput`] (→ 400) citant la valeur reçue et les formes
+/// attendues.
+///
+/// # Errors
+///
+/// - [`GradatumError::InvalidInput`] si la référence ne résout vers aucune note.
+/// - Propage [`GradatumError::Storage`] si l'index échoue.
+async fn resolve_note_ref_strict(
+    state: &AppState,
+    tenant: &str,
+    reference: &str,
+) -> Result<String, GradatumError> {
+    resolve_note_ref_opt(state, tenant, reference)
+        .await?
+        .ok_or_else(|| {
+            GradatumError::InvalidInput(format!(
+                "unresolvable note reference {} — expected a bare ULID, \
+                 a prefixed \"section/ULID\", an exact note title, or a redirect slug",
+                echo_ref(reference)
+            ))
+        })
+}
+
+/// Longueur maximale (en caractères) d'une référence réfléchie dans un message d'erreur.
+///
+/// Les champs `note_id` ne sont bornés par aucun schéma : sans troncature, une référence
+/// de plusieurs kilo-octets serait recopiée telle quelle dans la réponse **et** dans les
+/// journaux. Safety cap (ADN 5), pas un paramètre utilisateur.
+const MAX_REF_ECHO_CHARS: usize = 96;
+
+/// Rend une référence **fournie par l'appelant** sûre à citer dans un message d'erreur.
+///
+/// Tronque à [`MAX_REF_ECHO_CHARS`] sur une frontière de caractère (jamais d'octet, pour
+/// ne pas produire d'UTF-8 invalide) et cite la valeur entre guillemets via `{:?}`, ce qui
+/// neutralise aussi les caractères de contrôle dans les journaux.
+///
+/// Portée volontairement étroite : on ne réfléchit **que** l'entrée de l'appelant, jamais
+/// une chaîne d'origine serveur — c'est la distinction que fait déjà
+/// `jobs::sanitize_job_error`, qui opacifie les erreurs remontées d'un *worker* (chemins
+/// FS absolus, état interne). Rendre à un client la valeur qu'il vient d'envoyer ne lui
+/// apprend rien qu'il ne sache déjà.
+fn echo_ref(reference: &str) -> String {
+    let mut chars = reference.chars();
+    let head: String = chars.by_ref().take(MAX_REF_ECHO_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head:?}(truncated)")
+    } else {
+        format!("{head:?}")
+    }
+}
+
 /// Logique métier de `POST /api/v1/vault_graph`.
 ///
 /// ACL Read + neighbors + backlinks optionnels.
+///
+/// `root` accepte l'ULID nu, la forme préfixée `section/ULID`, un titre ou un slug
+/// (parité `vault_read` — cf. `resolve_note_ref`) ; un nœud inconnu rend un graphe
+/// vide (200), pas une erreur (F-215).
 pub async fn vault_graph_impl(
     state: &AppState,
     trust: &TrustContext,
@@ -1444,6 +1676,10 @@ pub async fn vault_graph_impl(
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
 
+    // F-215 : résout ULID / `section/ULID` / titre / slug (parité vault_read).
+    // Nœud inconnu → graphe vide (contrat v1), jamais un rejet.
+    let root = resolve_note_ref(state, &tenant, &req.root).await?;
+
     let raw_depth = req.depth.unwrap_or(2);
     if raw_depth > 5 {
         return Err(GradatumError::InvalidInput(
@@ -1452,28 +1688,28 @@ pub async fn vault_graph_impl(
     }
     let depth = raw_depth.min(3) as u8;
 
-    let neighbors = state.search.neighbors(&tenant, &req.root, depth).await?;
+    let neighbors = state.search.neighbors(&tenant, &root, depth).await?;
 
     let mut edges: Vec<GraphEdge> = neighbors
         .iter()
         .map(|n| GraphEdge {
-            from: req.root.clone(),
+            from: root.clone(),
             to: n.clone(),
             kind: "wikilink".to_string(),
         })
         .collect();
 
     let mut nodes: Vec<String> = neighbors;
-    nodes.push(req.root.clone());
+    nodes.push(root.clone());
     nodes.sort();
     nodes.dedup();
 
     if req.include_backlinks.unwrap_or(false) {
-        let backlinks = state.search.backlinks(&tenant, &req.root).await?;
+        let backlinks = state.search.backlinks(&tenant, &root).await?;
         for bl in &backlinks {
             edges.push(GraphEdge {
                 from: bl.clone(),
-                to: req.root.clone(),
+                to: root.clone(),
                 kind: "wikilink".to_string(),
             });
             if !nodes.contains(bl) {
@@ -1493,6 +1729,10 @@ pub async fn vault_graph_impl(
 /// Logique métier de `POST /api/v1/vault_links`.
 ///
 /// ACL Read + liens sortants (depth=1) + backlinks.
+///
+/// `path` accepte l'ULID nu, la forme préfixée `section/ULID`, un titre ou un slug
+/// (parité `vault_read` — cf. `resolve_note_ref`) ; un nœud inconnu rend un graphe
+/// vide (200), pas une erreur (F-215).
 pub async fn vault_links_impl(
     state: &AppState,
     trust: &TrustContext,
@@ -1509,25 +1749,29 @@ pub async fn vault_links_impl(
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
 
-    let outbound = state.search.neighbors(&tenant, &req.path, 1).await?;
+    // F-215 : résout ULID / `section/ULID` / titre / slug (parité vault_read).
+    // Nœud inconnu → graphe vide (contrat v1), jamais un rejet.
+    let path = resolve_note_ref(state, &tenant, &req.path).await?;
+
+    let outbound = state.search.neighbors(&tenant, &path, 1).await?;
     let mut edges: Vec<GraphEdge> = outbound
         .iter()
         .map(|n| GraphEdge {
-            from: req.path.clone(),
+            from: path.clone(),
             to: n.clone(),
             kind: "wikilink".to_string(),
         })
         .collect();
 
     let mut nodes: Vec<String> = outbound;
-    nodes.push(req.path.clone());
+    nodes.push(path.clone());
 
     if req.include_backlinks.unwrap_or(true) {
-        let backlinks = state.search.backlinks(&tenant, &req.path).await?;
+        let backlinks = state.search.backlinks(&tenant, &path).await?;
         for bl in &backlinks {
             edges.push(GraphEdge {
                 from: bl.clone(),
-                to: req.path.clone(),
+                to: path.clone(),
                 kind: "wikilink".to_string(),
             });
             if !nodes.contains(bl) {
@@ -1747,9 +1991,20 @@ pub async fn vault_authors_impl(
 /// ce gate un tenant ≠ main porteur d'un grant ACL couvrant `main/*` listait les tags
 /// (topologie/PII-adjacent) des notes de `main` → fuite cross-tenant. À ON, un contexte
 /// sans tenant est refusé 403.
+/// Borne par défaut du nombre de tags renvoyés par `vault_tags` quand l'appelant
+/// ne fournit pas de `limit` explicite.
+///
+/// Safety cap anti-DoS de contexte (F-216) : sans borne, `vault_tags` renvoyait la
+/// liste complète (~135 Ko observés), saturant le budget de contexte des appelants
+/// agents. Les tags sont triés fréquence décroissante (`distinct_tags`), donc les
+/// `DEFAULT_TAGS_LIMIT` premiers sont les plus utiles ; l'appelant lève la borne
+/// via `limit` et détecte la troncature via le champ `total` de la réponse.
+const DEFAULT_TAGS_LIMIT: usize = 50;
+
 pub async fn vault_tags_impl(
     state: &AppState,
     trust: &TrustContext,
+    req: VaultTagsRequest,
 ) -> Result<VaultTagsResponse, GradatumError> {
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
@@ -1768,15 +2023,20 @@ pub async fn vault_tags_impl(
     if state.acl.evaluate(trust, AclOp::Read, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
+    // `distinct_tags` renvoie déjà les tags triés fréquence décroissante (puis
+    // alpha) — `total` = cardinal complet AVANT bornage (détection de troncature).
     let rows = state.search.distinct_tags(&vault_id).await?;
+    let total = rows.len() as u64;
+    let limit = req.limit.unwrap_or(DEFAULT_TAGS_LIMIT);
     let tags = rows
         .into_iter()
+        .take(limit)
         .map(|(tag, count)| TagEntry {
             tag,
             note_count: count,
         })
         .collect();
-    Ok(VaultTagsResponse { tags })
+    Ok(VaultTagsResponse { tags, total })
 }
 
 // ── §2 TIMELINE ──────────────────────────────────────────────────────────────
@@ -2339,6 +2599,12 @@ pub async fn vault_write_impl(
     }
 
     // Résolution note_id (None → ULID frais, invalide → 400).
+    //
+    // F-215 critère 4 — issue retenue : REFUS EXPLICITE (pas de parité `vault_read`).
+    // Ce `note_id` n'est PAS une référence à résoudre : c'est un ULID **pré-alloué**
+    // par un write antérieur, que le serveur honore tel quel. Y résoudre un titre ou un
+    // slug ferait écraser une note homonyme. Refus déjà nommé et typé 400 ; le message
+    // cite désormais la valeur reçue et la forme attendue.
     let note_id_prealloc = match req.note_id.as_deref() {
         None => Ulid::generate(),
         Some(s) => match Ulid::from_string(s) {
@@ -2354,7 +2620,11 @@ pub async fn vault_write_impl(
                     Some(s.to_string()),
                 )
                 .await;
-                return Err(GradatumError::InvalidInput("invalid note_id".into()));
+                return Err(GradatumError::InvalidInput(format!(
+                    "invalid note_id {} — a bare pre-allocated ULID is expected \
+                     (this endpoint does not resolve \"section/ULID\", titles or slugs)",
+                    echo_ref(s)
+                )));
             }
         },
     };
@@ -2634,10 +2904,19 @@ pub async fn vault_classify_impl(
     }
 
     // Validation ULID — erreur 400 si invalide (avant toute I/O vault).
+    //
+    // F-215 critère 4 — issue retenue : REFUS EXPLICITE (pas de parité `vault_read`).
+    // `vault_classify` prend une poignée de maintenance (ULID alloué par le write /
+    // remonté par la file du curateur), pas un `path` de résultat de recherche : lui
+    // faire résoudre un titre ou un slug introduirait une cible ambiguë là où le contrat
+    // est déjà univoque. Le refus était DÉJÀ nommé et typé 400 ; seul le message manquait
+    // — il cite désormais la valeur reçue et la forme attendue.
     if ulid::Ulid::from_string(&req.note_id).is_err() {
-        return Err(GradatumError::InvalidInput(
-            "invalid note_id (ULID expected)".into(),
-        ));
+        return Err(GradatumError::InvalidInput(format!(
+            "invalid note_id {} — a bare ULID is expected \
+             (this endpoint does not resolve \"section/ULID\", titles or slugs)",
+            echo_ref(&req.note_id)
+        )));
     }
 
     // Lecture de la note — 404 si absente, 500 sur erreur disque.
@@ -2745,21 +3024,18 @@ pub async fn vault_history_impl(
     //   - note présente, autre section    → no-op (200 normal) ;
     //   - note absente de l'index (map vide) → section "" → no-op (préserve le 200 vide) ;
     //   - erreur d'index → sentinelle `identity` → FAIL-CLOSED (non-priv 403, priv OK).
-    let (title, section) = resolve_title_section_failclosed(state, tenant, &req.note_id).await;
-    enforce_identity_read_guard(
-        state,
-        trust,
-        tenant,
-        &section,
-        title.as_deref(),
-        &req.note_id,
-    )
-    .await?;
+    // F-215 critère 4 : parité `vault_read` — ULID nu, `section/ULID`, titre ou slug.
+    // Résolu AVANT le guard identité : une forme préfixée non résolue rendait une section
+    // vide, donc un guard no-op — le guard doit porter sur la note RÉELLE.
+    let note_id = resolve_note_ref_strict(state, tenant, &req.note_id).await?;
+
+    let (title, section) = resolve_title_section_failclosed(state, tenant, &note_id).await;
+    enforce_identity_read_guard(state, trust, tenant, &section, title.as_deref(), &note_id).await?;
 
     // Task 23 (W3) : history routé par le vault EFFECTIF (`tenant`) — `history_versions`
     // est instance-bound (`{self.vault_id}/.history/…`). À OFF singleton `main`.
     let versions = read_back_reader(state, tenant)?
-        .history_versions(&req.note_id)
+        .history_versions(&note_id)
         .await?;
     let count = versions.len();
     Ok(VaultHistoryResponse { versions, count })
@@ -2783,10 +3059,13 @@ pub async fn vault_history_get_impl(
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
 
+    // F-215 critère 4 : parité `vault_read` (cf. [`resolve_note_ref_strict`]).
+    let note_id = resolve_note_ref_strict(state, tenant, &req.note_id).await?;
+
     // Task 23 (W3) : history routé par le vault EFFECTIF (`tenant`) — `history_get` est
     // instance-bound (`{self.vault_id}/.history/…`). À OFF singleton `main`.
     let snapshot = read_back_reader(state, tenant)?
-        .history_get(&req.note_id, req.ts_ms)
+        .history_get(&note_id, req.ts_ms)
         .await?;
 
     // Guard identité par-agent (parité `vault_read_impl`) : l'historique CoW exposait
@@ -2795,18 +3074,12 @@ pub async fn vault_history_get_impl(
     // sans appel index supplémentaire ni chemin d'échec.
     let section = snapshot.frontmatter.section.to_string();
     let title = extract_h1_title(&snapshot.body.markdown);
-    enforce_identity_read_guard(
-        state,
-        trust,
-        tenant,
-        &section,
-        title.as_deref(),
-        &req.note_id,
-    )
-    .await?;
+    enforce_identity_read_guard(state, trust, tenant, &section, title.as_deref(), &note_id).await?;
 
     Ok(VaultHistoryGetResponse {
-        note_id: req.note_id,
+        // Écho de l'identifiant RÉSOLU (parité `vault_read`, dont `path` est résolu) :
+        // l'appelant récupère la forme canonique, pas la référence qu'il a saisie.
+        note_id,
         ts_ms: req.ts_ms,
         body: snapshot.body.markdown,
         section,
@@ -2840,16 +3113,14 @@ pub async fn vault_restore_impl(
     // garde write inline de `vault_write_impl`. Sans ce guard, un non-privilégié avec ACL
     // Write pourrait restaurer/écraser l'âme d'un AUTRE agent. Section + titre résolus
     // server-side ; FAIL-CLOSED sur erreur d'index ; no-op hors section `identity`.
-    let (title, section) = resolve_title_section_failclosed(state, tenant, &req.note_id).await;
-    enforce_identity_write_guard(
-        state,
-        trust,
-        tenant,
-        &section,
-        title.as_deref(),
-        &req.note_id,
-    )
-    .await?;
+    // F-215 critère 4 : parité `vault_read`, résolue AVANT le guard write (le guard doit
+    // porter sur la note RÉELLE). Le sous-système CoW est traité comme une unité : les
+    // quatre outils qui partagent le champ `note_id` acceptent les mêmes formes.
+    let note_id = resolve_note_ref_strict(state, tenant, &req.note_id).await?;
+
+    let (title, section) = resolve_title_section_failclosed(state, tenant, &note_id).await;
+    enforce_identity_write_guard(state, trust, tenant, &section, title.as_deref(), &note_id)
+        .await?;
 
     // C4 (caveat C1 HAUTE, council 01KXTRART) : témoin write épinglant la restauration
     // couche-Vault au vault vérifié — un tenant tiers ciblant l'historique d'une note de
@@ -2858,10 +3129,11 @@ pub async fn vault_restore_impl(
         gradatum_core::scope::AclCheckedVaultId::attest_write_checked(VaultId::new(tenant));
     let content_hash = state
         .vault
-        .history_restore(&checked, &req.note_id, req.ts_ms)
+        .history_restore(&checked, &note_id, req.ts_ms)
         .await?;
     Ok(VaultRestoreResponse {
-        note_id: req.note_id,
+        // Écho de l'identifiant RÉSOLU (parité `vault_history_get`).
+        note_id,
         ts_ms: req.ts_ms,
         content_hash,
     })
@@ -2897,21 +3169,14 @@ pub async fn vault_diff_impl(
     // cross-agent identique à `vault_history_get`. Section + titre (`identity/<agent>`)
     // résolus server-side depuis l'index, jamais depuis l'input. FAIL-CLOSED sur erreur
     // d'index (sentinelle `identity`) ; no-op si note absente ou section non-`identity`.
-    let (title, section) = resolve_title_section_failclosed(state, tenant, &req.note_id).await;
-    enforce_identity_read_guard(
-        state,
-        trust,
-        tenant,
-        &section,
-        title.as_deref(),
-        &req.note_id,
-    )
-    .await?;
+    // F-215 critère 4 : parité `vault_read`. Placé APRÈS la validation des sélecteurs
+    // pour préserver la précédence du 400 « invalid selector » déjà couverte par les tests.
+    let note_id = resolve_note_ref_strict(state, tenant, &req.note_id).await?;
 
-    let lines = state
-        .vault
-        .history_diff(&req.note_id, &req.a, &req.b)
-        .await?;
+    let (title, section) = resolve_title_section_failclosed(state, tenant, &note_id).await;
+    enforce_identity_read_guard(state, trust, tenant, &section, title.as_deref(), &note_id).await?;
+
+    let lines = state.vault.history_diff(&note_id, &req.a, &req.b).await?;
     let count = lines.len();
     Ok(VaultDiffResponse { lines, count })
 }
@@ -3199,11 +3464,20 @@ pub async fn vault_downgrade_impl(
     .await?;
 
     // Parse des ULID — erreurs déjà typées via GradatumError::Validation.
+    //
+    // F-215 critère 4 — issue retenue : REFUS EXPLICITE (pas de parité `vault_read`).
+    // `vault_downgrade` déclasse une note : résoudre un titre ou un slug rendrait la cible
+    // d'une mutation ambiguë. Refus déjà nommé et typé 400 ; le message cite désormais la
+    // valeur reçue et la forme attendue.
     let note_id = ulid::Ulid::from_string(&req.note_id)
         .map(NoteId)
         .map_err(|_| {
             GradatumError::Validation(gradatum_core::error::ValidationError::InvalidInput(
-                "invalid note_id (ULID expected)".into(),
+                format!(
+                    "invalid note_id {} — a bare ULID is expected \
+                 (this endpoint does not resolve \"section/ULID\", titles or slugs)",
+                    echo_ref(&req.note_id)
+                ),
             ))
         })?;
     let replaced_by = req
@@ -3212,7 +3486,11 @@ pub async fn vault_downgrade_impl(
         .map(|s| {
             ulid::Ulid::from_string(s).map(NoteId).map_err(|_| {
                 GradatumError::Validation(gradatum_core::error::ValidationError::InvalidInput(
-                    "invalid replaced_by (ULID expected)".into(),
+                    format!(
+                        "invalid replaced_by {} — a bare ULID is expected \
+                         (this endpoint does not resolve \"section/ULID\", titles or slugs)",
+                        echo_ref(s)
+                    ),
                 ))
             })
         })
@@ -3570,8 +3848,8 @@ mod tests {
     use gradatum_core::trust::TrustContext;
 
     use super::{
-        GradatumError, KNOWN_DOC_KINDS, LESSONS_SECTION, LESSONS_TENANT, effective_author,
-        locus_for_section, locus_for_tenant,
+        GradatumError, KNOWN_DOC_KINDS, LESSONS_SECTION, LESSONS_TENANT, MAX_REF_ECHO_CHARS,
+        echo_ref, effective_author, locus_for_section, locus_for_tenant,
     };
 
     // ── Tests helpers ──────────────────────────────────────────────────────────
@@ -3660,6 +3938,34 @@ mod tests {
             tenant_id: "main".into(),
             jti: None,
         }
+    }
+
+    #[test]
+    fn echo_ref_truncates_beyond_the_safety_cap_on_a_char_boundary() {
+        // F-215 critère 4 — le safety cap est la raison d'être de `echo_ref` : le champ
+        // `note_id` n'est borné par aucun schéma, une référence énorme serait recopiée
+        // telle quelle dans la réponse ET les journaux. Multi-octets pour prouver que la
+        // coupe est faite en CARACTÈRES (une coupe en octets produirait de l'UTF-8 invalide,
+        // donc un panic à la construction de la String).
+        let long: String = "é".repeat(MAX_REF_ECHO_CHARS + 10);
+        let echoed = echo_ref(&long);
+        assert!(
+            echoed.ends_with("(truncated)"),
+            "au-delà du cap, la troncature doit être signalée — obtenu : {echoed}"
+        );
+        assert_eq!(
+            echoed.matches('é').count(),
+            MAX_REF_ECHO_CHARS,
+            "exactement {MAX_REF_ECHO_CHARS} caractères retenus"
+        );
+    }
+
+    #[test]
+    fn echo_ref_quotes_a_short_reference_without_truncation_marker() {
+        // En-deçà du cap, la valeur est citée intégralement (`{:?}` neutralise aussi les
+        // caractères de contrôle) : c'est ce qui rend le refus diagnosticable.
+        let echoed = echo_ref("project-map/01M0BCH3JSMGBNYMC2P8AGDRNM");
+        assert_eq!(echoed, "\"project-map/01M0BCH3JSMGBNYMC2P8AGDRNM\"");
     }
 
     #[test]

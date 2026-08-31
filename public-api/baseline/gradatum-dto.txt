@@ -408,6 +408,8 @@ pub fn gradatum_dto::VaultLinksRequest::new(alloc::string::String) -> Self
 pub gradatum_dto::VaultListRequest::cursor: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::limit: core::option::Option<u32>
 pub gradatum_dto::VaultListRequest::pattern: core::option::Option<alloc::string::String>
+pub gradatum_dto::VaultListRequest::role_kind: core::option::Option<alloc::string::String>
+pub gradatum_dto::VaultListRequest::role_status: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::section: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 #[non_exhaustive] pub struct gradatum_dto::VaultPurgeRequest
@@ -457,6 +459,10 @@ pub gradatum_dto::VaultSearchRequest::to_ms: core::option::Option<i64>
 pub gradatum_dto::VaultSearchRequest::vault_id: core::option::Option<gradatum_core::scope::VaultId>
 impl gradatum_dto::VaultSearchRequest
 pub fn gradatum_dto::VaultSearchRequest::new(alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::VaultTagsRequest
+pub gradatum_dto::VaultTagsRequest::limit: core::option::Option<usize>
+impl gradatum_dto::VaultTagsRequest
+pub fn gradatum_dto::VaultTagsRequest::new() -> Self
 #[non_exhaustive] pub struct gradatum_dto::VaultTimelineRequest
 pub gradatum_dto::VaultTimelineRequest::as_of_ms: core::option::Option<i64>
 pub gradatum_dto::VaultTimelineRequest::compact: bool

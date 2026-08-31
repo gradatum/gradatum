@@ -2,7 +2,7 @@
 
 > `Embedder` trait with HTTP (OpenAI-compatible) and ONNX CPU backends, plus a fallback decorator.
 
-**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -22,10 +22,10 @@ the fallback is called transparently.
 
 ```toml
 [dependencies]
-gradatum-embed = "2.0.0"
+gradatum-embed = "2.1.0"
 
 # For local ONNX CPU inference:
-gradatum-embed = { version = "2.0.0", features = ["fastembed-cpu"] }
+gradatum-embed = { version = "2.1.0", features = ["fastembed-cpu"] }
 ```
 
 ```rust

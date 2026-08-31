@@ -59,7 +59,8 @@
 //! - `GET /internal/v1/title-lookup`             — lookup ULID par titre (H1 Markdown)
 //! - `GET /internal/v1/id-lookup`                — lookup existence par ULID (ULID-first)
 //! - `GET /internal/v1/notes/by-locus`           — notes par préfixe locus
-//! - `GET /internal/v1/notes/count-unprocessed`  — comptage notes live non-processed (F-112)
+//! - `GET /internal/v1/notes/by-section`         — notes d'une section canonique (scope distill F-112)
+//! - `GET /internal/v1/notes/count-unprocessed`  — comptage notes live non-processed par SECTION (F-112)
 //! - `GET /internal/v1/notes/by-status`          — notes par statut
 //! - `GET /internal/v1/notes/garbage`            — notes Garbage expirées
 //! - `GET /internal/v1/forget/search`            — FTS5 pour scope Topic forget
@@ -179,6 +180,10 @@ pub fn build_internal_router(state: AppState) -> Router {
         .route(
             "/internal/v1/notes/by-locus",
             get(reads::handle_notes_by_locus),
+        )
+        .route(
+            "/internal/v1/notes/by-section",
+            get(reads::handle_notes_by_section),
         )
         .route(
             "/internal/v1/notes/count-unprocessed",

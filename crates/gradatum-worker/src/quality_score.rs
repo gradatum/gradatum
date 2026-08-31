@@ -1,7 +1,7 @@
 //! Deterministic quality scorer for distilled notes (pure module, zero I/O).
 //! grounding (embedding-cosine) x f17 x f47 x num/entity penalties -> quality_score.
 
-use crate::distill_cluster::cosine_similarity;
+use gradatum_distill::cosine_similarity;
 
 /// Component-wise centroid of a set of same-dimension embeddings.
 /// Returns an empty vector if `embeddings` is empty (or dimensions are inconsistent).

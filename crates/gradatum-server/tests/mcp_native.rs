@@ -1357,10 +1357,9 @@ async fn start_write_capable_mcp_server() -> (
     use gradatum_acl_policy::AclEngine;
     use gradatum_auth::jwt::JwtService;
     use gradatum_core::scope::VaultId;
-    use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
+    use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
     use gradatum_server::api_v1::mcp::build_mcp_service;
     use gradatum_vault::Vault;
-    use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::TempDir;
 
     // ACL : le SUJET du credential ("agent-credential") peut écrire partout. L'en-tête
@@ -1384,9 +1383,7 @@ write_patterns = ["**"]
             .expect("Vault::create task9"),
     );
 
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory — invariant test task9");
     run_migrations(&jobs_pool)

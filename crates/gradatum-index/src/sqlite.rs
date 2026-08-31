@@ -42,7 +42,7 @@ use gradatum_core::scheduled_health::{ScheduledTaskHealth, TaskOutcome};
 use gradatum_core::scope::{
     AgentId, AgentVaultGrant, GrantAccess, OverrideScope, TenantId, VaultGrant, VaultId,
 };
-use gradatum_core::section::{section_to_c_kind, section_to_doc_kind};
+use gradatum_core::section::{Section, section_to_c_kind, section_to_doc_kind};
 use gradatum_core::status::NoteStatus;
 
 /// Row returned by [`SqliteIndex::list_forgotten_notes`].
@@ -209,6 +209,34 @@ pub enum Freshness {
     /// No entry for this `(vault_id, source_path)` in `code_freshness`.
     /// Accuracy > coverage: never treated as `Fresh`.
     Unknown,
+}
+
+/// Outcome of a [`SqliteIndex::backfill_project_map_roles`] (or its dry-run twin) run.
+///
+/// The two counters are deliberately distinct, so that a caller can tell **"nothing left
+/// to back-fill"** (`scanned == 0`) from **"scanned rows but typed none of them"**
+/// (`scanned > 0 && updated == 0`). A tool that collapsed the two would reproduce the
+/// silent-zero failure that cost the 2.0.1 release — a component that never errors, shows
+/// its metrics, and reassures on an empty base.
+///
+/// - `scanned` — project-map rows that still lacked a `role_kind` when the run started
+///   (`WHERE section = 'project-map' AND role_kind IS NULL`, sentinels excluded).
+/// - `updated` — the subset the run actually typed, i.e. rows whose body yielded a
+///   `[[kind:…]]` through [`gradatum_core::project_map::roles_of_body`]. Tied to the
+///   number of rows the `UPDATE` really affected, never to the number of rows examined.
+///
+/// `scanned - updated` is the count of rows that carry no derivable `kind`: they are left
+/// NULL (never typed by force) and surfaced here rather than silently written. This is a
+/// legitimate, reported outcome — the population precedes the write-time validator, so the
+/// "no empty column" invariant is a property of fresh writes, not of the whole history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[must_use]
+#[non_exhaustive]
+pub struct BackfillReport {
+    /// project-map rows that lacked `role_kind` at the start of the run.
+    pub scanned: usize,
+    /// Subset of `scanned` this run typed (derived and wrote a non-NULL `role_kind`).
+    pub updated: usize,
 }
 
 /// Escapes SQLite LIKE metacharacters (`%`, `_`, `\`) in a value intended to be
@@ -1232,6 +1260,43 @@ impl SqliteIndex {
         Ok(total as u64)
     }
 
+    /// Timestamp (Unix epoch **ms**) of the most recently indexed live note in a vault.
+    ///
+    /// `MAX(COALESCE(updated, created))` over `status = 'live'`, non-sentinel notes —
+    /// the exact corpus counted by [`Self::live_note_count`]. Reuses the existing
+    /// `idx_notes_updated` index. Backs `vault_status.last_indexed_at`.
+    ///
+    /// In this write-indexed store every note write IS an indexation event: `created` on
+    /// insert, `updated` on mutation. Their maximum is therefore the instant of the most
+    /// recent indexation touching live content — the field's observable meaning. The
+    /// per-row `COALESCE(updated, created)` mirrors `vault_list.modified_at`
+    /// (`updated.unwrap_or(created)`): `updated` is `NULL` until a note is first mutated,
+    /// so a once-written note's indexation instant is its `created`.
+    ///
+    /// Returns `Ok(None)` **iff** the live corpus is empty (`MAX` over zero rows is
+    /// `NULL`). `created` is `NOT NULL`, so `COALESCE(updated, created)` is never `NULL`
+    /// per row — a non-empty corpus always yields `Some`. A storage failure is
+    /// propagated, never collapsed to `None`: a `null` on error would re-introduce the
+    /// misleading "never indexed" signal this method exists to remove.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    pub async fn last_indexed_at(&self, vault_id: &str) -> Result<Option<i64>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let latest: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(COALESCE(updated, created)) FROM notes
+                 WHERE vault_id = ?1
+                   AND status = 'live'
+                   AND id NOT LIKE '__sentinel__%'",
+                [vault_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| GradatumError::Storage(format!("last_indexed_at: {e}")))?;
+        Ok(latest)
+    }
+
     /// Updates the `title` column of an existing note.
     ///
     /// Idempotent. Used post-curation to persist the H1 title extracted from the body.
@@ -1579,6 +1644,26 @@ impl SqliteIndex {
         )
     }
 
+    /// SQL clause excluding the `Section::DEFAULT_SEARCH_EXCLUDED` sections, or `""`
+    /// when the inventory is empty.
+    ///
+    /// The section names come from the `Section` enum (kebab-case, no user input), so the
+    /// inline interpolation is injection-safe by construction. This is the SAME inventory
+    /// applied in memory by `vault_search_impl` on the BM25 hits (`SearchHitRaw.section`):
+    /// both paths read the same `n.section` column, so the exclusion cannot diverge
+    /// between results and count.
+    fn default_search_exclusion_clause() -> String {
+        let quoted: Vec<String> = Section::DEFAULT_SEARCH_EXCLUDED
+            .iter()
+            .map(|s| format!("'{}'", s.as_str()))
+            .collect();
+        if quoted.is_empty() {
+            String::new()
+        } else {
+            format!("AND n.section NOT IN ({})", quoted.join(", "))
+        }
+    }
+
     /// FTS5 search with native FTS5 snippet, optional section and locus filters.
     ///
     /// Uses `snippet(notes_fts, 0, '»', '«', '...', 32)` to locate the most relevant
@@ -1923,6 +2008,17 @@ impl SqliteIndex {
     /// identical by construction to `search_fts_with_snippet(base_param_idx=4, ...)`.
     /// A future 6th predicate has exactly ONE place to modify.
     ///
+    /// ## Default-search exclusion
+    ///
+    /// When `section` is `None` (no explicit section filter), the sections in
+    /// [`Section::DEFAULT_SEARCH_EXCLUDED`] (raw capture — `snapshot`) are NOT counted:
+    /// the exclusion clause is injected in the same sub-query, so the `LIMIT 10001` cap
+    /// applies to the VISIBLE count (exact, never a post-hoc subtraction). With an
+    /// explicit `section` — including `"snapshot"` itself — the exclusion is skipped
+    /// (default ≠ inaccessibility). `vault_search_impl` is the sole production caller,
+    /// and it applies the SAME inventory on the lexical hits in memory, so the count can
+    /// never announce matches the caller cannot see.
+    ///
     /// ## Count cap
     ///
     /// `LIMIT 10001` in the sub-query: if `COUNT(*) = 10001`, the true total is ≥ 10001.
@@ -1957,6 +2053,16 @@ impl SqliteIndex {
         let (downgraded_clause, section_clause, locus_clause, status_clause, _status_param_idx) =
             Self::build_fts_where_parts(3, include_downgraded, section, locus);
 
+        // F-246 : sans filtre de section explicite, les sections DEFAULT_SEARCH_EXCLUDED
+        // (raw capture) ne sont PAS comptées — même inventaire que le filtre en mémoire
+        // de `vault_search_impl`. Un filtre de section explicite (y compris `snapshot`)
+        // désactive l'exclusion : `section_clause` restreint déjà au périmètre demandé.
+        let default_exclusion_clause = if section.is_none() {
+            Self::default_search_exclusion_clause()
+        } else {
+            String::new()
+        };
+
         // R4 : LIMIT 10001 → cap 10000 via apply_cap.
         // Pas de snippet/JOIN lourd. Sous-requête sur FTS pour COUNT.
         let sql = format!(
@@ -1970,6 +2076,7 @@ impl SqliteIndex {
                  {section_clause}
                  {locus_clause}
                  {status_clause}
+                 {default_exclusion_clause}
                LIMIT 10001
              )"
         );
@@ -2399,6 +2506,174 @@ impl SqliteIndex {
                 .map_err(|e| GradatumError::Storage(format!("query list_notes: {e}")))?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| GradatumError::Storage(format!("collect list_notes: {e}")))?
+            }
+        };
+
+        Ok((records, total as u64))
+    }
+
+    /// Paginated metadata listing filtered by typed **project-map roles**.
+    ///
+    /// Identical to [`Self::list_notes`] (same pagination, same `ORDER BY id ASC`, same
+    /// `downgraded` exclusion, same `limit` clamp) with two **optional** equality filters on
+    /// the `role_kind` / `role_status` columns — populated at write time from the card body
+    /// (see [`gradatum_core::project_map::roles_of_body`]). A `None` filter means "no
+    /// constraint on that axis": both `None` reproduces [`Self::list_notes`] to the byte.
+    ///
+    /// Each role filter is bound **once** to a single numbered parameter, referenced twice in
+    /// the SQL (`?N IS NULL OR col = ?N`) — the statement stays entirely numbered, no anonymous
+    /// placeholder is mixed in. A NULL column value (a card not yet backfilled, or any note
+    /// outside `project-map`) never satisfies `col = ?N`, so an active filter excludes it: the
+    /// filter is deliberately blind to un-backfilled cards until the backfill runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradatumError::Storage`] if the SQLite query fails.
+    pub async fn list_notes_filtered(
+        &self,
+        vault_id: &str,
+        section: Option<&str>,
+        role_kind: Option<&str>,
+        role_status: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        let conn = self.conn.lock().await;
+        let limit_clamped = limit.clamp(1, 200) as i64;
+
+        // Comptage total — deux branches (section optionnelle). Les rôles sont des filtres
+        // NULL-safe : un `?N` NULL neutralise la clause (`?N IS NULL OR col = ?N`), d'où
+        // l'égalité stricte avec list_notes quand les deux rôles sont None.
+        let total: i64 = match section {
+            Some(sec) => conn.query_row(
+                "SELECT COUNT(*) FROM notes
+                 WHERE vault_id = ?1
+                   AND section = ?2
+                   AND id NOT LIKE '__sentinel__%'
+                   AND status != 'downgraded'
+                   AND (?3 IS NULL OR role_kind   = ?3)
+                   AND (?4 IS NULL OR role_status = ?4)",
+                rusqlite::params![vault_id, sec, role_kind, role_status],
+                |row| row.get(0),
+            ),
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM notes
+                 WHERE vault_id = ?1
+                   AND id NOT LIKE '__sentinel__%'
+                   AND status != 'downgraded'
+                   AND (?2 IS NULL OR role_kind   = ?2)
+                   AND (?3 IS NULL OR role_status = ?3)",
+                rusqlite::params![vault_id, role_kind, role_status],
+                |row| row.get(0),
+            ),
+        }
+        .map_err(|e| GradatumError::Storage(format!("list_notes_filtered count: {e}")))?;
+
+        // Requête paginée — même keyset ULID que list_notes. Rôles en ?5/?6 (branche Some)
+        // ou ?4/?5 (branche None) : ils suivent les indices déjà consommés par list_notes,
+        // sans mélange d'anonyme et de numéroté.
+        let cursor_val = cursor.unwrap_or("");
+
+        let records: Vec<NoteRecord> = match section {
+            Some(sec) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, vault_id, section, status, body_text,
+                                COALESCE(author_display_name, author_id) AS author,
+                                tags, content_hash, created, updated, title, locus
+                         FROM notes
+                         WHERE vault_id = ?1
+                           AND section = ?4
+                           AND id NOT LIKE '__sentinel__%'
+                           AND status != 'downgraded'
+                           AND (?2 = '' OR id > ?2)
+                           AND (?5 IS NULL OR role_kind   = ?5)
+                           AND (?6 IS NULL OR role_status = ?6)
+                         ORDER BY id ASC
+                         LIMIT ?3",
+                    )
+                    .map_err(|e| {
+                        GradatumError::Storage(format!(
+                            "list_notes_filtered prepare (section): {e}"
+                        ))
+                    })?;
+
+                stmt.query_map(
+                    rusqlite::params![
+                        vault_id,
+                        cursor_val,
+                        limit_clamped,
+                        sec,
+                        role_kind,
+                        role_status
+                    ],
+                    |row| {
+                        Ok(NoteRecord {
+                            id: row.get(0)?,
+                            vault_id: row.get(1)?,
+                            section: row.get(2)?,
+                            status: row.get(3)?,
+                            body_text: row.get(4)?,
+                            author: row.get(5)?,
+                            tags_raw: row.get(6)?,
+                            content_hash: row.get::<_, Vec<u8>>(7)?,
+                            created: row.get(8)?,
+                            updated: row.get(9)?,
+                            title: row.get(10)?,
+                            locus: row.get(11)?,
+                        })
+                    },
+                )
+                .map_err(|e| {
+                    GradatumError::Storage(format!("query list_notes_filtered (section): {e}"))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| {
+                    GradatumError::Storage(format!("collect list_notes_filtered (section): {e}"))
+                })?
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, vault_id, section, status, body_text,
+                                COALESCE(author_display_name, author_id) AS author,
+                                tags, content_hash, created, updated, title, locus
+                         FROM notes
+                         WHERE vault_id = ?1
+                           AND id NOT LIKE '__sentinel__%'
+                           AND status != 'downgraded'
+                           AND (?2 = '' OR id > ?2)
+                           AND (?4 IS NULL OR role_kind   = ?4)
+                           AND (?5 IS NULL OR role_status = ?5)
+                         ORDER BY id ASC
+                         LIMIT ?3",
+                    )
+                    .map_err(|e| {
+                        GradatumError::Storage(format!("list_notes_filtered prepare: {e}"))
+                    })?;
+
+                stmt.query_map(
+                    rusqlite::params![vault_id, cursor_val, limit_clamped, role_kind, role_status],
+                    |row| {
+                        Ok(NoteRecord {
+                            id: row.get(0)?,
+                            vault_id: row.get(1)?,
+                            section: row.get(2)?,
+                            status: row.get(3)?,
+                            body_text: row.get(4)?,
+                            author: row.get(5)?,
+                            tags_raw: row.get(6)?,
+                            content_hash: row.get::<_, Vec<u8>>(7)?,
+                            created: row.get(8)?,
+                            updated: row.get(9)?,
+                            title: row.get(10)?,
+                            locus: row.get(11)?,
+                        })
+                    },
+                )
+                .map_err(|e| GradatumError::Storage(format!("query list_notes_filtered: {e}")))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| GradatumError::Storage(format!("collect list_notes_filtered: {e}")))?
             }
         };
 
@@ -3446,6 +3721,19 @@ impl SqliteIndex {
         // Usage scoring effectif : DIFFÉRÉ v0.4.0 (F-17). Section reste autoritaire.
         let c_kind = section_to_c_kind(&note.frontmatter.section);
         let doc_kind = section_to_doc_kind(&note.frontmatter.section);
+        // role_kind / role_status : dérivés du corps via parse_link (source unique — voir
+        // gradatum_core::project_map::roles_of_body). Uniquement pour project-map ; NULL
+        // ailleurs, même patron que c_kind/doc_kind. Filtrables sans lire body_text (F-171).
+        let roles = if matches!(
+            note.frontmatter.section,
+            gradatum_core::section::Section::ProjectMap
+        ) {
+            gradatum_core::project_map::roles_of_body(&note.body.markdown)
+        } else {
+            gradatum_core::project_map::ProjectMapRoles::default()
+        };
+        let role_kind: Option<&str> = roles.kind;
+        let role_status: Option<&str> = roles.status;
         // NoteStatus : kebab-case via Display (ex. "pending-review")
         let status_str = note.frontmatter.status.to_string();
 
@@ -3515,8 +3803,8 @@ impl SqliteIndex {
                 author_kind, author_id, author_display_name,
                 created, updated, status_changed, status_reason,
                 content_hash, version, body_text, integrity_signature, extra_json, tags,
-                c_kind, doc_kind, provenance, trust
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                c_kind, doc_kind, provenance, trust, role_kind, role_status
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             ON CONFLICT(vault_id, id) DO UPDATE SET
                 vault_id             = excluded.vault_id,
                 -- P1-1 (F-37 S1.4): preserve a locus modified via update_note_locus.
@@ -3558,7 +3846,11 @@ impl SqliteIndex {
                                          WHEN notes.provenance IS NOT excluded.provenance
                                            THEN excluded.trust
                                          ELSE notes.trust
-                                       END
+                                       END,
+                -- F-171: roles derived from the body; a re-upsert of a modified body must
+                -- refresh the roles (otherwise the column stays on the old kind/status).
+                role_kind            = excluded.role_kind,
+                role_status          = excluded.role_status
             WHERE notes.vault_id = excluded.vault_id",
             rusqlite::params![
                 id_str,
@@ -3584,6 +3876,8 @@ impl SqliteIndex {
                 doc_kind,         // doc_kind CoALA (F-42 c-prime, scoring-only)
                 provenance,       // F-47 provenance String (depuis frontmatter)
                 trust,            // F-47 trust REAL (depuis TRUST_SCORES, défaut 0.50)
+                role_kind,        // F-171 role_kind (parse_link, project-map only, NULL sinon)
+                role_status,      // F-171 role_status (parse_link, project-map only, NULL sinon)
             ],
         )
         .map_err(|e| GradatumError::Storage(format!("INSERT notes : {e}")))?;
@@ -3602,6 +3896,146 @@ impl SqliteIndex {
         .map_err(|e| GradatumError::Storage(format!("INSERT notes_fts : {e}")))?;
 
         Ok(())
+    }
+
+    /// Back-fills `role_kind` / `role_status` on the project-map cards that predate the
+    /// write-time role derivation.
+    ///
+    /// Migration 0043 added the two columns as NULL; only cards written **after** the
+    /// derivation shipped ([`Self::upsert_note`]) carry populated columns. This method
+    /// types the pre-existing rows through the **same** analyser as the write path —
+    /// [`gradatum_core::project_map::roles_of_body`], i.e. the very `parse_link` that
+    /// [`Self::upsert_note`] uses. No second analyser exists, so a back-filled row is
+    /// byte-identical to what a re-write would have produced.
+    ///
+    /// ## Distinct SQL path from the write path
+    ///
+    /// The write path exercises `ON CONFLICT … DO UPDATE`; this method issues a **bare
+    /// `UPDATE`** on pre-existing rows. It is a separate path, covered by its own tests.
+    ///
+    /// ## Idempotence
+    ///
+    /// The scan is gated on `role_kind IS NULL`, and each `UPDATE` repeats that guard, so a
+    /// second run touches no row already typed by the first. A row whose body yields no
+    /// `[[kind:…]]` cannot be typed: it stays NULL, is re-scanned on every run, and is
+    /// reported through `scanned > updated` — never written by force. Running twice on a
+    /// fully-typable population therefore yields `updated == 0` on the second pass.
+    ///
+    /// ## Scope
+    ///
+    /// `section = 'project-map'` only, sentinels excluded (`id NOT LIKE '__sentinel__%'`,
+    /// mirroring [`Self::allocate_feature_number`], which reads the same section). **Every**
+    /// card is typed, including `downgraded` ones: a downgraded card is still a card and its
+    /// *type* is independent of its *status* (two orthogonal axes).
+    ///
+    /// The scan, the per-row derivation and every `UPDATE` run inside one transaction: any
+    /// failure rolls the whole run back, leaving the columns exactly as before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradatumError::Storage`] if any query fails. On error the transaction rolls
+    /// back and no column is left half-written.
+    pub async fn backfill_project_map_roles(&self) -> Result<BackfillReport, GradatumError> {
+        self.backfill_project_map_roles_inner(true).await
+    }
+
+    /// Dry-run twin of [`Self::backfill_project_map_roles`].
+    ///
+    /// Runs the exact same scan and derivation inside a transaction it then **rolls back**,
+    /// so the returned [`BackfillReport`] reports what an apply *would* do — `scanned` and
+    /// `updated` are identical to the apply outcome — without mutating a single row. There
+    /// is a single analyser and a single code path shared with the apply variant; only the
+    /// final `COMMIT` differs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradatumError::Storage`] if any query fails.
+    pub async fn dry_run_project_map_roles(&self) -> Result<BackfillReport, GradatumError> {
+        self.backfill_project_map_roles_inner(false).await
+    }
+
+    /// Shared body of [`Self::backfill_project_map_roles`] and
+    /// [`Self::dry_run_project_map_roles`]: one analyser, one transaction.
+    ///
+    /// `apply == true` commits; `apply == false` drops the transaction, whose default
+    /// rusqlite drop behaviour is `Rollback`, so a dry-run mutates nothing.
+    async fn backfill_project_map_roles_inner(
+        &self,
+        apply: bool,
+    ) -> Result<BackfillReport, GradatumError> {
+        let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction().map_err(|e| {
+            GradatumError::Storage(format!("backfill_project_map_roles BEGIN: {e}"))
+        })?;
+
+        // Collecte des lignes non typées AVANT toute écriture : un statement `SELECT`
+        // emprunté ne peut pas cohabiter avec un `UPDATE` sur la même connexion. project-map
+        // est O(centaines) → une page en mémoire est négligeable.
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT vault_id, id, body_text FROM notes
+                     WHERE section = 'project-map'
+                       AND role_kind IS NULL
+                       AND id NOT LIKE '__sentinel__%'",
+                )
+                .map_err(|e| {
+                    GradatumError::Storage(format!("backfill_project_map_roles prepare: {e}"))
+                })?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| {
+                    GradatumError::Storage(format!("backfill_project_map_roles query: {e}"))
+                })?;
+            let mut collected = Vec::new();
+            for row in mapped {
+                collected.push(row.map_err(|e| {
+                    GradatumError::Storage(format!("backfill_project_map_roles row: {e}"))
+                })?);
+            }
+            collected
+        };
+
+        let scanned = rows.len();
+        let mut updated = 0usize;
+
+        for (vault_id, id, body_text) in &rows {
+            let roles = gradatum_core::project_map::roles_of_body(body_text);
+            // Un corps dont aucun `[[kind:…]]` n'est dérivable ne peut pas quitter le filtre
+            // `role_kind IS NULL` : on le laisse NULL (re-scanné, jamais typé au forceps) et
+            // il n'entre pas dans `updated`. C'est la ligne que le rapport surface via
+            // `scanned > updated` (constat #3 de l'audit Task 4).
+            let Some(kind) = roles.kind else { continue };
+            // `updated` est incrémenté du nombre de lignes RÉELLEMENT affectées par l'UPDATE
+            // (0 ou 1), jamais d'un compteur détaché de l'écriture — le rapport ne peut donc
+            // pas mentir sur ce qu'il a écrit. La garde `role_kind IS NULL` du WHERE rejoue
+            // l'idempotence côté SQL.
+            updated += tx
+                .execute(
+                    "UPDATE notes SET role_kind = ?1, role_status = ?2
+                     WHERE vault_id = ?3 AND id = ?4 AND role_kind IS NULL",
+                    rusqlite::params![kind, roles.status, vault_id, id],
+                )
+                .map_err(|e| {
+                    GradatumError::Storage(format!("backfill_project_map_roles UPDATE: {e}"))
+                })?;
+        }
+
+        if apply {
+            tx.commit().map_err(|e| {
+                GradatumError::Storage(format!("backfill_project_map_roles COMMIT: {e}"))
+            })?;
+        }
+        // apply == false → `tx` est droppé ici sans commit : rollback implicite (drop_behavior
+        // par défaut de rusqlite = Rollback). Aucune ligne n'est mutée en dry-run.
+
+        Ok(BackfillReport { scanned, updated })
     }
 
     /// Reads the trust score for a note from the `notes.trust` column, scoped to `vault_id`.
@@ -3668,7 +4102,7 @@ impl SqliteIndex {
     ///
     /// `upsert_note` derives `trust` statically from `provenance` via `TRUST_SCORES`
     /// (e.g. `distilled` → `0.60`). Distillation computes a **dynamic** trust
-    /// (`compute_distill_trust` = mean(trust sources) × confidence) that must overwrite
+    /// (`gradatum_distill::compute_distill_trust` = mean(trust sources) × confidence) that must overwrite
     /// the static value after writing the synthesis note.
     ///
     /// This method is the sole write point for trust values computed outside `TRUST_SCORES`.
@@ -4764,6 +5198,38 @@ impl SqliteIndex {
             .map_err(|e| {
                 GradatumError::Storage(format!("collect list_notes_by_locus_prefix: {e}"))
             })?;
+        Ok(rows)
+    }
+
+    /// Section-scope resolution: notes whose `section` equals the given canonical name.
+    ///
+    /// The per-section counterpart of [`Self::list_notes_by_locus_prefix`] — same
+    /// `(id, section)` shape, same `forgotten = 0` filter, but matched on the `section`
+    /// column instead of `locus LIKE prefix%`. The conditional distill cron
+    /// measures consolidation pressure per section and enqueues `JobScope::Section`
+    /// jobs that this listing resolves.
+    pub async fn list_notes_by_section(
+        &self,
+        vault_id: &str,
+        section: &str,
+    ) -> Result<Vec<(String, String)>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, section
+                 FROM notes
+                 WHERE vault_id = ?1
+                   AND section = ?2
+                   AND forgotten = 0",
+            )
+            .map_err(|e| GradatumError::Storage(format!("prepare list_notes_by_section: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![vault_id, section], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| GradatumError::Storage(format!("query list_notes_by_section: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| GradatumError::Storage(format!("collect list_notes_by_section: {e}")))?;
         Ok(rows)
     }
 
@@ -7005,6 +7471,22 @@ impl SqliteIndex {
         Ok(out)
     }
 
+    /// Counts **embeddable** notes with no embedding in `note_embeddings`.
+    ///
+    /// Delegates the SQL to `count_embeddable_unembedded` (unit-tested against a
+    /// minimal schema), whose status filter derives from the same SSOT the embedding backfill
+    /// repairs. Feeds `DriftScanResult::embeddable_notes_without_vector`.
+    ///
+    /// ## Errors
+    ///
+    /// - `GradatumError::Storage` if the query fails.
+    pub async fn count_embeddable_notes_without_embedding(&self) -> Result<u64, GradatumError> {
+        let conn = self.conn.lock().await;
+        crate::drift::count_embeddable_unembedded(&conn).map_err(|e| {
+            GradatumError::Storage(format!("count_embeddable_notes_without_embedding: {e}"))
+        })
+    }
+
     pub async fn get_note(
         &self,
         tenant_id: &str,
@@ -8204,6 +8686,123 @@ mod vault_status_tests {
             count, 0,
             "vault 'other' sans notes → live_note_count = 0 (isolation correcte)"
         );
+    }
+
+    // ── F-169 : last_indexed_at (fraîcheur de l'index) ─────────────────────────
+
+    /// Insère une note avec `created`/`updated`/`status`/`vault_id` explicites.
+    ///
+    /// Passe par le `conn` brut (accessible en test) car aucun seed public ne permet
+    /// de fixer `updated` — or la valeur exacte de `updated` est ce que
+    /// [`SqliteIndex::last_indexed_at`] doit départager (COALESCE per-row).
+    async fn seed_note_ts(
+        idx: &SqliteIndex,
+        id: &str,
+        vault: &str,
+        status: &str,
+        created: i64,
+        updated: Option<i64>,
+    ) {
+        let conn = idx.conn.lock().await;
+        conn.execute(
+            "INSERT INTO notes (id, vault_id, section, status, schema_version, created, updated, content_hash, body_text) \
+             VALUES (?1, ?2, 'reference', ?3, 1, ?4, ?5, X'00', 'b')",
+            rusqlite::params![id, vault, status, created, updated],
+        )
+        .unwrap();
+    }
+
+    /// Corpus live vide → `None` (rien n'a jamais été indexé) — jamais un faux nul.
+    #[tokio::test]
+    async fn last_indexed_at_empty_vault_returns_none() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        let got = idx.last_indexed_at("main").await.unwrap();
+        assert_eq!(got, None, "vault vide → last_indexed_at = None");
+    }
+
+    /// Renvoie le MAX des horodatages parmi les notes live.
+    #[tokio::test]
+    async fn last_indexed_at_returns_max_over_live_notes() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        seed_note_ts(&idx, "01A", "main", "live", 100, None).await;
+        seed_note_ts(&idx, "01B", "main", "live", 500, None).await;
+        seed_note_ts(&idx, "01C", "main", "live", 300, None).await;
+        let got = idx.last_indexed_at("main").await.unwrap();
+        assert_eq!(got, Some(500), "doit retourner le created le plus récent");
+    }
+
+    /// `updated`, quand il est renseigné, prime sur `created` (COALESCE per-row).
+    ///
+    /// Mordant : tue une implémentation `MAX(created)` (donnerait 100).
+    #[tokio::test]
+    async fn last_indexed_at_uses_updated_when_present() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        seed_note_ts(&idx, "01A", "main", "live", 100, Some(9000)).await;
+        let got = idx.last_indexed_at("main").await.unwrap();
+        assert_eq!(
+            got,
+            Some(9000),
+            "note mutée : `updated` doit primer sur `created`"
+        );
+    }
+
+    /// `updated` NULL retombe sur `created` (COALESCE per-row).
+    ///
+    /// Mordant : tue une implémentation `MAX(updated)` (retournerait None sur une
+    /// unique ligne à `updated` NULL).
+    #[tokio::test]
+    async fn last_indexed_at_falls_back_to_created_when_updated_null() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        seed_note_ts(&idx, "01A", "main", "live", 5000, None).await;
+        let got = idx.last_indexed_at("main").await.unwrap();
+        assert_eq!(
+            got,
+            Some(5000),
+            "note jamais mutée : `created` doit être pris en compte"
+        );
+    }
+
+    /// Exclut les notes non-live (downgraded), même plus récentes.
+    ///
+    /// Mordant : tue le retrait du filtre `status = 'live'`.
+    #[tokio::test]
+    async fn last_indexed_at_excludes_non_live() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        seed_note_ts(&idx, "01LIVE", "main", "live", 100, None).await;
+        seed_note_ts(&idx, "01DOWN", "main", "downgraded", 99_999, None).await;
+        let got = idx.last_indexed_at("main").await.unwrap();
+        assert_eq!(
+            got,
+            Some(100),
+            "une note downgraded plus récente ne doit pas compter"
+        );
+    }
+
+    /// Exclut les sentinelles (`id LIKE '__sentinel__%'`), même plus récentes.
+    ///
+    /// Mordant : tue le retrait du filtre `id NOT LIKE '__sentinel__%'`.
+    #[tokio::test]
+    async fn last_indexed_at_excludes_sentinel() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        seed_note_ts(&idx, "01REAL", "main", "live", 100, None).await;
+        seed_note_ts(&idx, "__sentinel__main", "main", "live", 99_999, None).await;
+        let got = idx.last_indexed_at("main").await.unwrap();
+        assert_eq!(
+            got,
+            Some(100),
+            "la sentinelle ne doit pas peser sur last_indexed_at"
+        );
+    }
+
+    /// Scoping par vault : une note d'un autre vault ne fuit pas.
+    ///
+    /// Mordant : tue le retrait du filtre `vault_id = ?1`.
+    #[tokio::test]
+    async fn last_indexed_at_vault_isolation() {
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+        seed_note_ts(&idx, "01A", "main", "live", 100, None).await;
+        let got = idx.last_indexed_at("other").await.unwrap();
+        assert_eq!(got, None, "vault 'other' sans note → None (isolation)");
     }
 }
 
@@ -13174,6 +13773,846 @@ mod list_recent_notes_tests {
             2,
             "la limite k=2 doit être respectée, got {}",
             records.len()
+        );
+    }
+}
+
+// ── Tests F-171 : dérivation role_kind / role_status dans upsert_note ─────────
+//
+// Vérifie que upsert_note dérive et persiste role_kind / role_status via
+// gradatum_core::project_map::roles_of_body (source unique = parse_link), et
+// uniquement pour la section project-map (NULL ailleurs).
+
+#[cfg(test)]
+mod role_columns_tests {
+    use super::*;
+    use chrono::Utc;
+    use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
+    use gradatum_core::identity::{ContentHash, NoteId, NoteVersion};
+    use gradatum_core::note::{Note, NoteBody};
+    use gradatum_core::scope::VaultId;
+    use gradatum_core::section::Section;
+    use gradatum_core::status::NoteStatus;
+
+    /// Construit une Note `(section, body)` avec un id ULID **déterministe** dérivé de `id_key`.
+    ///
+    /// L'id est dérivé (`NoteId::derived_from`), jamais fourni littéralement : `upsert_note`
+    /// stocke `note.id.to_string()`, qui round-trip par le crate `ulid` (26 caractères
+    /// Crockford) — une chaîne arbitraire ne peut donc pas être imposée comme id. Le test
+    /// interroge par `note.id.to_string()`.
+    fn note_for_test(id_key: &str, section: Section, body: &str) -> Note {
+        let frontmatter = Frontmatter {
+            schema_version: 1,
+            vault_id: VaultId::new("main"),
+            locus: None,
+            section,
+            status: NoteStatus::Live,
+            status_reason: None,
+            status_changed: None,
+            tags: Default::default(),
+            author: None,
+            created: Utc::now(),
+            updated: None,
+            extra: ExtraFields::empty(),
+            provenance: None,
+            forgotten: None,
+            forgotten_at: None,
+            forgotten_by: None,
+        };
+        let note_body = NoteBody {
+            markdown: body.to_string(),
+        };
+        let content_hash = ContentHash::compute(&frontmatter, body);
+        Note {
+            id: NoteId::derived_from(id_key.as_bytes()),
+            frontmatter,
+            body: note_body,
+            version: NoteVersion::initial(),
+            content_hash,
+            integrity_signature: None,
+        }
+    }
+
+    fn project_map_note_for_test(id_key: &str, body: &str) -> Note {
+        note_for_test(id_key, Section::ProjectMap, body)
+    }
+
+    fn decisions_note_for_test(id_key: &str, body: &str) -> Note {
+        note_for_test(id_key, Section::Decisions, body)
+    }
+
+    /// Lit `(role_kind, role_status)` de la ligne `notes` d'`id` (vault `main`).
+    ///
+    /// Factorise le `SELECT` partagé par les tests de rôles (le motif apparaissait
+    /// à l'identique dans chaque test). `expect` : la ligne DOIT exister — un test
+    /// qui interroge un id non inséré est un bug de test, pas un cas d'erreur runtime.
+    async fn select_roles(idx: &SqliteIndex, id: &str) -> (Option<String>, Option<String>) {
+        let conn = idx.conn.lock().await;
+        conn.query_row(
+            "SELECT role_kind, role_status FROM notes WHERE vault_id='main' AND id=?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("SELECT role_kind/role_status")
+    }
+
+    #[tokio::test]
+    async fn upsert_note_derives_role_columns_for_project_map() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let note = project_map_note_for_test(
+            "f171-role-cols-project-map-1",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+        );
+        let id = note.id.to_string();
+        idx.upsert_note(&note).await.expect("upsert_note");
+
+        let (kind, status) = select_roles(&idx, &id).await;
+        assert_eq!(kind.as_deref(), Some("FIX"));
+        assert_eq!(status.as_deref(), Some("OPEN"));
+    }
+
+    #[tokio::test]
+    async fn upsert_note_leaves_roles_null_outside_project_map() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        // Corps PORTEUR de rôles valides : sur une section project-map il donnerait
+        // FIX/OPEN. Ici la section est `decisions` — seul le gate de section (et non
+        // l'absence de wikilink) doit maintenir les colonnes à NULL. Sans le gate,
+        // `roles_of_body` peuplerait FIX/OPEN et les `is_none()` tomberaient : le test
+        // exerce désormais réellement la propriété « rôles dérivés SEULEMENT en project-map ».
+        let note = decisions_note_for_test(
+            "f171-role-cols-decisions-1",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+        );
+        let id = note.id.to_string();
+        idx.upsert_note(&note).await.expect("upsert_note");
+
+        let (kind, status) = select_roles(&idx, &id).await;
+        assert!(kind.is_none(), "une note hors project-map n'a pas de rôle");
+        assert!(
+            status.is_none(),
+            "une note hors project-map n'a pas de statut"
+        );
+    }
+
+    /// Ré-upsert d'une carte project-map dont le corps a perdu ses rôles : les
+    /// colonnes doivent repasser à NULL (branche `ON CONFLICT DO UPDATE`, transition
+    /// valeur→NULL). Garde-fou contre une future application du motif `COALESCE`
+    /// (déjà utilisé pour `locus`/`trust` dans la même clause) qui figerait l'ancien
+    /// rôle et casserait silencieusement cette transition.
+    #[tokio::test]
+    async fn reupsert_project_map_clears_roles_when_body_loses_them() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        // 1er upsert (INSERT) : corps porteur → colonnes peuplées.
+        let note = project_map_note_for_test(
+            "f171-role-cols-reupsert-1",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+        );
+        let id = note.id.to_string();
+        idx.upsert_note(&note).await.expect("upsert_note INSERT");
+        let (kind, status) = select_roles(&idx, &id).await;
+        assert_eq!(
+            kind.as_deref(),
+            Some("FIX"),
+            "INSERT doit peupler role_kind"
+        );
+        assert_eq!(
+            status.as_deref(),
+            Some("OPEN"),
+            "INSERT doit peupler role_status"
+        );
+
+        // 2e upsert (ON CONFLICT DO UPDATE), MÊME id, corps SANS rôles : les colonnes
+        // doivent repasser à NULL. `role_kind = excluded.role_kind` (pas COALESCE).
+        let note_cleared = project_map_note_for_test(
+            "f171-role-cols-reupsert-1",
+            "## Carte\naucun wikilink typé ici",
+        );
+        assert_eq!(
+            note_cleared.id.to_string(),
+            id,
+            "même id_key ⇒ même id dérivé (déclenche ON CONFLICT DO UPDATE)"
+        );
+        idx.upsert_note(&note_cleared)
+            .await
+            .expect("upsert_note UPDATE");
+        let (kind, status) = select_roles(&idx, &id).await;
+        assert!(
+            kind.is_none(),
+            "ré-upsert d'un corps sans rôle doit remettre role_kind à NULL"
+        );
+        assert!(
+            status.is_none(),
+            "ré-upsert d'un corps sans rôle doit remettre role_status à NULL"
+        );
+    }
+
+    // ── Tests F-171 Task 2 : list_notes_filtered ─────────────────────────────
+
+    /// Filtrage conjonctif `kind` ∧ `status`. Le jeu est délibérément croisé :
+    /// deux cartes FIX, deux cartes OPEN, mais une **seule** FIX∧OPEN. Aucun filtre
+    /// mono-axe ne peut donc rendre exactement 1 (kind=FIX → 2, status=OPEN → 2,
+    /// aucun filtre → 3) — seule la conjonction correcte le fait. Ferme d'un même
+    /// jeu les mutations « un seul axe appliqué », « aucun filtre appliqué » et
+    /// « colonnes kind/status inversées dans la requête » (rendrait 0).
+    #[tokio::test]
+    async fn list_notes_filtered_returns_exact_set() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let mut want_id = String::new();
+        for (id_key, kind, status) in [
+            ("f171-filter-fix-open", "FIX", "OPEN"),
+            ("f171-filter-fix-done", "FIX", "DONE"),
+            ("f171-filter-feature-open", "FEATURE", "OPEN"),
+        ] {
+            let body = format!("[[project:gradatum]] [[status:{status}]] [[kind:{kind}]]");
+            let note = project_map_note_for_test(id_key, &body);
+            if kind == "FIX" && status == "OPEN" {
+                want_id = note.id.to_string();
+            }
+            idx.upsert_note(&note).await.expect("upsert_note");
+        }
+
+        let (notes, total) = idx
+            .list_notes_filtered(
+                "main",
+                Some("project-map"),
+                Some("FIX"),
+                Some("OPEN"),
+                50,
+                None,
+            )
+            .await
+            .expect("list_notes_filtered");
+
+        assert_eq!(total, 1, "un seul FIX encore OPEN");
+        assert_eq!(notes.len(), 1, "une seule carte dans la page");
+        assert_eq!(notes[0].id, want_id, "la carte FIX∧OPEN, pas une autre");
+    }
+
+    /// Rétro-compatibilité stricte : sans aucun filtre (`None`/`None`),
+    /// `list_notes_filtered` rend **exactement** ce que rend `list_notes`. Le jeu est
+    /// volontairement mixte — une carte porteuse de rôles, une carte à colonnes de rôle
+    /// NULL — pour fermer la mutation « le chemin sans filtre exclut par erreur les
+    /// lignes à role NULL » (invisible si toute carte portait un rôle). Ferme aussi
+    /// « la méthode inhérente rend l'ensemble vide / omet des lignes » (rendrait 0 vs 2).
+    /// NB : l'appel porte sur la méthode **inhérente** de `SqliteIndex` — l'override du
+    /// trait `IndexStore` n'est pas traversé ici (il l'est via le chemin serveur).
+    #[tokio::test]
+    async fn list_notes_filtered_without_filter_matches_list_notes() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        idx.upsert_note(&project_map_note_for_test(
+            "f171-filter-none-with-roles",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+        ))
+        .await
+        .expect("upsert_note avec rôles");
+        idx.upsert_note(&project_map_note_for_test(
+            "f171-filter-none-bare",
+            "## Carte\naucun wikilink typé ici",
+        ))
+        .await
+        .expect("upsert_note sans rôle");
+
+        let (a, ta) = idx
+            .list_notes("main", Some("project-map"), 50, None)
+            .await
+            .expect("list_notes");
+        let (b, tb) = idx
+            .list_notes_filtered("main", Some("project-map"), None, None, 50, None)
+            .await
+            .expect("list_notes_filtered");
+
+        let ids_a: Vec<&str> = a.iter().map(|n| n.id.as_str()).collect();
+        let ids_b: Vec<&str> = b.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ta, tb, "total identique sans filtre");
+        assert_eq!(
+            ids_a, ids_b,
+            "même page, mêmes ids sans filtre (dont la carte à role NULL)"
+        );
+    }
+
+    // ── Tests F-171 Task 4 : oracle relationnel semé + robustesse corruption ──
+    //
+    // Layer A (partition exacte + contrôle négatif de divergence) et Layer C
+    // (robustesse de l'analyseur sur corruption) vivent ici, au niveau index :
+    // ils exigent l'accès SQL brut (`idx.conn.lock().await`) et le VRAI `upsert_note`,
+    // qu'aucun harnais serveur n'expose. Les deux gardes qui réclament le scanner
+    // *curator* (accord core↔curator D2, preuve que le chemin d'écriture rejette la
+    // corruption C1) vivent côté serveur (`api_v1_handlers.rs`) : `gradatum-index`
+    // ne dépend PAS de `gradatum-curator` (bloc P0 : dérivation via core, comme
+    // `c_kind`/`doc_kind`), et l'y ajouter en dev-dep créerait un cycle dev-dep
+    // (curator dépend d'index) — écart au fichier prescrit, imposé par le code.
+
+    /// Sème un corpus project-map à réponse connue via le VRAI `upsert_note`.
+    ///
+    /// Composition : les **4 `kind` réels** (`FEATURE`/`FIX`/`ENHANCEMENT`/`TASK` —
+    /// dont `ENHANCEMENT`, une catégorie qu'une liste `IN (…)` figée laissait tomber au
+    /// comptage d'origine) + du **bruit adverse** (prose citant un autre type — cas A/B,
+    /// sous-chaîne d'un mot plus long — cas C, lien malformé écarté — cas E).
+    /// Chaque carte porte exactement **un** `kind` valide (première occurrence gagnante) :
+    /// `role_kind IS NULL` reste donc 0 sur tout le corpus, et le bruit ne peuple jamais la
+    /// colonne — il ne nourrit que la sous-chaîne nue du contrôle négatif.
+    ///
+    /// Rend le nombre de cartes live semées (== `COUNT(*)` attendu).
+    async fn seed_role_corpus(idx: &SqliteIndex) -> i64 {
+        // Chaque corps commence par 1 project + 1 status + 1 kind BIEN FORMÉS ; la prose
+        // adverse suit. Le seul lien typé supplémentaire volontaire est le `[[kind:bugfix]]`
+        // MALFORMÉ du cas E — écarté par `parse_link`, donc jamais un 2e kind valide.
+        let cards: &[(&str, &str)] = &[
+            // — 4 kinds propres, un par bucket.
+            (
+                "f171-t4-clean-feature",
+                "[[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]]\n\nCorps propre.",
+            ),
+            (
+                "f171-t4-clean-fix",
+                "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]\n\nCorps propre.",
+            ),
+            (
+                "f171-t4-clean-task",
+                "[[project:gradatum]] [[status:DONE]] [[kind:TASK]]\n\nCorps propre.",
+            ),
+            (
+                "f171-t4-clean-enh",
+                "[[project:gradatum]] [[status:OPEN]] [[kind:ENHANCEMENT]]\n\nCorps propre.",
+            ),
+            // — Cas A : FEATURE dont la PROSE cite FIX. La colonne dit FEATURE, le LIKE naïf
+            //   la compte AUSSI dans le bucket FIX → source de divergence.
+            (
+                "f171-t4-prose-a",
+                "[[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]]\n\nCette carte parle d'un FIX à corriger.",
+            ),
+            // — Cas B : TASK qui référence une autre carte et cite des types en prose.
+            (
+                "f171-t4-dep-b",
+                "[[project:gradatum]] [[status:IN_PROGRESS]] [[kind:TASK]] [[decisions:01KVBTMYNK4XXZJAKWMTB4AM9K]]\n\nDépend d'une FEATURE et d'une ENHANCEMENT décrites ailleurs.",
+            ),
+            // — Cas C : TASK dont la prose porte des SOUS-CHAÎNES (PREFIX⊃FIX, FEATURED⊃FEATURE).
+            (
+                "f171-t4-substr-c",
+                "[[project:gradatum]] [[status:OPEN]] [[kind:TASK]]\n\nUn PREFIX et une FEATURED : sous-chaînes qui nourrissent le LIKE naïf.",
+            ),
+            // — Cas E : ENHANCEMENT avec un [[kind:bugfix]] MALFORMÉ (minuscule) devant le vrai
+            //   kind. `roles_of_body` écarte le malformé (parse_link échoue), le premier VALIDE
+            //   (ENHANCEMENT) gagne. Aucun bucket `bugfix`.
+            (
+                "f171-t4-malformed-e",
+                "[[project:gradatum]] [[status:OPEN]] [[kind:bugfix]] [[kind:ENHANCEMENT]]\n\nMalformé écarté.",
+            ),
+        ];
+        for (id_key, body) in cards {
+            idx.upsert_note(&project_map_note_for_test(id_key, body))
+                .await
+                .expect("upsert_note seed corpus");
+        }
+        cards.len() as i64
+    }
+
+    /// Partition exacte par `GROUP BY` (jamais `IN (...)`) + contrôle négatif
+    /// de divergence qui **mord** (Σ naïve par sous-chaîne nue > `COUNT(*)`), sinon échec explicite.
+    #[tokio::test]
+    async fn typed_partition_is_exact_and_negative_control_bites() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_role_corpus(&idx).await;
+
+        let conn = idx.conn.lock().await;
+        let base = "vault_id='main' AND section='project-map' AND status='live'";
+
+        // (1) Aucune carte project-map sans type après écriture.
+        let nulls: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM notes WHERE {base} AND role_kind IS NULL"),
+                [],
+                |r| r.get(0),
+            )
+            .expect("COUNT role_kind IS NULL");
+        assert_eq!(
+            nulls, 0,
+            "aucune carte project-map sans type après écriture"
+        );
+
+        // (2) Énumération par GROUP BY — JAMAIS une liste figée qui laisserait tomber une
+        //     catégorie entière (bug d'origine : ENHANCEMENT hors comptage).
+        let kinds: Vec<(String, i64)> = conn
+            .prepare(&format!(
+                "SELECT role_kind, COUNT(*) FROM notes WHERE {base} AND role_kind IS NOT NULL \
+                 GROUP BY role_kind"
+            ))
+            .expect("prepare GROUP BY role_kind")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query_map GROUP BY")
+            .collect::<Result<_, _>>()
+            .expect("collect GROUP BY");
+        assert!(
+            kinds.len() >= 4,
+            "au moins FEATURE/FIX/ENHANCEMENT/TASK via GROUP BY, jamais une liste figée — \
+             observé : {kinds:?}"
+        );
+
+        // (3) Partition exacte : Σ des buckets typés == COUNT(*) des cartes.
+        let sum_typed: i64 = kinds.iter().map(|(_, n)| n).sum();
+        let total: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM notes WHERE {base}"),
+                [],
+                |r| r.get(0),
+            )
+            .expect("COUNT(*)");
+        assert_eq!(
+            sum_typed, total,
+            "partition exacte : ni trou ni recouvrement"
+        );
+
+        // (4) CONTRÔLE NÉGATIF : tokens DÉRIVÉS du GROUP BY (pas codés en dur) ; Σ des comptes
+        //     naïfs par sous-chaîne nue > COUNT(*) → le contrôle mord. Sinon, échec explicite :
+        //     le corpus adverse est insuffisant (à renforcer, PAS à verdir en relâchant).
+        let mut sum_naive: i64 = 0;
+        for (kind, _) in &kinds {
+            let n: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM notes WHERE {base} AND body_text LIKE '%' || ?1 || '%'"
+                    ),
+                    rusqlite::params![kind],
+                    |r| r.get(0),
+                )
+                .expect("COUNT naïf par sous-chaîne");
+            sum_naive += n;
+        }
+        assert!(
+            sum_naive > total,
+            "données de test trop propres : le contrôle négatif ne mord pas (Σ naïf {sum_naive} \
+             == total {total}) — semer davantage de bruit adverse (prose A/B, sous-chaîne C)"
+        );
+    }
+
+    /// La colonne stockée == `roles_of_body(body_text)` sur tout le corpus,
+    /// **y compris après un ré-upsert** qui change le kind (prouve que `ON CONFLICT DO UPDATE`
+    /// rafraîchit les colonnes, pas de `COALESCE` figeant l'ancienne valeur).
+    ///
+    /// Portée honnête : cette garde recompute avec le **même** scanner core que celui
+    /// qui a peuplé la colonne — elle ne peut donc PAS révéler une divergence core↔curator ;
+    /// cette dernière est gardée côté serveur (test d'accord core↔curator).
+    #[tokio::test]
+    async fn stored_columns_equal_roles_of_body_recomputation() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_role_corpus(&idx).await;
+
+        // Ré-upsert d'une carte semée avec un kind DIFFÉRENT (FEATURE → TASK) : sans ce
+        // conflit, D1 ne verrait que des INSERT et raterait un gel de colonne sur UPDATE.
+        idx.upsert_note(&project_map_note_for_test(
+            "f171-t4-clean-feature",
+            "[[project:gradatum]] [[status:DONE]] [[kind:TASK]]\n\nRé-upsert FEATURE vers TASK.",
+        ))
+        .await
+        .expect("re-upsert conflit");
+
+        let conn = idx.conn.lock().await;
+        let rows: Vec<(String, Option<String>, Option<String>)> = conn
+            .prepare(
+                "SELECT body_text, role_kind, role_status FROM notes \
+                 WHERE vault_id='main' AND section='project-map' AND status='live'",
+            )
+            .expect("prepare SELECT corpus")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query_map corpus")
+            .collect::<Result<_, _>>()
+            .expect("collect corpus");
+        assert!(
+            !rows.is_empty(),
+            "garde anti-vacuité : le corpus doit exister"
+        );
+
+        let mut checked_reupsert = false;
+        for (body, col_kind, col_status) in &rows {
+            let roles = gradatum_core::project_map::roles_of_body(body);
+            assert_eq!(
+                col_kind.as_deref(),
+                roles.kind,
+                "role_kind stocké == recomputation roles_of_body — corps : {body:?}"
+            );
+            assert_eq!(
+                col_status.as_deref(),
+                roles.status,
+                "role_status stocké == recomputation roles_of_body — corps : {body:?}"
+            );
+            if body.contains("Ré-upsert FEATURE vers TASK") {
+                assert_eq!(
+                    col_kind.as_deref(),
+                    Some("TASK"),
+                    "ON CONFLICT DO UPDATE a rafraîchi role_kind (pas figé sur FEATURE)"
+                );
+                checked_reupsert = true;
+            }
+        }
+        assert!(
+            checked_reupsert,
+            "la carte ré-upsertée doit être présente dans le corpus"
+        );
+    }
+
+    /// Côté index, l'analyseur **encaisse** la corruption non représentable par le
+    /// chemin d'écriture : rôle en double (F → première occurrence gagne), aucun rôle (G → NULL),
+    /// rôle dans un bloc de code (D → scanner aveugle aux fences, première occurrence gagne).
+    /// Aucune panique. La **preuve** que le chemin d'écriture réel refuserait F/G/D est portée
+    /// côté serveur (accès au scanner curator).
+    #[tokio::test]
+    async fn corrupt_bodies_are_absorbed_by_index() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        // F — rôle en double : première occurrence (FIX) gagne.
+        let f = project_map_note_for_test(
+            "f171-t4-corrupt-f",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]] [[kind:ENHANCEMENT]]",
+        );
+        let f_id = f.id.to_string();
+        idx.upsert_note(&f).await.expect("upsert_note corrompu F");
+        let (k, _) = select_roles(&idx, &f_id).await;
+        assert_eq!(
+            k.as_deref(),
+            Some("FIX"),
+            "F : première occurrence de kind gagne"
+        );
+
+        // G — aucun kind : role_kind NULL.
+        let g =
+            project_map_note_for_test("f171-t4-corrupt-g", "[[project:gradatum]] [[status:OPEN]]");
+        let g_id = g.id.to_string();
+        idx.upsert_note(&g).await.expect("upsert_note corrompu G");
+        let (k, _) = select_roles(&idx, &g_id).await;
+        assert!(k.is_none(), "G : aucun kind → role_kind NULL");
+
+        // D — [[kind:FIX]] dans un bloc de code, à côté du vrai [[kind:FEATURE]]. Le scanner
+        //   core est aveugle aux fences : les DEUX cibles sont extraites, la première (FEATURE)
+        //   gagne. Le rejet 400 par le chemin d'écriture réel est prouvé côté serveur.
+        let d = project_map_note_for_test(
+            "f171-t4-corrupt-d",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]]\n```\n[[kind:FIX]]\n```",
+        );
+        let d_id = d.id.to_string();
+        idx.upsert_note(&d).await.expect("upsert_note corrompu D");
+        let (k, _) = select_roles(&idx, &d_id).await;
+        assert_eq!(
+            k.as_deref(),
+            Some("FEATURE"),
+            "D : première occurrence (hors fence) gagne"
+        );
+    }
+
+    // ── Tests F-171 Task 5 Étape 2 : backfill_project_map_roles ──────────────
+    //
+    // Le backfill type les colonnes role_kind/role_status des cartes project-map
+    // déjà indexées AVANT la dérivation à l'écriture (migration 0043 = colonnes NULL).
+    // Chemin SQL distinct du chemin d'écriture : un `UPDATE` nu sur lignes préexistantes,
+    // là où upsert_note exerce `ON CONFLICT DO UPDATE`.
+
+    /// Insère une ligne `notes` brute en laissant `role_kind`/`role_status` NULL par
+    /// omission — simule une carte déjà indexée AVANT la dérivation F-171 (l'état que
+    /// `backfill_project_map_roles` doit rétro-remplir).
+    ///
+    /// Copie locale de `seed_raw` (privé au module `vault_list_by_status_tests`, donc
+    /// inaccessible ici) : mêmes colonnes. `upsert_note` ne conviendrait pas — il peuplerait
+    /// justement les colonnes et ne laisserait rien à combler. `section` et `status` sont
+    /// paramétrés pour couvrir le contrôle négatif de section et les cartes `downgraded`.
+    async fn seed_row_null_roles(
+        idx: &SqliteIndex,
+        id: &str,
+        section: &str,
+        body: &str,
+        status: &str,
+    ) {
+        let conn = idx.conn.lock().await;
+        let now = Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO notes \
+             (id, vault_id, section, status, schema_version, created, content_hash, body_text) \
+             VALUES (?1, 'main', ?2, ?3, 1, ?4, X'00', ?5)",
+            rusqlite::params![id, section, status, now, body],
+        )
+        .expect("seed_row_null_roles INSERT");
+    }
+
+    /// Lit une valeur scalaire (`SELECT COUNT(*)` …) — vérification INDÉPENDANTE du
+    /// rapport de la méthode, effectuée contre la base elle-même.
+    async fn count_scalar(idx: &SqliteIndex, sql: &str) -> i64 {
+        let conn = idx.conn.lock().await;
+        conn.query_row(sql, [], |r| r.get(0)).expect("count_scalar")
+    }
+
+    /// Nominal + idempotence : les cartes project-map non typées sont toutes typées,
+    /// puis un 2e passage ne touche rien (`role_kind IS NULL` filtre les déjà-peuplées).
+    #[tokio::test]
+    async fn backfill_types_project_map_and_is_idempotent() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_row_null_roles(
+            &idx,
+            "pm-fix-1",
+            "project-map",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+            "live",
+        )
+        .await;
+        seed_row_null_roles(
+            &idx,
+            "pm-feat-1",
+            "project-map",
+            "[[project:gradatum]] [[status:DONE]] [[kind:FEATURE]]",
+            "live",
+        )
+        .await;
+        seed_row_null_roles(
+            &idx,
+            "pm-task-1",
+            "project-map",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:TASK]]",
+            "live",
+        )
+        .await;
+
+        // Pré-état : 3 lignes project-map, 0 typée.
+        assert_eq!(
+            count_scalar(
+                &idx,
+                "SELECT COUNT(*) FROM notes WHERE section='project-map' AND role_kind IS NOT NULL"
+            )
+            .await,
+            0,
+            "pré-backfill : aucune colonne role_kind peuplée"
+        );
+
+        let report = idx.backfill_project_map_roles().await.expect("backfill");
+        assert_eq!(report.scanned, 3, "3 cartes project-map scannées");
+        assert_eq!(report.updated, 3, "3 cartes typées");
+
+        // Vérification INDÉPENDANTE contre la base (le rapport ne se vérifie pas lui-même).
+        assert_eq!(
+            count_scalar(
+                &idx,
+                "SELECT COUNT(*) FROM notes WHERE section='project-map' AND role_kind IS NULL"
+            )
+            .await,
+            0,
+            "après backfill : plus aucune role_kind NULL"
+        );
+        assert_eq!(
+            count_scalar(
+                &idx,
+                "SELECT COUNT(*) FROM notes WHERE section='project-map' AND role_kind IS NOT NULL"
+            )
+            .await,
+            3,
+            "3 cartes désormais typées en base"
+        );
+        // La valeur écrite == roles_of_body (source unique) sur une carte témoin.
+        let (kind, status) = select_roles(&idx, "pm-fix-1").await;
+        assert_eq!(kind.as_deref(), Some("FIX"));
+        assert_eq!(status.as_deref(), Some("OPEN"));
+
+        // 2e passage : idempotent — rien à scanner, rien à faire.
+        let report2 = idx.backfill_project_map_roles().await.expect("backfill 2");
+        assert_eq!(
+            report2.scanned, 0,
+            "2e passage : aucune ligne non typée restante"
+        );
+        assert_eq!(
+            report2.updated, 0,
+            "2e passage : aucune écriture (idempotence)"
+        );
+    }
+
+    /// Constat #3 de l'audit : une carte dont le corps ne porte aucun `[[kind:…]]` ne peut
+    /// être typée. Elle est SCANNÉE, laissée NULL (jamais au forceps), et RAPPORTÉE via
+    /// `scanned > updated`. Le rapport dit la vérité : `updated` == lignes réellement typées.
+    #[tokio::test]
+    async fn backfill_reports_untypable_rows_and_leaves_them_null() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_row_null_roles(
+            &idx,
+            "pm-typable-1",
+            "project-map",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+            "live",
+        )
+        .await;
+        seed_row_null_roles(
+            &idx,
+            "pm-typable-2",
+            "project-map",
+            "[[project:gradatum]] [[status:DONE]] [[kind:FEATURE]]",
+            "live",
+        )
+        .await;
+        // INTYPABLE : porte un statut mais AUCUN [[kind:…]] → roles_of_body().kind == None.
+        seed_row_null_roles(
+            &idx,
+            "pm-untypable-1",
+            "project-map",
+            "[[project:gradatum]] [[status:OPEN]]",
+            "live",
+        )
+        .await;
+
+        let report = idx.backfill_project_map_roles().await.expect("backfill");
+        assert_eq!(
+            report.scanned, 3,
+            "3 cartes scannées (2 typables + 1 intypable)"
+        );
+        assert_eq!(report.updated, 2, "seules les 2 typables sont écrites");
+
+        // Le rapport ne ment pas : updated == lignes réellement typées en base.
+        let non_null = count_scalar(
+            &idx,
+            "SELECT COUNT(*) FROM notes WHERE section='project-map' AND role_kind IS NOT NULL",
+        )
+        .await;
+        assert_eq!(
+            non_null, 2,
+            "2 lignes typées en base — updated (2) correspond à la réalité"
+        );
+        // La carte intypable reste NULL sur LES DEUX colonnes (jamais typée au forceps).
+        let (kind, status) = select_roles(&idx, "pm-untypable-1").await;
+        assert!(
+            kind.is_none(),
+            "carte sans [[kind:…]] : role_kind reste NULL"
+        );
+        assert!(
+            status.is_none(),
+            "carte non typée : role_status reste NULL aussi"
+        );
+    }
+
+    /// Contrôle négatif de section : une note hors `project-map`, même au corps porteur de
+    /// rôles valides, n'est jamais scannée ni typée par le backfill.
+    #[tokio::test]
+    async fn backfill_ignores_non_project_map_sections() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_row_null_roles(
+            &idx,
+            "pm-scoped-1",
+            "project-map",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+            "live",
+        )
+        .await;
+        // Note `decisions` au corps porteur de rôles : le gate de section (pas l'absence de
+        // wikilink) doit l'exclure.
+        seed_row_null_roles(
+            &idx,
+            "dec-1",
+            "decisions",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+            "live",
+        )
+        .await;
+
+        let report = idx.backfill_project_map_roles().await.expect("backfill");
+        assert_eq!(report.scanned, 1, "seule la carte project-map est scannée");
+        assert_eq!(report.updated, 1, "seule la carte project-map est typée");
+
+        let (kind, status) = select_roles(&idx, "dec-1").await;
+        assert!(
+            kind.is_none(),
+            "une note decisions ne doit jamais être typée par le backfill"
+        );
+        assert!(status.is_none());
+    }
+
+    /// Constat #2 de l'audit : une carte `downgraded` typable EST typée — une carte reste
+    /// une carte, son type est indépendant de son statut. Ne pas laisser un tiers de la
+    /// population vide.
+    #[tokio::test]
+    async fn backfill_types_downgraded_cards() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_row_null_roles(
+            &idx,
+            "pm-live-1",
+            "project-map",
+            "[[project:gradatum]] [[status:DONE]] [[kind:FEATURE]]",
+            "live",
+        )
+        .await;
+        seed_row_null_roles(
+            &idx,
+            "pm-down-1",
+            "project-map",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+            "downgraded",
+        )
+        .await;
+
+        let report = idx.backfill_project_map_roles().await.expect("backfill");
+        assert_eq!(report.scanned, 2, "live + downgraded scannées");
+        assert_eq!(
+            report.updated, 2,
+            "les DEUX typées, y compris la rétrogradée"
+        );
+
+        let (kind, _) = select_roles(&idx, "pm-down-1").await;
+        assert_eq!(
+            kind.as_deref(),
+            Some("FIX"),
+            "la carte downgraded doit porter son type"
+        );
+        assert_eq!(
+            count_scalar(
+                &idx,
+                "SELECT COUNT(*) FROM notes WHERE section='project-map' AND role_kind IS NULL"
+            )
+            .await,
+            0,
+            "aucune carte project-map (même downgraded) ne reste NULL"
+        );
+    }
+
+    /// Le dry-run rapporte exactement ce que l'apply écrirait, sans muter une seule ligne
+    /// (transaction rollback). C'est le chemin par défaut de la sous-commande admin.
+    #[tokio::test]
+    async fn dry_run_reports_counts_without_writing() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        seed_row_null_roles(
+            &idx,
+            "pm-dry-1",
+            "project-map",
+            "[[project:gradatum]] [[status:OPEN]] [[kind:FIX]]",
+            "live",
+        )
+        .await;
+        // Intypable — pour vérifier que le dry-run compte comme l'apply (1 sur 2).
+        seed_row_null_roles(
+            &idx,
+            "pm-dry-2",
+            "project-map",
+            "[[project:gradatum]] [[status:OPEN]]",
+            "live",
+        )
+        .await;
+
+        let dry = idx.dry_run_project_map_roles().await.expect("dry-run");
+        assert_eq!(dry.scanned, 2, "dry-run scanne comme l'apply");
+        assert_eq!(dry.updated, 1, "dry-run rapporte ce que l'apply écrirait");
+
+        // Rien n'a été écrit : la base est intacte.
+        assert_eq!(
+            count_scalar(
+                &idx,
+                "SELECT COUNT(*) FROM notes WHERE section='project-map' AND role_kind IS NOT NULL"
+            )
+            .await,
+            0,
+            "dry-run ne doit muter aucune ligne (rollback)"
+        );
+
+        // L'apply qui suit écrit bien — le dry-run n'a pas consommé l'état.
+        let applied = idx.backfill_project_map_roles().await.expect("apply");
+        assert_eq!(applied.updated, 1);
+        assert_eq!(
+            count_scalar(
+                &idx,
+                "SELECT COUNT(*) FROM notes WHERE section='project-map' AND role_kind IS NOT NULL"
+            )
+            .await,
+            1,
+            "apply écrit la ligne typable après le dry-run"
         );
     }
 }

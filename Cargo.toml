@@ -13,6 +13,7 @@ members = [
     "crates/gradatum-core",
     "crates/gradatum-curator",
     "crates/gradatum-db-sqlite",
+    "crates/gradatum-distill",
     "crates/gradatum-embed",
     "crates/gradatum-engine",
     "crates/gradatum-index",
@@ -56,7 +57,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Gradatum Contributors"]
@@ -106,30 +107,15 @@ include_dir = "=0.7.4"
 moka        = { version = "=0.12.15", features = ["future"] }
 
 # Database
-# ⛔ F-142 lot 3 (2026-08-08) : rusqlite NE PEUT PAS MONTER, et ce n'est pas un choix de prudence.
-# Blocage mécanique établi par le compilateur : `libsqlite3-sys` porte `links = "sqlite3"`, donc
-# une seule copie est autorisée dans tout le graphe. Or `sqlx-sqlite 0.8.6` exige
-# `libsqlite3-sys ^0.30.1`, tandis que rusqlite 0.33 et au-delà exigent 0.31, 0.32, ... jusqu'à
-# 0.38 pour la 0.40. Les deux contraintes sont inconciliables.
-#
-# **0.32.1 est donc la dernière version de rusqlite compatible avec sqlx 0.8** — vérifié version
-# par version sur le registre, pas déduit.
-#
-# Conséquence à connaître : la montée de sqlx n'est pas seulement une question de fraîcheur, elle
-# **verrouille toute la couche base de données**. Tant que sqlx reste en 0.8, rusqlite reste en
-# 0.32. L'analyse d'API des deux crates prise séparément concluait que rusqlite était montable —
-# c'est faux, elles sont couplées par une bibliothèque native commune que ni l'une ni l'autre ne
-# nomme dans son manifeste.
-rusqlite    = { version = "=0.32.1", features = ["bundled", "chrono"] }
+# rusqlite =0.40.2 : montée F-145 (jalon 2.1.0, lot final). Le blocage historique
+# qui épinglait 0.32.1 (sqlx 0.8 exigeait libsqlite3-sys ^0.30.1, inconciliable avec
+# rusqlite 0.33+) a été LEVÉ le 2026-08-25 : sqlx est retiré du graphe de dépendances
+# entier. La montée est décidée sur MESURE de performance (voir banc B11 et CHANGELOG
+# section 2.1.0) — elle porte le bénéfice de la carte. Elle change la version du moteur
+# SQLite embarqué (libsqlite3-sys 0.30.1 → 0.38.x) : version déclarée dans le CHANGELOG,
+# jamais déduite du numéro de crate (test `sqlite_engine_version`).
+rusqlite    = { version = "=0.40.2", features = ["bundled", "chrono"] }
 dashmap     = "=6.2.1"
-# F-142 lot 3 (2026-08-08) : maintenu en 0.8.6, dernière de la ligne 0.8.x. La 0.9.0 est écartée
-# pour deux raisons indépendantes, chacune suffisante. (1) Elle exige une version minimale de
-# compilateur supérieure à celle que le workspace déclare — la relever est une décision de
-# politique de compatibilité, pas la conséquence mécanique d'une montée. (2) Elle restreint les
-# fonctions `query*()` aux chaînes littérales : `gradatum-db-sqlite/src/queue_store_sqlite.rs`
-# construit sa requête dynamiquement et cesserait de compiler sans une annotation explicite
-# d'innocuité. Adaptable, mais hors du cadre d'une montée de routine.
-sqlx        = { version = "=0.8.6", features = ["sqlite", "runtime-tokio", "macros"] }
 # ANN sqlite-vec extension (v0.5.3 ANN-1) — compile la static lib sqlite_vec0.
 # default-features = false : évite de tirer rusqlite ^0.31 (dev-dep upstream) en conflit
 # avec notre rusqlite =0.32.1 bundled. La static lib est liée via build.rs cc.
@@ -236,7 +222,10 @@ jsonwebtoken  = { version = "=9.3.1", default-features = false }
 pkcs8         = "=0.10.2"
 
 # UNIX syscalls (statfs NFS check — caveat C11; signal: SIGTERM smoke test)
-nix         = { version = "=0.31.3", features = ["fs", "signal", "process"] }
+# "user" (F-191) : gradatum-engine --check résout l'identité (uid/gid/groupes) du
+# `User=` de l'unité systemd qui servira la configuration, au lieu de juger pour l'uid
+# du processus appelant. Module de bindings libc purs — aucune dépendance transitive.
+nix         = { version = "=0.31.3", features = ["fs", "signal", "process", "user"] }
 
 # Tests
 tempfile    = "=3.27.0"
@@ -253,29 +242,41 @@ criterion   = "=0.8.2"
 # Cross-crate — version= obligatoire pour cargo publish (crates.io refuse les path-only)
 # Toutes ces crates héritent `version.workspace = true` : la valeur déclarée ici doit
 # rester alignée sur `workspace.package.version`.
-gradatum = { path = "crates/gradatum", version = "2.0.0" }
-gradatum-dto = { path = "crates/gradatum-dto", version = "2.0.0" }
-gradatum-warden = { path = "crates/gradatum-warden", version = "2.0.0" }
+gradatum = { path = "crates/gradatum", version = "2.1.0" }
+gradatum-dto = { path = "crates/gradatum-dto", version = "2.1.0" }
+gradatum-warden = { path = "crates/gradatum-warden", version = "2.1.0" }
 schemars = { version = "=1.2.1", features = ["derive"] }
-gradatum-acl-auth = { path = "crates/gradatum-acl-auth", version = "2.0.0" }
-gradatum-acl-policy = { path = "crates/gradatum-acl-policy", version = "2.0.0" }
-gradatum-auth = { path = "crates/gradatum-auth", version = "2.0.0" }
-gradatum-cache = { path = "crates/gradatum-cache", version = "2.0.0" }
-gradatum-chat = { path = "crates/gradatum-chat", version = "2.0.0" }
-gradatum-core = { path = "crates/gradatum-core", version = "2.0.0" }
-gradatum-curator = { path = "crates/gradatum-curator", version = "2.0.0" }
-gradatum-embed = { path = "crates/gradatum-embed", version = "2.0.0" }
-gradatum-engine = { path = "crates/gradatum-engine", version = "2.0.0" }
-gradatum-index = { path = "crates/gradatum-index", version = "2.0.0" }
-gradatum-markdown = { path = "crates/gradatum-markdown", version = "2.0.0" }
-gradatum-queue = { path = "crates/gradatum-queue", version = "2.0.0" }
-gradatum-search = { path = "crates/gradatum-search", version = "2.0.0" }
+gradatum-acl-auth = { path = "crates/gradatum-acl-auth", version = "2.1.0" }
+gradatum-acl-policy = { path = "crates/gradatum-acl-policy", version = "2.1.0" }
+gradatum-auth = { path = "crates/gradatum-auth", version = "2.1.0" }
+gradatum-cache = { path = "crates/gradatum-cache", version = "2.1.0" }
+gradatum-chat = { path = "crates/gradatum-chat", version = "2.1.0" }
+gradatum-core = { path = "crates/gradatum-core", version = "2.1.0" }
+gradatum-curator = { path = "crates/gradatum-curator", version = "2.1.0" }
+gradatum-embed = { path = "crates/gradatum-embed", version = "2.1.0" }
+gradatum-engine = { path = "crates/gradatum-engine", version = "2.1.0" }
+gradatum-index = { path = "crates/gradatum-index", version = "2.1.0" }
+gradatum-markdown = { path = "crates/gradatum-markdown", version = "2.1.0" }
+gradatum-queue = { path = "crates/gradatum-queue", version = "2.1.0" }
+gradatum-search = { path = "crates/gradatum-search", version = "2.1.0" }
+# DIVERGENCE VOULUE — NE PAS aligner cette ligne sur la version du workspace.
+# `gradatum-sdk-rs` porte `publish = false` depuis 2.1.0 : sa 2.1.0 n'existera JAMAIS
+# sur crates.io. Or `gradatum` la déclare en dépendance optionnelle (feature `client`),
+# et crates.io exige que toute dépendance déclarée — optionnelle comprise — soit
+# résolvable au registre. La hausser à "2.1.0" rendrait donc `gradatum` IMPUBLIABLE.
+# La borne reste "2.0.0" parce que gradatum-sdk-rs 2.0.0 est réellement publié (dernière
+# version où la crate était publiable). Vérifié par l'API crates.io le 2026-08-29.
+# Le gate « requirements intra-famille » de scripts/internal/publish-crates-io-v2.1.0.sh
+# classe cette ligne en NOTE, jamais en violation — c'est voulu, pas un oubli.
+# Pour la réaligner un jour il faut D'ABORD trancher le sort de la feature `client`
+# (retrait, ou republication de gradatum-sdk-rs).
 gradatum-sdk-rs = { path = "crates/gradatum-sdk-rs", version = "2.0.0" }
-gradatum-storage = { path = "crates/gradatum-storage", version = "2.0.0" }
-gradatum-vault = { path = "crates/gradatum-vault", version = "2.0.0" }
-gradatum-worker = { path = "crates/gradatum-worker", version = "2.0.0" }
-gradatum-db-sqlite = { path = "crates/gradatum-db-sqlite", version = "2.0.0" }
-gradatum-gateway = { path = "crates/gradatum-gateway", version = "2.0.0" }
+gradatum-storage = { path = "crates/gradatum-storage", version = "2.1.0" }
+gradatum-vault = { path = "crates/gradatum-vault", version = "2.1.0" }
+gradatum-worker = { path = "crates/gradatum-worker", version = "2.1.0" }
+gradatum-db-sqlite = { path = "crates/gradatum-db-sqlite", version = "2.1.0" }
+gradatum-distill = { path = "crates/gradatum-distill", version = "2.1.0" }
+gradatum-gateway = { path = "crates/gradatum-gateway", version = "2.1.0" }
 
 [profile.release]
 opt-level = 3

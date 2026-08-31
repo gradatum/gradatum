@@ -2,11 +2,33 @@
 //!
 //! ## Configuration sources
 //!
-//! 1. Local TOML file (`EngineConfig::load_local(path)`) via figment.
-//! 2. Environment variables prefixed with `GRADATUM_ENGINE_` (override).
-//! 3. Central source `/api/v1/config/:binary` = deferred figment provider. The endpoint
-//!    is deliberately not implemented; the `load_local` path is the only supported
-//!    source.
+//! The local TOML file handed to [`EngineConfig::load_local`] is the **only** source.
+//! Neither the process environment nor any remote endpoint contributes a value.
+//!
+//! The central source `/api/v1/config/:binary` remains a deferred figment provider,
+//! deliberately not implemented.
+//!
+//! ### Why the environment is not a source
+//!
+//! This module used to advertise a second source: variables prefixed with
+//! `GRADATUM_ENGINE_`. None of them ever reached a field. The deserialization target is
+//! a private wrapper carrying the `[engine]` table, and the provider had no key
+//! splitting configured — so no flat environment key could ever address
+//! `engine.<field>`. The promise failed *silently*: an operator overriding a port or a
+//! model path started on a configuration that was not the one they asked for, without
+//! a single warning.
+//!
+//! The promise was removed rather than wired, for two reasons.
+//!
+//! 1. **The prefix is already taken, by a secret.** Every deployed unit exports
+//!    `GRADATUM_ENGINE_API_KEY` through its `EnvironmentFile=` — surveyed 2026-08-18,
+//!    5 engine units out of 5, and it is the only variable of that prefix any of them
+//!    carries. Making the prefix address configuration fields would turn one name into
+//!    two meanings.
+//! 2. **It would route a secret through figment.** `figment::Error` renders the
+//!    offending value in its `Display` — the leak `gradatum_core::config::redact_figment_error`
+//!    exists to contain. The api-key keeps its own, narrower door: a single
+//!    `std::env::var` read in the binary, straight into a `Zeroizing<String>`.
 //!
 //! ## Security
 //!
@@ -674,11 +696,12 @@ impl EngineConfig {
             .unwrap_or_else(|| self.port.saturating_add(1))
     }
 
-    /// Loads the config from a local TOML file and overrides from `GRADATUM_ENGINE_*` env vars.
+    /// Loads the config from a local TOML file — the single configuration source.
     ///
-    /// Uses figment to load the local TOML file. The central source
-    /// (`/api/v1/config/:binary`) is a deferred figment provider and is deliberately not
-    /// implemented.
+    /// The process environment contributes nothing: no `GRADATUM_ENGINE_*` variable
+    /// overrides any field, by design (see the module documentation). The central
+    /// source (`/api/v1/config/:binary`) is a deferred figment provider and is
+    /// deliberately not implemented.
     ///
     /// **Security note**: this method only parses and deserializes. It does NOT validate
     /// `model_path`. Call [`EngineConfig::validate()`] afterwards for path and bind-address
@@ -689,11 +712,10 @@ impl EngineConfig {
     pub fn load_local(path: &std::path::Path) -> Result<Self, Box<figment::Error>> {
         use figment::{
             Figment,
-            providers::{Env, Format, Toml},
+            providers::{Format, Toml},
         };
         let w: Wrapper = Figment::new()
             .merge(Toml::file(path))
-            .merge(Env::prefixed("GRADATUM_ENGINE_"))
             .extract()
             .map_err(Box::new)?;
         Ok(w.engine)

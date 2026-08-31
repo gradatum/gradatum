@@ -23,10 +23,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::{JwtService, TokenScope};
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 use gradatum_server::config::{MultiTenantConfig, ServerConfig};
 use gradatum_server::state::AppState;
-use sqlx::sqlite::SqlitePoolOptions;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -65,9 +64,7 @@ async fn build_c2_env(multi_tenant_enabled: bool) -> C2Env {
     let acl =
         AclEngine::from_preset_str(TEST_ACL_C2).expect("preset ACL C2 valide — invariant statique");
 
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory — invariant test");
     run_migrations(&jobs_pool)

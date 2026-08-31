@@ -32,15 +32,16 @@ pub mod scoring;
 /// Reranker module — cross-encoder abstraction for post-ranking.
 pub mod reranker;
 
-/// Re-exports `rrf_fuse` and `RrfHit` for direct use from `gradatum_search`.
-pub use rrf::{RrfHit, rrf_fuse};
+/// Re-exports `rrf_fuse`, `rrf_fuse_short_circuit`, `hybrid_fuse_weighted` and `RrfHit` for direct use from `gradatum_search`.
+pub use rrf::{RrfHit, hybrid_fuse_weighted, rrf_fuse, rrf_fuse_short_circuit};
 
 /// Re-exports multi-factor scoring functions and trust decay utilities.
 pub use scoring::{
     DEFAULT_TRUST_HALF_LIVES, GAMMA_TRUST, ResolvedWeights, SalienceParams, ScoringWeightsWire,
     TrustDecayConfig, apply_salience, composite_score, composite_score_weighted,
-    composite_score_with_trust, default_half_lives, pagerank_factor, recency_factor,
-    resolve_weights, salience_factor, salience_weighted_sum, trust_decay_factor,
+    composite_score_with_trust, default_half_lives, normalize_bm25, normalize_semantic,
+    pagerank_factor, recency_factor, resolve_weights, salience_factor, salience_weighted_sum,
+    trust_decay_factor, weighted_fusion_score,
 };
 
 /// Re-exports the `Reranker` trait and `NoopReranker`.

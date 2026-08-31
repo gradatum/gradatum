@@ -25,9 +25,47 @@
 //! and 1 `[[version:…]]` — satisfying the required triple plus the optional
 //! version link as validated by [`gradatum_core::project_map::validate_links_from_targets`].
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 
 use crate::changelog_parse::ChangelogEntry;
+
+/// Normal form of a card title, used to detect duplicates.
+///
+/// Two titles that differ only by letter case or by runs of whitespace denote the same
+/// card. The normal form lowercases (Unicode-aware, so accented titles fold correctly)
+/// and collapses every whitespace run into a single space, trimming both ends.
+///
+/// The guard must never be stricter than the measurement that motivated it: the registry
+/// clean-up counted duplicates under exactly this normal form, so a stricter comparison
+/// would let through what the measurement had counted.
+#[must_use]
+pub fn normalize_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Indexes existing cards by the normal form of their title.
+///
+/// Takes the `(locus, title)` pairs reported by
+/// [`crate::changelog_backfill::VaultWriteClient::existing_titles`] and keys them by
+/// [`normalize_title`], so a back-fill can tell whether a card bearing the same title is
+/// already present — and name it.
+///
+/// When several existing cards collapse onto the same normal form, the first one wins;
+/// naming any one of them is enough for an operator to find the collision.
+#[must_use]
+pub fn build_title_index(entries: Vec<(String, String)>) -> HashMap<String, String> {
+    let mut index = HashMap::with_capacity(entries.len());
+    for (locus, title) in entries {
+        index.entry(normalize_title(&title)).or_insert(locus);
+    }
+    index
+}
 
 /// Payload ready to be sent to `POST /api/v1/vault_write`.
 #[derive(Debug, Clone, Serialize)]
@@ -184,7 +222,7 @@ mod tests {
 
     #[test]
     fn card_section_hint_is_project_map() {
-        let entry = make_entry("0.5.2", KindKind::Chore, "Dependency cleanup", 0);
+        let entry = make_entry("0.5.2", KindKind::Task, "Dependency cleanup", 0);
         let card = render_card(&entry);
         assert_eq!(card.section_hint, "project-map");
     }
@@ -196,8 +234,6 @@ mod tests {
             KindKind::Feature,
             KindKind::Enhancement,
             KindKind::Fix,
-            KindKind::Chore,
-            KindKind::Spike,
             KindKind::Task,
         ];
         for kind in kinds {
@@ -295,5 +331,47 @@ mod tests {
                 entry
             );
         }
+    }
+
+    // ── Forme normale du titre ─────────────────────────────────────────────
+
+    #[test]
+    fn normalize_title_folds_case_and_whitespace_runs() {
+        assert_eq!(
+            normalize_title("  [PROJECT-MAP][Gradatum]   Vault   Write  "),
+            normalize_title("[project-map][gradatum] vault write")
+        );
+    }
+
+    #[test]
+    fn normalize_title_folds_accented_letters() {
+        // `to_lowercase` est Unicode : un titre français crié se replie correctement.
+        assert_eq!(
+            normalize_title("RÉSOLUTION Différée"),
+            "résolution différée"
+        );
+    }
+
+    #[test]
+    fn normalize_title_keeps_distinct_titles_distinct() {
+        assert_ne!(
+            normalize_title("[PROJECT-MAP][gradatum] Vault write — v0.5.2"),
+            normalize_title("[PROJECT-MAP][gradatum] Vault write — v0.5.3"),
+            "le suffixe de version distingue deux cartes légitimes"
+        );
+    }
+
+    #[test]
+    fn build_title_index_keys_by_normal_form_and_keeps_the_first() {
+        let index = build_title_index(vec![
+            ("project-map/aaa".to_string(), "Vault   Write".to_string()),
+            ("project-map/bbb".to_string(), "vault write".to_string()),
+        ]);
+        assert_eq!(index.len(), 1, "les deux titres se replient sur une clé");
+        assert_eq!(
+            index.get("vault write").map(String::as_str),
+            Some("project-map/aaa"),
+            "la première carte rencontrée est celle qui est nommée"
+        );
     }
 }

@@ -36,7 +36,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use crate::changelog_parse::parse_changelog;
-use crate::project_map_card::{VaultWriteCard, render_card};
+use crate::project_map_card::{VaultWriteCard, build_title_index, normalize_title, render_card};
 
 /// Returns `true` when `marker` occurs in `haystack` with a valid right boundary.
 ///
@@ -80,6 +80,21 @@ pub trait VaultWriteClient: Send + Sync + 'static {
     ///
     /// The HTTP call fails, or the response cannot be parsed.
     async fn marker_exists(&self, marker: &str) -> Result<bool>;
+
+    /// Reports every project-map card already present, as `(locus, title)` pairs.
+    ///
+    /// Loaded once per run, before any write, so a back-fill can refuse to create a card
+    /// whose title already exists — the axis on which the historical duplicates were
+    /// measured.
+    ///
+    /// Deliberately carries no default implementation: an implementer that silently
+    /// answered "nothing exists" would disable the guard without emitting any signal,
+    /// which is exactly how the original marker check failed in June 2026.
+    ///
+    /// # Errors
+    ///
+    /// An HTTP call fails, or a response cannot be parsed.
+    async fn existing_titles(&self) -> Result<Vec<(String, String)>>;
 
     /// `POST /api/v1/vault_write` — creates a note and returns its ULID.
     ///
@@ -261,6 +276,39 @@ impl HttpVaultClient {
             .map(str::to_string)
             .with_context(|| format!("'content' field absent from vault_read response path={path}"))
     }
+
+    /// Reads a note's title through `POST /api/v1/vault_read`.
+    ///
+    /// Returns `None` when the note carries no `title` field, which is legitimate: a
+    /// title-less note can never collide on the title axis, so it is simply left out of
+    /// the index.
+    ///
+    /// # Errors
+    ///
+    /// The HTTP call fails, the status is not 2xx, or the body is not valid JSON.
+    async fn vault_read_title(&self, path: &str) -> Result<Option<String>> {
+        let url = format!("{}/api/v1/vault_read", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.jwt)
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await
+            .with_context(|| format!("vault_read (title) path={path}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            bail!("vault_read (title) failed: HTTP {status} — path={path}");
+        }
+
+        let payload: serde_json::Value = resp
+            .json()
+            .await
+            .with_context(|| format!("parsing vault_read response path={path}"))?;
+
+        Ok(payload["title"].as_str().map(str::to_string))
+    }
 }
 
 #[async_trait]
@@ -362,6 +410,25 @@ impl VaultWriteClient for HttpVaultClient {
         Ok(false)
     }
 
+    async fn existing_titles(&self) -> Result<Vec<(String, String)>> {
+        // ECON: un vault_read par carte (aucun endpoint ne renvoie les titres en masse).
+        // Coût borné : un seul balayage par run, contre un balayage potentiel PAR carte
+        // dans le repli de `marker_exists`. Upgrade -> champ `title` exposé par
+        // vault_list, qui rendrait cette boucle inutile.
+        let paths = self
+            .vault_list_section_paths("project-map")
+            .await
+            .context("listing project-map cards for the title index")?;
+
+        let mut entries = Vec::with_capacity(paths.len());
+        for path in paths {
+            if let Some(title) = self.vault_read_title(&path).await? {
+                entries.push((path, title));
+            }
+        }
+        Ok(entries)
+    }
+
     async fn vault_write(&self, card: &VaultWriteCard) -> Result<String> {
         let url = format!("{}/api/v1/vault_write", self.base_url);
         let resp = self
@@ -437,6 +504,13 @@ pub struct BackfillChangelogReport {
     pub created: usize,
     /// Apply mode only: number of notes skipped because the card already existed.
     pub skipped: usize,
+    /// Apply mode only: number of notes refused because a card already carried the same
+    /// title, under the normal form of [`crate::project_map_card::normalize_title`].
+    ///
+    /// Distinct from [`Self::skipped`], which counts the source-marker match: this axis
+    /// catches a duplicate that the marker misses — a card imported from another source,
+    /// or a CHANGELOG item whose positional marker shifted.
+    pub skipped_title: usize,
     /// Number of entries dropped because their section is outside the allow-list, which
     /// only happens when `include_meta` is `false`.
     pub skipped_meta: usize,
@@ -480,6 +554,19 @@ pub async fn run_backfill<C: VaultWriteClient>(
         ..Default::default()
     };
 
+    // Index des titres déjà présents, chargé une seule fois avant toute écriture.
+    // Vide en dry-run : aucun appel réseau n'y est fait.
+    let mut title_index = if args.apply {
+        build_title_index(
+            client
+                .existing_titles()
+                .await
+                .context("loading the existing project-map titles")?,
+        )
+    } else {
+        std::collections::HashMap::new()
+    };
+
     for entry in &entries {
         let card = render_card(entry);
 
@@ -497,15 +584,29 @@ pub async fn run_backfill<C: VaultWriteClient>(
                 .await
                 .with_context(|| format!("idempotency check marker={}", entry.source_marker))?;
 
+            let normalized = normalize_title(&card.title);
+
             if exists {
                 report.skipped += 1;
                 tracing::debug!(marker = %entry.source_marker, "map already exists — skip");
+            } else if let Some(existing) = title_index.get(&normalized) {
+                // Une carte est insupprimable par conception : la garde refuse d'écrire
+                // et nomme celle qui occupe déjà le titre, elle n'efface jamais.
+                report.skipped_title += 1;
+                tracing::warn!(
+                    marker = %entry.source_marker,
+                    title = %card.title,
+                    existing = %existing,
+                    "a card already carries this title — refusing to write a duplicate"
+                );
             } else {
-                client
+                let locus = client
                     .vault_write(&card)
                     .await
                     .with_context(|| format!("vault_write for marker={}", entry.source_marker))?;
                 report.created += 1;
+                // Alimenter l'index au fil de l'eau ferme aussi la collision intra-run.
+                title_index.insert(normalized, locus);
                 tracing::info!(marker = %entry.source_marker, "map created");
             }
         }
@@ -537,8 +638,12 @@ mod tests {
 "#;
 
     /// Mock du client vault — pas d'appel réseau réel.
+    ///
+    /// Mémorise les cartes écrites : rejouer un run sur la MÊME instance rend visibles,
+    /// via `existing_titles`, les titres produits au run précédent.
     struct MockVaultClient {
         existing_markers: Vec<String>,
+        preexisting_titles: Vec<String>,
         created: Arc<Mutex<Vec<VaultWriteCard>>>,
     }
 
@@ -546,6 +651,16 @@ mod tests {
         fn new(existing: Vec<&str>) -> Self {
             Self {
                 existing_markers: existing.into_iter().map(str::to_string).collect(),
+                preexisting_titles: Vec::new(),
+                created: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Mock dont le vault porte déjà ces titres, sans le marqueur correspondant.
+        fn with_preexisting_titles(titles: Vec<&str>) -> Self {
+            Self {
+                existing_markers: Vec::new(),
+                preexisting_titles: titles.into_iter().map(str::to_string).collect(),
                 created: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -564,12 +679,28 @@ mod tests {
             Ok(self.existing_markers.iter().any(|m| m == marker))
         }
 
+        async fn existing_titles(&self) -> Result<Vec<(String, String)>> {
+            let mut out: Vec<(String, String)> = self
+                .preexisting_titles
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("project-map/pre-{i}"), t.clone()))
+                .collect();
+            let guard = self.created.lock().expect("mutex non-empoisonné en test");
+            out.extend(
+                guard
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (format!("project-map/mock-{i}"), c.title.clone())),
+            );
+            Ok(out)
+        }
+
         async fn vault_write(&self, card: &VaultWriteCard) -> Result<String> {
-            self.created
-                .lock()
-                .expect("mutex non-empoisonné en test")
-                .push(card.clone());
-            Ok("mock-ulid".to_string())
+            let mut guard = self.created.lock().expect("mutex non-empoisonné en test");
+            let locus = format!("project-map/mock-{}", guard.len());
+            guard.push(card.clone());
+            Ok(locus)
         }
     }
 
@@ -682,6 +813,70 @@ mod tests {
 
         // Le premier marqueur existait → 1 skip, N-1 créés
         assert_eq!(report.skipped, 1, "1 note doit être sautée");
+        assert_eq!(report.created, entries.len() - 1);
+    }
+
+    // ── Rejeu : la garde du titre rattrape un marqueur décalé ──────────────
+    //
+    // Le marqueur du changelog est POSITIONNEL (`changelog/{ver}/{section}/{idx}`) :
+    // insérer un item en tête d'une section décale tous les suivants, et un rejeu
+    // recréerait des cartes déjà présentes. Ici le marqueur est constamment aveugle,
+    // ce qui couvre ce décalage comme le bug historique — le second run ne crée rien.
+
+    #[tokio::test]
+    async fn replay_creates_nothing_when_the_marker_is_blind() {
+        let (_dir, mut args) = make_args_from_str(TEST_CHANGELOG, true);
+        args.api_key = "test-api-key".to_string();
+
+        let client = MockVaultClient::new(vec![]);
+
+        let first = run_backfill(&args, &client).await.expect("premier run");
+        assert!(first.created > 0, "le premier run doit créer des cartes");
+        assert_eq!(
+            first.skipped_title, 0,
+            "aucun titre préexistant au premier run"
+        );
+        let created_first = first.created;
+
+        let second = run_backfill(&args, &client).await.expect("second run");
+        assert_eq!(second.created, 0, "le rejeu ne doit créer aucune carte");
+        assert_eq!(
+            second.skipped, 0,
+            "le marqueur reste aveugle : ce n'est pas lui qui bloque"
+        );
+        assert_eq!(
+            second.skipped_title, created_first,
+            "toutes les cartes sont refusées sur l'axe du titre"
+        );
+        assert_eq!(
+            client.created_count(),
+            created_first,
+            "aucune écriture supplémentaire au second run"
+        );
+    }
+
+    // ── La garde n'est pas plus stricte que la mesure ───────────────────────
+
+    #[tokio::test]
+    async fn title_guard_folds_case_and_whitespace() {
+        let (_dir, mut args) = make_args_from_str(TEST_CHANGELOG, true);
+        args.api_key = "test-api-key".to_string();
+
+        let content = std::fs::read_to_string(&args.changelog_path).expect("lecture");
+        let entries = parse_changelog(&content, &args.from_version, &args.to_version, false);
+        let first_title = render_card(&entries[0]).title;
+        let shouted = format!("  {}  ", first_title.to_uppercase().replace(' ', "    "));
+
+        let client = MockVaultClient::with_preexisting_titles(vec![&shouted]);
+
+        let report = run_backfill(&args, &client)
+            .await
+            .expect("run avec titre préexistant");
+
+        assert_eq!(
+            report.skipped_title, 1,
+            "casse et espaces ne doivent pas masquer le doublon"
+        );
         assert_eq!(report.created, entries.len() - 1);
     }
 

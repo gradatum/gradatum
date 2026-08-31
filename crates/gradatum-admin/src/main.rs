@@ -28,8 +28,8 @@
 use anyhow::Context as _;
 use gradatum_admin::{
     BackfillArgs, BackfillAuthorsArgs, BackfillNoteLinksArgs, BackfillTitlesArgs,
-    DowngradeFromTrashArgs, RepairNoteLinksArgs, VaultRenameArgs, api_key_cmd, code_cmd, init,
-    jobs_cmd, token, vault_forget_cmd, vault_rename,
+    DowngradeFromTrashArgs, ReindexOrphansArgs, RepairNoteLinksArgs, VaultRenameArgs, api_key_cmd,
+    code_cmd, init, jobs_cmd, token, vault_forget_cmd, vault_rename,
 };
 use gradatum_core::paths::vault_index_path;
 
@@ -190,6 +190,65 @@ enum Cmd {
         /// Maximum number of notes to process (unlimited if absent).
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Re-indexes notes present on disk but absent from the index (idempotent).
+    ///
+    /// Finds `.md` files whose ULID has no index row (orphans left by the legacy bulk
+    /// import) and re-indexes each through the write funnel — index entry, `file_checksums`
+    /// drift footprint and an enqueued embed job, exactly like a normal write. Never
+    /// re-opens the `ReIndex` API stub. `--dry-run` previews without writing. Non-canonical
+    /// physical paths are refused (would duplicate the `.md`). The volume guard requires an
+    /// explicit `--limit` for any tenant other than `main`.
+    #[command(name = "reindex-orphans")]
+    ReindexOrphans {
+        /// Gradatum root directory.
+        #[arg(long, default_value = "/var/lib/gradatum")]
+        root: std::path::PathBuf,
+        /// Tenant to process (default: `"main"`).
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Maximum number of orphans to re-index (unlimited if absent).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Preview actions without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Retro-fills `file_checksums` drift footprints for on-disk notes lacking one (F-174).
+    ///
+    /// Writes ONLY the checksum footprint (never the `.md`, index note, embedding or queue),
+    /// for notes written before F-165 wired the footprint into the funnel. Idempotent, with
+    /// the same volume guard as `backfill-embeddings` (`--limit` required off `main`).
+    /// `--dry-run` previews. Run offline (server stopped, backup first).
+    #[command(name = "backfill-checksums")]
+    BackfillChecksums {
+        /// Gradatum root directory.
+        #[arg(long, default_value = "/var/lib/gradatum")]
+        root: std::path::PathBuf,
+        /// Tenant to process (default: `"main"`).
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Maximum number of files to footprint (unlimited if absent).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Preview actions without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Runs the coherence drift scan and alerts when any drift is found (F-174).
+    ///
+    /// Read-only: reports files that drifted (hash mismatch), `file_checksums` entries whose
+    /// file is gone (missing), note `.md` on disk absent from the `file_checksums` drift
+    /// footprint (untracked — **not** the same as absent from the index: such a note may be
+    /// fully indexed and searchable, it merely lacks a drift footprint), and live
+    /// notes without an embedding. Exits non-zero when any of these is non-zero, so it can
+    /// gate a cron/CI health check. Never repairs — reconstruction stays behind its gated
+    /// entry point.
+    #[command(name = "drift-scan")]
+    DriftScan {
+        /// Gradatum root directory.
+        #[arg(long, default_value = "/var/lib/gradatum")]
+        root: std::path::PathBuf,
     },
     /// Inspects and manages the job queue (list/get/cancel/dlq).
     Jobs {
@@ -464,6 +523,26 @@ enum ProjectMapCmd {
         #[arg(long, default_value = "")]
         api_key: String,
     },
+    /// Back-fills `role_kind` / `role_status` on project-map cards indexed before the
+    /// F-171 write-time derivation (migration 0043 left the two columns NULL).
+    ///
+    /// Reads AND writes the SQLite index directly, with no HTTP call. The derivation goes
+    /// through `roles_of_body` — the same `parse_link` as the write path, no second
+    /// analyser. Idempotent: a card already typed is skipped; a card whose body carries no
+    /// `[[kind:…]]` is left NULL and reported (`untypable`), never typed by force. Every
+    /// card is typed, `downgraded` ones included (type is orthogonal to status).
+    ///
+    /// Dry-run by DEFAULT: it scans and reports what it WOULD write, mutating nothing.
+    /// Pass `--apply` to write the columns. Run with the server stopped.
+    #[command(name = "backfill-roles")]
+    BackfillRoles {
+        /// Gradatum root directory.
+        #[arg(long, default_value = "/var/lib/gradatum")]
+        root: std::path::PathBuf,
+        /// Write the columns for real (default: dry-run preview).
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 /// Sub-commands of `vault`.
@@ -689,6 +768,82 @@ async fn main() -> anyhow::Result<()> {
                 report.skipped_drift,
                 report.skipped_missing_md,
             );
+            Ok(())
+        }
+        Cmd::ReindexOrphans {
+            root,
+            tenant,
+            limit,
+            dry_run,
+        } => {
+            let args = ReindexOrphansArgs {
+                root,
+                tenant,
+                limit,
+                dry_run,
+            };
+            let report = gradatum_admin::reindex_orphans::run(args).await?;
+            let tag = if report.dry_run { " [DRY-RUN]" } else { "" };
+            println!(
+                "reindex-orphans{tag}: orphans_found={} reindexed={} embed_enqueued={} skipped_malformed={} skipped_path_mismatch={}",
+                report.orphans_found,
+                report.reindexed,
+                report.embed_enqueued,
+                report.skipped_malformed,
+                report.skipped_path_mismatch,
+            );
+            Ok(())
+        }
+        Cmd::BackfillChecksums {
+            root,
+            tenant,
+            limit,
+            dry_run,
+        } => {
+            let report = gradatum_admin::backfill_checksums::run(
+                gradatum_admin::backfill_checksums::BackfillChecksumsArgs {
+                    root,
+                    tenant,
+                    limit,
+                    dry_run,
+                },
+            )
+            .await?;
+            let tag = if report.dry_run { " [DRY-RUN]" } else { "" };
+            println!(
+                "backfill-checksums{tag}: candidates_found={} backfilled={} skipped_unreadable={}",
+                report.candidates_found, report.backfilled, report.skipped_unreadable,
+            );
+            Ok(())
+        }
+        Cmd::DriftScan { root } => {
+            let report =
+                gradatum_admin::drift_scan::run(gradatum_admin::drift_scan::DriftScanCliArgs {
+                    root,
+                })
+                .await?;
+            println!(
+                "drift-scan: mismatch={} missing={} untracked={} embeddable_notes_without_vector={} stable={}",
+                report.mismatch,
+                report.missing,
+                report.untracked,
+                report.embeddable_notes_without_vector,
+                report.stable,
+            );
+            // Légende : `untracked` est le terme le plus facile à mal lire — il ne dit PAS
+            // « absent de l'index ». Un dispositif doit dire la mesure qu'il a faite.
+            println!(
+                "  legend: untracked = .md on disk without a footprint in file_checksums \
+                 (NOT \"absent from the index\": the note may be indexed and searchable) \
+                 — targeted repair: backfill-checksums --tenant <t> --limit <n>"
+            );
+            if report.has_drift() {
+                eprintln!(
+                    "ALERTE: derive detectee — {} ecart(s) de coherence (voir compteurs ci-dessus)",
+                    report.total_drift()
+                );
+                std::process::exit(2);
+            }
             Ok(())
         }
         Cmd::Jobs { cmd } => jobs_cmd::run(cmd).await,
@@ -964,6 +1119,10 @@ async fn main() -> anyhow::Result<()> {
                         async fn marker_exists(&self, _marker: &str) -> anyhow::Result<bool> {
                             Ok(false)
                         }
+                        async fn existing_titles(&self) -> anyhow::Result<Vec<(String, String)>> {
+                            // Jamais appelé : `run_backfill` ne charge l'index qu'en mode apply.
+                            Ok(Vec::new())
+                        }
                         async fn vault_write(
                             &self,
                             _card: &gradatum_admin::project_map_card::VaultWriteCard,
@@ -987,8 +1146,12 @@ async fn main() -> anyhow::Result<()> {
                     );
                 } else {
                     println!(
-                        "backfill-changelog: parsed={} created={} skipped={} skipped_meta={}",
-                        report.parsed, report.created, report.skipped, report.skipped_meta
+                        "backfill-changelog: parsed={} created={} skipped={} skipped_title={} skipped_meta={}",
+                        report.parsed,
+                        report.created,
+                        report.skipped,
+                        report.skipped_title,
+                        report.skipped_meta
                     );
                 }
                 Ok(())
@@ -1010,8 +1173,44 @@ async fn main() -> anyhow::Result<()> {
                 println!("  IN_PROGRESS      : {}", scope.in_progress_count);
                 println!("  BLOCKED          : {}", scope.blocked_count);
                 println!("  DONE             : {}", scope.done_count);
+                println!("  OBSOLETE         : {}", scope.obsolete_count);
+                println!("  BRAINSTORMING    : {}", scope.brainstorming_count);
+                println!("  unclassified    : {}", scope.unaccounted_count);
+                // Réconciliation explicite : total vs somme des statuts. Toute
+                // divergence est nommée dans la sortie, jamais laissée à déduire
+                // par comparaison de deux nombres non comparables (F-207).
+                println!("  somme statuts    : {}", scope.status_sum());
+                let gap = scope.reconciliation_gap();
+                if gap == 0 {
+                    println!("  gap total−sum: 0 (reconciled)");
+                } else {
+                    println!("  gap total−sum: {gap} ⚠ NOT RECONCILED — uncounted cards");
+                }
                 if !scope.versions.is_empty() {
                     println!("  versions         : {}", scope.versions.join(", "));
+                }
+                // F-207 critère 3 : un écart ne doit pas seulement s'IMPRIMER, il doit
+                // faire ÉCHOUER le contrôle qui l'observe. Rendre `Ok(())` laissait la
+                // ligne « NON RÉCONCILIÉ » sans aucun pouvoir bloquant.
+                //
+                // Le code 2 n'est pas arbitraire : c'est celui que `drift-scan` réserve déjà
+                // dans ce même binaire pour « travail fait, verdict négatif », par
+                // opposition au 1 que `main() -> anyhow::Result<()>` rend via
+                // `Termination` quand le binaire n'a PAS pu faire son travail. Un
+                // consommateur peut donc discriminer les deux — et celui qui discrimine
+                // sur 2 a déjà toute la sortie sous les yeux : elle est écrite AVANT
+                // l'appel à `exit`, ligne par ligne (stdout est un `LineWriter`).
+                let code = gradatum_admin::project_map_scope::scope_exit_code(&scope);
+                if code != gradatum_admin::project_map_scope::EXIT_SCOPE_RECONCILED {
+                    // Sans accent, comme l'ALERTE de `drift-scan` : meme canal (stderr),
+                    // meme forme, et zero hit ajoute au gate `scan-fr-strings`.
+                    eprintln!(
+                        "ALERTE: reconciliation non tenue — total={} somme des statuts={} \
+                         ecart={gap} (voir la ligne d'ecart ci-dessus)",
+                        scope.total_count,
+                        scope.status_sum(),
+                    );
+                    std::process::exit(code);
                 }
                 Ok(())
             }
@@ -1055,6 +1254,10 @@ async fn main() -> anyhow::Result<()> {
                     async fn marker_exists(&self, _marker: &str) -> anyhow::Result<bool> {
                         Ok(false)
                     }
+                    async fn existing_titles(&self) -> anyhow::Result<Vec<(String, String)>> {
+                        // Jamais appelé : `run_backfill_features` ne charge l'index qu'en apply.
+                        Ok(Vec::new())
+                    }
                     async fn vault_write(
                         &self,
                         _card: &gradatum_admin::project_map_card::VaultWriteCard,
@@ -1080,8 +1283,44 @@ async fn main() -> anyhow::Result<()> {
                     );
                 } else {
                     println!(
-                        "backfill-features: parsed={} created={} skipped={}",
-                        report.parsed, report.created, report.skipped,
+                        "backfill-features: parsed={} created={} skipped={} skipped_title={}",
+                        report.parsed, report.created, report.skipped, report.skipped_title,
+                    );
+                }
+                Ok(())
+            }
+            ProjectMapCmd::BackfillRoles { root, apply } => {
+                // Ouverture directe de l'index (dép gradatum-index déjà présente) : aucune
+                // API HTTP ne pose une colonne d'index. Exige un serveur ARRÊTÉ.
+                let index_path = vault_index_path(&root);
+                if !index_path.exists() {
+                    anyhow::bail!(
+                        "index.db not found: {} — the server must have started at least once",
+                        index_path.display()
+                    );
+                }
+                let index = gradatum_index::SqliteIndex::open(&index_path)
+                    .await
+                    .with_context(|| format!("ouverture index.db : {}", index_path.display()))?;
+
+                let report = if apply {
+                    index.backfill_project_map_roles().await?
+                } else {
+                    index.dry_run_project_map_roles().await?
+                };
+                // untypable = cartes scannées mais sans [[kind:…]] dérivable — laissées NULL.
+                let untypable = report.scanned.saturating_sub(report.updated);
+
+                if apply {
+                    println!(
+                        "backfill-roles: scanned={} updated={} untypable={}",
+                        report.scanned, report.updated, untypable
+                    );
+                } else {
+                    println!(
+                        "backfill-roles [DRY-RUN]: scanned={} would_type={} untypable={} \
+                         (re-run with --apply to write)",
+                        report.scanned, report.updated, untypable
                     );
                 }
                 Ok(())

@@ -4,8 +4,9 @@
 //!
 //! ## Contents
 //!
-//! - [`SqliteQueueStore`]: implementation of the `QueueStore` trait via async `sqlx`
-//!   (WAL mode, atomic `UPDATE…RETURNING`). Migration `006_apalis_bootstrap.sql`.
+//! - [`SqliteQueueStore`]: implementation of the `QueueStore` trait via rusqlite
+//!   (WAL mode, atomic `UPDATE…RETURNING`). Migrations `006 → 012`.
+//! - [`QueueDb`]: shared handle to the queue connection (sync/async bridge).
 //!
 //! ## Architecture
 //!
@@ -30,8 +31,9 @@
 pub mod queue_store_sqlite;
 
 pub use queue_store_sqlite::{
-    SqliteQueueStore, apply_sqlite_pragmas, idempotency_cleanup, idempotency_insert,
-    idempotency_lookup, run_migrations,
+    QueueDb, SqliteQueueStore, apply_sqlite_pragmas, idempotency_cleanup, idempotency_insert,
+    idempotency_lookup, open_queue_db, open_queue_db_existing, open_queue_db_in_memory,
+    run_migrations,
 };
 
 /// Crate version (from `workspace.package.version`).

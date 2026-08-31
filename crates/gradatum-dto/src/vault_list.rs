@@ -24,4 +24,12 @@ pub struct VaultListRequest {
     pub limit: Option<u32>,
     /// Pagination cursor (opaque token).
     pub cursor: Option<String>,
+    /// Filter on the `kind` role of a project-map card (`FIX`, `FEATURE`,
+    /// `ENHANCEMENT`, `TASK`). Absent or `null`: no filter — the routing to
+    /// `list_notes` is unchanged. The value is the canonical SCREAMING_SNAKE wire form.
+    pub role_kind: Option<String>,
+    /// Filter on the `status` role of a project-map card (`OPEN`, `IN_PROGRESS`, `BLOCKED`,
+    /// `DONE`, `OBSOLETE`, `BRAINSTORMING`). Not to be confused with the note's lifecycle
+    /// status (`live`, `downgraded`): two distinct notions, two distinct columns.
+    pub role_status: Option<String>,
 }

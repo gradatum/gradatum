@@ -3,7 +3,7 @@
 //! ## Startup sequence
 //!
 //! 1. Parses CLI arguments (DB path, config path).
-//! 2. Opens the SQLite WAL pool, applies `SCHEMA_V1` (queue + leadership slot) then the
+//! 2. Opens the SQLite WAL queue database, applies `SCHEMA_V1` (queue + leadership slot) then the
 //!    `gradatum-db-sqlite` migrations (`gradatum_jobs`, `gradatum_idempotency`). Les deux
 //!    sont nécessaires : sans les secondes, un worker démarré avant le serveur sur une base
 //!    vierge s'arrête silencieusement dès la première tâche.
@@ -41,7 +41,6 @@
 mod apalis_backend;
 mod apalis_handlers;
 mod config_health;
-mod distill_cluster;
 // Required by apalis_handlers::handle_validate (F-43 quality gate) — wired via monitor.rs.
 mod internal_client;
 mod quality_score;
@@ -62,9 +61,8 @@ use std::time::Duration;
 use anyhow::Context as _;
 use clap::Parser;
 use gradatum_core::QueueStore;
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
+use gradatum_db_sqlite::{SqliteQueueStore, open_queue_db, run_migrations};
 use gradatum_embed::{Embedder, HttpEmbedder, Noop as NoopEmbedder};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -211,47 +209,34 @@ async fn main() -> anyhow::Result<()> {
         "gradatum-worker v0.2.0 starting (Apalis Monitor multi-worker, worker-flip)"
     );
 
-    // ── Open the SQLite WAL pool ──────────────────────────────────────────────
-    let opts = SqliteConnectOptions::new()
-        .filename(&db_path)
-        // create_if_missing stays true: the worker unit only `Wants=` the server,
-        // so it may legitimately reach this point on a first boot before the
-        // server created the file. What used to make this dangerous was the
-        // hard-coded path — a wrong path could be created silently. That door is
-        // now closed by resolve_queue_db_path: the path is either derived from
-        // [storage] root, or validated against it.
-        .create_if_missing(true)
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        // busy_timeout 5 s: without this, SQLite returns SQLITE_BUSY immediately
-        // if the server holds the WAL lock during a dequeue or ack. With
-        // busy_timeout, SQLite retries for up to 5 s before failing — ack failure
-        // triggers job retry instead of leaving the job in Running state.
-        .busy_timeout(std::time::Duration::from_secs(5));
-    let pool = Arc::new(
-        SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect_with(opts)
-            .await
-            .context("opening SQLite queue pool")?,
-    );
+    // ── Open the SQLite WAL queue database ────────────────────────────────────
+    // create_if_missing stays true: the worker unit only `Wants=` the server,
+    // so it may legitimately reach this point on a first boot before the
+    // server created the file. What used to make this dangerous was the
+    // hard-coded path — a wrong path could be created silently. That door is
+    // now closed by resolve_queue_db_path: the path is either derived from
+    // [storage] root, or validated against it.
+    // `open_queue_db` applique WAL + busy_timeout 5 s (réglages sqlx d'origine) :
+    // sans busy_timeout, SQLite renvoie SQLITE_BUSY immédiatement si le serveur tient
+    // le verrou WAL lors d'un dequeue/ack — avec, il retente jusqu'à 5 s avant d'échouer.
+    let db = open_queue_db(&db_path)
+        .await
+        .context("opening SQLite queue database")?;
 
     // Apply the schema (idempotent via IF NOT EXISTS).
     //
-    // `sqlx::query` exécute bien les cinq instructions de SCHEMA_V1 : le pilote SQLite de
-    // sqlx boucle sur les instructions du texte tant qu'aucune limite n'est fixée, et
-    // `Executor::execute` n'en fixe aucune (`fetch_optional` en fixerait une). Vérifié par
-    // relevé du schéma d'une base neuve : `jobs_v2`, `worker_leadership` et les deux index
-    // sont tous créés.
-    sqlx::query(gradatum_queue::schema::SCHEMA_V1)
-        .execute(pool.as_ref())
+    // `execute_batch` exécute l'unique instruction de SCHEMA_V1 (`worker_leadership`).
+    // La table legacy `jobs_v2` et ses deux index ne sont plus créés depuis 2.1.0 (F-177)
+    // — le worker ne lit que `gradatum_jobs`.
+    db.with_conn(|conn| conn.execute_batch(gradatum_queue::schema::SCHEMA_V1))
         .await
         .context("applying queue schema")?;
 
     // Migrations Apalis — `gradatum_jobs`, `gradatum_idempotency` et leurs index.
     //
-    // SCHEMA_V1 ne couvre QUE la queue historique (`jobs_v2`) et le slot de leadership ;
-    // les tables que consomment le Monitor et les balayages périodiques viennent des
-    // migrations de `gradatum-db-sqlite`. Sans cet appel, un worker démarré sur une base
+    // SCHEMA_V1 ne couvre QUE le slot de leadership (la file legacy `jobs_v2` est
+    // supprimée depuis 2.1.0, F-177) ; les tables que consomment le Monitor et les
+    // balayages périodiques viennent des migrations de `gradatum-db-sqlite`. Sans cet appel, un worker démarré sur une base
     // vierge journalise un boot nominal puis s'arrête ~200 ms plus tard : chaque tâche
     // Apalis échoue sur `no such table: gradatum_jobs`, le Monitor se vide et rend la main
     // avec le code 0 — une mort silencieuse que rien ne distingue d'un arrêt propre.
@@ -259,12 +244,12 @@ async fn main() -> anyhow::Result<()> {
     // Invisible en production tant que `gradatum-server` ouvre la base en premier, mais
     // l'unité du worker ne fait que `Wants=` le serveur : l'ordre inverse est légal.
     //
-    // Migrations idempotentes, donc sûres à rejouer si le serveur les a déjà appliquées.
-    // Sur une base vierge où les deux processus démarrent simultanément, le perdant de la
-    // course voit sa transaction rejetée et sort en erreur ; `Restart=always` +
-    // `RestartSec=15s` le ramènent sur une base déjà migrée. Échouer bruyamment est ici
-    // préférable à démarrer sur un schéma partiel.
-    run_migrations(pool.as_ref())
+    // Le runner honore la table de suivi `_sqlx_migrations` : aucune migration déjà
+    // appliquée n'est rejouée (les migrations 007/011 non-idempotentes ne peuvent donc
+    // pas corrompre la base LIVE). Sur une base vierge où les deux processus démarrent
+    // simultanément, le perdant de la course voit sa transaction rejetée et sort en
+    // erreur ; `Restart=always` + `RestartSec=15s` le ramènent sur une base déjà migrée.
+    run_migrations(&db)
         .await
         .context("applying queue migrations (gradatum_jobs, gradatum_idempotency)")?;
 
@@ -322,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── Leader election ───────────────────────────────────────────────────────
-    let el = LeaderElection::new(pool.clone(), LeaderConfig::default())
+    let el = LeaderElection::new(db.clone(), LeaderConfig::default())
         .await
         .context("leader election init")?;
     if !el.try_acquire().await.context("try_acquire leader")? {
@@ -333,9 +318,9 @@ async fn main() -> anyhow::Result<()> {
     let renewal = el.clone().spawn_renewal();
 
     // ── QueueStore ────────────────────────────────────────────────────────────
-    // SqlitePool internally owns an Arc (pool.clone() is cheap).
-    // SqliteQueueStore::new takes SqlitePool (not Arc<SqlitePool>).
-    let store: Arc<dyn QueueStore + Send + Sync> = Arc::new(SqliteQueueStore::new((*pool).clone()));
+    // QueueDb is an Arc<Mutex<Connection>> — `clone()` shares the same connection.
+    // SqliteQueueStore::new takes QueueDb (not Arc<QueueDb>).
+    let store: Arc<dyn QueueStore + Send + Sync> = Arc::new(SqliteQueueStore::new(db.clone()));
 
     // ── Apalis config ─────────────────────────────────────────────────────────
     let apalis_cfg: ApalisConfig = load_section(
@@ -414,21 +399,21 @@ async fn main() -> anyhow::Result<()> {
     // ── Periodic sweep (30 s) ─────────────────────────────────────────────────
     // Detached tokio task — terminates naturally when the runtime stops.
     let sweep_store = Arc::clone(&store);
-    let sweep_pool = Arc::clone(&pool);
+    let sweep_db = db.clone();
     let sweep_handle = tokio::spawn(async move {
         let lease_ttl = Duration::from_secs(300); // 5 minutes par défaut
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            // Pool passed for idempotency_cleanup with 24 h TTL.
-            run_sweep_once(sweep_store.as_ref(), lease_ttl, Some(sweep_pool.as_ref())).await;
+            // QueueDb passed for idempotency_cleanup with 24 h TTL.
+            run_sweep_once(sweep_store.as_ref(), lease_ttl, Some(&sweep_db)).await;
         }
     });
 
     // ── Build the Monitor ─────────────────────────────────────────────────────
     let monitor = build_monitor(
         Arc::clone(&store),
-        Arc::clone(&pool),
+        db.clone(),
         MonitorDeps {
             client: Arc::clone(&internal_client) as Arc<dyn internal_client::InternalClient>,
             curator: Arc::clone(&curator)
@@ -436,8 +421,8 @@ async fn main() -> anyhow::Result<()> {
             embedder: Arc::clone(&embedder),
             // Distillation: deterministic synthesizer by default (MVP).
             // Replaceable by a `distill-semantic` LLM gateway backend without handler changes.
-            distill_synthesizer: Arc::new(apalis_handlers::TemplateSynthesizer)
-                as Arc<dyn apalis_handlers::DistillSynthesizer + Send + Sync>,
+            distill_synthesizer: Arc::new(gradatum_distill::TemplateSynthesizer)
+                as Arc<dyn gradatum_distill::DistillSynthesizer + Send + Sync>,
         },
         &apalis_cfg,
         distill_cron_cfg,

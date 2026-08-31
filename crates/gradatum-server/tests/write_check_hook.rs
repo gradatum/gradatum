@@ -18,14 +18,12 @@ use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::JwtService;
 use gradatum_core::scope::VaultId;
 use gradatum_core::trust::TrustContext;
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-use gradatum_queue::SqliteQueue;
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 use gradatum_server::api_v1;
 use gradatum_server::metrics::DriftRuleLabel;
 use gradatum_server::state::AppState;
 use gradatum_vault::{Registry, Vault};
 use prometheus_client::encoding::text::encode;
-use sqlx::sqlite::SqlitePoolOptions;
 use tempfile::TempDir;
 use tower::util::ServiceExt as _;
 
@@ -84,14 +82,7 @@ async fn build_write_env() -> (Router, AppState, TempDir) {
             .expect("Vault::create — invariant test fixture"),
     );
 
-    let queue = Arc::new(
-        SqliteQueue::in_memory()
-            .await
-            .expect("SqliteQueue::in_memory — invariant test fixture"),
-    );
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("sqlite::memory: pool — invariant test fixture");
     run_migrations(&jobs_pool)
@@ -103,7 +94,6 @@ async fn build_write_env() -> (Router, AppState, TempDir) {
     let acl = AclEngine::from_preset_str(WRITE_ACL).expect("preset ACL write_check_hook valide");
 
     let state = AppState::with_jwt_and_acl(jwt, acl)
-        .with_queue(queue as Arc<dyn gradatum_queue::Queue>)
         .with_job_store(job_store as Arc<dyn gradatum_core::QueueStore>, jobs_pool)
         .with_vault_arc(vault as Arc<dyn Registry>);
 

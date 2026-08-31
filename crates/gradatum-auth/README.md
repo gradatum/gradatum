@@ -2,7 +2,7 @@
 
 > JWT verification (Ed25519, audience-scoped, mandatory `kid`), signing-key store, and `jti` revocation.
 
-**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -24,7 +24,7 @@ combines the two.
 
 ```toml
 [dependencies]
-gradatum-auth = "2.0.0"
+gradatum-auth = "2.1.0"
 ```
 
 ```rust

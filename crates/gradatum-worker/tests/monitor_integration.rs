@@ -13,7 +13,7 @@
 //!
 //! ## Architecture
 //!
-//! Les tests s'appuient sur `SqliteQueueStore` in-memory via `sqlx::SqlitePool`
+//! Les tests s'appuient sur `SqliteQueueStore` in-memory via `rusqlite`
 //! (`:memory:`). Le Monitor Apalis complet n'est PAS démarré dans ces tests —
 //! il nécessite un runtime multi-thread + temporisations incompatibles avec `cargo test`.
 //! Les comportements testés sont les modules individiuels qui le composent.
@@ -36,28 +36,25 @@ use gradatum_core::{
     CurateSpec, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority, JobRecord, JobRetry,
     JobScheduling, JobScope, JobSpec, JobStatus, QueueStore, RetryBackoff, TriggerSource,
 };
-use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
 use gradatum_worker::{ApalisConfig, WorkerMetrics};
-use sqlx::SqlitePool;
 use ulid::Ulid;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Crée un pool SQLite in-memory avec schéma appliqué.
-async fn test_pool() -> SqlitePool {
-    let pool = SqlitePool::connect("sqlite::memory:")
-        .await
-        .expect("pool in-memory");
-    apply_sqlite_pragmas(&pool).await.expect("pragmas");
-    run_migrations(&pool).await.expect("migrations");
-    pool
+/// Crée une base SQLite in-memory avec schéma appliqué.
+async fn test_db() -> QueueDb {
+    let db = QueueDb::open_in_memory().await.expect("db in-memory");
+    apply_sqlite_pragmas(&db).await.expect("pragmas");
+    run_migrations(&db).await.expect("migrations");
+    db
 }
 
 /// Crée un `SqliteQueueStore` in-memory prêt à l'emploi.
 async fn test_store() -> SqliteQueueStore {
-    SqliteQueueStore::new(test_pool().await)
+    SqliteQueueStore::new(test_db().await)
 }
 
 /// Construit un `JobRecord` minimal de kind `Curate` en statut Pending.
@@ -160,7 +157,7 @@ async fn sweep_recover_stale_leases_returns_ids() {
     let store = test_store().await;
 
     // Store vide — sweep ne doit pas paniquer.
-    // pool=None : idempotency_cleanup ignoré en test d'intégration (pas de pool séparé nécessaire).
+    // db=None : idempotency_cleanup ignoré en test d'intégration (pas de base séparée nécessaire).
     sweep(&store, Duration::from_secs(0), None).await;
     // Aucune assertion sur le statut — on valide simplement que sweep tourne sans erreur
 

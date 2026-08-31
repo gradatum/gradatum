@@ -107,20 +107,30 @@ ttl_days = 90
 #
 # INTENTIONNELLEMENT DÉSACTIVÉ (`enabled = false` par défaut) — JAMAIS actif par défaut.
 #
-# Mesure la pression de consolidation par locus (notes `live` non-`processed`) et enfile
-# des `Job::Distill` scope `Locus` mode `Semantic`/`Batch` au-delà du seuil. Le cron
-# n'écrit JAMAIS le vault directement — il enfile des jobs (pipeline F-43 gaté PendingReview
-# inchangé). Activation = décision opérateur séparée (spec F-112 §6 : GO + regression-guard
-# léger + 1ʳᵉ exécution supervisée). Ne PAS décommenter sans validation explicite.
+# Mesure la pression de consolidation par SECTION CANONIQUE (notes `live` non-`processed`)
+# et enfile des `Job::Distill` scope `Section` mode `Semantic`/`Batch` au-delà du seuil.
+# L'axe est la section, pas le locus : la colonne `locus` est NULL sur tout le corpus
+# (jamais écrite), la pression par locus vaut donc toujours 0. Le cron n'écrit JAMAIS le
+# vault directement — il enfile des jobs (pipeline F-43 gaté PendingReview inchangé).
+# Activation = décision opérateur séparée (spec F-112 §6 : GO + regression-guard léger +
+# 1ʳᵉ exécution supervisée). Ne PAS décommenter sans validation explicite.
+#
+# `sections` par défaut VIDE = état légitime « aucune section visée, cron INERTE » :
+# enregistré mais aucun comptage, aucun job. Ne JAMAIS configurer de sections par défaut
+# dans le code — un défaut pointant des sections réelles ferait passer la pression de 0 à
+# un valeur vivante au premier déploiement et enfilerait des jobs qui ÉCRIVENT dans le
+# vault, sans décision humaine. `sections = ["…"]` est un opt-in explicite.
 #
 # Extraction figment SÉPARÉE de `[apalis]` (clé top-level, PAS `[apalis.distill_cron]`).
 # Validation fail-loud au boot (build_monitor) : cron parseable (format natif crate `cron`,
-# secondes + DOW 1=Sun), pressure_min ≥ 1, max_jobs_per_tick ≥ 1, loci non vide sans doublon.
+# secondes + DOW 1=Sun), pressure_min ≥ 1, max_jobs_per_tick ≥ 1, sections sans doublon.
+# Une liste `sections` vide EST valide (cron inerte) — elle ne refuse pas le démarrage.
 #
 # [distill_cron]
 # enabled = false                                   # défaut — cron non enregistré
 # cron = "0 0 4 * * Sun"                            # hebdomadaire, dimanche 04:00 (crate `cron`)
-# loci = ["debug", "experiments", "reference"]      # sections consolidables, ordre de priorité
-# pressure_min = 20                                 # seuil notes live non-processed / locus
+# sections = []                                     # défaut VIDE — cron inerte ; opt-in explicite
+# sections = ["debug", "experiments", "reference"]  # sections consolidables, ordre de priorité
+# pressure_min = 20                                 # seuil notes live non-processed / section
 # max_jobs_per_tick = 2                             # cap strict de jobs enfilés par tick
 # ──────────────────────────────────────────────────────────────────────────────

@@ -22,11 +22,9 @@ use axum::http::{Request, StatusCode};
 use gradatum_acl_policy::AclEngine;
 use gradatum_auth::jwt::{JwtService, TokenScope};
 use gradatum_core::scope::AgentId;
-use gradatum_db_sqlite::{SqliteQueueStore, run_migrations};
-use gradatum_queue::SqliteQueue;
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 use gradatum_server::auth_routes::ExchangeResponse;
 use gradatum_server::state::AppState;
-use sqlx::sqlite::SqlitePoolOptions;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -62,16 +60,9 @@ async fn build_tenant_test_state() -> (AppState, TempDir) {
     let acl = AclEngine::from_preset_str(TEST_ACL_TENANT)
         .expect("preset ACL tenant valide — invariant statique");
 
-    let queue = Arc::new(
-        SqliteQueue::in_memory()
-            .await
-            .expect("SqliteQueue::in_memory() — invariant test"),
-    );
-
     // Phase 1.2 : vault_write bridge vers job_store (gradatum_jobs) — nécessaire pour 202.
-    let jobs_pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+    // La queue legacy `jobs_v2` est supprimée (F-177) — plus d'injection legacy.
+    let jobs_pool = QueueDb::open_in_memory()
         .await
         .expect("jobs pool in-memory — invariant test");
     run_migrations(&jobs_pool)
@@ -80,7 +71,6 @@ async fn build_tenant_test_state() -> (AppState, TempDir) {
     let job_store = Arc::new(SqliteQueueStore::new(jobs_pool.clone()));
 
     let state = AppState::with_jwt_and_acl(jwt, acl)
-        .with_queue(queue as Arc<dyn gradatum_queue::Queue>)
         .with_job_store(job_store as Arc<dyn gradatum_core::QueueStore>, jobs_pool)
         .with_api_keys_path(&api_keys_path)
         .await
@@ -209,16 +199,13 @@ async fn staging_key_exchange_returns_403() {
         .await
         .expect("create api key main");
 
-    let pool = SqlitePoolOptions::new()
-        .connect(&format!("sqlite://{}", api_keys_path.display()))
-        .await
-        .expect("open api_keys sqlite");
-    sqlx::query("UPDATE api_keys SET tenant_id = 'staging' WHERE prefix = ?")
-        .bind(&material.prefix)
-        .execute(&pool)
-        .await
-        .expect("mutate tenant to staging");
-    pool.close().await;
+    let conn = rusqlite::Connection::open(&api_keys_path).expect("open api_keys sqlite");
+    conn.execute(
+        "UPDATE api_keys SET tenant_id = 'staging' WHERE prefix = ?1",
+        rusqlite::params![material.prefix],
+    )
+    .expect("mutate tenant to staging");
+    drop(conn);
 
     let router = build_tenant_router(state);
     let req = Request::builder()

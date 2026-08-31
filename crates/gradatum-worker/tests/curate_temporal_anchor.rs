@@ -33,7 +33,7 @@ use gradatum_core::{
     CurateSpec, GradatumJob, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority,
     JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, QueueStore, TriggerSource,
 };
-use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
+use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
 use gradatum_dto::{
     EmbeddingOkResponse, PersistCuratedRequest, PersistDistillRequest, PersistEmbeddingRequest,
     PersistForgetRequest, PersistOkResponse, TemporalEntryDto,
@@ -44,7 +44,6 @@ use gradatum_worker::apalis_handlers::handle_curate;
 use gradatum_worker::internal_client::{
     EmbeddingReadDto, InternalClient, InternalClientError, NoteIdDto, NoteReadDto,
 };
-use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use ulid::Ulid;
@@ -55,16 +54,16 @@ use ulid::Ulid;
 
 /// Crée un `SqliteQueueStore` in-memory avec schéma appliqué.
 async fn test_store() -> SqliteQueueStore {
-    let pool = SqlitePool::connect("sqlite::memory:")
+    let db = QueueDb::open_in_memory()
         .await
         .expect("pool in-memory — invariant test fixture");
-    apply_sqlite_pragmas(&pool)
+    apply_sqlite_pragmas(&db)
         .await
         .expect("pragmas — invariant test fixture");
-    run_migrations(&pool)
+    run_migrations(&db)
         .await
         .expect("migrations — invariant test fixture");
-    SqliteQueueStore::new(pool)
+    SqliteQueueStore::new(db)
 }
 
 /// Fixture partagée : Vault + SqliteIndex dans TempDir.

@@ -2,7 +2,7 @@
 
 > SQLite-backed durable job queue with atomic lease acquisition and automatic recovery.
 
-**Status**: v2.0.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -19,15 +19,17 @@ The crate provides two APIs:
 
 - **`GradatumQueue`** — primary API (since 0.2.0). Implements the `QueueStore` trait from
   `gradatum-core`, backed by `SqliteQueueStore` in WAL mode with `QueueEvent` broadcast.
-- **`SqliteQueue` / `Queue`** — deprecated since 0.2.0; scheduled for removal. Available
-  for backward compatibility.
 - **`LegacyQueue`** — synchronous `rusqlite`-based implementation, preserved for backward compatibility.
+
+The former `SqliteQueue` / `Queue` pair, which read the legacy `jobs_v2` table, is **removed**:
+`jobs_v2` is dropped by migration 012 and is no longer part of `schema::SCHEMA_V1`. Use
+`GradatumQueue` (or `gradatum_core::QueueStore`) instead.
 
 ## Usage
 
 ```toml
 [dependencies]
-gradatum-queue = "2.0.0"
+gradatum-queue = "2.1.0"
 ```
 
 ```rust

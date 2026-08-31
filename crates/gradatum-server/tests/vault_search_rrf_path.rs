@@ -246,12 +246,14 @@ async fn rrf_path_semantic_only_note_returned() {
         "id_b doit apparaître via path semantic (BM25 ne le trouve pas). body={json}"
     );
 
-    // Score RRF doit être borné raisonnablement : 2/(k=60) max ≈ 0.0333 sup.
+    // Score de fusion pondérée (F-162 critère 10) : la magnitude est conservée —
+    // borne ∈ [0,1] (scores normalisés) × composite ≤ 1.32. La borne RRF k=60
+    // (≈ 0.0333, magnitude jetée) ne s'applique plus.
     for item in items {
         let score = item["score"].as_f64().unwrap();
         assert!(
-            (0.0..0.1).contains(&score),
-            "score RRF k=60 doit être dans [0, 0.1[. score={score}, item={item}"
+            (0.0..=1.4).contains(&score),
+            "score fusion pondérée ∈ [0, 1.4] (composite ≤ 1.32). score={score}, item={item}"
         );
     }
 }
@@ -397,11 +399,13 @@ async fn rrf_path_semantic_only_hit_enriched_title_section() {
     );
 }
 
-/// Test 4 : RRF score k=60 — score retourné est cohérent avec la formule.
+/// Test 4 : score de fusion pondérée (F-162 critère 10) — cohérent avec la formule.
 ///
-/// Avec 1 note matchant BM25 (rang 0) et semantic (rang 0) → score RRF brut = 2/(60+0) ≈ 0.0333.
-/// Le score retourné est `composite = rrf × (1+0.2×R) × (1+0.1×P)`.
-/// Sur une note fraîchement créée (R≈1.0) sans backlinks (P=0), composite = rrf × 1.2 ≈ 0.040.
+/// Avec 1 note matchant BM25 (token unique → bm25 peu négatif) ET semantic (cosine=1.0,
+/// embedding aligné) → fusion pondérée = 0.5·normalize_bm25 + 0.5·1.0 ∈ [0.5, 1.0].
+/// Le score retourné est `composite = fusion × (1+0.2×R) × (1+0.1×P)`. Sur une note
+/// fraîchement créée (R≈1.0) sans backlinks (P=0), composite = fusion × 1.2 ∈ [0.6, 1.2].
+/// La magnitude est conservée — le plafond RRF ≈ 0.04 n'existe plus.
 #[tokio::test]
 async fn rrf_path_score_within_expected_range_k60() {
     let mut q = vec![0.0f32; 8];
@@ -436,11 +440,10 @@ async fn rrf_path_score_within_expected_range_k60() {
     assert!(!items.is_empty(), "doit contenir 1 note. body={json}");
 
     let score = items[0]["score"].as_f64().expect("score number");
-    // k=60 : 2/(60+0) = 0.03333 (RRF brut) → boost composite max 1.32 → < 0.045.
-    // Sur une note nouvellement seedée (R~1.0, P=0) le score se trouve typiquement
-    // autour de 0.040 (= 0.0333 × 1.2). On élargit la borne pour absorber f32+seed timing.
+    // Deux bras au maximum : fusion ∈ [0.5, 1.0] × composite ≤ 1.32 → borne [0.4, 1.4].
+    // La note matche les deux bras fortement (cosine=1.0) : score typiquement > 0.6.
     assert!(
-        (0.030..0.05).contains(&score),
-        "score doit être dans [0.030, 0.05] (RRF k=60 × composite ≤ 1.32). score={score}"
+        (0.4..1.4).contains(&score),
+        "score fusion pondérée ∈ [0.4, 1.4] (deux bras, cosine=1.0). score={score}"
     );
 }

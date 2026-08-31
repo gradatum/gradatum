@@ -23,7 +23,6 @@ gradatum-worker  = { path = "../gradatum-worker" }
 # T12 — shape parity tests : gradatum-server lib + auth
 gradatum-server  = { path = "../gradatum-server" }
 gradatum-db-sqlite = { path = "../gradatum-db-sqlite" }
-sqlx             = { workspace = true, features = ["sqlite", "runtime-tokio"] }
 gradatum-auth    = { path = "../gradatum-auth" }
 gradatum-acl-policy = { path = "../gradatum-acl-policy" }
 axum             = { workspace = true }

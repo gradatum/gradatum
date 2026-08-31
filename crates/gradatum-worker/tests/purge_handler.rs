@@ -725,6 +725,9 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
     async fn total_body_size_bytes(&self, vault_id: &str) -> Result<u64, GradatumError> {
         self.inner.total_body_size_bytes(vault_id).await
     }
+    async fn last_indexed_at(&self, vault_id: &str) -> Result<Option<i64>, GradatumError> {
+        self.inner.last_indexed_at(vault_id).await
+    }
     async fn upsert_link(
         &self,
         vault_id: &str,
@@ -790,6 +793,13 @@ impl gradatum_core::IndexStore for FaultStatusIndex {
         self.inner
             .list_notes_by_locus_prefix(vault_id, prefix)
             .await
+    }
+    async fn list_notes_by_section(
+        &self,
+        vault_id: &str,
+        section: &str,
+    ) -> Result<Vec<(String, String)>, GradatumError> {
+        self.inner.list_notes_by_section(vault_id, section).await
     }
     async fn list_notes_by_agent(
         &self,

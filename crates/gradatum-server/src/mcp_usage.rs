@@ -2,12 +2,15 @@
 //!
 //! ## Design
 //!
-//! `McpToolCounters` est une map fermée pré-peuplée à l'init (23 clés — voir `MCP_TOOL_KEYS`).
-//! Elle ne couvre PAS tous les outils déclarés par `tool_catalog()` : un outil absent de
-//! `MCP_TOOL_KEYS` n'est pas instrumenté.
+//! `McpToolCounters` est une map fermée pré-peuplée à l'init (une clé par outil MCP
+//! instrumenté — voir `MCP_TOOL_KEYS`).
+//! Elle DOIT couvrir tous les outils déclarés par `tool_catalog()` : cette parité est
+//! garantie par le test `every_declared_tool_is_instrumented` (`api_v1::mcp::tests`),
+//! qui compare les deux sources et rougit sur tout outil exposé mais non compté (F-234).
 //! Les `AtomicU64` gèrent l'incrément concurrent sans verrou sur la map.
 //! `record(name)` fait un simple `map.get(name)` — un nom inconnu est un **no-op**
-//! (garantit la cardinalité bornée à 23 séries, quelle que soit l'entrée).
+//! (garantit la cardinalité bornée au nombre d'entrées de `MCP_TOOL_KEYS`, quelle que
+//! soit l'entrée).
 //!
 //! ## Usage
 //!
@@ -20,12 +23,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::read_usage_store::UsageFlushEntry;
 
-/// 23 paires `(nom_outil, clé_endpoint)` définissant la map fermée.
+/// Paires `(nom_outil, clé_endpoint)` définissant la map fermée — une par outil MCP
+/// instrumenté.
 ///
 /// Le préfixe `mcp:` namespaced les clés pour les distinguer des 5 read-paths
 /// HTTP dans la table `read_usage_counters` et dans les familles Prometheus.
 ///
-/// Ordre identique aux arms de `dispatch_tool()` dans `mcp.rs`.
+/// Ordre calé sur les arms de `dispatch_tool()` dans `mcp.rs`. La complétude vis-à-vis
+/// de `tool_catalog()` n'est PAS supposée depuis cet ordre : elle est prouvée par le
+/// test de parité `every_declared_tool_is_instrumented` (F-234).
 pub const MCP_TOOL_KEYS: &[(&str, &str)] = &[
     ("vault_status", "mcp:vault_status"),
     ("vault_authors", "mcp:vault_authors"),
@@ -50,6 +56,16 @@ pub const MCP_TOOL_KEYS: &[(&str, &str)] = &[
     ("vault_archives_list", "mcp:vault_archives_list"),
     ("code_scope", "mcp:code_scope"),
     ("create_feature_card", "mcp:create_feature_card"),
+    // F-234 : capacités exposées par `dispatch_tool` mais historiquement hors compteur
+    // (`vault_proactive_recall`/`_feedback` appelées à chaque recall/écriture, `job_status`
+    // à chaque confirmation de job). Désormais instrumentées — aucune exclusion. La parité
+    // avec `tool_catalog()` est verrouillée par `every_declared_tool_is_instrumented`.
+    ("vault_proactive_recall", "mcp:vault_proactive_recall"),
+    (
+        "vault_proactive_recall_feedback",
+        "mcp:vault_proactive_recall_feedback",
+    ),
+    ("job_status", "mcp:job_status"),
 ];
 
 /// Compteurs atomiques par outil MCP — map fermée, pré-peuplée, lecture seule après `new()`.
@@ -66,7 +82,7 @@ pub struct McpToolCounters {
 }
 
 impl McpToolCounters {
-    /// Crée un jeu de compteurs pré-peuplé avec les 23 outils de `MCP_TOOL_KEYS`.
+    /// Crée un jeu de compteurs pré-peuplé avec tous les outils de `MCP_TOOL_KEYS`.
     ///
     /// La map est en lecture seule après `new()` — aucun verrou nécessaire sur le `get`.
     /// Les `AtomicU64` sont initialisés à 0.
@@ -169,16 +185,21 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// La map contient exactement 23 outils ; `record` incrémente le bon compteur.
+    /// `record` incrémente le bon compteur ; les autres restent à zéro.
+    ///
+    /// Le CARDINAL de la map (autrefois `assert_eq!(MCP_TOOL_KEYS.len(), 23)`) n'est
+    /// volontairement plus gravé ici : un compte en dur dérive au premier ajout et
+    /// reste vert sur un renommage. La complétude de l'instrumentation est prouvée par
+    /// parité de sources dans `every_declared_tool_is_instrumented`
+    /// (`api_v1::mcp::tests`) — pas par un nombre (F-234).
     #[test]
-    fn mcp_counters_has_23_tools_and_records() {
+    fn mcp_counters_record_and_swap_deltas() {
         let c = McpToolCounters::new();
         c.record("vault_list");
         c.record("vault_list");
         c.record("code_scope");
         // swap renvoie les deltas ; vault_list=2, code_scope=1, autres=0
         let entries = c.swap_all_for_test();
-        assert_eq!(MCP_TOOL_KEYS.len(), 23);
         assert_eq!(get_hit(&entries, "mcp:vault_list"), 2);
         assert_eq!(get_hit(&entries, "mcp:code_scope"), 1);
         assert_eq!(get_hit(&entries, "mcp:vault_write"), 0);

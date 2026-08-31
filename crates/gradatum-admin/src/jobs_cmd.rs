@@ -24,8 +24,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use gradatum_core::{JobFilter, JobRecord, JobStatus, QueueStore, paths::queue_db_path};
-use gradatum_db_sqlite::{SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
-use sqlx::SqlitePool;
+use gradatum_db_sqlite::{
+    QueueDb, SqliteQueueStore, apply_sqlite_pragmas, open_queue_db, run_migrations,
+};
 use ulid::Ulid;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -143,23 +144,22 @@ pub async fn run(cmd: JobsCmd) -> Result<()> {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Opens the SQLite queue pool from `<root>/db/queue.sqlite`.
+/// Opens the SQLite queue database from `<root>/db/queue.sqlite`.
 ///
 /// Applies WAL pragmas and runs migrations.
-async fn open_queue_pool(root: &std::path::Path) -> Result<SqlitePool> {
+async fn open_queue_pool(root: &std::path::Path) -> Result<QueueDb> {
     // SSOT : chemin via helper canonique — jamais root.join(...) manuel.
     let db_path = queue_db_path(root);
-    let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    let pool = SqlitePool::connect(&url)
+    let db = open_queue_db(&db_path)
         .await
         .with_context(|| format!("cannot open the SQLite queue: {}", db_path.display()))?;
-    apply_sqlite_pragmas(&pool)
+    apply_sqlite_pragmas(&db)
         .await
         .context("queue WAL pragmas error")?;
-    run_migrations(&pool)
+    run_migrations(&db)
         .await
         .context("queue migrations error")?;
-    Ok(pool)
+    Ok(db)
 }
 
 /// Formats a `JobRecord` as a single summary line for `list`.
@@ -176,6 +176,28 @@ fn format_record_short(r: &JobRecord) -> String {
         prio = r.spec.priority.as_u8(),
         created = r.lifecycle.created_at.format("%Y-%m-%dT%H:%M:%SZ"),
     )
+}
+
+/// Truncates `s` to at most `max_chars` **characters** (not bytes), on a char
+/// boundary, appending `…` when truncation actually occurred.
+///
+/// Byte-slicing free-form display text — as `&s[..s.len().min(80)]` did — panics
+/// when the cut index lands inside a multi-byte UTF-8 scalar. `last_error` carries
+/// arbitrary text from engine/storage layers (e.g. « erreur métier », `opendal`
+/// paths, non-ASCII), so a fixed byte offset is never safe here. This truncates on
+/// character count and never panics; the `…` marks that the line was cut, so an
+/// operator does not mistake the truncated cause for the whole cause.
+///
+/// F-217 follow-up : the composed `last_error` made this path reachable
+/// (previously always the 27-byte ASCII « max_retries atteint »).
+fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
 }
 
 /// Parses a string into `JobStatus` (case-insensitive).
@@ -349,7 +371,7 @@ async fn jobs_dlq(args: JobsDlqArgs) -> Result<()> {
             format_record_short(r),
             r.retry.count,
             r.retry.max,
-            &last_err[..last_err.len().min(80)],
+            truncate_ellipsis(last_err, 80),
         );
     }
 
@@ -377,29 +399,32 @@ async fn jobs_dlq(args: JobsDlqArgs) -> Result<()> {
 /// Replays a single DLQ job by resetting it to `Pending` via a direct SQL update.
 ///
 /// A direct SQL query is used for DLQ replay, outside of any DAG chaining.
-async fn replay_single(_store: &SqliteQueueStore, pool: &SqlitePool, id: Ulid) -> Result<()> {
+async fn replay_single(_store: &SqliteQueueStore, db: &QueueDb, id: Ulid) -> Result<()> {
     let id_str = id.to_string();
-    let result = sqlx::query(
-        r#"
-        UPDATE gradatum_jobs
-        SET status        = 'Pending',
-            lease_until   = NULL,
-            scheduled_at  = datetime('now'),
-            -- Reset the attempt counter: without reset, the replayed job would
-            -- have attempt_count >= max_attempts and be immediately sent back
-            -- to DLQ by promote_retries on the next sweep (30s).
-            attempt_count = 0,
-            last_error    = NULL
-        WHERE id = ?
-          AND status = 'DLQ'
-        "#,
-    )
-    .bind(&id_str)
-    .execute(pool)
-    .await
-    .with_context(|| format!("DLQ replay error job {}", id))?;
+    let db = db.clone();
+    let result = db
+        .with_conn(move |conn| {
+            conn.execute(
+                r#"
+                UPDATE gradatum_jobs
+                SET status        = 'Pending',
+                    lease_until   = NULL,
+                    scheduled_at  = datetime('now'),
+                    -- Reset the attempt counter: without reset, the replayed job would
+                    -- have attempt_count >= max_attempts and be immediately sent back
+                    -- to DLQ by promote_retries on the next sweep (30s).
+                    attempt_count = 0,
+                    last_error    = NULL
+                WHERE id = ?1
+                  AND status = 'DLQ'
+                "#,
+                [&id_str],
+            )
+        })
+        .await
+        .with_context(|| format!("DLQ replay error job {}", id))?;
 
-    if result.rows_affected() == 0 {
+    if result == 0 {
         anyhow::bail!("Job {} not found in DLQ (status ≠ DLQ or unknown ID)", id);
     }
 
@@ -475,6 +500,63 @@ async fn jobs_dlq_prune(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-217 follow-up — la troncature d'affichage de `last_error` doit se faire
+    /// sur une frontière de caractère, jamais au milieu d'un scalaire UTF-8.
+    ///
+    /// Repro exact du défaut : une cause dont l'octet 80 tombe à l'intérieur d'un
+    /// caractère multi-octets. La composition `fail_dlq` (« cause — max_retries… »)
+    /// a rendu ce chemin atteignable ; et les vraies causes portent déjà de l'UTF-8
+    /// (« erreur métier », le tiret cadratin du séparateur). L'ancienne découpe en
+    /// octets `&s[..s.len().min(80)]` PANIQUE sur cette entrée — ce test l'exige,
+    /// puis vérifie que `truncate_ellipsis` passe et marque la coupe.
+    #[test]
+    fn last_error_display_truncation_is_char_safe() {
+        // 79 octets ASCII + « é » (U+00E9, 2 octets → positions 79..81) : l'octet 80
+        // tombe DANS le « é ». Puis du texte pour dépasser 80 et forcer la coupe.
+        let cause = format!("{}ément la cause réelle du dernier échec", "a".repeat(79));
+        assert!(
+            !cause.is_char_boundary(80),
+            "pré-condition : l'octet 80 n'est pas une frontière de caractère"
+        );
+        assert!(cause.len() > 80, "pré-condition : la coupe a bien lieu");
+
+        // AVANT (découpe en octets) : PANIQUE. On le prouve, sans polluer stderr.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let byte_slice_panics = std::panic::catch_unwind(|| {
+            let _ = &cause[..cause.len().min(80)];
+        })
+        .is_err();
+        std::panic::set_hook(prev_hook);
+        assert!(
+            byte_slice_panics,
+            "la découpe en octets DOIT paniquer sur une frontière multi-octets (défaut F-217)"
+        );
+
+        // APRÈS (correctif char-safe) : pas de panic, marqueur de troncature visible.
+        let shown = truncate_ellipsis(&cause, 80);
+        assert!(
+            shown.ends_with('…'),
+            "le texte tronqué doit porter un marqueur visible, obtenu : {shown}"
+        );
+        assert_eq!(
+            shown.chars().count(),
+            81,
+            "80 caractères + le marqueur « … »"
+        );
+        // Le corps affiché est bien un préfixe (par caractères) de la cause.
+        let body: String = cause.chars().take(80).collect();
+        assert_eq!(shown, format!("{body}…"));
+    }
+
+    /// Une chaîne plus courte que la limite n'est ni tronquée ni marquée.
+    #[test]
+    fn truncate_ellipsis_leaves_short_strings_intact() {
+        let s = "max_retries atteint (4 / 3)";
+        assert_eq!(truncate_ellipsis(s, 80), s);
+        assert!(!truncate_ellipsis(s, 80).ends_with('…'));
+    }
 
     #[test]
     fn parse_older_than_valid_days() {

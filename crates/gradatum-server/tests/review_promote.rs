@@ -308,6 +308,9 @@ impl IndexStore for FailFindPromotableIndex {
     async fn total_body_size_bytes(&self, _vault_id: &str) -> Result<u64, GradatumError> {
         Ok(0)
     }
+    async fn last_indexed_at(&self, _vault_id: &str) -> Result<Option<i64>, GradatumError> {
+        Ok(None)
+    }
     async fn upsert_link(
         &self,
         _vault_id: &str,

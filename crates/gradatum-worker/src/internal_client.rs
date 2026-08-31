@@ -156,7 +156,7 @@ struct NoteListDto {
 /// Count returned by `GET /internal/v1/notes/count-unprocessed`.
 #[derive(Debug, serde::Deserialize)]
 struct CountDto {
-    /// Live non-processed notes in the locus (capped at the `min` query param).
+    /// Live non-processed notes in the section (capped at the `min` query param).
     count: u64,
 }
 
@@ -349,11 +349,12 @@ pub trait InternalClient: Send + Sync + 'static {
         vaults: &[String],
     ) -> Result<Vec<NoteIdDto>, InternalClientError>;
 
-    /// `GET /internal/v1/notes/count-unprocessed?vault=<v>&locus=<l>&min=<m>`
+    /// `GET /internal/v1/notes/count-unprocessed?vault=<v>&section=<s>&min=<m>`
     ///
-    /// Counts the `live`, non-`processed` notes of the locus, capped at `min` so the
-    /// server can exit early. Consumed by the conditional distill cron to measure
-    /// consolidation pressure per locus.
+    /// Counts the `live`, non-`processed` notes of the canonical **section**, capped at
+    /// `min` so the server can exit early. Consumed by the conditional distill cron to
+    /// measure consolidation pressure per section — the axis the cron thresholds on since
+    /// the `locus` column is `NULL` on the whole corpus.
     ///
     /// The default implementation is **fail-closed** (`Err`): only the concrete HTTP
     /// client overrides it, and test doubles that never call it inherit the default
@@ -366,13 +367,38 @@ pub trait InternalClient: Send + Sync + 'static {
     async fn count_unprocessed(
         &self,
         vault: &str,
-        locus: &str,
+        section: &str,
         min: u64,
     ) -> Result<u64, InternalClientError> {
-        let _ = (vault, locus, min);
+        let _ = (vault, section, min);
         Err(InternalClientError::ServerError {
             status: 501,
             body: "count_unprocessed not implemented by this InternalClient".to_string(),
+        })
+    }
+
+    /// `GET /internal/v1/notes/by-section?vault=<v>&section=<s>`
+    ///
+    /// Resolves a `JobScope::Section` scope for the distill handler: the notes of a
+    /// canonical section (`forgotten = 0`), in `(id, section)` form.
+    ///
+    /// The default implementation is **fail-closed** (`Err`): only the concrete HTTP
+    /// client overrides it, and test doubles that never call it inherit the default
+    /// without having to stub it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the concrete client's HTTP or parse error; the default implementation
+    /// always returns `InternalClientError::ServerError`.
+    async fn list_notes_by_section(
+        &self,
+        vault: &str,
+        section: &str,
+    ) -> Result<Vec<NoteIdDto>, InternalClientError> {
+        let _ = (vault, section);
+        Err(InternalClientError::ServerError {
+            status: 501,
+            body: "list_notes_by_section not implemented by this InternalClient".to_string(),
         })
     }
 
@@ -814,7 +840,7 @@ impl InternalClient for InternalPersistClient {
     async fn count_unprocessed(
         &self,
         vault: &str,
-        locus: &str,
+        section: &str,
         min: u64,
     ) -> Result<u64, InternalClientError> {
         let url = format!("{}/internal/v1/notes/count-unprocessed", self.base_url);
@@ -823,13 +849,30 @@ impl InternalClient for InternalPersistClient {
             .execute_with_retry(|| {
                 self.client.get(&url).query(&[
                     ("vault", vault),
-                    ("locus", locus),
+                    ("section", section),
                     ("min", min_str.as_str()),
                 ])
             })
             .await?;
-        let dto: CountDto = Self::parse_json(resp, locus).await?;
+        let dto: CountDto = Self::parse_json(resp, section).await?;
         Ok(dto.count)
+    }
+
+    async fn list_notes_by_section(
+        &self,
+        vault: &str,
+        section: &str,
+    ) -> Result<Vec<NoteIdDto>, InternalClientError> {
+        let url = format!("{}/internal/v1/notes/by-section", self.base_url);
+        let resp = self
+            .execute_with_retry(|| {
+                self.client
+                    .get(&url)
+                    .query(&[("vault", vault), ("section", section)])
+            })
+            .await?;
+        let dto: NoteListDto = Self::parse_json(resp, section).await?;
+        Ok(dto.note_ids)
     }
 
     async fn list_active_vaults(&self) -> Result<Vec<String>, InternalClientError> {

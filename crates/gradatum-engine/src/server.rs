@@ -125,7 +125,10 @@ impl EngineServer {
         let client = reqwest::Client::builder()
             .build()
             .expect("client reqwest de test");
-        let health = Arc::new(HealthState::new("test-model"));
+        let health = Arc::new(HealthState::new_with_telemetry(
+            "test-model",
+            crate::health::TelemetryStatus::Active,
+        ));
         health.set_ready();
         let state = AppState {
             proxy: ForwardProxy::new(client, child_base_url),
@@ -510,7 +513,10 @@ mod transparent_handler {
         child_port: u16,
     ) -> (Router, Arc<gradatum_core::event_sink::InMemorySink>) {
         let client = reqwest::Client::builder().build().unwrap();
-        let health = Arc::new(crate::health::HealthState::new("test-model"));
+        let health = Arc::new(crate::health::HealthState::new_with_telemetry(
+            "test-model",
+            crate::health::TelemetryStatus::Active,
+        ));
         health.set_ready();
         let sink = Arc::new(gradatum_core::event_sink::InMemorySink::default());
         let state = AppState {

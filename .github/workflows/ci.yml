@@ -207,11 +207,30 @@ jobs:
           bash scripts/ci-lint-toolchain-pin.sh
 
   # ─────────────────────────────────────────────────────────────────────────
+  # public-scripts-location — l'emplacement décide de l'appartenance (F-172)
+  # Ce job est le seul endroit où la règle est vérifiée SUR L'ARBRE PUBLIÉ, dans
+  # les conditions exactes d'un tiers qui clone : `.forgejo/` étant absent du
+  # snapshot, le gate y bascule de lui-même en mode « clone public » et traite
+  # tout fichier suivi comme surface publique. Il échoue si un script prescrit
+  # par une surface publique ne résout pas — c'est-à-dire si le dépôt publié
+  # promet une commande que personne ne peut exécuter.
+  # Bash + git uniquement : aucune toolchain, quelques secondes.
+  # ─────────────────────────────────────────────────────────────────────────
+  public-scripts-location:
+    name: public-scripts-location
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Emplacement des scripts vs prescriptions publiques
+        run: bash scripts/ci-public-scripts-location.sh
+
+  # ─────────────────────────────────────────────────────────────────────────
   # i18n-lint — gate anti-régression français (F-102) sur la surface distribuée
   # Voir le pendant Forgejo pour le raisonnement complet. En résumé : ce gate
   # n'était appelé nulle part, « non exécuté » n'est pas un PASS. Surface
   # `strings` bloquante ici ; surface `docs` (doc-comments docs.rs) enforced au
-  # niveau release par G5 de scripts/release-readiness-scan.sh, à basculer ici
+  # niveau release par G5 de scripts/internal/release-readiness-scan.sh, à basculer ici
   # (`--surface both`) une fois le polish rustdoc v1.0.0 atterri.
   # ─────────────────────────────────────────────────────────────────────────
   i18n-lint:
@@ -240,12 +259,12 @@ jobs:
   # celui du dernier maillon du pipe, et le gate rendrait un vert silencieux.
   # ─────────────────────────────────────────────────────────────────────────
   # mcp-catalog-parity — SKIPPÉ sur GitHub (Option A, 2026-08-04) : le job exécute
-  # `scripts/mcp-catalog-parity.sh`, absent du snapshot public (`scripts/` exclu) →
+  # `scripts/internal/mcp-catalog-parity.sh`, absent du snapshot public (`scripts/` exclu) →
   # exit 127 sur GitHub. S'exécute exclusivement sur le CI Forgejo
   # (`.forgejo/workflows/ci.yml`), qui reste la source de vérité des gates.
 
   # docs-consistency — SKIPPÉ sur GitHub (Option A, 2026-08-04) : le job exécute
-  # `scripts/docs-consistency-gate.sh`, absent du snapshot public (`scripts/` exclu)
+  # `scripts/internal/docs-consistency-gate.sh`, absent du snapshot public (`scripts/` exclu)
   # → exit 127 sur GitHub. S'exécute exclusivement sur le CI Forgejo
   # (`.forgejo/workflows/ci.yml`), qui reste la source de vérité des gates.
   # Raisonnement complet (ratio faussetés/corrections, anti-shallow fetch-depth:0) :

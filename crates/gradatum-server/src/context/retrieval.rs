@@ -1,8 +1,10 @@
-//! Retrieval RRF — récupération des candidats pour l'assemblage de contexte LLM.
+//! Retrieval — récupération des candidats pour l'assemblage de contexte LLM.
 //!
 //! Ce module implémente la couche de récupération du pipeline `vault_context` v0.7.0 :
-//! fusion BM25 + sémantique via RRF (Reciprocal Rank Fusion, k=60), avec dégradation
-//! gracieuse (BM25-only) en cas d'échec ou timeout de l'embed.
+//! fusion BM25 + sémantique via `rrf_fuse_short_circuit` (F-162 critère 6 + critère 10) —
+//! à bras unique, le score normalisé du bras qui répond fait foi ; à deux bras, la fusion
+//! pondérée sur scores normalisés remplace le RRF pur (la magnitude cesse d'être jetée).
+//! Dégradation gracieuse (BM25-only) en cas d'échec ou timeout de l'embed.
 //!
 //! ## Flux principal
 //!
@@ -25,7 +27,7 @@
 //!        │
 //!        └─── Noop ──► embed_fallback=true, sem=[]
 //!               │
-//!           rrf_fuse(k=60, limit=top_n)
+//!           rrf_fuse_short_circuit(k=60, limit=top_n)
 //!               │
 //!           RetrievalOutcome { candidates, query_embedding, embed_fallback, kind }
 //! ```
@@ -104,19 +106,20 @@ pub struct RetrievalOutcome {
 
 /// Récupère les candidats pertinents pour une requête dans un vault donné.
 ///
-/// Implements the RRF retrieval pipeline for the LLM context (since v0.7.0).
+/// Implements the (hybrid) retrieval pipeline for the LLM context (since v0.7.0).
 ///
 /// ## Algorithme (voir module-level doc pour le diagramme complet)
 ///
 /// 1. **ULID-direct (P1-4)** : si `query` est un ULID valide → `[ulid] ++ backlinks`,
-///    `kind=UlidDirect`, sans RRF ni embed.
+///    `kind=UlidDirect`, sans fusion ni embed.
 /// 2. **Sanitization FTS5 (P1-1)** : `build_fts_query(query)`. Vide → early return,
 ///    aucun appel FTS (évite les erreurs `parse error` FTS5 → pas de 500).
 /// 3. **BM25** : `search_fts_with_snippet(limit=top_n*2, section=None)` suivi d'un
 ///    filtre en mémoire si `sections=Some(set)` (C1 : invariant parité FTS).
 /// 4. **Sémantique (P2-3)** : embed borné par `embed_timeout_ms`. Timeout/erreur/Noop →
-///    `embed_fallback=true`, RRF dégradé en BM25-only. Pas de panique, pas de 500.
-/// 5. **Fusion RRF** : `rrf_fuse(k=60, limit=top_n)`.
+///    `embed_fallback=true`, fusion dégradée en BM25-only. Pas de panique, pas de 500.
+/// 5. **Fusion** : `rrf_fuse_short_circuit(k=60, limit=top_n)` — bras unique → score
+///    normalisé du bras ; deux bras → fusion pondérée sur scores normalisés (F-162).
 ///
 /// ## Multi-section filter (since v0.7.1)
 ///
@@ -320,11 +323,28 @@ pub async fn retrieve_candidates(
         vec![]
     };
 
-    // ── Fusion RRF (k=60) + cap top_n ─────────────────────────────────────────
+    // ── Fusion (k=60) + cap top_n ─────────────────────────────────────────────
     //
-    // `k=60` : constante standard (Cormack et al. 2009).
-    // Notes absentes d'un signal reçoivent le rang de pénalité `N+1`.
-    let fused = gradatum_search::rrf_fuse(&bm25_for_rrf, &sem_for_rrf, 60.0, top_n);
+    // `rrf_fuse_short_circuit` (F-162 critère 6 + critère 10) : à bras unique, le
+    // score normalisé du bras qui répond fait foi ; à deux bras, la fusion pondérée
+    // sur scores normalisés remplace le RRF pur — la magnitude cesse d'être jetée.
+    // La décision opérateur 2026-08-24 étend ce reweighting au chemin de contexte
+    // (pas seulement `vault_search`), pour l'embedder ACTIF.
+    //
+    // Le chemin BM25-only par configuration (embedder Noop) reste, lui, sur la fusion
+    // par rang pure `rrf_fuse` — rétrocompat bit-à-bit, à l'identique de la garde de
+    // `logic.rs` (`vault_search`, tests snapshot `salience_off` inchangés) : sous Noop,
+    // `sem_for_rrf` est toujours vide, le court-circuit rendrait `normalize_bm25(...)`
+    // (une magnitude sur l'échelle BM25) là où le contrat documenté exige le score de
+    // rang `1/(k+rank)`. Ce reweighting mal appliqué déplacerait le classement composite
+    // en aval (`select.rs`, `rrf_score` entrée pondérée de `composite_score_weighted`).
+    // `k=60` conservé pour compatibilité de signature ; sans effet dans les cas
+    // court-circuit/pondéré.
+    let fused = if state.embedder.backend_kind() != EmbedBackend::Noop {
+        gradatum_search::rrf_fuse_short_circuit(&bm25_for_rrf, &sem_for_rrf, 60.0, top_n)
+    } else {
+        gradatum_search::rrf_fuse(&bm25_for_rrf, &sem_for_rrf, 60.0, top_n)
+    };
     let candidates = fused
         .into_iter()
         .map(|h| Candidate {

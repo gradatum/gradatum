@@ -1,0 +1,18 @@
+[package]
+name = "gradatum-distill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Semantic distillation primitives: cosine clustering, cluster synthesis and distilled trust scoring"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+gradatum-core.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
