@@ -183,6 +183,7 @@ Gradatum is built in three chapters: **memory first, then agents, then the sover
 | **v0.7.6** | ✅ shipped | Memory intelligence layer: assembled context pipeline (BM25 + semantic + RRF + composite scoring), proactive recall (server-initiated + pull surface), session-window context efficiency, temporal search filters and decay scoring, agent identity injection via MCP, scheduled-task health observability, curated metrics timeseries with Studio charts, and deterministic distill validation gate. |
 | **v1.0.0** | ✅ shipped | First stable release. Multi-tenant / multi-vault isolation foundation, multi-user identity, per-note usage salience, reversible delete (on-demand delete archives the note, registry-driven retention GC, operator-only restore), FR→EN **user-facing** string migration complete (runtime literals, CLI, HTTP API) — internal rustdoc migration deferred to a `1.x` minor, SemVer strict from here. |
 | **v2.0.0** *(Alluvium)* | ✅ shipped | Identity is strictly credential-derived — no default identity, no client-declared `author`, no silent fallback — closing the `1.x` line. Vault storage on an S3-compatible object backend as an alternative to local filesystem, notes written in plaintext with no encryption applied by gradatum itself — see [SECURITY.md § Privacy posture](SECURITY.md#privacy-posture); the network-filesystem startup restriction is removed. Link-edge reconciliation (`gradatum-admin repair-note-links`), Docker deployment, workspace dependency refresh. |
+| **v2.1.0** | ✅ shipped | SemVer since v1.0.0, with documented exceptions. v2.1.0 is a minor release that removes public API surface in four crates (`gradatum-core`, `gradatum-engine`, `gradatum-index`, `gradatum-queue`); every removal is inventoried in the release manifest and matched against the previous release in CI. sqlx retired from the entire workspace dependency graph — replaced by rusqlite in the auth, ACL, and job-queue stores; SQLite engine `3.46.0` → `3.53.2`. Legacy `jobs_v2` queue path removed; `compute_distill_trust` moved to the new `gradatum-distill` crate. Read the [2.0.0 → 2.1.0 upgrade guide](docs/UPGRADING-2.0.0-to-2.1.0.md) before moving. |
 | — | ⬜ planned | Agent runtime — terminal agent that reasons over the codebase using the vault as its memory. No version is committed to it yet. |
 
 > **What the Status column means.** ✅ *shipped* = the milestone is complete in this repository
@@ -202,6 +203,17 @@ Gradatum is built in three chapters: **memory first, then agents, then the sover
 Condensed — the authoritative, detailed log for every version lives in
 **[CHANGELOG.md](CHANGELOG.md)**.
 
+- **v2.1.0** — SemVer since v1.0.0, with documented exceptions: this minor release removes
+  public API surface in four crates (`gradatum-core`, `gradatum-engine`, `gradatum-index`,
+  `gradatum-queue`), each removal inventoried in the release manifest and matched against the
+  previous release in CI. sqlx is retired from the entire workspace dependency graph —
+  replaced by rusqlite in `gradatum-auth`'s revocation store, `gradatum-acl-auth`'s API-key
+  store, and `gradatum-queue`'s job queue; SQLite engine bumped `3.46.0` → `3.53.2`. The legacy
+  `jobs_v2` queue path is removed (`GET /api/v1/jobs/:id`, `gradatum_queue::queue` module);
+  `compute_distill_trust` moves to the new `gradatum-distill` crate; `KindKind::Chore` /
+  `::Spike` are removed for good. `Section`, `HealthSnapshot`, and `DriftScanResult` are now
+  `#[non_exhaustive]`. **Breaking changes** — see
+  [docs/UPGRADING-2.0.0-to-2.1.0.md](docs/UPGRADING-2.0.0-to-2.1.0.md).
 - **v2.0.0** *(Alluvium)* — Identity is strictly credential-derived: no default identity, no
   client-declared `author`, no silent fallback. Vault storage on an S3-compatible object
   backend as an alternative to local filesystem — notes stay in plaintext, no encryption
@@ -219,7 +231,7 @@ Condensed — the authoritative, detailed log for every version lives in
   scoring); agent identity injection via MCP `initialize`; curated metrics timeseries with
   Studio charts; deterministic distill quality gate.
 
-See [CHANGELOG.md](CHANGELOG.md) `[2.0.0]`, `[1.0.0]`, `[0.7.6]` for the full field-by-field
+See [CHANGELOG.md](CHANGELOG.md) `[2.1.0]`, `[2.0.0]`, `[1.0.0]`, `[0.7.6]` for the full field-by-field
 detail, including every breaking change and deprecation.
 
 ---
