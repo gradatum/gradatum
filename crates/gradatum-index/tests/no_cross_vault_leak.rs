@@ -828,3 +828,113 @@ async fn ann_insert_collision_cross_vault() {
         "le vecteur exclusif de `vault-b` reste visible dans sa propre partition (ULID {only_b})"
     );
 }
+
+/// `notes_fts` upsert EN PLACE (v1 → v2) EN RÉGIME MULTI-TENANT — pendant cross-vault de
+/// `upsert_in_place_leaves_no_stale_fts_postings` (unit test `src/sqlite.rs`).
+///
+/// Chaque suite `*_no_cross_vault_leak` ne sème qu'UNE fois par couple `(vault, clé)` : le
+/// chemin `old_fts = Some(...)` du correctif FTS5 (capture des anciennes valeurs avant
+/// réécriture + commande `'delete'` + réinsertion) n'était donc exercé par AUCUN test en
+/// contexte multi-vault. Ici, sur DEUX vaults au MÊME ULID collisionné, on applique un
+/// upsert v1 puis un upsert v2 EN PLACE (`ON CONFLICT(vault_id, id) DO UPDATE`, rowid
+/// stable) sur chacun, avec des tokens identifiables par `(vault, version)` — une fuite ou
+/// un posting périmé est ainsi RECONNAISSABLE, pas seulement détectable.
+///
+/// Propriétés prouvées :
+/// 1. **Pas de posting périmé** — le token v1 de chaque vault ne rend plus AUCUN hit après
+///    v2. C'est l'assertion DISCRIMINANTE : sur le code d'avant le correctif, l'ancien
+///    posting v1 reste orphelin dans l'index → le token v1 rend encore un hit.
+/// 2. **Index fonctionnel** — le token v2 de chaque vault reste indexé dans SON vault.
+/// 3. **Pas de fuite** — le token v2 du vault A ne se résout jamais depuis le vault B, et
+///    réciproquement (scoping `(id, vault_id)`, C4-1d).
+/// 4. **Pas de corruption** — aucune requête ne lève « database disk image is malformed » ;
+///    `search_fts_scored` appelle `bm25(notes_fts)`, qui trébuche sur un index incohérent.
+///    Chaque `.expect()` sur un appel `search_fts_scored` est donc aussi une garde anti-corruption.
+#[tokio::test]
+async fn upsert_in_place_cross_vault_leaves_no_stale_fts_postings() {
+    let idx = two_vault_index().await;
+
+    // Clé de collision : même ULID dérivé dans les deux vaults.
+    let key = "xvault-stale-fts";
+    let ulid = colliding_note_id(key).to_string();
+
+    // Tokens purement alphabétiques (un seul token FTS5 chacun), distincts par
+    // `(vault, version)` pour rendre toute fuite/persistance identifiable.
+    let main_v1 = "mainvuno";
+    let main_v2 = "mainvdos";
+    let vault_b_v1 = "vaultbvuno";
+    let vault_b_v2 = "vaultbvdos";
+
+    // Sur CHAQUE vault : upsert v1 puis upsert v2 EN PLACE (2e appel = même `(vault, clé)`
+    // → `ON CONFLICT DO UPDATE`, rowid conservé → chemin `old_fts = Some(...)`).
+    seed_colliding_note(&idx, VAULT_MAIN, key, main_v1).await;
+    seed_colliding_note(&idx, VAULT_MAIN, key, main_v2).await;
+    seed_colliding_note(&idx, VAULT_B, key, vault_b_v1).await;
+    seed_colliding_note(&idx, VAULT_B, key, vault_b_v2).await;
+
+    // ── 1. Aucun posting périmé (DISCRIMINANT) — token v1 injoignable après v2 ──
+    let main_v1_hits = idx
+        .search_fts_scored(&VaultId::new(VAULT_MAIN), main_v1, 16, true)
+        .await
+        .expect("search token main-v1 (jamais 'database disk image is malformed')");
+    assert!(
+        !main_v1_hits
+            .iter()
+            .any(|(nid, _, _)| nid.to_string() == ulid),
+        "token v1 de `main` encore indexé après v2 → posting FTS périmé (ULID {ulid})"
+    );
+    let vault_b_v1_hits = idx
+        .search_fts_scored(&VaultId::new(VAULT_B), vault_b_v1, 16, true)
+        .await
+        .expect("search token vault-b-v1 (jamais 'database disk image is malformed')");
+    assert!(
+        !vault_b_v1_hits
+            .iter()
+            .any(|(nid, _, _)| nid.to_string() == ulid),
+        "token v1 de `vault-b` encore indexé après v2 → posting FTS périmé (ULID {ulid})"
+    );
+
+    // ── 2. L'index reste fonctionnel — le token v2 se résout dans SON vault ──
+    let main_v2_hits = idx
+        .search_fts_scored(&VaultId::new(VAULT_MAIN), main_v2, 16, true)
+        .await
+        .expect("search token main-v2");
+    assert!(
+        main_v2_hits
+            .iter()
+            .any(|(nid, _, _)| nid.to_string() == ulid),
+        "token v2 de `main` doit être indexé dans `main` (ULID {ulid})"
+    );
+    let vault_b_v2_hits = idx
+        .search_fts_scored(&VaultId::new(VAULT_B), vault_b_v2, 16, true)
+        .await
+        .expect("search token vault-b-v2");
+    assert!(
+        vault_b_v2_hits
+            .iter()
+            .any(|(nid, _, _)| nid.to_string() == ulid),
+        "token v2 de `vault-b` doit être indexé dans `vault-b` (ULID {ulid})"
+    );
+
+    // ── 3. Aucune fuite cross-vault du token v2 ──
+    let cross_main_to_b = idx
+        .search_fts_scored(&VaultId::new(VAULT_B), main_v2, 16, true)
+        .await
+        .expect("search token main-v2 depuis vault-b");
+    assert!(
+        !cross_main_to_b
+            .iter()
+            .any(|(nid, _, _)| nid.to_string() == ulid),
+        "token v2 de `main` ne doit JAMAIS être résolu depuis `vault-b` (ULID {ulid})"
+    );
+    let cross_b_to_main = idx
+        .search_fts_scored(&VaultId::new(VAULT_MAIN), vault_b_v2, 16, true)
+        .await
+        .expect("search token vault-b-v2 depuis main");
+    assert!(
+        !cross_b_to_main
+            .iter()
+            .any(|(nid, _, _)| nid.to_string() == ulid),
+        "token v2 de `vault-b` ne doit JAMAIS être résolu depuis `main` (ULID {ulid})"
+    );
+}

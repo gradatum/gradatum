@@ -12,6 +12,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > file, the public release that carried its changes forward. That mapping follows the document's
 > order, not a change-by-change diff — see the `[2.0.0]` note below for a case worked out in full.
 
+## [2.1.1] — 2026-09-01
+
+### Fixed — `upsert_note` laissait des postings FTS périmés, la recherche levait `SQLITE_CORRUPT` (F-267)
+
+- **`notes_fts` (FTS5 external-content, `content=notes`, sans trigger) laissait des
+  postings périmés après une mise à jour de note.** `SqliteIndex::upsert_note` réécrivait
+  `notes.body_text` **puis** exécutait `INSERT OR REPLACE INTO notes_fts` : le retrait
+  implicite de postings relisait le **nouveau** contenu et laissait orphelins ceux de
+  l'**ancien**, jusqu'à ce que `snippet()` lise une position inexistante dans le corps
+  courant — `SQLITE_CORRUPT` (« database disk image is malformed »), rendu au client en
+  `internal error`. Le même défaut existait sur `write_note_derived_batch` (branche
+  `ON CONFLICT DO UPDATE`).
+- **Correction, sur les deux chemins** : figer les anciennes valeurs (`rowid`, `body_text`,
+  `tags`) avant toute mutation, émettre
+  `INSERT INTO notes_fts(notes_fts, rowid, body_text, tags) VALUES('delete', …)`, puis
+  insérer les nouveaux postings — le patron documenté de synchronisation FTS5
+  external-content (celui d'un trigger `AFTER UPDATE`), désormais indépendant de l'ordre
+  des statements vis-à-vis de la réécriture de `notes`. Prouvé par
+  `upsert_in_place_leaves_no_stale_fts_postings` : le token de l'ancienne version ne rend
+  plus jamais de posting ni de `snippet()` corrompu.
+- **Impact mesuré sur l'instance de référence (2026-09-01)** : 3,6 % des documents
+  portaient au moins un posting périmé, dont 66 % concentrés dans une même section —
+  une seule ligne corrompue dans le top-N suffisait à faire échouer l'appel entier.
+- ⚠️ **2.1.1 empêche la corruption future, il ne répare pas l'existante.** Un index créé ou
+  mis à jour avant 2.1.1 peut porter des postings périmés ; le symptôme est un **échec de
+  recherche**, jamais une perte de données — le corps des notes en base n'est pas altéré.
+  Réparation (services arrêtés, backup fait au préalable) :
+  ```sql
+  INSERT INTO notes_fts(notes_fts) VALUES('rebuild');
+  ```
+- ⚠️ **Quatre contrôles usuels rendent VERT sur un index pourtant corrompu** : la
+  comparaison `count(notes)` / `count(notes_fts_docsize)`, `PRAGMA integrity_check`,
+  `PRAGMA quick_check`, et `INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')`
+  **sans** `rank`. Seule la forme rangée détecte cette classe de corruption :
+  ```sql
+  INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1);
+  ```
+  Un utilisateur qui se fie à l'un des quatre premiers contrôles conclut à tort que son
+  index est sain.
+- **Garde interne ajoutée, aucune API publique nouvelle** : `SqliteIndex::fts_integrity_check`
+  (`pub(crate)`) exécute la forme rangée ci-dessus et rend un verdict de contenu —
+  `Ok(true)`/`Ok(false)`, distinct d'une panne de la vérification elle-même (`Err`). Prouvé
+  par `fts_integrity_check_detects_stale_postings` : VERT sur index sain, ROUGE dès qu'un
+  posting périmé subsiste, y compris sur la reproduction en SQL brut de l'ancien défaut.
+  2.1.1 reste un correctif — aucun symbole public ajouté.
+- **`SqliteIndex::upsert_note` est désormais transactionnel.** Ses quatre statements
+  (snapshot des anciens postings, `INSERT`/`UPDATE` `notes`, `'delete'` FTS, `INSERT` FTS)
+  tournaient auparavant en autocommit, alors que `write_note_derived_batch` était déjà
+  enveloppé dans `BEGIN IMMEDIATE` + COMMIT/ROLLBACK — l'asymétrie était l'oubli. Si un
+  statement FTS échouait **après** que `notes.body_text` portait déjà la nouvelle version,
+  un retry relisait cette nouvelle version et émettait un retrait FTS contre des postings
+  qui n'existent plus — le même sous-flux FTS5, « results undefined », que ce correctif
+  traite par ailleurs. Reprend le patron du chemin batch (`BEGIN IMMEDIATE` +
+  COMMIT/ROLLBACK), sans changer signatures, sémantique d'erreur ni ordre des statements.
+  Prouvé par `upsert_note_rolls_back_fts_failure_and_retry_stays_consistent` : échoue
+  transaction neutralisée, passe transaction en place.
+
 ## [2.1.0] — 2026-08-29
 
 > Cette section liste les changements de comportement mesurés sur ce jalon. À l'exception des cartes

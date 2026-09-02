@@ -165,8 +165,11 @@ pub(crate) fn locus_for_section(tenant_id: &str, section: Option<&str>) -> Strin
 /// - `req_author` `None` + `subject` `None` → **REFUS** : aucune identité résolue, jamais une
 ///   note sans auteur (R2, fail-closed).
 ///
-/// **Locus unique du refus** : cette fonction a un seul appelant de production
-/// ([`vault_write_impl`], qui propage l'erreur) — la garde vit ici et nulle part ailleurs.
+/// **Locus unique du refus** : la garde vit ici et nulle part ailleurs. Deux appelants
+/// de production la traversent — [`vault_write_impl`] (propage l'erreur via `?`) et le
+/// handler de capture (`capture.rs`, mappe l'erreur en statut HTTP) — et **tous deux sont
+/// fail-closed sur l'identité du credential** : ils passent `req_author = None` en dur et
+/// n'obtiennent un author que du sujet authentifié.
 ///
 /// # Errors
 ///

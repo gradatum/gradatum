@@ -4,7 +4,7 @@
 //!
 //! ## Stability
 //!
-//! `2.0.0` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
+//! `2.1.1` — public API under [SemVer 2.0.0](https://semver.org): backward-compatible
 //! additions only within `2.x`, breaking changes deferred to the next major. Traits still
 //! tagged `#[stability::unstable]` or `#[stability::experimental]` carry a finer-grained
 //! tier per RELEASE-POLICY.md AM1.

@@ -3708,6 +3708,13 @@ impl SqliteIndex {
     /// `ON CONFLICT(id) DO UPDATE`: atomic upsert on the ULID primary key.
     /// FTS5: `notes_fts` uses `content=notes` — `INSERT OR REPLACE` keeps
     /// `rowid ↔ body_text/tags` consistent on updates.
+    ///
+    /// ## Atomicity
+    ///
+    /// The `notes` write and the `notes_fts` posting maintenance run inside a single
+    /// `BEGIN IMMEDIATE` transaction (parity with [`Self::write_note_derived_batch`]).
+    /// On any error the whole set rolls back, so a later retry sees a consistent index
+    /// instead of a half-updated one that would corrupt FTS5.
     pub async fn upsert_note(&self, note: &Note) -> Result<(), GradatumError> {
         let conn = self.conn.lock().await;
 
@@ -3797,7 +3804,46 @@ impl SqliteIndex {
             .and_then(gradatum_core::provenance::trust_for)
             .unwrap_or(0.50) as f64;
 
-        conn.execute(
+        // ── Transaction atomique (parité write_note_derived_batch) ───────────────
+        // Les statements SQL ci-dessous (snapshot old_fts, INSERT/UPDATE `notes`,
+        // 'delete' FTS, INSERT FTS) forment UNE écriture indivisible. En autocommit,
+        // l'échec du dernier INSERT (disque plein, I/O) APRÈS le commit du 'delete'
+        // laisserait `notes` en v2 et `notes_fts` sans posting → un retry relit v2,
+        // émet un 'delete' contre des postings inexistants → sous-flux FTS5
+        // (« results undefined »/SQLITE_CORRUPT). Une transaction rend l'ensemble
+        // tout-ou-rien : sur échec, ROLLBACK restaure l'état v1 et un retry réussit.
+        // Patron repris de `write_note_derived_batch` (BEGIN IMMEDIATE + closure +
+        // COMMIT/ROLLBACK) plutôt qu'un patron neuf : parité de comportement, DRY.
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| GradatumError::Storage(format!("upsert_note BEGIN: {e}")))?;
+
+        let result = (|| -> Result<(), GradatumError> {
+            // ── FTS5 (content=notes) — capture des ANCIENS postings AVANT réécriture ──
+            // `notes_fts` est une table FTS5 external-content, SANS trigger : la synchro est
+            // manuelle. Piège : sur une table external-content, tout retrait de postings
+            // (DELETE explicite OU implicite via `INSERT OR REPLACE`) relit `notes` pour savoir
+            // quels tokens décrémenter. L'ancien code retirait APRÈS la réécriture de
+            // `notes.body_text` : FTS retirait les postings du NOUVEAU texte et laissait
+            // ORPHELINS ceux de l'ancien → accumulation de postings périmés → `snippet()` lit
+            // une position inexistante → SQLITE_CORRUPT (« database disk image is malformed »).
+            //
+            // Parade = contrat FTS5 documenté (patron du trigger `AFTER UPDATE`) : figer les
+            // ANCIENNES valeurs (rowid + body_text + tags exactement comme indexées) AVANT toute
+            // mutation, puis émettre la commande spéciale `'delete'` avec ces valeurs. La
+            // correction est alors INDÉPENDANTE de l'ordre des statements relativement à la
+            // réécriture de `notes` — c'est cette dépendance d'ordre qui était la cause racine.
+            // `COALESCE(tags,'')` reconstruit exactement la valeur insérée à l'origine (`tags_str`,
+            // `""` quand vide alors que `notes.tags` vaut NULL) → aucun « results undefined ».
+            let old_fts: Option<(i64, String, String)> = conn
+            .query_row(
+                "SELECT rowid, body_text, COALESCE(tags, '') FROM notes WHERE id = ?1 AND vault_id = ?2",
+                rusqlite::params![id_str, vault_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| GradatumError::Storage(format!("upsert_note old FTS snapshot : {e}")))?;
+
+            conn.execute(
             "INSERT INTO notes (
                 id, vault_id, locus, section, status, schema_version,
                 author_kind, author_id, author_display_name,
@@ -3882,20 +3928,98 @@ impl SqliteIndex {
         )
         .map_err(|e| GradatumError::Storage(format!("INSERT notes : {e}")))?;
 
-        // Maintien FTS5 : INSERT OR REPLACE synchronise rowid + body_text + tags.
-        // `content=notes` exige que rowid FTS = rowid de la table notes (même entier).
-        // C4-1d (P1 security review) : le rowid est résolu par `(id, vault_id)` — avec la PK
-        // composite chaque vault a sa propre ligne/rowid, donc son entrée FTS. Un `WHERE id=?`
-        // seul renverrait le rowid d'un AUTRE vault en collision d'ULID → clobber cross-vault.
-        // Réutilise `tags_str` déjà calculé pour notes.tags (migration 0003) — pas de duplication.
-        conn.execute(
-            "INSERT OR REPLACE INTO notes_fts (rowid, body_text, tags)
+            // Maintien FTS5 (suite du contrat external-content amorcé plus haut) :
+            // 1. Retrait des ANCIENS postings via `'delete'` + valeurs figées avant réécriture.
+            //    Sauté quand la note est neuve (aucun ancien posting à retirer).
+            if let Some((old_rowid, old_body, old_tags)) = old_fts {
+                conn.execute(
+                "INSERT INTO notes_fts(notes_fts, rowid, body_text, tags) VALUES('delete', ?1, ?2, ?3)",
+                rusqlite::params![old_rowid, old_body, old_tags],
+            )
+            .map_err(|e| GradatumError::Storage(format!("notes_fts delete old postings : {e}")))?;
+            }
+            // 2. Insertion des NOUVEAUX postings. `content=notes` exige rowid FTS = rowid notes.
+            //    C4-1d (P1 security review) : rowid résolu par `(id, vault_id)` — PK composite,
+            //    une ligne/rowid par vault ; un `WHERE id=?` seul renverrait le rowid d'un AUTRE
+            //    vault en collision d'ULID → clobber cross-vault.
+            //    Réutilise `tags_str` déjà calculé pour notes.tags (migration 0003).
+            conn.execute(
+                "INSERT INTO notes_fts (rowid, body_text, tags)
              VALUES ((SELECT rowid FROM notes WHERE id = ?1 AND vault_id = ?4), ?2, ?3)",
-            rusqlite::params![id_str, note.body.markdown.as_str(), tags_str, vault_id],
-        )
-        .map_err(|e| GradatumError::Storage(format!("INSERT notes_fts : {e}")))?;
+                rusqlite::params![id_str, note.body.markdown.as_str(), tags_str, vault_id],
+            )
+            .map_err(|e| GradatumError::Storage(format!("INSERT notes_fts : {e}")))?;
 
-        Ok(())
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| GradatumError::Storage(format!("upsert_note COMMIT: {e}")))?;
+                Ok(())
+            }
+            Err(e) => {
+                // Rollback best-effort — ignorer toute erreur de rollback (parité
+                // write_note_derived_batch). Restaure l'état v1 : le retry réussira.
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Verifies that the `notes_fts` external-content index is consistent with the
+    /// `notes` content table — a **content-level** integrity guard, not a row-count one.
+    ///
+    /// Runs the FTS5-native `'integrity-check'` command with `rank = 1`, which re-derives
+    /// the tokens from the *current* `notes` contents and compares them, posting by posting,
+    /// against what the index actually stores. It therefore catches STALE POSTINGS left in
+    /// place by a faulty in-place update (the corruption class fixed in
+    /// [`Self::upsert_note`]) — the precise failure that
+    /// `count(notes) == count(notes_fts_docsize)` row counts,
+    /// `PRAGMA integrity_check`, `PRAGMA quick_check`, and the argument-less
+    /// `'integrity-check'` all report as GREEN (empirically confirmed on the
+    /// `2026-06-22` corruption backup: 12588 == 12588 rows, `quick_check` = `ok`,
+    /// yet `rank = 1` returns `SQLITE_CORRUPT_VTAB`).
+    ///
+    /// ## Return contract (supervision-friendly)
+    ///
+    /// - `Ok(true)`  : index and content are consistent.
+    /// - `Ok(false)` : the index diverges from the content — a valid NEGATIVE verdict a
+    ///   health check can surface, **not** an operational error. Mapped from
+    ///   `SQLITE_CORRUPT`/`SQLITE_CORRUPT_VTAB`, the only outcome this command uses to
+    ///   report a content mismatch.
+    /// - `Err(_)`    : the check itself could not run (locking, I/O, …) — distinct from a
+    ///   negative verdict so supervision never conflates "index is bad" with "probe failed".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradatumError::Storage`] if the check could not be executed (any SQLite
+    /// error other than a corruption verdict).
+    // Consommée uniquement par les tests du crate aujourd'hui : en `pub(crate)` sans
+    // appelant hors `#[cfg(test)]`, la cible lib (compilée sans `cfg(test)`) déclenche
+    // `dead_code`. `#[expect(dead_code)]` serait un no-op sous la cible test — où la fn
+    // EST utilisée — et lèverait `unfulfilled_lint_expectations` : `allow` est le seul
+    // outil robuste aux deux configs de cible. F-268 ajoutera un consommateur cross-crate
+    // et la repromouvra en `pub` (retirer cet `allow` à ce moment-là).
+    #[allow(dead_code)]
+    #[must_use = "an FTS integrity verdict must be acted upon by the caller"]
+    pub(crate) async fn fts_integrity_check(&self) -> Result<bool, GradatumError> {
+        let conn = self.conn.lock().await;
+        match conn.execute(
+            "INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)",
+            [],
+        ) {
+            Ok(_) => Ok(true),
+            // SQLITE_CORRUPT (primary 11) / SQLITE_CORRUPT_VTAB (extended 779) → mismatch
+            // index↔contenu. C'est le verdict NÉGATIF attendu du garde, pas une panne.
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseCorrupt =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(GradatumError::Storage(format!("fts_integrity_check : {e}"))),
+        }
     }
 
     /// Back-fills `role_kind` / `role_status` on the project-map cards that predate the
@@ -5708,6 +5832,27 @@ impl SqliteIndex {
                     }
                     None => None,
                 };
+
+                // FTS5 (content=notes) — même contrat 'delete' que `upsert_note` : sur le
+                // chemin `ON CONFLICT DO UPDATE` (note déjà présente, rowid stable), le
+                // `body_text` de `notes` est réécrit ci-dessous ; retirer les postings APRÈS
+                // relirait le NOUVEAU texte et laisserait orphelins ceux de l'ancien. On fige
+                // donc les anciennes valeurs AVANT la réécriture. `None` (note neuve) → aucun
+                // retrait. `COALESCE(tags,'')` reconstruit la valeur exactement indexée.
+                let old_fts: Option<(i64, String, String)> = conn
+                    .query_row(
+                        "SELECT rowid, body_text, COALESCE(tags, '') FROM notes WHERE id = ?1 AND vault_id = ?2",
+                        rusqlite::params![note.id.to_string(), vault_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|e| {
+                        GradatumError::Storage(format!(
+                            "write_note_derived_batch old FTS snapshot {}: {e}",
+                            note.id
+                        ))
+                    })?;
+
                 conn.execute(
                     "INSERT INTO notes (
                         id, vault_id, locus, section, status, schema_version,
@@ -5730,14 +5875,26 @@ impl SqliteIndex {
                 )
                 .map_err(|e| GradatumError::Storage(format!("write_note_derived_batch insert note {}: {e}", note.id)))?;
 
-                // Synchroniser FTS5 (content=notes).
-                // INSERT OR REPLACE garantit l'idempotence : si la note existait déjà
-                // (ON CONFLICT DO UPDATE laisse le rowid intact), le REPLACE écrase l'ancienne
-                // entrée FTS plutôt que de créer un doublon (invariant §4.2 — 0 doublons FTS).
+                // Synchroniser FTS5 (content=notes) — retrait des anciens postings puis
+                // insertion des nouveaux. Retrait sauté si la note est neuve (`old_fts` None).
+                // Retirer avec les valeurs figées avant réécriture évite les postings
+                // orphelins du chemin `ON CONFLICT DO UPDATE` (parité `upsert_note`).
+                if let Some((old_rowid, old_body, old_tags)) = old_fts {
+                    conn.execute(
+                        "INSERT INTO notes_fts(notes_fts, rowid, body_text, tags) VALUES('delete', ?1, ?2, ?3)",
+                        rusqlite::params![old_rowid, old_body, old_tags],
+                    )
+                    .map_err(|e| {
+                        GradatumError::Storage(format!(
+                            "write_note_derived_batch fts delete old {}: {e}",
+                            note.id
+                        ))
+                    })?;
+                }
                 // C4-1d : rowid résolu par `(id, vault_id)` — parité avec la sync FTS de
                 // `write_note`, la PK composite donnant une ligne/rowid par vault.
                 conn.execute(
-                    "INSERT OR REPLACE INTO notes_fts (rowid, body_text, tags)
+                    "INSERT INTO notes_fts (rowid, body_text, tags)
                      SELECT rowid, body_text, tags FROM notes WHERE id = ?1 AND vault_id = ?2",
                     rusqlite::params![note.id.to_string(), vault_id],
                 )
@@ -10141,6 +10298,153 @@ mod locus_preservation_tests {
             Some("decisions"),
             "vrai changement de contenu doit APPLIQUER le locus du frontmatter (P1-1)"
         );
+    }
+
+    // ── Régression FTS5 external-content (postings périmés en place) ──────────
+
+    /// P0 : un upsert EN PLACE (v1 → v2) ne doit JAMAIS laisser de postings périmés
+    /// dans `notes_fts`. Un token présent SEULEMENT en v1 doit rendre 0 résultat,
+    /// jamais « database disk image is malformed ».
+    ///
+    /// Cause racine : `notes_fts` est une table FTS5 external-content ; le retrait de
+    /// postings relit `notes`. L'ancien `INSERT OR REPLACE` APRÈS réécriture de
+    /// `notes.body_text` retirait les postings du NOUVEAU texte et laissait orphelins
+    /// ceux de l'ancien. Ce test ÉCHOUE sur le code d'avant le correctif (le token v1
+    /// reste indexé → `v1_hits == 1`) et PASSE après (`'delete'` avec valeurs figées).
+    #[tokio::test]
+    async fn upsert_in_place_leaves_no_stale_fts_postings() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let id = NoteId::new();
+
+        idx.upsert_note(&make_note(id, None, "le renardv1uniq brun saute"))
+            .await
+            .expect("upsert v1");
+        idx.upsert_note(&make_note(id, None, "le chatv2uniq noir dort"))
+            .await
+            .expect("upsert v2");
+
+        let conn = idx.conn.lock().await;
+
+        // Token seulement-v1 : plus aucun posting (0 orphelin).
+        let v1_hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM notes_fts WHERE notes_fts MATCH 'renardv1uniq'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("MATCH token v1 ne doit pas rendre 'malformed'");
+        assert_eq!(
+            v1_hits, 0,
+            "token v1 encore indexé → posting FTS périmé (corruption)"
+        );
+
+        // Token v2 : l'index reste fonctionnel.
+        let v2_hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM notes_fts WHERE notes_fts MATCH 'chatv2uniq'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("MATCH token v2");
+        assert_eq!(v2_hits, 1, "token v2 doit être indexé");
+
+        // snippet() sur un token v1 retiré : jamais 'malformed', 0 ligne attendue.
+        let mut stmt = conn
+            .prepare(
+                "SELECT snippet(notes_fts, 0, '»', '«', '...', 8) \
+                 FROM notes_fts WHERE notes_fts MATCH 'renardv1uniq'",
+            )
+            .expect("prepare snippet");
+        let snips: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .expect("snippet() ne doit pas rendre 'database disk image is malformed'")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect snippet");
+        assert!(snips.is_empty(), "aucun snippet pour un token v1 retiré");
+    }
+
+    /// La garde `fts_integrity_check` rend un verdict de CONTENU : VERT sur un index
+    /// sain, ROUGE dès qu'un posting périmé subsiste — exactement le défaut que les
+    /// comptes de lignes, `PRAGMA quick_check` et l'`integrity-check` natif sans `rank`
+    /// ratent (tous VERTS sur la base corrompue du 2026-06-22). On prouve le ROUGE en
+    /// reproduisant l'ancien défaut (INSERT OR REPLACE après réécriture) en SQL brut.
+    #[tokio::test]
+    async fn fts_integrity_check_detects_stale_postings() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let id = NoteId::new();
+
+        idx.upsert_note(&make_note(id, None, "contenu sain alpha"))
+            .await
+            .expect("upsert");
+        assert!(
+            idx.fts_integrity_check()
+                .await
+                .expect("integrity check sain"),
+            "index sain (chemin corrigé) doit être VERT"
+        );
+
+        // Reproduire le défaut : réécrire notes.body_text PUIS INSERT OR REPLACE
+        // (relit le NOUVEAU texte → laisse orphelins les postings de l'ancien).
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute(
+                "UPDATE notes SET body_text = 'contenu mute beta' WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+            )
+            .expect("mutate body");
+            conn.execute(
+                "INSERT OR REPLACE INTO notes_fts (rowid, body_text, tags)
+                 VALUES ((SELECT rowid FROM notes WHERE id = ?1), 'contenu mute beta', '')",
+                rusqlite::params![id.to_string()],
+            )
+            .expect("resync bogué (reproduction du défaut)");
+        }
+
+        assert!(
+            !idx.fts_integrity_check()
+                .await
+                .expect("integrity check s'exécute (verdict, pas panne)"),
+            "postings périmés → la garde doit rendre ROUGE (Ok(false))"
+        );
+    }
+
+    /// Symétrique côté SUPPRESSION : la dette P2 du 2026-06-22 (postings orphelins
+    /// après delete) est FONCTIONNELLEMENT close par l'ordre actuel (DELETE `notes_fts`
+    /// pendant que `notes` porte encore le contenu, PUIS DELETE `notes`). Ce test PASSE
+    /// sur le code actuel — il PROUVE la clôture de la dette et sert de garde
+    /// anti-régression : un token de la note supprimée ne doit plus matcher et la garde
+    /// d'intégrité doit rester VERTE.
+    #[tokio::test]
+    async fn delete_note_leaves_no_stale_fts_postings() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let id = NoteId::new();
+
+        idx.upsert_note(&make_note(id, None, "note ephemere gammauniq"))
+            .await
+            .expect("upsert");
+
+        let deleted = idx
+            .delete_note_from_index("main", &id.to_string())
+            .await
+            .expect("delete");
+        assert!(deleted, "la note existait → supprimée");
+
+        assert!(
+            idx.fts_integrity_check()
+                .await
+                .expect("integrity check après delete"),
+            "après delete l'index doit rester cohérent (dette juin close par l'ordre)"
+        );
+
+        let conn = idx.conn.lock().await;
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM notes_fts WHERE notes_fts MATCH 'gammauniq'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("MATCH token supprimé");
+        assert_eq!(hits, 0, "aucun posting résiduel après suppression");
     }
 }
 
@@ -14613,6 +14917,135 @@ mod role_columns_tests {
             .await,
             1,
             "apply écrit la ligne typable après le dry-run"
+        );
+    }
+}
+
+#[cfg(test)]
+mod upsert_transaction_atomicity_tests {
+    use super::*;
+    use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
+    use gradatum_core::identity::{ContentHash, NoteId, NoteVersion};
+    use gradatum_core::note::{Note, NoteBody};
+    use gradatum_core::scope::VaultId;
+    use gradatum_core::section::Section;
+    use gradatum_core::status::NoteStatus;
+
+    /// Note minimale valide pour ce test (miroir de `tests/common::make_note_with_id`,
+    /// inaccessible depuis le module `#[cfg(test)]` in-crate).
+    fn note_with_body(id: NoteId, vault: &str, body: &str) -> Note {
+        let frontmatter = Frontmatter {
+            schema_version: 1,
+            vault_id: VaultId::new(vault),
+            locus: None,
+            section: Section::Reference,
+            status: NoteStatus::Live,
+            status_reason: None,
+            status_changed: None,
+            tags: Default::default(),
+            author: None,
+            created: chrono::Utc::now(),
+            updated: None,
+            extra: ExtraFields::empty(),
+            provenance: None,
+            forgotten: None,
+            forgotten_at: None,
+            forgotten_by: None,
+        };
+        let content_hash = ContentHash::compute(&frontmatter, body);
+        Note {
+            id,
+            frontmatter,
+            body: NoteBody {
+                markdown: body.to_string(),
+            },
+            version: NoteVersion::initial(),
+            content_hash,
+            integrity_signature: None,
+        }
+    }
+
+    /// Régression G10 : `upsert_note` DOIT être transactionnel, à parité avec
+    /// `write_note_derived_batch`.
+    ///
+    /// On force l'échec d'un statement FTS APRÈS que `notes` a été réécrit en v2 — en
+    /// renommant `notes_fts` hors de portée le temps d'un seul appel. `INSERT notes`
+    /// (external-content FTS5 SANS trigger : cf. migration 0001) réussit ; le premier
+    /// statement FTS échoue ensuite (table absente). On restaure `notes_fts`, puis on
+    /// ré-essaie le MÊME upsert.
+    ///
+    /// - Sans transaction : `notes` reste committé en v2 alors que les postings FTS
+    ///   n'ont pas suivi ; le retry relit v2, émet un `'delete'` FTS contre des postings
+    ///   qui ne correspondent plus → sous-flux FTS5 → `fts_integrity_check` FAUX.
+    /// - Avec transaction : l'échec déclenche un ROLLBACK qui ramène `notes` en v1 ; le
+    ///   retry repart d'un état sain et laisse l'index cohérent (VERT).
+    #[tokio::test]
+    async fn upsert_note_rolls_back_fts_failure_and_retry_stays_consistent() {
+        let idx = SqliteIndex::open_in_memory()
+            .await
+            .expect("open_in_memory ne doit pas échouer");
+        let id = NoteId::new();
+        let vault = "main";
+
+        // v1 : état de départ sain.
+        idx.upsert_note(&note_with_body(id, vault, "alpha bravo charlie"))
+            .await
+            .expect("upsert v1");
+        assert!(
+            idx.fts_integrity_check().await.expect("integrity v1"),
+            "index sain attendu après v1"
+        );
+
+        let v2 = note_with_body(id, vault, "delta echo foxtrot");
+
+        // Injection : `notes_fts` inaccessible le temps de l'appel v2. Le lock est
+        // relâché avant l'appel à `upsert_note` (qui reprend le même lock).
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute_batch("ALTER TABLE notes_fts RENAME TO notes_fts_off")
+                .expect("rename notes_fts off");
+        }
+
+        let injected = idx.upsert_note(&v2).await;
+        assert!(
+            injected.is_err(),
+            "l'upsert v2 doit échouer (statement FTS injecté en erreur)"
+        );
+
+        // Restaurer FTS pour le retry.
+        {
+            let conn = idx.conn.lock().await;
+            conn.execute_batch("ALTER TABLE notes_fts_off RENAME TO notes_fts")
+                .expect("rename notes_fts back");
+        }
+
+        // Retry du MÊME upsert, sans injection.
+        idx.upsert_note(&v2)
+            .await
+            .expect("le retry v2 doit réussir");
+
+        // Preuve de cohérence : l'index FTS doit être VERT après échec + retry.
+        assert!(
+            idx.fts_integrity_check()
+                .await
+                .expect("integrity check exécutable"),
+            "index FTS incohérent après échec + retry — upsert_note non transactionnel \
+             (corruption G10 : notes en v2, postings FTS orphelins)"
+        );
+
+        // Et le contenu servi doit bien être la v2.
+        let body: String = {
+            let conn = idx.conn.lock().await;
+            conn.query_row(
+                "SELECT body_text FROM notes WHERE id = ?1 AND vault_id = ?2",
+                rusqlite::params![id.to_string(), vault],
+                |row| row.get(0),
+            )
+            .expect("relecture body v2")
+        };
+        assert_eq!(
+            body, "delta echo foxtrot",
+            "notes doit porter la v2 après retry"
         );
     }
 }
