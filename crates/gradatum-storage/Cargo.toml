@@ -16,7 +16,7 @@ categories.workspace = true
 exclude = ["tests/**"]
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "2.1.0" }
+gradatum-core = { path = "../gradatum-core", version = "2.2.0" }
 async-trait   = { workspace = true }
 opendal       = { workspace = true }
 thiserror     = { workspace = true }

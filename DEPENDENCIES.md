@@ -2,7 +2,9 @@
 
 > Arbre de dépendances Cargo. Établi par lecture des `Cargo.toml` du workspace (source de
 > vérité) ; à recouper avec `cargo tree --workspace --depth 1`.
-> Version workspace `2.1.0`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> Version workspace `2.1.1`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> MAJ 2026-09-02 (`6a7515a5..3a981130`) : aucune dépendance externe ajoutée, retirée ni bumpée —
+> le delta `Cargo.lock` (32/32) est la propagation des 34 bornes intra-famille à `2.1.1`.
 > MAJ 2026-08-23 (delta `c942cb15..687b7ac5`, 9 commits sur les manifestes — paliers 2.0.2→2.0.9) :
 > **aucune dépendance ajoutée, retirée ni repinnée**. Seul changement réel de l'arbre : la crate
 > `nix` gagne la feature `user` (`fs, signal, process` → `fs, signal, process, user`). Le reste des

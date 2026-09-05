@@ -43,10 +43,6 @@ name = "curator_f1"
 path = "src/bin/curator_f1.rs"
 
 [[bin]]
-name = "search_golden"
-path = "src/bin/search_golden.rs"
-
-[[bin]]
 # Bench recall ANN sqlite-vec (v0.5.3 ANN-1).
 # Requiert l'extension sqlite-vec chargée au runtime (unsafe register dans main()).
 # Pas de #![forbid(unsafe_code)] sur ce binary.

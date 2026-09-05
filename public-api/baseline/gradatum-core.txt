@@ -874,13 +874,20 @@ pub gradatum_core::project_map::AnnexRole::Plan
 pub gradatum_core::project_map::AnnexRole::Spec
 impl gradatum_core::project_map::AnnexRole
 pub const fn gradatum_core::project_map::AnnexRole::prefix(&self) -> &'static str
+#[non_exhaustive] pub enum gradatum_core::project_map::DerivationFallbackReason
+pub gradatum_core::project_map::DerivationFallbackReason::NoTrack
+pub gradatum_core::project_map::DerivationFallbackReason::Undetermined(gradatum_core::project_map::ReleaseDerivationError)
+pub gradatum_core::project_map::DerivationFallbackReason::Unresolved(gradatum_core::project_map::TrackResolutionError)
 #[non_exhaustive] pub enum gradatum_core::project_map::KindKind
+pub gradatum_core::project_map::KindKind::Backlog
 pub gradatum_core::project_map::KindKind::Enhancement
 pub gradatum_core::project_map::KindKind::Feature
 pub gradatum_core::project_map::KindKind::Fix
+pub gradatum_core::project_map::KindKind::Roadmap
 pub gradatum_core::project_map::KindKind::Task
 impl gradatum_core::project_map::KindKind
 pub const fn gradatum_core::project_map::KindKind::as_wire(&self) -> &'static str
+pub const fn gradatum_core::project_map::KindKind::is_structure(&self) -> bool
 #[non_exhaustive] pub enum gradatum_core::project_map::ProjectMapLink
 pub gradatum_core::project_map::ProjectMapLink::Annex
 pub gradatum_core::project_map::ProjectMapLink::Annex::role: gradatum_core::project_map::AnnexRole
@@ -891,13 +898,22 @@ pub gradatum_core::project_map::ProjectMapLink::Dep::ulid: alloc::string::String
 pub gradatum_core::project_map::ProjectMapLink::Feature(alloc::string::String)
 pub gradatum_core::project_map::ProjectMapLink::Kind(gradatum_core::project_map::KindKind)
 pub gradatum_core::project_map::ProjectMapLink::Parent(alloc::string::String)
+pub gradatum_core::project_map::ProjectMapLink::Porteuse
+pub gradatum_core::project_map::ProjectMapLink::Porteuse::project: alloc::string::String
+pub gradatum_core::project_map::ProjectMapLink::Porteuse::version: alloc::string::String
 pub gradatum_core::project_map::ProjectMapLink::Project(alloc::string::String)
 pub gradatum_core::project_map::ProjectMapLink::Release(gradatum_core::project_map::ReleaseKind)
 pub gradatum_core::project_map::ProjectMapLink::Status(gradatum_core::project_map::StatusKind)
 pub gradatum_core::project_map::ProjectMapLink::Supersedes(alloc::string::String)
+pub gradatum_core::project_map::ProjectMapLink::Track
+pub gradatum_core::project_map::ProjectMapLink::Track::project: alloc::string::String
+pub gradatum_core::project_map::ProjectMapLink::Track::target: alloc::string::String
 pub gradatum_core::project_map::ProjectMapLink::Version
 pub gradatum_core::project_map::ProjectMapLink::Version::project: alloc::string::String
 pub gradatum_core::project_map::ProjectMapLink::Version::version: alloc::string::String
+pub gradatum_core::project_map::ProjectMapLink::Visibility(gradatum_core::project_map::VisibilityKind)
+#[non_exhaustive] pub enum gradatum_core::project_map::ReleaseDerivationError
+pub gradatum_core::project_map::ReleaseDerivationError::UndeterminedRoadmapStatus(gradatum_core::project_map::StatusKind)
 #[non_exhaustive] pub enum gradatum_core::project_map::ReleaseKind
 pub gradatum_core::project_map::ReleaseKind::Dropped
 pub gradatum_core::project_map::ReleaseKind::Planned
@@ -910,21 +926,39 @@ pub gradatum_core::project_map::SchemaError::EmptyValue(alloc::string::String)
 pub gradatum_core::project_map::SchemaError::FeatureCardinality(usize)
 pub gradatum_core::project_map::SchemaError::FeatureIdentInvalid(alloc::string::String)
 pub gradatum_core::project_map::SchemaError::FeatureVersionCardinality(usize)
+pub gradatum_core::project_map::SchemaError::IncoherentReleaseVersion
+pub gradatum_core::project_map::SchemaError::IncoherentReleaseVersion::version: alloc::string::String
 pub gradatum_core::project_map::SchemaError::InvalidChars(alloc::string::String, alloc::string::String)
 pub gradatum_core::project_map::SchemaError::InvalidKind(alloc::string::String)
 pub gradatum_core::project_map::SchemaError::InvalidRelease(alloc::string::String)
 pub gradatum_core::project_map::SchemaError::InvalidStatus(alloc::string::String)
+pub gradatum_core::project_map::SchemaError::InvalidVisibility(alloc::string::String)
 pub gradatum_core::project_map::SchemaError::KindCardinality(usize)
+pub gradatum_core::project_map::SchemaError::MalformedPorteuse(alloc::string::String)
+pub gradatum_core::project_map::SchemaError::MalformedTrack(alloc::string::String)
 pub gradatum_core::project_map::SchemaError::MalformedVersion(alloc::string::String)
 pub gradatum_core::project_map::SchemaError::MissingPrefix(alloc::string::String)
+pub gradatum_core::project_map::SchemaError::PorteuseCardinality(usize)
+pub gradatum_core::project_map::SchemaError::PorteuseForbidden(usize)
 pub gradatum_core::project_map::SchemaError::ProjectCardinality(usize)
 pub gradatum_core::project_map::SchemaError::ReleaseCardinality(usize)
 pub gradatum_core::project_map::SchemaError::StatusCardinality(usize)
+pub gradatum_core::project_map::SchemaError::StructureFeatureForbidden(usize)
+pub gradatum_core::project_map::SchemaError::StructureVersionCardinality(usize)
+pub gradatum_core::project_map::SchemaError::TrackCardinality(usize)
+pub gradatum_core::project_map::SchemaError::TrackOnStructureCard(usize)
+pub gradatum_core::project_map::SchemaError::UnknownRole
+pub gradatum_core::project_map::SchemaError::UnknownRole::prefix: alloc::string::String
+pub gradatum_core::project_map::SchemaError::UnknownRole::value: alloc::string::String
 pub gradatum_core::project_map::SchemaError::ValueTooLong(alloc::string::String, alloc::string::String, usize)
 pub gradatum_core::project_map::SchemaError::VersionCardinality(usize)
 pub gradatum_core::project_map::SchemaError::VersionProjectMismatch
 pub gradatum_core::project_map::SchemaError::VersionProjectMismatch::project: alloc::string::String
 pub gradatum_core::project_map::SchemaError::VersionProjectMismatch::version_project: alloc::string::String
+pub gradatum_core::project_map::SchemaError::VisibilityCardinality(usize)
+pub gradatum_core::project_map::SchemaError::VisibilityForbidden(usize)
+pub gradatum_core::project_map::SchemaError::VisibilityWorkCardCardinality(usize)
+pub gradatum_core::project_map::SchemaError::WorkCardNotDerivable
 #[non_exhaustive] pub enum gradatum_core::project_map::StatusKind
 pub gradatum_core::project_map::StatusKind::Blocked
 pub gradatum_core::project_map::StatusKind::Brainstorming
@@ -935,6 +969,29 @@ pub gradatum_core::project_map::StatusKind::Open
 impl gradatum_core::project_map::StatusKind
 pub const fn gradatum_core::project_map::StatusKind::as_wire(&self) -> &'static str
 pub fn gradatum_core::project_map::StatusKind::from_wire(&str) -> core::option::Option<Self>
+#[non_exhaustive] pub enum gradatum_core::project_map::TrackResolutionError
+pub gradatum_core::project_map::TrackResolutionError::PorteuseNotFound
+pub gradatum_core::project_map::TrackResolutionError::PorteuseNotFound::porteuse: alloc::string::String
+pub gradatum_core::project_map::TrackResolutionError::PorteuseNotFound::roadmap: alloc::string::String
+pub gradatum_core::project_map::TrackResolutionError::TargetNotFound
+pub gradatum_core::project_map::TrackResolutionError::TargetNotFound::identity: alloc::string::String
+#[non_exhaustive] pub enum gradatum_core::project_map::TrackTarget
+pub gradatum_core::project_map::TrackTarget::Backlog
+pub gradatum_core::project_map::TrackTarget::Roadmap
+pub gradatum_core::project_map::TrackTarget::Roadmap::porteuse_status: core::option::Option<gradatum_core::project_map::StatusKind>
+pub gradatum_core::project_map::TrackTarget::Roadmap::status: gradatum_core::project_map::StatusKind
+#[non_exhaustive] pub enum gradatum_core::project_map::VisibilityKind
+pub gradatum_core::project_map::VisibilityKind::Interne
+pub gradatum_core::project_map::VisibilityKind::Public
+impl gradatum_core::project_map::VisibilityKind
+pub const fn gradatum_core::project_map::VisibilityKind::as_wire(&self) -> &'static str
+#[non_exhaustive] pub struct gradatum_core::project_map::DerivationDiagnostic
+pub gradatum_core::project_map::DerivationDiagnostic::feature: alloc::string::String
+pub gradatum_core::project_map::DerivationDiagnostic::reason: gradatum_core::project_map::DerivationFallbackReason
+pub gradatum_core::project_map::DerivationDiagnostic::stored: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct gradatum_core::project_map::DerivedExport
+pub gradatum_core::project_map::DerivedExport::diagnostics: alloc::vec::Vec<gradatum_core::project_map::DerivationDiagnostic>
+pub gradatum_core::project_map::DerivedExport::entries: alloc::vec::Vec<gradatum_core::project_map::FeatureEntry>
 pub struct gradatum_core::project_map::ExportOptions
 pub gradatum_core::project_map::ExportOptions::include_dropped: bool
 pub struct gradatum_core::project_map::FeatureEntry
@@ -942,16 +999,39 @@ pub gradatum_core::project_map::FeatureEntry::feature: alloc::string::String
 pub gradatum_core::project_map::FeatureEntry::release: alloc::string::String
 pub gradatum_core::project_map::FeatureEntry::title: alloc::string::String
 pub gradatum_core::project_map::FeatureEntry::version: core::option::Option<alloc::string::String>
+pub struct gradatum_core::project_map::ProjectMapCardEntry
+pub gradatum_core::project_map::ProjectMapCardEntry::feature: core::option::Option<alloc::string::String>
+pub gradatum_core::project_map::ProjectMapCardEntry::id: alloc::string::String
+pub gradatum_core::project_map::ProjectMapCardEntry::kind: core::option::Option<alloc::string::String>
+pub gradatum_core::project_map::ProjectMapCardEntry::parent: alloc::vec::Vec<alloc::string::String>
+pub gradatum_core::project_map::ProjectMapCardEntry::release: core::option::Option<alloc::string::String>
+pub gradatum_core::project_map::ProjectMapCardEntry::status: core::option::Option<alloc::string::String>
+pub gradatum_core::project_map::ProjectMapCardEntry::supersedes: alloc::vec::Vec<alloc::string::String>
+pub gradatum_core::project_map::ProjectMapCardEntry::title: alloc::string::String
+pub gradatum_core::project_map::ProjectMapCardEntry::track: core::option::Option<alloc::string::String>
+pub gradatum_core::project_map::ProjectMapCardEntry::version: core::option::Option<alloc::string::String>
+pub gradatum_core::project_map::ProjectMapCardEntry::visibility: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub struct gradatum_core::project_map::ProjectMapRoles
 pub gradatum_core::project_map::ProjectMapRoles::kind: core::option::Option<&'static str>
 pub gradatum_core::project_map::ProjectMapRoles::status: core::option::Option<&'static str>
+pub struct gradatum_core::project_map::StructureIndex
+impl gradatum_core::project_map::StructureIndex
+pub fn gradatum_core::project_map::StructureIndex::from_notes(&[(alloc::string::String, alloc::string::String)]) -> Self
+pub fn gradatum_core::project_map::StructureIndex::resolve_track(&self, &str, &str) -> core::result::Result<gradatum_core::project_map::TrackTarget, gradatum_core::project_map::TrackResolutionError>
+pub fn gradatum_core::project_map::derivable_track_target(&str) -> core::option::Option<alloc::string::String>
+pub fn gradatum_core::project_map::derive_canonical_title(&str, &str) -> alloc::string::String
+pub fn gradatum_core::project_map::derive_release(gradatum_core::project_map::StatusKind, gradatum_core::project_map::TrackTarget) -> core::result::Result<gradatum_core::project_map::ReleaseKind, gradatum_core::project_map::ReleaseDerivationError>
 pub fn gradatum_core::project_map::feature_identity_from_targets(&[alloc::string::String]) -> alloc::vec::Vec<alloc::string::String>
 pub fn gradatum_core::project_map::map_version_raw(&str) -> core::option::Option<alloc::string::String>
 pub fn gradatum_core::project_map::max_feature_number(&str) -> core::option::Option<u32>
 pub fn gradatum_core::project_map::parse_link(&str) -> core::result::Result<gradatum_core::project_map::ProjectMapLink, gradatum_core::project_map::SchemaError>
+pub fn gradatum_core::project_map::project_map_card_index(&[(alloc::string::String, alloc::string::String, alloc::string::String)], core::option::Option<&str>, core::option::Option<&str>) -> alloc::vec::Vec<gradatum_core::project_map::ProjectMapCardEntry>
 pub fn gradatum_core::project_map::project_map_feature_entries(&[(alloc::string::String, alloc::string::String)], gradatum_core::project_map::ExportOptions) -> alloc::vec::Vec<gradatum_core::project_map::FeatureEntry>
+pub fn gradatum_core::project_map::project_map_feature_entries_derived_scoped(&[(alloc::string::String, alloc::string::String)], gradatum_core::project_map::ExportOptions, core::option::Option<&str>) -> gradatum_core::project_map::DerivedExport
+pub fn gradatum_core::project_map::project_map_feature_entries_scoped(&[(alloc::string::String, alloc::string::String)], gradatum_core::project_map::ExportOptions, core::option::Option<&str>) -> alloc::vec::Vec<gradatum_core::project_map::FeatureEntry>
 pub fn gradatum_core::project_map::reserved_node_target(&str) -> core::option::Option<alloc::string::String>
 pub fn gradatum_core::project_map::roles_of_body(&str) -> gradatum_core::project_map::ProjectMapRoles
+pub fn gradatum_core::project_map::validate_card_body(&str) -> core::result::Result<(), gradatum_core::project_map::SchemaError>
 pub fn gradatum_core::project_map::validate_links(&[gradatum_core::project_map::ProjectMapLink]) -> core::result::Result<(), gradatum_core::project_map::SchemaError>
 pub fn gradatum_core::project_map::validate_links_from_targets(&[alloc::string::String]) -> core::result::Result<(), gradatum_core::project_map::SchemaError>
 pub mod gradatum_core::provenance

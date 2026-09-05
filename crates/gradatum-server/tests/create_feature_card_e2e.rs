@@ -132,6 +132,24 @@ async fn enqueued_body(job_store: &Arc<dyn QueueStore>, job_id: &str) -> (String
     }
 }
 
+/// Lit le TITRE réellement enqueué pour un `job_id` — extrait de `CurateSpec.title`.
+///
+/// C'est le titre que le worker persistera dans l'index (le titre ne vit que là). Le vérifier
+/// ici prouve le câblage F-247 du chemin d'écriture (dérivation dans `vault_write_impl`) sans
+/// dépendre du worker.
+async fn enqueued_title(job_store: &Arc<dyn QueueStore>, job_id: &str) -> Option<String> {
+    let ulid = Ulid::from_string(job_id).expect("job_id ULID valide");
+    let rec = job_store
+        .get(ulid, None)
+        .await
+        .expect("get job")
+        .expect("job présent dans le store");
+    match rec.spec.kind {
+        Job::Curate(spec) => spec.title,
+        other => panic!("job attendu Curate, obtenu {other:?}"),
+    }
+}
+
 // ── Test 1 : le serveur attribue le numéro et l'injecte dans le corps enqueué ──
 
 #[tokio::test]
@@ -236,8 +254,10 @@ async fn create_feature_rejects_client_supplied_feature_role_without_burning() {
 async fn create_feature_rejects_incomplete_card_without_burning() {
     let (addr, _job_store) = start_server().await;
 
-    // Manque [[release:…]] et [[version:…]] → carte-feature invalide.
-    let incomplete = "[[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]]\n\nIncomplète.";
+    // Manque [[status:…]] → carte invalide (StatusCardinality). Depuis F-184 Phase 7,
+    // release/version sont optionnels : l'invalidité doit venir d'un rôle encore requis
+    // (ici status) pour prouver que la pré-validation garde bien l'allocation.
+    let incomplete = "[[project:gradatum]] [[kind:FEATURE]]\n\nIncomplète.";
     let resp = post_create(
         addr,
         &serde_json::json!({ "title": "Incomplète", "body": incomplete }),
@@ -276,4 +296,54 @@ async fn create_feature_unauthenticated_401() {
         .await
         .expect("requête sans bearer");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── Test 6 (F-247) : le titre enqueué est DÉRIVÉ canonique — backlog → sans suffixe ───
+
+#[tokio::test]
+async fn create_feature_derives_canonical_title_backlog_no_suffix() {
+    let (addr, job_store) = start_server().await;
+    // VALID_BODY porte `[[version:gradatum/backlog]]` → aucun suffixe de version.
+    let resp = post_create(
+        addr,
+        &serde_json::json!({ "title": "Titre sans préfixe", "body": VALID_BODY }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let json: serde_json::Value = resp.json().await.expect("réponse JSON");
+    let job_id = json["job_id"].as_str().expect("job_id string");
+
+    // Preuve par relecture du record enqueué : le titre a été dérivé (préfixe ajouté),
+    // sans suffixe car la carte est backlog.
+    let title = enqueued_title(&job_store, job_id).await;
+    assert_eq!(
+        title.as_deref(),
+        Some("[PROJECT-MAP][gradatum] Titre sans préfixe"),
+        "titre canonique dérivé (backlog → pas de suffixe) : {title:?}"
+    );
+}
+
+// ── Test 7 (F-247) : version concrète → suffixe `— vX.Y.Z` dérivé ────────────────────
+
+#[tokio::test]
+async fn create_feature_derives_version_suffix_from_role() {
+    let (addr, job_store) = start_server().await;
+    let body = "[[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+                [[release:planned]] [[version:gradatum/2.2.0]]\n\nDescription.";
+    let resp = post_create(
+        addr,
+        &serde_json::json!({ "title": "[MAUVAIS][x] Mon sujet — v9.9.9", "body": body }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let json: serde_json::Value = resp.json().await.expect("réponse JSON");
+    let job_id = json["job_id"].as_str().expect("job_id string");
+
+    // Le préfixe erroné est écrasé et le suffixe suit le rôle de version.
+    let title = enqueued_title(&job_store, job_id).await;
+    assert_eq!(
+        title.as_deref(),
+        Some("[PROJECT-MAP][gradatum] Mon sujet \u{2014} v2.2.0"),
+        "préfixe erroné corrigé + suffixe dérivé du rôle version : {title:?}"
+    );
 }

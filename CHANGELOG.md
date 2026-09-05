@@ -12,6 +12,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > file, the public release that carried its changes forward. That mapping follows the document's
 > order, not a change-by-change diff — see the `[2.0.0]` note below for a case worked out in full.
 
+## [2.2.0] — 2026-09-04
+
+> Cette version change le **contrat d'écriture** du registre `project-map` (F-184, F-213, F-256)
+> sans rupture repérable par l'outillage sur la surface API Rust publique — le diff de la
+> référence `public-api` confirme l'ajout **sans retrait**. ✅ **Mesuré** : la baseline
+> `gradatum-core` a été régénérée pour ce jalon (`public-api/regen.sh --write`) — **80 ajouts,
+> 0 retrait** (variantes additives `KindKind::Roadmap`/`::Backlog`, `VisibilityKind`,
+> `ReleaseDerivationError`, variantes `SchemaError`), toutes sous `#[non_exhaustive]`. « Rien ne
+> casse au niveau bibliothèque » est donc un fait **mesuré**, cohérent avec `cargo-semver-checks`
+> (0 rupture, rang patch). Les
+> ruptures de ce jalon touchent les **opérateurs d'un registre `project-map`** (cartes refusées
+> par le nouveau validateur), pas les consommateurs de bibliothèque Rust (variantes additives
+> sous `#[non_exhaustive]`, absorbées sans casser un `match` existant). **Si vous exploitez un
+> registre `project-map`, lisez le guide de migration avant d'adopter 2.2.0** :
+> [`docs/UPGRADING-2.1.0-to-2.2.0.md`](docs/UPGRADING-2.1.0-to-2.2.0.md).
+>
+> Suivi : cartes F-184, F-213, F-256, F-211, F-247, F-263, F-254, F-161, F-212.
+
+### Changed — BREAKING (opérateurs de registre uniquement) : la version devient une carte, `release` n'est plus stocké mais dérivé (F-184)
+
+- **Un jalon de version est désormais une carte de structure**, pas un attribut inline porté par
+  chaque carte de travail. `[[kind:ROADMAP]]` par version, `[[kind:BACKLOG]]` par projet ; une
+  carte de travail s'y attache par un pointeur **unique** `[[track:]]` et ne porte plus
+  `[[version:]]` ni `[[release:]]`.
+- **`release` n'est plus stocké, il est dérivé** côté serveur
+  (`gradatum_core::project_map::derive_release`), ordre de priorité fixe : carte `DONE` →
+  `released` **quelle que soit** la structure trackée ; carte `OBSOLETE` → `dropped` ; sinon
+  dérivé de la structure trackée (`BACKLOG` → `roadmap` ; `ROADMAP` `DONE` → `released`,
+  `OPEN`/`IN_PROGRESS`/`BLOCKED` → `planned`, `OBSOLETE` → `dropped`).
+- Nouvelles variantes wire **additives** `KindKind::Roadmap` / `KindKind::Backlog`
+  (`#[non_exhaustive]` depuis 2.1 — absorbées par le bras `_` d'un `match` existant, aucune
+  rupture de compilation).
+- Migration en six phases gatées (création des cartes de structure → double-écriture
+  `[[track:]]` → recensement en lecture seule → bascule des lecteurs dérivés et déploiement →
+  retrait **irréversible** de l'axe stocké, dans cet ordre strict — « déployer les lecteurs
+  dérivés avant de retirer la donnée stockée, jamais l'inverse ») : séquence complète, scripts
+  de migration et table de rollback dans le guide de migration.
+
+### Changed — BREAKING (opérateurs de registre uniquement) : gardes de cohérence des rôles au validateur (F-213)
+
+- Le validateur `validate_links` **refuse** désormais ce qu'il acceptait silencieusement en 2.1 :
+  rôle inconnu, `[[release:roadmap]]` combiné à un `[[version:]]` concret, plus d'un
+  `[[release:]]`/`[[version:]]` sur une même carte, `[[track:]]` sur une carte de structure,
+  carte de travail sans `[[version:]]` ni `[[track:]]`. Chaque message de refus nomme le
+  remplacement attendu — table complète dans le guide de migration.
+
+### Added — axe de visibilité étendu aux cartes de travail (F-256)
+
+- `[[visibilite:interne|public]]` (0 ou 1 lien, défaut `public`) est désormais accepté sur les
+  cartes de travail, pas seulement sur les cartes de structure. Une carte `ROADMAP` exige
+  exactement une `[[visibilite:]]` ; une `BACKLOG` la refuse (un backlog n'est jamais publié).
+  L'export du catalogue public exclut `visibilite:interne`, en plus des filtres de type et de
+  statut déjà en place.
+
+### Added — endpoint `GET /api/v1/project-map/cards?version=<v>` (F-211)
+
+- Liste en une seule requête toutes les cartes — de travail **et** de structure — d'un jalon
+  donné, avec chaque axe nommé en colonne (identifiant, numéro de fonctionnalité, statut, type,
+  `release` dérivé, version, visibilité, titre, rôles de dépendance). Remplace l'export filtré à
+  la main. Purement additif — rien de l'existant n'est retiré.
+
+### Changed — dérivation du titre canonique à l'écriture (F-247)
+
+- Toute écriture de carte (création, mise à jour, `create_feature_card`) dérive désormais son
+  titre sous la forme `[PROJECT-MAP][projet] sujet — vX.Y.Z`, de façon pure et **idempotente** —
+  une réécriture d'un titre déjà conforme ne le modifie pas. Un préfixe erroné est corrigé
+  automatiquement à l'écriture.
+
+### Removed — `search_golden` retiré de `gradatum-bench` (F-263)
+
+- Binaire de benchmark sans appelant (aucune surface CI ne l'invoquait) qui rendait un succès
+  (`exit 0`) même en l'absence de l'étalon de comparaison — un faux-vert latent. Le critère qu'il
+  devait couvrir reste couvert par ailleurs (`eph-gate.sh`).
+
+### Docs — guide de migration 2.1.0 → 2.2.0 (F-254)
+
+- [`docs/UPGRADING-2.1.0-to-2.2.0.md`](docs/UPGRADING-2.1.0-to-2.2.0.md) — deux publics distincts
+  (consommateur de bibliothèque Rust vs opérateur d'un registre `project-map`), table de
+  correspondance rupture → mode de détection → carte, table complète des refus du nouveau
+  validateur avec le remplacement à écrire pour chacun.
+
+### Tooling — discipline opérationnelle du jalon, hors surface du crate (F-161, F-212)
+
+- Ces deux cartes ne modifient ni le code ni le contrat du crate `gradatum` — elles portent la
+  discipline opérationnelle qui entoure ce jalon, documentées ici pour mémoire du jalon complet.
+  Règle de titre « survivance au contenant » propagée aux skills de gouvernance locaux (un titre
+  de note doit nommer le sujet, pas seulement un contenant périssable — version, phase, machine).
+  Le gate de release opérateur consomme désormais l'endpoint F-211 pour vérifier l'occupation
+  d'un numéro de version, au lieu d'un export filtré à la main.
+
 ## [2.1.1] — 2026-09-01
 
 ### Fixed — `upsert_note` laissait des postings FTS périmés, la recherche levait `SQLITE_CORRUPT` (F-267)

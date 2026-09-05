@@ -10,9 +10,12 @@
 //!
 //! | Méthode | Path | Auth | Query | Réponse |
 //! |---------|------|------|-------|---------|
-//! | GET | `/api/v1/project-map/export-features` | Bearer JWT (Read) | `include_dropped` (bool, défaut `false`) | `200 application/json` — tableau `[FeatureEntry]` |
+//! | GET | `/api/v1/project-map/export-features` | Bearer JWT (Read) | `include_dropped` (bool, défaut `false`), `derived` (bool, défaut `true`) | `200 application/json` — tableau `[FeatureEntry]` |
 //!
 //! - Auth : même middleware Bearer JWT que les autres routes `/api/v1`.
+//! - `derived` (défaut `true`) : `release`/`version` dérivés du `[[track:]]`. Le
+//!   stocké ayant été retiré, la dérivation est l'unique voie qui projette encore les features.
+//!   `derived=false` = voie stockée pure (compat/diagnostic, de facto vide post-retrait).
 //! - `include_dropped=true` : expose les cartes `release:dropped` (audit complet).
 //! - Défaut (`include_dropped=false`) : miroir-site — inclut backlog (version `"vX.Y.Z"`),
 //!   exclut uniquement `release:dropped` (Règle A NOMENCLATURE §10e).
@@ -50,7 +53,11 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
 };
-use gradatum_core::project_map::{ExportOptions, FeatureEntry, project_map_feature_entries};
+use gradatum_core::project_map::{
+    DerivationFallbackReason, ExportOptions, FeatureEntry, ProjectMapCardEntry,
+    project_map_card_index, project_map_feature_entries,
+    project_map_feature_entries_derived_scoped,
+};
 use gradatum_core::scope::VaultId;
 use gradatum_core::trust::TrustContext;
 use serde::Deserialize;
@@ -86,13 +93,123 @@ const PAGE_SIZE: usize = 200;
 const MAX_PAGES: usize = 50;
 
 /// Query parameters de `GET /api/v1/project-map/export-features`.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct ExportFeaturesQuery {
     /// Si `true`, inclut les cartes `release:dropped` (audit complet).
     /// Défaut `false` : miroir-site — exclut uniquement `dropped`,
     /// inclut les cartes backlog (version `"vX.Y.Z"`) (Règle A).
     #[serde(default)]
     pub include_dropped: bool,
+    /// Dérive `release` **et** `version` depuis le pointeur `[[track:]]` au lieu du
+    /// `[[release:]]`/`[[version:]]` stocké.
+    ///
+    /// **Défaut `true` depuis le retrait irréversible du stocké** : les cartes de
+    /// travail ne portent plus de `[[release:]]`/`[[version:]]`, la dérivation est donc l'unique
+    /// source qui projette encore les features. `derived=false` sélectionne la voie stockée pure
+    /// (conservée pour compat/diagnostic) — devenue de facto vide post-retrait. Les cartes
+    /// indérivables sont journalisées — jamais de repli silencieux.
+    #[serde(default = "default_derived")]
+    pub derived: bool,
+}
+
+/// Valeur par défaut de [`ExportFeaturesQuery::derived`] : `true` depuis le retrait du stocké.
+/// La dérivation est désormais la voie nominale de l'export.
+const fn default_derived() -> bool {
+    true
+}
+
+impl Default for ExportFeaturesQuery {
+    /// Reflète les défauts serde : `include_dropped = false`, `derived = true` (voie nominale
+    /// post-retrait). Garde `ExportFeaturesQuery::default()` cohérent avec une requête sans query
+    /// string.
+    fn default() -> Self {
+        Self {
+            include_dropped: false,
+            derived: default_derived(),
+        }
+    }
+}
+
+/// Récupère **toutes** les notes de la section `project-map` du vault, en déroulant la pagination
+/// cursor de `list_notes` (clampée à 200/page côté crate index).
+///
+/// SSOT de récupération partagée par [`export_features`] et [`list_cards`]. Le filtre garbage
+/// (parité CLI) reste à la charge de l'appelant : ce helper rend les enregistrements bruts (hors
+/// `downgraded`, déjà exclus par `list_notes`).
+///
+/// `caller` n'apparaît que dans les logs (contexte de diagnostic).
+///
+/// # Errors
+///
+/// `500 Internal Server Error` si `list_notes` échoue sur une page.
+async fn fetch_all_project_map_records(
+    state: &AppState,
+    vault: &str,
+    caller: &str,
+) -> Result<Vec<gradatum_core::index::NoteRecord>, StatusCode> {
+    // list_notes clamp le limit à 200 (sqlite.rs:1822) — on pagine explicitement.
+    // Stratégie : première requête fixe `total`, boucle jusqu'à épuisement.
+    // Guard anti-runaway : MAX_PAGES (50 pages = 10 000 notes).
+    let mut all_records = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages_fetched: usize = 0;
+
+    loop {
+        if pages_fetched >= MAX_PAGES {
+            // Anomalie opérationnelle : runaway guard atteint — log et arrêt propre.
+            tracing::warn!(
+                caller,
+                pages = pages_fetched,
+                max_pages = MAX_PAGES,
+                collected = all_records.len(),
+                section = SECTION,
+                "fetch_all_project_map_records: MAX_PAGES reached — abnormally large \
+                 project-map section. Partial result returned."
+            );
+            break;
+        }
+
+        let (records, total) = state
+            .search
+            .list_notes(vault, Some(SECTION), PAGE_SIZE, cursor.as_deref())
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    caller,
+                    err = %e,
+                    section = SECTION,
+                    page = pages_fetched,
+                    "fetch_all_project_map_records: list_notes failed"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let page_len = records.len();
+        pages_fetched += 1;
+
+        // Cursor suivant = dernier ULID de la page (tri ASC ULID dans list_notes).
+        if let Some(last) = records.last() {
+            cursor = Some(last.id.clone());
+        }
+
+        all_records.extend(records);
+
+        // Épuisement naturel : page incomplète OU total atteint.
+        let done = page_len < PAGE_SIZE || all_records.len() >= total as usize;
+        if done {
+            break;
+        }
+    }
+
+    tracing::debug!(
+        caller,
+        section = SECTION,
+        pages = pages_fetched,
+        raw_count = all_records.len(),
+        "fetch_all_project_map_records: retrieval complete"
+    );
+
+    Ok(all_records)
 }
 
 /// `GET /api/v1/project-map/export-features?include_dropped=<bool>`
@@ -146,65 +263,8 @@ pub async fn export_features(
     );
 
     // ── Récupération paginée de toutes les notes project-map ─────────────────
-    //
-    // list_notes clamp le limit à 200 (sqlite.rs:1822) — on pagine explicitement.
-    // Stratégie : première requête fixe `total`, boucle jusqu'à épuisement.
-    // Guard anti-runaway : MAX_PAGES (50 pages = 10 000 notes).
-    let mut all_records = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut pages_fetched: usize = 0;
-
-    loop {
-        if pages_fetched >= MAX_PAGES {
-            // Anomalie opérationnelle : runaway guard atteint — log et arrêt propre.
-            tracing::warn!(
-                pages = pages_fetched,
-                max_pages = MAX_PAGES,
-                collected = all_records.len(),
-                section = SECTION,
-                "export_features: MAX_PAGES reached — abnormally large project-map section. \
-                 Partial export returned."
-            );
-            break;
-        }
-
-        let (records, total) = state
-            .search
-            .list_notes(vault.as_str(), Some(SECTION), PAGE_SIZE, cursor.as_deref())
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    err = %e,
-                    section = SECTION,
-                    page = pages_fetched,
-                    "export_features: list_notes failed"
-                );
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        let page_len = records.len();
-        pages_fetched += 1;
-
-        // Cursor suivant = dernier ULID de la page (tri ASC ULID dans list_notes).
-        if let Some(last) = records.last() {
-            cursor = Some(last.id.clone());
-        }
-
-        all_records.extend(records);
-
-        // Épuisement naturel : page incomplète OU total atteint.
-        let done = page_len < PAGE_SIZE || all_records.len() >= total as usize;
-        if done {
-            break;
-        }
-    }
-
-    tracing::debug!(
-        section = SECTION,
-        pages = pages_fetched,
-        raw_count = all_records.len(),
-        "export_features: retrieval complete"
-    );
+    let all_records =
+        fetch_all_project_map_records(&state, vault.as_str(), "export_features").await?;
 
     // ── C2 : filtre garbage (parité CLI admin) ────────────────────────────────
     //
@@ -224,7 +284,131 @@ pub async fn export_features(
         include_dropped: params.include_dropped,
     };
 
-    let entries = project_map_feature_entries(&notes, opts);
+    // Make-before-break (F-184 Phase 6) : `derived=true` dérive `release` du pointeur `[[track:]]`
+    // (voie parallèle) ; défaut = lecture du `[[release:]]` stocké (byte-identique à l'existant).
+    let entries = if params.derived {
+        let out = project_map_feature_entries_derived_scoped(&notes, opts, None);
+        // Échec de dérivation : VISIBLE (jamais silencieux, jamais de panic — P2-A). Un `NoTrack`
+        // est attendu pendant la fenêtre additive → debug ; les autres cas sont des anomalies → warn.
+        // Post-retrait (Phase 7), `stored: None` signifie carte IGNORÉE (ni dérivable ni stockée) —
+        // une anomalie de registre (pointeur `[[track:]]` pendant).
+        for d in &out.diagnostics {
+            let outcome = if d.stored.is_some() {
+                "fell back to stored release"
+            } else {
+                "skipped — no stored release either (dangling track anomaly)"
+            };
+            match &d.reason {
+                DerivationFallbackReason::NoTrack if d.stored.is_some() => tracing::debug!(
+                    feature = %d.feature,
+                    stored = ?d.stored,
+                    "export_features(derived): no track pointer — {outcome}"
+                ),
+                DerivationFallbackReason::NoTrack => tracing::warn!(
+                    feature = %d.feature,
+                    stored = ?d.stored,
+                    "export_features(derived): no track pointer — {outcome}"
+                ),
+                DerivationFallbackReason::Unresolved(e) => tracing::warn!(
+                    feature = %d.feature,
+                    stored = ?d.stored,
+                    err = %e,
+                    "export_features(derived): track unresolved — {outcome}"
+                ),
+                DerivationFallbackReason::Undetermined(e) => tracing::warn!(
+                    feature = %d.feature,
+                    stored = ?d.stored,
+                    err = %e,
+                    "export_features(derived): structure status undeterminable — {outcome}"
+                ),
+                // `DerivationFallbackReason` est #[non_exhaustive] : toute variante future
+                // reste VISIBLE (warn), jamais silencieuse.
+                other => tracing::warn!(
+                    feature = %d.feature,
+                    stored = ?d.stored,
+                    reason = ?other,
+                    "export_features(derived): derivation failure — {outcome}"
+                ),
+            }
+        }
+        out.entries
+    } else {
+        project_map_feature_entries(&notes, opts)
+    };
+
+    Ok(Json(entries))
+}
+
+/// Query parameters de `GET /api/v1/project-map/cards`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListCardsQuery {
+    /// Filtre optionnel par **version**. Accepte `2.1.0` ou `v2.1.0` (le préfixe `v` est
+    /// normalisé). Une carte de travail matche si son `[[track:]]` vise cette version ; une carte
+    /// de structure (ROADMAP/BACKLOG) matche si son propre `[[version:]]` la porte — le listing
+    /// d'un jalon inclut donc sa propre carte de structure (F-211). Absent = toutes les cartes.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// `GET /api/v1/project-map/cards?version=<v>`
+///
+/// Listage sanctionné des cartes project-map en **une seule requête**, tous axes d'identification
+/// **nommés** (F-211, supersedes F-253). Résout le manque de longue date : il n'existait aucune
+/// voie sanctionnée pour lister les cartes d'un jalon — cela passait par un export + filtre manuel
+/// ou par l'« oracle de sous-chaîne faux » (recherche d'une chaîne de version).
+///
+/// Rend, par carte (travail **et** structure) : identifiant (ULID), numéro `F-XX`, statut, type,
+/// release (dérivé du `[[track:]]` — jamais le stocké retiré), version, visibilité,
+/// titre, et les rôles de dépendance (`supersedes`, `parent`, `track`). Contrairement à
+/// [`export_features`] (miroir-site, `FEATURE`-only, axes pauvres), ce listing **n'applique aucun
+/// filtre miroir** : chaque carte du périmètre est rendue avec chaque axe exposé, pour qu'un
+/// appelant filtre sur les colonnes **nommées** plutôt que sur un prédicat caché (criteria 7, 8).
+///
+/// ## Contrat
+///
+/// | Méthode | Path | Auth | Query | Réponse |
+/// |---------|------|------|-------|---------|
+/// | GET | `/api/v1/project-map/cards` | Bearer JWT (Read) | `version` (str, opt) | `200` — `[ProjectMapCardEntry]` |
+///
+/// Tri : cartes de structure d'abord, puis cartes de travail par `F-XX` croissant (égalités par
+/// ULID). Une version inexistante rend `[]`. Une carte de travail au `[[track:]]` irrésolu est
+/// listée avec `release: null` (le null est le signal visible de l'anomalie, jamais un drop).
+///
+/// # Errors
+///
+/// - `401 Unauthorized` : requête non authentifiée.
+/// - `403 Forbidden` : ACL Read refusée sur `main/project-map`.
+/// - `500 Internal Server Error` : erreur de stockage index.
+pub async fn list_cards(
+    State(state): State<AppState>,
+    Extension(trust): Extension<TrustContext>,
+    Query(params): Query<ListCardsQuery>,
+) -> Result<Json<Vec<ProjectMapCardEntry>>, StatusCode> {
+    if !trust.is_authenticated() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let vault =
+        crate::api_v1::tenant_guard::resolve_read_vault(&state, &trust, target_vault(), SECTION)
+            .await?;
+
+    tracing::debug!(
+        version = ?params.version,
+        "list_cards: access granted"
+    );
+
+    let all_records = fetch_all_project_map_records(&state, vault.as_str(), "list_cards").await?;
+
+    // Filtre garbage (parité CLI admin, identique à export_features) : list_notes exclut
+    // `downgraded` mais pas `garbage`. On aligne pour que le décompte rendu égale le périmètre
+    // (criterion 5). Triples `(id, body, title)` — l'ULID est requis pour l'axe identifiant.
+    let notes: Vec<(String, String, String)> = all_records
+        .into_iter()
+        .filter(|r| r.status != "garbage")
+        .map(|r| (r.id, r.body_text, r.title.unwrap_or_default()))
+        .collect();
+
+    let entries = project_map_card_index(&notes, params.version.as_deref(), Some("gradatum"));
 
     Ok(Json(entries))
 }

@@ -7,6 +7,7 @@
 //! | Method | Path | ACL | Handler |
 //! |--------|------|-----|---------|
 //! | GET | `/project-map/export-features` | Read | [`project_map::export_features`] |
+//! | GET | `/project-map/cards` | Read | [`project_map::list_cards`] |
 //!
 //! # Read routes
 //!
@@ -216,6 +217,12 @@ pub fn router() -> Router<AppState> {
             "/project-map/export-features",
             get(project_map::export_features),
         )
+        // ── F-211 project-map listing — GET fixe, auth Read ──────────────────
+        //
+        // Listage sanctionné des cartes d'un jalon en une requête, tous axes nommés
+        // (numéro, id, statut, kind, release dérivé, version, visibilité, rôles).
+        // Filtre optionnel `?version=`. Route entièrement fixe (fixed-before-parametric).
+        .route("/project-map/cards", get(project_map::list_cards))
         // ── Création de carte-feature à numéro serveur — POST fixe, auth Write ──
         //
         // Le serveur alloue le `F-XX`, l'injecte, et enqueue la carte (le client ne fournit

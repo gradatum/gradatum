@@ -2419,6 +2419,279 @@ pub enum FeatureWriteAuthority {
     ServerAllocated,
 }
 
+// ── F-184 : résolution du rôle `track` au write-path (hors validate_links) ──────
+//
+// `validate_links` ne voit qu'un corps, pas le registre : les contrôles d'existence et de
+// `kind` de la cible d'un `[[track:]]` vivent donc ici. La résolution s'appuie sur les
+// méthodes d'index EXISTANTES (`list_notes_filtered` sur `role_kind`, colonne 0043 déjà
+// dérivée par `roles_of_body`, qui reconnaît désormais ROADMAP/BACKLOG) — aucune colonne ni
+// migration nouvelle n'est requise pour la Phase 2.
+
+/// Issue de la résolution d'une cible `[[track:<project>/<target>]]` contre le registre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackResolution {
+    /// Une carte de STRUCTURE (ROADMAP/BACKLOG) porte `[[version:<project>/<target>]]`.
+    Structure,
+    /// Aucune carte de structure, mais une carte de travail porte cette version.
+    WorkCardOnly,
+    /// Aucune carte ne porte cette version.
+    NotFound,
+}
+
+/// `true` si le corps porte `[[version:<want>]]` (want = `"project/version"`).
+fn card_carries_version(body: &str, want: &str) -> bool {
+    for t in gradatum_curator::wikilinks::extract_wikilinks(body) {
+        if let Ok(gradatum_core::project_map::ProjectMapLink::Version { project, version }) =
+            gradatum_core::project_map::parse_link(&t)
+            && format!("{project}/{version}") == want
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `true` si le corps porte `[[track:<want>]]` (want = `"project/target"`).
+fn card_carries_track(body: &str, want: &str) -> bool {
+    for t in gradatum_curator::wikilinks::extract_wikilinks(body) {
+        if let Ok(gradatum_core::project_map::ProjectMapLink::Track { project, target }) =
+            gradatum_core::project_map::parse_link(&t)
+            && format!("{project}/{target}") == want
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `true` si une carte de structure (ROADMAP puis BACKLOG) porte `[[version:<want>]]`.
+///
+/// Chemin RAPIDE — un filtre `role_kind` (index 0043) borne le scan aux ~30 cartes de
+/// structure. Utilisé par l'injection (déliv. 8) et par le chemin rapide de
+/// [`resolve_track_target`].
+async fn is_structure_target(
+    state: &AppState,
+    tenant: &str,
+    want: &str,
+) -> Result<bool, GradatumError> {
+    for kind_wire in ["ROADMAP", "BACKLOG"] {
+        let mut cursor: Option<String> = None;
+        loop {
+            let (recs, _) = state
+                .search
+                .list_notes_filtered(
+                    tenant,
+                    Some("project-map"),
+                    Some(kind_wire),
+                    None,
+                    200,
+                    cursor.as_deref(),
+                )
+                .await?;
+            let n = recs.len();
+            if recs
+                .iter()
+                .any(|r| card_carries_version(&r.body_text, want))
+            {
+                return Ok(true);
+            }
+            if n < 200 {
+                break;
+            }
+            cursor = recs.last().map(|r| r.id.clone());
+        }
+    }
+    Ok(false)
+}
+
+/// Résout `want` (`"project/target"`) en distinguant structure / carte de travail / absence.
+///
+/// Le chemin LENT (scan complet project-map) ne s'exécute qu'en cas de rejet, pour
+/// distinguer « cible = carte de travail » (preuve #5) de « cible inexistante » (preuve #4).
+async fn resolve_track_target(
+    state: &AppState,
+    tenant: &str,
+    want: &str,
+) -> Result<TrackResolution, GradatumError> {
+    if is_structure_target(state, tenant, want).await? {
+        return Ok(TrackResolution::Structure);
+    }
+    let mut cursor: Option<String> = None;
+    loop {
+        let (recs, _) = state
+            .search
+            .list_notes_filtered(
+                tenant,
+                Some("project-map"),
+                None,
+                None,
+                200,
+                cursor.as_deref(),
+            )
+            .await?;
+        let n = recs.len();
+        if recs
+            .iter()
+            .any(|r| card_carries_version(&r.body_text, want))
+        {
+            return Ok(TrackResolution::WorkCardOnly);
+        }
+        if n < 200 {
+            break;
+        }
+        cursor = recs.last().map(|r| r.id.clone());
+    }
+    Ok(TrackResolution::NotFound)
+}
+
+/// Contrôles write-path (a)+(b) F-184 pour un `[[track:]]` EXPLICITE.
+///
+/// - (b) `track.project == card.project` (même famille que `VersionProjectMismatch`) —
+///   sans lui une carte `project:system` rattachée à une ROADMAP publique de gradatum
+///   satisfait mécaniquement les deux prédicats d'export.
+/// - (a) existence + `kind` de la cible — verrou §3.3 : un pointeur non résolvable est un
+///   ÉCHEC BLOQUANT, jamais un silence.
+///
+/// Ne s'applique qu'au track fourni par le client : le track injecté (déliv. 8) est déjà
+/// prouvé résolvable avant injection.
+async fn enforce_explicit_track(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant: &str,
+    locus: &str,
+    request_id: &str,
+    targets: &[String],
+) -> Result<(), GradatumError> {
+    use gradatum_core::project_map::ProjectMapLink;
+    let links: Vec<ProjectMapLink> = targets
+        .iter()
+        .filter_map(|t| gradatum_core::project_map::parse_link(t).ok())
+        .collect();
+    let card_project = links.iter().find_map(|l| match l {
+        ProjectMapLink::Project(p) => Some(p.as_str()),
+        _ => None,
+    });
+    let Some((tp, tt)) = links.iter().find_map(|l| match l {
+        ProjectMapLink::Track { project, target } => Some((project.as_str(), target.as_str())),
+        _ => None,
+    }) else {
+        return Ok(()); // pas de track explicite → rien à contrôler
+    };
+
+    // (b) track.project == card.project.
+    if card_project != Some(tp) {
+        emit_write_rejection_audit(
+            state,
+            trust,
+            tenant,
+            locus,
+            request_id,
+            "rejected_400_project_map_track_project_mismatch",
+            None,
+        )
+        .await;
+        return Err(GradatumError::InvalidInput(format!(
+            "project-map: track project {tp:?} ≠ card project {:?} — a card may only attach \
+             to a structure card of its own project",
+            card_project.unwrap_or("")
+        )));
+    }
+
+    // (a) existence + kind de la cible.
+    let want = format!("{tp}/{tt}");
+    match resolve_track_target(state, tenant, &want).await? {
+        TrackResolution::Structure => Ok(()),
+        TrackResolution::WorkCardOnly => {
+            emit_write_rejection_audit(
+                state,
+                trust,
+                tenant,
+                locus,
+                request_id,
+                "rejected_400_project_map_track_not_structure",
+                None,
+            )
+            .await;
+            Err(GradatumError::InvalidInput(format!(
+                "project-map: track target {want:?} resolves to a work card, not a \
+                 ROADMAP/BACKLOG — attach only to a structure card"
+            )))
+        }
+        TrackResolution::NotFound => {
+            emit_write_rejection_audit(
+                state,
+                trust,
+                tenant,
+                locus,
+                request_id,
+                "rejected_400_project_map_track_not_found",
+                None,
+            )
+            .await;
+            Err(GradatumError::InvalidInput(format!(
+                "project-map: track target {want:?} does not resolve to any structure card \
+                 (non-derivable pointer — §3.3 lock; create the ROADMAP/BACKLOG first)"
+            )))
+        }
+    }
+}
+
+/// Identité `(project, target)` d'une carte de STRUCTURE (ROADMAP/BACKLOG), ou `None`.
+///
+/// L'identité qu'un `[[track:]]` résout est le `[[version:]]` de la carte de structure
+/// (ROADMAP : `project/x.y.z` ; BACKLOG : `project/backlog`). Renvoie `None` pour une carte
+/// de travail — le contrôle (c) est SCOPÉ aux seules cartes de structure.
+fn structure_card_identity(body: &str) -> Option<(String, String)> {
+    use gradatum_core::project_map::ProjectMapLink;
+    let links: Vec<ProjectMapLink> = gradatum_curator::wikilinks::extract_wikilinks(body)
+        .iter()
+        .filter_map(|t| gradatum_core::project_map::parse_link(t).ok())
+        .collect();
+    let is_structure = links
+        .iter()
+        .any(|l| matches!(l, ProjectMapLink::Kind(k) if k.is_structure()));
+    if !is_structure {
+        return None;
+    }
+    links.iter().find_map(|l| match l {
+        ProjectMapLink::Version { project, version } => Some((project.clone(), version.clone())),
+        _ => None,
+    })
+}
+
+/// `true` si une carte project-map porte `[[track:<want>]]` (want = `"project/target"`).
+///
+/// Scan complet project-map (chemin froid de gouvernance — la rétrogradation est rare).
+async fn structure_has_children(
+    state: &AppState,
+    tenant: &str,
+    want: &str,
+) -> Result<bool, GradatumError> {
+    let mut cursor: Option<String> = None;
+    loop {
+        let (recs, _) = state
+            .search
+            .list_notes_filtered(
+                tenant,
+                Some("project-map"),
+                None,
+                None,
+                200,
+                cursor.as_deref(),
+            )
+            .await?;
+        let n = recs.len();
+        if recs.iter().any(|r| card_carries_track(&r.body_text, want)) {
+            return Ok(true);
+        }
+        if n < 200 {
+            break;
+        }
+        cursor = recs.last().map(|r| r.id.clone());
+    }
+    Ok(false)
+}
+
 /// Logique métier de `POST /api/v1/vault_write`.
 ///
 /// ACL Write + audit + optimistic-lock (F-41) + enqueue job curate. Sur `project-map`, une
@@ -2499,8 +2772,34 @@ pub async fn vault_write_impl(
     // Les 11 autres sections : aucune validation (inchangé).
     // Validateur DÉDIÉ (spec §16 D1) — ne réveille pas F-38.
     if req.section_hint.as_deref() == Some("project-map") {
+        // ── F-184 déliv. 8 — injection serveur du rôle track ────────────────────
+        // Le corps d'une carte est construit CÔTÉ CLIENT et les verbes RMW de gov-todo le
+        // réécrivent ENTIER en ne recopiant que l'identité : sans injection serveur une
+        // mutation efface le pointeur → carte non dérivable → disparaît de tout export SANS
+        // erreur (§3.3). Le serveur re-dérive le track du [[version:]] encore présent et ne
+        // l'injecte QUE s'il résout vers une carte de structure existante — ainsi une
+        // écriture vivante avant la Phase 3 (aucune ROADMAP encore) n'est jamais cassée.
+        let has_explicit_track = gradatum_curator::wikilinks::extract_wikilinks(&req.body)
+            .iter()
+            .any(|t| {
+                matches!(
+                    gradatum_core::project_map::parse_link(t),
+                    Ok(gradatum_core::project_map::ProjectMapLink::Track { .. })
+                )
+            });
+        if !has_explicit_track
+            && let Some(want) = gradatum_core::project_map::derivable_track_target(&req.body)
+            && is_structure_target(state, &tenant, &want).await?
+        {
+            req.body = format!("{}\n\n[[track:{want}]]", req.body);
+        }
+
+        // Validation de schéma (voit le track injecté ci-dessus). F-213 : validation sur le CORPS
+        // brut (`validate_card_body`) — extraction zone-structurelle (rôles en prose/fence non
+        // comptés), rejet des rôles inconnus/malformés, cohérence release/version. `targets`
+        // (extraction plein-corps) reste calculé pour `enforce_explicit_track` ci-dessous.
         let targets = gradatum_curator::wikilinks::extract_wikilinks(&req.body);
-        if let Err(schema_err) = gradatum_core::project_map::validate_links_from_targets(&targets) {
+        if let Err(schema_err) = gradatum_core::project_map::validate_card_body(&req.body) {
             emit_write_rejection_audit(
                 state,
                 trust,
@@ -2515,6 +2814,26 @@ pub async fn vault_write_impl(
                 "project-map schema: {schema_err}"
             )));
         }
+
+        // Contrôles write-path (a)+(b) pour un track EXPLICITE (fourni par le client). Un
+        // track injecté ci-dessus est déjà prouvé résolvable → non re-contrôlé.
+        if has_explicit_track {
+            enforce_explicit_track(state, trust, &tenant, &locus, request_id, &targets).await?;
+        }
+
+        // ── F-247 — dérivation du titre canonique (création ET mise à jour) ──────
+        // Le serveur possède déjà tout ce qu'il faut (section → `[PROJECT-MAP]`, rôle
+        // `[[project:]]`, axe version via `[[track:]]`/`[[version:]]`) : le titre est
+        // DÉRIVABLE, pas seulement vérifiable. On DÉRIVE plutôt que de rejeter (F-247 :
+        // rejeter renvoie la charge sur l'appelant ; une dérivation est invisible et juste).
+        //
+        // Point d'insertion partagé avec la garde de cohérence des rôles : les deux
+        // s'appliquent au même moment, à chaque écriture project-map. En re-dérivant à CHAQUE
+        // écriture depuis les rôles COURANTS (track injecté ci-dessus inclus), le suffixe
+        // « suit un changement de version » automatiquement — sans dépendre d'une opération
+        // de mutation de rôle dédiée (F-153, différée 2.3.0). Idempotent : un titre déjà
+        // conforme est inchangé à l'octet.
+        req.title = gradatum_core::project_map::derive_canonical_title(&req.body, &req.title);
     }
 
     // ── Validation section `identity` (F-34 v0.7.3, A1/C2/C6) ──────────────────
@@ -3499,6 +3818,29 @@ pub async fn vault_downgrade_impl(
         })
         .transpose()?;
 
+    // ── F-184 contrôle (c) — RESTRICT symétrique (C11) ──────────────────────────
+    // Refuser de rétrograder une carte de STRUCTURE (ROADMAP/BACKLOG) qui a des enfants
+    // (cartes pointant vers elle via [[track:]]) : sinon le mécanisme d'annulation de la
+    // Phase 3 fabrique des pointeurs pendants. SCOPÉ aux cartes de structure — rétrograder
+    // une carte de travail référencée (parent/backport) reste permis (réparation).
+    //
+    // FAIL-SAFE : toute défaillance de lecture (vault non résolu, note absente/cross-vault)
+    // ⇒ on SAUTE ce contrôle et laisse le chemin `downgrade_note` ci-dessous rendre son
+    // verdict. Ne jamais propager ici : cela perturberait l'oracle fail-closed C3a (une
+    // cible cross-vault ou inexistante DOIT rester un 404 indistinguable — EX-C3a P0).
+    if let Ok(reader) = read_back_reader(state, tenant)
+        && let Ok(existing) = reader.read_note_by_id(&req.note_id).await
+        && let Some((proj, target)) = structure_card_identity(&existing.body.markdown)
+    {
+        let want = format!("{proj}/{target}");
+        if structure_has_children(state, tenant, &want).await? {
+            return Err(GradatumError::InvalidInput(format!(
+                "project-map: cannot downgrade structure card {want} — it still has children \
+                 pointing at it via [[track:]] (RESTRICT; detach or downgrade them first)"
+            )));
+        }
+    }
+
     // C3a (EX-C3a P0) : la mutation par ULID est épinglée au vault dont l'ACL Write vient
     // d'être vérifiée (`tenant`) — cross-vault → `NoteNotFound` (fail-closed, pas d'oracle).
     let checked =
@@ -3730,10 +4072,11 @@ pub async fn create_feature_card_impl(
     }
 
     // (3) Pré-validation schéma avec un feature SYNTHÉTIQUE : attrape un corps incomplet
-    // AVANT d'allouer (un numéro n'est brûlé que si la carte est réellement enqueue).
-    let mut precheck = targets;
-    precheck.push("feature:F-00".to_string());
-    gradatum_core::project_map::validate_links_from_targets(&precheck)
+    // AVANT d'allouer (un numéro n'est brûlé que si la carte est réellement enqueue). F-213 :
+    // validation sur le CORPS (`validate_card_body`) — le feature synthétique est injecté comme
+    // ligne structurelle finale, exactement comme le vrai feature le sera à l'étape (5).
+    let precheck_body = format!("{}\n\n[[feature:F-00]]", req.body);
+    gradatum_core::project_map::validate_card_body(&precheck_body)
         .map_err(|e| GradatumError::InvalidInput(format!("project-map schema: {e}")))?;
 
     // (4) Allocation atomique du numéro sur le vault résolu.

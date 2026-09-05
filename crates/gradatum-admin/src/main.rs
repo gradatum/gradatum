@@ -497,6 +497,17 @@ enum ProjectMapCmd {
         /// Default: mirror the public website, which excludes both.
         #[arg(long, default_value_t = false)]
         include_dropped: bool,
+        /// Opt out of the derived projection and read the stored `[[release:]]`/`[[version:]]` axis.
+        ///
+        /// Since the irreversible removal of the stored axis on work cards, the export
+        /// **derives** `release` and `version` from each card's `[[track:]]` pointer by default —
+        /// keeping the CLI byte-identical to `GET /api/v1/project-map/export-features` on the same
+        /// DB (the CLI↔HTTP parity invariant). Passing `--stored` selects the legacy stored path,
+        /// which is de facto empty post-retrait; retained for compat/diagnostic. Cards whose release
+        /// cannot be derived fall back to the stored value (or are skipped absent it) and are
+        /// reported to stderr — never silently dropped.
+        #[arg(long = "stored", action = clap::ArgAction::SetFalse)]
+        derived: bool,
     },
     /// Back-fills project-map feature cards from a `features.ts` catalogue (idempotent).
     ///
@@ -1218,10 +1229,39 @@ async fn main() -> anyhow::Result<()> {
                 root,
                 vault,
                 include_dropped,
+                derived,
             } => {
-                use gradatum_admin::project_map_export::{ExportOptions, export_features};
+                use gradatum_admin::project_map_export::{
+                    ExportOptions, export_features, export_features_derived,
+                };
                 let opts = ExportOptions { include_dropped };
-                let features = export_features(&root, &vault, opts).await?;
+                let features = if derived {
+                    let out = export_features_derived(&root, &vault, opts).await?;
+                    // Échec de dérivation : VISIBLE sur stderr, jamais silencieux (P2-A).
+                    // `stored: Some(..)` = repli sur le stocké ; `None` = carte IGNORÉE (ni
+                    // dérivable ni stockée — anomalie de registre post-retrait).
+                    for d in &out.diagnostics {
+                        match &d.stored {
+                            Some(stored) => eprintln!(
+                                "[derive_release] {} : fell back to stored release {stored:?} — {:?}",
+                                d.feature, d.reason
+                            ),
+                            None => eprintln!(
+                                "[derive_release] {} : SKIPPED — neither derivable nor stored — {:?}",
+                                d.feature, d.reason
+                            ),
+                        }
+                    }
+                    if !out.diagnostics.is_empty() {
+                        eprintln!(
+                            "[derive_release] {} non-derivable card(s) (fell back to stored or skipped).",
+                            out.diagnostics.len()
+                        );
+                    }
+                    out.entries
+                } else {
+                    export_features(&root, &vault, opts).await?
+                };
                 // Sérialisation JSON sur stdout (opérateur redirige ou pipe vers CI).
                 let json = serde_json::to_string_pretty(&features)
                     .context("export-features JSON serialization")?;

@@ -12,10 +12,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-gradatum-core      = { path = "../gradatum-core", version = "2.1.0" }
+gradatum-core      = { path = "../gradatum-core", version = "2.2.0" }
 # gradatum-db-sqlite is publishable (no `publish` key); this dependency does not block
 # publication of gradatum-queue.
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.1.0" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.2.0" }
 # P2.0b dependencies (rusqlite-based async Queue trait + SqliteQueue)
 async-trait   = { workspace = true }
 chrono        = { workspace = true }
