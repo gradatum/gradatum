@@ -21,6 +21,8 @@ default = []
 [dependencies]
 # Workspace crates
 gradatum-core    = { workspace = true }
+gradatum-dto     = { workspace = true }
+gradatum-heartbeat = { workspace = true }
 gradatum-embed   = { workspace = true }
 gradatum-search  = { workspace = true }
 

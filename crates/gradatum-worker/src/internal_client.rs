@@ -83,6 +83,13 @@ pub struct NoteReadDto {
     pub body: String,
     /// Section in kebab-case.
     pub section: String,
+    /// Canonical note title (body H1), or `None` when absent.
+    ///
+    /// F-125 inv. 9: lets `handle_forget` apply the path-aware `identity/person/*`
+    /// carve-out. `#[serde(default)]` keeps deserialization tolerant of servers
+    /// that predate the field (absent → `None` → fail-closed for identity).
+    #[serde(default)]
+    pub title: Option<String>,
     /// Status in kebab-case.
     pub status: String,
     /// Tags.

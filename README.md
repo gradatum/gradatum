@@ -184,6 +184,8 @@ Gradatum is built in three chapters: **memory first, then agents, then the sover
 | **v1.0.0** | ✅ shipped | First stable release. Multi-tenant / multi-vault isolation foundation, multi-user identity, per-note usage salience, reversible delete (on-demand delete archives the note, registry-driven retention GC, operator-only restore), FR→EN **user-facing** string migration complete (runtime literals, CLI, HTTP API) — internal rustdoc migration deferred to a `1.x` minor, SemVer strict from here. |
 | **v2.0.0** *(Alluvium)* | ✅ shipped | Identity is strictly credential-derived — no default identity, no client-declared `author`, no silent fallback — closing the `1.x` line. Vault storage on an S3-compatible object backend as an alternative to local filesystem, notes written in plaintext with no encryption applied by gradatum itself — see [SECURITY.md § Privacy posture](SECURITY.md#privacy-posture); the network-filesystem startup restriction is removed. Link-edge reconciliation (`gradatum-admin repair-note-links`), Docker deployment, workspace dependency refresh. |
 | **v2.1.0** | ✅ shipped | SemVer since v1.0.0, with documented exceptions. v2.1.0 is a minor release that removes public API surface in four crates (`gradatum-core`, `gradatum-engine`, `gradatum-index`, `gradatum-queue`); every removal is inventoried in the release manifest and matched against the previous release in CI. sqlx retired from the entire workspace dependency graph — replaced by rusqlite in the auth, ACL, and job-queue stores; SQLite engine `3.46.0` → `3.53.2`. Legacy `jobs_v2` queue path removed; `compute_distill_trust` moved to the new `gradatum-distill` crate. Read the [2.0.0 → 2.1.0 upgrade guide](docs/UPGRADING-2.0.0-to-2.1.0.md) before moving. |
+| **v2.2.0** | ✅ shipped | The `project-map` registry write contract changes: a version milestone becomes a structure card and `release` is no longer stored but derived server-side from card status. The Rust public API is additive only (80 additions, 0 removals, all under `#[non_exhaustive]`), so the breaking changes affect `project-map` registry operators, not library consumers. Read the [2.1.0 → 2.2.0 upgrade guide](docs/UPGRADING-2.1.0-to-2.2.0.md) before moving. |
+| **v2.3.0** | ✅ shipped | First slice of agent-identity data — person cards under `identity/person/*` — plus durable inter-agent messaging, an in-memory fleet registry fed by a token-authenticated heartbeat ingress, a typed `project-map` role-mutation endpoint, and multi-vault search. Three deliberate, minor-scoped Rust public-API breaks: `Job` becomes `#[non_exhaustive]`, `derive_release` is no longer public, and `EngineConfig::warm_up` is removed. |
 | — | ⬜ planned | Agent runtime — terminal agent that reasons over the codebase using the vault as its memory. No version is committed to it yet. |
 
 > **What the Status column means.** ✅ *shipped* = the milestone is complete in this repository
@@ -203,6 +205,21 @@ Gradatum is built in three chapters: **memory first, then agents, then the sover
 Condensed — the authoritative, detailed log for every version lives in
 **[CHANGELOG.md](CHANGELOG.md)**.
 
+- **v2.3.0** — First slice of agent-identity data: **person cards** (`identity/person/*`) record
+  structured, non-executable information about a human under a strict field whitelist, with GDPR
+  Article 9 markers refused and two categories (`self`, `private`) open for writes. Durable,
+  single-target **inter-agent messaging** over SSE (`message_send` / `message_poll` /
+  `message_ack`); an in-memory **fleet registry** fed by a token-authenticated, rate-limited
+  heartbeat ingress; a typed `vault_mutate_role` endpoint for the `project-map` registry; and
+  **multi-vault search** (`vault_ids` / `all_readable`, reciprocal-rank-fused). Three
+  minor-scoped Rust public-API breaks — `Job` is `#[non_exhaustive]`, `derive_release` is no
+  longer public, `EngineConfig::warm_up` is removed.
+- **v2.2.0** — The `project-map` registry write contract changes: a version milestone becomes a
+  structure card (`[[kind:ROADMAP]]` / `[[kind:BACKLOG]]`) and `release` is no longer stored but
+  derived server-side from card status. The Rust public API is additive only — 80 additions, 0
+  removals, all under `#[non_exhaustive]` — so breaking changes affect `project-map` registry
+  operators, not library consumers. See
+  [docs/UPGRADING-2.1.0-to-2.2.0.md](docs/UPGRADING-2.1.0-to-2.2.0.md).
 - **v2.1.0** — SemVer since v1.0.0, with documented exceptions: this minor release removes
   public API surface in four crates (`gradatum-core`, `gradatum-engine`, `gradatum-index`,
   `gradatum-queue`), each removal inventoried in the release manifest and matched against the
@@ -231,7 +248,7 @@ Condensed — the authoritative, detailed log for every version lives in
   scoring); agent identity injection via MCP `initialize`; curated metrics timeseries with
   Studio charts; deterministic distill quality gate.
 
-See [CHANGELOG.md](CHANGELOG.md) `[2.1.0]`, `[2.0.0]`, `[1.0.0]`, `[0.7.6]` for the full field-by-field
+See [CHANGELOG.md](CHANGELOG.md) `[2.3.0]`, `[2.2.0]`, `[2.1.0]`, `[2.0.0]`, `[1.0.0]`, `[0.7.6]` for the full field-by-field
 detail, including every breaking change and deprecation.
 
 ---

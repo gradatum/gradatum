@@ -58,13 +58,14 @@ Configure in your MCP host:
 | Category | Tools |
 |---|---|
 | Read | `vault_search`, `vault_read`, `vault_list`, `vault_status`, `vault_graph`, `vault_links`, `vault_trace`, `vault_context`, `vault_timeline`, `vault_authors`, `vault_tags` |
-| Write | `vault_write`, `create_feature_card`, `vault_classify`, `vault_downgrade` |
+| Write | `vault_write`, `create_feature_card`, `vault_mutate_role`, `vault_classify`, `vault_downgrade` |
 | History | `vault_history`, `vault_history_get`, `vault_restore`, `vault_diff` |
 | Archives | `vault_archives_list` |
 | Forget | `vault_forget` |
 | Lessons Recall | `vault_lessons_recall` |
 | Code Scope | `code_scope` |
 | Proactive Recall | `vault_proactive_recall`, `vault_proactive_recall_feedback` |
+| Messaging (F-144) | `message_send`, `message_poll`, `message_ack` |
 
 The table above is a guide to the categories, not a contract. The stub proxies the
 tools it declares at `tools/list`; that response is authoritative for a given build,

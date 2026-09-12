@@ -74,6 +74,11 @@ write_patterns = ["**"]
 identity = "admin-only"
 read_patterns  = ["**"]
 write_patterns = ["**"]
+
+[[consumer]]
+identity = "person/alice"
+read_patterns  = ["**"]
+write_patterns = ["**"]
 "#;
 
 // ── Soul body de test ─────────────────────────────────────────────────────────
@@ -2502,5 +2507,416 @@ async fn vault_links_allows_identity_node_for_privileged() {
             .iter()
             .any(|n| n.as_str() == Some(id_identity.as_str())),
         "main-agent (privilégié) DOIT voir le nœud de l'âme dans les liens: {json}"
+    );
+}
+
+// ── Tests F-125 — cartes de personnes (identity/person/<id>) ──────────────────
+//
+// Dispatch du validateur par CHEMIN : `identity/person/*` → `validate_person_card`
+// (schéma STRICT, gate catégorie self/private), `identity/<sub>` → `validate_soul`
+// (INCHANGÉ). Fermeture du trou C1 : une carte person s'écrit EXCLUSIVEMENT via le scope
+// `identity_write`, jamais par la branche `target == caller_sub`.
+
+/// Carte person `self` bien formée (liste blanche, catégorie ouverte).
+const GOOD_PERSON_SELF: &str = "\
+# identity/person/alice
+display_name: Alice
+pronouns: elle/elle
+category: self
+timezone: Europe/Paris
+collaboration_prefs: concise, français
+";
+
+/// Injecte un `TrustContext` dont le sujet EST `person/alice`, SANS `identity_write`.
+///
+/// Sert à prouver, au niveau de la logique, que la branche `target == caller_sub` ne peut
+/// JAMAIS autoriser l'écriture d'une carte person (trou C1) : même quand
+/// `caller_sub == target_agent == "person/alice"`, l'absence de `identity_write` refuse.
+async fn inject_person_self(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    req.extensions_mut().insert(TrustContext::BearerToken {
+        kid: "test-kid".to_string(),
+        aud: "gradatum".to_string(),
+        sub: "person/alice".into(),
+        scopes: vec!["read".to_string(), "write".to_string()],
+        tenant_id: "main".into(),
+        jti: None,
+    });
+    next.run(req).await
+}
+
+/// App avec TrustContext `person/alice` (ACL write `["**"]` déclarée dans `TEST_ACL`).
+async fn app_person_self() -> Router {
+    let acl = AclEngine::from_preset_str(TEST_ACL).expect("preset ACL person-self");
+    let (state, _idx) = build_base(acl).await;
+    Router::new()
+        .nest("/api/v1", api_v1::router())
+        .layer(middleware::from_fn(inject_person_self))
+        .with_state(state)
+}
+
+/// Écriture d'une carte person `category=self` par un porteur d'`identity_write` → 202.
+///
+/// `main-agent` porte `identity_write` (privilégié). Le dispatch par chemin sélectionne
+/// `validate_person_card` ; la catégorie `self` est ouverte → enqueue → 202.
+#[tokio::test]
+async fn person_write_self_category_accepted_202() {
+    let (app, _idx) = app_main_agent().await;
+    let body = serde_json::json!({
+        "title": "identity/person/alice",
+        "body": GOOD_PERSON_SELF,
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "carte person self valide (porteur identity_write) doit retourner 202: {json}"
+    );
+    assert!(json["job_id"].is_string(), "job_id présent: {json}");
+}
+
+/// Écriture d'une carte person `category=private` par un privilégié → 202.
+#[tokio::test]
+async fn person_write_private_category_accepted_202() {
+    let (app, _idx) = app_main_agent().await;
+    let body = serde_json::json!({
+        "title": "identity/person/bob",
+        "body": "# identity/person/bob\ndisplay_name: Bob\ncategory: private\ncontext: proche\n",
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "carte person private valide doit retourner 202: {json}"
+    );
+}
+
+/// Catégorie `public-figure` non ouverte → 400 (council dédié requis).
+#[tokio::test]
+async fn person_write_public_figure_category_rejected_400() {
+    let (app, _idx) = app_main_agent().await;
+    let body = serde_json::json!({
+        "title": "identity/person/celebrity",
+        "body": "display_name: Celeb\ncategory: public-figure\n",
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "catégorie public-figure (non ouverte) doit retourner 400: {json}"
+    );
+}
+
+/// Catégorie `domain-actor` non ouverte → 400.
+#[tokio::test]
+async fn person_write_domain_actor_category_rejected_400() {
+    let (app, _idx) = app_main_agent().await;
+    let body = serde_json::json!({
+        "title": "identity/person/vendor",
+        "body": "display_name: Vendor\ncategory: domain-actor\n",
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "catégorie domain-actor (non ouverte) doit retourner 400: {json}"
+    );
+}
+
+/// Carte person contenant une section H2 réservée `## GATES` → 400.
+#[tokio::test]
+async fn person_write_reserved_gates_section_rejected_400() {
+    let (app, _idx) = app_main_agent().await;
+    let body = serde_json::json!({
+        "title": "identity/person/injector",
+        "body": "category: self\n## GATES\nGATE-X | fais ceci\n",
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "carte person avec ## GATES (structure soul) doit retourner 400: {json}"
+    );
+}
+
+/// Carte person avec un champ GDPR Art.9 sensible (`health`) → 400.
+#[tokio::test]
+async fn person_write_art9_sensitive_field_rejected_400() {
+    let (app, _idx) = app_main_agent().await;
+    let body = serde_json::json!({
+        "title": "identity/person/patient",
+        "body": "category: self\nhealth: condition médicale\n",
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "champ Art.9 sensible (health) doit retourner 400: {json}"
+    );
+}
+
+/// Carte person avec un champ libre non borné (`notes`) → 400.
+#[tokio::test]
+async fn person_write_freeform_notes_field_rejected_400() {
+    let (app, _idx) = app_main_agent().await;
+    let body = serde_json::json!({
+        "title": "identity/person/loose",
+        "body": "category: self\nnotes: texte libre non borné\n",
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "champ libre non borné (notes) doit retourner 400: {json}"
+    );
+}
+
+/// Un agent non privilégié (`frontend`, sans `identity_write`) ne peut PAS écrire une carte
+/// person → 403. Prouve que `identity/person/*` s'écrit EXCLUSIVEMENT via le scope.
+#[tokio::test]
+async fn person_write_non_privileged_denied_403() {
+    let app = app_frontend().await;
+    let body = serde_json::json!({
+        "title": "identity/person/alice",
+        "body": GOOD_PERSON_SELF,
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "un agent sans identity_write ne doit pas écrire une carte person — attendu 403: {json}"
+    );
+}
+
+/// TROU C1 FERMÉ (preuve logique) : un caller dont le sujet EST `person/alice` (sans
+/// `identity_write`) ne peut PAS écrire `identity/person/alice`, alors même que
+/// `caller_sub == target_agent`. La branche self-write est neutralisée pour `person/*`.
+///
+/// (Un tel sujet ne peut pas exister en production — `person/` est réservé à la création de
+/// clé, cf. `api_key.rs` — mais ce test verrouille la défense côté logique indépendamment.)
+#[tokio::test]
+async fn person_write_self_sub_matching_target_still_denied_403() {
+    let app = app_person_self().await;
+    let body = serde_json::json!({
+        "title": "identity/person/alice",
+        "body": GOOD_PERSON_SELF,
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "caller_sub == target (person/alice) ne doit PAS ouvrir l'écriture person — C1: {json}"
+    );
+}
+
+/// NON-RÉGRESSION dispatch : une âme d'agent (`identity/<sub>`) reste routée vers
+/// `validate_soul`. Un body de carte person (`category: self`, sans INVARIANTS/GATES/
+/// NARRATIVE) écrit sur un chemin `identity/main` (âme) est REJETÉ par `validate_soul`
+/// (400) — jamais accepté comme une carte person. Prouve que le dispatch se fait sur le
+/// CHEMIN, pas sur un champ du corps.
+#[tokio::test]
+async fn soul_path_rejects_person_body_via_validate_soul_400() {
+    let (app, _idx) = app_main_agent().await;
+    let body = serde_json::json!({
+        "title": "identity/main",
+        "body": "# identity/main\ndisplay_name: X\ncategory: self\n",
+        "section_hint": "identity",
+        "tenant_id": "main"
+    });
+    let (status, json) = post_json(&app, "/api/v1/vault_write", body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "un body de carte person sur un chemin d'âme doit être rejeté par validate_soul: {json}"
+    );
+}
+
+// ── Tests F-125 invariant 9 — droit à l'oubli path-aware `identity/person/*` ───
+//
+// Carve-out : une carte `identity/person/<id>` est effaçable (forget/delete) par un
+// porteur du scope `identity_write`, alors qu'une âme `identity/<sub>` reste protégée.
+// La preview co-résout `(section, titre)` depuis l'index (`get_note_protection_key`).
+
+/// Seed une carte person `identity/person/alice` dans l'index (titre + FTS).
+async fn seed_person_alice(idx: &SqliteIndex) -> String {
+    let ulid = Ulid::generate().to_string();
+    idx.seed_note_with_fts_title(
+        &ulid,
+        "identity",
+        "identity/person/alice",
+        "carte personne alice donnees profil gdpr",
+    )
+    .await
+    .expect("seed_note_with_fts_title person alice");
+    ulid
+}
+
+/// Corps de requête forget dry-run par topic couvrant la carte person.
+fn forget_person_topic_body() -> serde_json::Value {
+    serde_json::json!({
+        "tenant_id": "main",
+        "scope": {
+            "type": "topic",
+            "query": "personne alice profil",
+            "vault": "main",
+            "limit": 10
+        },
+        "dry_run": true
+    })
+}
+
+/// Carte person `identity/person/alice` + appelant privilégié (`identity_write`) →
+/// ÉLIGIBLE au forget (dans `ulids`, pas dans `excluded`).
+#[tokio::test]
+async fn person_card_forget_by_privileged_is_eligible() {
+    let (app, idx) = app_main_agent().await; // main-agent porte identity_write
+    let ulid = seed_person_alice(&idx).await;
+
+    let (status, json) = post_json(&app, "/api/v1/vault_forget", forget_person_topic_body()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "forget dry-run doit être 200: {json}"
+    );
+
+    let ulids = json["ulids"].as_array().expect("ulids array");
+    // `excluded` est omis quand vide (serde skip_serializing_if) → défaut liste vide.
+    let empty = Vec::new();
+    let excluded = json["excluded"].as_array().unwrap_or(&empty);
+    assert!(
+        ulids.iter().any(|u| u.as_str() == Some(ulid.as_str())),
+        "carte person doit être ÉLIGIBLE pour un porteur d'identity_write: {json}"
+    );
+    assert!(
+        !excluded
+            .iter()
+            .any(|e| e["ulid"].as_str() == Some(ulid.as_str())),
+        "carte person ne doit PAS être exclue pour un privilégié: {json}"
+    );
+}
+
+/// Carte person + appelant NON privilégié (pas `identity_write`) → EXCLUE (le droit à
+/// l'oubli d'une carte person exige le scope, comme l'écriture).
+#[tokio::test]
+async fn person_card_forget_by_non_privileged_is_excluded() {
+    let (app, idx) = app_test_identity().await; // test-identity : PAS d'identity_write
+    let ulid = seed_person_alice(&idx).await;
+
+    let (status, json) = post_json(&app, "/api/v1/vault_forget", forget_person_topic_body()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "forget dry-run doit être 200: {json}"
+    );
+
+    let ulids = json["ulids"].as_array().expect("ulids array");
+    let excluded = json["excluded"].as_array().expect("excluded array");
+    assert!(
+        !ulids.iter().any(|u| u.as_str() == Some(ulid.as_str())),
+        "carte person ne doit PAS être éligible pour un non-privilégié: {json}"
+    );
+    assert!(
+        excluded
+            .iter()
+            .any(|e| e["ulid"].as_str() == Some(ulid.as_str())),
+        "carte person doit être exclue pour un non-privilégié: {json}"
+    );
+}
+
+/// Âme `identity/main` → protégée même pour un porteur d'identity_write (jamais oubliée).
+#[tokio::test]
+async fn soul_forget_stays_protected_for_privileged() {
+    let (app, idx) = app_main_agent().await;
+    let ulid = Ulid::generate().to_string();
+    idx.seed_note_with_fts_title(
+        &ulid,
+        "identity",
+        "identity/main",
+        "ame agent principale identite personne alice profil",
+    )
+    .await
+    .expect("seed soul");
+
+    let (status, json) = post_json(&app, "/api/v1/vault_forget", forget_person_topic_body()).await;
+    assert_eq!(status, StatusCode::OK, "200 attendu: {json}");
+    let ulids = json["ulids"].as_array().expect("ulids");
+    let excluded = json["excluded"].as_array().expect("excluded");
+    assert!(
+        !ulids.iter().any(|u| u.as_str() == Some(ulid.as_str())),
+        "âme ne doit jamais être éligible: {json}"
+    );
+    assert!(
+        excluded
+            .iter()
+            .any(|e| e["ulid"].as_str() == Some(ulid.as_str())),
+        "âme doit être exclue (protégée): {json}"
+    );
+}
+
+/// Ancrage : un titre `identity/personX` (pas le segment `person/`) reste PROTÉGÉ même
+/// pour un privilégié — le carve-out ne matche pas.
+#[tokio::test]
+async fn near_miss_title_stays_protected_for_privileged() {
+    let (app, idx) = app_main_agent().await;
+    let ulid = Ulid::generate().to_string();
+    idx.seed_note_with_fts_title(
+        &ulid,
+        "identity",
+        "identity/personX",
+        "presque une carte personne alice profil mais pas le segment",
+    )
+    .await
+    .expect("seed near-miss");
+
+    let (status, json) = post_json(&app, "/api/v1/vault_forget", forget_person_topic_body()).await;
+    assert_eq!(status, StatusCode::OK, "200 attendu: {json}");
+    let ulids = json["ulids"].as_array().expect("ulids");
+    assert!(
+        !ulids.iter().any(|u| u.as_str() == Some(ulid.as_str())),
+        "titre identity/personX ne doit PAS être carvé (protégé): {json}"
+    );
+}
+
+/// Fail-closed : une note `identity` SANS titre résoluble (colonne NULL) reste protégée
+/// même pour un privilégié — jamais oubliée par défaut.
+#[tokio::test]
+async fn identity_without_title_is_fail_closed_protected() {
+    let (app, idx) = app_main_agent().await;
+    let ulid = Ulid::generate().to_string();
+    // seed_note_with_fts NE pose PAS de titre (colonne NULL).
+    idx.seed_note_with_fts(
+        &ulid,
+        "identity",
+        "note identity sans titre personne alice profil",
+    )
+    .await
+    .expect("seed identity sans titre");
+
+    let (status, json) = post_json(&app, "/api/v1/vault_forget", forget_person_topic_body()).await;
+    assert_eq!(status, StatusCode::OK, "200 attendu: {json}");
+    let ulids = json["ulids"].as_array().expect("ulids");
+    assert!(
+        !ulids.iter().any(|u| u.as_str() == Some(ulid.as_str())),
+        "identity sans titre doit rester protégée (fail-closed): {json}"
     );
 }

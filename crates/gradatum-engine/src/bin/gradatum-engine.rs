@@ -260,6 +260,30 @@ async fn serve() -> anyhow::Result<()> {
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
+    // F-156 P6b — announce liveness to the fleet registry under this engine's role name.
+    //
+    // The registry allowlist is exact: the service name MUST be one of
+    // `engine-agent-main` | `engine-curator` | `engine-embed`. That role name is the
+    // operator-configured `agent_id` (the same identifier already used for the event-log) —
+    // sent verbatim; a misconfigured name is rejected `UnknownService` at the ingress and
+    // counted (visible), never guessed here. `agent_id` unset ⇒ no heartbeat (the role is
+    // unknown). Opt-in by env (`GRADATUM_HEARTBEAT_URL` + `_TOKEN`); fire-and-forget,
+    // non-blocking, bounded backoff — a heartbeat never degrades inference.
+    match config.agent_id.clone() {
+        Some(role) => {
+            let _ = gradatum_heartbeat::spawn_from_env(
+                role,
+                env!("CARGO_PKG_VERSION"),
+                gradatum_heartbeat::sha_opt(env!("BUILD_SHA")),
+            );
+        }
+        None => {
+            tracing::info!(
+                "fleet heartbeat disabled: no `agent_id` set (cannot resolve the engine role)"
+            );
+        }
+    }
+
     // --- Match runtime ---
     if config.runtime == RuntimeKind::Onnx {
         anyhow::bail!("runtime 'onnx' is not implemented. Use runtime='llamaserver' (default).");

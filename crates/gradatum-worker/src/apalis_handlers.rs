@@ -1476,30 +1476,39 @@ pub async fn handle_forget(
     let mut excluded_details: Vec<(String, String)> = Vec::new(); // (ulid, section)
 
     for ulid in raw_candidates {
-        // Scopé `vault_id` : la garde « section protégée » DOIT porter sur la note qui
-        // sera mutée. Non scopée, elle jugeait l'homonyme de `main` — une note protégée
-        // du vault cible pouvait passer, une note libre être bloquée par un homonyme.
-        let section_str = client
+        // Scopé `vault_id` : la garde de protection DOIT porter sur la note qui sera
+        // mutée. Non scopée, elle jugeait l'homonyme de `main` — une note protégée du
+        // vault cible pouvait passer, une note libre être bloquée par un homonyme.
+        //
+        // F-125 inv. 9 : co-résolution `(section, titre)` depuis le MÊME read
+        // (`get_note` → section frontmatter + titre H1 du corps), pour appliquer le
+        // carve-out path-aware `identity/person/*`. Le titre est la valeur H1
+        // canonique que l'index persiste dans `notes.title`, donc ce verdict est en
+        // parité avec la preview côté serveur (qui lit `get_note_protection_key`).
+        let key = client
             .get_note(vault_id, &ulid)
             .await
             .ok()
-            .map(|dto| dto.section);
+            .map(|dto| (dto.section, dto.title.unwrap_or_default()));
 
-        // Fail-closed: unknown section (note absent from index) = PROTECTED.
-        // unwrap_or(true) ensures that any out-of-index ULID is excluded rather
-        // than included — conservative behavior consistent with the
-        // "protected sections are never forgotten" policy.
-        let is_protected = section_str
-            .as_deref()
-            .map(|s| Section::PROTECTED_FORGET.iter().any(|p| p.as_str() == s))
+        // Fail-closed: note absent from index (or read error) = PROTECTED. Any
+        // out-of-index ULID is excluded rather than included — conservative,
+        // consistent with the "protected notes are never forgotten" policy.
+        // Le privilège `identity_write` est vérifié EN AMONT (frontière API
+        // `vault_forget`) : le worker ne réévalue que la protection path-aware —
+        // un job n'a pu être enfilé que si l'appelant privilégié a passé la preview,
+        // donc `confirm_ulids == eligible` reste vrai pour les cartes person.
+        let is_protected = key
+            .as_ref()
+            .map(|(section, title)| Section::is_forget_protected(section, title))
             .unwrap_or(true);
 
         if is_protected {
-            let section = section_str.unwrap_or_default();
+            let section = key.map(|(s, _)| s).unwrap_or_default();
             tracing::info!(
                 note_id = %ulid,
                 section = %section,
-                "forget: note excluded — protected section"
+                "forget: note excluded — protected (path-aware)"
             );
             excluded_details.push((ulid, section));
         } else {

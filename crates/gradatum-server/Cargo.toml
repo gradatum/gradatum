@@ -26,6 +26,7 @@ path = "src/lib.rs"
 [dependencies]
 gradatum-core.workspace = true
 gradatum-dto = { workspace = true, features = ["schemars"] }
+gradatum-heartbeat.workspace = true
 rusqlite.workspace = true
 gradatum-embed.workspace = true
 gradatum-vault.workspace = true
@@ -36,7 +37,7 @@ gradatum-storage.workspace = true
 gradatum-index = { workspace = true, features = ["sqlite-vec-ann"] }
 gradatum-search.workspace = true
 gradatum-queue.workspace = true
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.2.0" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.3.0" }
 gradatum-acl-policy.workspace = true
 gradatum-acl-auth.workspace = true
 gradatum-auth.workspace = true
@@ -50,6 +51,7 @@ gradatum-warden.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 tokio.workspace = true
+arc-swap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
@@ -93,6 +95,7 @@ s3 = ["gradatum-vault/s3", "gradatum-storage/s3"]
 [dev-dependencies]
 tempfile.workspace = true
 reqwest.workspace = true
+gradatum-dto.workspace = true
 nix.workspace = true
 gradatum-worker.workspace = true
 gradatum-curator.workspace = true

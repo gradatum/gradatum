@@ -533,3 +533,132 @@ async fn second_forget_resynchronises_the_index_and_keeps_the_audit_trail() {
         "la re-synchronisation ne doit PAS réhorodater l'oubli initial"
     );
 }
+
+// ── Tests F-125 invariant 9 — parité worker du carve-out `identity/person/*` ────
+//
+// Le worker applique le MÊME verdict path-aware que la preview côté serveur : une
+// carte `identity/person/*` est éligible (forgetable), une âme `identity/<sub>` est
+// exclue. Preuve du contrat `confirm_ulids == eligible` : un forget réel confirmé sur
+// la carte person réussit et marque la note ; le même sur une âme échoue (mismatch).
+
+/// Écrit une note `identity` réelle sous un locus ciblable + fixe son titre d'index.
+async fn seed_identity_note_at_locus(fixture: &ForgetFixture, title: &str, locus: &str) -> String {
+    use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
+    use gradatum_core::identity::NoteId;
+    use gradatum_core::scope::LocusId;
+    use gradatum_core::section::Section;
+    use gradatum_core::status::NoteStatus;
+
+    let note_id = NoteId::new();
+    let ulid = note_id.0.to_string();
+    let now = Utc::now();
+    let fm = Frontmatter {
+        schema_version: 1,
+        vault_id: VaultId::new("main"),
+        locus: Some(LocusId::new(locus)),
+        section: Section::Identity,
+        status: NoteStatus::Live,
+        status_reason: None,
+        status_changed: Some(now),
+        tags: Default::default(),
+        author: None,
+        created: now,
+        updated: None,
+        extra: ExtraFields::empty(),
+        provenance: None,
+        forgotten: None,
+        forgotten_at: None,
+        forgotten_by: None,
+    };
+    fixture
+        .vault
+        .write_note_with_id(
+            fm,
+            format!("# {title}\n\ncorps identite oubliable"),
+            note_id,
+        )
+        .await
+        .expect("write_note_with_id identity");
+    fixture
+        .index
+        .upsert_note_title("main", &note_id, title)
+        .await
+        .expect("upsert_note_title identity");
+    ulid
+}
+
+fn forget_spec_locus(ulid: &str, locus: &str) -> ForgetSpec {
+    ForgetSpec {
+        scope: ForgetScope::Locus {
+            vault: "main".to_string(),
+            locus: locus.to_string(),
+        },
+        dry_run: false,
+        forgotten_by: Some("gdpr-request".to_string()),
+        confirm_ulids: vec![ulid.to_string()],
+    }
+}
+
+/// Carte `identity/person/alice` : le worker la juge ÉLIGIBLE — le forget réel confirmé
+/// réussit et marque le frontmatter `forgotten = true` (parité avec la preview).
+#[tokio::test]
+async fn worker_forgets_person_card() {
+    use gradatum_core::identity::NoteId;
+    use gradatum_worker::apalis_handlers::{MultiTenantCfg, handle_forget};
+
+    let fixture = make_fixture().await;
+    let ulid = seed_identity_note_at_locus(&fixture, "identity/person/alice", "person/inbox").await;
+
+    let out = handle_forget(
+        make_forget_job(forget_spec_locus(&ulid, "person/inbox"), JobMode::Batch),
+        Data::new(client_for(&fixture)),
+        Data::new(MultiTenantCfg::default()),
+    )
+    .await
+    .expect("worker doit accepter le forget d'une carte person (confirm == eligible)");
+    let _ = out;
+
+    let note = fixture
+        .vault
+        .read_note(NoteId(Ulid::from_string(&ulid).expect("ulid")))
+        .await
+        .expect("read_note person card");
+    assert_eq!(
+        note.frontmatter.forgotten,
+        Some(true),
+        "la carte person doit être réellement oubliée par le worker"
+    );
+}
+
+/// Âme `identity/main` : le worker l'EXCLUT (eligible = []), donc un forget confirmé sur
+/// elle échoue (mismatch `confirm_ulids != eligible`) et la note reste non oubliée.
+#[tokio::test]
+async fn worker_excludes_soul_confirm_mismatch() {
+    use gradatum_core::identity::NoteId;
+    use gradatum_worker::apalis_handlers::{MultiTenantCfg, handle_forget};
+
+    let fixture = make_fixture().await;
+    let ulid = seed_identity_note_at_locus(&fixture, "identity/main", "soul/inbox").await;
+
+    let res = handle_forget(
+        make_forget_job(forget_spec_locus(&ulid, "soul/inbox"), JobMode::Batch),
+        Data::new(client_for(&fixture)),
+        Data::new(MultiTenantCfg::default()),
+    )
+    .await;
+    assert!(
+        res.is_err(),
+        "un forget confirmé sur une âme doit échouer (âme exclue → confirm mismatch)"
+    );
+
+    let note = fixture
+        .vault
+        .read_note(NoteId(Ulid::from_string(&ulid).expect("ulid")))
+        .await
+        .expect("read_note soul");
+    assert_ne!(
+        note.frontmatter.forgotten,
+        Some(true),
+        "l'âme ne doit jamais être oubliée"
+    );
+}

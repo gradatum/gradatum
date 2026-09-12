@@ -865,7 +865,25 @@ async fn health_returns_ok() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // `status` sérialisé via l'énum DTO `HealthStatus::Ok` → wire "ok".
     assert_eq!(json["status"].as_str().unwrap_or(""), "ok");
+    // build_sha public toujours présent (fallback "unknown" hors git), jamais vide.
+    let sha = json["build_sha"]
+        .as_str()
+        .expect("champ 'build_sha' attendu");
+    assert!(!sha.is_empty(), "build_sha non vide attendu");
+    // Rétro-compat : version + providers conservés dans le body.
+    assert!(
+        !json["version"].as_str().unwrap_or("").is_empty(),
+        "champ 'version' conservé attendu"
+    );
+    let providers = json["providers"]
+        .as_array()
+        .expect("champ 'providers' conservé attendu");
+    assert!(
+        !providers.is_empty(),
+        "au moins 1 provider configuré attendu (rétro-compat)"
+    );
 }
 
 /// /v1/models retourne la liste des aliases configurés.

@@ -8,6 +8,7 @@ pub gradatum_acl_auth::api_key::ApiKeyError::Crypto(alloc::string::String)
 pub gradatum_acl_auth::api_key::ApiKeyError::InvalidTenant(alloc::string::String)
 pub gradatum_acl_auth::api_key::ApiKeyError::Migration(alloc::string::String)
 pub gradatum_acl_auth::api_key::ApiKeyError::NotFound
+pub gradatum_acl_auth::api_key::ApiKeyError::ReservedOwnerNamespace(alloc::string::String)
 pub gradatum_acl_auth::api_key::ApiKeyError::Sql(rusqlite::error::Error)
 pub struct gradatum_acl_auth::api_key::ApiKey
 pub gradatum_acl_auth::api_key::ApiKey::created_at: i64
@@ -63,6 +64,7 @@ pub gradatum_acl_auth::ApiKeyError::Crypto(alloc::string::String)
 pub gradatum_acl_auth::ApiKeyError::InvalidTenant(alloc::string::String)
 pub gradatum_acl_auth::ApiKeyError::Migration(alloc::string::String)
 pub gradatum_acl_auth::ApiKeyError::NotFound
+pub gradatum_acl_auth::ApiKeyError::ReservedOwnerNamespace(alloc::string::String)
 pub gradatum_acl_auth::ApiKeyError::Sql(rusqlite::error::Error)
 pub struct gradatum_acl_auth::ApiKey
 pub gradatum_acl_auth::ApiKey::created_at: i64

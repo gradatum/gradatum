@@ -602,6 +602,7 @@ impl InternalClient for TestInternalClient {
                 sha256_hex: note.content_hash.hex(),
                 body: note.body.markdown,
                 section: rec.section,
+                title: rec.title,
                 status: rec.status,
                 tags: note
                     .frontmatter
@@ -623,6 +624,7 @@ impl InternalClient for TestInternalClient {
                 sha256_hex: hex_lower(&rec.content_hash),
                 body: rec.body_text,
                 section: rec.section,
+                title: rec.title,
                 status: rec.status,
                 tags: rec
                     .tags_raw
@@ -637,6 +639,9 @@ impl InternalClient for TestInternalClient {
             // historique (tests qui écrivent le `.md` sans passer par l'index).
             (None, Some(note)) => Ok(NoteReadDto {
                 note_id: ulid.to_string(),
+                // Pas de ligne d'index : titre dérivé du H1 du corps (SSOT), comme
+                // le fait le serveur dans `handle_note_read`.
+                title: gradatum_index::extract_h1_title(&note.body.markdown),
                 sha256_hex: note.content_hash.hex(),
                 body: note.body.markdown,
                 section: section_to_str(note.frontmatter.section),

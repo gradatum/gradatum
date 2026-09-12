@@ -244,10 +244,33 @@ fn build_child_args(cfg: &EngineConfig) -> Vec<String> {
         args.push(p.to_string());
     }
 
+    // Generation cap via the dedicated `max_tokens` field. `None` = unlimited: no flag is
+    // emitted, so the `llama-server` default applies (this preserves the prior LIVE
+    // behaviour, where max_tokens never reached the argv). `Some(n)` → authoritative
+    // `--n-predict <n>`. `LlamaServerSupervisor::new` guarantees `extra_args` never also
+    // carries `--n-predict`/`-n` when `max_tokens` is set, so this is the sole emitter.
+    if let Some(n) = cfg.max_tokens {
+        args.push("--n-predict".into());
+        args.push(n.to_string());
+    }
+
     // Extra args — validated against the allow-list at supervisor construction.
     args.extend(cfg.extra_args.iter().cloned());
 
     args
+}
+
+/// `true` if `extra_args` contains an explicit n-predict flag (`--n-predict` or its `-n`
+/// alias), in either `--flag value` or `--flag=value` form.
+///
+/// Used by [`LlamaServerSupervisor::new`] to reject a config that sets both `max_tokens`
+/// (authoritative `--n-predict` emitter) and an `extra_args` n-predict flag — two sources
+/// would otherwise emit `--n-predict`.
+fn extra_args_has_n_predict(extra_args: &[String]) -> bool {
+    extra_args.iter().any(|arg| {
+        let key = arg.split('=').next().unwrap_or(arg.as_str());
+        key == "--n-predict" || key == "-n"
+    })
 }
 
 /// Result of a child health check.
@@ -288,7 +311,8 @@ impl LlamaServerSupervisor {
     ///
     /// # Errors
     /// Returns `EngineError::ModelLoad` if the binary is invalid or outside the allowed prefix.
-    /// Returns `EngineError::BadRequest` if `extra_args` contains a flag not in the allow-list.
+    /// Returns `EngineError::BadRequest` if `extra_args` contains a flag not in the allow-list,
+    /// or if `max_tokens` is set while `extra_args` also carries `--n-predict`/`-n` (conflict).
     pub fn new(config: EngineConfig) -> Result<Arc<Self>, EngineError> {
         let canonical_bin = canonicalize_bin_path(&config.llama_server_bin)?;
 
@@ -307,6 +331,19 @@ impl LlamaServerSupervisor {
         }
 
         validate_extra_args(&config.extra_args)?;
+
+        // Conflict guard: `max_tokens` (authoritative `--n-predict` emitter) and an
+        // `extra_args` `--n-predict`/`-n` must not both be present — a single source owns
+        // the flag. `--n-predict`/`-n` stay allow-listed so configs already tuning it via
+        // `extra_args` keep loading (when `max_tokens` is unset).
+        if config.max_tokens.is_some() && extra_args_has_n_predict(&config.extra_args) {
+            return Err(EngineError::BadRequest(
+                "config conflict: max_tokens is set AND extra_args carries --n-predict/-n — \
+                 both would emit --n-predict. Use a single source: remove --n-predict/-n from \
+                 extra_args (max_tokens is authoritative), or unset max_tokens."
+                    .to_string(),
+            ));
+        }
 
         let child_port = config.child_port;
         let client = reqwest::Client::builder()
@@ -898,7 +935,7 @@ pub fn inject_allowed_env(cmd: &mut Command) {
 /// would silently abort every other test running in the same binary.
 ///
 /// M4 fix (doc accuracy, 2026-07-10): what the test actually asserts is
-/// `health.snapshot().status == "unhealthy"` after `supervise_loop()` returns, plus an
+/// `health.snapshot().status == HealthStatus::Unhealthy` after `supervise_loop()` returns, plus an
 /// elapsed-time bound. That is a sufficient proxy — post-R1, `unhealthy` is only ever
 /// set immediately before `escalate_to_systemd` is called, so observing it after the
 /// loop returns is equivalent to observing that this function was reached. Restart
@@ -1301,6 +1338,64 @@ mod tests {
         );
     }
 
+    // --- max_tokens vs --n-predict conflict guard ---
+
+    #[test]
+    fn new_rejects_max_tokens_and_n_predict_conflict() {
+        // max_tokens défini ET --n-predict dans extra_args → BadRequest (double source).
+        let mut config = make_test_config();
+        config.max_tokens = Some(256);
+        config.extra_args = vec!["--n-predict".into(), "512".into()];
+        // `LlamaServerSupervisor` n'implémente pas `Debug` (contient un `Mutex<Option<Child>>`),
+        // donc on discrimine l'erreur via `matches!` plutôt que `expect_err`.
+        assert!(
+            matches!(
+                LlamaServerSupervisor::new(config),
+                Err(EngineError::BadRequest(_))
+            ),
+            "le conflit max_tokens/--n-predict doit être un BadRequest"
+        );
+    }
+
+    #[test]
+    fn new_rejects_max_tokens_and_n_alias_conflict() {
+        // L'alias `-n` déclenche la même garde (form --flag value).
+        let mut config = make_test_config();
+        config.max_tokens = Some(256);
+        config.extra_args = vec!["-n".into(), "512".into()];
+        assert!(
+            matches!(
+                LlamaServerSupervisor::new(config),
+                Err(EngineError::BadRequest(_))
+            ),
+            "le conflit max_tokens/-n (alias) doit aussi être rejeté"
+        );
+    }
+
+    #[test]
+    fn new_accepts_n_predict_in_extra_args_when_max_tokens_none() {
+        // Config LIVE préservée : --n-predict seul dans extra_args (max_tokens illimité) → OK.
+        let mut config = make_test_config();
+        config.max_tokens = None;
+        config.extra_args = vec!["--n-predict".into(), "512".into()];
+        assert!(
+            LlamaServerSupervisor::new(config).is_ok(),
+            "--n-predict seul dans extra_args (max_tokens=None) doit rester accepté"
+        );
+    }
+
+    #[test]
+    fn new_accepts_max_tokens_alone() {
+        // max_tokens défini SANS --n-predict dans extra_args → OK (source unique).
+        let mut config = make_test_config();
+        config.max_tokens = Some(256);
+        config.extra_args = vec![];
+        assert!(
+            LlamaServerSupervisor::new(config).is_ok(),
+            "max_tokens seul (sans --n-predict en extra_args) doit être accepté"
+        );
+    }
+
     // --- budget restart + flapping (P1-b logique) ---
 
     #[test]
@@ -1536,7 +1631,7 @@ mod tests {
 
             assert_eq!(
                 health.snapshot().status,
-                "unhealthy",
+                gradatum_dto::HealthStatus::Unhealthy,
                 "engine must end unhealthy once the persistent failure exhausts child_restart_max"
             );
             assert!(
@@ -1687,6 +1782,37 @@ mod tests {
                 .iter()
                 .any(|a| a == "--spec-draft-n-max" || a == "--spec-draft-p-min"),
             "aucun --spec-draft-n-max/--spec-draft-p-min quand None"
+        );
+    }
+
+    #[test]
+    fn build_child_args_no_n_predict_when_max_tokens_none() {
+        // Défaut illimité (max_tokens absent) → AUCUN --n-predict émis (comportement LIVE).
+        let cfg = EngineConfig::from_toml(
+            "[engine]\nmodel_path=\"/opt/gradatum/models/m.gguf\"\nmodel_kind=\"chat\"\nport=8080\nchild_port=8090\n",
+        )
+        .unwrap();
+        assert!(cfg.max_tokens.is_none(), "défaut max_tokens = None");
+        let args = build_child_args(&cfg);
+        assert!(
+            !args.iter().any(|a| a == "--n-predict"),
+            "max_tokens=None → aucun --n-predict (illimité, préserve le LIVE) : {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_child_args_emits_n_predict_when_max_tokens_set() {
+        // max_tokens=256 → --n-predict 256 autoritaire présent.
+        let cfg = EngineConfig::from_toml(
+            "[engine]\nmodel_path=\"/opt/gradatum/models/m.gguf\"\nmodel_kind=\"chat\"\nport=8080\nchild_port=8090\nmax_tokens=256\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.max_tokens, Some(256), "max_tokens=256 parsé");
+        let args = build_child_args(&cfg);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--n-predict" && w[1] == "256"),
+            "max_tokens=Some(256) → --n-predict 256 injecté : {args:?}"
         );
     }
 
@@ -1960,7 +2086,6 @@ mod tests {
             model_path: "/opt/gradatum/models/test.gguf".into(),
             model_kind: ModelKind::Chat,
             runtime: RuntimeKind::LlamaServer,
-            warm_up: "eager".into(),
             gpu_layers: 0,
             n_threads: 4,
             context_len: 4096,
@@ -1968,7 +2093,7 @@ mod tests {
             bind_addr: None, // défaut loopback
             metrics_port: None,
             timeout_secs: 30,
-            max_tokens: 512,
+            max_tokens: None, // défaut illimité (préserve le comportement LIVE)
             gradatum_url: Some("http://127.0.0.1:19090".into()),
             agent_id: None,
             llama_server_bin: PathBuf::from("/usr/local/bin/llama-server"),

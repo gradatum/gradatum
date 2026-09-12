@@ -21,7 +21,8 @@ use serde::Serialize;
 
 // ── Re-exports depuis gradatum-dto (single source of truth) ───────────────────
 pub use gradatum_dto::{
-    CreateFeatureCardRequest, CreateFeatureCardResponse, SessionTraceRequest, SessionTraceResponse,
+    CreateFeatureCardRequest, CreateFeatureCardResponse, MutateRoleCardVerdict, MutateRoleItem,
+    MutateRoleRequest, MutateRoleResponse, SessionTraceRequest, SessionTraceResponse,
     VaultClassifyRequest, VaultClassifyResponse, VaultContextRequest, VaultGraphRequest,
     VaultLinksRequest, VaultListRequest, VaultReadRequest, VaultSearchRequest, VaultTagsRequest,
     VaultTimelineRequest, VaultTraceRequest, VaultWriteRequest,

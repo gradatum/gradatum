@@ -1,0 +1,14 @@
+pub mod gradatum_heartbeat
+pub struct gradatum_heartbeat::HeartbeatConfig
+pub gradatum_heartbeat::HeartbeatConfig::build_sha: core::option::Option<alloc::string::String>
+pub gradatum_heartbeat::HeartbeatConfig::interval: core::time::Duration
+pub gradatum_heartbeat::HeartbeatConfig::service: alloc::string::String
+pub gradatum_heartbeat::HeartbeatConfig::token: secrecy::SecretString
+pub gradatum_heartbeat::HeartbeatConfig::url: alloc::string::String
+pub gradatum_heartbeat::HeartbeatConfig::version: alloc::string::String
+pub const gradatum_heartbeat::DEFAULT_INTERVAL: core::time::Duration
+pub const gradatum_heartbeat::ENV_TOKEN: &str
+pub const gradatum_heartbeat::ENV_URL: &str
+pub fn gradatum_heartbeat::sha_opt(&str) -> core::option::Option<alloc::string::String>
+pub fn gradatum_heartbeat::spawn(gradatum_heartbeat::HeartbeatConfig) -> tokio::runtime::task::join::JoinHandle<()>
+pub fn gradatum_heartbeat::spawn_from_env(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, core::option::Option<alloc::string::String>) -> core::option::Option<tokio::runtime::task::join::JoinHandle<()>>

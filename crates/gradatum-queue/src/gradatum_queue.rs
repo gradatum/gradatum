@@ -89,6 +89,15 @@ impl QueueStore for GradatumQueue {
         self.inner.complete(id, result).await
     }
 
+    /// Completes a lease-free delivery of a `Job::Message` (state-carrying row).
+    async fn complete_message_delivery(
+        &self,
+        id: Ulid,
+        result: JobResult,
+    ) -> Result<(), QueueError> {
+        self.inner.complete_message_delivery(id, result).await
+    }
+
     async fn fail(&self, id: Ulid, err: &str, attempt: u32) -> Result<(), QueueError> {
         self.inner.fail(id, err, attempt).await
     }

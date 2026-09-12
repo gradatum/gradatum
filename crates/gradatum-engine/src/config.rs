@@ -147,14 +147,6 @@ pub struct EngineConfig {
     /// Inference runtime (default: `llamaserver`).
     #[serde(default)]
     pub runtime: RuntimeKind,
-    /// Warm-up strategy. **Accepted and validated, but not yet acted upon**: the engine
-    /// always warms up eagerly today, whatever this is set to. Setting `"lazy"` changes
-    /// nothing. Kept so existing configuration files keep loading, and so the strategy
-    /// can be honoured without a breaking change once implemented.
-    // not yet wired (v2.1) — no branch reads this field; `health.rs::warm_up_state` is a
-    // runtime state (loading/ready), unrelated to this setting.
-    #[serde(default = "default_warmup")]
-    pub warm_up: String,
     /// Number of layers to offload to the GPU (0 = CPU only).
     #[serde(default)]
     pub gpu_layers: u32,
@@ -190,16 +182,22 @@ pub struct EngineConfig {
     /// On expiry → `EngineError::Timeout` (HTTP 504) → the gateway triggers its fallback.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    /// Intended cap on tokens generated per chat request (default 512).
+    /// Authoritative cap on tokens generated per request, wired to `--n-predict`.
     ///
-    /// **Not enforced.** This value is parsed and then ignored: nothing caps generation
-    /// length today. Do not rely on it as a safety limit — to bound generation, pass
-    /// `--n-predict` explicitly through `extra_args`, which the child process does honour.
-    // not yet wired (v2.1) — never reaches `build_child_args`; wiring it to `--n-predict`
-    // would suddenly cap every running engine at the 512 default, so it is a deliberate
-    // behavioural change, not a mechanical fix.
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
+    /// - `None` (default): **unlimited** — no `--n-predict` flag is emitted, so the
+    ///   `llama-server` default applies. This is the behaviour of every deployed engine
+    ///   today; leaving the field unset changes nothing.
+    /// - `Some(n)` (`n ≥ 1`): the supervisor injects `--n-predict <n>` as an
+    ///   **authoritative** flag. `0` is rejected by [`EngineConfig::validate`] (omit the
+    ///   field for unlimited instead of using `0`).
+    ///
+    /// **Never also via `extra_args`**: `--n-predict`/`-n` stay allow-listed (a config
+    /// that already tunes generation through `extra_args` keeps loading), but supplying
+    /// **both** `max_tokens` and an `extra_args` `--n-predict`/`-n` is rejected by
+    /// [`LlamaServerSupervisor::new`](crate::supervisor::LlamaServerSupervisor::new) with
+    /// `EngineError::BadRequest` — a single source must own the flag.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     /// Base URL of the gradatum server (for the event-log and JWT exchange).
     ///
     /// - `Some(url)`: the engine builds an `HttpEventSink` and posts events to
@@ -381,9 +379,6 @@ pub struct EngineConfig {
     pub body_limit_bytes: usize,
 }
 
-fn default_warmup() -> String {
-    "eager".into()
-}
 fn default_threads() -> u32 {
     8
 }
@@ -392,9 +387,6 @@ fn default_ctx() -> u32 {
 }
 fn default_timeout() -> u64 {
     120
-}
-fn default_max_tokens() -> u32 {
-    512
 }
 fn default_llama_server_bin() -> PathBuf {
     PathBuf::from("/usr/local/bin/llama-server")
@@ -598,6 +590,25 @@ fn validate_spec_draft_p_min(
     Ok(())
 }
 
+/// Validates the generation cap `max_tokens` (pure, no filesystem).
+///
+/// - `None` → valid (unlimited: no `--n-predict` emitted, `llama-server` default applies).
+/// - `Some(0)` → error (`--n-predict 0` would generate nothing — a footgun; omit the field
+///   for unlimited instead of using `0`, mirroring the `spec_draft_n_max` rule).
+/// - `Some(n)` with `n ≥ 1` → valid (injected as authoritative `--n-predict <n>`).
+///
+/// # Errors
+/// Returns `anyhow::Error` if `max_tokens` is `Some(0)`.
+fn validate_max_tokens(max_tokens: Option<u32>) -> Result<(), anyhow::Error> {
+    if max_tokens == Some(0) {
+        anyhow::bail!(
+            "max_tokens 0 is invalid — omit the field for unlimited generation, \
+             or set a positive cap (Some(n), n ≥ 1)"
+        );
+    }
+    Ok(())
+}
+
 /// Checks constraints on an IPv4 address (internal helper).
 ///
 /// `display` is the textual representation of the original address (may be an
@@ -653,6 +664,9 @@ impl EngineConfig {
                 MAX_BODY_LIMIT_BYTES
             );
         }
+
+        // --- max_tokens: cheap coherence check (no fs) ---
+        validate_max_tokens(self.max_tokens)?;
 
         // --- model_path ---
         validate_model_prefix(std::path::Path::new(&self.model_path))
@@ -753,7 +767,6 @@ mod tests {
 [engine]
 model_path  = "/opt/models/qwen3-4b.gguf"
 model_kind  = "chat"
-warm_up     = "eager"
 gpu_layers  = 0
 n_threads   = 8
 context_len = 32768
@@ -1051,17 +1064,58 @@ extra_args       = ["--flash-attn"]
         assert_eq!(c.timeout_secs, 60);
     }
 
-    /// `max_tokens` is parsed from TOML with a default of 512.
+    /// `max_tokens` defaults to `None` (unlimited) and parses an explicit cap as `Some(n)`.
     #[test]
     fn parses_max_tokens_with_default() {
         let toml_default = "[engine]\nmodel_path=\"x\"\nmodel_kind=\"chat\"\nport=1\n";
         let c = EngineConfig::from_toml(toml_default).unwrap();
-        assert_eq!(c.max_tokens, 512, "défaut max_tokens = 512");
+        assert_eq!(
+            c.max_tokens, None,
+            "défaut max_tokens = None (illimité — préserve le comportement LIVE)"
+        );
 
         let toml_custom =
             "[engine]\nmodel_path=\"x\"\nmodel_kind=\"chat\"\nport=1\nmax_tokens=256\n";
         let c2 = EngineConfig::from_toml(toml_custom).unwrap();
-        assert_eq!(c2.max_tokens, 256, "max_tokens custom parsé");
+        assert_eq!(
+            c2.max_tokens,
+            Some(256),
+            "max_tokens custom parsé en Some(256)"
+        );
+    }
+
+    /// `validate_max_tokens` accepts `None` and `Some(n≥1)`, rejects `Some(0)`.
+    #[test]
+    fn validate_max_tokens_none_and_positive_ok_zero_rejected() {
+        assert!(
+            validate_max_tokens(None).is_ok(),
+            "max_tokens=None → OK (illimité)"
+        );
+        for n in [1_u32, 256, u32::MAX] {
+            assert!(
+                validate_max_tokens(Some(n)).is_ok(),
+                "max_tokens=Some({n}) → OK (plafond positif)"
+            );
+        }
+        let err = validate_max_tokens(Some(0)).unwrap_err().to_string();
+        assert!(
+            err.contains("max_tokens 0 is invalid"),
+            "max_tokens=Some(0) doit être rejeté avec un message clair : {err}"
+        );
+    }
+
+    /// A config carrying the removed `warm_up` field still loads (parse-safe): the field
+    /// is unknown and silently ignored (`EngineConfig` has no `deny_unknown_fields`).
+    #[test]
+    fn removed_warm_up_field_is_parse_safe() {
+        let toml = "[engine]\nmodel_path=\"x\"\nmodel_kind=\"chat\"\nport=1\nwarm_up=\"eager\"\n";
+        let c = EngineConfig::from_toml(toml)
+            .expect("un warm_up résiduel dans une config LIVE doit continuer de charger");
+        assert_eq!(
+            c.model_kind,
+            ModelKind::Chat,
+            "le reste de la config est parsé"
+        );
     }
 
     #[test]

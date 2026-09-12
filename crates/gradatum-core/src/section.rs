@@ -1,4 +1,4 @@
-//! The 14 canonical sections of Gradatum.
+//! The 15 canonical sections of Gradatum.
 //!
 //! These sections form the semantic hierarchy of the store. Each note is assigned
 //! to exactly one section. The set is stable: adding a section requires updating
@@ -9,12 +9,13 @@
 //! typed-wikilink schema (`[[project:…]]` + `[[status:…]]` + `[[kind:…]]`).
 //! The `Identity` variant (13th) stores agent soul notes (persona/governance).
 //! The `Snapshot` variant (14th) stores raw session event-capture lines.
+//! The `Messaging` variant (15th) stores inter-agent mailbox content.
 
 use serde::{Deserialize, Serialize};
 
 /// Canonical section of a Gradatum note.
 ///
-/// 14 fixed sections representing the semantic categories of the knowledge store.
+/// 15 fixed sections representing the semantic categories of the knowledge store.
 /// Serialised as `kebab-case` in YAML frontmatters and APIs.
 ///
 // Extension remains subject to a project-side governance review, but no longer
@@ -78,6 +79,18 @@ pub enum Section {
     // Extension remains subject to a project-side governance review, but no longer
     // breaks downstream consumers.
     Snapshot,
+    /// Messaging: inter-agent mailbox content, written directly by
+    /// `message_send`, never curated nor recalled.
+    ///
+    /// Notes here carry the body of a delivered message (the mailbox); the delivery
+    /// state lives in a separate job row (`Job::Message`). The section is excluded
+    /// from the default search scope (see [`Section::DEFAULT_SEARCH_EXCLUDED`]) and
+    /// from every recall surface: mailbox content is private to the recipient, not
+    /// corpus knowledge.
+    ///
+    // Extension remains subject to a project-side governance review, but no longer
+    // breaks downstream consumers.
+    Messaging,
 }
 
 impl Section {
@@ -136,19 +149,99 @@ impl Section {
     ///
     /// # Invariant
     ///
-    /// `Snapshot` alone is excluded by default; any future raw-capture section
+    /// `Snapshot` (raw capture) and `Messaging` (inter-agent mailbox) are
+    /// excluded by default; any future raw-capture or private-mailbox section
     /// must be added here.
-    pub const DEFAULT_SEARCH_EXCLUDED: &'static [Section] = &[Section::Snapshot];
+    pub const DEFAULT_SEARCH_EXCLUDED: &'static [Section] =
+        &[Section::Snapshot, Section::Messaging];
 
-    /// Returns `true` if `name` (kebab-case section) can never be hard-deleted.
+    /// Full note-title prefix that carves person cards out of identity protection.
     ///
-    /// Single source of truth for the [`Section::PROTECTED_DELETE`] membership
-    /// test, shared by the `vault_delete` endpoint and the cascade choke point
-    /// (`cascade_delete_note`). Unknown section names return `false` (they are
-    /// not in the governance perimeter).
+    /// A note whose title starts with this prefix is a **person card**
+    /// (`identity/person/<id>`), subject to the GDPR right to erasure
+    /// (invariant 9), NOT an agent soul. The prefix is the composition of the
+    /// `identity` section name and the reserved
+    /// [`crate::person::PERSON_NAMESPACE_PREFIX`] namespace — kept in sync by the
+    /// unit test `identity_person_title_prefix_matches_person_namespace`.
+    ///
+    /// Anchored, segment-terminated (trailing `/`): `identity/personX` and
+    /// `identity/personal-foo` do **not** match — only the exact `person/`
+    /// path segment carves out.
+    pub const IDENTITY_PERSON_TITLE_PREFIX: &'static str = "identity/person/";
+
+    /// Returns `true` if `title` designates an `identity/person/*` card.
+    ///
+    /// Single carve-out predicate shared by [`Section::is_forget_protected`] and
+    /// [`Section::is_delete_protected`] so that the person-card exception is
+    /// applied identically to both protection perimeters (which keeps
+    /// `PROTECTED_FORGET ⊆ PROTECTED_DELETE` true by construction).
+    ///
+    /// Uses `starts_with` on the anchored, slash-terminated prefix — never
+    /// `contains` — so the match is anchored at the title root and bounded to the
+    /// `person/` segment.
+    #[must_use]
+    pub fn identity_person_carveout(title: &str) -> bool {
+        title.starts_with(Self::IDENTITY_PERSON_TITLE_PREFIX)
+    }
+
+    /// Returns `true` if the note `(section, title)` can never be semantically
+    /// forgotten — **path-aware** (invariant 9).
+    ///
+    /// For [`Section::Identity`]: a person card (`identity/person/*`, see
+    /// [`Section::identity_person_carveout`]) is **not** protected (GDPR right to
+    /// erasure, gated upstream by the `identity_write` privilege); every other
+    /// identity note (an agent soul) stays protected. All other
+    /// [`Section::PROTECTED_FORGET`] sections are protected unconditionally
+    /// (their `title` is ignored).
+    ///
+    /// The `title` MUST be co-resolved with `section` from the same authoritative
+    /// read (never taken from a stale candidate list) — the resolver
+    /// `get_note_protection_key` on the index enforces this at the mutation sites.
+    #[must_use]
+    pub fn is_forget_protected(section: &str, title: &str) -> bool {
+        if section == Section::Identity.as_str() {
+            return !Self::identity_person_carveout(title);
+        }
+        Section::PROTECTED_FORGET
+            .iter()
+            .any(|s| s.as_str() == section)
+    }
+
+    /// Returns `true` if the note `(section, title)` can never be hard-deleted —
+    /// **path-aware** (invariant 9).
+    ///
+    /// Same carve-out as [`Section::is_forget_protected`] for
+    /// [`Section::Identity`] (person cards are erasable, souls are not), applied
+    /// over the wider [`Section::PROTECTED_DELETE`] perimeter. Because both
+    /// predicates share [`Section::identity_person_carveout`] and identity is a
+    /// member of both constant sets, the invariant
+    /// `is_forget_protected ⟹ is_delete_protected` holds over the whole
+    /// `(section, title)` domain (proved by the property test
+    /// `forget_protected_implies_delete_protected`).
+    ///
+    /// The `title` MUST be co-resolved with `section` from the same authoritative
+    /// read (never a stale candidate list).
+    #[must_use]
+    pub fn is_delete_protected(section: &str, title: &str) -> bool {
+        if section == Section::Identity.as_str() {
+            return !Self::identity_person_carveout(title);
+        }
+        Section::PROTECTED_DELETE
+            .iter()
+            .any(|s| s.as_str() == section)
+    }
+
+    /// Returns `true` if `name` (kebab-case section) can never be hard-deleted —
+    /// **section-only** (title-agnostic).
+    ///
+    /// Kept for the section-granularity call sites and API stability. Equivalent
+    /// to [`Section::is_delete_protected`] with an empty title (an empty title
+    /// never triggers the person-card carve-out), so the two never diverge.
+    /// Prefer [`Section::is_delete_protected`] wherever a title is available
+    /// (path-aware protection). Unknown section names return `false`.
     #[must_use]
     pub fn is_protected_delete(name: &str) -> bool {
-        Section::PROTECTED_DELETE.iter().any(|s| s.as_str() == name)
+        Section::is_delete_protected(name, "")
     }
 
     /// Sections protected from the automatic downgrade policy (graduated forgetting).
@@ -176,7 +269,7 @@ impl Section {
     ///
     // Extension remains subject to a project-side governance review, but no longer
     // breaks downstream consumers.
-    pub const ALL: [Section; 14] = [
+    pub const ALL: [Section; 15] = [
         Section::Decisions,
         Section::Architecture,
         Section::Debug,
@@ -191,6 +284,7 @@ impl Section {
         Section::ProjectMap,
         Section::Identity,
         Section::Snapshot,
+        Section::Messaging,
     ];
 
     /// Parse a kebab-case string into a `Section`.
@@ -232,6 +326,7 @@ impl Section {
             Section::ProjectMap => "project-map",
             Section::Identity => "identity",
             Section::Snapshot => "snapshot",
+            Section::Messaging => "messaging",
         }
     }
 }
@@ -257,12 +352,12 @@ pub fn is_protected_downgrade(section: &str) -> bool {
 // behaviour (composite α/β unchanged).
 //
 // The SQL backfill (migrations 0008 + 0011 + 0021 + 0024) MUST produce the same values
-// for all 14 enum sections — see tests `c_kind_matches_backfill_sql` below.
+// for all 15 enum sections — see tests `c_kind_matches_backfill_sql` below.
 
 /// Deterministic CoALA cognitive category (4 categories) derived from section.
 ///
 /// Returns `"episodic"`, `"semantic"`, `"procedural"`, or `"reflective"`.
-/// The match is exhaustive over all 14 [`Section`] variants — there is no runtime
+/// The match is exhaustive over all 15 [`Section`] variants — there is no runtime
 /// fallback. Adding a new variant requires updating this function (the compiler
 /// will enforce it via an exhaustiveness error).
 ///
@@ -289,6 +384,8 @@ pub const fn section_to_c_kind(section: &Section) -> &'static str {
         Section::Identity => "procedural",
         // Snapshot : lignes de capture d'événements de session, datées → episodic (F-246)
         Section::Snapshot => "episodic",
+        // Messaging : courrier inter-agents daté, hors périmètre de rappel → episodic (F-144)
+        Section::Messaging => "episodic",
     }
 }
 
@@ -296,7 +393,7 @@ pub const fn section_to_c_kind(section: &Section) -> &'static str {
 ///
 /// Returns `"Event"` (dated incident, point in time) or `"Static"`
 /// (stable knowledge, durable reference).
-/// The match is exhaustive over all 14 [`Section`] variants — there is no runtime
+/// The match is exhaustive over all 15 [`Section`] variants — there is no runtime
 /// fallback. Adding a new variant requires updating this function (the compiler
 /// will enforce it via an exhaustiveness error).
 ///
@@ -325,6 +422,8 @@ pub const fn section_to_doc_kind(section: &Section) -> &'static str {
         | Section::Identity => "Static",
         // Council : verdict ponctuel daté → Event (cohérent avec Debug/AgentIssues)
         Section::Council => "Event",
+        // Messaging : message délivré daté (occurrence ponctuelle) → Event (F-144)
+        Section::Messaging => "Event",
     }
 }
 
@@ -419,6 +518,8 @@ pub const fn trust_for_section(section: &Section) -> f64 {
         Section::Debug | Section::Experiments => 0.40,
         // Snapshot : matière première brute (lignes de capture non interprétées) → palier D (F-246)
         Section::Snapshot => 0.40,
+        // Messaging : courrier non validé, hors périmètre de recherche → palier D (F-144)
+        Section::Messaging => 0.40,
     }
 }
 
@@ -453,7 +554,7 @@ pub fn section_str_to_doc_kind(section: &str) -> &'static str {
 mod from_canonical_str_tests {
     use super::*;
 
-    /// Toutes les 14 sections sont reconnues par from_canonical_str.
+    /// Toutes les 15 sections sont reconnues par from_canonical_str.
     #[test]
     fn accepts_all_canonical_sections() {
         for section in Section::ALL {
@@ -516,7 +617,7 @@ mod from_canonical_str_tests {
     ///
     /// Invariants vérifiés :
     /// - round-trip parse (`from_canonical_str` / `as_str`)
-    /// - `ALL.len() == 13`
+    /// - `ALL.len() == 15`
     /// - `doc_kind = "Static"` (âme stable, mutée par RMW)
     /// - `c_kind = "procedural"` (gouvernance/comportement)
     /// - présence dans `PROTECTED_FORGET` (jamais oubliée)
@@ -528,14 +629,45 @@ mod from_canonical_str_tests {
             Some(Section::Identity)
         );
         assert_eq!(Section::Identity.as_str(), "identity");
-        // 14 canonical sections total.
-        assert_eq!(Section::ALL.len(), 14);
+        // 15 canonical sections total.
+        assert_eq!(Section::ALL.len(), 15);
         // doc_kind = "Static" (âme stable, mutée par RMW — A4 F-34).
         assert_eq!(section_to_doc_kind(&Section::Identity), "Static");
         // c_kind = "procedural" (gouvernance/comportement — F-34 v0.7.3).
         assert_eq!(section_to_c_kind(&Section::Identity), "procedural");
         // Jamais oubliée (A3 PROTECTED_FORGET).
         assert!(Section::PROTECTED_FORGET.contains(&Section::Identity));
+    }
+
+    /// F-144 — propriétés canoniques de la 15e section `messaging`.
+    ///
+    /// Invariants vérifiés :
+    /// - round-trip parse (`from_canonical_str` / `as_str`)
+    /// - membre de `ALL` (15 sections au total, verrouillé par `identity_section…`)
+    /// - exclue de la recherche par défaut (`DEFAULT_SEARCH_EXCLUDED`)
+    /// - hors périmètres de protection forget/delete/downgrade (cycle de vie standard,
+    ///   purgeable — arbitrage Q4 council 2026-09-07)
+    /// - mappings CoALA/trust définis (matchs exhaustifs verrouillés par les tests *all_sections)
+    #[test]
+    fn messaging_section_is_canonical_excluded_from_search() {
+        // Round-trip parse.
+        assert_eq!(
+            Section::from_canonical_str("messaging"),
+            Some(Section::Messaging)
+        );
+        assert_eq!(Section::Messaging.as_str(), "messaging");
+        // Membre de ALL.
+        assert!(Section::ALL.contains(&Section::Messaging));
+        // Exclue de la recherche par défaut (F-144 — boîte aux lettres privée).
+        assert!(Section::DEFAULT_SEARCH_EXCLUDED.contains(&Section::Messaging));
+        // Hors protections gouvernance : cycle de vie standard, purgeable (Q4).
+        assert!(!Section::PROTECTED_FORGET.contains(&Section::Messaging));
+        assert!(!Section::PROTECTED_DELETE.contains(&Section::Messaging));
+        assert!(!Section::PROTECTED_DOWNGRADE.contains(&Section::Messaging.as_str()));
+        // Mappings CoALA/trust définis (utilisés par les chemins d'écriture).
+        assert_eq!(section_to_c_kind(&Section::Messaging), "episodic");
+        assert_eq!(section_to_doc_kind(&Section::Messaging), "Event");
+        assert!((0.0..=1.0).contains(&trust_for_section(&Section::Messaging)));
     }
 
     /// Invariant F-100 : `PROTECTED_FORGET ⊆ PROTECTED_DELETE`.
@@ -585,18 +717,133 @@ mod from_canonical_str_tests {
         assert!(!Section::is_protected_delete("bogus-section"));
     }
 
-    /// F-246 — l'inventaire `DEFAULT_SEARCH_EXCLUDED` contient exactement `Snapshot`.
+    // ── F-125 invariant 9 — carve-out droit à l'oubli `identity/person/*` ────────
+
+    /// Le préfixe gravé `IDENTITY_PERSON_TITLE_PREFIX` reste la composition exacte
+    /// de la section `identity` et du namespace réservé `person/` — anti-dérive si
+    /// l'un des deux évolue.
+    #[test]
+    fn identity_person_title_prefix_matches_person_namespace() {
+        let composed = format!(
+            "{}/{}",
+            Section::Identity.as_str(),
+            crate::person::PERSON_NAMESPACE_PREFIX
+        );
+        assert_eq!(Section::IDENTITY_PERSON_TITLE_PREFIX, composed);
+    }
+
+    /// Le carve-out est ANCRÉ et borné au segment `person/` : seuls les vrais
+    /// `identity/person/<id>` matchent — jamais `identity/personX`,
+    /// `identity/personal-*`, ni un `person/` en milieu de chaîne.
+    #[test]
+    fn identity_person_carveout_is_anchored_segment() {
+        // Vrais person cards.
+        assert!(Section::identity_person_carveout("identity/person/alice"));
+        assert!(Section::identity_person_carveout("identity/person/bob-42"));
+        // Ancrage : le segment doit être `person/`, pas un préfixe de mot.
+        assert!(!Section::identity_person_carveout("identity/personX"));
+        assert!(!Section::identity_person_carveout("identity/personal-foo"));
+        assert!(!Section::identity_person_carveout("identity/person")); // pas de `/`
+        // Non ancré au début → refusé (jamais `contains`).
+        assert!(!Section::identity_person_carveout(
+            "x-identity/person/alice"
+        ));
+        assert!(!Section::identity_person_carveout("identity/main"));
+        assert!(!Section::identity_person_carveout(""));
+    }
+
+    /// Âme `identity/<sub>` : protégée forget ET delete ; carte `identity/person/*` :
+    /// ni l'un ni l'autre (droit à l'oubli). Le titre vide (non résoluble) retombe
+    /// côté protégé pour la section identity (fail-closed en amont).
+    #[test]
+    fn identity_protection_is_path_aware() {
+        // Âme → protégée des deux côtés.
+        assert!(Section::is_forget_protected("identity", "identity/main"));
+        assert!(Section::is_delete_protected("identity", "identity/main"));
+        // Carte person → effaçable des deux côtés (carve-out).
+        assert!(!Section::is_forget_protected(
+            "identity",
+            "identity/person/alice"
+        ));
+        assert!(!Section::is_delete_protected(
+            "identity",
+            "identity/person/alice"
+        ));
+        // Titre vide sur identity → protégé (fail-closed).
+        assert!(Section::is_forget_protected("identity", ""));
+        assert!(Section::is_delete_protected("identity", ""));
+        // Ancrage négatif : titre proche mais non carve-out → protégé.
+        assert!(Section::is_forget_protected(
+            "identity",
+            "identity/personal"
+        ));
+        assert!(Section::is_delete_protected(
+            "identity",
+            "identity/personal"
+        ));
+    }
+
+    /// Les autres sections protégées restent INCONDITIONNELLES (titre ignoré) : un
+    /// `identity/person/*` en guise de titre ne carve PAS une note `council`.
+    #[test]
+    fn other_protected_sections_ignore_title() {
+        for s in ["agent-issues", "council", "project-map"] {
+            assert!(Section::is_forget_protected(s, "identity/person/alice"));
+            assert!(Section::is_delete_protected(s, "identity/person/alice"));
+        }
+        // Decisions/Reasoning : delete-only, jamais carvés par un titre.
+        for s in ["decisions", "reasoning"] {
+            assert!(!Section::is_forget_protected(s, "identity/person/alice"));
+            assert!(Section::is_delete_protected(s, "identity/person/alice"));
+        }
+        // Section libre → jamais protégée.
+        assert!(!Section::is_forget_protected(
+            "feedback",
+            "identity/person/alice"
+        ));
+        assert!(!Section::is_delete_protected(
+            "feedback",
+            "identity/person/alice"
+        ));
+    }
+
+    proptest::proptest! {
+        /// Invariant F-100 path-aware : `is_forget_protected ⟹ is_delete_protected`
+        /// sur tout le domaine `(section, titre)` — incluant person/soul/vide/malformé.
+        #[test]
+        fn forget_protected_implies_delete_protected(
+            section in proptest::sample::select(vec![
+                "identity", "agent-issues", "council", "project-map",
+                "decisions", "reasoning", "feedback", "snapshot", "bogus", "",
+            ]),
+            title in proptest::string::string_regex(
+                "(identity/person/[a-z0-9-]{0,8}|identity/personal|identity/main|person/x|)"
+            ).expect("regex titre proptest valide"),
+        ) {
+            if Section::is_forget_protected(section, &title) {
+                proptest::prop_assert!(
+                    Section::is_delete_protected(section, &title),
+                    "forget-protégé sans être delete-protégé: section={section:?} title={title:?}"
+                );
+            }
+        }
+    }
+
+    /// F-246 + F-144 — l'inventaire `DEFAULT_SEARCH_EXCLUDED` contient exactement
+    /// `Snapshot` et `Messaging`.
     ///
-    /// Seule la section de capture brute est hors périmètre de recherche par défaut ;
-    /// aucune autre section canonique n'y figure.
+    /// Les sections de capture brute (`snapshot`) et de boîte aux lettres
+    /// inter-agents (`messaging`, F-144) sont hors périmètre de recherche par
+    /// défaut ; aucune autre section canonique n'y figure.
     #[test]
     fn default_search_excluded_exact_perimeter() {
         assert!(Section::DEFAULT_SEARCH_EXCLUDED.contains(&Section::Snapshot));
-        assert_eq!(Section::DEFAULT_SEARCH_EXCLUDED.len(), 1);
+        assert!(Section::DEFAULT_SEARCH_EXCLUDED.contains(&Section::Messaging));
+        assert_eq!(Section::DEFAULT_SEARCH_EXCLUDED.len(), 2);
         for sec in Section::ALL {
             assert_eq!(
                 Section::DEFAULT_SEARCH_EXCLUDED.contains(&sec),
-                sec == Section::Snapshot,
+                matches!(sec, Section::Snapshot | Section::Messaging),
                 "section {sec} incohérente avec DEFAULT_SEARCH_EXCLUDED"
             );
         }
@@ -633,7 +880,7 @@ mod from_canonical_str_tests {
 mod cognitive_kind_tests {
     use super::*;
 
-    /// Vérifie que section_to_c_kind produit les valeurs attendues pour les 14 sections.
+    /// Vérifie que section_to_c_kind produit les valeurs attendues pour les 15 sections.
     #[test]
     fn c_kind_all_sections() {
         let cases = [
@@ -651,6 +898,7 @@ mod cognitive_kind_tests {
             (Section::ProjectMap, "procedural"),
             (Section::Identity, "procedural"),
             (Section::Snapshot, "episodic"),
+            (Section::Messaging, "episodic"),
         ];
         for (section, expected) in cases {
             assert_eq!(
@@ -661,7 +909,7 @@ mod cognitive_kind_tests {
         }
     }
 
-    /// Vérifie que section_to_doc_kind produit les valeurs attendues pour les 14 sections.
+    /// Vérifie que section_to_doc_kind produit les valeurs attendues pour les 15 sections.
     #[test]
     fn doc_kind_all_sections() {
         let cases = [
@@ -679,6 +927,7 @@ mod cognitive_kind_tests {
             (Section::ProjectMap, "Static"),
             (Section::Identity, "Static"),
             (Section::Snapshot, "Event"),
+            (Section::Messaging, "Event"),
         ];
         for (section, expected) in cases {
             assert_eq!(
@@ -739,8 +988,8 @@ mod cognitive_kind_tests {
     ///
     /// The SQL backfill uses a CASE expression on the `section` column (string).
     /// This test simulates the SQL CASE and compares the result with the Rust constants
-    /// for all enum sections (the 14 canonical ones, including `Identity` added in v0.7.3
-    /// and `Snapshot` added in F-246).
+    /// for all enum sections (the 15 canonical ones, including `Identity` added in v0.7.3,
+    /// `Snapshot` added in F-246, and `Messaging` added in F-144).
     /// Any mismatch means existing DB rows will have different values than new rows
     /// written via `upsert_note`.
     #[test]
@@ -789,6 +1038,14 @@ mod cognitive_kind_tests {
         }
 
         for section in Section::ALL {
+            // F-144 : `messaging` n'a PAS de backfill SQL — la section naît en 2.3.0
+            // (aucune ligne pré-existante), toutes ses lignes sont écrites par le chemin
+            // Rust (`message_send`). La simulation CASE des migrations 0008/0011/0021/0024
+            // ne la connaît pas (retombe sur les défauts `semantic`/`Static`), donc la
+            // comparaison Rust↔SQL est vide de sens pour elle : on la saute explicitement.
+            if section == Section::Messaging {
+                continue;
+            }
             let s = section.as_str();
             assert_eq!(
                 section_to_c_kind(&section),
@@ -807,7 +1064,7 @@ mod cognitive_kind_tests {
         }
     }
 
-    /// F-261 — les 14 sections canoniques ont toutes une valeur de confiance définie,
+    /// F-261 — les 15 sections canoniques ont toutes une valeur de confiance définie,
     /// dans [0, 1], et l'ordre des paliers est strictement décroissant du palier A au D.
     #[test]
     fn trust_for_section_all_sections_in_zero_one() {
@@ -866,7 +1123,7 @@ mod cognitive_kind_tests {
         assert_eq!(section_str_to_doc_kind(""), "Static");
     }
 
-    /// F-261 — section_str_to_doc_kind est cohérente avec section_to_doc_kind sur les 14 sections.
+    /// F-261 — section_str_to_doc_kind est cohérente avec section_to_doc_kind sur les 15 sections.
     #[test]
     fn section_str_to_doc_kind_matches_typed() {
         for section in Section::ALL {

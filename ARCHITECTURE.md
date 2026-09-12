@@ -873,7 +873,7 @@ CREATE INDEX IF NOT EXISTS idx_notes_c_kind   ON notes(c_kind);
 CREATE INDEX IF NOT EXISTS idx_notes_doc_kind ON notes(doc_kind);
 ```
 
-**Note on section mapping** : the `Section` enum has 14 variants (was 11 before the identity/project-map and snapshot sections were added). Notes with `section_hint="council"` map to `Section::Council` → stored as `section="council"` → `c_kind="episodic"` (decision-based). Prior versions (v0.3.x) lacked this variant; notes fell back to `Section::Reference` in those older versions.
+**Note on section mapping** : the `Section` enum has 15 variants (was 11 before the identity/project-map, snapshot and messaging sections were added). Notes with `section_hint="council"` map to `Section::Council` → stored as `section="council"` → `c_kind="episodic"` (decision-based). Prior versions (v0.3.x) lacked this variant; notes fell back to `Section::Reference` in those older versions.
 
 ### Migration 0004 (`vault_downgrade`)
 

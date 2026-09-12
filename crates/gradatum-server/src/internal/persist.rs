@@ -861,13 +861,24 @@ pub(crate) async fn cascade_delete_note(
 ) -> Result<CascadeDeleteOutcome, GradatumError> {
     // 0. Garde PROTECTED_DELETE system-wide — refus AVANT toute mutation.
     //
-    // Résolution de la section côté serveur (autorité unique de la protection),
-    // indépendante de ce que l'appelant a — ou n'a pas — vérifié. Protège l'API
-    // et le Purge par le même point de passage. Une note absente de l'index
-    // (section = None) n'est pas protégeable ici : la suppression vault suivante
-    // tranchera (NoteNotFound si le `.md` est absent).
-    if let Some(section) = state.search.get_note_section(vault_id, ulid).await?
-        && Section::is_protected_delete(&section)
+    // Résolution PATH-AWARE côté serveur (autorité unique de la protection),
+    // indépendante de ce que l'appelant a — ou n'a pas — vérifié. La clé de
+    // protection `(section, titre)` est co-résolue depuis une SEULE ligne d'index
+    // (`get_note_protection_key`) : ni la section ni le titre ne peuvent décrire
+    // deux notes différentes (anti-dérive F-125). Protège l'API et le Purge par le
+    // même point de passage.
+    //
+    // Carve-out F-125 inv. 9 : une carte `identity/person/*` n'est PAS protégée
+    // (droit à l'oubli) ; toute autre note `identity` (âme) le reste. Le privilège
+    // d'effacement est vérifié en amont (frontière API `vault_delete_core`) — le
+    // Purge auto n'atteint jamais une carte person (jamais rétrogradée en garbage :
+    // `identity` ∈ PROTECTED_DOWNGRADE, hors périmètre F-125).
+    //
+    // Une note absente de l'index (clé = None) n'est pas protégeable ici : la
+    // suppression vault suivante tranchera (NoteNotFound si le `.md` est absent) —
+    // comportement d'idempotence préexistant, inchangé.
+    if let Some((section, title)) = state.search.get_note_protection_key(vault_id, ulid).await?
+        && Section::is_delete_protected(&section, &title)
     {
         return Err(GradatumError::Forbidden(format!(
             "protected section: '{section}' can never be hard-deleted (PROTECTED_DELETE, no bypass)"

@@ -27,7 +27,7 @@ pub gradatum_engine::config::EngineConfig::extra_args: alloc::vec::Vec<alloc::st
 pub gradatum_engine::config::EngineConfig::gpu_layers: u32
 pub gradatum_engine::config::EngineConfig::gradatum_url: core::option::Option<alloc::string::String>
 pub gradatum_engine::config::EngineConfig::llama_server_bin: std::path::PathBuf
-pub gradatum_engine::config::EngineConfig::max_tokens: u32
+pub gradatum_engine::config::EngineConfig::max_tokens: core::option::Option<u32>
 pub gradatum_engine::config::EngineConfig::metrics_port: core::option::Option<u16>
 pub gradatum_engine::config::EngineConfig::min_stable_uptime_secs: u64
 pub gradatum_engine::config::EngineConfig::mmproj_path: core::option::Option<std::path::PathBuf>
@@ -42,7 +42,6 @@ pub gradatum_engine::config::EngineConfig::spec_draft_p_min: core::option::Optio
 pub gradatum_engine::config::EngineConfig::spec_type: core::option::Option<gradatum_engine::config::SpecType>
 pub gradatum_engine::config::EngineConfig::startup_timeout_secs: u64
 pub gradatum_engine::config::EngineConfig::timeout_secs: u64
-pub gradatum_engine::config::EngineConfig::warm_up: alloc::string::String
 impl gradatum_engine::config::EngineConfig
 pub fn gradatum_engine::config::EngineConfig::from_toml(&str) -> core::result::Result<Self, toml::de::error::Error>
 pub fn gradatum_engine::config::EngineConfig::load_local(&std::path::Path) -> core::result::Result<Self, alloc::boxed::Box<figment::error::Error>>
@@ -73,9 +72,11 @@ pub const fn gradatum_engine::health::TelemetryStatus::is_active(self) -> bool
 pub const fn gradatum_engine::health::TelemetryStatus::label(self) -> &'static str
 #[non_exhaustive] pub struct gradatum_engine::health::HealthSnapshot
 pub gradatum_engine::health::HealthSnapshot::backend: &'static str
+pub gradatum_engine::health::HealthSnapshot::build_sha: &'static str
 pub gradatum_engine::health::HealthSnapshot::event_log: &'static str
 pub gradatum_engine::health::HealthSnapshot::model: alloc::string::String
-pub gradatum_engine::health::HealthSnapshot::status: &'static str
+pub gradatum_engine::health::HealthSnapshot::status: gradatum_dto::health::HealthStatus
+pub gradatum_engine::health::HealthSnapshot::version: &'static str
 pub gradatum_engine::health::HealthSnapshot::warm_up_state: &'static str
 pub struct gradatum_engine::health::HealthState
 impl gradatum_engine::health::HealthState

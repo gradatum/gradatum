@@ -244,6 +244,44 @@ impl AclEngine {
         // Step 7: implicit default — no pattern matched.
         AclDecision::DenyImplicit
     }
+
+    /// Evaluates the inter-agent messaging emit policy for a recipient.
+    ///
+    /// A sender may dispatch a message to `recipient` **only** when its
+    /// `write_patterns` cover the recipient's channel locus — exactly one locus,
+    /// [`messaging_channel_locus`], evaluated with [`AclEngine::evaluate`] on
+    /// [`AclOp::Write`]. Zero new field: this reuses the engine's compiled glob
+    /// sets (allow + deny-wins `!`).
+    ///
+    /// Returns the tri-state decision (the caller decides the wire answer — the
+    /// message API answers with a silent refusal on any denial, C2):
+    /// - [`AclDecision::Allow`] — a write pattern covers `messaging/<recipient>`.
+    /// - [`AclDecision::DenyImplicit`] — default deny (no allow pattern matched).
+    /// - [`AclDecision::DenyExplicit`] — a `!messaging/<...>` negation matched.
+    #[must_use]
+    pub fn evaluate_messaging_send(
+        &self,
+        trust: &TrustContext,
+        recipient_identity: &str,
+    ) -> AclDecision {
+        self.evaluate(
+            trust,
+            AclOp::Write,
+            &messaging_channel_locus(recipient_identity),
+        )
+    }
+}
+
+/// Builds the channel locus of a recipient's mailbox: `messaging/<recipient_identity>`.
+///
+/// The locus is the address evaluated by the C4 emit policy: a sender may write a
+/// message into a recipient's channel only when its `write_patterns` cover this
+/// exact locus. `recipient_identity` is the credited agent identity
+/// (`identity/<kind>/<id>`), kept verbatim — the locus is a plain string
+/// composition, never a parsed/validated structure (parse-don't-validate).
+#[must_use]
+pub fn messaging_channel_locus(recipient_identity: &str) -> String {
+    format!("messaging/{recipient_identity}")
 }
 
 // ── Helpers internes ─────────────────────────────────────────────────────────
@@ -374,6 +412,132 @@ write_patterns = []
         };
         assert_eq!(
             engine.evaluate(&trust, AclOp::Read, "main/decisions"),
+            AclDecision::DenyImplicit
+        );
+    }
+
+    // ── C4 — politique émetteur → destinataire (canal `messaging/<recipient>`) ──
+
+    /// Bearer `main` pour un `sub` donné.
+    fn bearer(sub: &str) -> TrustContext {
+        TrustContext::BearerToken {
+            kid: "k-c4".to_owned(),
+            aud: "gradatum".to_owned(),
+            sub: AgentId::new(sub),
+            scopes: vec!["vault_write".to_owned()],
+            tenant_id: gradatum_core::scope::TenantId::new("main"),
+            jti: None,
+        }
+    }
+
+    /// Le locus canal est la composition exacte `messaging/<recipient>`.
+    #[test]
+    fn messaging_channel_locus_composes_exact_locus() {
+        assert_eq!(messaging_channel_locus("agent-x"), "messaging/agent-x");
+        // Une identity créditée (F-125) reste verbatim dans le locus.
+        assert_eq!(
+            messaging_channel_locus("identity/agent/alice"),
+            "messaging/identity/agent/alice"
+        );
+    }
+
+    /// Write pattern couvrant le canal du destinataire → Allow (C4).
+    #[test]
+    fn evaluate_messaging_send_allows_covered_recipient() {
+        let preset = r#"
+[[consumer]]
+identity = "sender"
+read_patterns = []
+write_patterns = ["messaging/agent-x"]
+"#;
+        let engine = AclEngine::from_preset_str(preset).expect("preset valide");
+        assert_eq!(
+            engine.evaluate_messaging_send(&bearer("sender"), "agent-x"),
+            AclDecision::Allow
+        );
+    }
+
+    /// Destinataire hors patterns → DenyImplicit (default deny, refus muet C2).
+    #[test]
+    fn evaluate_messaging_send_denies_implicit_uncovered_recipient() {
+        let preset = r#"
+[[consumer]]
+identity = "sender"
+read_patterns = []
+write_patterns = ["messaging/agent-x"]
+"#;
+        let engine = AclEngine::from_preset_str(preset).expect("preset valide");
+        assert_eq!(
+            engine.evaluate_messaging_send(&bearer("sender"), "agent-y"),
+            AclDecision::DenyImplicit
+        );
+    }
+
+    /// Negation `!messaging/**` → DenyExplicit même avec un allow générique (deny-wins).
+    #[test]
+    fn evaluate_messaging_send_deny_wins_over_broad_allow() {
+        let preset = r#"
+[[consumer]]
+identity = "sender"
+read_patterns = []
+write_patterns = ["messaging/*", "!messaging/agent-y"]
+"#;
+        let engine = AclEngine::from_preset_str(preset).expect("preset valide");
+        assert_eq!(
+            engine.evaluate_messaging_send(&bearer("sender"), "agent-x"),
+            AclDecision::Allow
+        );
+        assert_eq!(
+            engine.evaluate_messaging_send(&bearer("sender"), "agent-y"),
+            AclDecision::DenyExplicit
+        );
+    }
+
+    /// Émetteur inconnu → DenyImplicit (une identité sans consumer déclaré ne peut
+    /// envoyer aucun message).
+    #[test]
+    fn evaluate_messaging_send_denies_unknown_sender() {
+        let preset = r#"
+[[consumer]]
+identity = "sender"
+read_patterns = []
+write_patterns = ["messaging/agent-x"]
+"#;
+        let engine = AclEngine::from_preset_str(preset).expect("preset valide");
+        assert_eq!(
+            engine.evaluate_messaging_send(&bearer("stranger"), "agent-x"),
+            AclDecision::DenyImplicit
+        );
+    }
+
+    /// Non authentifié → DenyImplicit immédiat (step 1 du moteur).
+    #[test]
+    fn evaluate_messaging_send_denies_unauthenticated() {
+        let preset = r#"
+[[consumer]]
+identity = "sender"
+read_patterns = []
+write_patterns = ["messaging/agent-x"]
+"#;
+        let engine = AclEngine::from_preset_str(preset).expect("preset valide");
+        assert_eq!(
+            engine.evaluate_messaging_send(&TrustContext::Unauthenticated, "agent-x"),
+            AclDecision::DenyImplicit
+        );
+    }
+
+    /// Un consumer sans aucun write_pattern sur le canal ne peut rien envoyer.
+    #[test]
+    fn evaluate_messaging_send_denies_sender_without_channel_pattern() {
+        let preset = r#"
+[[consumer]]
+identity = "reader"
+read_patterns = ["main/**"]
+write_patterns = []
+"#;
+        let engine = AclEngine::from_preset_str(preset).expect("preset valide");
+        assert_eq!(
+            engine.evaluate_messaging_send(&bearer("reader"), "agent-x"),
             AclDecision::DenyImplicit
         );
     }

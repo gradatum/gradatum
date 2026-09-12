@@ -92,7 +92,7 @@ fn build_tenant_router(state: AppState) -> axum::Router {
         ));
 
     let unauthed = Router::new()
-        .route("/health", get(health::handler))
+        .route("/health", get(health::liveness_handler))
         .merge(gradatum_server::auth_routes::router());
 
     authed.merge(unauthed).with_state(state)

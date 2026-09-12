@@ -380,6 +380,19 @@ impl IndexStore for SqliteIndex {
         self.list_notes(vault_id, section, limit, cursor).await
     }
 
+    /// Mailbox message listing across an ACL vault allow-list — delegates to
+    /// `SqliteIndex::list_messaging_notes`.
+    async fn list_messaging_notes(
+        &self,
+        vault_ids: &[String],
+        recipient: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        self.list_messaging_notes(vault_ids, recipient, limit, cursor)
+            .await
+    }
+
     /// Atomic feature-number allocation — delegates to
     /// `SqliteIndex::allocate_feature_number` (overrides the loud-error trait default).
     async fn allocate_feature_number(&self, vault_id: &VaultId) -> Result<u32, GradatumError> {
@@ -605,6 +618,15 @@ impl IndexStore for SqliteIndex {
         note_id: &str,
     ) -> Result<Option<String>, GradatumError> {
         self.get_note_section(vault_id, note_id).await
+    }
+
+    /// Delegates to `SqliteIndex::get_note_protection_key`.
+    async fn get_note_protection_key(
+        &self,
+        vault_id: &str,
+        note_id: &str,
+    ) -> Result<Option<(String, String)>, GradatumError> {
+        self.get_note_protection_key(vault_id, note_id).await
     }
 
     /// Delegates to `SqliteIndex::is_note_forgotten`.

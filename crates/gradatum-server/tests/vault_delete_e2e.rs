@@ -697,3 +697,100 @@ fn main_rs_wires_prod_audit_sink() {
         "main.rs doit câbler le sink d'audit durable via with_audit_dir (anti-régression P1-1)"
     );
 }
+
+// ── Tests F-125 invariant 9 — hard-delete path-aware `identity/person/*` ───────
+//
+// Carve-out : une carte `identity/person/<id>` est hard-deletable par l'opérateur
+// admin (pleine autorité de cette porte) alors qu'une âme `identity/<sub>` reste
+// protégée par PROTECTED_DELETE. La décision co-résout `(section, titre)` server-side.
+
+/// Écrit un `.md` réel en section `identity` et fixe son titre d'index.
+async fn write_identity_note(env: &DeleteEnv, title: &str) -> String {
+    let note = env
+        .vault
+        .write_note(
+            live_frontmatter(Section::Identity),
+            format!("# {title}\ncorps identite"),
+        )
+        .await
+        .expect("write_note identity");
+    env.idx
+        .upsert_note_title("main", &note.id, title)
+        .await
+        .expect("upsert_note_title identity");
+    note.id.to_string()
+}
+
+/// Carte `identity/person/alice` → hard-delete admin AUTORISÉ ; la note est retirée.
+#[tokio::test]
+async fn person_card_hard_delete_is_allowed_and_removes_note() {
+    let env = build_app().await;
+    let id = write_identity_note(&env, "identity/person/alice").await;
+
+    // Dry-run : PAS de 403 (carte person effaçable), exists=true.
+    let (status_dry, json_dry) = post_delete(
+        env.app.clone(),
+        serde_json::json!({ "note_id": id, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(
+        status_dry,
+        StatusCode::OK,
+        "carte person dry-run ne doit PAS être 403: {json_dry}"
+    );
+    assert_eq!(json_dry["exists"], true, "carte person existe: {json_dry}");
+
+    // Mode réel : suppression effective (archivage).
+    let (status, json) = post_delete(
+        env.app.clone(),
+        serde_json::json!({ "note_id": id, "dry_run": false, "confirm_ulids": [id] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "hard-delete carte person 200: {json}"
+    );
+    assert_eq!(json["deleted"], true, "carte person deleted=true: {json}");
+
+    // La note est réellement retirée de l'index.
+    assert!(
+        env.idx.get_note("main", &id).await.unwrap().is_none(),
+        "la carte person doit être retirée de l'index après hard-delete"
+    );
+}
+
+/// Âme `identity/main` → hard-delete admin REFUSÉ (403), note préservée. Prouve que le
+/// carve-out n'ouvre QUE les cartes person, pas les âmes.
+#[tokio::test]
+async fn soul_hard_delete_stays_protected_403() {
+    let env = build_app().await;
+    let id = write_identity_note(&env, "identity/main").await;
+
+    let (status_dry, json_dry) = post_delete(
+        env.app.clone(),
+        serde_json::json!({ "note_id": id, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(
+        status_dry,
+        StatusCode::FORBIDDEN,
+        "âme identity/main dry-run doit être 403: {json_dry}"
+    );
+
+    let (status_real, json_real) = post_delete(
+        env.app.clone(),
+        serde_json::json!({ "note_id": id, "dry_run": false, "confirm_ulids": [id] }),
+    )
+    .await;
+    assert_eq!(
+        status_real,
+        StatusCode::FORBIDDEN,
+        "âme identity/main mode réel doit être 403: {json_real}"
+    );
+
+    assert!(
+        env.idx.get_note("main", &id).await.unwrap().is_some(),
+        "âme protégée jamais supprimée"
+    );
+}

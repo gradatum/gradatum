@@ -56,6 +56,7 @@ pub const MCP_TOOL_KEYS: &[(&str, &str)] = &[
     ("vault_archives_list", "mcp:vault_archives_list"),
     ("code_scope", "mcp:code_scope"),
     ("create_feature_card", "mcp:create_feature_card"),
+    ("vault_mutate_role", "mcp:vault_mutate_role"),
     // F-234 : capacités exposées par `dispatch_tool` mais historiquement hors compteur
     // (`vault_proactive_recall`/`_feedback` appelées à chaque recall/écriture, `job_status`
     // à chaque confirmation de job). Désormais instrumentées — aucune exclusion. La parité
@@ -66,6 +67,10 @@ pub const MCP_TOOL_KEYS: &[(&str, &str)] = &[
         "mcp:vault_proactive_recall_feedback",
     ),
     ("job_status", "mcp:job_status"),
+    // F-144 — messagerie inter-agents (3 outils ajoutés en 2.3.0).
+    ("message_send", "mcp:message_send"),
+    ("message_poll", "mcp:message_poll"),
+    ("message_ack", "mcp:message_ack"),
 ];
 
 /// Compteurs atomiques par outil MCP — map fermée, pré-peuplée, lecture seule après `new()`.

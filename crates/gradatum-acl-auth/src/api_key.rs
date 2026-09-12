@@ -145,6 +145,19 @@ pub enum ApiKeyError {
     /// implemented.
     #[error("unsupported tenant (mono-vault): '{0}' ≠ 'main'")]
     InvalidTenant(String),
+
+    /// The requested owner falls inside the reserved `person/` namespace.
+    ///
+    /// `person/<id>` addresses a **person card** (`identity/person/*`) — descriptive data
+    /// about a human, never an authenticatable principal. Minting a credential whose
+    /// subject started with `person/` would let the identity write guard's
+    /// `target == caller_sub` self-write branch authorize a write to a person card
+    /// (caveat C1). The namespace is therefore refused as an owner at creation, so that
+    /// no caller can ever *be* a `person/<id>`.
+    #[error(
+        "reserved namespace: owner must not start with 'person/' (person cards are not principals): '{0}'"
+    )]
+    ReservedOwnerNamespace(String),
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -723,6 +736,21 @@ impl ApiKeyStore for SqliteApiKeyStore {
             );
             return Err(ApiKeyError::InvalidTenant(tenant_id));
         }
+        // F-125 inv 2/3 — `person/` est un namespace réservé aux profils de personnes
+        // (`identity/person/*`), jamais un principal authentifiable. Refuser de frapper une
+        // clé dont le propriétaire (= futur `sub` du JWT) tomberait dans ce namespace ferme
+        // le trou C1 : aucun appelant ne peut alors s'auto-attribuer une carte person via la
+        // branche `target == caller_sub` de la garde d'écriture identity.
+        if owner
+            .as_str()
+            .starts_with(gradatum_core::person::PERSON_NAMESPACE_PREFIX)
+        {
+            tracing::warn!(
+                owner = %owner,
+                "api_key creation refused: owner in reserved 'person/' namespace (F-125 C1)"
+            );
+            return Err(ApiKeyError::ReservedOwnerNamespace(owner.to_string()));
+        }
         let scopes_json = serde_json::to_string(&scopes)
             .map_err(|e| ApiKeyError::Crypto(format!("scopes JSON serialization failed: {e}")))?;
         let owner = owner.to_string();
@@ -1206,6 +1234,26 @@ mod tests {
         assert!(
             matches!(result, Err(ApiKeyError::InvalidTenant(t)) if t == "evil"),
             "création clé tenant='evil' doit être refusée (InvalidTenant)"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_person_namespace_owner_is_refused() {
+        // F-125 C1 : `person/` est réservé aux cartes person, jamais un principal.
+        // Frapper une clé dont le propriétaire (= futur sub JWT) est `person/*` est refusé,
+        // fermant à la racine le trou `target == caller_sub` de la garde d'écriture identity.
+        let store = make_store().await;
+        let result = store
+            .create(
+                &AgentId::new("person/alice"),
+                vec!["read".to_string()],
+                "main".to_string(),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ApiKeyError::ReservedOwnerNamespace(ref o)) if o == "person/alice"),
+            "owner dans le namespace réservé 'person/' doit être refusé (C1), obtenu : {result:?}"
         );
     }
 

@@ -78,6 +78,31 @@ pub struct VaultSearchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub vault_id: Option<VaultId>,
+    /// Opt-in multi-vault: read the union of THESE vaults in addition to the
+    /// principal's own vault, with global RRF re-scoring; each hit carries its
+    /// `vault_id` provenance. `None` (default) → own vault only, response
+    /// **byte-identical** to the historical shape.
+    ///
+    /// A requested vault that is not authorized (no covering read grant, target ACL
+    /// deny, or inactive target tenant) is **silently excluded**: never a `403`, no
+    /// observable distinction between "vault does not exist" and "vault not authorized"
+    /// (no existence oracle).
+    ///
+    /// Honored only when `multi_tenant.enabled = true`. Mutually exclusive with the
+    /// singular `vault_id` field (supplying both → `400 Bad Request`). The resolved set
+    /// is capped at `MAX_VAULTS_PER_SEARCH` (overflow → `400`, never silent
+    /// truncation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_ids: Option<Vec<String>>,
+    /// Opt-in multi-vault: read ALL vaults readable by the principal, with global RRF
+    /// re-scoring. Default `false` → own vault only.
+    ///
+    /// Same silent-exclusion semantics and `MAX_VAULTS_PER_SEARCH` cap as `vault_ids`
+    /// (a set beyond the cap → `400`, the caller must enumerate). Honored only when
+    /// `multi_tenant.enabled = true`. Mutually exclusive with the singular `vault_id`
+    /// field.
+    #[serde(default)]
+    pub all_readable: bool,
     /// If `true`, enriches each result with a `scores` object detailing
     /// the composite score breakdown.
     ///
@@ -156,6 +181,8 @@ impl VaultSearchRequest {
             include_downgraded: false,
             locus: None,
             vault_id: None,
+            vault_ids: None,
+            all_readable: false,
             include_scores: false,
             include_corpus_count: false,
             from_ms: None,
@@ -194,7 +221,61 @@ pub fn escape_like(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_like;
+    use super::{VaultSearchRequest, escape_like};
+
+    /// F-63 : un payload SANS les champs multi-vault → défauts (`None` / `false`),
+    /// rétro-compatibilité stricte (`deny_unknown_fields` respecté).
+    #[test]
+    fn multivault_fields_default_when_absent() {
+        let req: VaultSearchRequest =
+            serde_json::from_value(serde_json::json!({ "query": "foo" })).expect("payload minimal");
+        assert_eq!(req.vault_ids, None, "vault_ids absent → None");
+        assert!(!req.all_readable, "all_readable absent → false");
+    }
+
+    /// F-63 : un payload AVEC les champs multi-vault → parsés tels quels.
+    #[test]
+    fn multivault_fields_parsed_when_present() {
+        let req: VaultSearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "foo",
+            "vault_ids": ["a", "b"],
+            "all_readable": true,
+        }))
+        .expect("payload multi-vault");
+        assert_eq!(
+            req.vault_ids.as_deref(),
+            Some(["a".to_owned(), "b".to_owned()].as_slice()),
+            "vault_ids parsés"
+        );
+        assert!(req.all_readable, "all_readable parsé");
+    }
+
+    /// F-63 : un champ inconnu reste refusé (`deny_unknown_fields` préservé).
+    #[test]
+    fn unknown_field_still_rejected() {
+        let res: Result<VaultSearchRequest, _> = serde_json::from_value(serde_json::json!({
+            "query": "foo",
+            "vault_idz": ["typo"],
+        }));
+        assert!(res.is_err(), "champ inconnu → erreur de désérialisation");
+    }
+
+    /// F-63 : `vault_id` (singulier) + `vault_ids` coexistent au parse — le conflit
+    /// est détectable (les deux champs sont peuplés) ; la validation 400 est en T4.
+    #[test]
+    fn singular_and_plural_vault_id_both_parse() {
+        let req: VaultSearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "foo",
+            "vault_id": "main",
+            "vault_ids": ["a"],
+        }))
+        .expect("payload conflit vault_id + vault_ids");
+        assert!(req.vault_id.is_some(), "vault_id singulier présent");
+        assert!(
+            req.vault_ids.is_some(),
+            "vault_ids présent → conflit détectable"
+        );
+    }
 
     /// escape_like encode correctement les métacaractères LIKE SQLite.
     ///

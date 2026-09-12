@@ -66,6 +66,11 @@ pub mod overrides;
 /// these helpers.
 /// See [`paths::vault_index_path`], [`paths::vault_dir_index_path`] and [`paths::queue_db_path`].
 pub mod paths;
+/// Strict whitelist validator for person cards (`identity/person/<id>`).
+///
+/// Descriptive profiles of humans, *referenced* by agents, never executed as a system
+/// prompt — distinct from [`soul`] (agent souls). See [`person::validate_person_card`].
+pub mod person;
 pub mod project_map;
 pub mod provenance;
 pub mod scheduled_health;
@@ -102,6 +107,8 @@ pub use job::{
     IngestInputSource,
     IngestSource,
     IngestStrategy,
+    // F-144 — kind dénormalisé d'une livraison de message (garde anti-dequeue)
+    JOB_KIND_MESSAGE,
     // Enum principal + helper routing
     Job,
     JobClass,
@@ -134,6 +141,8 @@ pub use job::{
     JobTrigger,
     // Workspace + Progress + Output
     JobWorkspace,
+    // F-144 — livraison de message (Job::Message)
+    MessageDeliverySpec,
     MigrateMode,
     MigrateSource,
     NotifyChannel,

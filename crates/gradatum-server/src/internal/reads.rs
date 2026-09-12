@@ -42,6 +42,14 @@ pub(crate) struct NoteReadResponse {
     pub body: String,
     /// Section sérialisée (kebab-case).
     pub section: String,
+    /// Titre canonique de la note (H1 du corps), ou `None` si absent.
+    ///
+    /// F-125 inv. 9 : nécessaire au worker `handle_forget` pour appliquer le
+    /// carve-out path-aware `identity/person/*`. Dérivé du MÊME `.md` que la
+    /// section (H1 du corps via `extract_h1_title`) — source unique, anti-dérive ;
+    /// c'est aussi la valeur que l'index persiste dans `notes.title`, donc la
+    /// preview (index) et le worker (H1) rendent le même verdict de protection.
+    pub title: Option<String>,
     /// Statut sérialisé (kebab-case).
     pub status: String,
     /// Tags (strings validées).
@@ -259,11 +267,16 @@ pub(crate) async fn handle_note_read(
                 .map(|t| t.as_str().to_string())
                 .collect();
 
+            // Titre canonique = H1 du corps (même `.md` que la section → source
+            // unique). Dérivé AVANT le move de `note.body.markdown`.
+            let title = gradatum_curator::extract_h1_title(&note.body.markdown);
+
             Json(NoteReadResponse {
                 note_id: ulid,
                 sha256_hex,
                 body: note.body.markdown,
                 section: note.frontmatter.section.as_str().to_string(),
+                title,
                 status: note.frontmatter.status.to_string(),
                 tags,
                 forgotten: note.frontmatter.forgotten.unwrap_or(false),

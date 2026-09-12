@@ -41,6 +41,7 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Utc;
+use gradatum_acl_auth::IDENTITY_WRITE_SCOPE;
 use gradatum_acl_policy::{AclDecision, AclOp};
 use gradatum_core::{
     ForgetScope, ForgetSpec, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority,
@@ -58,17 +59,17 @@ use crate::api_v1::logic::locus_for_tenant;
 use crate::api_v1::tenant_guard::{effective_tenant, effective_write_vault};
 use crate::state::AppState;
 
-// ── Sections protégées ────────────────────────────────────────────────────────
+// ── Protection forget — path-aware (F-125 inv. 9) ──────────────────────────────
 //
-// Source unique : `Section::PROTECTED_FORGET` dans `gradatum-core::section`.
-// Ne pas redéfinir ici — C7 audit F-44 : source unique garantit cohérence
-// API (handler) et worker (apalis_handlers).
-
-fn is_protected(section_name: &str) -> bool {
-    Section::PROTECTED_FORGET
-        .iter()
-        .any(|s| s.as_str() == section_name)
-}
+// Source unique : `Section::is_forget_protected(section, title)` dans
+// `gradatum-core::section`. Ne pas redéfinir ici — C7 audit F-44 : source unique
+// garantit cohérence API (preview) et worker (apalis_handlers).
+//
+// La preview co-résout `(section, titre)` depuis l'index (`get_note_protection_key`,
+// autorité unique) et jamais depuis la section de la liste candidate (anti-dérive) :
+// une carte `identity/person/*` est effaçable (droit à l'oubli) alors qu'une âme
+// `identity/<sub>` reste protégée. Le privilège `identity_write` gate en plus les
+// cartes person côté preview (voir `partition_candidates`).
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -128,22 +129,71 @@ async fn resolve_scope(
 
 // ── Partition éligibles / exclus ──────────────────────────────────────────────
 
-fn partition_candidates(candidates: Vec<(String, String)>) -> (Vec<String>, Vec<ExcludedNote>) {
+/// Partitions raw candidates into `(eligible, excluded)` — **path-aware**
+/// (F-125 inv. 9) and **privilege-aware**.
+///
+/// For every candidate ULID the protection key `(section, title)` is co-resolved
+/// from the index (`get_note_protection_key`, the single authoritative read) —
+/// **never** from the candidate list's own `section`, which comes from the FTS
+/// scan and may be stale (anti-drift). A candidate that no longer resolves is
+/// **fail-closed** (excluded, never forgotten).
+///
+/// A person card (`identity/person/*`) is eligible only when the caller holds the
+/// `identity_write` privilege (`privileged = true`); a non-privileged caller sees
+/// it in `excluded`. This keeps the `confirm_ulids == eligible` contract
+/// per-caller: a non-privileged real-mode call re-derives the same exclusion, so
+/// a forged confirm never matches.
+///
+/// # Errors
+///
+/// [`GradatumError::Storage`] if an index protection-key read fails.
+async fn partition_candidates(
+    state: &AppState,
+    vault_id: &str,
+    candidates: Vec<(String, String)>,
+    privileged: bool,
+) -> Result<(Vec<String>, Vec<ExcludedNote>), GradatumError> {
     let mut eligible = Vec::with_capacity(candidates.len());
     let mut excluded = Vec::new();
 
-    for (ulid, section) in candidates {
-        if is_protected(&section) {
+    for (ulid, _candidate_section) in candidates {
+        // Anti-dérive : la clé de protection est re-résolue depuis l'index, jamais
+        // lue depuis `_candidate_section` (issue du FTS, potentiellement périmée).
+        let Some((section, title)) = state
+            .search
+            .get_note_protection_key(vault_id, &ulid)
+            .await?
+        else {
+            // Fail-closed : note disparue de l'index → exclue (jamais oubliée).
+            excluded.push(ExcludedNote {
+                ulid,
+                section: String::new(),
+                reason: "protected: note not resolvable (fail-closed)".to_owned(),
+            });
+            continue;
+        };
+
+        if Section::is_forget_protected(&section, &title) {
+            // Âme identity ou autre section protégée inconditionnelle.
             excluded.push(ExcludedNote {
                 ulid,
                 section: section.clone(),
                 reason: format!("protected section: {section}"),
             });
+        } else if Section::identity_person_carveout(&title) && !privileged {
+            // Carve-out person, mais appelant non privilégié : le droit à l'oubli
+            // d'une carte person exige le scope `identity_write` (comme l'écriture).
+            excluded.push(ExcludedNote {
+                ulid,
+                section,
+                reason: "protected: identity/person/* forget requires the identity_write scope"
+                    .to_owned(),
+            });
         } else {
             eligible.push(ulid);
         }
     }
-    (eligible, excluded)
+    Ok((eligible, excluded))
 }
 
 // ── Validation mono-tenant ────────────────────────────────────────────────────
@@ -493,8 +543,15 @@ pub async fn vault_forget(
     // Résoudre le scope → candidats bruts (ulid, section).
     let raw_candidates = resolve_scope(&state, &req.scope, &vault_id).await?;
 
-    // Partitionner éligibles / exclues (sections protégées).
-    let (eligible, excluded) = partition_candidates(raw_candidates);
+    // Partitionner éligibles / exclues — path-aware (co-résolution index) +
+    // privilège `identity_write` pour le carve-out des cartes `identity/person/*`.
+    let privileged = trust.has_scope(IDENTITY_WRITE_SCOPE);
+    let (eligible, excluded) = partition_candidates(&state, &vault_id, raw_candidates, privileged)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "vault_forget: partition_candidates failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     let eligible_count = eligible.len();
 
     // ── Dry-run : réponse preview sans mutation ───────────────────────────────
@@ -648,7 +705,10 @@ pub(crate) async fn vault_forget_mcp_impl(
         .await
         .map_err(|_| GradatumError::Storage("scope resolution failed".to_owned()))?;
 
-    let (eligible, excluded) = partition_candidates(raw_candidates);
+    // Path-aware + privilège `identity_write` (parité avec la porte HTTP).
+    let privileged = trust.has_scope(IDENTITY_WRITE_SCOPE);
+    let (eligible, excluded) =
+        partition_candidates(&state, &vault_id, raw_candidates, privileged).await?;
     let eligible_count = eligible.len();
 
     // Dry-run.

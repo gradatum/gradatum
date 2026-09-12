@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "gradatum-core",
  "gradatum-sdk-rs",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-acl-auth"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-acl-policy"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "globset",
  "gradatum-core",
@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-admin"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-auth"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1881,7 +1881,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-bench"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-cache"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-chat"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-cli"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "clap",
  "reqwest 0.13.4",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-core"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-curator"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-db-sqlite"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-distill"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "gradatum-core",
@@ -2034,8 +2034,9 @@ dependencies = [
 
 [[package]]
 name = "gradatum-dto"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
+ "chrono",
  "gradatum-core",
  "schemars",
  "serde",
@@ -2044,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-embed"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "fastembed",
@@ -2060,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-engine"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2069,6 +2070,7 @@ dependencies = [
  "figment",
  "gradatum-core",
  "gradatum-dto",
+ "gradatum-heartbeat",
  "nix",
  "prometheus-client",
  "reqwest 0.13.4",
@@ -2087,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-gateway"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2097,7 +2099,9 @@ dependencies = [
  "figment",
  "futures",
  "gradatum-core",
+ "gradatum-dto",
  "gradatum-embed",
+ "gradatum-heartbeat",
  "gradatum-search",
  "http",
  "once_cell",
@@ -2120,8 +2124,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gradatum-heartbeat"
+version = "2.3.0"
+dependencies = [
+ "gradatum-dto",
+ "reqwest 0.13.4",
+ "secrecy",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "gradatum-index"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2142,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-ingest"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "gradatum-core",
  "gradatum-index",
@@ -2161,7 +2176,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-markdown"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "gradatum-core",
  "once_cell",
@@ -2174,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-mcp-stub"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2194,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-queue"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2212,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-sdk-rs"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "reqwest 0.13.4",
  "serde",
@@ -2222,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-search"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -2238,10 +2253,11 @@ dependencies = [
 
 [[package]]
 name = "gradatum-server"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "apalis",
+ "arc-swap",
  "async-trait",
  "axum",
  "axum-server",
@@ -2256,6 +2272,7 @@ dependencies = [
  "gradatum-db-sqlite",
  "gradatum-dto",
  "gradatum-embed",
+ "gradatum-heartbeat",
  "gradatum-index",
  "gradatum-queue",
  "gradatum-search",
@@ -2296,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-storage"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "gradatum-core",
@@ -2312,11 +2329,11 @@ dependencies = [
 
 [[package]]
 name = "gradatum-studio"
-version = "2.2.0"
+version = "2.3.0"
 
 [[package]]
 name = "gradatum-vault"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2338,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-warden"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2357,11 +2374,12 @@ dependencies = [
 
 [[package]]
 name = "gradatum-worker"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "apalis",
  "apalis-cron",
+ "arc-swap",
  "async-trait",
  "axum",
  "chrono",
@@ -2376,6 +2394,7 @@ dependencies = [
  "gradatum-distill",
  "gradatum-dto",
  "gradatum-embed",
+ "gradatum-heartbeat",
  "gradatum-index",
  "gradatum-queue",
  "gradatum-vault",
@@ -2865,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "index-parity-tests"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -6366,7 +6385,7 @@ dependencies = [
 
 [[package]]
 name = "v1-parity-tests"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "axum",

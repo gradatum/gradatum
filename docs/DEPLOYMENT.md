@@ -220,8 +220,12 @@ n_threads = 8
 # KV cache context length in tokens. Default: 32768.
 context_len = 32768
 
-# Maximum tokens generated per chat request. Default: 512.
-max_tokens = 512
+# Maximum tokens generated per chat request, injected as --n-predict.
+# Default: unset (unbounded — no --n-predict passed, llama-server's own default
+# applies; bounded by context_len/EOS, not truly infinite). Setting it to 0 is
+# rejected at startup (use unset for "no cap", not 0).
+# Cannot be combined with --n-predict/-n in extra_args (rejected as a conflicting flag).
+# max_tokens = 512
 
 # ── Startup and resilience ────────────────────────────────────────────────────
 # Time in seconds to wait for the child /health to return 200. Default: 60.
@@ -307,7 +311,7 @@ parallel      = 4
 gpu_layers    = 0
 n_threads     = 8
 context_len   = 32768
-max_tokens    = 512
+max_tokens    = 512      # explicit cap — omit entirely for the default (unlimited, see §4)
 bind_addr     = "127.0.0.1"
 ```
 

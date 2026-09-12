@@ -41,6 +41,7 @@
 mod apalis_backend;
 mod apalis_handlers;
 mod config_health;
+mod health;
 // Required by apalis_handlers::handle_validate (F-43 quality gate) — wired via monitor.rs.
 mod internal_client;
 mod quality_score;
@@ -56,7 +57,7 @@ mod wikilinks;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -69,6 +70,7 @@ use tracing_subscriber::EnvFilter;
 
 use config_health::{ConfigHealth, load_section};
 use curator_loader::build_curator_pipeline;
+use health::{HealthServerConfig, HealthSnapshot, ProbeDeps};
 use internal_client::InternalPersistClient;
 use leader::{LeaderConfig, LeaderElection};
 use metrics::{MetricsConfig, WorkerMetrics, spawn_metrics_server};
@@ -195,6 +197,9 @@ impl Default for WorkerEmbedConfig {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    // Captured at the very start so `/health` uptime and `started_at` count from boot.
+    let started_at = Instant::now();
+    let started_at_systime = SystemTime::now();
     let cli = Cli::parse();
 
     // SSOT — the queue path comes from [storage] root via the canonical helper,
@@ -207,6 +212,15 @@ async fn main() -> anyhow::Result<()> {
         db = %db_path.display(),
         config = %cli.config.display(),
         "gradatum-worker v0.2.0 starting (Apalis Monitor multi-worker, worker-flip)"
+    );
+
+    // F-156 P6b — announce liveness to the fleet registry as "worker".
+    // Opt-in by env (`GRADATUM_HEARTBEAT_URL` + `_TOKEN`); absent ⇒ no producer, no error.
+    // Fire-and-forget, non-blocking, bounded backoff — never degrades the worker.
+    let _ = gradatum_heartbeat::spawn_from_env(
+        "worker",
+        env!("CARGO_PKG_VERSION"),
+        gradatum_heartbeat::sha_opt(env!("BUILD_SHA")),
     );
 
     // ── Open the SQLite WAL queue database ────────────────────────────────────
@@ -365,6 +379,15 @@ async fn main() -> anyhow::Result<()> {
         "Prometheus server disabled, no metric exposed",
         &mut config_health,
     );
+    // [apalis.health] — the unconditional loopback /health listener (F-156 P3). Loaded
+    // before `publish` so a malformed section shows up in `gradatum_config_degraded`. Its
+    // fallback effect is benign: /health binds the default dedicated port 127.0.0.1:19094.
+    let health_cfg: HealthServerConfig = load_section(
+        &cli.config,
+        "apalis.health",
+        "/health listener on the default dedicated port 127.0.0.1:19094",
+        &mut config_health,
+    );
     let metrics = WorkerMetrics::new();
     // Publier AVANT le démarrage du serveur : la première collecte voit déjà l'état réel.
     config_health.publish(&metrics);
@@ -395,6 +418,39 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+
+    // ── /health surface (F-156 P3) ────────────────────────────────────────────
+    // The worker's first liveness/readiness endpoint. The listener is unconditional
+    // (independent of [apalis.metrics].enabled) and bind-tolerant; a background probe
+    // loop publishes an immutable snapshot the handlers read with zero I/O.
+    //
+    // The consumption signal (`metrics.last_consumed_ms`) is what makes the worker's
+    // readiness reflect real job consumption rather than the renew lease alone —
+    // the lease mechanism is untouched.
+    let (curator_backend, curator_llm_base_url) = health::curator_probe_target(&cli.config);
+    let health_snapshot = Arc::new(HealthSnapshot::from_pointee(health::starting_report(
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_SHA"),
+    )));
+    health::spawn_health_server(&health_cfg, Arc::clone(&health_snapshot))
+        .context("starting /health listener")?;
+    let probe_deps = ProbeDeps {
+        store: Arc::clone(&store),
+        metrics: metrics.clone(),
+        internal_url: internal_url.clone(),
+        embed_enabled: embed_cfg.enabled,
+        embed_endpoint: embed_cfg.endpoint.clone(),
+        curator_backend,
+        curator_llm_base_url,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_sha: env!("BUILD_SHA").to_string(),
+        started_at,
+        started_at_systime,
+    };
+    let health_probe_handle = tokio::spawn(health::run_probe_loop(
+        probe_deps,
+        Arc::clone(&health_snapshot),
+    ));
 
     // ── Periodic sweep (30 s) ─────────────────────────────────────────────────
     // Detached tokio task — terminates naturally when the runtime stops.
@@ -458,6 +514,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     sweep_handle.abort();
+    health_probe_handle.abort();
 
     // Best-effort release of the leadership lease.
     renewal.abort();

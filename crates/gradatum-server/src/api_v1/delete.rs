@@ -140,15 +140,28 @@ pub(crate) async fn vault_delete_core(
         return to_value(&result);
     };
 
-    // 6b. Refus dur si section protégée — AUCUN flag de contournement (1.2b).
+    // 6b. Refus dur si note protégée — PATH-AWARE (1.2b + F-125 inv. 9).
     //     S'applique QUAND MÊME à l'admin : une note de gouvernance reste insupprimable
     //     via cette API, même avec pleine autorité opérateur.
+    //
+    //     Carve-out F-125 : une carte `identity/person/*` est effaçable (droit à
+    //     l'oubli) alors qu'une âme `identity/<sub>` reste protégée. La section ET le
+    //     titre proviennent du MÊME record (`get_note` — une seule ligne), donc la
+    //     décision est anti-dérive. Titre absent (NULL) → chaîne vide → une note
+    //     `identity` sans titre retombe côté protégé (fail-closed).
+    //
+    //     Privilège : le hard-delete d'une carte person est gardé par l'AUTORITÉ
+    //     ADMIN de cette porte (loopback + token admin, pleine autorité opérateur) —
+    //     c'est le seul appelant du delete depuis F-100 1.6. Le carve-out ouvre les
+    //     cartes person à cet opérateur privilégié sans toucher `admin_trust`
+    //     (hors périmètre) ; le scope `identity_write` gouverne l'AUTRE voie
+    //     d'effacement (forget public JWT-scopé), pas cette voie admin.
     //
     // Court-circuit précoce (avant backlinks/backup) pour une erreur explicite.
     // La protection de fond reste garantie dans `cascade_delete_note`
     // (choke point system-wide) même si ce court-circuit était retiré : la même
-    // section y est re-résolue et refusée avant toute mutation.
-    if Section::is_protected_delete(&record.section) {
+    // clé `(section, titre)` y est re-résolue et refusée avant toute mutation.
+    if Section::is_delete_protected(&record.section, record.title.as_deref().unwrap_or("")) {
         return Err(GradatumError::Forbidden(format!(
             "protected section: '{}' can never be hard-deleted (PROTECTED_DELETE, no bypass)",
             record.section

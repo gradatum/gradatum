@@ -31,7 +31,19 @@
 //! a stale credential kept the event-log silent for ten days before an audit found it.
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use gradatum_dto::HealthStatus;
 use serde::Serialize;
+
+/// Build commit SHA injected at compile time by `build.rs` (`cargo:rustc-env=BUILD_SHA`).
+///
+/// **Public** by design — a short git commit identifier, never sensitive
+/// data. Falls back to `"unknown"` when the crate was built outside a git checkout (the
+/// `build.rs` fallback), so the field is always present in the fleet inventory. Aligned with
+/// `gradatum-server` (`option_env!("BUILD_SHA").unwrap_or("unknown")`).
+const BUILD_SHA: &str = match option_env!("BUILD_SHA") {
+    Some(sha) => sha,
+    None => "unknown",
+};
 
 /// State of the engine's event-log telemetry: active, or folded onto the inert sink
 /// (with the reason for the fold).
@@ -91,8 +103,20 @@ impl TelemetryStatus {
 #[derive(Debug, Serialize)]
 #[non_exhaustive]
 pub struct HealthSnapshot {
-    /// `"ok"` when ready, `"starting"` during startup, `"unhealthy"` when the restart budget is exhausted.
-    pub status: &'static str,
+    /// Overall status, conforming to the unified fleet enum [`gradatum_dto::HealthStatus`].
+    ///
+    /// The engine only ever reports [`HealthStatus::Ok`] (ready), [`HealthStatus::Starting`]
+    /// (warming up), or [`HealthStatus::Unhealthy`] (restart budget exhausted) — it never
+    /// emits `Degraded`. Serializes to the same lowercase wire values (`"ok"`, `"starting"`,
+    /// `"unhealthy"`) as the previous `&'static str`, so the contract read by the gateway is
+    /// byte-for-byte unchanged.
+    pub status: HealthStatus,
+    /// Binary version (`CARGO_PKG_VERSION`). Part of the fleet inventory — the server
+    /// pulls this `/health` to build the service registry.
+    pub version: &'static str,
+    /// Build commit SHA (public — a short git identifier, never sensitive). Injected by
+    /// `build.rs`; `"unknown"` when built out-of-git. Also part of the fleet inventory.
+    pub build_sha: &'static str,
     /// Alias of the loaded model.
     pub model: String,
     /// Backend runtime — `"llama-server"`.
@@ -182,12 +206,14 @@ impl HealthState {
     pub fn snapshot(&self) -> HealthSnapshot {
         let s = self.state.load(Ordering::SeqCst);
         let (status, warm_up_state) = match s {
-            state::READY => ("ok", "ready"),
-            state::UNHEALTHY => ("unhealthy", "unhealthy"),
-            _ => ("starting", "loading"),
+            state::READY => (HealthStatus::Ok, "ready"),
+            state::UNHEALTHY => (HealthStatus::Unhealthy, "unhealthy"),
+            _ => (HealthStatus::Starting, "loading"),
         };
         HealthSnapshot {
             status,
+            version: crate::VERSION,
+            build_sha: BUILD_SHA,
             model: self.model.clone(),
             backend: compiled_backend(),
             warm_up_state,
@@ -225,9 +251,9 @@ mod tests {
     #[test]
     fn health_status_field() {
         let h = HealthState::new_with_telemetry("test", TelemetryStatus::Active);
-        assert_eq!(h.snapshot().status, "starting");
+        assert_eq!(h.snapshot().status, HealthStatus::Starting);
         h.set_ready();
-        assert_eq!(h.snapshot().status, "ok");
+        assert_eq!(h.snapshot().status, HealthStatus::Ok);
     }
 
     #[test]
@@ -235,7 +261,7 @@ mod tests {
         let h = HealthState::new_with_telemetry("test", TelemetryStatus::Active);
         h.set_unhealthy();
         let s = h.snapshot();
-        assert_eq!(s.status, "unhealthy");
+        assert_eq!(s.status, HealthStatus::Unhealthy);
         assert_eq!(s.warm_up_state, "unhealthy");
         assert!(!h.is_ready(), "unhealthy ≠ ready");
     }
@@ -262,7 +288,7 @@ mod tests {
             "new(&str) doit retomber sur NotConfigured, pas sur un état actif mensonger"
         );
         // Le reste du comportement est identique au constructeur explicite.
-        assert_eq!(h.snapshot().status, "starting");
+        assert_eq!(h.snapshot().status, HealthStatus::Starting);
         assert_eq!(h.snapshot().model, "qwen3-4b");
     }
 
@@ -296,12 +322,13 @@ mod tests {
         let h = HealthState::new_with_telemetry("qwen3-4b", TelemetryStatus::Unauthorized);
         // Avant warm-up : starting, mais le motif de repli est déjà visible.
         assert_eq!(h.snapshot().event_log, "folded_unauthorized");
-        assert_eq!(h.snapshot().status, "starting");
+        assert_eq!(h.snapshot().status, HealthStatus::Starting);
         // Après warm-up : le moteur sert (ok / ready), et event_log reste au motif 401.
         h.set_ready();
         let s = h.snapshot();
         assert_eq!(
-            s.status, "ok",
+            s.status,
+            HealthStatus::Ok,
             "un event-log replié ne rend PAS le moteur unhealthy"
         );
         assert_eq!(s.warm_up_state, "ready");
@@ -323,13 +350,68 @@ mod tests {
         let active_but_unhealthy = HealthState::new_with_telemetry("m", TelemetryStatus::Active);
         active_but_unhealthy.set_unhealthy();
         let s = active_but_unhealthy.snapshot();
-        assert_eq!(s.status, "unhealthy");
+        assert_eq!(s.status, HealthStatus::Unhealthy);
         assert_eq!(s.event_log, "active");
 
         let ok_but_folded = HealthState::new_with_telemetry("m", TelemetryStatus::Unreachable);
         ok_but_folded.set_ready();
         let s = ok_but_folded.snapshot();
-        assert_eq!(s.status, "ok");
+        assert_eq!(s.status, HealthStatus::Ok);
         assert_eq!(s.event_log, "folded_unreachable");
+    }
+
+    #[test]
+    fn snapshot_exposes_version_and_build_sha() {
+        // F-156 : le snapshot /health porte version + build_sha pour l'inventaire de flotte.
+        let s = HealthState::new_with_telemetry("qwen3-4b", TelemetryStatus::Active).snapshot();
+        assert_eq!(
+            s.version,
+            crate::VERSION,
+            "version doit être CARGO_PKG_VERSION"
+        );
+        assert!(!s.version.is_empty(), "version jamais vide");
+        // build_sha vient de build.rs ; hors-git il retombe sur \"unknown\", jamais vide.
+        assert!(
+            !s.build_sha.is_empty(),
+            "build_sha jamais vide (fallback \"unknown\")"
+        );
+    }
+
+    #[test]
+    fn snapshot_wire_conforms_to_dto_and_keeps_engine_fields() {
+        // Contrat F-156 : le serveur PULL ce /health et le parse dans le DTO de flotte.
+        // On sérialise le snapshot moteur puis on le re-parse dans `LivenessReport` (DTO) —
+        // c'est exactement ce que fait le consommateur (unknown fields ignorés par serde).
+        let h = HealthState::new_with_telemetry("qwen3-4b", TelemetryStatus::Active);
+        h.set_ready();
+        let snap = h.snapshot();
+        let json = serde_json::to_value(&snap).expect("snapshot sérialisable");
+
+        // 1) status conforme à l'énum DTO : re-parse sans perte.
+        let liveness: gradatum_dto::LivenessReport =
+            serde_json::from_value(json.clone()).expect("parse dans le DTO de flotte");
+        assert_eq!(
+            liveness.status,
+            HealthStatus::Ok,
+            "status \"ok\" doit mapper HealthStatus::Ok"
+        );
+        assert_eq!(liveness.version, crate::VERSION);
+        assert_eq!(
+            liveness.build_sha.as_deref(),
+            Some(BUILD_SHA),
+            "build_sha (public) doit remonter dans le DTO"
+        );
+
+        // 2) valeur de fil de `status` inchangée vs l'ancien &'static str → gateway non cassée.
+        assert_eq!(
+            json["status"], "ok",
+            "wire \"ok\" préservée (rétro-compat gateway)"
+        );
+
+        // 3) rétro-compat : les champs additifs moteur restent présents et intacts.
+        assert_eq!(json["model"], "qwen3-4b");
+        assert_eq!(json["backend"], "llama-server");
+        assert_eq!(json["warm_up_state"], "ready");
+        assert_eq!(json["event_log"], "active");
     }
 }

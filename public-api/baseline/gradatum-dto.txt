@@ -1,4 +1,9 @@
 pub mod gradatum_dto
+#[non_exhaustive] pub enum gradatum_dto::CapabilityState
+pub gradatum_dto::CapabilityState::NotConfigured
+pub gradatum_dto::CapabilityState::Reachable
+pub gradatum_dto::CapabilityState::Unknown
+pub gradatum_dto::CapabilityState::Unreachable
 pub enum gradatum_dto::ContextMode
 pub gradatum_dto::ContextMode::Assembled
 pub gradatum_dto::ContextMode::Compact
@@ -14,6 +19,34 @@ pub gradatum_dto::ForgetScopeDto::Topic
 pub gradatum_dto::ForgetScopeDto::Topic::limit: core::option::Option<usize>
 pub gradatum_dto::ForgetScopeDto::Topic::query: alloc::string::String
 pub gradatum_dto::ForgetScopeDto::Topic::vault: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub enum gradatum_dto::HealthStatus
+pub gradatum_dto::HealthStatus::Degraded
+pub gradatum_dto::HealthStatus::Ok
+pub gradatum_dto::HealthStatus::Starting
+pub gradatum_dto::HealthStatus::Unhealthy
+pub gradatum_dto::HealthStatus::Unknown
+#[non_exhaustive] pub enum gradatum_dto::MessageStatus
+pub gradatum_dto::MessageStatus::Accepted
+pub gradatum_dto::MessageStatus::Delivered
+#[non_exhaustive] pub enum gradatum_dto::MessageValidationError
+pub gradatum_dto::MessageValidationError::BodyTooLarge
+pub gradatum_dto::MessageValidationError::BodyTooLarge::max: usize
+pub gradatum_dto::MessageValidationError::BodyTooLarge::size: usize
+pub gradatum_dto::MessageValidationError::RecipientIdentityMalformed
+pub gradatum_dto::MessageValidationError::RecipientIdentityTooLarge
+pub gradatum_dto::MessageValidationError::RecipientIdentityTooLarge::max: usize
+pub gradatum_dto::MessageValidationError::RecipientIdentityTooLarge::size: usize
+pub gradatum_dto::MessageValidationError::SubjectTooLarge
+pub gradatum_dto::MessageValidationError::SubjectTooLarge::max: usize
+pub gradatum_dto::MessageValidationError::SubjectTooLarge::size: usize
+impl core::error::Error for gradatum_dto::MessageValidationError
+impl core::fmt::Display for gradatum_dto::MessageValidationError
+pub fn gradatum_dto::MessageValidationError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum gradatum_dto::MutationOutcome
+pub gradatum_dto::MutationOutcome::Conflict
+pub gradatum_dto::MutationOutcome::NotFound
+pub gradatum_dto::MutationOutcome::Queued
+pub gradatum_dto::MutationOutcome::Refused
 pub enum gradatum_dto::RankMode
 pub gradatum_dto::RankMode::RecencyBoosted
 pub gradatum_dto::RankMode::Relevance
@@ -29,6 +62,13 @@ pub gradatum_dto::ArchiveEntryDto::restored_at: core::option::Option<i64>
 pub gradatum_dto::ArchiveEntryDto::section: alloc::string::String
 pub gradatum_dto::ArchiveEntryDto::title: core::option::Option<alloc::string::String>
 pub gradatum_dto::ArchiveEntryDto::vault_id: gradatum_core::scope::VaultId
+#[non_exhaustive] pub struct gradatum_dto::CapabilityReport
+pub gradatum_dto::CapabilityReport::critical: bool
+pub gradatum_dto::CapabilityReport::last_probe_ms: core::option::Option<u64>
+pub gradatum_dto::CapabilityReport::name: alloc::string::String
+pub gradatum_dto::CapabilityReport::state: gradatum_dto::CapabilityState
+impl gradatum_dto::CapabilityReport
+pub fn gradatum_dto::CapabilityReport::new(alloc::string::String, bool, gradatum_dto::CapabilityState, core::option::Option<u64>) -> Self
 pub struct gradatum_dto::CodeScopeEntry
 pub gradatum_dto::CodeScopeEntry::body: core::option::Option<alloc::string::String>
 pub gradatum_dto::CodeScopeEntry::callers: alloc::vec::Vec<alloc::string::String>
@@ -118,6 +158,38 @@ pub gradatum_dto::ForgottenNoteEntry::forgotten_by: core::option::Option<alloc::
 pub gradatum_dto::ForgottenNoteEntry::section: alloc::string::String
 pub gradatum_dto::ForgottenNoteEntry::title: core::option::Option<alloc::string::String>
 pub gradatum_dto::ForgottenNoteEntry::ulid: alloc::string::String
+#[non_exhaustive] pub struct gradatum_dto::HealthReport
+pub gradatum_dto::HealthReport::build_sha: core::option::Option<alloc::string::String>
+pub gradatum_dto::HealthReport::capabilities: alloc::vec::Vec<gradatum_dto::CapabilityReport>
+pub gradatum_dto::HealthReport::dlq_by_kind: alloc::collections::btree::map::BTreeMap<alloc::string::String, u64>
+pub gradatum_dto::HealthReport::dlq_depth: u64
+pub gradatum_dto::HealthReport::dlq_oldest_age_secs: u64
+pub gradatum_dto::HealthReport::locus_count: u32
+pub gradatum_dto::HealthReport::queue_depth: u64
+pub gradatum_dto::HealthReport::queue_oldest_age_secs: u64
+pub gradatum_dto::HealthReport::sqlite_wal_size_bytes: u64
+pub gradatum_dto::HealthReport::started_at: core::option::Option<alloc::string::String>
+pub gradatum_dto::HealthReport::status: gradatum_dto::HealthStatus
+pub gradatum_dto::HealthReport::tenant_count: u32
+pub gradatum_dto::HealthReport::uptime_secs: u64
+pub gradatum_dto::HealthReport::version: alloc::string::String
+impl gradatum_dto::HealthReport
+pub fn gradatum_dto::HealthReport::new(gradatum_dto::HealthStatus, alloc::string::String) -> Self
+pub fn gradatum_dto::HealthReport::with_build_sha(self, core::option::Option<alloc::string::String>) -> Self
+pub fn gradatum_dto::HealthReport::with_capabilities(self, alloc::vec::Vec<gradatum_dto::CapabilityReport>) -> Self
+pub fn gradatum_dto::HealthReport::with_counts(self, u32, u32) -> Self
+pub fn gradatum_dto::HealthReport::with_dlq(self, u64, u64, alloc::collections::btree::map::BTreeMap<alloc::string::String, u64>) -> Self
+pub fn gradatum_dto::HealthReport::with_queue(self, u64, u64) -> Self
+pub fn gradatum_dto::HealthReport::with_sqlite_wal_size_bytes(self, u64) -> Self
+pub fn gradatum_dto::HealthReport::with_started_at(self, core::option::Option<alloc::string::String>) -> Self
+pub fn gradatum_dto::HealthReport::with_uptime_secs(self, u64) -> Self
+#[non_exhaustive] pub struct gradatum_dto::HeartbeatRequest
+pub gradatum_dto::HeartbeatRequest::build_sha: core::option::Option<alloc::string::String>
+pub gradatum_dto::HeartbeatRequest::pid: u32
+pub gradatum_dto::HeartbeatRequest::service: alloc::string::String
+pub gradatum_dto::HeartbeatRequest::version: alloc::string::String
+impl gradatum_dto::HeartbeatRequest
+pub fn gradatum_dto::HeartbeatRequest::new(alloc::string::String, alloc::string::String, core::option::Option<alloc::string::String>, u32) -> Self
 #[non_exhaustive] pub struct gradatum_dto::JobStatusRequest
 pub gradatum_dto::JobStatusRequest::job_id: alloc::string::String
 impl gradatum_dto::JobStatusRequest
@@ -142,6 +214,67 @@ pub gradatum_dto::LessonsRecallResponse::items: alloc::vec::Vec<gradatum_dto::Le
 pub struct gradatum_dto::LinkDto
 pub gradatum_dto::LinkDto::dst: alloc::string::String
 pub gradatum_dto::LinkDto::src: alloc::string::String
+#[non_exhaustive] pub struct gradatum_dto::LivenessReport
+pub gradatum_dto::LivenessReport::build_sha: core::option::Option<alloc::string::String>
+pub gradatum_dto::LivenessReport::status: gradatum_dto::HealthStatus
+pub gradatum_dto::LivenessReport::version: alloc::string::String
+impl gradatum_dto::LivenessReport
+pub fn gradatum_dto::LivenessReport::new(gradatum_dto::HealthStatus, alloc::string::String, core::option::Option<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct gradatum_dto::MessageAckRequest
+pub gradatum_dto::MessageAckRequest::message_id: alloc::string::String
+impl gradatum_dto::MessageAckRequest
+pub fn gradatum_dto::MessageAckRequest::new(alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::MessageEnvelope
+pub gradatum_dto::MessageEnvelope::body: alloc::string::String
+pub gradatum_dto::MessageEnvelope::created_at: chrono::datetime::DateTime<chrono::offset::utc::Utc>
+pub gradatum_dto::MessageEnvelope::message_id: alloc::string::String
+pub gradatum_dto::MessageEnvelope::recipient_identity: alloc::string::String
+pub gradatum_dto::MessageEnvelope::sender_identity: alloc::string::String
+pub gradatum_dto::MessageEnvelope::subject: core::option::Option<alloc::string::String>
+pub gradatum_dto::MessageEnvelope::vault_id: core::option::Option<alloc::string::String>
+impl gradatum_dto::MessageEnvelope
+pub fn gradatum_dto::MessageEnvelope::new(alloc::string::String, alloc::string::String, alloc::string::String, core::option::Option<alloc::string::String>, alloc::string::String, chrono::datetime::DateTime<chrono::offset::utc::Utc>) -> Self
+pub fn gradatum_dto::MessageEnvelope::with_vault_id(self, alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::MessagePollParams
+pub gradatum_dto::MessagePollParams::cursor: core::option::Option<alloc::string::String>
+pub gradatum_dto::MessagePollParams::limit: core::option::Option<u32>
+pub gradatum_dto::MessagePollParams::status: core::option::Option<alloc::string::String>
+impl gradatum_dto::MessagePollParams
+pub fn gradatum_dto::MessagePollParams::new(core::option::Option<alloc::string::String>, core::option::Option<u32>, core::option::Option<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct gradatum_dto::MessageSendRequest
+pub gradatum_dto::MessageSendRequest::body: alloc::string::String
+pub gradatum_dto::MessageSendRequest::recipient_identity: alloc::string::String
+pub gradatum_dto::MessageSendRequest::subject: core::option::Option<alloc::string::String>
+impl gradatum_dto::MessageSendRequest
+pub fn gradatum_dto::MessageSendRequest::new(alloc::string::String, core::option::Option<alloc::string::String>, alloc::string::String) -> Self
+impl core::convert::TryFrom<gradatum_dto::MessageSendRequest> for gradatum_dto::ValidatedMessageSend
+pub type gradatum_dto::ValidatedMessageSend::Error = gradatum_dto::MessageValidationError
+pub fn gradatum_dto::ValidatedMessageSend::try_from(gradatum_dto::MessageSendRequest) -> core::result::Result<Self, Self::Error>
+#[non_exhaustive] pub struct gradatum_dto::MutateRoleCardVerdict
+pub gradatum_dto::MutateRoleCardVerdict::current_sha256: core::option::Option<alloc::string::String>
+pub gradatum_dto::MutateRoleCardVerdict::error: core::option::Option<alloc::string::String>
+pub gradatum_dto::MutateRoleCardVerdict::job_id: core::option::Option<alloc::string::String>
+pub gradatum_dto::MutateRoleCardVerdict::note_id: alloc::string::String
+pub gradatum_dto::MutateRoleCardVerdict::outcome: gradatum_dto::MutationOutcome
+pub gradatum_dto::MutateRoleCardVerdict::poll_url: core::option::Option<alloc::string::String>
+impl gradatum_dto::MutateRoleCardVerdict
+pub fn gradatum_dto::MutateRoleCardVerdict::conflict(alloc::string::String, core::option::Option<alloc::string::String>, alloc::string::String) -> Self
+pub fn gradatum_dto::MutateRoleCardVerdict::not_found(alloc::string::String, alloc::string::String) -> Self
+pub fn gradatum_dto::MutateRoleCardVerdict::queued(alloc::string::String, alloc::string::String, alloc::string::String) -> Self
+pub fn gradatum_dto::MutateRoleCardVerdict::refused(alloc::string::String, alloc::string::String) -> Self
+#[non_exhaustive] pub struct gradatum_dto::MutateRoleItem
+pub gradatum_dto::MutateRoleItem::expected_sha256: alloc::string::String
+pub gradatum_dto::MutateRoleItem::history_line: core::option::Option<alloc::string::String>
+pub gradatum_dto::MutateRoleItem::new_value: alloc::string::String
+pub gradatum_dto::MutateRoleItem::note_id: alloc::string::String
+pub gradatum_dto::MutateRoleItem::role_type: alloc::string::String
+#[non_exhaustive] pub struct gradatum_dto::MutateRoleRequest
+pub gradatum_dto::MutateRoleRequest::mutations: alloc::vec::Vec<gradatum_dto::MutateRoleItem>
+pub gradatum_dto::MutateRoleRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
+impl gradatum_dto::MutateRoleRequest
+pub fn gradatum_dto::MutateRoleRequest::new(alloc::vec::Vec<gradatum_dto::MutateRoleItem>) -> Self
+pub struct gradatum_dto::MutateRoleResponse
+pub gradatum_dto::MutateRoleResponse::results: alloc::vec::Vec<gradatum_dto::MutateRoleCardVerdict>
 pub struct gradatum_dto::NoteStatusPatch
 pub gradatum_dto::NoteStatusPatch::add_tags: core::option::Option<alloc::vec::Vec<alloc::string::String>>
 pub gradatum_dto::NoteStatusPatch::replaced_by: core::option::Option<alloc::string::String>
@@ -233,6 +366,18 @@ pub gradatum_dto::QaEventDto::status_code: u16
 pub gradatum_dto::QaEventDto::timestamp: alloc::string::String
 pub gradatum_dto::QaEventDto::tokens_input: core::option::Option<u32>
 pub gradatum_dto::QaEventDto::tokens_output: core::option::Option<u32>
+#[non_exhaustive] pub struct gradatum_dto::RegistryEntry
+pub gradatum_dto::RegistryEntry::build_sha: core::option::Option<alloc::string::String>
+pub gradatum_dto::RegistryEntry::last_seen_ms: i64
+pub gradatum_dto::RegistryEntry::pid: u32
+pub gradatum_dto::RegistryEntry::service: alloc::string::String
+pub gradatum_dto::RegistryEntry::version: alloc::string::String
+impl gradatum_dto::RegistryEntry
+pub fn gradatum_dto::RegistryEntry::new(alloc::string::String, alloc::string::String, core::option::Option<alloc::string::String>, u32, i64) -> Self
+#[non_exhaustive] pub struct gradatum_dto::RegistryReport
+pub gradatum_dto::RegistryReport::entries: alloc::vec::Vec<gradatum_dto::RegistryEntry>
+impl gradatum_dto::RegistryReport
+pub fn gradatum_dto::RegistryReport::new(alloc::vec::Vec<gradatum_dto::RegistryEntry>) -> Self
 pub struct gradatum_dto::ScoringWeights
 pub gradatum_dto::ScoringWeights::pagerank: core::option::Option<f64>
 pub gradatum_dto::ScoringWeights::recency: core::option::Option<f64>
@@ -259,6 +404,13 @@ pub gradatum_dto::TemporalEntryDto::valid_until_ms: core::option::Option<i64>
 pub struct gradatum_dto::UnforgotResponse
 pub gradatum_dto::UnforgotResponse::status: alloc::string::String
 pub gradatum_dto::UnforgotResponse::ulid: alloc::string::String
+pub struct gradatum_dto::ValidatedMessageSend
+pub gradatum_dto::ValidatedMessageSend::body: alloc::string::String
+pub gradatum_dto::ValidatedMessageSend::recipient_identity: alloc::string::String
+pub gradatum_dto::ValidatedMessageSend::subject: core::option::Option<alloc::string::String>
+impl core::convert::TryFrom<gradatum_dto::MessageSendRequest> for gradatum_dto::ValidatedMessageSend
+pub type gradatum_dto::ValidatedMessageSend::Error = gradatum_dto::MessageValidationError
+pub fn gradatum_dto::ValidatedMessageSend::try_from(gradatum_dto::MessageSendRequest) -> core::result::Result<Self, Self::Error>
 #[non_exhaustive] pub struct gradatum_dto::VaultArchivesListRequest
 pub gradatum_dto::VaultArchivesListRequest::include_gc: bool
 pub gradatum_dto::VaultArchivesListRequest::include_restored: bool
@@ -444,6 +596,7 @@ pub gradatum_dto::VaultRestoreResponse::content_hash: alloc::string::String
 pub gradatum_dto::VaultRestoreResponse::note_id: alloc::string::String
 pub gradatum_dto::VaultRestoreResponse::ts_ms: i64
 #[non_exhaustive] pub struct gradatum_dto::VaultSearchRequest
+pub gradatum_dto::VaultSearchRequest::all_readable: bool
 pub gradatum_dto::VaultSearchRequest::compact: bool
 pub gradatum_dto::VaultSearchRequest::from_ms: core::option::Option<i64>
 pub gradatum_dto::VaultSearchRequest::include_corpus_count: bool
@@ -457,6 +610,7 @@ pub gradatum_dto::VaultSearchRequest::status: core::option::Option<alloc::string
 pub gradatum_dto::VaultSearchRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 pub gradatum_dto::VaultSearchRequest::to_ms: core::option::Option<i64>
 pub gradatum_dto::VaultSearchRequest::vault_id: core::option::Option<gradatum_core::scope::VaultId>
+pub gradatum_dto::VaultSearchRequest::vault_ids: core::option::Option<alloc::vec::Vec<alloc::string::String>>
 impl gradatum_dto::VaultSearchRequest
 pub fn gradatum_dto::VaultSearchRequest::new(alloc::string::String) -> Self
 #[non_exhaustive] pub struct gradatum_dto::VaultTagsRequest
@@ -501,6 +655,9 @@ pub const gradatum_dto::DEFAULT_BUDGET_TOKENS: u32
 pub const gradatum_dto::LESSON_CLASSES: [&str; 12]
 pub const gradatum_dto::MAX_CALLERS_PER_ENTRY: usize
 pub const gradatum_dto::MAX_FORGOTTEN_BY_LEN: usize
+pub const gradatum_dto::MAX_MESSAGE_BODY_BYTES: usize
+pub const gradatum_dto::MAX_MESSAGE_RECIPIENT_BYTES: usize
+pub const gradatum_dto::MAX_MESSAGE_SUBJECT_BYTES: usize
 pub const gradatum_dto::SELECTOR_KINDS: [&str; 3]
 pub fn gradatum_dto::default_main_vault() -> gradatum_core::scope::VaultId
 pub fn gradatum_dto::escape_like(&str) -> alloc::string::String

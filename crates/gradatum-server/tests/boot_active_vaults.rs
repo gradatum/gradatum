@@ -322,8 +322,16 @@ async fn orphan_gauge_is_exposed_on_metrics_endpoint() {
     };
     let bind: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
     let metrics = state.metrics.clone();
+    let health_snapshot = state.health_snapshot.clone();
+    let registry = state.registry.clone();
     tokio::spawn(async move {
-        let _ = gradatum_server::metrics::spawn_metrics_listener(bind, metrics).await;
+        let _ = gradatum_server::metrics::spawn_metrics_listener(
+            bind,
+            metrics,
+            health_snapshot,
+            registry,
+        )
+        .await;
     });
 
     let url = format!("http://127.0.0.1:{port}/metrics");

@@ -650,6 +650,8 @@ impl ServerHandler for StubHandler {
                     self.forward_post("project-map/create-feature", body)
                         .await?
                 }
+                // Mutation ciblée d'un rôle typé project-map (F-153) — POST batch
+                "vault_mutate_role" => self.forward_post("project-map/mutate-role", body).await?,
                 "vault_classify" => self.forward_post("vault_classify", body).await?,
                 "vault_downgrade" => self.forward_post("vault_downgrade", body).await?,
                 // History endpoints F-40 — POST synchrones 200 OK
@@ -672,6 +674,33 @@ impl ServerHandler for StubHandler {
                 "vault_proactive_recall" => self.forward_post("proactive_recall", body).await?,
                 "vault_proactive_recall_feedback" => {
                     self.forward_post("proactive_recall/feedback", body).await?
+                }
+                // F-144 — messagerie inter-agents (jumeaux REST)
+                "message_send" => self.forward_post("messages", body).await?,
+                "message_poll" => {
+                    let endpoint = build_message_poll_endpoint(&body)?;
+                    self.forward_get(&endpoint).await?
+                }
+                "message_ack" => {
+                    let id = body
+                        .get("message_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            ErrorData::invalid_params("message_id (ULID) required", None)
+                        })?;
+                    // Validation du format AVANT interpolation dans le path : un id
+                    // client contenant `/`, `?`, `#` ou `\` détournerait l'URL vers un
+                    // autre endpoint (injection de path) — rejeté ici. Un ULID canonique
+                    // fait 26 caractères alphanumériques ASCII (base32 Crockford) ;
+                    // le serveur re-valide le ULID strict (400 sur alphabet hors set).
+                    if !is_safe_ack_message_id(id) {
+                        return Err(ErrorData::invalid_params(
+                            "message_id must be a canonical 26-char ULID",
+                            None,
+                        ));
+                    }
+                    self.forward_post(&format!("messages/{id}/ack"), body)
+                        .await?
                 }
                 unknown => {
                     return Err(ErrorData::invalid_params(
@@ -787,6 +816,61 @@ fn build_lessons_recall_endpoint(body: &serde_json::Value) -> Result<String, Err
     Ok(endpoint)
 }
 
+/// `true` si `id` peut être interpolé sans risque dans le path `/messages/{id}/ack`.
+///
+/// Un ULID canonique fait 26 caractères alphanumériques ASCII (base32 Crockford).
+/// Tout séparateur de chemin/query (`/`, `?`, `#`, `\`) ou toute longueur déviante
+/// est rejeté — l'interpolation d'un id client brut détournerait l'URL vers un autre
+/// endpoint (injection de path).
+#[must_use]
+fn is_safe_ack_message_id(id: &str) -> bool {
+    id.len() == 26 && id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Construit l'endpoint GET de `message_poll` (F-144) : `messages` + query optionnels
+/// `status` / `limit` / `cursor`. La valeur `status` est bornée au vocabulaire
+/// contrôlé (`accepted` | `delivered`).
+fn build_message_poll_endpoint(body: &serde_json::Value) -> Result<String, ErrorData> {
+    let mut endpoint = String::from("messages");
+
+    // `status` — filter optionnel (accepted | delivered).
+    if let Some(status_val) = body.get("status")
+        && !status_val.is_null()
+    {
+        let status = status_val.as_str().ok_or_else(|| {
+            ErrorData::invalid_params("message_poll: 'status' must be a string", None)
+        })?;
+        if !matches!(status, "accepted" | "delivered") {
+            return Err(ErrorData::invalid_params(
+                "message_poll: 'status' must be 'accepted' or 'delivered'",
+                None,
+            ));
+        }
+        endpoint.push_str(&format!("?status={status}"));
+    }
+
+    let mut sep = if endpoint.contains('?') { '&' } else { '?' };
+    if let Some(limit_val) = body.get("limit")
+        && !limit_val.is_null()
+    {
+        let limit = limit_val.as_u64().ok_or_else(|| {
+            ErrorData::invalid_params("message_poll: 'limit' must be a positive integer", None)
+        })?;
+        endpoint.push_str(&format!("{sep}limit={limit}"));
+        sep = '&';
+    }
+    if let Some(cursor_val) = body.get("cursor")
+        && !cursor_val.is_null()
+    {
+        let cursor = cursor_val.as_str().ok_or_else(|| {
+            ErrorData::invalid_params("message_poll: 'cursor' must be a string", None)
+        })?;
+        endpoint.push_str(&format!("{sep}cursor={}", percent_encode_value(cursor)));
+    }
+
+    Ok(endpoint)
+}
+
 /// URL-encodes a query-string value using RFC 3986 percent-encoding.
 ///
 /// Every byte outside the "unreserved" class (ALPHA / DIGIT / `-` / `.` / `_` / `~`) is
@@ -821,13 +905,13 @@ fn percent_encode_value(s: &str) -> String {
 /// ce qui est réellement servi.
 fn tool_catalogue() -> Vec<Tool> {
     use gradatum_dto::{
-        CodeScopeRequest, CreateFeatureCardRequest, LessonsRecallRequest,
-        ProactiveRecallFeedbackRequest, ProactiveRecallRequest, VaultArchivesListRequest,
-        VaultClassifyRequest, VaultContextRequest, VaultDiffRequest, VaultDowngradeRequest,
-        VaultForgetRequest, VaultGraphRequest, VaultHistoryGetRequest, VaultHistoryRequest,
-        VaultLinksRequest, VaultListRequest, VaultReadRequest, VaultRestoreRequest,
-        VaultSearchRequest, VaultTagsRequest, VaultTimelineRequest, VaultTraceRequest,
-        VaultWriteRequest,
+        CodeScopeRequest, CreateFeatureCardRequest, LessonsRecallRequest, MessageAckRequest,
+        MessagePollParams, MessageSendRequest, MutateRoleRequest, ProactiveRecallFeedbackRequest,
+        ProactiveRecallRequest, VaultArchivesListRequest, VaultClassifyRequest,
+        VaultContextRequest, VaultDiffRequest, VaultDowngradeRequest, VaultForgetRequest,
+        VaultGraphRequest, VaultHistoryGetRequest, VaultHistoryRequest, VaultLinksRequest,
+        VaultListRequest, VaultReadRequest, VaultRestoreRequest, VaultSearchRequest,
+        VaultTagsRequest, VaultTimelineRequest, VaultTraceRequest, VaultWriteRequest,
     };
 
     vec![
@@ -866,6 +950,14 @@ fn tool_catalogue() -> Vec<Tool> {
              Fields: title (req), body (req — the 5 non-feature roles, NO [[feature:…]]), \
              author, tags[], tenant_id, occurred_at. Async: returns \
              { feature, number, job_id, note_id, poll_url } — poll job_status.",
+        ),
+        tool_def::<MutateRoleRequest>(
+            "vault_mutate_role",
+            "Mutate a typed role (status/kind/release/version/track) on one or more project-map \
+             cards WITHOUT holding the card body (F-153): the server reads the current body, \
+             replaces the role value in place, re-derives the title and re-checks the schema. \
+             Batch — one verdict per card, never aggregated. Async per accepted card — poll \
+             job_status.",
         ),
         tool_def::<VaultClassifyRequest>(
             "vault_classify",
@@ -978,6 +1070,27 @@ fn tool_catalogue() -> Vec<Tool> {
              accepted_ulids (req — list of accepted ULIDs, may be empty), \
              tenant_id (opt, default 'main'). \
              Returns 200 on success.",
+        ),
+        // ── F-144 — messagerie inter-agents (jumeaux REST) ─────────────
+        tool_def::<MessageSendRequest>(
+            "message_send",
+            "Send a single-target inter-agent message (F-144). \
+             sender_identity is derived from the credential (never client-supplied). \
+             Fields: recipient_identity (req — identity/<kind>/<id>), subject (opt), body (req). \
+             Returns 202 {message_id, status:'accepted', job_id, poll_url}.",
+        ),
+        tool_def::<MessagePollParams>(
+            "message_poll",
+            "Poll the caller's mailbox (F-144). Single-target: only messages \
+             addressed to the caller's credited identity. Fields (all opt): \
+             status ('accepted' [default] | 'delivered'), limit, cursor. \
+             Returns {messages:[MessageEnvelope], next_cursor}.",
+        ),
+        tool_def::<MessageAckRequest>(
+            "message_ack",
+            "Acknowledge a message delivery (F-144, recipient only). \
+             Fields: message_id (req — ULID). \
+             Returns {status:'delivered'}.",
         ),
     ]
 }
@@ -1247,6 +1360,8 @@ mod tests {
             "vault_downgrade",
             // allocation de numéro de feature
             "create_feature_card",
+            // mutation ciblée d'un rôle typé project-map (F-153)
+            "vault_mutate_role",
             // history F-40
             "vault_history",
             "vault_history_get",
@@ -1263,6 +1378,10 @@ mod tests {
             // proactive recall F-46
             "vault_proactive_recall",
             "vault_proactive_recall_feedback",
+            // messagerie inter-agents F-144
+            "message_send",
+            "message_poll",
+            "message_ack",
         ];
 
         let catalogue = tool_catalogue();
@@ -1614,5 +1733,34 @@ mod tests {
             .expect("ExchangeResponse doit fonctionner avec les champs minimaux");
         assert_eq!(resp.token, "t");
         assert_eq!(resp.ttl_secs, 3600);
+    }
+}
+
+#[cfg(test)]
+mod message_ack_path_safety_tests {
+    use super::is_safe_ack_message_id;
+
+    #[test]
+    fn accepts_canonical_ulid() {
+        let id = "01J00000000000000000000000";
+        assert!(is_safe_ack_message_id(id), "ULID 26 alphanum accepté");
+    }
+
+    #[test]
+    fn rejects_path_separators_and_length_drift() {
+        for evil in [
+            "01J0000000/../../etc/passwd", // slash → autre endpoint
+            "01J0000000?status=delivered", // query injection
+            "01J0000000#frag",             // fragment
+            "01J0000000\\..\\..\\x",       // backslash
+            "short",                       // longueur ≠ 26
+            "01J0000000000000000000000!",  // caractère non alphanum
+            "01J000000000000000000000000", // 27 chars
+        ] {
+            assert!(
+                !is_safe_ack_message_id(evil),
+                "id malveillant/déviant rejeté : {evil:?}"
+            );
+        }
     }
 }

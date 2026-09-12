@@ -93,6 +93,8 @@ const CANONICAL_TOOL_NAMES: &[&str] = &[
     "vault_downgrade",
     // feature card creation — 1 (numéro F-XX attribué serveur)
     "create_feature_card",
+    // role mutation F-153 — 1 (mutation ciblée d'un rôle typé, verdict par carte)
+    "vault_mutate_role",
     // history F-40 — 4
     "vault_history",
     "vault_history_get",
@@ -111,6 +113,10 @@ const CANONICAL_TOOL_NAMES: &[&str] = &[
     "vault_proactive_recall_feedback",
     // job introspection F-63 — 1 (état terminal d'un job async, « tout MCP natif »)
     "job_status",
+    // messagerie inter-agents F-144 — 3 (section Messaging écrite uniquement via message_send)
+    "message_send",
+    "message_poll",
+    "message_ack",
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

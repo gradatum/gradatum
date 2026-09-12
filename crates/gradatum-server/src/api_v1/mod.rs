@@ -90,6 +90,7 @@ pub mod jobs_v2;
 pub mod lessons;
 pub mod logic;
 pub mod mcp;
+pub mod messaging;
 pub mod notes;
 pub mod proactive_recall_handlers;
 pub mod project_map;
@@ -147,6 +148,15 @@ pub fn router() -> Router<AppState> {
             "/vault_write",
             post(write::vault_write).layer(DefaultBodyLimit::max(256 * 1024)),
         )
+        // F-144 — message_send (body ≤ MAX_MESSAGE_BODY_BYTES 64 KiB + overhead).
+        .route(
+            "/messages",
+            post(messaging::message_send).layer(DefaultBodyLimit::max(70 * 1024)),
+        )
+        // F-144 — message_poll (GET /messages, même chemin que POST — axum fusionne).
+        .route("/messages", get(messaging::message_poll))
+        // F-144 — message_ack (fixe /messages AVANT paramétrique /messages/{id}/ack).
+        .route("/messages/{id}/ack", post(messaging::message_ack))
         .route("/vault_classify", post(write::vault_classify))
         // ── F-40 History CoW (v0.4.0 — synchrones 200 OK) ────────────────────
         // Règle fixed-before-parametric respectée : toutes les routes fixes.
@@ -231,6 +241,11 @@ pub fn router() -> Router<AppState> {
             "/project-map/create-feature",
             post(project_map::create_feature),
         )
+        // ── F-153 mutation ciblée de rôle — POST fixe, auth Write ────────────
+        //
+        // Mute en place un rôle typé d'une/plusieurs cartes sans que le client possède le
+        // corps. Route entièrement fixe (fixed-before-parametric). Verdict par carte.
+        .route("/project-map/mutate-role", post(project_map::mutate_role))
         // ── F-37 S1.3 Dashboard (v0.4.6) — GET fixe, auth Read ───────────────
         .route("/dashboard", get(dashboard::dashboard))
         // ── F-85 v0.7.5 T5 — santé tâches récurrentes, auth Read ─────────────
@@ -276,7 +291,7 @@ pub fn router() -> Router<AppState> {
             post(capture::post_capture)
                 .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)),
         )
-        // ── session-log Tier 1 (council Art.15bis 2026-06-12) — append-only ──
+        // ── session-log Tier 1 (append-only) ──
         //
         // Body limit 4 KiB : payload nominal <1 KB (intent≤200, target≤512, refs
         // courts). Protège contre un flood avant parsing JSON (pattern vault_timeline).

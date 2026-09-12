@@ -73,6 +73,7 @@ use tracing::instrument;
 use gradatum_core::{error::GradatumError, trust::TrustContext};
 use gradatum_dto::{
     CodeScopeRequest, CreateFeatureCardRequest, JobStatusRequest, LessonsRecallRequest,
+    MessageAckRequest, MessagePollParams, MessageSendRequest, MutateRoleRequest,
     ProactiveRecallFeedbackRequest, ProactiveRecallRequest, VaultArchivesListRequest,
     VaultClassifyRequest, VaultDiffRequest, VaultDowngradeRequest, VaultForgetRequest,
     VaultHistoryGetRequest, VaultHistoryRequest, VaultRestoreRequest,
@@ -88,7 +89,7 @@ use crate::{
             VaultTraceRequest, VaultWriteRequest,
         },
         forget::vault_forget_mcp_impl,
-        logic,
+        logic, messaging,
     },
     state::AppState,
 };
@@ -315,6 +316,14 @@ impl GradatumMcpHandler {
                     .map_err(gradatum_error_to_mcp)?;
                 to_mcp_content(res)
             }
+            "vault_mutate_role" => {
+                let req: MutateRoleRequest = deserialize_args(args)?;
+                let request_id = ulid::Ulid::generate().to_string();
+                let res = logic::mutate_role_impl(&self.state, &trust, req, &request_id)
+                    .await
+                    .map_err(gradatum_error_to_mcp)?;
+                to_mcp_content(res)
+            }
             "vault_classify" => {
                 let req: VaultClassifyRequest = deserialize_args(args)?;
                 let res = logic::vault_classify_impl(&self.state, &trust, req)
@@ -424,6 +433,34 @@ impl GradatumMcpHandler {
                     .map_err(job_status_error_to_mcp)?;
                 to_mcp_content(view)
             }
+            // ── F-144 — messagerie inter-agents ─────────────────────────────
+            "message_send" => {
+                let req: MessageSendRequest = deserialize_args(args)?;
+                let res = messaging::message_send_impl(&self.state, &trust, req, "mcp")
+                    .await
+                    .map_err(gradatum_error_to_mcp)?;
+                to_mcp_content(res)
+            }
+            "message_poll" => {
+                let req: MessagePollParams = deserialize_args(args)?;
+                let res = messaging::message_poll_impl(
+                    &self.state,
+                    &trust,
+                    req.status.as_deref(),
+                    req.limit.map_or(50, |l| l as usize),
+                    req.cursor.as_deref(),
+                )
+                .await
+                .map_err(gradatum_error_to_mcp)?;
+                to_mcp_content(res)
+            }
+            "message_ack" => {
+                let req: MessageAckRequest = deserialize_args(args)?;
+                let res = messaging::message_ack_impl(&self.state, &trust, &req.message_id)
+                    .await
+                    .map_err(gradatum_error_to_mcp)?;
+                to_mcp_content(res)
+            }
             _ => Err(ErrorData::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 format!("unknown tool: {name}"),
@@ -455,6 +492,19 @@ impl GradatumMcpHandler {
         // L'identité vient du credential — jamais d'un paramètre/en-tête client. Sujet absent
         // (`Studio` / `Mtls`) → aucune âme, aucun repli sur une identité par défaut (R2).
         let agent = trust.subject().map(gradatum_core::scope::AgentId::as_str)?;
+        // F-125 inv 4 — le canal boot `instructions` ne résout QUE `identity/<sub>` (âme
+        // d'agent exécutable). Le namespace réservé `person/` (cartes de personnes, données
+        // NON fiables) n'est JAMAIS résolu ni injecté comme system-prompt — frontière de
+        // confiance anti-injection. Défense explicite : un `sub` ne peut de toute façon pas
+        // tomber dans `person/` (réservé à la création de clé), mais on refuse ici sans
+        // dépendre de cette garde amont.
+        if agent.starts_with(gradatum_core::person::PERSON_NAMESPACE_PREFIX) {
+            tracing::debug!(
+                agent = %agent,
+                "mcp::initialize: reserved 'person/' namespace excluded from the boot canal (F-125 inv 4)"
+            );
+            return None;
+        }
         let mut req = VaultReadRequest::new(format!("identity/{agent}"));
         req.section = Some("identity".to_string());
         req.tenant_id = Some(gradatum_core::scope::TenantId::new("main"));
@@ -521,7 +571,7 @@ impl GradatumMcpHandler {
 
 impl ServerHandler for GradatumMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(server_capabilities())
             .with_server_info(Implementation::new(
                 "gradatum-mcp",
                 env!("CARGO_PKG_VERSION"),
@@ -672,6 +722,16 @@ fn tool_catalog() -> Vec<Tool> {
              version) and must NOT contain a [[feature:…]] link. Async: returns \
              { feature, number, job_id, note_id, poll_url } — poll job_status.",
         ),
+        tool_def::<MutateRoleRequest>(
+            "vault_mutate_role",
+            "Mutate a typed role (status/kind/release/version/track) on one or more project-map \
+             cards WITHOUT holding the card body: the server reads the current body, replaces the \
+             role value in place (every other byte identical), re-derives the title and re-checks \
+             the schema. Supports a batch; returns { results: [ { note_id, outcome, job_id?, \
+             poll_url?, current_sha256?, error? } ] } — one verdict PER CARD, never aggregated. \
+             expected_sha256 is the per-card optimistic lock. feature/project roles are refused \
+             (card identity). Async per accepted card — poll job_status.",
+        ),
         tool_def::<VaultClassifyRequest>("vault_classify", "Classify a note (heuristic)"),
         tool_def::<VaultDowngradeRequest>("vault_downgrade", "Downgrade a note's status"),
         tool_def::<VaultHistoryRequest>("vault_history", "CoW history of a note"),
@@ -697,6 +757,19 @@ fn tool_catalog() -> Vec<Tool> {
             "job_status",
             "State of an async job by job_id. Returns { status, terminal, error, conflict, result_note }: `terminal=true` (Done/DLQ/Cancelled/Conflict) → conclude, `terminal=false` (Pending/Running/Waiting/Failed) → keep polling. Snapshot at instant T — the caller re-polls, no server-side wait.",
         ),
+        // F-144 — messagerie inter-agents (réception non sollicitée).
+        tool_def::<MessageSendRequest>(
+            "message_send",
+            "Send a single-target inter-agent message. The sender identity is derived from the credential (never client-supplied). Returns { message_id, status: \"accepted\", job_id, poll_url }.",
+        ),
+        tool_def::<MessagePollParams>(
+            "message_poll",
+            "Poll the caller's mailbox. Default view = accepted (pending inbox); pass status=delivered to read the archive. Single-target: only messages addressed to the caller's credited identity.",
+        ),
+        tool_def::<MessageAckRequest>(
+            "message_ack",
+            "Acknowledge a message delivery (recipient only). Returns { status: \"delivered\" } — the delivery row reaches terminal Done.",
+        ),
     ]
 }
 
@@ -716,6 +789,22 @@ fn tool_def<T: JsonSchema>(name: &'static str, description: &'static str) -> Too
 /// et invalide toute la liste d'outils (régression 34e70eb).
 fn tool_def_no_params(name: &'static str, description: &'static str) -> Tool {
     Tool::new(name, description, gradatum_dto::mcp_empty_params_schema())
+}
+
+/// Capacités MCP annoncées à l'`initialize` (F-144 SSE voie2).
+///
+/// `tools` = la surface d'outils ; `logging` = capacité de notifications
+/// serveur→client (voie2 optionnelle de la messagerie : un **pointeur sans état**,
+/// jamais le corps). Sous le transport actuel (Streamable HTTP **stateless**,
+/// `LocalSessionManager` inerte), aucune session n'est connectée : la notification
+/// `notifications/message` n'est donc jamais émise (no-op par construction) — la
+/// capacité reste annoncée pour qu'un transport stateful futur puisse l'utiliser
+/// sans changement de contrat.
+fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities::builder()
+        .enable_tools()
+        .enable_logging()
+        .build()
 }
 
 /// Désérialise les arguments JSON vers un type `T`.
@@ -912,6 +1001,9 @@ mod tests {
             "code_scope",
             "create_feature_card",
             "job_status",
+            "message_ack",
+            "message_poll",
+            "message_send",
             "vault_archives_list",
             "vault_authors",
             "vault_classify",
@@ -925,6 +1017,7 @@ mod tests {
             "vault_lessons_recall",
             "vault_links",
             "vault_list",
+            "vault_mutate_role",
             "vault_proactive_recall",
             "vault_proactive_recall_feedback",
             "vault_read",
@@ -950,6 +1043,34 @@ mod tests {
         );
     }
 
+    /// F-63 T6 — le schéma auto-dérivé de `vault_search` déclare bien les deux champs
+    /// opt-in multi-vault (`vault_ids`, `all_readable`). Le NOMBRE d'outils est inchangé
+    /// (le schéma s'étend, pas la surface — cf. `tool_catalog_declares_the_expected_tool_names`),
+    /// donc `_MCP_EXPECTED_TOOLS` n'a pas à bouger.
+    #[test]
+    fn vault_search_schema_declares_multivault_fields() {
+        let catalog = tool_catalog();
+        let tool = catalog
+            .iter()
+            .find(|t| t.name == "vault_search")
+            .expect("outil vault_search présent");
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("inputSchema.properties objet");
+        assert!(
+            props.contains_key("vault_ids"),
+            "le schéma vault_search doit déclarer `vault_ids`. properties={:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            props.contains_key("all_readable"),
+            "le schéma vault_search doit déclarer `all_readable`. properties={:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// Aucun nom d'outil n'est déclaré deux fois.
     ///
     /// Le test d'ensemble ci-dessus dédoublonne par construction : un doublon y serait
@@ -963,6 +1084,22 @@ mod tests {
             unique.len(),
             catalog.len(),
             "au moins un nom d'outil est déclaré plusieurs fois dans tool_catalog"
+        );
+    }
+
+    /// F-144 voie2 (SSE) : la capacité `logging` est annoncée à l'`initialize` —
+    /// le serveur peut émettre une notification `notifications/message` (pointeur
+    /// sans état) vers un client connecté. La capacité `tools` reste annoncée.
+    #[test]
+    fn server_capabilities_advertise_logging_and_tools() {
+        let caps = server_capabilities();
+        assert!(
+            caps.logging.is_some(),
+            "la capacité logging (voie2 SSE) doit être annoncée"
+        );
+        assert!(
+            caps.tools.is_some(),
+            "la capacité tools doit rester annoncée"
         );
     }
 
@@ -986,7 +1123,7 @@ mod tests {
     /// Une exclusion délibérée (outil exposé volontairement non compté) est
     /// possible, mais DOIT être matérialisée par une allow-list explicite ici avec
     /// justification écrite — jamais une omission silencieuse. Aujourd'hui : aucune
-    /// exclusion (les 26 outils sont comptés).
+    /// exclusion (les 30 outils sont comptés, F-144 inclus).
     #[test]
     fn every_declared_tool_is_instrumented() {
         let declared: BTreeSet<String> =
@@ -1283,6 +1420,38 @@ mod tests {
         assert!(
             result.is_none(),
             "own-agent soul absente doit retourner None (dégradé bootstrap)"
+        );
+    }
+
+    /// Sujet dans le namespace réservé `person/` → `None` (F-125 inv 4).
+    ///
+    /// Le canal boot `instructions` ne résout QUE `identity/<sub>` (âme d'agent exécutable).
+    /// Une carte de personne (`identity/person/*`), donnée NON fiable, n'est JAMAIS injectée
+    /// comme system-prompt — frontière de confiance anti-injection. Le sujet porte pourtant
+    /// `identity_write` : l'exclusion tient à la RÈGLE DE TRANSPORT, pas à un défaut de
+    /// privilège. (Un tel sujet ne peut de toute façon pas exister — `person/` est réservé à
+    /// la création de clé — mais ce test verrouille la défense côté transport indépendamment.)
+    #[tokio::test]
+    async fn soul_instructions_person_subject_returns_none() {
+        use crate::state::AppState;
+        let handler = GradatumMcpHandler {
+            state: AppState::new(),
+        };
+        let trust = TrustContext::BearerToken {
+            kid: "test-kid".to_string(),
+            aud: "gradatum".to_string(),
+            sub: "person/alice".into(),
+            scopes: vec![
+                "read".to_string(),
+                gradatum_acl_auth::IDENTITY_WRITE_SCOPE.to_string(),
+            ],
+            tenant_id: "main".into(),
+            jti: None,
+        };
+        let result = handler.soul_instructions(&trust).await;
+        assert!(
+            result.is_none(),
+            "un sujet 'person/*' ne doit JAMAIS résoudre d'âme sur le canal boot (F-125 inv 4)"
         );
     }
 

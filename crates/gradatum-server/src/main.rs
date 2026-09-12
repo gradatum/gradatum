@@ -26,6 +26,8 @@ mod proactive_recall;
 mod proactive_recall_store;
 mod proactive_surface_store;
 mod read_usage_store;
+mod registry_ingress;
+mod registry_store;
 mod review_promote;
 mod scheduled_tasks;
 mod session_trace_store;
@@ -284,7 +286,10 @@ async fn main() -> anyhow::Result<()> {
         .with_context(cfg.context.clone())
         // v0.7.5 F-85 T5 — intervalles des tâches récurrentes disponibles dans
         // `GET /api/v1/system/scheduled` via task_interval_secs SSOT.
-        .with_server_config(cfg.clone());
+        .with_server_config(cfg.clone())
+        // F-156 P6a — registre de flotte : TTL des heartbeats depuis [registry] (clampé au
+        // plancher). Le store est peuplé par l'ingress P6b ; lu ici par GET /registry loopback.
+        .with_registry_ttl(cfg.registry.effective_ttl_secs());
 
     // A7 (Task 4) — bootstrap des handles de vaults au boot. À flag `multi_tenant` OFF
     // (défaut LIVE) : no-op strict, le registre reste le singleton `{main}` (byte-identical).
@@ -537,7 +542,7 @@ async fn main() -> anyhow::Result<()> {
         "EventLogStore (B1) wired on index.db"
     );
 
-    // session-log Tier 1 (council Art.15bis 2026-06-12) — câblage SessionTraceStore
+    // session-log Tier 1 — câblage SessionTraceStore
     // sur la même DB que SqliteIndex. La migration 0015 (table session_trace) est
     // exécutée par `with_search_path`. Connexion WAL dédiée (safe multi-connexion).
     let state = state
@@ -1465,11 +1470,37 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Sonde /health en tâche de fond (F-154 P2) — spawn AVANT le listener métriques pour
+    // publier un premier snapshot au plus tôt. La sonde écrit le snapshot immuable que les
+    // deux handlers /health lisent sans I/O ; une capacité qui pend n'affecte jamais /health.
+    {
+        let probe_state = state.clone();
+        let probe_snapshot = state.health_snapshot.clone();
+        let probe_interval = cfg.health.effective_interval_secs();
+        // Plancher sur le timeout — un `0` rendrait tout `unhealthy`.
+        let probe_timeout = Duration::from_millis(cfg.health.effective_probe_timeout_ms());
+        tokio::spawn(async move {
+            health::run_probe_loop(probe_state, probe_snapshot, probe_interval, probe_timeout)
+                .await;
+        });
+    }
+
     // Spawn du listener métriques en tâche tokio parallèle (C7).
+    // Le listener sert aussi /health/detailed (loopback fail-closed) — il partage le snapshot.
     let metrics_bind = cfg.server.metrics_bind;
     let app_metrics = state.metrics.clone();
+    let metrics_health_snapshot = state.health_snapshot.clone();
+    // F-156 P6a — /registry servi sur le même listener loopback (fail-closed, sans middleware).
+    let metrics_registry = state.registry.clone();
     tokio::spawn(async move {
-        if let Err(e) = metrics::spawn_metrics_listener(metrics_bind, app_metrics).await {
+        if let Err(e) = metrics::spawn_metrics_listener(
+            metrics_bind,
+            app_metrics,
+            metrics_health_snapshot,
+            metrics_registry,
+        )
+        .await
+        {
             error!(error = %e, "metrics listener stopped with error");
         }
     });
@@ -1487,6 +1518,51 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    // F-156 P6b — fleet heartbeat ingress (opt-in, DELIBERATELY non-loopback).
+    //
+    // `enabled = false` (default) ⇒ no listener, boot unaffected. When enabled, an announced
+    // capability that cannot open must fail VISIBLY: the bind (and the fail-closed checks —
+    // bind address present, token present) run synchronously here so any failure aborts the
+    // boot; only the serve loop is detached. The token comes from env (never config).
+    if cfg.registry_ingress.enabled {
+        let bind = cfg.registry_ingress.bind.context(
+            "[registry_ingress] enabled but no `bind` address is set — refusing to boot a \
+             capability that cannot bind",
+        )?;
+        let raw_token = std::env::var("GRADATUM_HEARTBEAT_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .context(
+                "[registry_ingress] enabled but GRADATUM_HEARTBEAT_TOKEN is unset/empty — \
+                 refusing to open an unauthenticated fleet surface (fail-closed)",
+            )?;
+        // Reuse the internal-token min-length validation (public-by-design length).
+        crate::config::validate_internal_token(&raw_token).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ingress_state = state
+            .clone()
+            .with_heartbeat_ingress_token(secrecy::SecretString::from(raw_token));
+        // Bind synchronously — a bind failure here aborts the boot (visible).
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("binding fleet heartbeat ingress on {bind}"))?;
+        let ingress_router = registry_ingress::build_ingress_router(ingress_state);
+        tokio::spawn(async move {
+            if let Err(e) = registry_ingress::serve_ingress(listener, ingress_router).await {
+                error!(error = %e, "heartbeat ingress listener stopped with error");
+            }
+        });
+        info!(addr = %bind, "fleet heartbeat ingress enabled (F-156 P6b)");
+    }
+
+    // F-156 P6b — this server is itself a fleet member: announce liveness as "server".
+    // Opt-in by env (`GRADATUM_HEARTBEAT_URL` + `_TOKEN`); absent ⇒ no producer, no error.
+    // Fire-and-forget, non-blocking, bounded backoff — never degrades the server.
+    let _ = gradatum_heartbeat::spawn_from_env(
+        "server",
+        env!("CARGO_PKG_VERSION"),
+        gradatum_heartbeat::sha_opt(env!("BUILD_SHA")),
+    );
 
     // V3 rate limiting : into_make_service_with_connect_info injecte ConnectInfo<SocketAddr>
     // dans les extensions — requis par PeerIpKeyExtractor + loopback_bypass.
@@ -1709,7 +1785,7 @@ fn build_router(
 
     // Routeur non soumis au rate limiting : /health, /ui/* (monitoring + studio).
     let unauthed = Router::new()
-        .route("/health", get(health::handler))
+        .route("/health", get(health::liveness_handler))
         .merge(auth_exchange)
         .merge(studio_router);
 

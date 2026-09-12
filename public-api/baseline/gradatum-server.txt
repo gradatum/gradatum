@@ -1,2 +1,26 @@
 pub mod gradatum_server
+pub mod gradatum_server::registry_store
+#[non_exhaustive] pub enum gradatum_server::registry_store::RegistryError
+pub gradatum_server::registry_store::RegistryError::CapacityExceeded(usize)
+pub gradatum_server::registry_store::RegistryError::FieldTooLong
+pub gradatum_server::registry_store::RegistryError::FieldTooLong::field: &'static str
+pub gradatum_server::registry_store::RegistryError::FieldTooLong::max: usize
+pub gradatum_server::registry_store::RegistryError::UnknownService(alloc::string::String)
+pub struct gradatum_server::registry_store::Registration
+pub gradatum_server::registry_store::Registration::build_sha: core::option::Option<alloc::string::String>
+pub gradatum_server::registry_store::Registration::last_seen: std::time::Instant
+pub gradatum_server::registry_store::Registration::last_seen_ms: i64
+pub gradatum_server::registry_store::Registration::pid: u32
+pub gradatum_server::registry_store::Registration::service: alloc::string::String
+pub gradatum_server::registry_store::Registration::version: alloc::string::String
+pub struct gradatum_server::registry_store::RegistryStore
+impl gradatum_server::registry_store::RegistryStore
+pub fn gradatum_server::registry_store::RegistryStore::new(core::time::Duration) -> Self
+pub fn gradatum_server::registry_store::RegistryStore::register(&self, gradatum_server::registry_store::Registration) -> core::result::Result<(), gradatum_server::registry_store::RegistryError>
+pub fn gradatum_server::registry_store::RegistryStore::report(&self) -> gradatum_dto::registry::RegistryReport
+pub fn gradatum_server::registry_store::RegistryStore::ttl(&self) -> core::time::Duration
+pub const gradatum_server::registry_store::ALLOWED_SERVICES: [&str; 6]
+pub const gradatum_server::registry_store::DEFAULT_TTL: core::time::Duration
+pub const gradatum_server::registry_store::MAX_ENTRIES: usize
+pub const gradatum_server::registry_store::MAX_FIELD_LEN: usize
 pub fn gradatum_server::build_rate_limit_test_app(&config::RateLimitConfig) -> axum::routing::Router

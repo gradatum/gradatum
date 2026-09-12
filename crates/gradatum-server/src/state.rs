@@ -35,6 +35,7 @@ use crate::mcp_usage::McpToolCounters;
 use crate::metrics::AppMetrics;
 use crate::note_usage_store::{NoteUsageStore, UsageKey, UsageValue};
 use crate::read_usage_store::ReadUsageCounterStore;
+use crate::registry_store::RegistryStore;
 
 // ── NoopAuditSink (state.rs) ──────────────────────────────────────────────────
 
@@ -981,6 +982,13 @@ pub struct AppState {
     /// wired: `gradatum-server/src/main.rs` + `internal/admin_auth.rs`
     pub admin_api_token: Option<Arc<secrecy::SecretString>>,
 
+    /// Fleet heartbeat ingress token (F-156 P6b) — **distinct** from the internal/admin
+    /// tokens (different secret, different header `X-Gradatum-Heartbeat`, different scope).
+    ///
+    /// Sourced from env `GRADATUM_HEARTBEAT_TOKEN` at boot, wrapped `SecretString`, never
+    /// logged. `None` = the ingress auth middleware rejects every request (fail-closed).
+    pub heartbeat_ingress_token: Option<Arc<secrecy::SecretString>>,
+
     /// Compteurs atomiques par outil MCP — télémétrie feat/usage-telemetry-19091.
     ///
     /// Map fermée pré-peuplée (21 outils). `record(name)` est un no-op sur nom inconnu.
@@ -1017,6 +1025,23 @@ pub struct AppState {
     /// Defaults: budget=2000, top_n=50, max_skills=3, frac=0.15, embed=800ms.
     /// Wired via `AppState::with_context` in `main.rs`.
     pub context: Arc<crate::config::ContextConfig>,
+
+    /// Immutable `/health` snapshot published by the background probe (F-154 P2).
+    ///
+    /// Both `GET /health` (public liveness) and `GET /health/detailed` (loopback superset)
+    /// read this atomically with zero I/O — the probe task is the sole writer. Initialised
+    /// to a `starting` report at boot; replaced with a real verdict within one probe pass
+    /// (`crate::health::run_probe_loop`, spawned in `main.rs`).
+    pub health_snapshot: Arc<crate::health::HealthSnapshot>,
+
+    /// In-memory fleet service registry (F-156 P6a).
+    ///
+    /// Holds the heartbeats of the fleet members with lazy TTL expiration. In P6a the store is
+    /// only *read* — by `GET /registry` on the loopback metrics side-channel; the write path
+    /// (heartbeat ingress + per-binary clients) is P6b. Defaults to a store with
+    /// [`crate::registry_store::DEFAULT_TTL`]; the boot wires the config TTL via
+    /// [`AppState::with_registry_ttl`].
+    pub registry: Arc<RegistryStore>,
 }
 
 impl AppState {
@@ -1073,10 +1098,18 @@ impl AppState {
             note_usage_accumulators: Arc::new(NoteUsageAccumulators::default()),
             internal_api_token: None,
             admin_api_token: None,
+            heartbeat_ingress_token: None,
             mcp_tool_counters: Arc::new(McpToolCounters::new()),
             skills_index: Arc::new(tokio::sync::RwLock::new(None)),
             server_config: Arc::new(crate::config::ServerConfig::default()),
             context: Arc::new(crate::config::ContextConfig::default()),
+            health_snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::health::starting_report(
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("BUILD_SHA").unwrap_or("unknown"),
+                ),
+            )),
+            registry: Arc::new(RegistryStore::new(crate::registry_store::DEFAULT_TTL)),
         }
     }
 
@@ -1120,10 +1153,18 @@ impl AppState {
             note_usage_accumulators: Arc::new(NoteUsageAccumulators::default()),
             internal_api_token: None,
             admin_api_token: None,
+            heartbeat_ingress_token: None,
             mcp_tool_counters: Arc::new(McpToolCounters::new()),
             skills_index: Arc::new(tokio::sync::RwLock::new(None)),
             server_config: Arc::new(crate::config::ServerConfig::default()),
             context: Arc::new(crate::config::ContextConfig::default()),
+            health_snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::health::starting_report(
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("BUILD_SHA").unwrap_or("unknown"),
+                ),
+            )),
+            registry: Arc::new(RegistryStore::new(crate::registry_store::DEFAULT_TTL)),
         }
     }
 
@@ -1951,6 +1992,17 @@ impl AppState {
         self
     }
 
+    /// Rebuilds the fleet registry store with the configured heartbeat TTL (F-156 P6).
+    ///
+    /// `ttl_secs` is expected to be the already-clamped effective value
+    /// (`RegistryConfig::effective_ttl_secs()`). Wired from `[registry]` at boot; without an
+    /// explicit call the constructor default ([`crate::registry_store::DEFAULT_TTL`]) applies.
+    #[must_use]
+    pub fn with_registry_ttl(mut self, ttl_secs: u64) -> Self {
+        self.registry = Arc::new(RegistryStore::new(std::time::Duration::from_secs(ttl_secs)));
+        self
+    }
+
     /// Opens a `ReadUsageCounterStore` at `path` and injects it into the state (production wiring).
     ///
     /// `path` must point to the same `index.db` file as `with_search_path`
@@ -2009,6 +2061,18 @@ impl AppState {
     /// Builder pattern: `state.with_admin_api_token(token)`
     pub fn with_admin_api_token(mut self, token: secrecy::SecretString) -> Self {
         self.admin_api_token = Some(Arc::new(token));
+        self
+    }
+
+    /// Injects the fleet heartbeat ingress token (F-156 P6b).
+    ///
+    /// Called from `main.rs` after reading env `GRADATUM_HEARTBEAT_TOKEN`, only when
+    /// `[registry_ingress].enabled`. **Distinct** from the worker/admin tokens. `None`
+    /// (never injected) ⇒ the ingress auth middleware is fail-closed (rejects all).
+    ///
+    /// Builder pattern: `state.with_heartbeat_ingress_token(token)`
+    pub fn with_heartbeat_ingress_token(mut self, token: secrecy::SecretString) -> Self {
+        self.heartbeat_ingress_token = Some(Arc::new(token));
         self
     }
 }

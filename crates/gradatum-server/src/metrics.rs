@@ -36,6 +36,8 @@
 //! | `gradatum_vault_orphan_dirs` | Gauge | (sans label) — réconciliation registre↔disque au boot (L7 volet 2) |
 //! | `gradatum_ann_deficit_partitions` | Gauge | (sans label) — gate de santé ANN au boot |
 //! | `gradatum_api_key_orphan_owners` | Gauge | (sans label) — clés actives dont l'owner n'est déclaré par aucun consumer du preset (B6′b) |
+//! | `gradatum_registry_heartbeat_rejected_total` | Counter | reason (6 motifs bornés) — ingress heartbeat F-156 P6b |
+//! | `gradatum_registry_heartbeat_accepted_total` | Counter | (sans label) — ingress heartbeat F-156 P6b |
 
 use std::sync::{
     Arc,
@@ -199,6 +201,19 @@ pub struct ProactiveRecallModeLabel {
 pub struct DriftRuleLabel {
     /// Règle de dérive déclenchée (ex. `"category_section_coherence"`).
     pub rule: &'static str,
+}
+
+/// Reason a fleet heartbeat was rejected at the ingress (F-156 P6b).
+///
+/// Cardinality bounded to **6** `&'static str` values — never a dynamic string:
+/// `unauthorized` (auth), `unknown_service` / `field_too_long` / `capacity` (store guards),
+/// `oversized_body` (body cap), `rate_limited` (per-source rate limit). A rejection is
+/// **never silent**: each maps to exactly one series so an outage/attack is observable by
+/// motive.
+#[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
+pub struct HeartbeatRejectLabel {
+    /// Rejection reason (bounded `&'static str`, see the struct docs).
+    pub reason: &'static str,
 }
 
 /// Label de mode pour les métriques context efficiency (F-29/F-30, v0.7.2).
@@ -443,6 +458,18 @@ pub struct AppMetrics {
     /// série Prometheus — `owner` est une cardinalité non bornée.
     pub api_key_orphan_owners: Gauge,
 
+    // -- Fleet heartbeat ingress (F-156 P6b) ----------------------------------
+    /// Heartbeats rejected at the ingress, by motive (`reason`).
+    ///
+    /// Série : `gradatum_registry_heartbeat_rejected_total{reason}`. Cardinality 6
+    /// (bounded `&'static str`). A rejection is never silent — each motive is a series.
+    pub registry_heartbeat_rejected: Family<HeartbeatRejectLabel, Counter>,
+    /// Heartbeats accepted (stored/refreshed) at the ingress.
+    ///
+    /// Série : `gradatum_registry_heartbeat_accepted_total`. The denominator for the
+    /// rejection ratio.
+    pub registry_heartbeat_accepted: Counter,
+
     // -- Cardinality cap (tenant) --------------------------------------------
     /// Number of distinct tenant labels registered so far.
     tenant_count: Arc<AtomicUsize>,
@@ -519,6 +546,10 @@ impl AppMetrics {
 
         // -- Intégrité référentielle owner ↔ identité ACL au boot (B6′b) ------
         let api_key_orphan_owners: Gauge = Gauge::default();
+
+        // -- Fleet heartbeat ingress (F-156 P6b) -----------------------------
+        let registry_heartbeat_rejected: Family<HeartbeatRejectLabel, Counter> = Family::default();
+        let registry_heartbeat_accepted: Counter = Counter::default();
 
         let mut registry = Registry::default();
 
@@ -717,6 +748,17 @@ impl AppMetrics {
             "Active API keys whose owner is declared by no consumer of the loaded ACL preset (boot reconciliation) — such keys authenticate then get denied everywhere",
             api_key_orphan_owners.clone(),
         );
+        // -- Fleet heartbeat ingress (F-156 P6b) -----------------------------
+        registry.register(
+            "gradatum_registry_heartbeat_rejected",
+            "Fleet heartbeats rejected at the ingress, by motive (unauthorized|unknown_service|field_too_long|capacity|oversized_body|rate_limited) — F-156 P6b",
+            registry_heartbeat_rejected.clone(),
+        );
+        registry.register(
+            "gradatum_registry_heartbeat_accepted",
+            "Fleet heartbeats accepted (stored or refreshed) at the ingress — F-156 P6b",
+            registry_heartbeat_accepted.clone(),
+        );
 
         Self {
             registry: Arc::new(registry),
@@ -756,6 +798,8 @@ impl AppMetrics {
             vault_orphan_dirs,
             ann_deficit_partitions,
             api_key_orphan_owners,
+            registry_heartbeat_rejected,
+            registry_heartbeat_accepted,
             tenant_count: Arc::new(AtomicUsize::new(0)),
             cap: 100,
         }
@@ -826,19 +870,44 @@ pub async fn metrics_handler(State(m): State<AppMetrics>) -> Result<Response, St
 }
 
 // ---------------------------------------------------------------------------
+// Handler /registry (F-156 P6a)
+// ---------------------------------------------------------------------------
+
+/// Axum handler for `GET /registry` — fleet service registry read projection.
+///
+/// Served on the loopback side-channel only (same listener as `/health/detailed`): the
+/// loopback bind *is* the access control (fail-closed, no per-request middleware). Returns the
+/// living fleet members ([`gradatum_dto::RegistryReport`]); expired ones are dropped lazily by
+/// the store. Read-only — the heartbeat write path is a separate (P6b) surface.
+pub async fn registry_handler(
+    axum::extract::State(registry): axum::extract::State<
+        std::sync::Arc<crate::registry_store::RegistryStore>,
+    >,
+) -> axum::Json<gradatum_dto::RegistryReport> {
+    axum::Json(registry.report())
+}
+
+// ---------------------------------------------------------------------------
 // Listener loopback
 // ---------------------------------------------------------------------------
 
 /// Starts the metrics listener on `bind` (must be loopback — no TLS escape for metrics).
 ///
-/// Spawned from `main.rs` after the main listener is bound.
+/// Spawned from `main.rs` after the main listener is bound. Serves both `/metrics` and the
+/// privileged `GET /health/detailed` (F-154 P2): the detailed health superset lives here,
+/// **on the loopback listener only**, because this function is fail-closed to loopback
+/// (bails on any non-loopback `bind`). The detailed route is thus never reachable on the
+/// public `:19090` listener — the loopback bind *is* the access control (no per-request
+/// middleware, consistent with `/metrics`).
 ///
 /// # Errors
-/// - Returns `Err` if `bind` is not loopback (metrics must not escape the loopback).
+/// - Returns `Err` if `bind` is not loopback (metrics + detailed health must not escape).
 /// - Returns `Err` if the TCP bind fails or if `axum::serve` returns an error.
 pub async fn spawn_metrics_listener(
     bind: std::net::SocketAddr,
     m: AppMetrics,
+    health_snapshot: std::sync::Arc<crate::health::HealthSnapshot>,
+    registry: std::sync::Arc<crate::registry_store::RegistryStore>,
 ) -> anyhow::Result<()> {
     use axum::{Router, routing::get};
 
@@ -849,12 +918,22 @@ pub async fn spawn_metrics_listener(
         );
     }
 
-    let app = Router::new()
+    // Sub-routers with distinct state, merged after `.with_state` erases each to `Router<()>`.
+    // `/health/detailed` and `/registry` both inherit the loopback-only listener (fail-closed):
+    // the loopback bind is the access control, no per-request middleware (F-154 P2 / F-156 P6a).
+    let metrics_router = Router::new()
         .route("/metrics", get(metrics_handler))
         .with_state(m);
+    let health_router = Router::new()
+        .route("/health/detailed", get(crate::health::detailed_handler))
+        .with_state(health_snapshot);
+    let registry_router = Router::new()
+        .route("/registry", get(registry_handler))
+        .with_state(registry);
+    let app = metrics_router.merge(health_router).merge(registry_router);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!(addr = %bind, "metrics listener listening");
+    tracing::info!(addr = %bind, "metrics + detailed-health listener listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

@@ -320,6 +320,120 @@ async fn require_active_target(state: &AppState, vault: &str) -> Result<(), Grad
     }
 }
 
+/// Safety cap (ADN 5 — DoS) : nombre maximum de vaults interrogés par une seule
+/// recherche multi-vault (F-63). Au-delà, la requête est refusée `InvalidInput`
+/// (jamais de troncature silencieuse d'un `vault_ids` explicite ni d'un `all_readable`
+/// — une absence tronquée serait une absence non prouvée).
+pub(crate) const MAX_VAULTS_PER_SEARCH: usize = 16;
+
+/// Résout l'ENSEMBLE des vaults de lecture effectifs d'une recherche multi-vault
+/// (F-63, opt-in `vault_ids` / `all_readable`) — chemin `multi_tenant.enabled = true`
+/// UNIQUEMENT.
+///
+/// C'est le point d'application de **C** (revue sécurité) : la séquence ACL COMPLÈTE
+/// d'[`effective_read_vault`] (L266→L288) est répliquée sur CHAQUE candidat, dans le
+/// même ordre — `acl.evaluate(Read, locus(cible))` **PUIS** [`require_read_grant`] +
+/// [`require_agent_read_grant`] + [`require_active_target`]. Un candidat qui échoue à
+/// N'IMPORTE quel barreau (ACL deny, grant absent, tenant cible inactif, ou lookup en
+/// erreur — fail-closed) est **exclu silencieusement** : il n'est jamais interrogé, et
+/// aucun `403`/oracle d'existence ne distingue « vault inexistant » de « vault non
+/// autorisé ». Le filtre allow-list `vault_id IN (…)` du cadre C est ainsi matérialisé
+/// par la seule composition de l'ensemble — jamais par un post-filtre sur la fusion.
+///
+/// Le vault propre du principal (`tenant`) est TOUJOURS candidat (`{propre} ∪ …`) ; il
+/// subit la même séquence (à ON, un tenant a un grant sur son propre vault) et peut
+/// donc être exclu comme les autres.
+///
+/// Ensemble candidat (dédupliqué, trié lexicographiquement pour un tie-break RRF
+/// reproductible aval — Q4/ADN 2) :
+/// - `all_readable = true` → `{propre}` ∪ vaults couverts par un grant tenant
+///   (lookup `tenant_grants`, fail-closed : lookup en erreur → aucun élargissement) ;
+/// - `vault_ids = [v…]` → `{propre}` ∪ `{v…}` (chaque `v` re-parsé, frontière non
+///   fiable ; malformé → `InvalidInput`).
+///
+/// # Errors
+/// - [`GradatumError::InvalidInput`] : un `vault_ids` explicite malformé, ou l'ensemble
+///   candidat dépasse [`MAX_VAULTS_PER_SEARCH`].
+#[must_use = "resolved vaults must scope the search's index reads"]
+pub(crate) async fn effective_read_vaults(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant: &str,
+    req_vault_ids: &[String],
+    all_readable: bool,
+    locus_section: Option<&str>,
+) -> Result<Vec<AclCheckedVaultId>, GradatumError> {
+    // 1. Ensemble candidat brut. Le vault propre est toujours inclus (`{propre} ∪ …`).
+    //    `own`/grants utilisent `VaultId::new` (déjà validés en amont) ; seuls les
+    //    `vault_ids` explicites — frontière non fiable — sont re-parsés (400 si malformé).
+    let mut candidates: Vec<VaultId> = vec![VaultId::new(tenant)];
+    if all_readable {
+        // fail-closed : un lookup en échec n'élargit RIEN (candidats = {propre}).
+        let tenant_id = TenantId::new(tenant);
+        match state.search.tenant_grants(&tenant_id).await {
+            Ok(grants) => candidates.extend(grants.into_iter().map(|g| g.vault_id)),
+            Err(e) => tracing::error!(
+                tenant = %tenant,
+                err = %e,
+                "effective_read_vaults: tenant_grants lookup failed — fail-closed (all_readable reduced to own vault)"
+            ),
+        }
+    }
+    for v in req_vault_ids {
+        let parsed = VaultId::parse(v)
+            .map_err(|e| GradatumError::InvalidInput(format!("invalid vault_id: {e}")))?;
+        candidates.push(parsed);
+    }
+    // Dédup + ordre déterministe (tie-break RRF reproductible aval).
+    candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    candidates.dedup_by(|a, b| a.as_str() == b.as_str());
+
+    // 2. Cap DoS AVANT toute interrogation (jamais de troncature silencieuse).
+    if candidates.len() > MAX_VAULTS_PER_SEARCH {
+        return Err(GradatumError::InvalidInput(format!(
+            "too many vaults requested ({}); max is {MAX_VAULTS_PER_SEARCH}",
+            candidates.len()
+        )));
+    }
+
+    // 3. Séquence ACL COMPLÈTE par candidat (C-1) — deny/erreur = exclusion silencieuse.
+    let mut checked: Vec<AclCheckedVaultId> = Vec::with_capacity(candidates.len());
+    for target in candidates {
+        // (a) ACL layer — jamais minter le témoin sans cette évaluation (C-1).
+        let acl_locus = crate::api_v1::logic::locus_for_section(target.as_str(), locus_section);
+        if state.acl.evaluate(trust, AclOp::Read, &acl_locus) != AclDecision::Allow {
+            crate::api_v1::logic::log_acl_deny(
+                trust,
+                AclOp::Read,
+                &acl_locus,
+                "effective_read_vaults",
+            );
+            continue;
+        }
+        // (b) grant tenant read vault-entier (section=None) — SSOT covers_section.
+        if require_read_grant(state, tenant, target.as_str(), None)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        // (c) intersection agent (0 grant → pass-through, fail-closed sur erreur).
+        if let Some(agent_id) = trust.subject()
+            && require_agent_read_grant(state, agent_id, target.as_str(), None)
+                .await
+                .is_err()
+        {
+            continue;
+        }
+        // (d) tenant cible actif.
+        if require_active_target(state, target.as_str()).await.is_err() {
+            continue;
+        }
+        checked.push(AclCheckedVaultId::attest_read_checked(target));
+    }
+    Ok(checked)
+}
+
 /// Témoin de lecture pour le vault **propre** du tenant (cible == appelant).
 ///
 /// À n'utiliser qu'en aval d'un contrôle ACL Read sur le locus du tenant (tête de
@@ -744,6 +858,309 @@ mod tests {
         assert_eq!(
             effective_tenant(&trust, Some(&TenantId::new("main"))),
             Err(StatusCode::FORBIDDEN)
+        );
+    }
+}
+
+/// Tests du résolveur multi-vault `effective_read_vaults` (F-63, C-1/C-2).
+///
+/// Chaque test monte un `AppState` avec index SQLite réel (migrations 0001-004x, seed
+/// `main`↔`main`) + preset ACL, puis seede tenants/grants via une connexion rusqlite
+/// séparée (même patron que `tests/vaultgrant_c1.rs`, mais in-crate car le résolveur
+/// est `pub(crate)`).
+#[cfg(test)]
+mod resolver_tests {
+    use super::{MAX_VAULTS_PER_SEARCH, effective_read_vault, effective_read_vaults};
+    use crate::config::{MultiTenantConfig, ServerConfig};
+    use crate::state::AppState;
+    use gradatum_acl_policy::AclEngine;
+    use gradatum_auth::jwt::JwtService;
+    use gradatum_core::scope::AclCheckedVaultId;
+    use gradatum_core::trust::TrustContext;
+    use tempfile::TempDir;
+
+    fn bearer(sub: &str, tenant: &str) -> TrustContext {
+        TrustContext::BearerToken {
+            kid: "k".into(),
+            aud: "gradatum".into(),
+            sub: sub.into(),
+            scopes: vec!["read".into()],
+            tenant_id: tenant.into(),
+            jti: None,
+        }
+    }
+
+    /// Monte l'`AppState` (flag ON) avec le preset ACL fourni.
+    async fn env(acl_preset: &str) -> (AppState, std::path::PathBuf, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let index_path = dir.path().join("index.db");
+        let jwt = JwtService::new_ephemeral();
+        let acl = AclEngine::from_preset_str(acl_preset).expect("preset ACL valide");
+        let cfg = ServerConfig {
+            multi_tenant: MultiTenantConfig { enabled: true },
+            ..ServerConfig::default()
+        };
+        let state = AppState::with_jwt_and_acl(jwt, acl)
+            .with_search_path(&index_path)
+            .await
+            .expect("SqliteIndex::open + migrations")
+            .with_server_config(cfg);
+        (state, index_path, dir)
+    }
+
+    fn seed(index_path: &std::path::Path, sql: &str) {
+        let conn = rusqlite::Connection::open(index_path).expect("open index.db seed");
+        conn.execute_batch(sql).expect("seed SQL");
+    }
+
+    fn ids(v: &[AclCheckedVaultId]) -> Vec<&str> {
+        v.iter().map(AclCheckedVaultId::as_str).collect()
+    }
+
+    /// Preset autorisant `reader-agent` à lire les loci `{a,b,c,reader,secret}/main`.
+    const ACL_READER: &str = r#"
+[[consumer]]
+identity = "reader-agent"
+read_patterns  = ["a/*", "b/*", "c/*", "reader/*", "secret/*"]
+write_patterns = []
+"#;
+
+    /// `all_readable` : ensemble = grants tenant actifs uniquement ; vault suspendu exclu.
+    #[tokio::test]
+    async fn all_readable_returns_active_granted_vaults_only() {
+        let (state, path, _dir) = env(ACL_READER).await;
+        seed(
+            &path,
+            "INSERT INTO tenants (id, status, created_at) VALUES
+                ('reader','active',0), ('a','active',0), ('b','active',0), ('c','suspended',0);
+             INSERT INTO tenant_vault_grants (tenant_id, vault_id, access) VALUES
+                ('reader','a','read'), ('reader','b','read'), ('reader','c','read');",
+        );
+        let trust = bearer("reader-agent", "reader");
+        let set = effective_read_vaults(&state, &trust, "reader", &[], true, None)
+            .await
+            .expect("résolution");
+        assert_eq!(
+            ids(&set),
+            vec!["a", "b"],
+            "c suspendu exclu, reader sans grant exclu"
+        );
+    }
+
+    /// **C-2** : `vault_ids=[a, secret]`, grant sur `a` seul → ensemble = {a}, `secret`
+    /// absent, AUCUNE erreur (pas d'oracle), MÊME si l'ACL autorise `secret/main`.
+    #[tokio::test]
+    async fn c2_unauthorized_vault_dropped_silently_no_oracle() {
+        let (state, path, _dir) = env(ACL_READER).await;
+        seed(
+            &path,
+            "INSERT INTO tenants (id, status, created_at) VALUES
+                ('reader','active',0), ('a','active',0);
+             INSERT INTO tenant_vault_grants (tenant_id, vault_id, access) VALUES
+                ('reader','a','read');",
+        );
+        let trust = bearer("reader-agent", "reader");
+        let set = effective_read_vaults(
+            &state,
+            &trust,
+            "reader",
+            &["a".to_owned(), "secret".to_owned()],
+            false,
+            None,
+        )
+        .await
+        .expect("200 — jamais 403 sur vault non autorisé");
+        assert_eq!(
+            ids(&set),
+            vec!["a"],
+            "secret sans grant droppé silencieux, aucune erreur"
+        );
+    }
+
+    /// **C-1** : un candidat avec grant tenant MAIS `acl.evaluate(Read)` refusée est
+    /// exclu silencieusement — le témoin `AclCheckedVaultId` n'est jamais minté sans
+    /// l'évaluation ACL (typestate honnête, ACL ≥ chemin mono).
+    #[tokio::test]
+    async fn c1_grant_present_but_acl_denied_excludes_vault() {
+        // ACL n'autorise QUE `a/main` ; `b/main` est refusé bien que le grant existe.
+        const ACL_ONLY_A: &str = r#"
+[[consumer]]
+identity = "reader-agent"
+read_patterns  = ["a/*"]
+write_patterns = []
+"#;
+        let (state, path, _dir) = env(ACL_ONLY_A).await;
+        seed(
+            &path,
+            "INSERT INTO tenants (id, status, created_at) VALUES
+                ('reader','active',0), ('a','active',0), ('b','active',0);
+             INSERT INTO tenant_vault_grants (tenant_id, vault_id, access) VALUES
+                ('reader','a','read'), ('reader','b','read');",
+        );
+        let trust = bearer("reader-agent", "reader");
+        let set = effective_read_vaults(
+            &state,
+            &trust,
+            "reader",
+            &["a".to_owned(), "b".to_owned()],
+            false,
+            None,
+        )
+        .await
+        .expect("résolution");
+        assert_eq!(
+            ids(&set),
+            vec!["a"],
+            "b a un grant mais ACL deny → exclu silencieux (C-1)"
+        );
+    }
+
+    /// Intersection agent : agent grants={a} restreint tenant grants={a,b} → {a} ;
+    /// 0 grant agent → pass-through (= ensemble tenant).
+    #[tokio::test]
+    async fn agent_grant_intersection_narrows_then_passthrough() {
+        let (state, path, _dir) = env(ACL_READER).await;
+        seed(
+            &path,
+            "INSERT INTO tenants (id, status, created_at) VALUES
+                ('reader','active',0), ('a','active',0), ('b','active',0);
+             INSERT INTO tenant_vault_grants (tenant_id, vault_id, access) VALUES
+                ('reader','a','read'), ('reader','b','read');
+             INSERT INTO agent_vault_grants (agent_id, vault_id, access) VALUES
+                ('reader-agent','a','read');",
+        );
+        let trust = bearer("reader-agent", "reader");
+        let narrowed = effective_read_vaults(&state, &trust, "reader", &[], true, None)
+            .await
+            .expect("résolution");
+        assert_eq!(
+            ids(&narrowed),
+            vec!["a"],
+            "agent grant {{a}} restreint tenant {{a,b}}"
+        );
+
+        // Agent sans grant (autre sub) → pass-through = ensemble tenant.
+        const ACL_OTHER: &str = r#"
+[[consumer]]
+identity = "other-agent"
+read_patterns  = ["a/*", "b/*"]
+write_patterns = []
+"#;
+        seed(&path, "-- no-op"); // les grants tenant persistent
+        let acl2 = AclEngine::from_preset_str(ACL_OTHER).expect("preset");
+        // Réutilise le même index (grants tenant a,b) avec un agent sans grant agent.
+        let state2 = AppState::with_jwt_and_acl(JwtService::new_ephemeral(), acl2)
+            .with_search_path(&path)
+            .await
+            .expect("reopen index")
+            .with_server_config(ServerConfig {
+                multi_tenant: MultiTenantConfig { enabled: true },
+                ..ServerConfig::default()
+            });
+        let trust2 = bearer("other-agent", "reader");
+        let passthrough = effective_read_vaults(&state2, &trust2, "reader", &[], true, None)
+            .await
+            .expect("résolution");
+        assert_eq!(
+            ids(&passthrough),
+            vec!["a", "b"],
+            "agent 0 grant → pass-through"
+        );
+    }
+
+    /// Défaut (`vault_ids=[]`, `all_readable=false`) → {vault propre} singleton,
+    /// byte-identical à `effective_read_vault(None)`.
+    #[tokio::test]
+    async fn default_singleton_matches_effective_read_vault() {
+        // Seed `main`↔`main` fourni par la migration 0030 ; ACL autorise main/main.
+        const ACL_MAIN: &str = r#"
+[[consumer]]
+identity = "main-agent"
+read_patterns  = ["main/*"]
+write_patterns = []
+"#;
+        let (state, _path, _dir) = env(ACL_MAIN).await;
+        let trust = bearer("main-agent", "main");
+        let set = effective_read_vaults(&state, &trust, "main", &[], false, None)
+            .await
+            .expect("résolution");
+        let mono = effective_read_vault(&state, &trust, "main", None, None, "acl deny")
+            .await
+            .expect("chemin mono");
+        assert_eq!(ids(&set), vec!["main"], "singleton = vault propre");
+        assert_eq!(
+            set[0].as_str(),
+            mono.as_str(),
+            "byte-identical au chemin mono"
+        );
+    }
+
+    /// Cap `MAX_VAULTS_PER_SEARCH` dépassé → `InvalidInput` (jamais troncature).
+    #[tokio::test]
+    async fn cap_exceeded_is_invalid_input() {
+        const ACL_MAIN: &str = r#"
+[[consumer]]
+identity = "main-agent"
+read_patterns  = ["*/*"]
+write_patterns = []
+"#;
+        let (state, _path, _dir) = env(ACL_MAIN).await;
+        let trust = bearer("main-agent", "main");
+        let many: Vec<String> = (0..MAX_VAULTS_PER_SEARCH + 5)
+            .map(|i| format!("vault-{i:02}"))
+            .collect();
+        let res = effective_read_vaults(&state, &trust, "main", &many, false, None).await;
+        assert!(
+            matches!(
+                res,
+                Err(gradatum_core::error::GradatumError::InvalidInput(_))
+            ),
+            "ensemble candidat > cap → InvalidInput, obtenu {res:?}"
+        );
+    }
+
+    /// Fail-closed : lookup grants en erreur (table absente) → aucun élargissement,
+    /// ensemble vide, jamais de panic.
+    #[tokio::test]
+    async fn grant_lookup_error_is_fail_closed_empty() {
+        let (state, path, _dir) = env(ACL_READER).await;
+        seed(&path, "DROP TABLE tenant_vault_grants;");
+        let trust = bearer("reader-agent", "reader");
+        let set = effective_read_vaults(&state, &trust, "reader", &[], true, None)
+            .await
+            .expect("jamais de panic — fail-closed");
+        assert!(
+            set.is_empty(),
+            "lookup en erreur → ensemble vide (aucun élargissement)"
+        );
+    }
+
+    /// `vault_ids` malformé (frontière non fiable) → `InvalidInput` (parité chemin mono).
+    #[tokio::test]
+    async fn malformed_explicit_vault_id_is_invalid_input() {
+        const ACL_MAIN: &str = r#"
+[[consumer]]
+identity = "main-agent"
+read_patterns  = ["*/*"]
+write_patterns = []
+"#;
+        let (state, _path, _dir) = env(ACL_MAIN).await;
+        let trust = bearer("main-agent", "main");
+        let res = effective_read_vaults(
+            &state,
+            &trust,
+            "main",
+            &["INVALID UPPER".to_owned()],
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(gradatum_core::error::GradatumError::InvalidInput(_))
+            ),
+            "vault_id malformé → InvalidInput, obtenu {res:?}"
         );
     }
 }

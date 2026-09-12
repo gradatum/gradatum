@@ -243,6 +243,78 @@ fn read_back_reader(
     }
 }
 
+// ── F-63 fusion multi-vault ──────────────────────────────────────────────────
+
+/// Séparateur des clés de fusion vault-qualifiées (F-63, R1).
+///
+/// `U+0001` (Start Of Heading) n'apparaît NI dans un ULID (`[0-9A-HJKMNP-TV-Z]`) NI
+/// dans un `vault_id` (charset `[a-z0-9-]`, cf. [`VaultId::parse`]) → la décomposition
+/// `{vault_id}\u{1}{note_id}` est non ambiguë, deux notes de vaults distincts partageant
+/// un ULID ne collisionnent jamais dans le `HashMap<&str>` de `rrf_fuse`.
+const MULTIVAULT_KEY_SEP: char = '\u{1}';
+
+/// Compose la clé de fusion vault-qualifiée `{vault}\u{1}{note}` (F-63).
+fn compose_multivault_key(vault: &str, note: &str) -> String {
+    format!("{vault}{MULTIVAULT_KEY_SEP}{note}")
+}
+
+/// Décompose une clé vault-qualifiée → `(vault_id, note_id)` (F-63, R1).
+///
+/// `None` si le séparateur est absent (clé mono-vault non qualifiée) — le caller décide
+/// alors du repli. Le `split_once` est sûr : le séparateur ne peut apparaître dans aucun
+/// des deux segments (cf. [`MULTIVAULT_KEY_SEP`]).
+fn decompose_multivault_key(key: &str) -> Option<(&str, &str)> {
+    key.split_once(MULTIVAULT_KEY_SEP)
+}
+
+/// Fusion RRF **globale re-scorée** sur l'union de plusieurs vaults (F-63, design A).
+///
+/// Chaque sous-liste par vault est déjà triée best-first (BM25 ASC — moins négatif = mieux ;
+/// sémantique DESC — cosine plus haut = mieux). Cette fonction :
+/// 1. aplatit et **merge-trie GLOBALEMENT** les deux signaux (rang = index global, pré-requis
+///    de [`rrf_fuse`] dont le rang est l'index d'entrée) ;
+/// 2. compose des **clés vault-qualifiées** (anti-collision ULID inter-vault, R1) ;
+/// 3. délègue à [`rrf_fuse`] / [`rrf_fuse_short_circuit`] **inchangés**.
+///
+/// Les `RrfHit.note_id` retournés portent la clé composite — le caller la décompose via
+/// [`decompose_multivault_key`] pour retrouver la provenance `(vault_id, note_id)`.
+///
+/// Le tie-break à score égal est déterministe : `sort_by` stable + itération des vaults
+/// dans l'ordre reçu (le résolveur les rend triés lexicographiquement — ADN 2).
+fn fuse_multivault(
+    bm25_by_vault: &[(VaultId, Vec<(String, f64)>)],
+    semantic_by_vault: &[(VaultId, Vec<(String, f32)>)],
+    hybrid: bool,
+    k: f64,
+    limit: usize,
+) -> Vec<gradatum_search::RrfHit> {
+    let mut bm25_global: Vec<(String, f64)> = bm25_by_vault
+        .iter()
+        .flat_map(|(vault, hits)| {
+            hits.iter()
+                .map(move |(note, score)| (compose_multivault_key(vault.as_str(), note), *score))
+        })
+        .collect();
+    // BM25 ASC (best = moins négatif) ; stable → tie-break = ordre d'insertion (vault puis rang).
+    bm25_global.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut sem_global: Vec<(String, f32)> = semantic_by_vault
+        .iter()
+        .flat_map(|(vault, hits)| {
+            hits.iter()
+                .map(move |(note, score)| (compose_multivault_key(vault.as_str(), note), *score))
+        })
+        .collect();
+    // Sémantique DESC (best = cosine le plus haut) ; stable.
+    sem_global.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    if hybrid {
+        rrf_fuse_short_circuit(&bm25_global, &sem_global, k, limit)
+    } else {
+        rrf_fuse(&bm25_global, &sem_global, k, limit)
+    }
+}
+
 // ── §1 READ HANDLERS ─────────────────────────────────────────────────────────
 
 /// Logique métier de `POST /api/v1/vault_search`.
@@ -273,6 +345,34 @@ pub async fn vault_search_impl(
     let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
+
+    // F-63 — opt-in multi-vault. `vault_id` (singulier, cross-read mono) est mutuellement
+    // exclusif avec `vault_ids`/`all_readable` : deux sémantiques de scope superposées =
+    // ambiguïté → 400 (explicite > implicite). Vérifié inconditionnellement (aucun client
+    // legacy n'envoie ces champs — OFF reste byte-identical pour le parc existant).
+    let opt_in_multivault = req.vault_ids.is_some() || req.all_readable;
+    if opt_in_multivault && req.vault_id.is_some() {
+        return Err(GradatumError::InvalidInput(
+            "vault_id (singular) is mutually exclusive with vault_ids/all_readable".into(),
+        ));
+    }
+    // C-2 — la bascule vers le chemin multi se fait sur l'ABSENCE d'opt-in, PAS sur la
+    // taille de l'ensemble : tout le parc existant (opt-in absent) emprunte le chemin mono
+    // inchangé ci-dessous (`effective_read_vault`), byte-identical par construction. Le
+    // chemin multi n'est atteint que sur opt-in explicite ET flag ON (à OFF les champs
+    // multi sont ignorés — comportement mono OFF intact).
+    if opt_in_multivault && state.server_config.multi_tenant.enabled {
+        let vaults = crate::api_v1::tenant_guard::effective_read_vaults(
+            state,
+            trust,
+            &tenant,
+            req.vault_ids.as_deref().unwrap_or(&[]),
+            req.all_readable,
+            req.section.as_deref(),
+        )
+        .await?;
+        return vault_search_multivault(state, trust, &req, &tenant, vaults).await;
+    }
 
     // EX-C2-1 : à `multi_tenant.enabled = true`, l'ACL est recalculée sur la CIBLE
     // (`read_vault_id`) + grant read per-vault. À OFF, le chemin legacy ci-dessous
@@ -965,6 +1065,485 @@ pub async fn vault_search_impl(
                 if rank < 3 {
                     state.note_usage_accumulators.record(
                         read_vault.as_str(),
+                        note_id,
+                        KIND_SEARCH_HIT_TOP3,
+                        now_ms,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(VaultSearchResponse {
+        items,
+        corpus_match_count,
+        corpus_count_capped,
+    })
+}
+
+/// Recherche multi-vault agrégée (F-63) — union re-scorée RRF sur `vaults`, chaque hit
+/// portant sa provenance `vault_id`.
+///
+/// Chemin distinct du chemin mono chaud (jamais atteint sans opt-in explicite). `vaults`
+/// est **déjà résolu et ACL-checké** par [`crate::api_v1::tenant_guard::effective_read_vaults`]
+/// (séquence C-1/C-2 : ACL + grants + statut actif par vault, exclusion silencieuse) —
+/// chaque `search_*(&AclCheckedVaultId, …)` est donc scopé `WHERE vault_id = ?` sur un
+/// membre AUTORISÉ, le filtre allow-list du cadre C étant matérialisé par la seule
+/// composition de l'ensemble (jamais un post-filtre sur la fusion).
+///
+/// Dégradations connues : le reranker (Noop en prod) n'est PAS appliqué ici (ordre
+/// composite retenu) ; un vault sans embedding sous l'embedder actif remonte en BM25-only
+/// (#2, `embedder_id` global-unique → cosines toujours comparables, jamais de NaN).
+async fn vault_search_multivault(
+    state: &AppState,
+    trust: &TrustContext,
+    req: &VaultSearchRequest,
+    _tenant: &str,
+    vaults: Vec<gradatum_core::scope::AclCheckedVaultId>,
+) -> Result<VaultSearchResponse, GradatumError> {
+    // Validations partagées avec le chemin mono (mêmes messages/ordre).
+    let status_filter = validate_search_status(req.status.as_deref())
+        .map_err(|()| GradatumError::InvalidInput("invalid status".into()))?;
+    if matches!((req.from_ms, req.to_ms), (Some(f), Some(t)) if f > t) {
+        return Err(GradatumError::InvalidInput("from_ms > to_ms".into()));
+    }
+    let query = req.query.trim();
+    let empty_response = || VaultSearchResponse {
+        items: vec![],
+        corpus_match_count: None,
+        corpus_count_capped: false,
+    };
+    if query.is_empty() || vaults.is_empty() {
+        return Ok(empty_response());
+    }
+
+    let limit = req.limit.unwrap_or(10).clamp(1, 50) as usize;
+    let fts_query = build_fts_query(query);
+    // F-246 : sections écartées par défaut (uniquement sans filtre de section explicite).
+    let excluded_sections: &[Section] = if req.section.is_none() {
+        Section::DEFAULT_SEARCH_EXCLUDED
+    } else {
+        &[]
+    };
+    let hybrid = state.embedder.backend_kind() != EmbedBackend::Noop;
+
+    // Embedding de requête — calculé UNE fois (query-level), réutilisé sur chaque vault.
+    let query_emb: Option<Vec<f32>> = if hybrid {
+        match state.embedder.embed(query).await {
+            Ok(e) => Some(e),
+            Err(e) => {
+                tracing::warn!(err = %e, query = %query, "vault_search_multivault: embed() failed, BM25 only");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Éventail par-vault. Chaque requête SQL est scopée `WHERE vault_id = ?` (membre autorisé).
+    let mut bm25_by_vault: Vec<(VaultId, Vec<(String, f64)>)> = Vec::with_capacity(vaults.len());
+    let mut sem_by_vault: Vec<(VaultId, Vec<(String, f32)>)> = Vec::with_capacity(vaults.len());
+    // Enrichissement post-fusion à clé composite (R1) : BM25 SearchHitRaw + ancre sémantique.
+    let mut bm25_raw: HashMap<String, gradatum_index::SearchHitRaw> = HashMap::new();
+    let mut sem_anchor: HashMap<String, i64> = HashMap::new();
+
+    for vault in &vaults {
+        let vid = vault.vault_id().clone();
+
+        // ── Bras BM25 ──
+        let bm25_hits = state
+            .search
+            .search_fts_with_snippet(
+                vault,
+                &fts_query,
+                limit * 2,
+                req.include_downgraded,
+                req.section.as_deref(),
+                req.locus.as_deref(),
+                status_filter.as_deref(),
+                req.from_ms,
+                req.to_ms,
+            )
+            .await?;
+        let mut bm25_list: Vec<(String, f64)> = Vec::with_capacity(bm25_hits.len());
+        for h in bm25_hits {
+            // F-246 : exclusion par défaut sur le bras lexical (parité mono).
+            if !excluded_sections.is_empty()
+                && excluded_sections
+                    .iter()
+                    .any(|s| s.as_str() == h.section.as_str())
+            {
+                continue;
+            }
+            let note = h.note_id.to_string();
+            let key = compose_multivault_key(vid.as_str(), &note);
+            bm25_list.push((note, h.bm25));
+            bm25_raw.insert(key, h);
+        }
+        bm25_by_vault.push((vid.clone(), bm25_list));
+
+        // ── Bras sémantique (dégradation gracieuse) ──
+        let mut sem_hits: Vec<(NoteId, f32)> = match &query_emb {
+            Some(emb) => state
+                .search
+                .search_semantic(
+                    vault,
+                    state.embedder.embedder_id(),
+                    emb,
+                    limit * 2,
+                    req.locus.as_deref(),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(err = %e, vault = %vid, "vault_search_multivault: search_semantic failed, BM25 only for this vault");
+                    vec![]
+                }),
+            None => vec![],
+        };
+
+        // Filtre section (fix C2, per-vault).
+        if let Some(wanted_section) = req.section.as_deref()
+            && !sem_hits.is_empty()
+        {
+            let ids: Vec<String> = sem_hits.iter().map(|(id, _)| id.to_string()).collect();
+            let sec = state.search.get_titles_sections(vault, &ids).await;
+            sem_hits = filter_semantic_by_section(sem_hits, wanted_section, sec);
+        }
+        // F-246 exclusion par défaut (per-vault).
+        if !excluded_sections.is_empty() && !sem_hits.is_empty() {
+            let excl: Vec<&str> = excluded_sections.iter().map(Section::as_str).collect();
+            let ids: Vec<String> = sem_hits.iter().map(|(id, _)| id.to_string()).collect();
+            let sec = state.search.get_titles_sections(vault, &ids).await;
+            sem_hits = filter_semantic_excluding_sections(sem_hits, &excl, sec);
+        }
+        // Filtre status (per-vault).
+        if let Some(wanted_status) = status_filter.as_deref()
+            && !sem_hits.is_empty()
+        {
+            let ids: Vec<String> = sem_hits.iter().map(|(id, _)| id.to_string()).collect();
+            let st = state.search.get_statuses(vault, &ids).await;
+            sem_hits = filter_semantic_by_status(sem_hits, wanted_status, st);
+        }
+        // Ancre temporelle + filtre bornes (per-vault, F-65).
+        if !sem_hits.is_empty() {
+            let ids: Vec<String> = sem_hits.iter().map(|(id, _)| id.to_string()).collect();
+            let bounds_active = req.from_ms.is_some() || req.to_ms.is_some();
+            let anchor = state
+                .search
+                .get_anchor_ms_batch(vault, &ids)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(err = %e, vault = %vid, "vault_search_multivault: get_anchor_ms_batch failed");
+                    HashMap::new()
+                });
+            if bounds_active {
+                sem_hits.retain(|(id, _)| match anchor.get(&id.to_string()) {
+                    None => false,
+                    Some(&ms) => {
+                        req.from_ms.is_none_or(|f| ms >= f) && req.to_ms.is_none_or(|t| ms <= t)
+                    }
+                });
+            }
+            for (id, _) in &sem_hits {
+                if let Some(&ms) = anchor.get(&id.to_string()) {
+                    sem_anchor.insert(compose_multivault_key(vid.as_str(), &id.to_string()), ms);
+                }
+            }
+        }
+
+        let sem_list: Vec<(String, f32)> = sem_hits
+            .into_iter()
+            .map(|(id, score)| (id.to_string(), score))
+            .collect();
+        sem_by_vault.push((vid, sem_list));
+    }
+
+    // Fusion GLOBALE re-scorée (clés vault-qualifiées) — rrf_fuse inchangé.
+    let rrf_buffer = (limit * 4).clamp(20, 200);
+    let mut fused = fuse_multivault(&bm25_by_vault, &sem_by_vault, hybrid, 60.0, rrf_buffer);
+
+    // Enrichissement depuis la map BM25 (clé composite) ; ancre sémantique sinon.
+    for hit in &mut fused {
+        if let Some(bh) = bm25_raw.get(&hit.note_id) {
+            hit.section = bh.section.clone();
+            hit.snippet = Some(bh.snippet.clone());
+            hit.title = bh.title.clone().filter(|s| !s.trim().is_empty());
+            hit.status = bh.status.clone();
+            hit.anchor_ms = bh.anchor_ms;
+        } else if hit.anchor_ms.is_none() {
+            hit.anchor_ms = sem_anchor.get(&hit.note_id).copied();
+        }
+    }
+
+    // Pré-scoring : section manquante (semantic-only) → batch get_titles_sections PAR vault.
+    let missing: Vec<String> = fused
+        .iter()
+        .filter(|h| h.section.is_empty())
+        .map(|h| h.note_id.clone())
+        .collect();
+    if !missing.is_empty() {
+        for vault in &vaults {
+            let ids: Vec<String> = missing
+                .iter()
+                .filter_map(|k| decompose_multivault_key(k))
+                .filter(|(v, _)| *v == vault.as_str())
+                .map(|(_, n)| n.to_owned())
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let sec_map = state
+                .search
+                .get_titles_sections(vault, ids.as_slice())
+                .await
+                .unwrap_or_default();
+            for hit in &mut fused {
+                if hit.section.is_empty()
+                    && let Some((v, n)) = decompose_multivault_key(&hit.note_id)
+                    && v == vault.as_str()
+                    && let Some((_, section)) = sec_map.get(n)
+                {
+                    hit.section.clone_from(section);
+                }
+            }
+        }
+    }
+
+    // Salience batch PAR vault (clé composite). OFF (state.salience == None) → map vide.
+    let mut salience_counts: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+    if let (Some(_), Some(store)) = (&state.salience, &state.note_usage) {
+        for vault in &vaults {
+            let ids: Vec<String> = fused
+                .iter()
+                .filter_map(|h| decompose_multivault_key(&h.note_id))
+                .filter(|(v, _)| *v == vault.as_str())
+                .map(|(_, n)| n.to_owned())
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            match store.counts_for_notes(vault.vault_id(), &ids).await {
+                Ok(map) => {
+                    for (note, counts) in map {
+                        salience_counts
+                            .insert(compose_multivault_key(vault.as_str(), &note), counts);
+                    }
+                }
+                Err(e) => tracing::warn!(err = %e, vault = %vault.as_str(),
+                    "vault_search_multivault: salience batch lookup failed — neutral factor"),
+            }
+        }
+    }
+
+    // Scoring composite (par hit, keyé sur le vault source décomposé).
+    let now_ms = Utc::now().timestamp_millis();
+    let mut composite_hits: Vec<(gradatum_search::RrfHit, f64)> = Vec::with_capacity(fused.len());
+    let mut score_breakdowns: HashMap<String, ScoreBreakdown> = HashMap::new();
+    for hit in fused {
+        let Some((vault_str, note_str)) = decompose_multivault_key(&hit.note_id) else {
+            // Non-composite key (impossible in multi) — skip rather than fabricate a hit.
+            tracing::error!(key = %hit.note_id, "vault_search_multivault: non-composite fusion key skipped");
+            continue;
+        };
+        let (vault_str, note_str) = (vault_str.to_owned(), note_str.to_owned());
+
+        let (created_ms, in_degree) = match state
+            .search
+            .get_note_created_and_indegree(&vault_str, &note_str)
+            .await
+        {
+            Ok(v) => v,
+            Err(GradatumError::NoteNotFound(_)) => (now_ms, 0u64),
+            Err(e) => return Err(e),
+        };
+        let anchor_for_recency = hit.anchor_ms.unwrap_or(created_ms);
+        let recency = recency_factor(anchor_for_recency, now_ms);
+        let pagerank = pagerank_factor(in_degree);
+        let trust_params = if state.scoring.enabled {
+            let age_days = ((now_ms - created_ms).max(0) as f64) / 86_400_000.0;
+            state.scoring.resolve_for_section(&hit.section, age_days)
+        } else {
+            None
+        };
+        let composite_base =
+            composite_score_with_trust(hit.rrf_score, recency, pagerank, trust_params);
+        // Salience per-vault (override A6 sinon global), gate OFF ⇒ None ⇒ neutre.
+        let eff_sal: Option<&std::sync::Arc<gradatum_search::SalienceParams>> =
+            state.salience.as_ref().and_then(|global| {
+                match state.salience_per_vault.get(vault_str.as_str()) {
+                    Some(entry) => entry.as_ref(),
+                    None => Some(global),
+                }
+            });
+        let (composite, salience_ws) = match eff_sal {
+            Some(params) => {
+                let ws = salience_counts
+                    .get(&hit.note_id)
+                    .map(|c| gradatum_search::salience_weighted_sum(c, &params.kind_weights))
+                    .unwrap_or(0.0);
+                (
+                    gradatum_search::apply_salience(composite_base, ws, params),
+                    ws,
+                )
+            }
+            None => (composite_base, 0.0),
+        };
+
+        if req.include_scores {
+            let (trust_raw, trust_decayed) = match trust_params {
+                Some((t, age_days, half_life)) => (
+                    Some(t as f32),
+                    Some(trust_decay_factor(t, age_days, half_life)),
+                ),
+                None => (None, None),
+            };
+            score_breakdowns.insert(
+                hit.note_id.clone(),
+                ScoreBreakdown {
+                    rrf_score: hit.rrf_score,
+                    recency_factor: recency,
+                    pagerank_factor: pagerank,
+                    in_degree,
+                    trust_raw,
+                    trust_decayed,
+                    composite,
+                    bm25_rank: hit.bm25_rank,
+                    sem_rank: hit.sem_rank,
+                    salience_weighted_sum: eff_sal.map(|_| salience_ws),
+                    salience_factor: eff_sal
+                        .map(|p| gradatum_search::salience_factor(salience_ws, p.k_norm)),
+                },
+            );
+        }
+        composite_hits.push((hit, composite));
+    }
+
+    composite_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    composite_hits.truncate(limit);
+
+    // Enrichissement semantic-only (titre/status) — batch PAR vault.
+    let sem_only: Vec<&str> = composite_hits
+        .iter()
+        .filter(|(h, _)| h.is_semantic_only)
+        .map(|(h, _)| h.note_id.as_str())
+        .collect();
+    let mut title_section_map: HashMap<String, (Option<String>, String)> = HashMap::new();
+    let mut status_map: HashMap<String, String> = HashMap::new();
+    if !sem_only.is_empty() {
+        for vault in &vaults {
+            let ids: Vec<String> = sem_only
+                .iter()
+                .filter_map(|k| decompose_multivault_key(k))
+                .filter(|(v, _)| *v == vault.as_str())
+                .map(|(_, n)| n.to_owned())
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            if let Ok(m) = state.search.get_titles_sections(vault, &ids).await {
+                for (n, ts) in m {
+                    title_section_map.insert(compose_multivault_key(vault.as_str(), &n), ts);
+                }
+            }
+            if let Ok(m) = state.search.get_statuses(vault, &ids).await {
+                for (n, st) in m {
+                    status_map.insert(compose_multivault_key(vault.as_str(), &n), st);
+                }
+            }
+        }
+    }
+
+    let identity_privileged = is_identity_privileged(trust);
+    let items: Vec<SearchHit> = composite_hits
+        .into_iter()
+        .filter_map(|(mut hit, composite)| {
+            let (vault_str, note_str) = decompose_multivault_key(&hit.note_id)?;
+            let (vault_str, note_str) = (vault_str.to_owned(), note_str.to_owned());
+            if (hit.title.is_none() || hit.section.is_empty())
+                && let Some((t, s)) = title_section_map.get(&hit.note_id)
+            {
+                if hit.title.is_none() {
+                    hit.title = t.clone().filter(|s| !s.trim().is_empty());
+                }
+                if hit.section.is_empty() {
+                    hit.section = s.clone();
+                }
+            }
+            // Guard identity FAIL-CLOSED (parité mono) — AVANT le fallback section→"main".
+            if identity_section_hidden(identity_privileged, &hit.section) {
+                return None;
+            }
+            if hit.status.is_empty()
+                && let Some(st) = status_map.get(&hit.note_id)
+            {
+                hit.status = st.clone();
+            }
+            let section = if hit.section.is_empty() {
+                "main".to_string()
+            } else {
+                hit.section
+            };
+            let scores = score_breakdowns.remove(&hit.note_id);
+            #[allow(deprecated)]
+            Some(SearchHit {
+                // Provenance : le vault source RÉEL du hit (décomposé de la clé composite).
+                vault_id: VaultId::new(vault_str),
+                path: format!("{section}/{note_str}"),
+                score: composite as f32,
+                title: hit.title,
+                snippet: hit.snippet,
+                trust: 0.5,
+                status: hit.status,
+                scores,
+                anchor_ms: hit.anchor_ms,
+            })
+        })
+        .collect();
+
+    // corpus_match_count (Q1 reco (a) : SOMME sur les vaults lus ; `capped` = OR).
+    let (corpus_match_count, corpus_count_capped) = if req.include_corpus_count {
+        let mut total: u64 = 0;
+        let mut capped = false;
+        for vault in &vaults {
+            match state
+                .search
+                .count_fts_matches(
+                    vault,
+                    &fts_query,
+                    req.include_downgraded,
+                    req.section.as_deref(),
+                    req.locus.as_deref(),
+                    status_filter.as_deref(),
+                )
+                .await
+            {
+                Ok((c, cap)) => {
+                    total = total.saturating_add(c);
+                    capped |= cap;
+                }
+                Err(e) => tracing::warn!(err = %e, vault = %vault.as_str(),
+                    "vault_search_multivault: count_fts_matches failed for a vault"),
+            }
+        }
+        (Some(total), capped)
+    } else {
+        (None, false)
+    };
+
+    // Télémétrie salience per-note — keyée par le vault SOURCE de chaque hit.
+    {
+        let now_ms = Utc::now().timestamp_millis();
+        for (rank, item) in items.iter().enumerate() {
+            if let Some(note_id) = item.path.rsplit('/').next() {
+                state.note_usage_accumulators.record(
+                    item.vault_id.as_str(),
+                    note_id,
+                    KIND_SEARCH_HIT,
+                    now_ms,
+                );
+                if rank < 3 {
+                    state.note_usage_accumulators.record(
+                        item.vault_id.as_str(),
                         note_id,
                         KIND_SEARCH_HIT_TOP3,
                         now_ms,
@@ -2836,6 +3415,30 @@ pub async fn vault_write_impl(
         req.title = gradatum_core::project_map::derive_canonical_title(&req.body, &req.title);
     }
 
+    // ── Section Messaging réservée (F-144) ────────────────────────────────────
+    // La section Messaging (boîtes aux lettres inter-agents) est écrite EXCLUSIVEMENT
+    // via `message_send` : ce chemin construit le canal C4 `locus = messaging/<recipient>`
+    // et évalue la write-policy sur CE locus (jamais sur la racine du vault). Le chemin
+    // générique `vault_write`, lui, n'évalue que `{tenant}/main` — lui laisser poser
+    // `section_hint="messaging"` ouvrirait une écriture dans Messaging sans passer la
+    // politique d'émission C4 (même logique de section réservée qu'`identity` et
+    // `project-map` ci-dessus/ci-dessous). Rejet 400 + audit, jamais auto-routé.
+    if req.section_hint.as_deref() == Some("messaging") {
+        emit_write_rejection_audit(
+            state,
+            trust,
+            &tenant,
+            &locus,
+            request_id,
+            "rejected_400_messaging_reserved_section",
+            None,
+        )
+        .await;
+        return Err(GradatumError::InvalidInput(
+            "messaging: reserved section, write only via message_send".into(),
+        ));
+    }
+
     // ── Validation section `identity` (F-34 v0.7.3, A1/C2/C6) ──────────────────
     // Forçage de schéma : sur section_hint="identity" UNIQUEMENT, le body doit
     // respecter le format soul INVARIANTS/GATES/NARRATIVE avec INV-CANARY (C4).
@@ -2889,34 +3492,99 @@ pub async fn vault_write_impl(
         // `trust.subject()` renvoie `sub` du JWT — jamais dérivé d'un paramètre client.
         let caller_sub = trust.subject().map(AgentId::as_str).unwrap_or("");
         let is_privileged = trust.has_scope(IDENTITY_WRITE_SCOPE);
-        if !is_privileged && target_agent != caller_sub {
-            emit_write_rejection_audit(
-                state,
-                trust,
-                &tenant,
-                &locus,
-                request_id,
-                "identity_write_denied_foreign_agent",
-                Some(target_agent.to_string()),
-            )
-            .await;
-            return Err(GradatumError::Forbidden(
-                "identity: an agent may only write its own soul".into(),
-            ));
-        }
-        // (b) Schema soul après ACL (body traité uniquement si droits OK).
-        if let Err(e) = gradatum_core::soul::validate_soul(&req.body) {
-            emit_write_rejection_audit(
-                state,
-                trust,
-                &tenant,
-                &locus,
-                request_id,
-                "rejected_400_identity_schema",
-                None,
-            )
-            .await;
-            return Err(GradatumError::InvalidInput(format!("identity schema: {e}")));
+
+        // ── F-125 — dispatch du validateur par CHEMIN (jamais par un champ du corps) ──
+        // `identity/person/<id>` → carte de personne (`validate_person_card`) ;
+        // `identity/<sub>`        → âme d'agent (`validate_soul`, comportement F-50 INCHANGÉ).
+        // Le choix se fait sur le préfixe du titre résolu server-side, jamais sur un champ
+        // `category:`/`kind:` auto-déclaré du corps (sinon un agent self-write échapperait à
+        // `validate_soul`).
+        if let Some(person_id) =
+            target_agent.strip_prefix(gradatum_core::person::PERSON_NAMESPACE_PREFIX)
+        {
+            // (a) Titre : l'identifiant après `person/` doit être non vide.
+            if person_id.is_empty() {
+                emit_write_rejection_audit(
+                    state,
+                    trust,
+                    &tenant,
+                    &locus,
+                    request_id,
+                    "rejected_400_person_bad_title",
+                    None,
+                )
+                .await;
+                return Err(GradatumError::InvalidInput(
+                    "person: title must be identity/person/<id> (non-empty id)".into(),
+                ));
+            }
+            // (b) ACL (inv 2/3, trou C1) : une carte person s'écrit EXCLUSIVEMENT via le
+            //     scope `identity_write`. La branche `target == caller_sub` est neutralisée
+            //     ici — `person/` étant un namespace réservé non-attribuable comme `sub`
+            //     (garde à la création de clé), `caller_sub` ne peut de toute façon jamais
+            //     l'égaler ; cette garde explicite le rend inconditionnel.
+            if !is_privileged {
+                emit_write_rejection_audit(
+                    state,
+                    trust,
+                    &tenant,
+                    &locus,
+                    request_id,
+                    "person_write_denied_not_privileged",
+                    Some(target_agent.to_string()),
+                )
+                .await;
+                return Err(GradatumError::Forbidden(
+                    "person: identity/person/* is writable only via the identity_write scope"
+                        .into(),
+                ));
+            }
+            // (c) Schéma person STRICT (liste blanche, taille, H2 réservées, Art.9, gate
+            //     catégorie) après ACL. Rejet de tout mismatch chemin↔format.
+            if let Err(e) = gradatum_core::person::validate_person_card(&req.body) {
+                emit_write_rejection_audit(
+                    state,
+                    trust,
+                    &tenant,
+                    &locus,
+                    request_id,
+                    "rejected_400_person_schema",
+                    None,
+                )
+                .await;
+                return Err(GradatumError::InvalidInput(format!("person schema: {e}")));
+            }
+        } else {
+            // ── Âme d'agent — garde ACL F-50 + schéma soul INCHANGÉS (inv 1) ──
+            if !is_privileged && target_agent != caller_sub {
+                emit_write_rejection_audit(
+                    state,
+                    trust,
+                    &tenant,
+                    &locus,
+                    request_id,
+                    "identity_write_denied_foreign_agent",
+                    Some(target_agent.to_string()),
+                )
+                .await;
+                return Err(GradatumError::Forbidden(
+                    "identity: an agent may only write its own soul".into(),
+                ));
+            }
+            // (b) Schema soul après ACL (body traité uniquement si droits OK).
+            if let Err(e) = gradatum_core::soul::validate_soul(&req.body) {
+                emit_write_rejection_audit(
+                    state,
+                    trust,
+                    &tenant,
+                    &locus,
+                    request_id,
+                    "rejected_400_identity_schema",
+                    None,
+                )
+                .await;
+                return Err(GradatumError::InvalidInput(format!("identity schema: {e}")));
+            }
         }
     }
 
@@ -4116,6 +4784,199 @@ pub async fn create_feature_card_impl(
     })
 }
 
+/// Logique métier de `POST /api/v1/vault_mutate_role` — mutation ciblée d'un rôle typé sur des
+/// cartes project-map (F-153).
+///
+/// Le corps courant de chaque carte est lu CÔTÉ SERVEUR, le rôle typé visé est muté **en place**
+/// (tout le reste octet-identique), le titre est re-dérivé (F-247) et le schéma re-validé (F-213)
+/// par la réutilisation intégrale de [`vault_write_impl`] — qui porte aussi l'ACL, l'immuabilité
+/// de l'identité feature, le verrou optimiste et l'enqueue. F-153 n'ajoute donc AUCUN chemin
+/// d'écriture : il déplace la construction du corps du client vers le serveur.
+///
+/// ## Verdict par carte, jamais agrégé
+///
+/// L'ACL (`Write` sur `{tenant}/main`) et la résolution du tenant sont au niveau REQUÊTE : un
+/// appelant non privilégié est refusé en bloc (403). Passé ce point, **chaque carte rend son
+/// propre verdict** (`MutateRoleCardVerdict`) et un échec (rôle absent, conflit de hash, valeur
+/// invalide, schéma post-mutation invalide, note absente) n'interrompt jamais le lot.
+///
+/// # Errors
+///
+/// - `GradatumError::Unauthorized` si non authentifié (niveau requête).
+/// - `GradatumError::Forbidden` si l'ACL Write est refusée (niveau requête).
+/// - `GradatumError::InvalidInput` si le lot est vide.
+pub async fn mutate_role_impl(
+    state: &AppState,
+    trust: &TrustContext,
+    req: crate::api_v1::dto::MutateRoleRequest,
+    request_id: &str,
+) -> Result<crate::api_v1::dto::MutateRoleResponse, GradatumError> {
+    use crate::api_v1::dto::MutateRoleResponse;
+
+    if !trust.is_authenticated() {
+        return Err(GradatumError::Unauthorized);
+    }
+    if req.mutations.is_empty() {
+        return Err(GradatumError::InvalidInput(
+            "vault_mutate_role: the mutations list must not be empty".into(),
+        ));
+    }
+
+    // ── ACL niveau requête (miroir vault_write_impl / create_feature_card_impl) ──
+    // La mutation project-map est réservée au writer privilégié : même ACL Write sur
+    // `{tenant}/main` que toute écriture project-map — jamais affaiblie. Un tenant partagé
+    // par tout le lot.
+    let tenant =
+        crate::api_v1::tenant_guard::effective_write_vault(state, trust, req.tenant_id.as_ref())
+            .await
+            .map_err(|r| r.into_forbidden("tenant cross mismatch"))?;
+    let locus = format!("{tenant}/main");
+    if state.acl.evaluate(trust, AclOp::Write, &locus) != AclDecision::Allow {
+        log_acl_deny(trust, AclOp::Write, &locus, "vault_mutate_role");
+        return Err(GradatumError::Forbidden("acl deny write".into()));
+    }
+
+    let mut results = Vec::with_capacity(req.mutations.len());
+    for item in req.mutations {
+        results.push(mutate_one_role(state, trust, &tenant, &item, request_id).await);
+        // Verdict par carte : `mutate_one_role` ne renvoie JAMAIS d'erreur transport — tout
+        // échec est un `MutateRoleCardVerdict`, le lot continue.
+    }
+    Ok(MutateRoleResponse { results })
+}
+
+/// Résout, mute et enqueue une seule carte, renvoyant TOUJOURS un verdict (jamais une erreur
+/// transport) — c'est l'unité atomique du lot F-153.
+async fn mutate_one_role(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant: &str,
+    item: &crate::api_v1::dto::MutateRoleItem,
+    request_id: &str,
+) -> crate::api_v1::dto::MutateRoleCardVerdict {
+    use crate::api_v1::dto::MutateRoleCardVerdict;
+    use gradatum_core::project_map::{
+        MutableRole, append_history_line, mutate_typed_role, validate_history_line,
+    };
+
+    let id = &item.note_id;
+
+    // (1) Rôle typé (allow-list + refus identité/inconnu).
+    let role = match MutableRole::from_wire(&item.role_type) {
+        Ok(r) => r,
+        Err(e) => return MutateRoleCardVerdict::refused(id.clone(), e.to_string()),
+    };
+
+    // (2) Lecture du corps courant + hash (le client ne possède PAS le corps).
+    let reader = match read_back_reader(state, tenant) {
+        Ok(r) => r,
+        Err(e) => {
+            return MutateRoleCardVerdict::refused(id.clone(), format!("vault access error: {e}"));
+        }
+    };
+    let note = match reader.read_note_by_id(id).await {
+        Ok(n) => n,
+        Err(GradatumError::NoteNotFound(_)) => {
+            return MutateRoleCardVerdict::not_found(
+                id.clone(),
+                "card not found (no live note for this ULID)".into(),
+            );
+        }
+        Err(e) => return MutateRoleCardVerdict::refused(id.clone(), format!("read error: {e}")),
+    };
+    let body = note.body.markdown;
+    let current_sha: String = note
+        .content_hash
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    // (3) Verrou optimiste synchrone : hash périmé → conflit POUR CETTE CARTE (lot poursuivi).
+    if item.expected_sha256 != current_sha {
+        return MutateRoleCardVerdict::conflict(
+            id.clone(),
+            Some(current_sha),
+            "expected_sha256 is stale — the card changed since it was read".into(),
+        );
+    }
+
+    // (4) Mutation en place du rôle + ajout historique. Byte-identique ailleurs.
+    // Garde amont F-153 : une history_line ne peut jamais smuggler un rôle structurel `[[…]]`
+    // (append_history_line est une insertion brute). Refus AVANT tout splice → carte intacte,
+    // en verdict PAR CARTE (jamais un 400 de lot — le contrat per-card tient).
+    if let Some(l) = item.history_line.as_deref()
+        && !l.trim().is_empty()
+        && let Err(e) = validate_history_line(l)
+    {
+        return MutateRoleCardVerdict::refused(id.clone(), e.to_string());
+    }
+    let mutated = match mutate_typed_role(&body, role, &item.new_value) {
+        Ok(b) => b,
+        Err(e) => return MutateRoleCardVerdict::refused(id.clone(), e.to_string()),
+    };
+    let mutated = match item.history_line.as_deref() {
+        Some(l) if !l.trim().is_empty() => append_history_line(&mutated, l),
+        _ => mutated,
+    };
+
+    // (5) Titre courant préservé (le sujet humain) — vault_write_impl re-dérive le suffixe.
+    let title = current_card_title(state, tenant, &item.note_id, &body).await;
+
+    // (6) Délégation au chemin d'écriture project-map : re-dérive le titre (F-247), re-valide
+    //     le schéma (F-213, post-condition validate_links), vérifie l'immuabilité feature,
+    //     honore le verrou optimiste (write_if_match worker) et enqueue. Tags préservés.
+    let mut write_req = crate::api_v1::dto::VaultWriteRequest::new(title, mutated);
+    write_req.section_hint = Some("project-map".to_string());
+    write_req.tenant_id = Some(gradatum_core::scope::TenantId::new(tenant.to_string()));
+    write_req.note_id = Some(item.note_id.clone());
+    write_req.expected_sha256 = Some(item.expected_sha256.clone());
+    write_req.tags = note
+        .frontmatter
+        .tags
+        .iter()
+        .map(|t| t.as_str().to_string())
+        .collect();
+
+    match vault_write_impl(
+        state,
+        trust,
+        write_req,
+        request_id,
+        FeatureWriteAuthority::External,
+    )
+    .await
+    {
+        Ok(enq) => MutateRoleCardVerdict::queued(id.clone(), enq.job_id, enq.poll_url),
+        Err(GradatumError::Conflict(msg)) => MutateRoleCardVerdict::conflict(id.clone(), None, msg),
+        Err(GradatumError::NoteNotFound(_)) => MutateRoleCardVerdict::not_found(
+            id.clone(),
+            "card vanished between read and write".into(),
+        ),
+        // InvalidInput (schéma post-mutation), Forbidden, Storage, … → refus par carte.
+        Err(e) => MutateRoleCardVerdict::refused(id.clone(), e.to_string()),
+    }
+}
+
+/// Titre courant d'une carte : titre indexé (`get_titles_sections`) avec repli sur le H1 du
+/// corps. Best-effort — un titre vide/absent laisse `vault_write_impl` dériver depuis le corps.
+async fn current_card_title(state: &AppState, tenant: &str, note_id: &str, body: &str) -> String {
+    let ids = [note_id.to_string()];
+    let indexed = state
+        .search
+        .get_titles_sections(
+            &crate::api_v1::tenant_guard::own_vault_checked(tenant),
+            &ids,
+        )
+        .await
+        .ok()
+        .and_then(|map| map.get(note_id).and_then(|(t, _)| t.clone()))
+        .filter(|s| !s.trim().is_empty());
+    indexed
+        .or_else(|| extract_h1_title(body))
+        .unwrap_or_default()
+}
+
 /// Logique métier de `POST /api/v1/notes/{id}/move`.
 ///
 /// ACL Write sur `{tenant}/main` + relocalisation physique du `.md` via `vault.move_locus`.
@@ -4195,8 +5056,105 @@ mod tests {
 
     use super::{
         GradatumError, KNOWN_DOC_KINDS, LESSONS_SECTION, LESSONS_TENANT, MAX_REF_ECHO_CHARS,
-        echo_ref, effective_author, locus_for_section, locus_for_tenant,
+        compose_multivault_key, decompose_multivault_key, echo_ref, effective_author,
+        fuse_multivault, locus_for_section, locus_for_tenant,
     };
+    use gradatum_core::scope::VaultId;
+
+    // ── F-63 fusion multi-vault ──────────────────────────────────────────────────
+
+    /// **Collision ULID** : deux vaults distincts, MÊME note_id, scores différents →
+    /// les DEUX hits présents, provenance correcte, aucun écrasement (discriminant du
+    /// bug de clé nue — sans clé composite, un seul survivrait dans le HashMap).
+    #[test]
+    fn fuse_multivault_ulid_collision_keeps_both_with_provenance() {
+        let ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned();
+        let bm25 = vec![
+            (VaultId::new("a"), vec![(ulid.clone(), -1.0_f64)]),
+            (VaultId::new("b"), vec![(ulid.clone(), -5.0_f64)]),
+        ];
+        let semantic: Vec<(VaultId, Vec<(String, f32)>)> = vec![];
+        // hybrid=false → rrf_fuse pur (BM25-only rang).
+        let fused = fuse_multivault(&bm25, &semantic, false, 60.0, 20);
+        assert_eq!(fused.len(), 2, "les deux notes homonymes survivent");
+        let mut provenance: Vec<(&str, &str)> = fused
+            .iter()
+            .map(|h| decompose_multivault_key(&h.note_id).expect("clé composite"))
+            .collect();
+        provenance.sort();
+        assert_eq!(
+            provenance,
+            vec![("a", ulid.as_str()), ("b", ulid.as_str())],
+            "provenance des deux vaults préservée, aucun écrasement"
+        );
+    }
+
+    /// Re-scoring GLOBAL : un hit fort de A est rangé au-dessus d'un hit faible de B
+    /// (ordre par score composite global, pas par vault).
+    #[test]
+    fn fuse_multivault_global_rescoring_orders_across_vaults() {
+        // BM25 : plus négatif = meilleur (cf. rrf.rs). A(-9.0) fort, B(-0.5) faible ;
+        // le rang GLOBAL (A meilleur) doit primer, pas l'ordre des vaults.
+        let bm25 = vec![
+            (
+                VaultId::new("a"),
+                vec![("01AAAAAAAAAAAAAAAAAAAAAAAA".to_owned(), -9.0_f64)],
+            ),
+            (
+                VaultId::new("b"),
+                vec![("01BBBBBBBBBBBBBBBBBBBBBBBB".to_owned(), -0.5_f64)],
+            ),
+        ];
+        let semantic: Vec<(VaultId, Vec<(String, f32)>)> = vec![];
+        let fused = fuse_multivault(&bm25, &semantic, false, 60.0, 20);
+        let (v0, _) = decompose_multivault_key(&fused[0].note_id).expect("clé");
+        assert_eq!(v0, "a", "hit fort de A avant hit faible de B (rang global)");
+        assert!(
+            fused[0].rrf_score >= fused[1].rrf_score,
+            "tri DESC par score composite global"
+        );
+    }
+
+    /// Délimiteur : `\u{1}` absent des ULID et des vault_id valides → décomposition non
+    /// ambiguë, y compris pour un vault_id contenant un tiret (`a-b`).
+    #[test]
+    fn multivault_key_roundtrip_unambiguous() {
+        let key = compose_multivault_key("a-b", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(
+            decompose_multivault_key(&key),
+            Some(("a-b", "01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+            "round-trip vault-avec-tiret + ULID"
+        );
+        assert_eq!(
+            decompose_multivault_key("no-separator-here"),
+            None,
+            "clé sans séparateur → None (repli côté caller)"
+        );
+    }
+
+    /// Un vault sans hit sémantique sous l'embedder actif → fusion BM25-only, zéro NaN
+    /// ni panic (#2 : dégradation BM25-only silencieuse).
+    #[test]
+    fn fuse_multivault_bm25_only_arm_no_nan() {
+        let bm25 = vec![
+            (
+                VaultId::new("a"),
+                vec![("01AAAAAAAAAAAAAAAAAAAAAAAA".to_owned(), -1.0_f64)],
+            ),
+            (
+                VaultId::new("b"),
+                vec![("01BBBBBBBBBBBBBBBBBBBBBBBB".to_owned(), -2.0_f64)],
+            ),
+        ];
+        let semantic: Vec<(VaultId, Vec<(String, f32)>)> = vec![];
+        // hybrid=true (embedder actif) mais bras sémantique vide → court-circuit BM25-only.
+        let fused = fuse_multivault(&bm25, &semantic, true, 60.0, 20);
+        assert_eq!(fused.len(), 2);
+        assert!(
+            fused.iter().all(|h| h.rrf_score.is_finite()),
+            "aucun score NaN/inf en fusion BM25-only"
+        );
+    }
 
     // ── Tests helpers ──────────────────────────────────────────────────────────
 

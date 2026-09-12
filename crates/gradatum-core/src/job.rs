@@ -56,6 +56,7 @@ pub type VaultScope = JobScope;
 /// of jobs already persisted in `gradatum_jobs`. Reordering variants is harmless.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
+#[non_exhaustive]
 pub enum Job {
     // System jobs (0-12) — automatic
     /// ReAct agent loop.
@@ -124,6 +125,38 @@ pub enum Job {
     // Embed variant (variant name is the wire discriminant; order is cosmetic)
     /// Vector embedding generation.
     Embed(EmbedSpec),
+
+    // F-144 — inter-agent message delivery (state-carrying row, never executed)
+    /// Inter-agent message delivery.
+    ///
+    /// **State-carrying row, never dequeued nor executed by a worker.** The variant
+    /// exists so the delivery lifecycle (Pending → `Done` via `QueueStore::complete`
+    /// on `message_ack`) is typed, durable, and observable through the shared queue —
+    /// but no apalis backend is registered for it, and `dequeue_by_kind` refuses its
+    /// kind, so it produces zero poll/churn. Terminal `Done` is reached **only** via
+    /// [`QueueStore::complete`], never by a handler.
+    Message(MessageDeliverySpec),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MessageDeliverySpec — Job::Message (F-144)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Specification of an inter-agent message delivery (`Job::Message`).
+///
+/// A **pointer**, never the body: the message content lives in a `Messaging` note
+/// (the mailbox), the job row only carries enough to (a) tie the delivery to its
+/// note and (b) scope it to the recipient channel. The row transitions
+/// `Pending` → `Done` via [`QueueStore::complete`] when the recipient
+/// acknowledges (`message_ack`) — no worker handler ever executes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageDeliverySpec {
+    /// Identifier of the message note (server-allocated ULID — also the mailbox
+    /// note id). The value `message_ack` uses to address the delivery.
+    pub message_id: Ulid,
+    /// Recipient credited identity (`identity/<kind>/<id>`) whose channel
+    /// (`messaging/<recipient>`, C4) this delivery targets.
+    pub recipient: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -812,8 +845,18 @@ pub fn job_kind_str(job: &Job) -> &'static str {
         Job::Notify(_) => "Notify",
         Job::Ingest(_) => "Ingest",
         Job::Embed(_) => "Embed",
+        // F-144 : "Message" — garde anti-dequeue partagée (voir JOB_KIND_MESSAGE).
+        Job::Message(_) => JOB_KIND_MESSAGE,
     }
 }
+
+/// Denormalised `kind` value of a [`Job::Message`] delivery row.
+///
+/// Single source of truth for the string used both as the `kind` column value at
+/// enqueue time and as the anti-dequeue guard in the queue store (a delivery row is
+/// state-carrying: no apalis backend may ever lease it). [`job_kind_str`] returns
+/// this constant for the `Message` variant, so the two cannot drift.
+pub const JOB_KIND_MESSAGE: &str = "Message";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // JobSpec — ce que fait le job
@@ -900,7 +943,9 @@ pub fn spec_tenant(spec: &JobSpec) -> &str {
         | Job::Classify
         | Job::Merge
         | Job::Annotate
-        | Job::Notify(_) => job_vault,
+        | Job::Notify(_)
+        // F-144 : la livraison porte le vault du job (mono-vault homelab = "main").
+        | Job::Message(_) => job_vault,
     }
 }
 
@@ -1719,6 +1764,38 @@ pub trait QueueStore: Send + Sync {
     /// Marks a job as `Done` with its result.
     async fn complete(&self, id: Ulid, result: JobResult) -> Result<(), QueueError>;
 
+    /// Completes a **state-carrying message delivery** (`Job::Message`).
+    ///
+    /// Unlike [`QueueStore::complete`] — which requires a `Running` lease held by a
+    /// worker — a delivery row is **never dequeued nor leased** (see the anti-dequeue
+    /// guard in `dequeue_by_kind`): it sits `Pending` until the recipient
+    /// acknowledges. This method transitions that row straight to the terminal
+    /// `Done` state, with the **acknowledgement as authority** — never a worker
+    /// handler.
+    ///
+    /// `result.success` is expected `true` (an ack is a successful delivery).
+    ///
+    /// # Default implementation
+    ///
+    /// Fails loudly (no silent no-op): only backends that actually store message
+    /// deliveries (currently `SqliteQueueStore`) override it.
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError::NotFound`] if no `Pending` `Job::Message` row matches `id`
+    /// (unknown message id, or delivery already terminal → the wire answers a mute
+    /// 404).
+    async fn complete_message_delivery(
+        &self,
+        _id: Ulid,
+        _result: JobResult,
+    ) -> Result<(), QueueError> {
+        Err(QueueError::Storage(
+            "complete_message_delivery: backend unsupported (only SqliteQueueStore stores Job::Message deliveries)"
+                .into(),
+        ))
+    }
+
     /// Marks a job as `Failed` (retry possible per policy).
     async fn fail(&self, id: Ulid, err: &str, attempt: u32) -> Result<(), QueueError>;
 
@@ -1780,6 +1857,50 @@ pub trait QueueStore: Send + Sync {
     ) -> Result<std::collections::HashMap<JobStatus, u64>, QueueError> {
         let _ = tenant_filter;
         Ok(std::collections::HashMap::new())
+    }
+
+    /// Counts **dead-letter** jobs grouped by `kind` (`WHERE status = 'DLQ' GROUP BY kind`).
+    ///
+    /// Turns the opaque `dlq_depth` counter into a per-kind breakdown, so a capability
+    /// that fails 100 % of the time (e.g. every `embed` job dying) is visible as a single
+    /// dominant kind rather than an anonymous rising total.
+    /// Kinds with zero DLQ jobs are absent from the map (callers treat absence as `0`);
+    /// `BTreeMap` gives a deterministic serialization order (ADN 2).
+    ///
+    /// # Default implementation
+    ///
+    /// Returns an empty map. Database-backed stores (e.g. `SqliteQueueStore`) override
+    /// with a native `GROUP BY kind` (single query, no N+1). Mocks and in-memory stores
+    /// inherit the empty default.
+    async fn dlq_counts_by_kind(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, u64>, QueueError> {
+        Ok(std::collections::BTreeMap::new())
+    }
+
+    /// Reports whether the worker's leader-election lease is currently **fresh**.
+    ///
+    /// The `worker` process renews a single-slot lease (`worker_leadership`, in the same
+    /// queue database) on a heartbeat; a live worker keeps `expires_at` in the future.
+    /// The server has no network channel to the worker, so lease freshness read from the
+    /// shared queue is the sound liveness signal (the `worker` capability).
+    ///
+    /// Returns:
+    /// - `Ok(Some(true))` — a lease row exists and `expires_at > now_ms` (worker alive).
+    /// - `Ok(Some(false))` — no lease row, or the lease has expired (worker down).
+    /// - `Ok(None)` — this store cannot observe leadership (no queue DB wired, mocks):
+    ///   the caller maps this to "not configured / unobservable", never to "down".
+    ///
+    /// `now_ms` is injected (Unix milliseconds) rather than read internally, so the
+    /// freshness verdict is deterministic under test.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` — leadership is unobservable. Database-backed stores override
+    /// with a native `SELECT expires_at FROM worker_leadership WHERE slot = 0`.
+    async fn worker_lease_fresh(&self, now_ms: i64) -> Result<Option<bool>, QueueError> {
+        let _ = now_ms;
+        Ok(None)
     }
 
     /// Permanently deletes jobs in the Dead Letter Queue.
@@ -2056,6 +2177,62 @@ mod tests {
             JobPriority::default_for(&JobClass::System),
             JobPriority::Low
         );
+    }
+
+    // ── F-144 — Job::Message (livraison, ligne état-porteuse) ─────────────────
+
+    /// Le discriminant JSON d'une livraison est stable (`"Message"`), la spec est un
+    /// pointeur (message_id + recipient, jamais le corps), et `job_kind_str` renvoie
+    /// exactement la constante anti-dequeue [`JOB_KIND_MESSAGE`].
+    #[test]
+    fn message_delivery_serializes_with_stable_discriminant() {
+        let spec = MessageDeliverySpec {
+            message_id: Ulid::generate(),
+            recipient: "identity/agent/recipient".to_string(),
+        };
+        let job = Job::Message(spec.clone());
+
+        let json = serde_json::to_string(&job).expect("Job::Message doit se sérialiser");
+        assert!(
+            json.contains("\"type\":\"Message\""),
+            "discriminant JSON doit être \"Message\" : {json}"
+        );
+        // Pointeur : le corps du message n'apparaît JAMAIS dans la spec.
+        assert!(
+            !json.contains("body"),
+            "spec de livraison sans corps : {json}"
+        );
+
+        let back: Job = serde_json::from_str(&json).expect("deserialisation");
+        match back {
+            Job::Message(MessageDeliverySpec {
+                message_id,
+                recipient,
+            }) => {
+                assert_eq!(message_id, spec.message_id);
+                assert_eq!(recipient, spec.recipient);
+            }
+            other => panic!("round-trip attendu Job::Message, obtenu {other:?}"),
+        }
+
+        // Cohérence kind ↔ constante anti-dequeue (les deux ne peuvent pas dériver).
+        assert_eq!(job_kind_str(&job), JOB_KIND_MESSAGE);
+        assert_eq!(JOB_KIND_MESSAGE, "Message");
+    }
+
+    /// `spec_tenant` replie une livraison sur le vault du job (mono-vault = "main") —
+    /// la spec ne porte pas de tenant propre (pointeur minimal).
+    #[test]
+    fn message_delivery_spec_tenant_falls_back_to_job_vault() {
+        let record = make_job_record(
+            Job::Message(MessageDeliverySpec {
+                message_id: Ulid::generate(),
+                recipient: "identity/agent/recipient".to_string(),
+            }),
+            JobClass::System,
+        );
+        // Scope VaultWide → pas de vault porté → repli mono-vault "main".
+        assert_eq!(spec_tenant(&record.spec), "main");
     }
 
     // ── E2: JobStatus::is_terminal() — exhaustive coverage all variants ──────

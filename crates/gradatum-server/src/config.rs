@@ -50,6 +50,15 @@ pub struct ServerConfig {
     /// Studio web UI — `ServeDir` for `/ui/*`.
     #[serde(default)]
     pub studio: StudioConfig,
+    /// Background `/health` probe cadence and per-capability timeout (F-154 P2).
+    #[serde(default)]
+    pub health: HealthConfig,
+    /// Fleet service registry — heartbeat TTL (F-156 P6).
+    #[serde(default)]
+    pub registry: RegistryConfig,
+    /// Fleet heartbeat ingress (F-156 P6b) — deliberately non-loopback, opt-in surface.
+    #[serde(default)]
+    pub registry_ingress: RegistryIngressConfig,
     /// API interne server-to-worker (Wave 2, v0.5.3).
     ///
     /// Listener sur `127.0.0.1:19092` uniquement si `token` configuré.
@@ -185,6 +194,131 @@ impl Default for StudioConfig {
     fn default() -> Self {
         Self {
             ui_dir: Self::default_ui_dir(),
+        }
+    }
+}
+
+/// Background `/health` probe configuration (F-154 P2).
+///
+/// A detached Tokio task probes the service's dependencies (embed, curator, worker,
+/// studio) off the request path and publishes an immutable snapshot the `/health`
+/// handlers read with zero I/O. These two knobs are the only runtime parameters:
+/// how often the probe runs and how long a single capability probe may hang before it
+/// is declared unreachable. Both have production defaults (10 s / 800 ms) and are
+/// clamped to a sane floor at boot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    /// Interval between two probe passes, in seconds. Default: 10.
+    /// A value below `MIN_PROBE_INTERVAL_SECS` is raised to that floor at boot
+    /// (a too-tight cadence would hammer the dependencies for no benefit).
+    #[serde(default = "HealthConfig::default_probe_interval_secs")]
+    pub probe_interval_secs: u64,
+    /// Per-capability probe deadline, in milliseconds. Default: 800.
+    /// A capability that does not answer within this budget is reported
+    /// `unreachable` — it never delays the probe pass past this bound.
+    #[serde(default = "HealthConfig::default_probe_timeout_ms")]
+    pub probe_timeout_ms: u64,
+}
+
+impl HealthConfig {
+    /// Lower bound on the probe cadence (safety cap against a hot probe loop).
+    pub const MIN_PROBE_INTERVAL_SECS: u64 = 2;
+
+    /// Lower bound on the per-capability probe deadline.
+    ///
+    /// Symmetric to [`Self::MIN_PROBE_INTERVAL_SECS`]: a `probe_timeout_ms = 0` would make
+    /// every `tokio::time::timeout` fire immediately, reporting **every** capability
+    /// `unreachable` and driving the whole service `unhealthy` for a mere misconfiguration.
+    /// The floor guarantees each probe always gets a real, if small, budget.
+    pub const MIN_PROBE_TIMEOUT_MS: u64 = 50;
+
+    fn default_probe_interval_secs() -> u64 {
+        10
+    }
+    fn default_probe_timeout_ms() -> u64 {
+        800
+    }
+
+    /// Effective probe interval, clamped to [`Self::MIN_PROBE_INTERVAL_SECS`].
+    #[must_use]
+    pub fn effective_interval_secs(&self) -> u64 {
+        self.probe_interval_secs.max(Self::MIN_PROBE_INTERVAL_SECS)
+    }
+
+    /// Effective per-capability probe timeout, clamped to [`Self::MIN_PROBE_TIMEOUT_MS`].
+    ///
+    /// A `0` (or otherwise too-small) configured value is raised to the floor so a single
+    /// hung dependency is bounded without collapsing the whole verdict to `unhealthy`.
+    #[must_use]
+    pub fn effective_probe_timeout_ms(&self) -> u64 {
+        self.probe_timeout_ms.max(Self::MIN_PROBE_TIMEOUT_MS)
+    }
+}
+
+/// Fleet service registry configuration (F-156 P6).
+///
+/// The registry holds the heartbeats of the fleet members in memory; this single knob sets
+/// how long a member stays "living" after its last heartbeat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryConfig {
+    /// Heartbeat TTL in seconds. Default: 45. A value below
+    /// [`RegistryConfig::MIN_TTL_SECS`] is raised to that floor at boot (a near-zero TTL
+    /// would expire every member instantly, rendering the registry blind).
+    #[serde(default = "RegistryConfig::default_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+impl RegistryConfig {
+    /// Lower bound on the heartbeat TTL (guards against a blind, always-empty registry).
+    pub const MIN_TTL_SECS: u64 = 5;
+
+    fn default_ttl_secs() -> u64 {
+        45
+    }
+
+    /// Effective TTL, clamped to [`Self::MIN_TTL_SECS`].
+    #[must_use]
+    pub fn effective_ttl_secs(&self) -> u64 {
+        self.ttl_secs.max(Self::MIN_TTL_SECS)
+    }
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: Self::default_ttl_secs(),
+        }
+    }
+}
+
+/// Fleet heartbeat ingress configuration (F-156 P6b).
+///
+/// This section opens the **one deliberately non-loopback surface** of the server: the
+/// endpoint the fleet POSTs its heartbeats to. Unlike the metrics/internal listeners
+/// (loopback-only, the bind *is* the access control), this ingress is protected by a
+/// dedicated bearer token (env `GRADATUM_HEARTBEAT_TOKEN`, never in config) plus an
+/// operator-provisioned nftables allowlist at deploy time.
+///
+/// The token is **not** a field here: a secret never lives in a config file (ADN 5,
+/// env-var precedence). `enabled = false` (default) ⇒ no listener, no error — the server
+/// boots exactly as before.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegistryIngressConfig {
+    /// Opt-in gate. Default `false`: no ingress listener is spawned, the boot is unaffected.
+    #[serde(default)]
+    pub enabled: bool,
+    /// LAN bind address (e.g. `"192.0.2.10:19095"`). **Required when `enabled`** — a boot
+    /// with `enabled = true` and no `bind` fails fast (a bound-capability that cannot bind
+    /// must be visible, never silent). Bind the specific LAN IP, never `0.0.0.0`.
+    #[serde(default)]
+    pub bind: Option<SocketAddr>,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            probe_interval_secs: Self::default_probe_interval_secs(),
+            probe_timeout_ms: Self::default_probe_timeout_ms(),
         }
     }
 }
@@ -1206,6 +1340,9 @@ impl Default for ServerConfig {
             scoring: ScoringConfig::default(),
             salience: SalienceConfig::default(),
             studio: StudioConfig::default(),
+            health: HealthConfig::default(),
+            registry: RegistryConfig::default(),
+            registry_ingress: RegistryIngressConfig::default(),
             internal_api: InternalApiConfig::default(),
             search: SearchConfig::default(),
             review_promote: ReviewPromoteConfig::default(),
@@ -1418,6 +1555,56 @@ mod scoring_defaults_tests {
         // F-261 : clé = doc_kind — Event = 90j (calibration reprise de distilled), Static absent.
         assert_eq!(from_config.get("Event").copied(), Some(90.0));
         assert!(!from_config.contains_key("Static"));
+    }
+}
+
+#[cfg(test)]
+mod health_registry_floor_tests {
+    use super::*;
+
+    /// Un `probe_timeout_ms = 0` doit être remonté au plancher,
+    /// jamais utilisé tel quel — sinon chaque probe timeout instantanément et tout devient
+    /// `unhealthy`. Symétrique au plancher de `probe_interval_secs`.
+    #[test]
+    fn effective_probe_timeout_ms_clamps_zero_to_floor() {
+        let cfg = HealthConfig {
+            probe_interval_secs: 10,
+            probe_timeout_ms: 0,
+        };
+        assert_eq!(
+            cfg.effective_probe_timeout_ms(),
+            HealthConfig::MIN_PROBE_TIMEOUT_MS,
+            "un timeout 0 doit être clampé au plancher"
+        );
+        // Le plancher doit laisser un vrai budget de probe (strictement positif).
+        assert_ne!(cfg.effective_probe_timeout_ms(), 0);
+    }
+
+    /// Une valeur au-dessus du plancher est respectée telle quelle (pas de sur-clamp).
+    #[test]
+    fn effective_probe_timeout_ms_preserves_value_above_floor() {
+        let cfg = HealthConfig {
+            probe_interval_secs: 10,
+            probe_timeout_ms: 800,
+        };
+        assert_eq!(cfg.effective_probe_timeout_ms(), 800);
+    }
+
+    /// Le défaut de production reste au-dessus du plancher (le clamp n'affecte pas le défaut).
+    #[test]
+    fn default_probe_timeout_is_above_floor() {
+        assert!(
+            HealthConfig::default().effective_probe_timeout_ms()
+                > HealthConfig::MIN_PROBE_TIMEOUT_MS
+        );
+    }
+
+    /// F-156 P6 : un TTL registre near-zero est remonté au plancher (registre non aveugle).
+    #[test]
+    fn registry_ttl_clamps_zero_to_floor() {
+        let cfg = RegistryConfig { ttl_secs: 0 };
+        assert_eq!(cfg.effective_ttl_secs(), RegistryConfig::MIN_TTL_SECS);
+        assert_eq!(RegistryConfig::default().ttl_secs, 45);
     }
 }
 

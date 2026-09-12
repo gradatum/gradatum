@@ -19,11 +19,26 @@
 //!
 //! `GET /metrics` → Prometheus text format (Content-Type: text/plain).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, IntCounter, Opts, Registry};
+use prometheus::{
+    CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, Opts, Registry,
+};
 use tracing::warn;
+
+/// Every job kind the Monitor consumes, in a fixed, code-defined set.
+///
+/// Used to bound the label cardinality of the per-kind failure read
+/// ([`WorkerMetrics::failure_counts_by_kind`]): the set is closed and never widened by
+/// operator input. Kept in sync with the workers registered in
+/// [`build_monitor`](crate::monitor::build_monitor).
+pub const JOB_KINDS: [&str; 7] = [
+    "curate", "embed", "reindex", "purge", "forget", "distill", "validate",
+];
 
 /// Prometheus registry shared across workers.
 ///
@@ -53,6 +68,18 @@ pub struct WorkerMetrics {
     /// consulted section yields exactly one series, so that a healthy configuration is
     /// distinguishable from a worker that never started.
     pub config_degraded: GaugeVec,
+    /// Unix-epoch timestamp (seconds) of the **last job actually consumed** — the
+    /// consumption signal.
+    ///
+    /// Distinct from the leader-election lease: the lease's `expires_at` only proves the
+    /// *renew* task is alive, so a frozen consumer with a live renew loop reads as
+    /// "reachable" though it processes nothing. This gauge advances **only** when a job
+    /// reaches a terminal outcome (via [`WorkerMetrics::inc_jobs_total`]), so a stalled
+    /// consumer is visible even while its lease keeps renewing.
+    pub last_consumed_ts: Gauge,
+    /// Unix-epoch milliseconds of the last consumed job, or `0` if none has been consumed
+    /// since boot. Read by the `/health` readiness probe with no Prometheus round-trip.
+    last_consumed_ms: Arc<AtomicI64>,
 }
 
 impl WorkerMetrics {
@@ -125,6 +152,13 @@ impl WorkerMetrics {
         )
         .expect("gradatum_config_degraded metric invalid — static bug");
 
+        let last_consumed_ts = Gauge::new(
+            "gradatum_worker_last_job_consumed_timestamp_seconds",
+            "Unix timestamp (seconds) of the last job consumed by the Monitor — real \
+             consumption signal, distinct from the leader lease renewal",
+        )
+        .expect("gradatum_worker_last_job_consumed_timestamp_seconds metric invalid — static bug");
+
         // Registration — errors logged without panicking
         for (name, result) in [
             (
@@ -151,6 +185,10 @@ impl WorkerMetrics {
                 "config_degraded",
                 registry.register(Box::new(config_degraded.clone())),
             ),
+            (
+                "last_consumed_ts",
+                registry.register(Box::new(last_consumed_ts.clone())),
+            ),
         ] {
             if let Err(e) = result {
                 warn!(metric = name, error = %e, "Prometheus metric registration failed");
@@ -165,12 +203,72 @@ impl WorkerMetrics {
             workers_active,
             distill_cron_enqueued,
             config_degraded,
+            last_consumed_ts,
+            last_consumed_ms: Arc::new(AtomicI64::new(0)),
         }
     }
 
-    /// Increments the `gradatum_jobs_total{kind, status}` counter.
+    /// Increments the `gradatum_jobs_total{kind, status}` counter **and** advances the
+    /// consumption signal.
+    ///
+    /// Every terminal job outcome (`done` or `error`) flows through here, so this is the
+    /// single choke point where "a job was actually consumed" is observable — it updates
+    /// [`last_consumed_ms`](Self::last_consumed_ms), [`consumed_total`](Self::consumed_total)
+    /// and the `gradatum_worker_last_job_consumed_timestamp_seconds` gauge. No extra call
+    /// site is needed in the Monitor `on_event` hooks (they already call this).
     pub fn inc_jobs_total(&self, kind: &str, status: &str) {
         self.jobs_total.with_label_values(&[kind, status]).inc();
+        self.record_consumption();
+    }
+
+    /// Records that a job was just consumed: stamps the current time into the atomic
+    /// millis clock (read by the readiness probe) and the Prometheus gauge (scraped).
+    fn record_consumption(&self) {
+        let (ms, secs) = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => (
+                i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+                d.as_secs_f64(),
+            ),
+            // Pre-epoch clock: impossible on a sane host. Fall back to "unknown" (0)
+            // rather than panic — the readiness probe treats 0 as "never consumed".
+            Err(_) => (0, 0.0),
+        };
+        self.last_consumed_ms.store(ms, Ordering::Relaxed);
+        self.last_consumed_ts.set(secs);
+    }
+
+    /// Unix-epoch milliseconds of the last consumed job, or `0` if none since boot.
+    #[must_use]
+    pub fn last_consumed_ms(&self) -> i64 {
+        self.last_consumed_ms.load(Ordering::Relaxed)
+    }
+
+    /// Reads, per job kind, `(failed, total)` from the in-process
+    /// `gradatum_jobs_total{kind,status}` counter — the source of the per-kind failure
+    /// rate exposed by `/health/detailed`.
+    ///
+    /// `failed` = observations at `status="error"`, `total` = `error + done`. Only kinds
+    /// with `total > 0` are returned (a kind that never ran carries no signal). The read is
+    /// **non-creating** (`get_metric_with_label_values`): querying an unobserved
+    /// `{kind,status}` pair does not materialise a spurious zero series in `/metrics`.
+    #[must_use]
+    pub fn failure_counts_by_kind(&self) -> BTreeMap<String, (u64, u64)> {
+        let mut out = BTreeMap::new();
+        for kind in JOB_KINDS {
+            // A never-observed label pair yields Err → counted as 0 (no series created).
+            let read = |status: &str| -> u64 {
+                self.jobs_total
+                    .get_metric_with_label_values(&[kind, status])
+                    .map(|c| c.get() as u64)
+                    .unwrap_or(0)
+            };
+            let failed = read("error");
+            let total = failed + read("done");
+            if total > 0 {
+                out.insert(kind.to_string(), (failed, total));
+            }
+        }
+        out
     }
 
     /// Records an execution duration sample for `gradatum_jobs_duration_seconds{kind}`.
@@ -388,5 +486,48 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.bind, "127.0.0.1");
         assert_eq!(cfg.port, 19091);
+    }
+
+    #[test]
+    fn consumption_signal_starts_at_zero_and_advances_on_consumption() {
+        // The consumption signal is the P2 Caveat-1 fix: it must differ from a mere lease
+        // renewal — it only advances when a job is actually consumed.
+        let m = WorkerMetrics::new();
+        assert_eq!(m.last_consumed_ms(), 0, "nothing consumed yet");
+
+        m.inc_jobs_total("embed", "done");
+        assert!(
+            m.last_consumed_ms() > 0,
+            "consuming a job must advance the consumption clock"
+        );
+        // The Prometheus gauge carries the same signal for scraping.
+        assert!(
+            m.render()
+                .contains("gradatum_worker_last_job_consumed_timestamp_seconds"),
+            "the consumption timestamp gauge must be exposed on /metrics"
+        );
+    }
+
+    #[test]
+    fn failure_counts_by_kind_reports_failed_over_total() {
+        let m = WorkerMetrics::new();
+        // 3 embed done + 2 embed error → (failed=2, total=5).
+        for _ in 0..3 {
+            m.inc_jobs_total("embed", "done");
+        }
+        for _ in 0..2 {
+            m.inc_jobs_total("embed", "error");
+        }
+        // 1 curate done only → (failed=0, total=1).
+        m.inc_jobs_total("curate", "done");
+
+        let by_kind = m.failure_counts_by_kind();
+        assert_eq!(by_kind.get("embed"), Some(&(2, 5)));
+        assert_eq!(by_kind.get("curate"), Some(&(0, 1)));
+        // Kinds that never ran carry no signal (and no spurious /metrics series).
+        assert!(
+            !by_kind.contains_key("purge"),
+            "an unran kind must not appear"
+        );
     }
 }

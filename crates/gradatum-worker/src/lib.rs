@@ -29,6 +29,8 @@ pub mod apalis_handlers;
 #[doc(hidden)]
 pub mod config_health;
 #[doc(hidden)]
+pub mod health;
+#[doc(hidden)]
 pub mod internal_client;
 #[doc(hidden)]
 pub mod metrics;

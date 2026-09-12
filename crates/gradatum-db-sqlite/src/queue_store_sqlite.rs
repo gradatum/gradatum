@@ -31,8 +31,8 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use gradatum_core::{
-    JobError, JobFilter, JobOrder, JobRecord, JobResult, JobStatus, QueueError, QueueEvent,
-    QueueStore, job_kind_str,
+    JOB_KIND_MESSAGE, JobError, JobFilter, JobOrder, JobRecord, JobResult, JobStatus, QueueError,
+    QueueEvent, QueueStore, job_kind_str,
 };
 
 /// Broadcast channel capacity for [`QueueEvent`] — default value.
@@ -524,6 +524,13 @@ impl QueueStore for SqliteQueueStore {
         kind: &str,
         tenant_filter: Option<&str>,
     ) -> Result<Option<JobRecord>, QueueError> {
+        // F-144 — ligne état-porteuse jamais exécutée : un `Job::Message` est une
+        // ligne de livraison (Pending → Done via `complete` à l'ack), PAS un travail
+        // à exécuter. Aucun backend apalis n'est enregistré pour ce kind ; ce garde
+        // rend un éventuel poll erroné inoffensif (zéro lease, zéro churn).
+        if kind == JOB_KIND_MESSAGE {
+            return Ok(None);
+        }
         let now = Utc::now().to_rfc3339();
         let lease_until = (Utc::now() + chrono::Duration::seconds(300)).to_rfc3339();
         let kind = kind.to_owned();
@@ -845,6 +852,97 @@ impl QueueStore for SqliteQueueStore {
             );
         }
 
+        Ok(())
+    }
+
+    async fn complete_message_delivery(
+        &self,
+        id: Ulid,
+        result: JobResult,
+    ) -> Result<(), QueueError> {
+        let id_str = id.to_string();
+        let now = Utc::now().to_rfc3339();
+        let db = self.db.clone();
+        let result_for_payload = result.clone();
+
+        // F-144 — transition Pending → Done SANS lease worker.
+        //
+        // `complete()` exige `status='Running'` + lease (P0-1/P2-6) car un worker qui
+        // termine doit détenir un lease valide. Une livraison `Job::Message` n'est
+        // JAMAIS dequeué ni leasée (ligne état-porteuse) : elle reste `Pending`
+        // jusqu'à l'ack. Cette méthode est le pendant « accusé de réception » :
+        // autorité = `message_ack`, jamais un handler. Transaction `BEGIN IMMEDIATE`
+        // comme `complete()` — sérialise un double-ack concurrent.
+        #[derive(Debug)]
+        enum AckOutcome {
+            /// UPDATE affected 0 rows (already terminal / never Pending) — rollback.
+            NotPending,
+            /// UPDATE succeeded — commit.
+            Updated,
+        }
+
+        let outcome = tokio::task::spawn_blocking(move || -> Result<AckOutcome, QueueError> {
+            let mut conn = db.blocking_lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage_err)?;
+
+            // Ne matche que la ligne état-porteuse Pending : une livraison déjà
+            // Done/DLQ/… est « inconnue » pour l'ack (404 muet, anti re-ack).
+            let payload_str: String = tx
+                .query_row(
+                    r#"SELECT payload FROM gradatum_jobs
+                           WHERE id = ?1 AND kind = ?2 AND status = 'Pending'"#,
+                    params![id_str, JOB_KIND_MESSAGE],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage_err)?
+                .ok_or(QueueError::NotFound(id))?;
+
+            let mut record = Self::deserialize_record(&payload_str)?;
+            // Garde de type : la ligne doit bien être une livraison de message.
+            if !matches!(record.spec.kind, gradatum_core::Job::Message(_)) {
+                tx.rollback().map_err(storage_err)?;
+                return Err(QueueError::NotFound(id));
+            }
+
+            record.lifecycle.status = JobStatus::Done;
+            record.lifecycle.completed_at = Some(Utc::now());
+            record.lifecycle.result = Some(result_for_payload);
+            let new_payload = Self::serialize_record(&record)?;
+
+            let rows_affected = tx
+                .execute(
+                    r#"UPDATE gradatum_jobs
+                           SET status = 'Done',
+                               completed_at = ?1,
+                               lease_until = NULL,
+                               payload = ?2
+                           WHERE id = ?3
+                             AND kind = ?4
+                             AND status = 'Pending'"#,
+                    params![now, new_payload, id_str, JOB_KIND_MESSAGE],
+                )
+                .map_err(storage_err)?;
+
+            if rows_affected == 0 {
+                tx.rollback().map_err(storage_err)?;
+                return Ok(AckOutcome::NotPending);
+            }
+
+            tx.commit().map_err(storage_err)?;
+            Ok(AckOutcome::Updated)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
+
+        match outcome {
+            AckOutcome::NotPending => return Err(QueueError::NotFound(id)),
+            AckOutcome::Updated => {}
+        }
+
+        self.publish(QueueEvent::JobCompleted(id, JobStatus::Done, result));
         Ok(())
     }
 
@@ -1565,6 +1663,70 @@ impl QueueStore for SqliteQueueStore {
         Ok(out)
     }
 
+    /// Native per-kind DLQ breakdown — a single `GROUP BY kind` on the dead-letter subset.
+    ///
+    /// `SELECT kind, COUNT(*) FROM gradatum_jobs WHERE status = 'DLQ' GROUP BY kind` — one
+    /// query, no N+1. `kind` is a free text column, returned verbatim (open producer set).
+    async fn dlq_counts_by_kind(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, u64>, QueueError> {
+        let db = self.db.clone();
+        let rows =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(String, i64)>, QueueError> {
+                let conn = db.blocking_lock();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT kind, COUNT(*) AS n FROM gradatum_jobs \
+                         WHERE status = 'DLQ' GROUP BY kind",
+                    )
+                    .map_err(storage_err)?;
+                let iter = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(storage_err)?;
+                let mut out = Vec::new();
+                for r in iter {
+                    out.push(r.map_err(storage_err)?);
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|_| blocking_err())??;
+
+        let mut out = std::collections::BTreeMap::new();
+        for (kind, n) in rows {
+            out.insert(kind, u64::try_from(n).unwrap_or(0));
+        }
+        Ok(out)
+    }
+
+    /// Reads the worker leader-election lease from the shared queue DB.
+    ///
+    /// `SELECT expires_at FROM worker_leadership WHERE slot = 0`. A present row with
+    /// `expires_at > now_ms` means a worker is actively renewing (alive); an absent or
+    /// expired lease means the worker is down. Returns `Some(bool)` (never `None`): the
+    /// SQLite store can always observe leadership, so it never reports "unobservable".
+    async fn worker_lease_fresh(&self, now_ms: i64) -> Result<Option<bool>, QueueError> {
+        let db = self.db.clone();
+        let expires_at: Option<i64> =
+            tokio::task::spawn_blocking(move || -> Result<Option<i64>, QueueError> {
+                let conn = db.blocking_lock();
+                conn.query_row(
+                    "SELECT expires_at FROM worker_leadership WHERE slot = 0",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(storage_err)
+            })
+            .await
+            .map_err(|_| blocking_err())??;
+
+        // Absent row → no worker has ever claimed the slot → down (Some(false)).
+        Ok(Some(expires_at.is_some_and(|exp| exp > now_ms)))
+    }
+
     /// Permanently deletes DLQ jobs (`DELETE WHERE status = 'DLQ'`).
     ///
     /// If `older_than = Some(cutoff)`, deletes only DLQ jobs created before
@@ -2129,9 +2291,9 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use gradatum_core::{
-        CurateSpec, EmbedSpec, Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority,
-        JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, JobTrigger, RetryBackoff,
-        TriggerCondition, TriggerSource, job_kind_str,
+        CurateSpec, EmbedSpec, JOB_KIND_MESSAGE, Job, JobClass, JobLifecycle, JobLineage, JobMode,
+        JobPriority, JobRecord, JobRetry, JobScheduling, JobScope, JobSpec, JobStatus, JobTrigger,
+        MessageDeliverySpec, RetryBackoff, TriggerCondition, TriggerSource, job_kind_str,
     };
     use rusqlite::Connection;
     use ulid::Ulid;
@@ -3228,6 +3390,83 @@ mod tests {
         assert!(
             got.is_none(),
             "dequeue_by_kind(Embed) ne doit PAS retourner un job Curate"
+        );
+    }
+
+    // ── F-144 — Job::Message, ligne état-porteuse jamais exécutée ────────────
+
+    /// Un `Job::Message` (livraison) reste `Pending` : `dequeue_by_kind` refuse son
+    /// kind (ligne état-porteuse), et `Done` n'est atteint QUE via `complete` (ack).
+    #[tokio::test]
+    async fn message_delivery_job_is_never_dequeued_and_completes_via_ack() {
+        let pool = test_db().await;
+        let store = SqliteQueueStore::new(pool);
+
+        let record = make_record(
+            Job::Message(MessageDeliverySpec {
+                message_id: Ulid::generate(),
+                recipient: "identity/agent/recipient".to_string(),
+            }),
+            JobClass::System,
+            JobStatus::Pending,
+        );
+        let id = record.id;
+        store.enqueue(record).await.expect("enqueue Message");
+
+        // Zéro churn : aucun poll ne peut le lease (garde anti-dequeue F-144).
+        let got = store
+            .dequeue_by_kind(JOB_KIND_MESSAGE, None)
+            .await
+            .expect("dequeue_by_kind Message doit réussir");
+        assert!(
+            got.is_none(),
+            "un Job::Message ne doit JAMAIS être dequeué par apalis (état-porteuse)"
+        );
+
+        // Toujours Pending après la tentative de dequeue.
+        let fetched = store
+            .get(id, None)
+            .await
+            .expect("get doit réussir")
+            .expect("le job doit exister");
+        assert_eq!(fetched.lifecycle.status, JobStatus::Pending);
+
+        // Terminal Done UNIQUEMENT via complete_message_delivery (message_ack) —
+        // jamais par un handler (complete() exigerait un lease Running).
+        let result = JobResult {
+            success: true,
+            duration_ms: 5,
+            cost_usd: None,
+            result_note: None,
+            conflict_payload: None,
+        };
+        store
+            .complete_message_delivery(id, result)
+            .await
+            .expect("complete_message_delivery (ack) doit réussir");
+        let done = store
+            .get(id, None)
+            .await
+            .expect("get doit réussir")
+            .expect("le job doit exister");
+        assert_eq!(done.lifecycle.status, JobStatus::Done);
+
+        // Double-ack : la livraison est déjà terminale → 404 muet (NotFound).
+        let double = store
+            .complete_message_delivery(
+                id,
+                JobResult {
+                    success: true,
+                    duration_ms: 1,
+                    cost_usd: None,
+                    result_note: None,
+                    conflict_payload: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(double, Err(QueueError::NotFound(_))),
+            "un second ack sur une livraison déjà Done doit être 404 (muet) — obtenu {double:?}"
         );
     }
 

@@ -449,3 +449,37 @@ pub async fn create_feature(
         .map(|resp| (StatusCode::ACCEPTED, Json(resp)))
         .map_err(|e| crate::api_v1::logic::err_to_status(&e))
 }
+
+/// `POST /api/v1/project-map/mutate-role` — mutation ciblée d'un rôle typé (F-153).
+///
+/// Mute en place le rôle typé visé (`status`/`kind`/`release`/`version`/`track`) d'une ou
+/// plusieurs cartes project-map, **sans que le client possède le corps** : le serveur lit le
+/// corps courant, remplace la valeur du rôle (octet-identique ailleurs), re-dérive le titre
+/// (F-247) et re-valide le schéma (F-213). Réservé au writer privilégié (ACL Write
+/// `{tenant}/main`).
+///
+/// Réponse `200` : `{ "results": [ { note_id, outcome, job_id?, poll_url?, current_sha256?,
+/// error? }, … ] }` — **un verdict par carte, jamais agrégé**. L'écriture de chaque carte
+/// acceptée est asynchrone (`outcome:"queued"`) — confirmer via `job_status`.
+///
+/// Thin wrapper — délègue à [`crate::api_v1::logic::mutate_role_impl`].
+///
+/// # Errors
+///
+/// - `400 Bad Request` : lot vide.
+/// - `401 Unauthorized` : requête non authentifiée.
+/// - `403 Forbidden` : ACL Write refusée / cross-tenant.
+///
+/// Les échecs par carte (rôle absent, conflit de hash, valeur invalide, note absente) ne sont
+/// **pas** des codes HTTP : ils sont portés par le verdict de la carte dans un `200`.
+pub async fn mutate_role(
+    State(state): State<AppState>,
+    Extension(trust): Extension<TrustContext>,
+    axum::extract::Json(req): axum::extract::Json<crate::api_v1::dto::MutateRoleRequest>,
+) -> Result<Json<crate::api_v1::dto::MutateRoleResponse>, StatusCode> {
+    let request_id = ulid::Ulid::generate().to_string();
+    crate::api_v1::logic::mutate_role_impl(&state, &trust, req, &request_id)
+        .await
+        .map(Json)
+        .map_err(|e| crate::api_v1::logic::err_to_status(&e))
+}

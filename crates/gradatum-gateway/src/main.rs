@@ -118,6 +118,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // F-156 P6b — announce liveness to the fleet registry as "gateway".
+    // Opt-in by env (`GRADATUM_HEARTBEAT_URL` + `_TOKEN`); absent ⇒ no producer, no error.
+    // Fire-and-forget, non-blocking, bounded backoff — never degrades the gateway.
+    let _ = gradatum_heartbeat::spawn_from_env(
+        "gateway",
+        env!("CARGO_PKG_VERSION"),
+        gradatum_heartbeat::sha_opt(env!("BUILD_SHA")),
+    );
+
     let listen_addr = config.server.listen.clone();
 
     let registry_path = config

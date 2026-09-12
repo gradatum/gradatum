@@ -27,10 +27,14 @@ use gradatum_core::scope::VaultId;
 mod code_scope;
 mod create_feature_card;
 mod event_log;
+mod health;
 mod internal;
 mod job_status;
 mod lessons_recall;
+mod messaging;
+mod mutate_role;
 mod proactive_recall;
+mod registry;
 mod session_trace;
 mod vault_admin;
 mod vault_archives;
@@ -63,14 +67,24 @@ pub use code_scope::{
 };
 pub use create_feature_card::{CreateFeatureCardRequest, CreateFeatureCardResponse};
 pub use event_log::{EventLogResponse, QaEventDto};
+pub use health::{CapabilityReport, CapabilityState, HealthReport, HealthStatus, LivenessReport};
 pub use job_status::JobStatusRequest;
 pub use lessons_recall::{
     LESSON_CLASSES, LessonHit, LessonsRecallRequest, LessonsRecallResponse, RankMode,
     is_valid_lesson_class,
 };
+pub use messaging::{
+    MAX_MESSAGE_BODY_BYTES, MAX_MESSAGE_RECIPIENT_BYTES, MAX_MESSAGE_SUBJECT_BYTES,
+    MessageAckRequest, MessageEnvelope, MessagePollParams, MessageSendRequest, MessageStatus,
+    MessageValidationError, ValidatedMessageSend,
+};
+pub use mutate_role::{
+    MutateRoleCardVerdict, MutateRoleItem, MutateRoleRequest, MutateRoleResponse, MutationOutcome,
+};
 pub use proactive_recall::{
     ProactiveHit, ProactiveRecallFeedbackRequest, ProactiveRecallRequest, ProactiveRecallResponse,
 };
+pub use registry::{HeartbeatRequest, RegistryEntry, RegistryReport};
 pub use session_trace::{SessionTraceRequest, SessionTraceResponse};
 pub use vault_admin::{
     VaultLifecycleRequest, VaultLifecycleResponse, VaultPurgeRequest, VaultPurgeResponse,

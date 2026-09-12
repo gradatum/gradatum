@@ -124,6 +124,7 @@ impl InternalClient for EmbedTestClient {
             sha256_hex: String::new(),
             body: self.body.clone(),
             section: "reference".to_string(),
+            title: None,
             status: "live".to_string(),
             tags: vec![],
             forgotten: false,

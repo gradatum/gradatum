@@ -2512,6 +2512,122 @@ impl SqliteIndex {
         Ok((records, total as u64))
     }
 
+    /// Lists message-note records across an ACL allow-list of vaults.
+    ///
+    /// The mailbox read primitive of the inter-agent messaging transport. The caller
+    /// (server `message_poll`) has already attested **each** vault of `vault_ids` via
+    /// `AclCheckedVaultId` — this method only runs the SQL, filtering the message
+    /// notes of one recipient channel **before** any projection: `vault_id IN
+    /// (allowlist)` + `section = 'messaging'` + `locus = 'messaging/<recipient>'`.
+    ///
+    /// An **empty** `vault_ids` (a "ghost" principal with no grant — or a caller that
+    /// passed no allowed vault) returns an empty result without touching the DB:
+    /// fail-closed, zero row ever leaks (C2 silent refusal). Every returned record
+    /// carries its `vault_id` (provenance, C2).
+    ///
+    /// Mirror of [`Self::list_notes`]: same ULID-cursor pagination (`ORDER BY id
+    /// ASC`, cursor exclusive), same `downgraded`/sentinel exclusions, same
+    /// `NoteRecord` projection. `recipient` is the credited identity
+    /// (`identity/<kind>/<id>`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    pub async fn list_messaging_notes(
+        &self,
+        vault_ids: &[String],
+        recipient: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        if vault_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let conn = self.conn.lock().await;
+        let limit_clamped = limit.clamp(1, 200) as i64;
+        let cursor_val = cursor.unwrap_or("");
+        // Le canal exact (C4) : `locus = 'messaging/<recipient>'`.
+        let channel = format!("messaging/{recipient}");
+
+        // Placeholders dynamiques `?` pour `vault_id IN (…)`, puis paramètres fixes.
+        let placeholders = vec!["?"; vault_ids.len()].join(",");
+        let n_fixed = vault_ids.len();
+
+        // COUNT total (même filtre, sans pagination) pour l'en-tête de pagination.
+        let total_sql = format!(
+            "SELECT COUNT(*) FROM notes
+             WHERE section = 'messaging'
+               AND vault_id IN ({placeholders})
+               AND locus = ?{n0}
+               AND status != 'downgraded'
+               AND id NOT LIKE '__sentinel__%'",
+            n0 = n_fixed + 1
+        );
+        let mut total_params: Vec<&dyn rusqlite::ToSql> = vault_ids
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
+        total_params.push(&channel);
+        let total: i64 = conn
+            .query_row(
+                &total_sql,
+                rusqlite::params_from_iter(total_params),
+                |row| row.get(0),
+            )
+            .map_err(|e| GradatumError::Storage(format!("list_messaging_notes count: {e}")))?;
+
+        let list_sql = format!(
+            "SELECT id, vault_id, section, status, body_text,
+                    COALESCE(author_display_name, author_id) AS author,
+                    tags, content_hash, created, updated, title, locus
+             FROM notes
+             WHERE section = 'messaging'
+               AND vault_id IN ({placeholders})
+               AND locus = ?{n0}
+               AND status != 'downgraded'
+               AND id NOT LIKE '__sentinel__%'
+               AND (?{n1} = '' OR id > ?{n1})
+             ORDER BY id ASC
+             LIMIT ?{n2}",
+            n0 = n_fixed + 1,
+            n1 = n_fixed + 2,
+            n2 = n_fixed + 3
+        );
+        let mut list_params: Vec<&dyn rusqlite::ToSql> = vault_ids
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
+        list_params.push(&channel);
+        list_params.push(&cursor_val);
+        list_params.push(&limit_clamped);
+
+        let mut stmt = conn
+            .prepare(&list_sql)
+            .map_err(|e| GradatumError::Storage(format!("list_messaging_notes prepare: {e}")))?;
+        let records = stmt
+            .query_map(rusqlite::params_from_iter(list_params), |row| {
+                Ok(NoteRecord {
+                    id: row.get(0)?,
+                    vault_id: row.get(1)?,
+                    section: row.get(2)?,
+                    status: row.get(3)?,
+                    body_text: row.get(4)?,
+                    author: row.get(5)?,
+                    tags_raw: row.get(6)?,
+                    content_hash: row.get::<_, Vec<u8>>(7)?,
+                    created: row.get(8)?,
+                    updated: row.get(9)?,
+                    title: row.get(10)?,
+                    locus: row.get(11)?,
+                })
+            })
+            .map_err(|e| GradatumError::Storage(format!("list_messaging_notes query: {e}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| GradatumError::Storage(format!("list_messaging_notes collect: {e}")))?;
+
+        Ok((records, total as u64))
+    }
+
     /// Paginated metadata listing filtered by typed **project-map roles**.
     ///
     /// Identical to [`Self::list_notes`] (same pagination, same `ORDER BY id ASC`, same
@@ -2740,7 +2856,7 @@ impl SqliteIndex {
         // au seed). Source de vérité = rôle du corps, jamais les tags. Corrige le plancher
         // vers le haut si une carte créée HORS allocateur a pris de l'avance sur le compteur
         // (période de transition : `gov-todo feature-add F-XX` fournit encore un numéro
-        // explicite côté client tant que le skill n'est pas migré — council Art.19 en attente).
+        // explicite côté client tant que le skill n'est pas migré — migration en attente).
         let derived: i64 = {
             let mut stmt = tx
                 .prepare(
@@ -3068,6 +3184,36 @@ impl SqliteIndex {
             rusqlite::params![id],
         )
         .map_err(|e| GradatumError::Storage(format!("seed_note_with_fts fts: {e}")))?;
+        Ok(())
+    }
+
+    /// Seeds a note with an explicit `title` column (protection-key tests).
+    ///
+    /// Same as [`Self::seed_note_with_fts`] but sets `notes.title`, so
+    /// [`Self::get_note_protection_key`] can co-resolve `(section, title)` — the
+    /// path-aware `identity/person/*` carve-out is only exercised when the title is
+    /// present.
+    pub async fn seed_note_with_fts_title(
+        &self,
+        id: &str,
+        section: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(), GradatumError> {
+        let conn = self.conn.lock().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO notes (id, vault_id, section, status, schema_version, created, content_hash, body_text, title)
+             VALUES (?1, 'main', ?2, 'live', 1, ?3, X'00', ?4, ?5)",
+            rusqlite::params![id, section, now, body, title],
+        )
+        .map_err(|e| GradatumError::Storage(format!("seed_note_with_fts_title notes: {e}")))?;
+        conn.execute(
+            "INSERT INTO notes_fts (rowid, body_text)
+             SELECT rowid, body_text FROM notes WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| GradatumError::Storage(format!("seed_note_with_fts_title fts: {e}")))?;
         Ok(())
     }
 
@@ -5232,6 +5378,36 @@ impl SqliteIndex {
             Ok(s) => Ok(Some(s)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(GradatumError::Storage(format!("get_note_section : {e}"))),
+        }
+    }
+
+    /// Co-resolves `(section, title)` from a single `notes` row (invariant 9).
+    ///
+    /// Single authoritative read backing the path-aware protection guards: section
+    /// and title come from the SAME row, so the person-card carve-out can never mix
+    /// two notes. `title` is coalesced to `""` when the column is `NULL`. Returns
+    /// `None` if the note is absent from the index.
+    pub async fn get_note_protection_key(
+        &self,
+        vault_id: &str,
+        note_id: &str,
+    ) -> Result<Option<(String, String)>, GradatumError> {
+        let conn = self.conn.lock().await;
+        let result = conn.query_row(
+            "SELECT section, title FROM notes WHERE vault_id = ?1 AND id = ?2",
+            rusqlite::params![vault_id, note_id],
+            |row| {
+                let section: String = row.get(0)?;
+                let title: Option<String> = row.get(1)?;
+                Ok((section, title.unwrap_or_default()))
+            },
+        );
+        match result {
+            Ok(pair) => Ok(Some(pair)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(GradatumError::Storage(format!(
+                "get_note_protection_key : {e}"
+            ))),
         }
     }
 
@@ -9764,6 +9940,147 @@ mod vault_list_tests {
             (135..=135 + N - 1).collect::<Vec<u32>>(),
             "les {N} allocations doivent couvrir 135..=154 sans trou ni doublon"
         );
+    }
+}
+
+// ── Tests list_messaging_notes (F-144, C1/C2) ────────────────────────────────
+
+#[cfg(test)]
+mod messaging_list_tests {
+    use super::*;
+
+    const ALICE: &str = "identity/agent/alice";
+    const BOB: &str = "identity/agent/bob";
+
+    async fn open() -> SqliteIndex {
+        SqliteIndex::open_in_memory()
+            .await
+            .expect("open_in_memory ne doit pas échouer")
+    }
+
+    /// Un seed direct section/locus (INSERT brut) pour un test donné.
+    async fn seed_msg(idx: &SqliteIndex, id: &str, vault: &str, recipient: &str, body: &str) {
+        let channel = format!("messaging/{recipient}");
+        idx.seed_note_with_fts_vault(id, vault, "messaging", Some(channel.as_str()), body)
+            .await
+            .expect("seed note messaging");
+    }
+
+    /// L'allow-list multi-vault filtre par `vault_id IN (…)` AVANT tout retour (C1),
+    /// le destinataire est filtré par canal exact (C4), et chaque enregistrement porte
+    /// sa provenance `vault_id` (C2).
+    #[tokio::test]
+    async fn list_messaging_notes_filters_by_allowlist_and_recipient() {
+        let idx = open().await;
+        // Alice reçoit 2 messages : un dans "main", un dans "other".
+        seed_msg(
+            &idx,
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "main",
+            ALICE,
+            "main→alice",
+        )
+        .await;
+        seed_msg(
+            &idx,
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+            "other",
+            ALICE,
+            "other→alice",
+        )
+        .await;
+        // Bob reçoit un message dans "main" — ne doit JAMAIS apparaître pour Alice.
+        seed_msg(&idx, "01CCCCCCCCCCCCCCCCCCCCCCCC", "main", BOB, "main→bob").await;
+        // Note non-messaging dans "main" portant un locus canal — exclue par section.
+        let alice_channel = format!("messaging/{ALICE}");
+        idx.seed_note_with_fts_vault(
+            "01DDDDDDDDDDDDDDDDDDDDDDDD",
+            "main",
+            "decisions",
+            Some(alice_channel.as_str()),
+            "note décision",
+        )
+        .await
+        .expect("seed note decisions");
+
+        let allowlist = vec!["main".to_string(), "other".to_string()];
+        let (records, total) = idx
+            .list_messaging_notes(&allowlist, ALICE, 50, None)
+            .await
+            .expect("list_messaging_notes doit réussir");
+
+        assert_eq!(total, 2, "2 messages pour Alice sur les 2 vaults autorisés");
+        assert_eq!(records.len(), 2);
+        let mut by_vault: std::collections::BTreeMap<&str, &str> =
+            std::collections::BTreeMap::new();
+        for r in &records {
+            assert_eq!(r.section, "messaging", "seulement la section messaging");
+            assert_eq!(
+                r.locus.as_deref(),
+                Some("messaging/identity/agent/alice"),
+                "locus = canal d'Alice"
+            );
+            assert!(
+                r.vault_id == "main" || r.vault_id == "other",
+                "provenance vault_id inattendue: {}",
+                r.vault_id
+            );
+            by_vault.insert(&r.vault_id, &r.body_text);
+        }
+        assert_eq!(by_vault.get("main").copied(), Some("main→alice"));
+        assert_eq!(by_vault.get("other").copied(), Some("other→alice"));
+    }
+
+    /// Réduire l'allow-list à un seul vault restreint le résultat (filtre SQL).
+    #[tokio::test]
+    async fn list_messaging_notes_respects_narrowed_allowlist() {
+        let idx = open().await;
+        seed_msg(
+            &idx,
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "main",
+            ALICE,
+            "main→alice",
+        )
+        .await;
+        seed_msg(
+            &idx,
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+            "other",
+            ALICE,
+            "other→alice",
+        )
+        .await;
+
+        let (records, total) = idx
+            .list_messaging_notes(&["main".to_string()], ALICE, 50, None)
+            .await
+            .expect("list_messaging_notes doit réussir");
+        assert_eq!(total, 1, "1 seul vault autorisé → 1 message");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].vault_id, "main");
+        assert_eq!(records[0].body_text, "main→alice");
+    }
+
+    /// Allow-list vide (principal "ghost", aucun grant) → résultat vide sans requête.
+    #[tokio::test]
+    async fn list_messaging_notes_empty_allowlist_returns_empty() {
+        let idx = open().await;
+        seed_msg(
+            &idx,
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "main",
+            ALICE,
+            "main→alice",
+        )
+        .await;
+
+        let (records, total) = idx
+            .list_messaging_notes(&[], ALICE, 50, None)
+            .await
+            .expect("allowlist vide doit réussir sans requête");
+        assert_eq!(total, 0);
+        assert!(records.is_empty(), "ghost → vide (C2)");
     }
 }
 

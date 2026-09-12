@@ -34,6 +34,7 @@ serve = [
     "dep:chrono",
     "dep:zeroize",
     "dep:gradatum-dto",
+    "dep:gradatum-heartbeat",
     "dep:anyhow",
     "dep:url",
     "dep:nix",
@@ -52,6 +53,7 @@ test-utils   = ["serve", "gradatum-core/test-utils"]
 gradatum-core.workspace = true
 
 # Toutes les dépendances sont optionnelles — compilées uniquement avec feature `serve`
+gradatum-heartbeat = { workspace = true, optional = true }
 axum              = { workspace = true, optional = true }
 tokio             = { workspace = true, optional = true }
 reqwest           = { workspace = true, optional = true }

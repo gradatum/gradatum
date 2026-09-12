@@ -302,7 +302,7 @@ impl ReleaseKind {
 }
 
 /// Structure card a work card's [`ProjectMapLink::Track`] resolves to, as consumed by
-/// [`derive_release`] (the `track → release` derivation).
+/// `derive_release` (the `track → release` derivation).
 ///
 /// A `[[track:…]]` is only ever valid pointing at a **structure card** — a ROADMAP or a
 /// BACKLOG ([`KindKind::is_structure`]). That invariant is enforced by the **resolver**
@@ -330,11 +330,11 @@ pub enum TrackTarget {
     Backlog,
 }
 
-/// Error type of [`derive_release`], retained so the derivation stays *typed-fallible* — a
+/// Error type of `derive_release`, retained so the derivation stays *typed-fallible* — a
 /// malformed structure would yield a typed error, never a panic nor a silently wrong release.
 ///
 /// **Not produced in the current mapping**: every
-/// [`StatusKind`] now maps to a release bucket, so [`derive_release`] never returns `Err`.
+/// [`StatusKind`] now maps to a release bucket, so `derive_release` never returns `Err`.
 /// This type is deliberately kept (rather than removed) because it is referenced *in type
 /// position* by the readers' visible-fallback path
 /// ([`DerivationFallbackReason::Undetermined`]): removing the sole variant would make that
@@ -355,12 +355,45 @@ pub enum ReleaseDerivationError {
     UndeterminedRoadmapStatus(StatusKind),
 }
 
+/// The reserved "no real release target" version sentinel.
+///
+/// A `[[track:<project>/0.0.0]]` names the bootstrap ROADMAP (`gradatum/0.0.0` —
+/// *"bootstrap, attribution lost"*): a structural placeholder that commits to **no**
+/// shippable version. A work card whose track resolves to it therefore has, by
+/// construction, no delivery. Kept as a named constant (ADN 4: no magic literal) so the
+/// single sentinel value is defined once.
+const SENTINEL_TRACK_VERSION: &str = "0.0.0";
+
+/// `true` when a resolved track version names the [`SENTINEL_TRACK_VERSION`]
+/// ("no real release target").
+///
+/// Only the version component is inspected: an optional `<project>/` prefix is stripped
+/// first (the project is already validated against the card's `[[project:]]` link). Same
+/// intent as [`map_version_raw`] — drop the `<project>/` namespace — but a **distinct**
+/// mechanism: this helper splits on the **last** `/` (`rsplit_once`) while `map_version_raw`
+/// splits on the **first** (`split_once`). The two coincide only under the single-slash
+/// invariant `<project>/<target>`; they are not interchangeable in general. Pure, total,
+/// no allocation.
+fn is_sentinel_track_version(track_version: &str) -> bool {
+    let version = track_version
+        .rsplit_once('/')
+        .map_or(track_version, |(_, v)| v);
+    version == SENTINEL_TRACK_VERSION
+}
+
 /// Derives the delivery status ([`ReleaseKind`]) of a **work card** from its own lifecycle
 /// status first, then — only for a non-terminal card — from the structure it tracks.
 ///
 /// Single source of the `track → release` derivation. **Pure** (no I/O, deterministic). It
-/// applies the *card-status-first* rule agreed with the operator on 2026-09-03:
+/// applies the *card-status-first* rule:
 ///
+/// 0. **Track-sentinel guard**: a card whose resolved track version is the
+///    [`SENTINEL_TRACK_VERSION`] (`0.0.0` — the bootstrap ROADMAP "bootstrap, attribution
+///    lost", which commits to no shippable version) is [`ReleaseKind::Dropped`],
+///    evaluated *before* rule 1. A closed/superseded `DONE` card pinned to
+///    `gradatum/0.0.0` therefore drops instead of leaking as `released`+`v0.0.0` into
+///    `export-features`. A real tracked version is never the sentinel, so rule 1's nominal
+///    `DONE → released` path is unaffected.
 /// 1. A `DONE` card is [`ReleaseKind::Released`], **whatever** the tracked structure. This
 ///    alone resolves the known blockers (features delivered under an internal ROADMAP
 ///    since rolled into a later version). It also upholds the invariant that a `DONE` card
@@ -395,10 +428,20 @@ pub enum ReleaseDerivationError {
 /// and [`ReleaseDerivationError`] are retained for the readers' visible-fallback path and for
 /// reversibility — see [`ReleaseDerivationError`] and `derive_roadmap_release`.
 #[must_use = "the derived release status must be observed — dropping it discards the derivation"]
-pub fn derive_release(
+pub(crate) fn derive_release(
     card_status: StatusKind,
     track_target: TrackTarget,
+    track_version: &str,
 ) -> Result<ReleaseKind, ReleaseDerivationError> {
+    // Rule 0 — a card tracking the "no real release target" sentinel (0.0.0) has no
+    // delivery, whatever its own status. Evaluated BEFORE the DONE short-circuit (rule 1):
+    // a closed/superseded DONE card pinned to the bootstrap ROADMAP must derive `dropped`,
+    // not `released`. Without this guard such cards leaked as `released`+`v0.0.0` into
+    // `export-features` (F-184 regression). A real version (e.g. `2.1.0`) is never the
+    // sentinel, so the nominal `DONE + real target → released` path (rule 1) is untouched.
+    if is_sentinel_track_version(track_version) {
+        return Ok(ReleaseKind::Dropped);
+    }
     // Rule 1 — a completed work card is released, whatever it tracks. Resolves the 11
     // blockers, and short-circuits before the structure so §1.4 cannot be violated.
     if card_status == StatusKind::Done {
@@ -465,6 +508,78 @@ mod derive_release_tests {
         StatusKind::Blocked,
     ];
 
+    /// A concrete, shippable tracked version — never the `0.0.0` sentinel. Threaded into
+    /// every non-sentinel case so rule 0 is a no-op and the pre-F-184 behaviour is asserted
+    /// unchanged.
+    const REAL_VERSION: &str = "2.1.0";
+
+    // ── Rule 0 — track-sentinel guard (F-184) ────────────────────────────────────────
+
+    /// F-184 regression: a `DONE` card closed/superseded under the bootstrap ROADMAP
+    /// (`[[track:gradatum/0.0.0]]`, resolving to a DONE roadmap with no porteuse) must derive
+    /// `dropped`, NOT `released` — the sentinel guard (rule 0) fires before the DONE
+    /// short-circuit (rule 1). Reproduces the exact resolved shape of F-09/36/54/65.
+    #[test]
+    fn done_superseded_card_is_dropped() {
+        let got = derive_release(
+            StatusKind::Done,
+            TrackTarget::Roadmap {
+                status: StatusKind::Done,
+                porteuse_status: None,
+            },
+            "0.0.0",
+        );
+        assert_eq!(got, Ok(ReleaseKind::Dropped));
+    }
+
+    /// Control (non-regression): the *same* DONE-card / DONE-roadmap shape tracking a **real**
+    /// version derives `released`. Proves rule 0 keys on the version identity alone, not on the
+    /// tracked roadmap status (identical here), so the nominal rule-1 path is untouched.
+    #[test]
+    fn done_card_on_real_version_stays_released() {
+        let got = derive_release(
+            StatusKind::Done,
+            TrackTarget::Roadmap {
+                status: StatusKind::Done,
+                porteuse_status: None,
+            },
+            "gradatum/2.1.0",
+        );
+        assert_eq!(got, Ok(ReleaseKind::Released));
+    }
+
+    /// The sentinel guard is independent of the `<project>/` prefix: a bare `0.0.0` and a
+    /// namespaced `gradatum/0.0.0` both drop.
+    #[test]
+    fn sentinel_guard_ignores_project_prefix() {
+        for track in ["0.0.0", "gradatum/0.0.0"] {
+            assert_eq!(
+                derive_release(StatusKind::Done, TrackTarget::Backlog, track),
+                Ok(ReleaseKind::Dropped),
+                "track {track:?} must resolve to the sentinel and drop"
+            );
+        }
+    }
+
+    /// Rule 0 fires independently of the card status: a **non-terminal** card (here `OPEN`,
+    /// which would otherwise fall through to structure derivation, rule 3) tracking the
+    /// `0.0.0` sentinel drops just like a `DONE` one. Locks the intended side effect — a
+    /// `0.0.0` target commits to no shippable version, so the card is `dropped` whatever its
+    /// own lifecycle status — and guards against a future regression that would gate rule 0
+    /// behind the DONE short-circuit.
+    #[test]
+    fn non_terminal_card_tracking_sentinel_is_dropped() {
+        let got = derive_release(
+            StatusKind::Open,
+            TrackTarget::Roadmap {
+                status: StatusKind::Open,
+                porteuse_status: None,
+            },
+            "gradatum/0.0.0",
+        );
+        assert_eq!(got, Ok(ReleaseKind::Dropped));
+    }
+
     // ── Rule 1 — DONE card ⇒ released, whatever it tracks ────────────────────────────
 
     /// The known-blockers shape reproduced literally: a `DONE` card tracking an `OBSOLETE`
@@ -477,6 +592,7 @@ mod derive_release_tests {
                 status: StatusKind::Obsolete,
                 porteuse_status: None,
             },
+            REAL_VERSION,
         );
         assert_eq!(got, Ok(ReleaseKind::Released));
     }
@@ -507,7 +623,7 @@ mod derive_release_tests {
         ];
         for target in targets {
             assert_eq!(
-                derive_release(StatusKind::Done, target),
+                derive_release(StatusKind::Done, target, REAL_VERSION),
                 Ok(ReleaseKind::Released),
                 "DONE card must be released for {target:?}"
             );
@@ -519,7 +635,7 @@ mod derive_release_tests {
     #[test]
     fn done_card_on_backlog_never_derives_the_backlog_bucket() {
         assert_eq!(
-            derive_release(StatusKind::Done, TrackTarget::Backlog),
+            derive_release(StatusKind::Done, TrackTarget::Backlog, REAL_VERSION),
             Ok(ReleaseKind::Released),
         );
     }
@@ -541,7 +657,7 @@ mod derive_release_tests {
         ];
         for target in targets {
             assert_eq!(
-                derive_release(StatusKind::Obsolete, target),
+                derive_release(StatusKind::Obsolete, target, REAL_VERSION),
                 Ok(ReleaseKind::Dropped),
                 "OBSOLETE card must be dropped for {target:?}"
             );
@@ -554,7 +670,7 @@ mod derive_release_tests {
     fn non_terminal_card_on_backlog_derives_roadmap_bucket() {
         for card in NON_TERMINAL {
             assert_eq!(
-                derive_release(card, TrackTarget::Backlog),
+                derive_release(card, TrackTarget::Backlog, REAL_VERSION),
                 Ok(ReleaseKind::Roadmap),
                 "non-terminal card {card:?} tracking BACKLOG must derive the roadmap bucket"
             );
@@ -571,6 +687,7 @@ mod derive_release_tests {
                         status: StatusKind::Done,
                         porteuse_status: None,
                     },
+                    REAL_VERSION,
                 ),
                 Ok(ReleaseKind::Released),
                 "non-terminal card {card:?} tracking a DONE roadmap must be released"
@@ -589,6 +706,7 @@ mod derive_release_tests {
                             status: roadmap,
                             porteuse_status: None,
                         },
+                        REAL_VERSION,
                     ),
                     Ok(ReleaseKind::Planned),
                     "card {card:?} tracking {roadmap:?} roadmap must be planned"
@@ -607,6 +725,7 @@ mod derive_release_tests {
                         status: StatusKind::Obsolete,
                         porteuse_status: None,
                     },
+                    REAL_VERSION,
                 ),
                 Ok(ReleaseKind::Dropped),
                 "non-terminal card {card:?} tracking an OBSOLETE roadmap without porteuse drops"
@@ -634,6 +753,7 @@ mod derive_release_tests {
                             status: StatusKind::Obsolete,
                             porteuse_status: Some(carrier),
                         },
+                        REAL_VERSION,
                     ),
                     Ok(expected),
                     "card {card:?}: roll-forward onto a {carrier:?} carrier must derive {expected:?}"
@@ -653,6 +773,7 @@ mod derive_release_tests {
                     status: StatusKind::Done,
                     porteuse_status: Some(StatusKind::Obsolete),
                 },
+                REAL_VERSION,
             );
             assert_eq!(
                 got,
@@ -683,6 +804,7 @@ mod derive_release_tests {
                             status: roadmap,
                             porteuse_status: None,
                         },
+                        REAL_VERSION,
                     ),
                     Ok(expected),
                     "card {card:?}: a {roadmap:?} roadmap must derive {expected:?}"
@@ -710,6 +832,7 @@ mod derive_release_tests {
                             status: StatusKind::Obsolete,
                             porteuse_status: Some(carrier),
                         },
+                        REAL_VERSION,
                     ),
                     Ok(expected),
                     "card {card:?}: roll-forward onto a {carrier:?} carrier must derive {expected:?}"
@@ -739,7 +862,7 @@ pub enum TrackResolutionError {
         identity: String,
     },
     /// The tracked `OBSOLETE` ROADMAP names a `[[porteuse:…]]` that itself resolves to no
-    /// structure card, so the roll-forward carrier (rule 4 of [`derive_release`]) cannot be read.
+    /// structure card, so the roll-forward carrier (rule 4 of `derive_release`) cannot be read.
     #[error(
         "OBSOLETE roadmap {roadmap:?} names porteuse {porteuse:?} which resolves to no structure card"
     )]
@@ -760,7 +883,7 @@ struct StructureFacts {
     /// The structure card's own lifecycle status.
     status: StatusKind,
     /// Identity (`project/version`) named by this card's `[[porteuse:…]]`, when present. Only a
-    /// ROADMAP can carry one; consulted for the roll-forward (rule 4 of [`derive_release`]).
+    /// ROADMAP can carry one; consulted for the roll-forward (rule 4 of `derive_release`).
     porteuse: Option<String>,
 }
 
@@ -852,9 +975,9 @@ impl StructureIndex {
     ///
     /// Reads the target structure card's kind and status, and — for an `OBSOLETE` ROADMAP that
     /// carries a `[[porteuse:…]]` — resolves the carrier **one level** to fill
-    /// [`TrackTarget::Roadmap::porteuse_status`] (the roll-forward input of [`derive_release`],
+    /// [`TrackTarget::Roadmap::porteuse_status`] (the roll-forward input of `derive_release`,
     /// rule 4). The porteuse is looked up **only** when the tracked ROADMAP is `OBSOLETE`,
-    /// mirroring exactly what [`derive_release`] consumes: a porteuse on any other status is never
+    /// mirroring exactly what `derive_release` consumes: a porteuse on any other status is never
     /// resolved, so a dangling carrier there can never spuriously error.
     ///
     /// # Errors
@@ -2313,10 +2436,10 @@ pub struct DerivedExport {
 /// Same input, same filtering (project filter, structure exclusion C10, mirror-site `dropped`/kind
 /// filters) and same sort as [`project_map_feature_entries_scoped`] — but **both** the card's
 /// `release` and its `version` are computed from its `[[track:]]` pointer (the primary source
-/// post-retrait), via [`StructureIndex`] + [`derive_release`], rather than read from
+/// post-retrait), via [`StructureIndex`] + `derive_release`, rather than read from
 /// the stored `[[release:]]`/`[[version:]]`:
 ///
-/// - `release` = [`derive_release`] applied to the card's `[[status:]]` and the resolved track
+/// - `release` = `derive_release` applied to the card's `[[status:]]` and the resolved track
 ///   target.
 /// - `version` = the tracked structure's identity `project/target` (which *is* that structure's
 ///   `[[version:]]`) mapped through [`map_version_raw`] — a `[[track:gradatum/2.1.0]]` yields
@@ -2403,7 +2526,7 @@ pub fn project_map_feature_entries_derived_scoped(
         let derivation: Result<(String, Option<String>), DerivationFallbackReason> =
             match (card_status, track) {
                 (Some(status), Some((tp, tt))) => match index.resolve_track(tp, tt) {
-                    Ok(target) => match derive_release(status, target) {
+                    Ok(target) => match derive_release(status, target, tt) {
                         // version dérivée = identité de la structure pointée (= son [[version:]]).
                         Ok(rk) => Ok((rk.as_wire().to_string(), Some(format!("{tp}/{tt}")))),
                         Err(e) => Err(DerivationFallbackReason::Undetermined(e)),
@@ -2480,7 +2603,7 @@ pub fn project_map_feature_entries_derived_scoped(
 /// and the addressable identifier included (criterion 1). Extending [`FeatureEntry`] would both
 /// break that frozen mirror contract and force the ULID through the two stable export projections
 /// that do not need it, so this is a separate projection reusing the same derivation machinery
-/// ([`StructureIndex`] / [`derive_release`]).
+/// ([`StructureIndex`] / `derive_release`).
 ///
 /// A field is `Option` when the axis may legitimately be absent (a structure card is never
 /// numbered, carries no `release`; a work card's derivation may fail on a dangling `[[track:]]`).
@@ -2501,7 +2624,7 @@ pub struct ProjectMapCardEntry {
     /// count of 2026-09-02 — always exposed here (criterion 8).
     pub kind: Option<String>,
     /// Delivery status. **Work card**: derived from `[[track:]]` + `[[status:]]` via
-    /// [`derive_release`] (the post-Phase-7 primary source; the stored `[[release:]]` is gone).
+    /// `derive_release` (the post-Phase-7 primary source; the stored `[[release:]]` is gone).
     /// **Structure card**: `None` (a structure has no delivery axis). `None` on a work card
     /// signals an unresolvable `[[track:]]` (a registry anomaly, rendered visibly).
     pub release: Option<String>,
@@ -2656,7 +2779,7 @@ pub fn project_map_card_index(
                 (Some(st), Some((tp, tt))) => index
                     .resolve_track(tp, tt)
                     .ok()
-                    .and_then(|target| derive_release(st, target).ok())
+                    .and_then(|target| derive_release(st, target, tt).ok())
                     .map(|rk| rk.as_wire().to_string()),
                 _ => None,
             }
@@ -2996,6 +3119,587 @@ pub fn derive_canonical_title(body: &str, current_title: &str) -> String {
         out.push_str(&version);
     }
     out
+}
+
+// ── F-153 — mutation ciblée d'un rôle typé ─────────────────────────────────────
+//
+// Le seul chemin d'écriture d'une carte project-map réémet le corps ENTIER : muter un
+// rôle exige de posséder le corps courant côté client, qui le reconstruit — un paragraphe
+// recomposé par le curateur peut être écrasé sans erreur, et la carte est insupprimable.
+// F-153 déplace la mutation CÔTÉ SERVEUR : le corps courant est lu, le rôle typé visé est
+// remplacé **en place**, tout le reste du corps reste octet-pour-octet identique.
+
+/// The typed roles of a project-map card that may be mutated **in place**.
+///
+/// Deliberately excludes the two identity roles: `feature` (the `F-XX` number — the card's
+/// identity, guaranteed unique) and `project` (the owning project). Both are rejected as
+/// [`RoleMutationError::ImmutableIdentity`] — a rename is a new card plus `[[supersedes:]]`,
+/// never an in-place mutation. Only the lifecycle (`status`/`kind`/`release`) and version
+/// (`version`/`track`) axes are mutable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MutableRole {
+    /// `[[status:<STATUS>]]` — lifecycle status.
+    Status,
+    /// `[[kind:<KIND>]]` — nature of the work unit.
+    Kind,
+    /// `[[release:<r>]]` — delivery status.
+    Release,
+    /// `[[version:<project>/<x.y.z>]]` — target version (structure cards).
+    Version,
+    /// `[[track:<project>/<target>]]` — version axis of a work card.
+    Track,
+}
+
+impl MutableRole {
+    /// The reserved wire prefix of this role (`status`, `kind`, `release`, `version`, `track`).
+    #[must_use]
+    pub const fn wire_prefix(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Kind => "kind",
+            Self::Release => "release",
+            Self::Version => "version",
+            Self::Track => "track",
+        }
+    }
+
+    /// Parses a role-type token into a mutable role.
+    ///
+    /// Enforces the allow-list at the frontier (parse-don't-validate): only the five mutable
+    /// typed roles are accepted. `feature`/`project` are refused **explicitly** as the card
+    /// identity; any other token is an unknown role type.
+    ///
+    /// # Errors
+    ///
+    /// - [`RoleMutationError::ImmutableIdentity`] for `feature` or `project`.
+    /// - [`RoleMutationError::UnknownRoleType`] for any other token.
+    pub fn from_wire(role_type: &str) -> Result<Self, RoleMutationError> {
+        match role_type {
+            "status" => Ok(Self::Status),
+            "kind" => Ok(Self::Kind),
+            "release" => Ok(Self::Release),
+            "version" => Ok(Self::Version),
+            "track" => Ok(Self::Track),
+            "feature" | "project" => {
+                Err(RoleMutationError::ImmutableIdentity(role_type.to_string()))
+            }
+            other => Err(RoleMutationError::UnknownRoleType(other.to_string())),
+        }
+    }
+
+    /// `true` when a parsed link is the variant this role designates.
+    fn matches_variant(self, link: &ProjectMapLink) -> bool {
+        matches!(
+            (self, link),
+            (Self::Status, ProjectMapLink::Status(_))
+                | (Self::Kind, ProjectMapLink::Kind(_))
+                | (Self::Release, ProjectMapLink::Release(_))
+                | (Self::Version, ProjectMapLink::Version { .. })
+                | (Self::Track, ProjectMapLink::Track { .. })
+        )
+    }
+}
+
+/// Error raised by [`mutate_typed_role`] or [`MutableRole::from_wire`].
+///
+/// Every variant is a **refusal** of one card's mutation — never a silent success. In a batch
+/// each refusal is a per-card verdict; the batch never collapses to a single aggregate outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum RoleMutationError {
+    /// The role-type token is not one of the five mutable typed roles.
+    #[error("unknown role type {0:?}: only status/kind/release/version/track are mutable")]
+    UnknownRoleType(String),
+    /// The role is the card identity (`feature`/`project`) and can never be mutated in place.
+    #[error(
+        "role {0:?} is the card identity and is immutable — a rename is a new card plus \
+         [[supersedes:]], never an in-place mutation"
+    )]
+    ImmutableIdentity(String),
+    /// The target role is absent from the card's structural zone. The mutation refuses to
+    /// **create** a role — it only replaces an existing value.
+    #[error(
+        "role [[{prefix}:…]] is absent from the card's structural zone — mutation refuses to \
+         create a role, only to replace an existing value"
+    )]
+    RoleAbsent {
+        /// Wire prefix of the absent role.
+        prefix: &'static str,
+    },
+    /// Several structural occurrences of the same typed role — a valid card carries at most one;
+    /// the mutation refuses to guess which to change.
+    #[error(
+        "multiple structural [[{prefix}:…]] roles — ambiguous, refusing to guess which to mutate"
+    )]
+    Ambiguous {
+        /// Wire prefix of the ambiguous role.
+        prefix: &'static str,
+    },
+    /// The submitted new value does not parse into a valid link of the target role's variant.
+    #[error("new value {value:?} is not a valid [[{prefix}:…]] role value")]
+    InvalidNewValue {
+        /// Wire prefix of the role.
+        prefix: &'static str,
+        /// The rejected value.
+        value: String,
+    },
+    /// The client-provided history line carries a structural-role opener (`[[`), which
+    /// [`append_history_line`] would splice verbatim — smuggling a bare role the client is never
+    /// allowed to inject through this path. Refused (not escaped) so the body stays unambiguous.
+    #[error(
+        "history line carries a structural-role marker `[[` — refused: this path never injects a \
+         structural role into a card body"
+    )]
+    HistoryLineInvalid,
+}
+
+/// Byte span of a role's **value** inside a card body (the bytes between `prefix:` and `]]`).
+#[derive(Debug, Clone, Copy)]
+struct RoleValueSpan {
+    /// Byte offset where the value starts (just after the first `:` of the token's inner text).
+    value_start: usize,
+    /// Byte offset where the value ends (the `]]` closing delimiter).
+    value_end: usize,
+}
+
+/// `true` when `line` (already stripped of its trailing newline / `\r`) opens or closes a
+/// fenced code block.
+fn is_fence_line(line: &str) -> bool {
+    line.trim_start().starts_with("```")
+}
+
+/// Strips a trailing `\n` then a trailing `\r` from a line produced by `split_inclusive('\n')`,
+/// yielding the line content (CRLF- and LF-safe). Byte offsets are unaffected — callers keep the
+/// raw line length for offset tracking.
+fn strip_eol(line_with_nl: &str) -> &str {
+    let s = line_with_nl.strip_suffix('\n').unwrap_or(line_with_nl);
+    s.strip_suffix('\r').unwrap_or(s)
+}
+
+/// Locates the **single structural** occurrence of `[[prefix:…]]` in `body`, returning the byte
+/// span of its value.
+///
+/// The role is addressed **by type, never by position**: it may sit on the first line or the
+/// last, alone or among other role links. A role merely *cited* in prose or inside a fenced code
+/// block is ignored — the structural-zone rule is identical to [`extract_structural_targets`]
+/// (a line whose residue, once every `[[…]]` token is removed, is only separators/whitespace).
+///
+/// # Errors
+///
+/// - [`RoleMutationError::RoleAbsent`] if no structural occurrence exists.
+/// - [`RoleMutationError::Ambiguous`] if more than one structural occurrence exists.
+fn locate_structural_role(
+    body: &str,
+    prefix: &'static str,
+) -> Result<RoleValueSpan, RoleMutationError> {
+    /// Same separator set as [`extract_structural_targets`] (backtick excluded on purpose).
+    const SEP: &[char] = &[
+        ' ', '\t', '\u{00b7}', '\u{2022}', '|', ',', '\u{2014}', '\u{2013}', '-',
+    ];
+    let mut found: Option<RoleValueSpan> = None;
+    let mut in_fence = false;
+    let mut line_start = 0usize;
+
+    for raw_line in body.split_inclusive('\n') {
+        let content = strip_eol(raw_line);
+
+        if is_fence_line(content) {
+            in_fence = !in_fence;
+            line_start += raw_line.len();
+            continue;
+        }
+        if in_fence {
+            line_start += raw_line.len();
+            continue;
+        }
+
+        // Walk the tokens of the line, building the residue and — in parallel — the candidate
+        // span for our prefix. The span is only retained once the line is proven structural.
+        let mut residue = String::new();
+        let mut candidate: Option<RoleValueSpan> = None;
+        let mut line_matches = 0usize; // structural-role matches of `prefix` on THIS line
+        let mut rest = content;
+        let mut cursor = line_start; // absolute byte offset of `rest[0]` in `body`
+        let mut has_token = false;
+        while let Some(open) = rest.find("[[") {
+            residue.push_str(&rest[..open]);
+            let token_abs = cursor + open;
+            let after_open = &rest[open + 2..];
+            if let Some(end) = after_open.find("]]") {
+                has_token = true;
+                let inner = &after_open[..end];
+                // Structural identity is the TRIMMED inner (parity with extract_structural_targets).
+                let (p, _) = split_prefix(inner.trim());
+                if p == prefix {
+                    line_matches += 1;
+                    // Value span: bytes after the FIRST `:` of the RAW inner, up to `]]`.
+                    if let Some(colon) = inner.find(':') {
+                        let inner_abs = token_abs + 2;
+                        candidate = Some(RoleValueSpan {
+                            value_start: inner_abs + colon + 1,
+                            value_end: inner_abs + inner.len(),
+                        });
+                    }
+                }
+                let consumed = open + 2 + end + 2;
+                cursor += consumed;
+                rest = &rest[consumed..];
+            } else {
+                // Unterminated `[[` — the remainder is text, not a link.
+                residue.push_str(rest);
+                rest = "";
+                break;
+            }
+        }
+        residue.push_str(rest);
+
+        let structural = has_token && residue.chars().all(|c| SEP.contains(&c));
+        if structural && let Some(span) = candidate {
+            // A valid card carries at most one structural occurrence of a typed role. Two on the
+            // SAME line (`line_matches > 1`) or one already seen on a PRIOR line (`found`) are both
+            // ambiguous — refuse to guess which to mutate (parity between intra- and inter-line).
+            if found.is_some() || line_matches > 1 {
+                return Err(RoleMutationError::Ambiguous { prefix });
+            }
+            found = Some(span);
+        }
+
+        line_start += raw_line.len();
+    }
+
+    found.ok_or(RoleMutationError::RoleAbsent { prefix })
+}
+
+/// Mutates the value of a single typed role in a project-map card body **in place**.
+///
+/// The role is located **by type, not by position** (see `locate_structural_role`); its value
+/// is replaced and **every other byte of `body` is left identical** — brackets, prefix, colon,
+/// separators, prose and fenced blocks all untouched. This is the core guarantee: the client
+/// never reconstructs the body, so no paragraph can be lost.
+///
+/// `new_value` is validated by re-parsing `"<prefix>:<new_value>"` through the link parser
+/// ([`parse_link`]); a value that does not yield the target role's variant is refused.
+///
+/// # Errors
+///
+/// - [`RoleMutationError::InvalidNewValue`] if `new_value` is not a valid value for `role`.
+/// - [`RoleMutationError::RoleAbsent`] if the role is absent from the structural zone.
+/// - [`RoleMutationError::Ambiguous`] if more than one structural occurrence exists.
+#[must_use = "the mutated body must be persisted or the mutation is lost"]
+pub fn mutate_typed_role(
+    body: &str,
+    role: MutableRole,
+    new_value: &str,
+) -> Result<String, RoleMutationError> {
+    let prefix = role.wire_prefix();
+
+    // (1) Validate the new value at the frontier: the candidate link must parse into the
+    //     target role's variant. Refuses off-taxonomy values, wrong shapes, empty values.
+    let candidate = format!("{prefix}:{new_value}");
+    match parse_link(&candidate) {
+        Ok(link) if role.matches_variant(&link) => {}
+        _ => {
+            return Err(RoleMutationError::InvalidNewValue {
+                prefix,
+                value: new_value.to_string(),
+            });
+        }
+    }
+
+    // (2) Locate the single structural occurrence and splice the value bytes only.
+    let span = locate_structural_role(body, prefix)?;
+    let mut out =
+        String::with_capacity(body.len() - (span.value_end - span.value_start) + new_value.len());
+    out.push_str(&body[..span.value_start]);
+    out.push_str(new_value);
+    out.push_str(&body[span.value_end..]);
+    Ok(out)
+}
+
+/// `true` when `line` (stripped of newline / `\r`) is a Markdown heading naming the `Historique`
+/// section (`## Historique`, `### Historique : …`, case-insensitive on the word).
+fn is_historique_heading(line: &str) -> bool {
+    let t = line.trim_start();
+    let hashes = t.chars().take_while(|c| *c == '#').count();
+    if hashes == 0 {
+        return false;
+    }
+    // '#' is ASCII (1 byte) → the char count equals the byte offset.
+    t[hashes..]
+        .trim_start()
+        .to_lowercase()
+        .starts_with("historique")
+}
+
+/// `true` when `line` (stripped of newline / `\r`) opens any Markdown heading.
+fn is_any_heading(line: &str) -> bool {
+    line.trim_start().starts_with('#')
+}
+
+/// Rejects a client-provided history line that would smuggle a structural role into a card.
+///
+/// [`append_history_line`] is a pure byte insertion — it never parses its input. A line containing
+/// the structural-role opener `[[` would therefore be spliced verbatim, letting a privileged
+/// writer inject a bare `[[status:DONE]]` (or any role) through the history path — exactly what
+/// the in-place mutation contract forbids the client to do. The downstream `validate_card_body` safety net would still reject a
+/// malformed result, but the invariant *"this path never injects a structural role"* must hold
+/// **upstream**, before any byte is spliced. Rejection (rather than escaping) keeps the resulting
+/// body unambiguous and the contract simple.
+///
+/// # Errors
+///
+/// - [`RoleMutationError::HistoryLineInvalid`] if `line` contains the `[[` opener.
+pub fn validate_history_line(line: &str) -> Result<(), RoleMutationError> {
+    if line.contains("[[") {
+        return Err(RoleMutationError::HistoryLineInvalid);
+    }
+    Ok(())
+}
+
+/// Appends a client-provided `line` to the card's `Historique` section, creating the section at
+/// the end of the body when absent.
+///
+/// Pure byte insertion: every existing byte of `body` is preserved; only `line` (plus the
+/// minimal newline needed to separate it) is added. When the section exists, the line is inserted
+/// at the **end of the section** — just before the next heading, or at end of body. When it does
+/// not, a `## Historique` section is appended at the end.
+///
+/// Fenced code blocks are skipped when detecting headings, so a `#`-leading or `Historique`-named
+/// line inside a fence never fools the placement.
+#[must_use]
+pub fn append_history_line(body: &str, line: &str) -> String {
+    let line = line.trim_end_matches(['\n', '\r']);
+
+    // Pass 1 — find the Historique heading (outside fences).
+    let mut heading_at: Option<usize> = None;
+    let mut in_fence = false;
+    let mut offset = 0usize;
+    for raw in body.split_inclusive('\n') {
+        let content = raw.strip_suffix('\n').unwrap_or(raw).trim_end_matches('\r');
+        if is_fence_line(content) {
+            in_fence = !in_fence;
+        } else if !in_fence && is_historique_heading(content) {
+            heading_at = Some(offset);
+            break;
+        }
+        offset += raw.len();
+    }
+
+    let Some(h) = heading_at else {
+        // No section → create it at end of body.
+        let mut out = String::with_capacity(body.len() + line.len() + 20);
+        out.push_str(body.trim_end_matches('\n'));
+        out.push_str("\n\n## Historique\n\n");
+        out.push_str(line);
+        out.push('\n');
+        return out;
+    };
+
+    // Pass 2 — the section ends at the next heading after `h`, or at end of body.
+    let mut sect_end = body.len();
+    let mut in_fence = false;
+    let mut o = h;
+    let mut first = true;
+    for raw in body[h..].split_inclusive('\n') {
+        let content = raw.strip_suffix('\n').unwrap_or(raw).trim_end_matches('\r');
+        if is_fence_line(content) {
+            in_fence = !in_fence;
+        } else if !first && !in_fence && is_any_heading(content) {
+            sect_end = o;
+            break;
+        }
+        first = false;
+        o += raw.len();
+    }
+
+    // Minimal byte insertion at the section boundary.
+    let need_leading_nl = !body[..sect_end].ends_with('\n');
+    let mut out = String::with_capacity(body.len() + line.len() + 2);
+    out.push_str(&body[..sect_end]);
+    if need_leading_nl {
+        out.push('\n');
+    }
+    out.push_str(line);
+    out.push('\n');
+    out.push_str(&body[sect_end..]);
+    out
+}
+
+#[cfg(test)]
+mod mutate_role_tests {
+    use super::{
+        MutableRole, RoleMutationError, append_history_line, mutate_typed_role,
+        validate_history_line,
+    };
+
+    /// A representative "large" card: multi-paragraph body, roles on the FIRST line, an
+    /// Historique section, and a fenced code block that *cites* the status role syntax.
+    const BIG_CARD: &str = "[[feature:F-153]] [[project:gradatum]] [[status:OPEN]] \
+[[kind:FEATURE]] [[release:planned]] [[track:gradatum/2.3.0]]
+
+# Mutation de rôle ciblée
+
+Un long paragraphe qui décrit le besoin métier. Il contient volontairement le mot status
+et une citation en prose de `[[status:DONE]]` pour vérifier qu'elle n'est jamais mutée.
+
+```text
+Exemple documenté : [[status:BLOCKED]] ne doit pas être touché dans un fence.
+```
+
+Un second paragraphe, avec des accents éàü et de la ponctuation — pour l'octet-identité.
+
+## Historique
+
+- 2026-09-01 : CREATED OPEN
+";
+
+    #[test]
+    fn status_mutation_is_byte_identical_except_the_role_value() {
+        let out = mutate_typed_role(BIG_CARD, MutableRole::Status, "DONE").expect("mutation OK");
+        let expected = BIG_CARD.replacen("[[status:OPEN]]", "[[status:DONE]]", 1);
+        assert_eq!(out, expected, "seule la valeur du rôle status change");
+        // La citation en prose et le fence sont intacts.
+        assert!(out.contains("`[[status:DONE]]`"), "prose inchangée");
+        assert!(out.contains("[[status:BLOCKED]]"), "fence inchangé");
+    }
+
+    #[test]
+    fn version_axis_track_mutation_replaces_only_the_value() {
+        let out =
+            mutate_typed_role(BIG_CARD, MutableRole::Track, "gradatum/2.4.0").expect("mutation OK");
+        let expected = BIG_CARD.replacen("[[track:gradatum/2.3.0]]", "[[track:gradatum/2.4.0]]", 1);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn role_on_the_last_line_is_mutated_typed_not_positional() {
+        // Rôles en FIN de document (position opposée à BIG_CARD).
+        let card = "# Titre\n\nDu texte de corps.\n\n## Historique\n\n- note\n\n\
+[[feature:F-9]] [[project:gradatum]] [[status:IN_PROGRESS]] [[kind:FIX]] [[release:planned]] [[version:gradatum/backlog]]\n";
+        let out = mutate_typed_role(card, MutableRole::Status, "DONE").expect("mutation OK");
+        assert_eq!(
+            out,
+            card.replacen("[[status:IN_PROGRESS]]", "[[status:DONE]]", 1)
+        );
+    }
+
+    #[test]
+    fn absent_role_is_refused_never_created() {
+        // Carte sans rôle visibilite.
+        let err = mutate_typed_role(BIG_CARD, MutableRole::Version, "gradatum/2.4.0")
+            .expect_err("aucun [[version:]] structurel → refus");
+        assert_eq!(err, RoleMutationError::RoleAbsent { prefix: "version" });
+    }
+
+    #[test]
+    fn role_only_cited_in_prose_or_fence_counts_as_absent() {
+        let card =
+            "# Carte\n\nProse citant `[[release:dropped]]`.\n\n```\n[[release:planned]]\n```\n";
+        let err = mutate_typed_role(card, MutableRole::Release, "released")
+            .expect_err("aucune occurrence structurelle");
+        assert_eq!(err, RoleMutationError::RoleAbsent { prefix: "release" });
+    }
+
+    #[test]
+    fn invalid_new_value_is_refused() {
+        // "done" minuscule n'est pas un StatusKind (wire SCREAMING_SNAKE).
+        let err = mutate_typed_role(BIG_CARD, MutableRole::Status, "done")
+            .expect_err("valeur hors taxonomie");
+        assert_eq!(
+            err,
+            RoleMutationError::InvalidNewValue {
+                prefix: "status",
+                value: "done".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn multiple_structural_occurrences_are_ambiguous() {
+        let card = "[[status:OPEN]]\n\n[[status:DONE]]\n";
+        let err = mutate_typed_role(card, MutableRole::Status, "BLOCKED")
+            .expect_err("deux occurrences structurelles");
+        assert_eq!(err, RoleMutationError::Ambiguous { prefix: "status" });
+    }
+
+    #[test]
+    fn two_same_type_roles_on_one_line_is_ambiguous() {
+        // Deux rôles du MÊME type sur une SEULE ligne structurelle : la garde d'ambiguïté doit
+        // opérer au niveau TOKEN, pas seulement inter-lignes — sinon le dernier écrase le premier
+        // en silence et le 2ᵉ est muté au lieu d'un refus.
+        let card = "[[status:OPEN]] [[status:DONE]]\n";
+        let err = mutate_typed_role(card, MutableRole::Status, "BLOCKED")
+            .expect_err("deux status sur une ligne → ambigu");
+        assert_eq!(err, RoleMutationError::Ambiguous { prefix: "status" });
+    }
+
+    #[test]
+    fn history_line_with_structural_marker_is_refused() {
+        // Une history_line ne peut jamais injecter un rôle structurel bare : `[[` est refusé en
+        // amont d'append_history_line (invariant F-153 « jamais injecter un rôle structurel »),
+        // avant tout splice — la carte reste donc intacte.
+        let err = validate_history_line("- 2026-09-06 : bascule [[status:DONE]] en douce")
+            .expect_err("marqueur structurel dans la ligne d'historique");
+        assert_eq!(err, RoleMutationError::HistoryLineInvalid);
+        // Une ligne d'historique légitime passe sans erreur.
+        validate_history_line("- 2026-09-06 : status OPEN→DONE (F-153)").expect("ligne saine OK");
+    }
+
+    #[test]
+    fn from_wire_refuses_identity_and_unknown_roles() {
+        assert_eq!(
+            MutableRole::from_wire("feature"),
+            Err(RoleMutationError::ImmutableIdentity("feature".to_string()))
+        );
+        assert_eq!(
+            MutableRole::from_wire("project"),
+            Err(RoleMutationError::ImmutableIdentity("project".to_string()))
+        );
+        assert_eq!(
+            MutableRole::from_wire("supersedes"),
+            Err(RoleMutationError::UnknownRoleType("supersedes".to_string()))
+        );
+        assert_eq!(MutableRole::from_wire("status"), Ok(MutableRole::Status));
+        assert_eq!(MutableRole::from_wire("track"), Ok(MutableRole::Track));
+    }
+
+    #[test]
+    fn append_history_inserts_at_end_of_existing_section() {
+        let out = append_history_line(BIG_CARD, "- 2026-09-06 : status OPEN→DONE (F-153)");
+        // Toutes les lignes d'origine sont préservées.
+        assert!(out.contains("- 2026-09-01 : CREATED OPEN"));
+        assert!(out.contains("- 2026-09-06 : status OPEN→DONE (F-153)"));
+        // La nouvelle ligne suit l'ancienne (section = dernière du corps).
+        let old = out.find("CREATED OPEN").unwrap();
+        let new = out.find("status OPEN→DONE").unwrap();
+        assert!(new > old, "append en fin de section");
+        // Aucun octet du préambule (rôles + prose) n'a bougé.
+        assert!(out.starts_with("[[feature:F-153]] [[project:gradatum]] [[status:OPEN]]"));
+    }
+
+    #[test]
+    fn append_history_creates_section_when_absent() {
+        let card = "# Carte\n\n[[status:OPEN]]\n";
+        let out = append_history_line(card, "- 2026-09-06 : créée");
+        assert!(out.starts_with("# Carte\n\n[[status:OPEN]]\n"));
+        assert!(out.contains("## Historique"));
+        assert!(out.trim_end().ends_with("- 2026-09-06 : créée"));
+    }
+
+    #[test]
+    fn append_history_inserts_before_a_following_section() {
+        // Historique n'est PAS la dernière section : l'insertion se fait avant la suivante.
+        let card = "## Historique\n\n- a\n\n## Notes\n\ndu texte\n";
+        let out = append_history_line(card, "- b");
+        let idx_b = out.find("- b").unwrap();
+        let idx_notes = out.find("## Notes").unwrap();
+        assert!(idx_b < idx_notes, "insertion avant la section suivante");
+        assert!(
+            out.contains("## Notes\n\ndu texte\n"),
+            "section suivante intacte"
+        );
+    }
 }
 
 #[cfg(test)]

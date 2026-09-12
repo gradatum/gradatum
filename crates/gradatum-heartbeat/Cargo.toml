@@ -1,0 +1,23 @@
+[package]
+name = "gradatum-heartbeat"
+publish = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fire-and-forget fleet heartbeat client for gradatum — a fleet member announces liveness to the registry ingress"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+gradatum-dto = { workspace = true }
+reqwest    = { workspace = true }
+tokio      = { workspace = true }
+tracing    = { workspace = true }
+secrecy    = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

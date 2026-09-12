@@ -50,6 +50,9 @@ pub mod proactive_surface_store;
 #[doc(hidden)]
 pub mod read_usage_store;
 #[doc(hidden)]
+pub mod registry_ingress;
+pub mod registry_store;
+#[doc(hidden)]
 pub mod review_promote;
 #[doc(hidden)]
 pub mod scheduled_tasks;

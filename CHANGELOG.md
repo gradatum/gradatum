@@ -12,6 +12,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > file, the public release that carried its changes forward. That mapping follows the document's
 > order, not a change-by-change diff — see the `[2.0.0]` note below for a case worked out in full.
 
+## [2.3.0] — 2026-09-10
+
+> This release ships a first slice of agent-identity data (person cards) and inter-agent
+> messaging, a fleet registry with heartbeat reporting, a typed mutation endpoint for the
+> `project-map` registry, and multi-vault search. It also assumes three deliberate,
+> minor-version-scoped breaks to the Rust public API — `Job` becomes `#[non_exhaustive]`,
+> `gradatum_core::project_map::derive_release` is no longer public, and
+> `EngineConfig::warm_up` is removed — detailed in the dedicated section below.
+>
+> Tracking: F-63, F-125, F-144, F-150, F-153, F-154, F-156, F-157, F-184, F-274.
+
+### Added — person cards under `identity/person/*` (F-125)
+
+- A new descriptive data kind, distinct from an agent soul: a **person card**
+  (`identity/person/<id>`) records structured, non-executable information about a human
+  (`display_name`, `pronouns`, `category`, `collaboration_prefs`, `working_style`,
+  `context`, `timezone`, `locale`) under a strict field whitelist. Two categories are open
+  for writes in this release — `self` (the operator's own profile) and `private`
+  (relatives/close peers) — the other two (`public-figure`, `domain-actor`) are refused
+  until a dedicated review.
+- Fields carrying a GDPR Article 9 "special category" marker (health, biometric, genetic,
+  religious/political belief, sexual orientation, ethnic origin, trade-union membership,
+  disability — matched on the field *key*, not scanned inside free-text values) are refused
+  regardless of category.
+- Writing and reading a person card, and exercising the right to erasure on one (`forget` or
+  hard delete), require the dedicated `identity_write` privilege; an agent soul remains
+  protected from both operations as before. Person cards are excluded from the identity note
+  injected into an agent's boot instructions.
+
+### Added — inter-agent messaging (F-144)
+
+- A durable, single-target message queue between agents, with delivery notification over
+  SSE and acknowledgement. Sending is guarded by a sender→recipient access-control check.
+  Exposed as three new MCP tools (`message_send`, `message_poll`, `message_ack`) alongside
+  matching REST routes.
+
+### Added — fleet registry and heartbeat (F-154, F-156)
+
+- `GET /health` reports richer capability metadata. A new in-memory fleet registry tracks
+  every known component instance from periodic heartbeats and is readable over a loopback
+  endpoint; a companion push client lets each component report itself to the registry. The
+  ingress endpoint that receives heartbeats is opt-in, token-authenticated, and rate-limited.
+
+### Added — typed `project-map` role mutation (F-153)
+
+- A new `vault_mutate_role` MCP tool (and matching REST endpoint) mutates a single typed
+  role — status, kind, release, version, or track — on a `project-map` card, returning a
+  per-card verdict (never a batch-level aggregate) and enforcing optimistic locking against
+  concurrent writes.
+
+### Added — multi-vault search (F-63)
+
+- `vault_search` accepts opt-in `vault_ids` / `all_readable` parameters to search across
+  several vaults in one call. Results from every vault are merged into a single re-scored
+  ranking (reciprocal rank fusion) and carry per-result provenance; per-vault read access
+  control is enforced before results are merged.
+
+### Changed — engine `max_tokens` defaults to unlimited generation (F-150)
+
+- `gradatum-engine`'s `max_tokens` now defaults to unbounded generation (no `--n-predict`
+  flag is passed to `llama-server`) instead of a fixed cap, preserving the behaviour already
+  running in production. Setting it explicitly still injects an authoritative
+  `--n-predict <n>`; combining it with `--n-predict`/`-n` supplied through `extra_args` is
+  now rejected as a conflicting flag.
+
+### Fixed — `project-map` export leaked closed cards as `released` (F-184, F-274)
+
+- A card closed without ever reaching a real release target (carrying the internal
+  placeholder that marks "no release yet") was derived as `released` at version `0.0.0`
+  instead of `dropped`, and leaked into the public catalog export. Closed/superseded cards
+  in that state are now derived as `dropped` before the released/planned rules run; a card
+  genuinely marked done against a real version is unaffected.
+
+### Changed / Removed — BREAKING (Rust public API, minor-version-scoped)
+
+Three call-outs below intentionally break the Rust public API within a *minor* release
+rather than waiting for the next major — each is scoped to a symbol added or already
+destined for removal within this same development cycle, so no patch release could have
+carried it without itself being breaking:
+
+- **`gradatum_core::job::Job` is now `#[non_exhaustive]`** — a `Message` variant was added
+  for the new messaging transport (F-144); the enum is marked non-exhaustive so that future
+  variants stay additive. A `match` on `Job` written against an earlier release must carry a
+  wildcard arm to keep compiling.
+- **`gradatum_core::project_map::derive_release` is no longer public** (F-184) — a card's
+  `release` value has been fully server-derived from its tracking state since `2.2.0`; this
+  release closes the accidental public export of the deriving function itself. No known
+  external consumer called it.
+- **`EngineConfig::warm_up` is removed** (F-150) — the field had no effect. A configuration
+  file that still sets it continues to load unchanged (the key is simply ignored), so no
+  operator action is required.
+
 ## [2.2.0] — 2026-09-04
 
 > Cette version change le **contrat d'écriture** du registre `project-map` (F-184, F-213, F-256)

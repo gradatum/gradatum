@@ -137,6 +137,82 @@ expression: schema_map
     "title": "JobStatusRequest",
     "type": "object"
   },
+  "message_ack": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Input of `message_ack` — the message id to acknowledge.",
+    "properties": {
+      "message_id": {
+        "description": "Server-allocated message identifier (ULID).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "message_id"
+    ],
+    "title": "MessageAckRequest",
+    "type": "object"
+  },
+  "message_poll": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Input parameters of `message_poll` (MCP tool + REST query mirror).\n\nEvery field is optional: `status` filters the mailbox (`accepted` (default) |\n`delivered`), `limit` caps the page, `cursor` paginates.",
+    "properties": {
+      "cursor": {
+        "description": "Opaque pagination cursor returned by a previous poll.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "limit": {
+        "description": "Page size cap (server default 50).",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "status": {
+        "description": "Delivery-state filter (`accepted` | `delivered`); absent → `accepted`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "title": "MessagePollParams",
+    "type": "object"
+  },
+  "message_send": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Client request body for `message_send` / `POST /api/v1/messages`.\n\nThe sender identity is intentionally **absent**: it is derived by the server\nfrom the request credential. `recipient_identity` is the single target; the\nserver enforces the emit policy (C4) before anything is persisted.",
+    "properties": {
+      "body": {
+        "description": "Message content.",
+        "type": "string"
+      },
+      "recipient_identity": {
+        "description": "Recipient identity (`identity/<kind>/<id>`).",
+        "type": "string"
+      },
+      "subject": {
+        "description": "Optional short subject (absent → `null`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "recipient_identity",
+      "body"
+    ],
+    "title": "MessageSendRequest",
+    "type": "object"
+  },
   "vault_archives_list": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
@@ -798,6 +874,66 @@ expression: schema_map
     "title": "VaultListRequest",
     "type": "object"
   },
+  "vault_mutate_role": {
+    "$defs": {
+      "MutateRoleItem": {
+        "description": "A single role mutation targeting one project-map card.",
+        "properties": {
+          "expected_sha256": {
+            "description": "Expected SHA-256 (64 lowercase hex) of the card being mutated — the per-card optimistic\nlock. A stale value fails **this** card with a `conflict` verdict, never the whole batch.",
+            "type": "string"
+          },
+          "history_line": {
+            "default": null,
+            "description": "Optional history line appended to the card's `Historique` section (created if absent).\nOmitted or empty → no history entry is added.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "new_value": {
+            "description": "New value of the role (e.g. `DONE` for `status`, `gradatum/2.4.0` for `track`). Validated\nserver-side by re-parsing `<role_type>:<new_value>`; an off-taxonomy value is refused.",
+            "type": "string"
+          },
+          "note_id": {
+            "description": "Bare ULID of the card to mutate (never a `section/ULID`, title or slug).",
+            "type": "string"
+          },
+          "role_type": {
+            "description": "Typed role to mutate: one of `status` / `kind` / `release` / `version` / `track`.\n\n`feature` / `project` are refused (card identity, immutable); any other token is refused\nas an unknown role type.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "note_id",
+          "role_type",
+          "new_value",
+          "expected_sha256"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request body for `vault_mutate_role` — always a list (a unitary mutation is a one-element\nlist), so the per-card-verdict contract holds uniformly.",
+    "properties": {
+      "mutations": {
+        "description": "The mutations to apply — 1..N. Each yields its own verdict.",
+        "items": {
+          "$ref": "#/$defs/MutateRoleItem"
+        },
+        "type": "array"
+      },
+      "tenant_id": {
+        "description": "Target tenant (principal) — optional; when omitted the server resolves it from the\ncredential identity (JWT/API-key), never `\"main\"` by default. Applies to every card in\nthe batch.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "mutations"
+    ],
+    "title": "MutateRoleRequest",
+    "type": "object"
+  },
   "vault_proactive_recall": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
@@ -928,6 +1064,11 @@ expression: schema_map
     "additionalProperties": false,
     "description": "Request body for `vault_search`.\n\n## Optional fields (backward-compatible)\n\n- `locus`: filter by physical path prefix (e.g. `\"council/\"` restricts to notes\n  whose `locus` starts with `council/`). Applied to both FTS and semantic paths.\n  The prefix is escaped against LIKE injection (metacharacters `%`, `_`, `\\`).\n- `vault_id`: cross-vault read — allows querying a vault other than `tenant_id`.\n  Writes remain unchanged (single-tenant). Validation: non-empty, max 128 chars.",
     "properties": {
+      "all_readable": {
+        "default": false,
+        "description": "Opt-in multi-vault: read ALL vaults readable by the principal, with global RRF\nre-scoring. Default `false` → own vault only.\n\nSame silent-exclusion semantics and `MAX_VAULTS_PER_SEARCH` cap as `vault_ids`\n(a set beyond the cap → `400`, the caller must enumerate). Honored only when\n`multi_tenant.enabled = true`. Mutually exclusive with the singular `vault_id`\nfield.",
+        "type": "boolean"
+      },
       "compact": {
         "default": false,
         "description": "If `true`, the server returns a **compact** rendering instead of the full\n`VaultSearchResponse`: an object `{ \"compact\": \"<text>\" }` where the text lists\neach hit as `<ulid> [<score>]` plus the `corpus_match_count` absence-proof hint.\n\nOptimises token cost for LLM consumers (the compaction is a product feature,\nnot transport). Preserves the lexical-absence reasoning with the three-state\ndistinction of the `include_corpus_count` field: a proven *lexical* absence\n(which does not disprove the returned results) is rendered differently from a\ncount that is *not applicable* to a punctuation-only query.\n\nOpt-in (default `false`): when absent, the response is **byte-for-byte identical**\nto the historical `VaultSearchResponse`. Existing clients are unaffected.",
@@ -1008,6 +1149,16 @@ expression: schema_map
         "description": "vault to query in read mode (optional).\n\nLifts the single-tenant constraint **for reads only** — allows querying\na vault other than `tenant_id`. Writes remain unchanged.\nValidation: non-empty, max 128 chars.\n\nAbsent or `null`: uses `tenant_id` (unchanged behavior).",
         "type": [
           "string",
+          "null"
+        ]
+      },
+      "vault_ids": {
+        "description": "Opt-in multi-vault: read the union of THESE vaults in addition to the\nprincipal's own vault, with global RRF re-scoring; each hit carries its\n`vault_id` provenance. `None` (default) → own vault only, response\n**byte-identical** to the historical shape.\n\nA requested vault that is not authorized (no covering read grant, target ACL\ndeny, or inactive target tenant) is **silently excluded**: never a `403`, no\nobservable distinction between \"vault does not exist\" and \"vault not authorized\"\n(no existence oracle).\n\nHonored only when `multi_tenant.enabled = true`. Mutually exclusive with the\nsingular `vault_id` field (supplying both → `400 Bad Request`). The resolved set\nis capped at `MAX_VAULTS_PER_SEARCH` (overflow → `400`, never silent\ntruncation).",
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
           "null"
         ]
       }

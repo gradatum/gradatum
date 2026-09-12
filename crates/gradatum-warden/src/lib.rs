@@ -38,6 +38,12 @@ pub mod layer;
 pub mod rate;
 pub mod service;
 
+// F-157 — configuration wiring guard. In-crate (not `tests/`) because
+// `WardenConfig` is `#[non_exhaustive]`: an exhaustive destructuring — the guard's
+// compile-time completeness branch — is only permitted within the defining crate.
+#[cfg(test)]
+mod config_wiring;
+
 pub use config::WardenConfig;
 pub use error::{WardenDecision, WardenError};
 pub use layer::WardenLayer;

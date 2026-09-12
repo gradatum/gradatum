@@ -234,6 +234,7 @@ impl InternalClient for MockInternalClient {
             sha256_hex: note.content_hash.hex(),
             body: note.body.markdown.clone(),
             section: note.frontmatter.section.as_str().to_string(),
+            title: None,
             status: note.frontmatter.status.to_string(),
             tags: note
                 .frontmatter

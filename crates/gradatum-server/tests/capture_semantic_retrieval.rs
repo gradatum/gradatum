@@ -350,6 +350,7 @@ impl InternalClient for CaptureTestClient {
             sha256_hex: note.content_hash.hex(),
             body: note.body.markdown,
             section: section_to_str(note.frontmatter.section),
+            title: None,
             status: status_to_str(note.frontmatter.status),
             tags: note
                 .frontmatter

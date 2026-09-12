@@ -805,6 +805,38 @@ pub trait IndexStore: Send + Sync {
         cursor: Option<&str>,
     ) -> Result<(Vec<NoteRecord>, u64), GradatumError>;
 
+    /// Lists message-note records across an ACL allow-list of vaults.
+    ///
+    /// Mailbox read primitive of the inter-agent messaging transport. The caller has
+    /// **already attested each vault** of `vault_ids` via [`AclCheckedVaultId`]; this
+    /// method only runs the SQL, filtering one recipient channel **before** any
+    /// projection: `vault_id IN (allowlist)` + `section = 'messaging'` +
+    /// `locus = 'messaging/<recipient>'`. An **empty** `vault_ids` returns an empty
+    /// result without touching the DB (fail-closed, ghost principal → nothing, C2).
+    /// Each returned record carries its `vault_id` (provenance, C2).
+    ///
+    /// Same `NoteRecord` projection and ULID-cursor pagination as
+    /// [`Self::list_notes`]; `recipient` is the credited identity
+    /// (`identity/<kind>/<id>`).
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok((vec![], 0))` — only the real SQLite index produces results; test
+    /// mocks inherit the default unchanged (same pattern as [`Self::list_notes_by_section`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    async fn list_messaging_notes(
+        &self,
+        _vault_ids: &[String],
+        _recipient: &str,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        Ok((Vec::new(), 0))
+    }
+
     /// Atomically allocates the next **feature number** for `vault_id`.
     ///
     /// Returns a number that is guaranteed unique across concurrent callers: the backing
@@ -1380,6 +1412,37 @@ pub trait IndexStore: Send + Sync {
         _vault_id: &str,
         _note_id: &str,
     ) -> Result<Option<String>, GradatumError> {
+        Ok(None)
+    }
+
+    /// Co-resolves a note's `(section, title)` **protection key** from a single
+    /// authoritative index row.
+    ///
+    /// This is the single resolver used at every mutation site
+    /// (`cascade_delete_note`, the `vault_forget` preview) to feed the path-aware
+    /// guards [`crate::section::Section::is_forget_protected`] /
+    /// [`crate::section::Section::is_delete_protected`]. Reading `section` and
+    /// `title` from the **same row** is what makes the person-card carve-out
+    /// drift-free — the pair can never describe two different notes, unlike a
+    /// section taken from a stale candidate list.
+    ///
+    /// Returns `Some((section, title))` if the note exists (title coalesced to an
+    /// empty string when the column is `NULL`), `None` otherwise. Callers treat
+    /// `None` as fail-closed (protected) on the forget path.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` — backend without an indexed protection key (neutral
+    /// no-op). `SqliteIndex` overrides with the real read.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the query fails.
+    async fn get_note_protection_key(
+        &self,
+        _vault_id: &str,
+        _note_id: &str,
+    ) -> Result<Option<(String, String)>, GradatumError> {
         Ok(None)
     }
 
