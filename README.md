@@ -186,6 +186,7 @@ Gradatum is built in three chapters: **memory first, then agents, then the sover
 | **v2.1.0** | ✅ shipped | SemVer since v1.0.0, with documented exceptions. v2.1.0 is a minor release that removes public API surface in four crates (`gradatum-core`, `gradatum-engine`, `gradatum-index`, `gradatum-queue`); every removal is inventoried in the release manifest and matched against the previous release in CI. sqlx retired from the entire workspace dependency graph — replaced by rusqlite in the auth, ACL, and job-queue stores; SQLite engine `3.46.0` → `3.53.2`. Legacy `jobs_v2` queue path removed; `compute_distill_trust` moved to the new `gradatum-distill` crate. Read the [2.0.0 → 2.1.0 upgrade guide](docs/UPGRADING-2.0.0-to-2.1.0.md) before moving. |
 | **v2.2.0** | ✅ shipped | The `project-map` registry write contract changes: a version milestone becomes a structure card and `release` is no longer stored but derived server-side from card status. The Rust public API is additive only (80 additions, 0 removals, all under `#[non_exhaustive]`), so the breaking changes affect `project-map` registry operators, not library consumers. Read the [2.1.0 → 2.2.0 upgrade guide](docs/UPGRADING-2.1.0-to-2.2.0.md) before moving. |
 | **v2.3.0** | ✅ shipped | First slice of agent-identity data — person cards under `identity/person/*` — plus durable inter-agent messaging, an in-memory fleet registry fed by a token-authenticated heartbeat ingress, a typed `project-map` role-mutation endpoint, and multi-vault search. Three deliberate, minor-scoped Rust public-API breaks: `Job` becomes `#[non_exhaustive]`, `derive_release` is no longer public, and `EngineConfig::warm_up` is removed. |
+| **v2.4.0** | ✅ shipped | Personal-data marking mechanism (F-160) ships inert: a write-time detection pass runs `report_only` with no category activated by default, so nothing is marked out of the box. ACL `read_patterns` are now deny-by-default, and the `personal-classified` refusal is expressed as a path-segment negation rather than a dedicated flag. The 2.3.1 → 2.4.0 upgrade is exercised end to end by an automated harness on every push and by the release gate. Container packaging ships — a multi-stage Docker image with OCI labels and a measured `HEALTHCHECK` start period. Read the [2.3.1 → 2.4.0 upgrade guide](docs/UPGRADING-2.3.1-to-2.4.0.md) before moving. |
 | — | ⬜ planned | Agent runtime — terminal agent that reasons over the codebase using the vault as its memory. No version is committed to it yet. |
 
 > **What the Status column means.** ✅ *shipped* = the milestone is complete in this repository
@@ -205,6 +206,20 @@ Gradatum is built in three chapters: **memory first, then agents, then the sover
 Condensed — the authoritative, detailed log for every version lives in
 **[CHANGELOG.md](CHANGELOG.md)**.
 
+- **v2.4.0** — **Personal-data marking mechanism** (F-160) ships inert: a write-time detection
+  pass runs `report_only` with an empty category list by default, so a fresh install scans
+  nothing until an operator opts in. A note found positive under an activated category carries
+  `personal-classified`, which removes it from the *results* of search, listing, the link graph,
+  the chronology and recall for a consumer who may not read it — it stays directly readable by
+  anyone who can already name it. The marker clears on a later clean pass, or through a new
+  administrative `vault_privacy_review` endpoint, the only other path back out. **ACL
+  `read_patterns` are now deny-by-default** — a consumer whose patterns hold only negations (or
+  none) reads nothing — and the `personal-classified` refusal is expressed as a path-segment
+  negation (`!personal-classified`, `!**/personal-classified/**`) rather than a dedicated flag.
+  The 2.3.1 → 2.4.0 upgrade is exercised end to end by an automated harness — schema, listing,
+  search, card export and record counts at zero tolerance — on every push and by the release
+  gate. Container packaging ships: a multi-stage Docker image with OCI labels and a measured
+  `HEALTHCHECK` start period. 28 of 34 workspace crates are published on crates.io.
 - **v2.3.0** — First slice of agent-identity data: **person cards** (`identity/person/*`) record
   structured, non-executable information about a human under a strict field whitelist, with GDPR
   Article 9 markers refused and two categories (`self`, `private`) open for writes. Durable,
