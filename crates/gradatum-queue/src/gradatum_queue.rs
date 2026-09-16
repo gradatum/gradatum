@@ -85,6 +85,22 @@ impl QueueStore for GradatumQueue {
         self.inner.get(id, tenant_filter).await
     }
 
+    /// Override the default trait impl — forwards to `SqliteQueueStore::get_many`, which
+    /// answers a whole batch in one query per 998 identifiers.
+    ///
+    /// The default trait impl loops over [`QueueStore::get`], i.e. one queue read per
+    /// identifier — exactly the N+1 the batched read exists to remove. Relying on
+    /// it here would make the module's claim ("every method delegates to
+    /// `SqliteQueueStore`") false the day a scan goes through the facade, with no test
+    /// turning red.
+    async fn get_many(
+        &self,
+        ids: &[Ulid],
+        tenant_filter: Option<&str>,
+    ) -> Result<Vec<JobRecord>, QueueError> {
+        self.inner.get_many(ids, tenant_filter).await
+    }
+
     async fn complete(&self, id: Ulid, result: JobResult) -> Result<(), QueueError> {
         self.inner.complete(id, result).await
     }
@@ -156,6 +172,7 @@ mod tests {
     use super::*;
     use gradatum_core::*;
     use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, apply_sqlite_pragmas, run_migrations};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use ulid::Ulid;
 
     /// Crée un `GradatumQueue` sur une base SQLite in-memory avec migrations appliquées.
@@ -249,6 +266,101 @@ mod tests {
         assert_eq!(
             got_embed.id, embed_id,
             "dequeue_by_kind(Embed) doit retourner le job Embed"
+        );
+    }
+
+    // ── get_many — lecture groupée, jamais N `get` ────────────────────────────
+
+    /// Compteur de statements SQL exécutés sur la connexion de la file.
+    ///
+    /// `Connection::trace_v2` n'accepte qu'un pointeur de fonction — pas de fermeture
+    /// capturante : l'état est donc un statique de processus. Seule la connexion qui a
+    /// installé le hook l'incrémente, et un seul test l'installe.
+    static SQL_STATEMENTS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_sql_statement(_event: rusqlite::trace::TraceEvent<'_>) {
+        SQL_STATEMENTS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// `GradatumQueue::get_many` délègue à `SqliteQueueStore::get_many` : N ids coûtent
+    /// UNE lecture de file, pas N `get`.
+    ///
+    /// La façade détient un `SqliteQueueStore` **concret** : aucun double de `QueueStore`
+    /// ne peut s'intercaler entre `GradatumQueue::get_many` et le store sous-jacent pour
+    /// compter les appels. Le seul point d'observation est la connexion SQLite partagée
+    /// (`QueueDb::with_conn`, puis `Connection::trace_v2`) : c'est le nombre de statements
+    /// exécutés — précisément ce que le défaut du trait multiplie.
+    ///
+    /// Le contrôle en tête de test établit que le compteur SAIT distinguer les deux
+    /// chemins : N `get` coûtent N statements (le prix du défaut du trait), là où la
+    /// délégation groupée en coûte un.
+    #[tokio::test]
+    async fn get_many_delegates_one_batched_read_for_n_ids() {
+        let db = QueueDb::open_in_memory()
+            .await
+            .expect("db in-memory doit créer");
+        apply_sqlite_pragmas(&db)
+            .await
+            .expect("pragmas WAL doivent s'appliquer");
+        run_migrations(&db)
+            .await
+            .expect("migrations doivent s'appliquer");
+        db.with_conn(|conn| {
+            conn.trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(count_sql_statement),
+            );
+            Ok(())
+        })
+        .await
+        .expect("le hook de trace doit s'installer");
+
+        let queue = GradatumQueue::new(SqliteQueueStore::new(db));
+
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(
+                queue
+                    .enqueue(make_record_for_test(
+                        Job::Curate(CurateSpec::default()),
+                        JobClass::Agent,
+                        JobStatus::Pending,
+                    ))
+                    .await
+                    .expect("enqueue doit réussir"),
+            );
+        }
+
+        // Contrôle : le chemin NON groupé, celui du défaut du trait.
+        SQL_STATEMENTS.store(0, Ordering::SeqCst);
+        for id in &ids {
+            let fetched = queue
+                .get(*id, None)
+                .await
+                .expect("get doit déléguer sans erreur");
+            assert!(fetched.is_some(), "le job {id} doit être relu par `get`");
+        }
+        assert_eq!(
+            SQL_STATEMENTS.load(Ordering::SeqCst),
+            ids.len(),
+            "un `get` par id coûte un statement par id — c'est le N+1 que F-279 supprime"
+        );
+
+        // Sujet : la façade doit prendre le chemin groupé sur la MÊME longueur d'entrée.
+        SQL_STATEMENTS.store(0, Ordering::SeqCst);
+        let got = queue
+            .get_many(&ids, None)
+            .await
+            .expect("get_many doit déléguer sans erreur");
+        assert_eq!(
+            got.iter().map(|r| r.id).collect::<Vec<_>>(),
+            ids,
+            "N ids demandés ⇒ N rendus, dans l'ordre demandé"
+        );
+        assert_eq!(
+            SQL_STATEMENTS.load(Ordering::SeqCst),
+            1,
+            "N ids ⇒ UNE lecture groupée : la façade ne retombe pas sur le défaut du trait (N `get`)"
         );
     }
 

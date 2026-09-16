@@ -158,6 +158,7 @@ pub async fn gradatum_engine::supervisor::LlamaServerSupervisor::spawn_child(&se
 pub async fn gradatum_engine::supervisor::LlamaServerSupervisor::supervise_loop(alloc::sync::Arc<Self>, alloc::sync::Arc<gradatum_engine::health::HealthState>, core::option::Option<std::time::Instant>)
 pub async fn gradatum_engine::supervisor::LlamaServerSupervisor::wait_ready(&self, &gradatum_engine::health::HealthState) -> gradatum_engine::supervisor::ChildState
 pub fn gradatum_engine::supervisor::canonicalize_bin_path(&std::path::Path) -> core::result::Result<std::path::PathBuf, gradatum_engine::error::EngineError>
+pub fn gradatum_engine::supervisor::config_arg_conflicts(&gradatum_engine::config::EngineConfig) -> alloc::vec::Vec<alloc::string::String>
 pub fn gradatum_engine::supervisor::inject_allowed_env(&mut tokio::process::Command)
 pub fn gradatum_engine::supervisor::validate_bin_path(&std::path::Path) -> core::result::Result<(), gradatum_engine::error::EngineError>
 pub fn gradatum_engine::supervisor::validate_extra_args(&[alloc::string::String]) -> core::result::Result<(), gradatum_engine::error::EngineError>

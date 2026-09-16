@@ -139,6 +139,16 @@ pub struct ServerConfig {
     /// un résolveur `_for` dédié ; ne pas généraliser avant un besoin per-vault réel.
     #[serde(default)]
     pub per_vault: std::collections::HashMap<String, PerVaultOverride>,
+
+    /// Frontière de détection de données personnelles (F-160). Défaut : aucun
+    /// détecteur monté (`[privacy]` absent ou `categories` vide ⇒ `NoopDetector`),
+    /// donc comportement d'écriture inchangé, octet pour octet.
+    ///
+    /// Wired: `AppState::with_privacy` puis `with_vault_path` dans `main.rs` — le
+    /// montage a lieu à la construction du vault, donc `with_privacy` doit précéder
+    /// `with_vault_path`.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 }
 
 /// Override de configuration pour un vault donné (A6, YAGNI minimal).
@@ -166,6 +176,178 @@ pub struct MultiTenantConfig {
     /// cross-vault (C2) — ce flag reste OFF partout en production sur le train C1.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Mode of the personal-data frontier (F-160).
+///
+/// `ReportOnly` observes and marks; `Mask` rewrites the body. 2.4.0 only ever runs
+/// in `ReportOnly`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyMode {
+    /// Detect and report, never alter the body. The delivered default.
+    #[default]
+    ReportOnly,
+    /// Detect and rewrite the matched passages. Not reachable in 2.4.0.
+    Mask,
+}
+
+impl PrivacyMode {
+    /// Canonical `snake_case` label of this mode — the wire value the configuration uses.
+    ///
+    /// The inverse of the serde representation, and the form the health report publishes:
+    /// an operator reading `/health/detailed` and one reading `server.toml` must be
+    /// reading the same word. Written out rather than derived from `Debug`, so a rename of
+    /// the variant cannot silently change a published value.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReportOnly => "report_only",
+            Self::Mask => "mask",
+        }
+    }
+}
+
+/// Per-category detection thresholds, in integer thousandths (`0..=1000`).
+///
+/// The unit is the same as the one written to a note's frontmatter, so no float
+/// ever crosses a serialisation boundary. `0` means **not calibrated** and enables
+/// nothing — it is not "everything passes".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrivacyThresholds {
+    /// Threshold applied to a category that has no entry of its own.
+    /// Parsed but not yet wired (2.5.0): no threshold reaches the delivered detector.
+    #[serde(default)]
+    pub default_m: u16,
+    /// Per-category overrides, keyed by the canonical category label.
+    /// Parsed but not yet wired (2.5.0): no threshold reaches the delivered detector.
+    #[serde(flatten)]
+    pub per_category: std::collections::BTreeMap<String, u16>,
+}
+
+/// Personal-data detection frontier (F-160) — mirror of the `[privacy]` block.
+///
+/// ## Default: nothing is mounted
+///
+/// With no `[privacy]` block, or with an empty `categories`, the write path mounts
+/// the do-nothing detector: a note is written exactly as it was before this
+/// frontier existed. A detector is mounted only on an explicit, non-empty
+/// `categories` list.
+///
+/// ## Why `Debug` is written by hand
+///
+/// The exception patterns are literal snippets of personal data by nature, and
+/// `server.toml` travels into an unencrypted backup: a derived `Debug` would print
+/// them into any log line that renders the configuration. The manual rendering
+/// states that exceptions exist, never what they are.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PrivacyConfig {
+    /// `report_only` (default) or `mask`. Only `report_only` is delivered in 2.4.0:
+    /// a configuration that sets `mask` is refused at load
+    /// (see [`ServerConfig::validate_privacy_mode`]). In-place masking is not yet
+    /// wired (2.5.0) — the value is validated, never consumed by a masking path.
+    #[serde(default)]
+    pub mode: PrivacyMode,
+    /// Enabled categories. **Empty by default**: a category is enabled only with a
+    /// threshold read off its own curve, and none is calibrated in 2.4.0. Only the
+    /// *emptiness* of this list is read in 2.4.0 (it decides whether a detector is
+    /// mounted); the category set itself is not yet wired to the detector (2.5.0).
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Largest body, in bytes, a single detector call may be handed.
+    #[serde(default = "PrivacyConfig::default_max_input_bytes")]
+    pub max_input_bytes: usize,
+    /// Overlap between two consecutive windows of a larger body, in bytes. Must be
+    /// at least the length of the longest entity the detector is expected to report.
+    #[serde(default = "PrivacyConfig::default_window_overlap_bytes")]
+    pub window_overlap_bytes: usize,
+    /// Score thresholds, in integer thousandths. Parsed but not yet wired to the
+    /// detector (2.5.0): no threshold is read by the delivered regex floor.
+    #[serde(default)]
+    pub thresholds: PrivacyThresholds,
+    /// Literal exception patterns, per tenant. Parsed but not yet wired (2.5.0): **no
+    /// exception is applied to detection in 2.4.0** — the earlier "applied after
+    /// detection" was the planned behaviour, not the delivered one.
+    #[serde(default)]
+    pub exceptions: std::collections::BTreeMap<String, Vec<String>>,
+    /// Whether the deferred rescan pass does its work. The task itself is always
+    /// spawned; this gates the work, never the spawn.
+    #[serde(default)]
+    pub rescan_enabled: bool,
+    /// Interval of the deferred rescan pass.
+    #[serde(default = "PrivacyConfig::default_rescan_interval_secs")]
+    pub rescan_interval_secs: u64,
+}
+
+impl PrivacyConfig {
+    /// Delivered per-call byte ceiling (256 KiB).
+    #[must_use]
+    pub const fn default_max_input_bytes() -> usize {
+        262_144
+    }
+
+    /// Delivered window overlap (512 bytes).
+    #[must_use]
+    pub const fn default_window_overlap_bytes() -> usize {
+        512
+    }
+
+    /// Delivered rescan interval (300 s).
+    #[must_use]
+    pub const fn default_rescan_interval_secs() -> u64 {
+        300
+    }
+
+    /// Budgets this configuration hands to a detector pass.
+    ///
+    /// The delays are the ones the sidecar protocol of §5.5 fixed; the one that is
+    /// still to be calibrated, `sync_per_kib_ms`, stays at zero until a measurement
+    /// says otherwise.
+    #[must_use]
+    pub(crate) fn budgets(&self) -> gradatum_core::pii::PrivacyBudgets {
+        let defaults = gradatum_core::pii::PrivacyBudgets::default();
+        gradatum_core::pii::PrivacyBudgets::new(
+            self.max_input_bytes,
+            self.window_overlap_bytes,
+            defaults.async_timeout_ms,
+            defaults.sync_base_ms,
+            defaults.sync_per_kib_ms,
+            defaults.sync_cap_ms,
+        )
+    }
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            mode: PrivacyMode::ReportOnly,
+            categories: Vec::new(),
+            max_input_bytes: Self::default_max_input_bytes(),
+            window_overlap_bytes: Self::default_window_overlap_bytes(),
+            thresholds: PrivacyThresholds::default(),
+            exceptions: std::collections::BTreeMap::new(),
+            rescan_enabled: false,
+            rescan_interval_secs: Self::default_rescan_interval_secs(),
+        }
+    }
+}
+
+impl std::fmt::Debug for PrivacyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivacyConfig")
+            .field("mode", &self.mode)
+            .field("categories", &self.categories)
+            .field("max_input_bytes", &self.max_input_bytes)
+            .field("window_overlap_bytes", &self.window_overlap_bytes)
+            .field("thresholds", &self.thresholds)
+            // Les motifs d'exception sont des extraits littéraux de données
+            // personnelles : le rendu debug dit qu'il y en a, jamais lesquels.
+            .field("exceptions", &"[REDACTED]")
+            .field("rescan_enabled", &self.rescan_enabled)
+            .field("rescan_interval_secs", &self.rescan_interval_secs)
+            .finish()
+    }
 }
 
 /// Studio web UI configuration.
@@ -1353,6 +1535,8 @@ impl Default for ServerConfig {
             multi_tenant: MultiTenantConfig::default(),
             // Défaut vide : aucun override per-vault ⇒ résolveurs = global exact (byte-identical).
             per_vault: std::collections::HashMap::new(),
+            // Défaut : aucun détecteur monté ⇒ passe-through strict (F-160).
+            privacy: PrivacyConfig::default(),
         }
     }
 }
@@ -1382,6 +1566,16 @@ pub enum ConfigError {
         Advice: set [server.tls] or change bind to 127.0.0.1:19090"
     )]
     BindTlsRefused { bind: SocketAddr },
+    /// `[privacy] mode = "mask"` was requested, but in-place masking is not delivered in
+    /// 2.4.0 — it arrives in 2.5.0, together with the detection sidecar. Accepting it
+    /// silently would hand an operator a plain tagging pass while the posture document
+    /// promised redaction: a false assurance of protection. Only `report_only` is
+    /// accepted today. No configuration value is rendered in the message.
+    #[error(
+        "privacy mode `mask` is not available in 2.4.0 (in-place masking ships in 2.5.0); \
+        set [privacy] mode = \"report_only\""
+    )]
+    PrivacyMaskUnavailable,
 }
 
 /// Hand-written `Debug` that never leaks configuration values.
@@ -1417,7 +1611,27 @@ impl ServerConfig {
         fig = fig.merge(Env::prefixed("GRADATUM_").split("__"));
         let cfg: Self = fig.extract()?;
         cfg.validate_bind_tls()?;
+        cfg.validate_privacy_mode()?;
         Ok(cfg)
+    }
+
+    /// Fail-loud on a personal-data mode the running version does not implement.
+    ///
+    /// `mode = "mask"` rewrites matched passages in place; the masking path is **not
+    /// shipped in 2.4.0** (it arrives in 2.5.0, with the detection sidecar). An operator
+    /// who set `mask` today would get a plain tagging pass while the security posture
+    /// promised redaction — a false assurance of protection. Reject the value at load
+    /// rather than accept it silently. The match is exhaustive (no wildcard): a future
+    /// mode variant forces a compile error here, so its acceptance is a deliberate
+    /// decision, never a default.
+    ///
+    /// # Errors
+    /// [`ConfigError::PrivacyMaskUnavailable`] if `[privacy] mode = "mask"`.
+    pub fn validate_privacy_mode(&self) -> Result<(), ConfigError> {
+        match self.privacy.mode {
+            PrivacyMode::ReportOnly => Ok(()),
+            PrivacyMode::Mask => Err(ConfigError::PrivacyMaskUnavailable),
+        }
     }
 
     /// Fail-closed bind/TLS check: refuses startup if bind is non-loopback without TLS.
@@ -2743,5 +2957,49 @@ mod config_error_redaction_tests {
             shown.contains("jwt_ttl_human_secs"),
             "le message masqué doit encore nommer la clé fautive : {shown}"
         );
+    }
+}
+
+/// F-160 — a personal-data mode the running version does not implement must be refused at
+/// config load, never accepted silently (fail-loud, ruling G34).
+///
+/// `mask` rewrites the body in place; the masking path ships in 2.5.0, not 2.4.0.
+/// Accepting it today would give a plain tagging pass while the posture document promised
+/// redaction. These tests pin the load-time refusal, the acceptance of the delivered mode,
+/// and the default.
+#[cfg(test)]
+mod privacy_mode_validation_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Loads a config from an inline TOML through the real [`ServerConfig::load`] path.
+    fn load_toml(toml: &str) -> Result<ServerConfig, ConfigError> {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(toml.as_bytes()).expect("write TOML");
+        ServerConfig::load(Some(file.path()))
+    }
+
+    #[test]
+    fn mask_mode_is_refused_at_load() {
+        let err = load_toml("[privacy]\nmode = \"mask\"\ncategories = []\n")
+            .expect_err("mask must be refused at load in 2.4.0");
+        assert!(
+            matches!(err, ConfigError::PrivacyMaskUnavailable),
+            "expected PrivacyMaskUnavailable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn report_only_mode_loads() {
+        let cfg = load_toml("[privacy]\nmode = \"report_only\"\ncategories = []\n")
+            .expect("report_only must load");
+        assert_eq!(cfg.privacy.mode, PrivacyMode::ReportOnly);
+    }
+
+    #[test]
+    fn absent_mode_defaults_to_report_only() {
+        let cfg =
+            load_toml("[privacy]\ncategories = []\n").expect("privacy without mode must load");
+        assert_eq!(cfg.privacy.mode, PrivacyMode::ReportOnly);
     }
 }

@@ -98,7 +98,12 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      # 90 s, from measurement, not precaution: on the reference host the first
+      # successful /health lands ~40 s after boot, so a 15 s window marked a healthy
+      # server `unhealthy` at every start (the false red this value removes). 90 s
+      # keeps a 2× margin over that ~40 s measurement and clears the 60 s floor the
+      # upgrade harness enforces — past it, a slow start is a real signal.
+      start_period: 90s
 
   # ── Worker (curation, embedding, distillation) ───────────────────────────
   gradatum-worker:
@@ -139,6 +144,46 @@ services:
     environment:
       - GRADATUM_INTERNAL_URL=http://127.0.0.1:19092
       - GRADATUM_INTERNAL_TOKEN=${GRADATUM_INTERNAL_TOKEN:?GRADATUM_INTERNAL_TOKEN required — provide via .env or export}
+      # Worker health listener (`[apalis.health]`). Dedicated loopback port, clear of
+      # every other Gradatum port (server 19090, metrics 19091, internal API 19092,
+      # engine 19093). Under `network_mode: host` it is bound at 127.0.0.1:19094, so that
+      # port must be free on the compose host — checked on the compose host, not on a
+      # machine that already runs a worker.
+      # Spelled as figment splits it (`GRADATUM_` prefix stripped, `__` as the section
+      # separator, keys lowercased ⇒ apalis.health.port). Measured at the commit this
+      # line lands with: the worker's per-section loader reads the TOML only
+      # (crates/gradatum-worker/src/config_health.rs `load_section` →
+      # `Figment::new().merge(Toml::file(..))`; `Env::prefixed("GRADATUM_")` is merged
+      # for `[storage]` alone, in queue_path.rs), so this variable does not reach the
+      # listener today: the port actually bound is the compiled default — 19094, the
+      # value declared here. The line is a declaration of the intended control surface,
+      # and takes effect the day the section learns the env layer.
+      - GRADATUM_APALIS__HEALTH__PORT=19094
+    # ── Healthcheck override — MANDATORY ─────────────────────────────────────
+    # The image carries `HEALTHCHECK … http://127.0.0.1:19090/health` (server
+    # port). This service does not listen on 19090 — and under `network_mode:
+    # host` the image's probe reaches the SERVER's listener, so the worker was
+    # reported healthy or unhealthy based on another process's state.
+    #
+    # The probe targets the worker's own apalis health listener (:19094) AND
+    # reads the JSON body, not the HTTP status: both routes of that listener
+    # (`liveness_handler`, `detailed_handler`) always answer 200, so a bare
+    # `curl -f` would pass on an `unhealthy` worker. The verdict lives in `status`.
+    #
+    # `ok` and `degraded` both count as healthy: `degraded` means a deep queue or
+    # a rotting DLQ while the worker is still serving — restarting it would be the
+    # wrong reflex. `unhealthy` means a CRITICAL capability is unreachable
+    # (internal API, leadership lease, embed endpoint, curator LLM), which is
+    # exactly what a health check should surface.
+    #
+    # No `start_period`: the grace comes from the retry budget (3 × 30 s), which
+    # covers the first probe pass (`starting`) without inventing a boot duration
+    # nobody has measured for this process.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:19094/health | grep -qE '\"status\":\"(ok|degraded)\"'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   # ── Initialization (one-shot) ────────────────────────────────────────────
   # Usage: docker compose --profile init up gradatum-init
@@ -152,6 +197,14 @@ services:
     # (validate_bind_tls). Writes to /var/lib/gradatum (the volume the server reads).
     command: ["init", "--root", "/var/lib/gradatum", "--bind", "127.0.0.1:19090", "--non-interactive"]
     profiles: ["init"]
+    # ── Healthcheck disabled — motivated ─────────────────────────────────────
+    # One-shot container: it runs `gradatum-admin init` and exits 0. It serves no
+    # port at all, so the image's `:19090/health` probe can only ever fail during
+    # a SUCCESSFUL init — a false red on the one run this container exists for.
+    # "Disabled" here is a statement about the service's nature, not a blind spot:
+    # its success criterion is the exit code, which the quickstart already checks.
+    healthcheck:
+      disable: true
 
   # ── LLM gateway (multi-provider proxy, optional) ─────────────────────────
   # The gateway is an LLM proxy with circuit-breaker, cross-encoder reranking and
@@ -172,6 +225,18 @@ services:
     entrypoint: ["/usr/local/bin/gradatum-gateway"]
     command: ["--config", "/etc/gradatum/gateway.toml"]
     profiles: ["gateway"]
+    # ── Healthcheck disabled — motivated ─────────────────────────────────────
+    # The image's probe targets :19090, which this service does not serve. It
+    # cannot be replaced by a fixed port either: the gateway's listen address
+    # comes from `[server] listen` in gateway.toml — a MANDATORY config key with no
+    # compiled default (crates/gradatum-gateway/src/config.rs), in a file `init`
+    # never creates. 19091 is only this file's documentation convention; an
+    # operator who sets another port would get a health check that probes a dead
+    # port and declares a perfectly healthy gateway unhealthy. A guessed probe is
+    # worse than no probe; the operator who owns the TOML is the one who can state
+    # the real port.
+    healthcheck:
+      disable: true
 
   # ── Engine runtime (llama-server supervisor, optional) ───────────────────
   # The engine starts and supervises a llama-server child process. In Docker,
@@ -196,6 +261,16 @@ services:
     # NOT a --config flag (crates/gradatum-engine/src/bin/gradatum-engine.rs).
     command: ["/etc/gradatum/engine.toml"]
     profiles: ["engine"]
+    # ── Healthcheck disabled — motivated ─────────────────────────────────────
+    # Same family as the gateway above: the image probes :19090, which the engine
+    # does not serve, and the engine's real port is `port` in engine.toml — a
+    # MANDATORY key with no compiled default (crates/gradatum-engine/src/config.rs),
+    # in a file `init` never creates (see the config note above). The engine in
+    # Docker is also expected to supervise a llama-server child rather than serve
+    # the requested port itself, so a port-shaped probe would not even test the
+    # thing that matters. Disabled, not guessed.
+    healthcheck:
+      disable: true
 
   # ── Local CPU LLM — embedding (DEFAULT — part of the operational minimum) ──
   # CPU only, no GPU. Serves [embed] in the gradatum config, which is enabled by

@@ -165,6 +165,11 @@ pub gradatum_dto::HealthReport::dlq_by_kind: alloc::collections::btree::map::BTr
 pub gradatum_dto::HealthReport::dlq_depth: u64
 pub gradatum_dto::HealthReport::dlq_oldest_age_secs: u64
 pub gradatum_dto::HealthReport::locus_count: u32
+pub gradatum_dto::HealthReport::mailbox_pending: core::option::Option<u64>
+pub gradatum_dto::HealthReport::privacy_detector: alloc::string::String
+pub gradatum_dto::HealthReport::privacy_mode: alloc::string::String
+pub gradatum_dto::HealthReport::privacy_scanned_total: u64
+pub gradatum_dto::HealthReport::privacy_unscanned_total: u64
 pub gradatum_dto::HealthReport::queue_depth: u64
 pub gradatum_dto::HealthReport::queue_oldest_age_secs: u64
 pub gradatum_dto::HealthReport::sqlite_wal_size_bytes: u64
@@ -174,11 +179,15 @@ pub gradatum_dto::HealthReport::tenant_count: u32
 pub gradatum_dto::HealthReport::uptime_secs: u64
 pub gradatum_dto::HealthReport::version: alloc::string::String
 impl gradatum_dto::HealthReport
+pub fn gradatum_dto::HealthReport::default_privacy_mode() -> alloc::string::String
 pub fn gradatum_dto::HealthReport::new(gradatum_dto::HealthStatus, alloc::string::String) -> Self
 pub fn gradatum_dto::HealthReport::with_build_sha(self, core::option::Option<alloc::string::String>) -> Self
 pub fn gradatum_dto::HealthReport::with_capabilities(self, alloc::vec::Vec<gradatum_dto::CapabilityReport>) -> Self
 pub fn gradatum_dto::HealthReport::with_counts(self, u32, u32) -> Self
 pub fn gradatum_dto::HealthReport::with_dlq(self, u64, u64, alloc::collections::btree::map::BTreeMap<alloc::string::String, u64>) -> Self
+pub fn gradatum_dto::HealthReport::with_mailbox_pending(self, u64) -> Self
+pub fn gradatum_dto::HealthReport::with_privacy(self, &str, u64, u64) -> Self
+pub fn gradatum_dto::HealthReport::with_privacy_detector(self, &str) -> Self
 pub fn gradatum_dto::HealthReport::with_queue(self, u64, u64) -> Self
 pub fn gradatum_dto::HealthReport::with_sqlite_wal_size_bytes(self, u64) -> Self
 pub fn gradatum_dto::HealthReport::with_started_at(self, core::option::Option<alloc::string::String>) -> Self
@@ -332,6 +341,17 @@ pub fn gradatum_dto::PersistForgetRequest::new(alloc::string::String, gradatum_c
 pub struct gradatum_dto::PersistOkResponse
 pub gradatum_dto::PersistOkResponse::note_id: alloc::string::String
 pub gradatum_dto::PersistOkResponse::status: alloc::string::String
+#[non_exhaustive] pub struct gradatum_dto::PrivacyRescanRequest
+pub gradatum_dto::PrivacyRescanRequest::limit: usize
+pub gradatum_dto::PrivacyRescanRequest::vault_id: alloc::string::String
+impl gradatum_dto::PrivacyRescanRequest
+pub fn gradatum_dto::PrivacyRescanRequest::new(impl core::convert::Into<alloc::string::String>, usize) -> Self
+#[non_exhaustive] pub struct gradatum_dto::PrivacyRescanResponse
+pub gradatum_dto::PrivacyRescanResponse::rewritten: usize
+pub gradatum_dto::PrivacyRescanResponse::skipped: usize
+pub gradatum_dto::PrivacyRescanResponse::unchanged: usize
+impl gradatum_dto::PrivacyRescanResponse
+pub fn gradatum_dto::PrivacyRescanResponse::new(usize, usize, usize) -> Self
 pub struct gradatum_dto::ProactiveHit
 pub gradatum_dto::ProactiveHit::score: f64
 pub gradatum_dto::ProactiveHit::section: alloc::string::String
@@ -559,10 +579,10 @@ pub fn gradatum_dto::VaultLinksRequest::new(alloc::string::String) -> Self
 #[non_exhaustive] pub struct gradatum_dto::VaultListRequest
 pub gradatum_dto::VaultListRequest::cursor: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::limit: core::option::Option<u32>
-pub gradatum_dto::VaultListRequest::pattern: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::role_kind: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::role_status: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::section: core::option::Option<alloc::string::String>
+pub gradatum_dto::VaultListRequest::tag: core::option::Option<alloc::string::String>
 pub gradatum_dto::VaultListRequest::tenant_id: core::option::Option<gradatum_core::scope::TenantId>
 #[non_exhaustive] pub struct gradatum_dto::VaultPurgeRequest
 pub gradatum_dto::VaultPurgeRequest::confirm_vault_id: core::option::Option<gradatum_core::scope::VaultId>

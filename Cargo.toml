@@ -18,6 +18,7 @@ members = [
     "crates/gradatum-engine",
     "crates/gradatum-index",
     "crates/gradatum-markdown",
+    "crates/gradatum-privacy",
     "crates/gradatum-queue",
     "crates/gradatum-search",
     "crates/gradatum-storage",
@@ -60,7 +61,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.3.0"
+version = "2.4.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Gradatum Contributors"]
@@ -149,8 +150,9 @@ axum        = "=0.8.9"
 # ambiguous process-default provider panic.
 axum-server = { version = "=0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 # rustls is a direct dep solely to install the process-default crypto provider at boot.
-# Pinned to the version already resolved transitively (=0.23.43) to avoid duplicates.
-rustls      = { version = "=0.23.40", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+# Pinned exactly (=0.23.45, the RUSTSEC-2026-0285 floor) so a single rustls resolves
+# across the graph: a range here would let a second one in.
+rustls      = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 http        = "=1.4.2"
 tower       = "=0.5.3"
 tower-http      = { version = "=0.7.0", features = ["cors", "trace", "fs", "set-header", "limit"] }
@@ -249,24 +251,25 @@ criterion   = "=0.8.2"
 # Cross-crate — version= obligatoire pour cargo publish (crates.io refuse les path-only)
 # Toutes ces crates héritent `version.workspace = true` : la valeur déclarée ici doit
 # rester alignée sur `workspace.package.version`.
-gradatum = { path = "crates/gradatum", version = "2.3.0" }
-gradatum-dto = { path = "crates/gradatum-dto", version = "2.3.0" }
-gradatum-heartbeat = { path = "crates/gradatum-heartbeat", version = "2.3.0" }
-gradatum-warden = { path = "crates/gradatum-warden", version = "2.3.0" }
+gradatum = { path = "crates/gradatum", version = "2.4.0" }
+gradatum-dto = { path = "crates/gradatum-dto", version = "2.4.0" }
+gradatum-heartbeat = { path = "crates/gradatum-heartbeat", version = "2.4.0" }
+gradatum-warden = { path = "crates/gradatum-warden", version = "2.4.0" }
 schemars = { version = "=1.2.1", features = ["derive"] }
-gradatum-acl-auth = { path = "crates/gradatum-acl-auth", version = "2.3.0" }
-gradatum-acl-policy = { path = "crates/gradatum-acl-policy", version = "2.3.0" }
-gradatum-auth = { path = "crates/gradatum-auth", version = "2.3.0" }
-gradatum-cache = { path = "crates/gradatum-cache", version = "2.3.0" }
-gradatum-chat = { path = "crates/gradatum-chat", version = "2.3.0" }
-gradatum-core = { path = "crates/gradatum-core", version = "2.3.0" }
-gradatum-curator = { path = "crates/gradatum-curator", version = "2.3.0" }
-gradatum-embed = { path = "crates/gradatum-embed", version = "2.3.0" }
-gradatum-engine = { path = "crates/gradatum-engine", version = "2.3.0" }
-gradatum-index = { path = "crates/gradatum-index", version = "2.3.0" }
-gradatum-markdown = { path = "crates/gradatum-markdown", version = "2.3.0" }
-gradatum-queue = { path = "crates/gradatum-queue", version = "2.3.0" }
-gradatum-search = { path = "crates/gradatum-search", version = "2.3.0" }
+gradatum-acl-auth = { path = "crates/gradatum-acl-auth", version = "2.4.0" }
+gradatum-acl-policy = { path = "crates/gradatum-acl-policy", version = "2.4.0" }
+gradatum-auth = { path = "crates/gradatum-auth", version = "2.4.0" }
+gradatum-cache = { path = "crates/gradatum-cache", version = "2.4.0" }
+gradatum-chat = { path = "crates/gradatum-chat", version = "2.4.0" }
+gradatum-core = { path = "crates/gradatum-core", version = "2.4.0" }
+gradatum-curator = { path = "crates/gradatum-curator", version = "2.4.0" }
+gradatum-embed = { path = "crates/gradatum-embed", version = "2.4.0" }
+gradatum-engine = { path = "crates/gradatum-engine", version = "2.4.0" }
+gradatum-index = { path = "crates/gradatum-index", version = "2.4.0" }
+gradatum-markdown = { path = "crates/gradatum-markdown", version = "2.4.0" }
+gradatum-privacy = { path = "crates/gradatum-privacy", version = "2.4.0" }
+gradatum-queue = { path = "crates/gradatum-queue", version = "2.4.0" }
+gradatum-search = { path = "crates/gradatum-search", version = "2.4.0" }
 # DIVERGENCE VOULUE — NE PAS aligner cette ligne sur la version du workspace.
 # `gradatum-sdk-rs` porte `publish = false` depuis 2.1.0 : sa 2.1.0 n'existera JAMAIS
 # sur crates.io. Or `gradatum` la déclare en dépendance optionnelle (feature `client`),
@@ -279,12 +282,12 @@ gradatum-search = { path = "crates/gradatum-search", version = "2.3.0" }
 # Pour la réaligner un jour il faut D'ABORD trancher le sort de la feature `client`
 # (retrait, ou republication de gradatum-sdk-rs).
 gradatum-sdk-rs = { path = "crates/gradatum-sdk-rs", version = "2.0.0" }
-gradatum-storage = { path = "crates/gradatum-storage", version = "2.3.0" }
-gradatum-vault = { path = "crates/gradatum-vault", version = "2.3.0" }
-gradatum-worker = { path = "crates/gradatum-worker", version = "2.3.0" }
-gradatum-db-sqlite = { path = "crates/gradatum-db-sqlite", version = "2.3.0" }
-gradatum-distill = { path = "crates/gradatum-distill", version = "2.3.0" }
-gradatum-gateway = { path = "crates/gradatum-gateway", version = "2.3.0" }
+gradatum-storage = { path = "crates/gradatum-storage", version = "2.4.0" }
+gradatum-vault = { path = "crates/gradatum-vault", version = "2.4.0" }
+gradatum-worker = { path = "crates/gradatum-worker", version = "2.4.0" }
+gradatum-db-sqlite = { path = "crates/gradatum-db-sqlite", version = "2.4.0" }
+gradatum-distill = { path = "crates/gradatum-distill", version = "2.4.0" }
+gradatum-gateway = { path = "crates/gradatum-gateway", version = "2.4.0" }
 
 [profile.release]
 opt-level = 3

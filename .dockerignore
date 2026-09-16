@@ -1,6 +1,8 @@
 target/
 models/
-.git/
+# `.git` n'est PLUS exclu : l'étape builder le copie (COPY .git ./.git, juste avant
+# la compilation) parce que les build.rs y résolvent le SHA court du commit. Le
+# stage runtime ne reprend que les 5 binaires — l'image publiée ne porte pas de dépôt.
 .github/
 .forgejo/
 docs/

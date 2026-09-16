@@ -14,6 +14,8 @@
 //! reusable library).
 
 #[doc(hidden)]
+pub mod acl_cmd;
+#[doc(hidden)]
 pub mod admin_client;
 #[doc(hidden)]
 pub mod admin_cmd;

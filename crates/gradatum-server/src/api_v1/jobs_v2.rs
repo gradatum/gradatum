@@ -56,7 +56,7 @@ use ulid::Ulid;
 
 use gradatum_acl_policy::{AclDecision, AclOp};
 use gradatum_core::scope::VaultId;
-use gradatum_core::{JobFilter, JobOrder, JobRecord, JobStatus, QueueEvent};
+use gradatum_core::{Job, JobFilter, JobOrder, JobRecord, JobStatus, QueueEvent};
 
 use crate::state::AppState;
 use gradatum_core::trust::TrustContext;
@@ -428,6 +428,19 @@ pub struct JobStatusView {
     /// the job produced, present on a successful `Done`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_note: Option<Ulid>,
+    /// `true` iff this job's payload was purged — `spec.kind` is the
+    /// [`Job::PayloadPurged`] sentinel (F-160, L-C).
+    ///
+    /// A terminal job may lose its body while keeping its whole lifecycle: `status`,
+    /// `terminal`, `created_at`, `completed_at` and `result_note` remain authoritative,
+    /// but the request that produced the job is gone and cannot be replayed. Saying so
+    /// explicitly is what keeps a purged job distinguishable from a job whose payload was
+    /// always empty.
+    ///
+    /// Additive field on a `Serialize`-only view: `#[serde(default)]` keeps a view
+    /// serialised before this field existed deserialisable as `false`.
+    #[serde(default)]
+    pub payload_purged: bool,
 }
 
 impl JobStatusView {
@@ -444,6 +457,10 @@ impl JobStatusView {
             .as_ref()
             .and_then(|r| r.conflict_payload.clone());
         let result_note = record.lifecycle.result.as_ref().and_then(|r| r.result_note);
+        // Read from the payload itself, never from the SQL `kind` column: the column
+        // deliberately keeps the original kind after a purge (it feeds the per-kind DLQ
+        // breakdown), so it can never tell whether the body is still there.
+        let payload_purged = matches!(record.spec.kind, Job::PayloadPurged);
         Self {
             job_id: record.id.to_string(),
             status,
@@ -454,6 +471,7 @@ impl JobStatusView {
             error: record.retry.last_error,
             conflict,
             result_note,
+            payload_purged,
         }
     }
 }
@@ -1103,4 +1121,156 @@ pub async fn job_events(
     );
 
     Ok(sse)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gradatum_core::{
+        JobClass, JobLifecycle, JobLineage, JobMode, JobPriority, JobResult, JobRetry,
+        JobScheduling, JobScope, JobSpec, TriggerSource,
+    };
+
+    /// Construit l'enregistrement qu'une purge laisse derrière elle : seul `spec.kind`
+    /// est remplacé par la sentinelle, tout le reste du `JobRecord` est celui du job
+    /// terminal d'origine.
+    fn purged_record(
+        status: JobStatus,
+        created_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        result_note: Ulid,
+    ) -> JobRecord {
+        JobRecord {
+            id: Ulid::generate(),
+            spec: JobSpec {
+                kind: Job::PayloadPurged,
+                class: JobClass::System,
+                mode: JobMode::Batch,
+                scope: JobScope::VaultWide,
+                priority: JobPriority::default_for(&JobClass::System),
+            },
+            scheduling: JobScheduling {
+                trigger: TriggerSource::Demand,
+                scheduled_at: created_at,
+                await_jobs: vec![],
+                deadline: None,
+                cron_expr: None,
+            },
+            lifecycle: JobLifecycle {
+                status,
+                created_at,
+                started_at: Some(created_at),
+                completed_at: Some(completed_at),
+                lease_until: None,
+                result: Some(JobResult {
+                    success: status == JobStatus::Done,
+                    duration_ms: 12,
+                    cost_usd: None,
+                    result_note: Some(result_note),
+                    conflict_payload: None,
+                }),
+            },
+            retry: JobRetry::default(),
+            lineage: JobLineage {
+                triggered_by: None,
+                parent_job: None,
+                pipeline_id: None,
+                pipeline_step: None,
+                children: vec![],
+                cost_usd: None,
+            },
+        }
+    }
+
+    /// Un job terminal **purgé** rend toujours son statut terminal, ses horodatages et
+    /// sa note de résultat — et `payload_purged` le dit explicitement.
+    ///
+    /// C'est le critère du P0-4 : la purge ne touche que `spec.kind`. Tout ce que
+    /// `job_status` sert au client (`created_at`, `completed_at`, `result_note` —
+    /// champ par lequel une écriture vault asynchrone est confirmée) vit ailleurs
+    /// dans le `JobRecord` et doit passer intact, pour les quatre variantes terminales.
+    #[test]
+    fn job_status_on_a_purged_terminal_job_still_reports_its_terminal_state() {
+        let created_at = Utc::now() - chrono::Duration::minutes(5);
+        let completed_at = Utc::now();
+        let result_note = Ulid::generate();
+
+        for status in [
+            JobStatus::Done,
+            JobStatus::DLQ,
+            JobStatus::Cancelled,
+            JobStatus::Conflict,
+        ] {
+            let view = JobStatusView::from_record(purged_record(
+                status,
+                created_at,
+                completed_at,
+                result_note,
+            ));
+
+            assert_eq!(view.status, status, "statut terminal rendu pour {status:?}");
+            assert!(view.terminal, "terminal == true pour {status:?}");
+            assert!(
+                view.payload_purged,
+                "payload_purged == true pour {status:?}"
+            );
+            assert_eq!(view.created_at, created_at, "created_at préservé");
+            assert_eq!(
+                view.completed_at,
+                Some(completed_at),
+                "completed_at préservé"
+            );
+            assert_eq!(view.result_note, Some(result_note), "result_note préservée");
+
+            // Champ additif : il doit sortir sérialisé, pas seulement exister.
+            let json = serde_json::to_value(&view).expect("JobStatusView sérialisable");
+            assert_eq!(
+                json["payload_purged"],
+                serde_json::Value::Bool(true),
+                "`payload_purged` sérialisé pour {status:?}"
+            );
+        }
+    }
+
+    /// `Job::PayloadPurged` n'a aucun handler worker : il n'est pas déclenchable par
+    /// `POST /api/v1/jobs`.
+    ///
+    /// ⚠️ `job_kind_is_triggerable` est un `matches!`, **pas** un `match` exhaustif :
+    /// ce test passe par construction et ne garde rien (R2-P2-4). Conservé pour
+    /// mémoire — il ne doit jamais être présenté comme une garde.
+    #[test]
+    fn purged_job_kind_is_not_triggerable() {
+        assert!(
+            !job_kind_is_triggerable(&Job::PayloadPurged),
+            "la sentinelle de purge n'est pas un kind déclenchable"
+        );
+    }
+
+    /// Un `PrivacyRescan` posté sur `POST /api/v1/jobs` est refusé : le handler mappe
+    /// tout `Err(JobSpecError)` en `400 Bad Request` (jamais un 202 qui mourrait en DLQ).
+    ///
+    /// ⚠️ Passe par construction tant que la variante n'est pas un variant sérialisable
+    /// de `Job` : la désérialisation échoue déjà (`JobSpecError::Invalid`). Ce test ne
+    /// garde rien aujourd'hui ; il devient utile le jour où la variante arrive sans
+    /// handler routé (R2-P2-4).
+    #[test]
+    fn privacy_rescan_is_rejected_by_post_jobs_400() {
+        let body = CreateJobRequest {
+            spec: serde_json::json!({
+                "kind": { "type": "PrivacyRescan", "data": { "vault_id": "main", "limit": 10 } }
+            }),
+            scheduling: None,
+            lineage: None,
+        };
+
+        let err = build_job_record_from_spec(body, "main")
+            .expect_err("un kind non routé ne doit jamais produire de 202");
+        match err {
+            JobSpecError::Invalid(_) | JobSpecError::Unsupported(_) => {}
+        }
+        assert!(
+            !err.to_string().is_empty(),
+            "le 400 doit porter un motif lisible"
+        );
+    }
 }

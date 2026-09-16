@@ -33,6 +33,7 @@ use gradatum_core::note::{EffectiveNote, Note, NoteBody};
 use gradatum_core::status::NoteStatus;
 
 use crate::error::VaultError;
+use crate::privacy_block;
 use crate::registry::Vault;
 
 /// Prefix for copy-on-write history directories — excluded from the index, FTS, and drift detector.
@@ -140,9 +141,31 @@ impl Vault {
     /// `pub(crate)`: accessible from `crate::write` and future `crate::history`.
     pub(crate) async fn write_note_inner(
         &self,
+        frontmatter: Frontmatter,
+        body: String,
+        id: NoteId,
+    ) -> Result<Note, VaultError> {
+        self.write_note_judged(frontmatter, body, id, None).await
+    }
+
+    /// The single insertion point, with a detection pass supplied by the caller.
+    ///
+    /// `reuse = None` is the ordinary path: the pass runs here, exactly as
+    /// [`write_note_inner`](Self::write_note_inner) always did. `reuse = Some(outcome)`
+    /// is the deferred sweep's path — [`Vault::rescan_privacy_in`] has already run the
+    /// pass to decide whether anything changed, and re-running it here would both pay
+    /// the detector twice and report the same pass twice to the observer. The outcome
+    /// is the same value the pass would have produced, from the same body.
+    ///
+    /// Everything downstream of the pass is shared: this is the only difference between
+    /// a first write and a re-judgement, so a sweep cannot reach a state an ordinary
+    /// write could not.
+    pub(crate) async fn write_note_judged(
+        &self,
         mut frontmatter: Frontmatter,
         body: String,
         id: NoteId,
+        reuse: Option<crate::privacy_rescan::PassOutcome>,
     ) -> Result<Note, VaultError> {
         // Invariant vault_id : le vault CIBLE de l'écriture est celui du frontmatter
         // (dérivé du tenant ACL-vérifié — C4-1b), sinon le tenant du Vault (legacy vide).
@@ -151,6 +174,31 @@ impl Vault {
             frontmatter.vault_id = self.vault_id.clone();
         }
         let write_vault = frontmatter.vault_id.clone();
+
+        // ── F-160 — passe de détection personnelle (point d'insertion UNIQUE) ──────
+        // Consultée, jamais obéie : la passe observe et rend son verdict, elle ne
+        // modifie aucun octet de la note. Elle est placée ici, après la résolution du
+        // vault d'écriture et AVANT tout I/O — un corps lourd ne fait pas payer une
+        // lecture pour rien.
+        //
+        // Garde 0 : `code-*` ou section `identity` ⇒ aucune passe, évaluée sur le
+        // vault RÉSOLU (jamais sur le frontmatter entrant) ; la surface et le budget
+        // sont dérivés du frontmatter et des budgets du vault, jamais d'un appelant.
+        //
+        // Passe-through strict : une erreur du détecteur ne bloque JAMAIS l'écriture
+        // (report_only, spec §5.4). Le journal porte l'erreur typée — jamais le corps,
+        // jamais la valeur détectée.
+        //
+        // Le verdict est gardé pour les étapes 3, 3ter et 4 du point d'insertion
+        // (§5.1), qui s'appliquent après la lecture-préservation : un bloc relu de la
+        // version précédente serait sinon écrit avant d'être recalculé.
+        let pass_outcome = match reuse {
+            Some(outcome) => Some(outcome),
+            None => {
+                self.run_privacy_pass(write_vault.as_str(), frontmatter.section, &body)
+                    .await
+            }
+        };
 
         // ── Phase 4 — Read-before-write (scopé au vault CIBLE — C4-1c) ────────────
         // Tenter de lire la version existante AVANT d'écrire.
@@ -170,6 +218,26 @@ impl Vault {
             Err(VaultError::Core(gradatum_core::error::GradatumError::NoteNotFound(_))) => None,
             Err(other) => return Err(other),
         };
+
+        // ── F-160 §5.1 étapes 3, 3ter et 4 — extra, tags réservés, bloc, verdict ──
+        //
+        // Les trois étapes sont regroupées dans `decide_privacy` parce que le balayage
+        // différé doit les rejouer **à blanc**, sur un clone, pour décider s'il a
+        // quelque chose à écrire : une seconde copie de cette logique serait une
+        // seconde autorité sur les tags réservés, et la seule qui divergerait un jour
+        // serait celle qu'on ne relit pas.
+        //
+        // L'observateur est notifié ici, une fois par passe, sur le bloc qui vient
+        // d'être résolu — jamais depuis la prévisualisation du balayage, qui rejoue la
+        // même passe sans écrire.
+        let decided_privacy =
+            self.decide_privacy(&mut frontmatter, existing.as_ref(), pass_outcome.as_ref());
+        if let (Some(outcome), Some((classified, unscanned))) =
+            (pass_outcome.as_ref(), decided_privacy)
+            && let Some(block) = frontmatter.extra.get(privacy_block::BLOCK_KEY)
+        {
+            self.observe_pass(outcome, block, classified, unscanned);
+        }
 
         // Mise à jour du timestamp de modification
         frontmatter.updated = Some(Utc::now());

@@ -1,4 +1,4 @@
-//! SSOT des 9 tâches récurrentes in-process du serveur gradatum.
+//! SSOT des 10 tâches récurrentes in-process du serveur gradatum.
 //!
 //! Ce module est la **source unique de vérité** (SSOT) pour :
 //! - les noms des tâches (`TASK_*` constantes)
@@ -46,10 +46,14 @@ pub const TASK_METRIC_SAMPLE: &str = "metric-sample";
 /// F-51 — passe d'audit / déduplication rétrospective (rapport seul, Option A).
 pub const TASK_AUDIT_DEDUP: &str = "audit-dedup";
 
-/// Liste ordonnée des 9 tâches récurrentes in-process.
+/// F-160 (L-D.2) — balayage différé des notes non scannées par la frontière
+/// de données personnelles.
+pub const TASK_PRIVACY_RESCAN: &str = "privacy-rescan";
+
+/// Liste ordonnée des 10 tâches récurrentes in-process.
 ///
 /// Utilisée pour le seed au boot et par l'endpoint `/api/v1/system/scheduled`.
-pub const ALL_SCHEDULED_TASKS: [&str; 9] = [
+pub const ALL_SCHEDULED_TASKS: [&str; 10] = [
     TASK_TELEMETRY_FLUSH,
     TASK_PURGE_EVENT_LOG,
     TASK_PURGE_SESSION_TRACE,
@@ -59,6 +63,7 @@ pub const ALL_SCHEDULED_TASKS: [&str; 9] = [
     TASK_ACTIVE_RECALL_PURGE,
     TASK_METRIC_SAMPLE,
     TASK_AUDIT_DEDUP,
+    TASK_PRIVACY_RESCAN,
 ];
 
 /// Retourne l'intervalle réel (en secondes) de la tâche `name`, tel que câblé dans `main.rs`.
@@ -81,6 +86,8 @@ pub const ALL_SCHEDULED_TASKS: [&str; 9] = [
 /// | proactive-refresh | `proactive_recall.refresh_interval_secs.max(60)` |
 /// | active-recall-purge | `session_trace.purge_interval_secs.max(60)` (même TTL) |
 /// | metric-sample | 60s hardcodé |
+/// | audit-dedup | `audit.interval_secs.max(60)` |
+/// | privacy-rescan | `privacy.rescan_interval_secs.max(60)` |
 ///
 /// # Fallback
 ///
@@ -96,6 +103,7 @@ pub fn task_interval_secs(name: &str, cfg: &ServerConfig) -> u64 {
         TASK_ACTIVE_RECALL_PURGE => cfg.session_trace.purge_interval_secs.max(60),
         TASK_METRIC_SAMPLE => 60,
         TASK_AUDIT_DEDUP => cfg.audit.interval_secs.max(60),
+        TASK_PRIVACY_RESCAN => cfg.privacy.rescan_interval_secs.max(60),
         _ => 60,
     }
 }

@@ -53,6 +53,7 @@ use gradatum_core::error::GradatumError;
 use gradatum_core::identity::NoteId;
 use gradatum_core::scope::{AgentId, LocusId, VaultId};
 use gradatum_core::section::Section;
+use gradatum_core::tag::parse_tag_query;
 use gradatum_core::temporal_query::{TimelineCursor, TimelineFilter};
 use gradatum_core::trust::TrustContext;
 use gradatum_dto::{
@@ -74,9 +75,9 @@ use crate::api_v1::dto::{
     AuthorEntry, EnqueuedResponseUlid, GraphEdge, ScoreBreakdown, SearchHit, TagEntry, TraceEntry,
     VaultAuthorsResponse, VaultContextRequest, VaultContextResponse, VaultEntry, VaultGraphRequest,
     VaultGraphResponse, VaultLinksRequest, VaultLinksResponse, VaultListRequest, VaultListResponse,
-    VaultReadRequest, VaultReadResponse, VaultSearchRequest, VaultSearchResponse,
-    VaultStatusResponse, VaultTagsRequest, VaultTagsResponse, VaultTimelineRequest,
-    VaultTraceRequest, VaultTraceResponse,
+    VaultPrivacyReviewRequest, VaultPrivacyReviewResponse, VaultReadRequest, VaultReadResponse,
+    VaultSearchRequest, VaultSearchResponse, VaultStatusResponse, VaultTagsRequest,
+    VaultTagsResponse, VaultTimelineRequest, VaultTraceRequest, VaultTraceResponse,
 };
 use crate::api_v1::handlers::{
     build_fts_query, filter_semantic_by_section, filter_semantic_by_status,
@@ -149,6 +150,92 @@ pub(crate) fn locus_for_section(tenant_id: &str, section: Option<&str>) -> Strin
     match section {
         Some(s) => format!("{}/{}", tenant_id, s),
         None => format!("{}/main", tenant_id),
+    }
+}
+
+/// How much of a rejected section name is echoed back. The longest canonical name is
+/// 15 characters, so this is wide enough for a caller to recognise its own typo.
+const SECTION_ECHO_MAX_CHARS: usize = 64;
+
+/// How much of a rejected tag value is echoed back. A well-formed tag is at most 64
+/// characters, so this is wide enough to carry the whole of any value that was nearly
+/// one — which is what a caller needs in order to recognise what it sent.
+const TAG_ECHO_MAX_CHARS: usize = 64;
+
+/// Rejects a section name that no canonical section matches.
+///
+/// The section carried by a read request builds the ACL locus (`{tenant}/{section}`)
+/// before it filters anything. An unknown name therefore produces an access verdict on
+/// a path that does not exist — `403` under a restrictive preset, `200` with no result
+/// under a permissive one. Both answers are about the wrong question: they discuss
+/// rights, or emptiness, where the truth is that the request names nothing. Deciding at
+/// the request boundary turns it back into what it is, a malformed request.
+///
+/// `None` is passed through: the caller then gets the tenant-level locus.
+///
+/// # Errors
+///
+/// [`GradatumError::InvalidInput`], which the HTTP surface maps to `400` **with an empty
+/// body** — `err_to_status` yields a bare status code. The message naming the offending
+/// value and the canonical sections travels on the MCP surface, where the error is
+/// forwarded as `invalid_params`. The offending value is echoed back truncated: a caller
+/// only needs to recognise what it sent, and the field is otherwise bounded by the
+/// request body limit alone.
+fn validated_section(section: Option<&str>) -> Result<Option<&str>, GradatumError> {
+    // Cette garde vit à la frontière de requête, et NON dans `locus_for_section` : ce
+    // helper reçoit aussi des sections que le SERVEUR produit — la pseudo-section
+    // `"timeline"` (chemin timeline ci-dessous), `Section::Snapshot` depuis la capture,
+    // la section interne du rappel proactif. Aucune ne vient d'un corps de requête, et
+    // `"timeline"` n'est pas dans `Section::ALL` : valider au fond ferait tomber la
+    // timeline. Le tri « ce que l'appelant a écrit » vs « ce que le serveur a produit »
+    // n'est observable qu'ici.
+    match section {
+        None => Ok(None),
+        Some(s) if Section::from_canonical_str(s).is_some() => Ok(Some(s)),
+        // La valeur est bornée AVANT d'entrer dans le message : celui-ci ressort côté MCP
+        // et traverse les `tracing::error!(err = %e)` des quatre handlers de lecture. Non
+        // bornée, elle n'est limitée que par la taille du corps — une section de plusieurs
+        // centaines de kilo-octets se recopierait telle quelle dans le journal.
+        Some(s) => Err(GradatumError::InvalidInput(format!(
+            "unknown section: {}; expected one of {}",
+            s.chars().take(SECTION_ECHO_MAX_CHARS).collect::<String>(),
+            Section::ALL
+                .iter()
+                .map(Section::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Rejects a tag-query value that no note could carry under that spelling.
+///
+/// The filter reaches the store as an **exact token** compared against the `tags`
+/// column, so a malformed value is not something the store can report: the request is
+/// well-formed, names nothing, and comes back as an empty page. `--tag Personal
+/// Classified` would then read as "no note carries this marker" — the answer an
+/// operator running a rescan is least able to tell apart from the truth. Deciding at
+/// the request boundary turns it back into what it is, a malformed request.
+///
+/// The two reserved names (`personal-classified`, `privacy-unscanned`) are accepted:
+/// they are what this surface exists to query. Whether the caller may *see* what comes
+/// back is a different question, answered downstream by the read guard — this function
+/// decides the spelling, never the permission, and the two must not be conflated.
+///
+/// # Errors
+///
+/// [`GradatumError::InvalidInput`], which the HTTP surface maps to `400` with an empty
+/// body; the message travels on the MCP surface. The offending value is echoed back
+/// truncated, for the reason given on [`validated_section`].
+fn validated_tag(tag: Option<&str>) -> Result<Option<&str>, GradatumError> {
+    match tag {
+        None => Ok(None),
+        Some(t) => parse_tag_query(t).map(Some).ok_or_else(|| {
+            GradatumError::InvalidInput(format!(
+                "invalid tag: {}; expected ^[a-z0-9][a-z0-9-]{{0,63}}$",
+                t.chars().take(TAG_ECHO_MAX_CHARS).collect::<String>(),
+            ))
+        }),
     }
 }
 
@@ -315,6 +402,166 @@ fn fuse_multivault(
     }
 }
 
+// ── D-14 — the read guard on the reserved tag ────────────────────────────────
+//
+// D-14 has three parts, and only the second one is a control:
+//
+// (a) **Ergonomics, NOT a guard.** The reserved names are removed from the `MATCH`
+//     expression built out of a caller's query, so a caller is not handed back results
+//     the server then takes away from them. It protects nobody: `notes_fts` is declared
+//     `tokenize='unicode61'` **without `tokenchars`** (`0001_phase1.sql:53`), and
+//     `unicode61` treats every ASCII non-alphanumeric character — the hyphen included —
+//     as a separator. `personal-classified` is therefore indexed as two **adjacent**
+//     tokens, and neither the phrase `"personal classified"` nor the bare token
+//     `classified` contains a reserved token at all. Both still match the `tags` column.
+// (b) The guard below. Everything that enumerates filters on it.
+// (c) `metadata.tags` masks `personal-classified` **alone** (SEC-P2-5): the operational
+//     marker `privacy-unscanned` is deliberately left in place — masking it would defeat
+//     its purpose, since an agent must be able to tell that a note was **not** scanned.
+//     The dissociation is the same in (b) and (c) instead of being posed in one and undone
+//     in the other. `privacy-unscanned` therefore has no constant here: nothing in this
+//     module ever matches it, and a `const` no code path reads would be a promise the
+//     compiler cannot check.
+//
+// The FTS5 projection is untouched: no `upsert_note` change, no migration.
+
+/// The tag that carries the privacy verdict a detection pass attaches to a note holding
+/// personal data (D-12). Its presence is what [`PrivacyReadGuard`] withholds.
+pub(crate) const PERSONAL_CLASSIFIED_TAG: &str = "personal-classified";
+
+/// Exact-token membership test on the **space-separated** form of the `tags` column.
+///
+/// Space-splitting (never `contains`) is what makes the match exact: a note tagged
+/// `personal-classified-2026` is a different note, and must keep being returned.
+fn carries_personal_classified(tags: &str) -> bool {
+    tags.split_whitespace()
+        .any(|t| t == PERSONAL_CLASSIFIED_TAG)
+}
+
+/// D-14(b) — **the** read guard: a result carrying [`PERSONAL_CLASSIFIED_TAG`] leaves the
+/// response unless the consumer may read it.
+///
+/// ## The predicate
+///
+/// ```text
+/// state.acl.evaluate(trust, AclOp::Read, &format!("{vault}/{PERSONAL_CLASSIFIED_TAG}"))
+///     == AclDecision::Allow
+/// ```
+///
+/// `vault` is the **result's** `vault_id`, never the requester's tenant (SEC-NP1-1):
+/// `vault_search` accepts `vault_ids`/`all_readable`, so one result set covers several
+/// vaults, and binding the verdict to the tenant would apply a single verdict to notes
+/// from different vaults — filtering the `main` note of a consumer negated only in
+/// `other`, or returning the `other` note of a consumer negated only in `main`. The
+/// verdict is therefore memoised **per distinct vault id** of the result set: one
+/// evaluation per vault, never one per row.
+///
+/// ## The predicate folds capacity and scope (SEC-NP2-1)
+///
+/// The old flag was a consumer *capacity*. A read decision on a synthetic locus filters
+/// **also** a consumer whose `read_patterns` merely do not cover that locus (say, narrowed
+/// to `main/decisions/**`). No consumer of the shipped presets is affected — `admin` and
+/// `studio` carry `["**"]` and no negation (`presets/hierarchical.toml:26`, `:36`) — and
+/// the direction of the error is the safe one: over-filtering. Differential evaluation —
+/// filter when `!= Allow` **and** `evaluate(Read, "{vault}/{result's section}") == Allow`
+/// — is **noted and not retained in `2.4.0`**: it doubles the ACL calls for a case no
+/// preset produces. The predicate survives lot F: before it, it was carried by the
+/// `locus.contains("personal-classified")` short-circuit when the flag was `false`; after,
+/// by the four pattern negations the presets carry.
+///
+/// Not to be confused with F-297: the ACL breaker is evaluated on the **locus**, never on
+/// a note's tag — neither before nor after.
+///
+/// ## Failure direction
+///
+/// A tag batch that cannot be read is **propagated**, never treated as "nothing is
+/// marked": the caller fails the request instead of serving a result it cannot vouch for.
+#[derive(Default)]
+pub(crate) struct PrivacyReadGuard {
+    /// One memoised verdict per distinct vault id of the result set.
+    verdicts: HashMap<String, bool>,
+}
+
+impl PrivacyReadGuard {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// `true` when `trust` may read the `personal-classified` locus of `vault`.
+    ///
+    /// Memoised: `vault_search` fuses up to a few hundred hits and evaluates the same
+    /// handful of vaults, so the ACL engine is asked once per vault, not once per row.
+    pub(crate) fn allows(&mut self, state: &AppState, trust: &TrustContext, vault: &str) -> bool {
+        if let Some(verdict) = self.verdicts.get(vault) {
+            return *verdict;
+        }
+        let verdict = state.acl.evaluate(
+            trust,
+            AclOp::Read,
+            &format!("{vault}/{PERSONAL_CLASSIFIED_TAG}"),
+        ) == AclDecision::Allow;
+        self.verdicts.insert(vault.to_owned(), verdict);
+        verdict
+    }
+
+    /// The subset of `ids` that must not be rendered, resolved in **one** batch for
+    /// `vault`.
+    ///
+    /// Returns an empty set — without touching the index — when the vault's verdict is
+    /// `Allow`, which is the path taken by `admin`, `studio`, and every consumer of a
+    /// vault they were not negated in.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a failing tag read. See the failure-direction note above.
+    pub(crate) async fn hidden_ids(
+        &mut self,
+        state: &AppState,
+        trust: &TrustContext,
+        vault: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, GradatumError> {
+        if ids.is_empty() || self.allows(state, trust, vault) {
+            return Ok(std::collections::HashSet::new());
+        }
+        let tags = state.search.get_tags_batch(vault, ids).await?;
+        Ok(tags
+            .into_iter()
+            .filter(|(_, tags)| tags.iter().any(|t| t == PERSONAL_CLASSIFIED_TAG))
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    /// [`Self::hidden_ids`] over a **vault-qualified** (F-63) result set: the ids are
+    /// composite keys, so they are grouped by vault first and resolved one batch per
+    /// vault — that grouping is the whole reason the verdict is per vault and not per
+    /// request.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a failing tag read.
+    pub(crate) async fn hidden_composite_ids(
+        &mut self,
+        state: &AppState,
+        trust: &TrustContext,
+        keys: &[String],
+    ) -> Result<std::collections::HashSet<String>, GradatumError> {
+        let mut by_vault: HashMap<&str, Vec<String>> = HashMap::new();
+        for key in keys {
+            if let Some((vault, note)) = decompose_multivault_key(key) {
+                by_vault.entry(vault).or_default().push(note.to_owned());
+            }
+        }
+        let mut hidden = std::collections::HashSet::new();
+        for (vault, notes) in by_vault {
+            for note in self.hidden_ids(state, trust, vault, &notes).await? {
+                hidden.insert(compose_multivault_key(vault, &note));
+            }
+        }
+        Ok(hidden)
+    }
+}
+
 // ── §1 READ HANDLERS ─────────────────────────────────────────────────────────
 
 /// Logique métier de `POST /api/v1/vault_search`.
@@ -341,6 +588,12 @@ pub async fn vault_search_impl(
         .read_usage_accumulators
         .vault_search
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Section validée AVANT toute construction de locus et toute évaluation ACL — les
+    // TROIS chemins de ce handler (multivault, mono `checked_on`, legacy) en construisent
+    // un chacun, les couvrir en amont est le seul point qui les couvre tous. Posée APRÈS
+    // le compteur d'usage, qui mesure les appels REÇUS sur le read-path : le franchir
+    // changerait un signal d'audit que rien ici ne demande de changer.
+    validated_section(req.section.as_deref())?;
     // P0 cross-tenant : tenant dérivé du JWT, refuse body divergent.
     let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
@@ -945,6 +1198,31 @@ pub async fn vault_search_impl(
             })
     };
 
+    // D-14(b) — la garde de lecture sur l'étiquette réservée, appliquée APRÈS la
+    // troncature à `limit` sur les seuls hits qui seront rendus : un lot de tags pour
+    // tout le jeu candidat, jamais une requête par ligne. La garde est FAIL-CLOSED par
+    // propagation (une lecture de tags en échec fait échouer la requête) — jamais par un
+    // `unwrap_or_default()` qui lirait « aucune note marquée ».
+    //
+    // Ce que la garde NE fait PAS : elle filtre les hits RENDUS, elle ne les remplace pas.
+    // Une note marquée qui sort de la fenêtre `limit` ne fait pas remonter la note
+    // suivante — la troncature a eu lieu sur le classement complet, exactement comme pour
+    // la garde identity ci-dessous. Rétro-remplir demanderait de re-classer contre un
+    // index dont on vient de retirer des lignes, sans base stable pour le faire.
+    let mut privacy_guard = PrivacyReadGuard::new();
+    let visible_note_ids: Vec<String> = final_hits
+        .iter()
+        .map(|(hit, _score)| hit.note_id.clone())
+        .collect();
+    let privacy_hidden = privacy_guard
+        .hidden_ids(
+            state,
+            trust,
+            read_vault.vault_id().as_str(),
+            &visible_note_ids,
+        )
+        .await?;
+
     // Guard P1-B FAIL-CLOSED (audit security-reviewer v0.7.3, durci 2026-06-28).
     //
     // Parité avec vault_read_impl (~L671) : la read-restriction identity existait déjà
@@ -983,6 +1261,13 @@ pub async fn vault_search_impl(
             // Guard FAIL-CLOSED : vérifier AVANT le fallback section→"main".
             // Si section=="identity" ou section=="" (indéterminée) et caller non-privilégié → exclure.
             if identity_section_hidden(identity_privileged, &hit.section) {
+                return None;
+            }
+            // D-14(b) : la note porte l'étiquette réservée et le consommateur n'a pas le
+            // verdict Allow sur `{vault}/personal-classified` → elle ne sort pas, ni titre
+            // ni snippet. `SearchHit` ne porte aucun `tags` : rien à masquer ici, la
+            // garde retire la ligne entière.
+            if privacy_hidden.contains(&hit.note_id) {
                 return None;
             }
             if hit.status.is_empty()
@@ -1034,7 +1319,18 @@ pub async fn vault_search_impl(
             )
             .await
         {
-            Ok((count, capped)) => (Some(count), capped),
+            // D-14(b) — le compte est une cardinalité **rendue**. Sans cet ajustement,
+            // `corpus_match_count > len(items)` annoncerait au consommateur nié qu'une
+            // note marquée appariée existe : la classe d'oracle exacte que le `total` de
+            // `vault_list` ferme déjà (`total -= hidden_in_page`). Même règle, même
+            // portée : on retranche ce que **cette réponse** a retenu, pas une seconde
+            // autorité sur le corpus. Approximation page-scopée documentée : une note
+            // marquée appariée **hors** de la fenêtre classée reste comptée (parité
+            // `vault_list`, P2 résiduel).
+            Ok((count, capped)) => (
+                Some(count.saturating_sub(privacy_hidden.len() as u64)),
+                capped,
+            ),
             Err(e) => {
                 tracing::warn!(
                     err = %e,
@@ -1453,6 +1749,21 @@ async fn vault_search_multivault(
         }
     }
 
+    // D-14(b), chemin multi-vaults (SEC-NP1-1). C'est ICI que la garde diffère du chemin
+    // mono : les clés sont composites `{vault}\u{1}{note}`, et un même jeu de résultats
+    // couvre PLUSIEURS vaults. Le verdict est donc rendu PAR VAULT SOURCE (regroupement
+    // par clé décomposée, un lot de tags par vault), jamais une fois pour la requête :
+    // un consommateur nié dans `other` seulement doit voir la note de `main` et pas celle
+    // de `other` — un verdict unique rendrait l'un des deux mauvais.
+    let mut privacy_guard = PrivacyReadGuard::new();
+    let visible_keys: Vec<String> = composite_hits
+        .iter()
+        .map(|(hit, _)| hit.note_id.clone())
+        .collect();
+    let privacy_hidden = privacy_guard
+        .hidden_composite_ids(state, trust, &visible_keys)
+        .await?;
+
     let identity_privileged = is_identity_privileged(trust);
     let items: Vec<SearchHit> = composite_hits
         .into_iter()
@@ -1471,6 +1782,10 @@ async fn vault_search_multivault(
             }
             // Guard identity FAIL-CLOSED (parité mono) — AVANT le fallback section→"main".
             if identity_section_hidden(identity_privileged, &hit.section) {
+                return None;
+            }
+            // D-14(b) — verdict rendu sur le vault SOURCE de ce hit (voir plus haut).
+            if privacy_hidden.contains(&hit.note_id) {
                 return None;
             }
             if hit.status.is_empty()
@@ -1525,7 +1840,10 @@ async fn vault_search_multivault(
                     "vault_search_multivault: count_fts_matches failed for a vault"),
             }
         }
-        (Some(total), capped)
+        // D-14(b) — même ajustement que le chemin mono (`total` de `vault_list`) :
+        // `privacy_hidden` porte les clés F-63 des hits retenus dans CETTE réponse.
+        let withheld = privacy_hidden.len() as u64;
+        (Some(total.saturating_sub(withheld)), capped)
     } else {
         (None, false)
     };
@@ -1586,6 +1904,8 @@ pub async fn vault_read_impl(
         .read_usage_accumulators
         .vault_read
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Avant le locus et l'ACL ; après le compteur d'usage (cf. `vault_search_impl`).
+    validated_section(req.section.as_deref())?;
     let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
@@ -1716,6 +2036,31 @@ pub async fn vault_read_impl(
             let authoritative_status =
                 db_status.unwrap_or_else(|| note.frontmatter.status.to_string());
 
+            // D-14(c) — le tag réservé sort de `metadata.tags` pour un consommateur sans
+            // verdict Allow sur `{vault}/personal-classified`. Le masquage suit
+            // EXACTEMENT le prédicat de (b) : le même consommateur, dans la même requête,
+            // ne peut pas voir la note en recherche et la lire ici sans son tag.
+            //
+            // Le masquage porte sur le SEUL `personal-classified` (SEC-P2-5, S-R3-P1-2).
+            // `privacy-unscanned` n'est JAMAIS masqué : c'est un état opérationnel, pas une
+            // donnée sensible, et un agent doit pouvoir constater qu'une note n'a PAS été
+            // balayée — le masquer rendrait une panne du détecteur indiscernable d'un
+            // corpus propre.
+            //
+            // Ce que (c) n'achète pas, et qu'il faut dire : la note reste LISIBLE, et ses
+            // tags restent présents dans le frontmatter du corps markdown servi. D-14
+            // ferme l'énumération, pas la lecture — la fermeture réelle est F-297.
+            let mut privacy_guard = PrivacyReadGuard::new();
+            let privacy_allowed =
+                privacy_guard.allows(state, trust, note.frontmatter.vault_id.as_str());
+            let rendered_tags: Vec<&str> = note
+                .frontmatter
+                .tags
+                .iter()
+                .map(|t| t.as_str())
+                .filter(|t| privacy_allowed || *t != PERSONAL_CLASSIFIED_TAG)
+                .collect();
+
             let resp = VaultReadResponse {
                 path: note_id_str,
                 title,
@@ -1724,7 +2069,7 @@ pub async fn vault_read_impl(
                     "section": note.frontmatter.section.to_string(),
                     "status": authoritative_status,
                     "author": note.frontmatter.author.as_ref().map(|a| a.id.as_str()),
-                    "tags": note.frontmatter.tags.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+                    "tags": rendered_tags,
                     "vault_id": note.frontmatter.vault_id.as_str(),
                     "created": note.frontmatter.created.timestamp_millis(),
                     "updated": note.frontmatter.updated.map(|d| d.timestamp_millis()),
@@ -1776,6 +2121,8 @@ pub async fn vault_list_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
+    // Avant le locus et l'ACL (cf. `vault_search_impl`).
+    validated_section(req.section.as_deref())?;
     let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
@@ -1784,71 +2131,185 @@ pub async fn vault_list_impl(
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
 
-    let _ = req.pattern; // ignoré (T12 pattern filter différé)
+    // F-160 / L-D.1 — validation de FORME du filtre d'étiquette, à la frontière de
+    // requête comme `validated_section` ci-dessus, et pour la même raison : la valeur
+    // arrive dans le magasin comme un jeton EXACT, donc une forme invalide ne serait
+    // pas une erreur du magasin mais une page vide — lue comme « aucune note marquée ».
+    let tag = validated_tag(req.tag.as_deref())?;
+
+    // Les deux filtres ne se composent pas : `list_notes_by_tag` n'a pas de paramètre de
+    // rôle, et `list_notes_filtered` pas de paramètre d'étiquette. Servir la requête en
+    // n'en appliquant qu'un rendrait une réponse fausse-et-silencieuse (« les cartes DONE
+    // portant X » → toutes les notes portant X). Refus explicite plutôt que filtre perdu.
+    if tag.is_some() && (req.role_kind.is_some() || req.role_status.is_some()) {
+        return Err(GradatumError::InvalidInput(
+            "tag and role_kind/role_status cannot be combined in one request".into(),
+        ));
+    }
+
     let limit = req.limit.unwrap_or(20).clamp(1, 200) as usize;
 
-    // F-171 : route vers la variante filtrée UNIQUEMENT si un filtre de rôle est présent —
-    // sinon `list_notes` inchangé (rétro-compat octet pour octet, aucun filtre neutre injecté).
-    let (records, total) = if req.role_kind.is_some() || req.role_status.is_some() {
-        state
-            .search
-            .list_notes_filtered(
-                &tenant,
-                req.section.as_deref(),
-                req.role_kind.as_deref(),
-                req.role_status.as_deref(),
-                limit,
-                req.cursor.as_deref(),
-            )
-            .await?
-    } else {
-        state
-            .search
-            .list_notes(
-                &tenant,
-                req.section.as_deref(),
-                limit,
-                req.cursor.as_deref(),
-            )
-            .await?
-    };
-
-    // Guard identity (parité `vault_search`/`vault_context`) : un appelant non
-    // privilégié ne doit pas découvrir l'existence/ULID/mtime des âmes d'agents via le
-    // listing (vecteur d'énumération). Exclusion simple sur la section RÉELLE de chaque
-    // record (fan-out RAG, pas de matching par-agent). No-op pour Studio / main-agent.
+    // Guard identity (parité `vault_search`/`vault_context`) : un appelant non privilégié ne
+    // doit pas découvrir l'existence/ULID/mtime des âmes d'agents via le listing (vecteur
+    // d'énumération). Exclusion sur la section RÉELLE de chaque record. No-op pour Studio /
+    // main-agent.
     let identity_privileged = is_identity_privileged(trust);
 
-    // `next_cursor` est calculé sur le nombre BRUT de records ramenés (avant filtre) pour
-    // que la pagination continue d'avancer même si une page entière est masquée.
-    let next_cursor = if records.len() == limit {
-        records.last().map(|r| r.id.clone())
-    } else {
-        None
-    };
+    // D-14(b) — garde de lecture sur l'étiquette réservée.
+    //
+    // Aucun I/O par record : `list_notes` (et ses variantes tag/rôle) SELECT la colonne
+    // `tags` et la portent dans `NoteRecord::tags_raw`, donc l'appariement par jeton exact ET
+    // le test de section identité se font sur la donnée déjà ramenée — pas de `get_tags_batch`.
+    //
+    // Le verdict est rendu sur `{tenant}/personal-classified` : `vault_list` ne lit qu'un
+    // vault (le sien — pas de `vault_ids`/`all_readable` ici), donc une seule évaluation,
+    // mémoïsée, prédicat de la garde unique `evaluate(Read, ..)`.
+    let mut privacy_guard = PrivacyReadGuard::new();
+    let privacy_allowed = privacy_guard.allows(state, trust, &tenant);
 
-    let entries: Vec<VaultEntry> = records
-        .into_iter()
-        .filter(|r| !identity_section_hidden(identity_privileged, &r.section))
-        .map(|r| {
+    // ── Pagination : le curseur n'avance JAMAIS sur un id retenu par la garde ────────
+    //
+    // Le curseur est la position keyset (`id > ?`) et il n'est PAS opaque : quel que soit
+    // l'ULID porté par `next_cursor`, l'appelant le lit. L'avancer sur le DERNIER record BRUT
+    // — comportement pré-garde hérité de 7b — remet à un consommateur nié sur
+    // `personal-classified` l'ULID d'une note masquée, et paginer transforme cela en
+    // énumération de toutes les notes marquées : exactement l'oracle que D-14(b) ferme. Le
+    // filtre `tag` l'aiguise, car sur `?tag=personal-classified` chaque record brut EST une
+    // note masquée.
+    //
+    // Donc le curseur n'avance que sur un record réellement rendu à l'appelant. La page est
+    // REMPLIE jusqu'à `limit` records visibles en re-requêtant au-delà des lignes masquées
+    // (même garde que `vault_timeline`) : une page vidée par la garde ne doit pas clore le
+    // listing alors que des notes visibles restent derrière — cela les perdrait ET ferait de
+    // la forme de la page un oracle. La boucle reprend en interne sur le dernier id BRUT
+    // parcouru (jamais rendu), et termine car le keyset avance strictement sur un magasin
+    // fini ; elle rompt sur le dernier id VISIBLE, ou `None` à la fin du magasin.
+    //
+    // Coût : un consommateur habilité court-circuite (`allows` → aucun travail par ligne) et
+    // ne lit qu'une page. Un consommateur nié paie une page de magasin de plus par fenêtre
+    // entièrement masquée ; sur un grand corpus marqué, un seul `?tag=personal-classified`
+    // peut le parcourir en entier. Inerte en 2.4.0 (`categories = []` → rien n'est marqué) ;
+    // à revisiter à l'activation (F-298).
+    let mut entries: Vec<VaultEntry> = Vec::with_capacity(limit);
+    let mut page_cursor: Option<String> = req.cursor.clone();
+    let mut header_total: Option<u64> = None;
+
+    let next_cursor: Option<String> = loop {
+        // Route vers la variante filtrée UNIQUEMENT si un filtre de rôle est présent — sinon
+        // `list_notes` inchangé (rétro-compat octet pour octet, aucun filtre neutre injecté).
+        let (records, total) = if let Some(tag) = tag {
+            state
+                .search
+                .list_notes_by_tag(
+                    &tenant,
+                    req.section.as_deref(),
+                    tag,
+                    limit,
+                    page_cursor.as_deref(),
+                )
+                .await?
+        } else if req.role_kind.is_some() || req.role_status.is_some() {
+            state
+                .search
+                .list_notes_filtered(
+                    &tenant,
+                    req.section.as_deref(),
+                    req.role_kind.as_deref(),
+                    req.role_status.as_deref(),
+                    limit,
+                    page_cursor.as_deref(),
+                )
+                .await?
+        } else {
+            state
+                .search
+                .list_notes(
+                    &tenant,
+                    req.section.as_deref(),
+                    limit,
+                    page_cursor.as_deref(),
+                )
+                .await?
+        };
+        let page_full = records.len() == limit;
+
+        // `total` est un compte d'EN-TÊTE, pris sur le PREMIER appel de magasin uniquement :
+        // sur les chemins non tagués c'est le compte vault-wide (« for X-Total-Count ») ; sur
+        // le chemin `tag` c'est la cardinalité de la PAGE des notes appariées
+        // (`list_notes_by_tag` le documente — ce n'est PAS un compte vault-wide, et la boucle
+        // ne l'agrège pas). Dans les deux cas il est décrémenté des lignes masquées de cette
+        // première page, donc il n'annonce jamais l'existence d'une note que la page ne porte
+        // pas. Le décrément est à la page : un appelant qui pagine voit un `total` qui ne
+        // suit que la première page — résidu accepté, jamais un oracle.
+        if header_total.is_none() {
+            let hidden_first = if privacy_allowed {
+                0u64
+            } else {
+                records
+                    .iter()
+                    .filter(|r| {
+                        r.tags_raw
+                            .as_deref()
+                            .is_some_and(carries_personal_classified)
+                    })
+                    .count() as u64
+            };
+            header_total = Some(total.saturating_sub(hidden_first));
+        }
+
+        let mut last_scanned: Option<String> = None;
+        let mut last_visible: Option<String> = None;
+        for r in records {
+            last_scanned = Some(r.id.clone());
+            // Une ligne masquée (blackout identité OU verdict D-14(b)) n'avance ni `entries`
+            // ni le curseur rendu. Le test D-14(b) porte sur la chaîne BRUTE de la colonne
+            // `tags` (séparée par des espaces), par jeton exact — `personal-classified-2026`
+            // reste listée.
+            if identity_section_hidden(identity_privileged, &r.section) {
+                continue;
+            }
+            if !privacy_allowed
+                && r.tags_raw
+                    .as_deref()
+                    .is_some_and(carries_personal_classified)
+            {
+                continue;
+            }
             let modified_at = {
                 let ms = r.updated.unwrap_or(r.created);
                 chrono::DateTime::from_timestamp_millis(ms)
                     .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                     .unwrap_or_default()
             };
-            VaultEntry {
+            entries.push(VaultEntry {
                 path: format!("{}/{}", r.section, r.id),
                 size_bytes: r.body_text.len() as u64,
                 modified_at,
+            });
+            last_visible = Some(r.id.clone());
+            if entries.len() == limit {
+                break;
             }
-        })
-        .collect();
+        }
+
+        // Page remplie à `limit` → reprise après son dernier record VISIBLE. Page brute
+        // courte → fin du magasin (avec le caveat documenté du chemin tag sur un jeton rare)
+        // → plus de page. Page brute pleine mais pas encore remplie → des lignes ont été
+        // masquées : continuer au-delà du dernier id BRUT, jamais rendu à l'appelant.
+        if entries.len() == limit {
+            break last_visible;
+        }
+        if page_full && last_scanned.is_some() {
+            page_cursor = last_scanned;
+            continue;
+        }
+        break None;
+    };
 
     Ok(VaultListResponse {
         entries,
         next_cursor,
-        total,
+        total: header_total.unwrap_or(0),
     })
 }
 
@@ -2107,6 +2568,51 @@ async fn filter_identity_nodes(
     Ok(())
 }
 
+/// Filtre les nœuds/arêtes de graphe pointant vers une note marquée
+/// [`PERSONAL_CLASSIFIED_TAG`], pour un consommateur que [`PrivacyReadGuard`] n'habilite
+/// pas — **parité exacte** avec [`filter_identity_nodes`], qu'il suit immédiatement.
+///
+/// Le raisonnement est celui de F-1, transposé à D-14 : un nœud ou une arête révèle
+/// l'**existence** et l'**ULID** d'une note, alors que `vault_search`/`vault_list`
+/// masquent déjà la note elle-même. La garder hors du graphe tout en la laissant
+/// énumérable par voisinage serait un trou d'énumération (ruling G22, P1-3).
+///
+/// Le prédicat n'est **pas** ré-écrit ici : il est emprunté à [`PrivacyReadGuard`], avec
+/// la mémoïsation et le fail-closed que ce type porte. Le vault évalué est celui **du
+/// résultat** — ici le vault propre du tenant, seul vault que `neighbors`/`backlinks`
+/// interrogent.
+///
+/// **No-op strict** (zéro appel index) pour un consommateur habilité : `hidden_ids`
+/// court-circuite sur `allows`. Les nœuds d'un lien pendant (absents de l'index) sont
+/// préservés — le graphe normal n'est pas cassé.
+///
+/// # Erreurs
+///
+/// Propage [`GradatumError::Storage`] si la lecture batch des tags échoue — fail-closed :
+/// on refuse la requête plutôt que de renvoyer un graphe non filtré.
+async fn filter_privacy_nodes(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant: &str,
+    nodes: &mut Vec<String>,
+    edges: &mut Vec<GraphEdge>,
+) -> Result<(), GradatumError> {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let vault = crate::api_v1::tenant_guard::own_vault_checked(tenant);
+    let mut guard = PrivacyReadGuard::new();
+    let hidden = guard
+        .hidden_ids(state, trust, vault.as_str(), nodes.as_slice())
+        .await?;
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    edges.retain(|e| !hidden.contains(&e.from) && !hidden.contains(&e.to));
+    nodes.retain(|id| !hidden.contains(id));
+    Ok(())
+}
+
 /// Normalise une référence de note vers son ULID **nu**.
 ///
 /// `note_links` (et donc `neighbors`/`backlinks`) porte des identifiants ULID **nus**,
@@ -2304,6 +2810,9 @@ pub async fn vault_graph_impl(
 
     // F-1 : masquer les âmes cross-agent aux non-privilégiés (parité vault_search/list).
     filter_identity_nodes(state, trust, &tenant, &mut nodes, &mut edges).await?;
+    // D-14(b) : masquer les notes marquées au même titre — même raison (existence + ULID
+    // révélés par un nœud/arête), même prédicat (ruling G22).
+    filter_privacy_nodes(state, trust, &tenant, &mut nodes, &mut edges).await?;
 
     Ok(VaultGraphResponse { nodes, edges })
 }
@@ -2367,6 +2876,9 @@ pub async fn vault_links_impl(
 
     // F-1 : masquer les âmes cross-agent aux non-privilégiés (parité vault_search/list).
     filter_identity_nodes(state, trust, &tenant, &mut nodes, &mut edges).await?;
+    // D-14(b) : masquer les notes marquées au même titre — même raison (existence + ULID
+    // révélés par un nœud/arête), même prédicat (ruling G22).
+    filter_privacy_nodes(state, trust, &tenant, &mut nodes, &mut edges).await?;
 
     Ok(VaultLinksResponse { nodes, edges })
 }
@@ -2465,8 +2977,27 @@ pub async fn vault_trace_impl(
     all_ids.retain(|id| seen.insert(id.clone()));
     all_ids.truncate(limit);
 
+    // D-14(b) — garde de lecture sur l'étiquette réservée.
+    //
+    // `TraceEntry` ne rend aucun tag (`tags: vec![]`, parité v1.6.2) : la surface
+    // d'exposition de `vault_trace` n'est pas le tag, c'est **l'identifiant** de chaque
+    // note du lignage — un consommateur qui énumère le voisinage d'une note découvre les
+    // ULID des notes marquées, et par là leur existence. La garde retire donc les notes
+    // marquées des `all_ids`, APRÈS déduplication et troncature, comme la garde identity
+    // retire les âmes : le lignage reste celui du graphe, moins ce que le consommateur ne
+    // peut pas énumérer.
+    //
+    // Le verdict porte sur `{tenant}` — `vault_trace` ne lit qu'un vault (le sien).
+    // Le seed lui-même n'est pas soumis à cette garde : il n'est pas dans `all_ids`, et
+    // l'adresser exactement (ULID ou titre) est une LECTURE, que D-14 ne ferme pas.
+    let mut privacy_guard = PrivacyReadGuard::new();
+    let privacy_hidden = privacy_guard
+        .hidden_ids(state, trust, &tenant, &all_ids)
+        .await?;
+
     let entries = all_ids
         .into_iter()
+        .filter(|id| !privacy_hidden.contains(id))
         .map(|id| TraceEntry {
             path: id,
             score: 1.0,
@@ -2501,6 +3032,8 @@ pub async fn vault_context_impl(
     if !trust.is_authenticated() {
         return Err(GradatumError::Unauthorized);
     }
+    // Avant le locus et l'ACL (cf. `vault_search_impl`).
+    validated_section(req.section.as_deref())?;
     let tenant = effective_tenant(trust, req.tenant_id.as_ref())
         .map_err(|_| GradatumError::Forbidden("tenant cross mismatch".into()))?
         .to_owned();
@@ -2512,9 +3045,12 @@ pub async fn vault_context_impl(
     // Guard identity F-34 (parité `vault_search_impl`, audit security-reviewer v0.7.3) :
     // le contexte assemblé est une surface RAG générique — les âmes d'agents ne doivent
     // pas devenir candidates (fuite de corps dans `assembled_text`) sauf caller privilégié.
-    // Le privilège est résolu ICI (accès à `trust`) puis propagé aux assembleurs.
-    let identity_privileged = is_identity_privileged(trust);
-    crate::context::assemble_context(state, &tenant, &req, identity_privileged).await
+    // Le privilège est résolu dans `assemble_context` (accès à `trust`).
+    //
+    // D-14(b) : `trust` est transmis aux assembleurs, qui appliquent le prédicat partagé
+    // (`PrivacyReadGuard`) aux candidats — le corps d'une note marquée n'entre pas dans
+    // `assembled_text`, et son ULID/titre ni dans `included` ni dans `references`.
+    crate::context::assemble_context(state, &tenant, &req, trust).await
 }
 
 /// Logique métier de `GET /api/v1/vault_authors`.
@@ -2605,9 +3141,25 @@ pub async fn vault_tags_impl(
     if state.acl.evaluate(trust, AclOp::Read, &locus) != AclDecision::Allow {
         return Err(GradatumError::Forbidden("acl deny".into()));
     }
-    // `distinct_tags` renvoie déjà les tags triés fréquence décroissante (puis
-    // alpha) — `total` = cardinal complet AVANT bornage (détection de troncature).
-    let rows = state.search.distinct_tags(&vault_id).await?;
+    // D-14(b) — garde de lecture sur l'étiquette réservée.
+    //
+    // `vault_tags` est la surface qui nomme les tags : laisser passer la ligne
+    // `personal-classified` y rendrait la marque elle-même énumérable, et avec elle le
+    // compte des notes marquées. La ligne sort donc, et `total` est recalculé sur les
+    // lignes RETENUES (il est documenté comme le cardinal complet avant bornage : c'est
+    // la détection de troncature, et il doit décrire ce que l'appelant peut obtenir).
+    //
+    // Le tri fréquence-décroissante est préservé : le filtre retire une ligne, il ne
+    // réordonne rien. Verdict sur `{vault_id}` — le vault effectif de ce chemin.
+    let mut privacy_guard = PrivacyReadGuard::new();
+    let privacy_allowed = privacy_guard.allows(state, trust, &vault_id);
+    let rows: Vec<(String, u64)> = state
+        .search
+        .distinct_tags(&vault_id)
+        .await?
+        .into_iter()
+        .filter(|(tag, _)| privacy_allowed || tag != PERSONAL_CLASSIFIED_TAG)
+        .collect();
     let total = rows.len() as u64;
     let limit = req.limit.unwrap_or(DEFAULT_TAGS_LIMIT);
     let tags = rows
@@ -2723,40 +3275,94 @@ pub async fn vault_timeline_impl(
         include_expired: req.include_expired,
     };
 
-    let rows = state.search.timeline(&vault, &filter).await?;
-
     // ── Guard identité — DÉJÀ ASSURÉ AU NIVEAU SQL (pas de filtre serveur redondant) ──
     // La requête `SqliteIndex::timeline` (sqlite.rs) exclut `n.section NOT IN
     // (Section::PROTECTED_FORGET)`. `Section::PROTECTED_FORGET` inclut `Identity` → aucune
-    // note `identity/<agent>` n'entre jamais dans `rows`, pour AUCUN appelant (garde plus
+    // note `identity/<agent>` n'entre jamais dans une page, pour AUCUN appelant (garde plus
     // forte que le filtre par-privilège de `vault_list` : blackout total, source unique
     // `Section::PROTECTED_FORGET`, testée par `timeline_excludes_protected_sections`).
     // Un filtre serveur `identity_section_hidden` ici serait une 2ᵉ source de vérité + une
     // requête `get_titles_sections` superflue par appel → non ajouté (dev-code-economy).
     // Régression verrouillée côté serveur par `vault_timeline_excludes_identity_*`.
 
-    let next_cursor = if rows.len() == limit {
-        rows.last().map(|r| {
-            TimelineCursor {
-                anchor_ms: r.anchor_ms,
-                note_id: r.note_id.0.to_string(),
-            }
-            .encode()
-        })
-    } else {
-        None
-    };
+    // ── Guard D-14(b) — le marqueur est un VERDICT, pas un blackout ───────────────
+    // L'exclusion identité ci-dessus est inconditionnelle : elle vit dans la clause SQL,
+    // pour tous les appelants. Le marqueur, lui, dépend du verdict — un consommateur
+    // habilité doit continuer de voir ces notes. Le porter au SQL demanderait un champ de
+    // plus sur `TimelineFilter`, structure publique **exhaustive** : ce serait un
+    // changement d'API publique cassant, hors du périmètre de ce correctif. Le filtre est
+    // donc serveur, après la requête, et le vault évalué est celui **du résultat** (le
+    // vault attesté de la requête), jamais le tenant.
+    //
+    // ## Pagination — remplissage, jamais de page vide au milieu
+    //
+    // Le curseur avance sur les lignes **brutes** (dernière ligne *parcourue*, retenue ou
+    // non) : le keyset `(anchor_ms, note_id)` progresse sur la base et non sur le rendu,
+    // donc une ligne retirée ne peut être ni perdue ni dupliquée. Mais la page doit être
+    // **remplie** jusqu'à `limit`, ou la base épuisée : rendre une page vide au milieu de
+    // la chronologie trahirait le retrait — un client qui s'arrête sur page vide perdrait
+    // la suite de la chronologie, et la forme même de la réponse deviendrait un oracle
+    // (« page vide ici = note retirée ici »), ce que D-14 interdit. D'où la boucle.
+    //
+    // C'est délibérément **plus fort** que la parité `vault_list` (page courte, `total`
+    // décrémenté à la page, P2 résiduel documenté) : ici la forme de la page est
+    // observable sans requête supplémentaire.
+    //
+    // Coût : un consommateur habilité court-circuite (`hidden_ids` → zéro I/O via
+    // `allows`) et ne lit qu'une page ; un consommateur nié paie un lot de tags par page
+    // brute, le verdict restant mémoïsé par vault.
+    let mut items: Vec<TimelineItem> = Vec::with_capacity(limit);
+    let mut page_cursor = filter.cursor.clone();
+    let mut privacy_guard = PrivacyReadGuard::new();
 
-    let items = rows
-        .into_iter()
-        .map(|r| TimelineItem {
-            note_id: r.note_id.0.to_string(),
-            anchor_ms: r.anchor_ms,
-            anchor_src: r.anchor_src,
-            doc_kind: r.doc_kind,
-            title: r.title,
-        })
-        .collect();
+    let next_cursor: Option<String> = loop {
+        let page = state
+            .search
+            .timeline(
+                &vault,
+                &TimelineFilter {
+                    cursor: page_cursor.clone(),
+                    ..filter.clone()
+                },
+            )
+            .await?;
+        let page_full = page.len() == limit;
+
+        let ids: Vec<String> = page.iter().map(|r| r.note_id.0.to_string()).collect();
+        let hidden = privacy_guard
+            .hidden_ids(state, trust, vault.as_str(), &ids)
+            .await?;
+
+        let mut last_scanned: Option<TimelineCursor> = None;
+        for row in page {
+            last_scanned = Some(TimelineCursor {
+                anchor_ms: row.anchor_ms,
+                note_id: row.note_id.0.to_string(),
+            });
+            let note_id = row.note_id.0.to_string();
+            if hidden.contains(&note_id) {
+                continue;
+            }
+            items.push(TimelineItem {
+                note_id,
+                anchor_ms: row.anchor_ms,
+                anchor_src: row.anchor_src,
+                doc_kind: row.doc_kind,
+                title: row.title,
+            });
+            if items.len() == limit {
+                break;
+            }
+        }
+
+        // Une page brute incomplète = base épuisée : plus rien après, pas de curseur.
+        // Sinon on reprend après la dernière ligne **parcourue**.
+        let resume = page_full.then_some(last_scanned).flatten();
+        if items.len() == limit || !page_full || resume.is_none() {
+            break resume.as_ref().map(TimelineCursor::encode);
+        }
+        page_cursor = resume;
+    };
 
     Ok(VaultTimelineResponse { items, next_cursor })
 }
@@ -4240,6 +4846,21 @@ pub async fn lessons_recall_impl(
         crate::api_v1::tenant_guard::own_vault_checked(LESSONS_TENANT)
     };
 
+    // D-14(b) — garde de lecture sur l'étiquette réservée.
+    //
+    // `LessonHit.tags` rend la liste des tags de la leçon : c'est la raison pour laquelle
+    // cette surface figure au compte de l'énumération (`gradatum-dto/src/lessons_recall.rs`).
+    // Une leçon marquée sort donc des items — comme partout ailleurs — pour un consommateur
+    // sans verdict Allow sur `{vault}/personal-classified`.
+    //
+    // Le verdict porte sur le vault du RÉSULTAT (`vault_id.vault_id()`, attesté read par
+    // `own_vault_checked`/`require_read_grant` ci-dessus), pas sur le tenant de l'appelant :
+    // le lessons est un vault global partagé, et c'est bien `main` que `recall_lessons`
+    // interroge. Les deux chemins (sémantique et BM25) appliquent la MÊME garde — un
+    // filtrage posé sur un seul laisserait l'autre fuiter.
+    let mut privacy_guard = PrivacyReadGuard::new();
+    let privacy_allowed = privacy_guard.allows(state, trust, vault_id.vault_id().as_str());
+
     // ── F-68 semantic opt-in ──────────────────────────────────────────────────
     //
     // Rétro-compat BLOQUANTE : `semantic` absent / `false` → chemin BM25 ci-dessous
@@ -4289,11 +4910,15 @@ pub async fn lessons_recall_impl(
                     .hydrate_lessons_by_ulids(vault_id.vault_id(), &ulid_refs)
                     .await?;
 
-                // Filtres post-hydratation : codified exclu + classe correcte.
+                // Filtres post-hydratation : codified exclu + classe correcte + D-14(b).
                 let filtered: Vec<_> = hydrated
                     .into_iter()
                     .filter(|h| !h.tags.iter().any(|t| t == "codified"))
                     .filter(|h| h.tags.iter().any(|t| t.as_str() == class))
+                    .filter(|h| {
+                        privacy_allowed
+                            || !h.tags.iter().any(|t| t.as_str() == PERSONAL_CLASSIFIED_TAG)
+                    })
                     .take(limit)
                     .collect();
 
@@ -4345,6 +4970,22 @@ pub async fn lessons_recall_impl(
         .search
         .recall_lessons(vault_id.vault_id(), class, limit)
         .await?;
+
+    // D-14(b), même garde que le chemin sémantique ci-dessus.
+    //
+    // `recall_lessons` rend EXACTEMENT `limit` lignes : filtrer après la troncature ne
+    // fait pas remonter la leçon suivante (pas de rétro-remplissage), contrairement au
+    // chemin sémantique qui sur-échantillonne `limit * 2` pour ses propres filtres. La
+    // dissymétrie est assumée : élargir la fenêtre BM25 ici changerait le jeu ramené pour
+    // TOUS les appelants, y compris ceux que la garde ne concerne pas, alors que le seul
+    // effet de la garde est de retirer des lignes. Le résultat est donc « au plus `limit`
+    // leçons », jamais « `limit` leçons dont les marquées ».
+    let raw_hits: Vec<_> = raw_hits
+        .into_iter()
+        .filter(|h| {
+            privacy_allowed || !h.tags.iter().any(|t| t.as_str() == PERSONAL_CLASSIFIED_TAG)
+        })
+        .collect();
 
     // Recency boost (opt-in) — rétro-compat BLOQUANTE : None / Relevance = BM25 inchangé.
     //
@@ -4782,6 +5423,264 @@ pub async fn create_feature_card_impl(
         note_id: enq.note_id,
         poll_url: enq.poll_url,
     })
+}
+
+// ── vault_privacy_review (F-160 D-13) ────────────────────────────────────────
+
+/// The `privacy` block key inside a note's `extra` frontmatter.
+///
+/// Spelled here rather than imported: `gradatum_vault::privacy_block` is private to the
+/// vault crate, so the server cannot reach its `BLOCK_KEY` / `REVIEW_KEY` / `Review::of`.
+/// The constants below are the wire form, and the resting-value rule is restated in
+/// [`recorded_review`] rather than assumed. This mirrors [`PERSONAL_CLASSIFIED_TAG`],
+/// which is a literal for the same reason.
+const PRIVACY_BLOCK_KEY: &str = "privacy";
+const PRIVACY_REVIEW_KEY: &str = "review";
+const PRIVACY_SPANS_DIGEST_KEY: &str = "spans_digest";
+
+/// The `review` a block records, reduced to its canonical spelling.
+///
+/// The vault's own accessor (`Review::of`) maps an absent or unrecognised value to
+/// `pending`, and this mirrors it exactly. Comparing the raw string instead would report
+/// a `409` on a note that is, in the vault's own terms, `pending`.
+fn recorded_review(block: &toml::value::Table) -> &str {
+    match block.get(PRIVACY_REVIEW_KEY).and_then(toml::Value::as_str) {
+        Some("accepted") => "accepted",
+        Some("rejected") => "rejected",
+        _ => "pending",
+    }
+}
+
+/// Logique métier de `POST /api/v1/vault_privacy_review` (F-160, D-13).
+///
+/// ## Ce que cette surface existe pour faire
+///
+/// D-11 donne à une étiquette réservée exactement **deux** voies de retrait : une passe
+/// `ok` qui ne rapporte rien d'important, et un verdict humain `rejected`. C'est la
+/// seconde, et c'est la **seule API du produit capable de déclasser durablement une
+/// note** : aucun autre chemin ne fait sortir une note de `personal-classified`.
+///
+/// ## Autorisation (SEC-P0-1)
+///
+/// Prédicat **identique** à celui de la garde de lecture D-14 :
+/// `evaluate(Read, "{vault}/personal-classified") == Allow`, évalué sur le vault effectif.
+/// Les deux surfaces ne peuvent donc pas diverger. En pratique : identité d'administration
+/// ou d'opérateur (`admin` et `studio` portent `["**"]`). **L'auteur d'une note ne revoit
+/// pas ses propres marquages** — c'est délibéré : un verdict sur des données personnelles
+/// est un acte humain, et l'identité qui a produit le contenu en est écartée.
+///
+/// ## Le verdict ne pose pas les étiquettes ici
+///
+/// La revue écrit `extra.privacy.review` par le **point d'insertion unique** et s'arrête
+/// là. Les étiquettes sont décidées par la primitive à partir de ce que la note porte sur
+/// le disque (D-11) : un `rejected` lie la passe **suivante**, jamais l'écriture de la
+/// revue elle-même. Retirer le marqueur ici créerait une seconde autorité sur lui, qui
+/// divergerait de la première.
+///
+/// ## Le compare-and-swap
+///
+/// `expected_sha256` est obligatoire : un verdict formé sur une version qui a bougé depuis
+/// ne doit pas s'appliquer à celle qui l'a remplacée. Le verrou est celui du vault
+/// (`write_if_match_internal`) — le conflit est rapporté par le stockage, jamais par une
+/// ré-implémentation locale de sa comparaison.
+///
+/// ## La relecture
+///
+/// Là où un détecteur est monté, la passe d'écriture recalcule le bloc et le verdict ne
+/// s'inscrit pas. La note est donc relue et le verdict **vérifié** avant la réponse : cette
+/// surface ne rapporte jamais un verdict que la note ne porte pas. Le cas échéant elle
+/// répond `409` et n'émet pas d'événement d'audit de succès.
+///
+/// ## L'événement d'audit (SEC-P1-5)
+///
+/// Obligatoire sur chaque appel abouti. L'acteur vient du `TrustContext`, le verdict et
+/// les deux digests voyagent dans `curator`. **Jamais** le corps, **jamais** un span,
+/// **jamais** une valeur détectée.
+///
+/// # Errors
+///
+/// - `GradatumError::Unauthorized` — pas d'identité authentifiée (`401`).
+/// - `GradatumError::Forbidden` — scope de tenant ou grant `personal-classified` (`403`).
+/// - `GradatumError::InvalidInput` — `note_id` non-ULID, ou `expected_sha256` absent ou
+///   malformé (`400`).
+/// - `GradatumError::NoteNotFound` — note inconnue **ou** hors du périmètre lisible : les
+///   deux sont délibérément indistinguables (`404`, jamais un oracle).
+/// - `GradatumError::Conflict` — pas de bloc `privacy`, pas de `spans_digest`, verrou
+///   périmé, ou verdict non porté par la note après écriture (`409`).
+pub async fn vault_privacy_review_impl(
+    state: &AppState,
+    trust: &TrustContext,
+    req: VaultPrivacyReviewRequest,
+    request_id: &str,
+) -> Result<VaultPrivacyReviewResponse, GradatumError> {
+    if !trust.is_authenticated() {
+        return Err(GradatumError::Unauthorized);
+    }
+    // Le corps ne porte pas de `tenant_id` : le vault effectif dérive du credential, et
+    // `effective_write_vault` y joint l'exigence de scope write à `multi_tenant` ON.
+    let tenant = effective_write_vault(state, trust, None)
+        .await
+        .map_err(|r| r.into_forbidden("tenant cross mismatch"))?;
+
+    // Autorisation — le prédicat de la garde de lecture D-14, sur le même locus synthétique.
+    // Même barreau, même statut, et la même ligne de journal en cas de refus.
+    let locus = format!("{tenant}/{PERSONAL_CLASSIFIED_TAG}");
+    let mut guard = PrivacyReadGuard::new();
+    if !guard.allows(state, trust, &tenant) {
+        log_acl_deny(trust, AclOp::Read, &locus, "vault_privacy_review");
+        return Err(GradatumError::Forbidden("acl deny read".into()));
+    }
+
+    // Validation ULID — 400 avant toute I/O vault (parité `vault_classify_impl`).
+    if ulid::Ulid::from_string(&req.note_id).is_err() {
+        return Err(GradatumError::InvalidInput(format!(
+            "invalid note_id {} — a bare ULID is expected \
+             (this endpoint does not resolve \"section/ULID\", titles or slugs)",
+            echo_ref(&req.note_id)
+        )));
+    }
+
+    // `expected_sha256` est obligatoire au contrat, et son absence est tranchée ici plutôt
+    // que par le désérialiseur — cf. la note portée par le DTO lui-même.
+    let Some(expected_hex) = req
+        .expected_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(GradatumError::InvalidInput(
+            "expected_sha256 is required — a review must name the version it judged".into(),
+        ));
+    };
+    let Some(expected) = parse_sha256_hex(expected_hex) else {
+        return Err(GradatumError::InvalidInput(format!(
+            "invalid expected_sha256 (64 lowercase hex expected): {}",
+            echo_ref(expected_hex)
+        )));
+    };
+
+    // 404 — note inconnue, ou hors du périmètre lisible. Délibérément muet : cette surface
+    // est administrative et ne doit pas devenir un oracle d'existence pour les notes que la
+    // garde de lecture soustrait.
+    let reader = read_back_reader(state, &tenant)?;
+    let note = reader.read_note_by_id(&req.note_id).await?;
+
+    // Le bloc est la trace de ce que la passe a vu. Sans lui il n'y a rien à revoir :
+    // forger un bloc fabriquerait un état « une passe a tourné » et casserait la doctrine
+    // des quatre états.
+    let mut extra = note.frontmatter.extra.clone();
+    let Some(existing) = extra.get(PRIVACY_BLOCK_KEY).and_then(toml::Value::as_table) else {
+        return Err(GradatumError::Conflict(
+            "the note carries no privacy block to review".into(),
+        ));
+    };
+    let mut block = existing.clone();
+    let Some(spans_digest_before) = block
+        .get(PRIVACY_SPANS_DIGEST_KEY)
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Err(GradatumError::Conflict(
+            "the note's privacy block carries no spans_digest".into(),
+        ));
+    };
+
+    // **Seule** `privacy.review` change : le digest couvre les spans sur lesquels le verdict
+    // est prononcé, le déplacer dépenserait le verdict avec eux (D-11).
+    block.insert(
+        PRIVACY_REVIEW_KEY.to_owned(),
+        toml::Value::String(req.verdict.as_str().to_owned()),
+    );
+    extra.insert(PRIVACY_BLOCK_KEY.to_owned(), toml::Value::Table(block));
+
+    // Le frontmatter est celui relu du disque, `extra` seul remplacé : `locus`, `status`,
+    // `created` et toute étiquette réservée que la note porte sont re-rapportés verbatim, et
+    // c'est la primitive qui décide des étiquettes depuis ce qu'elle relit (D-11).
+    let mut frontmatter = note.frontmatter.clone();
+    frontmatter.extra = extra;
+
+    let checked =
+        gradatum_core::scope::AclCheckedVaultId::attest_write_checked(VaultId::new(&tenant));
+    match reader
+        .write_if_match_internal(
+            &checked,
+            frontmatter,
+            note.body.markdown.clone(),
+            note.id,
+            expected,
+        )
+        .await?
+    {
+        gradatum_vault::WriteResult::Written { .. } => {}
+        gradatum_vault::WriteResult::Conflict { .. } => {
+            return Err(GradatumError::Conflict(
+                "expected_sha256 does not match the current version".into(),
+            ));
+        }
+    }
+
+    // Relecture, puis vérification : la passe d'écriture fait autorité sur le bloc, donc un
+    // verdict qui ne s'est pas inscrit est un conflit, jamais un succès.
+    let written = reader.read_note_by_id(&req.note_id).await?;
+    let written_block = written
+        .frontmatter
+        .extra
+        .get(PRIVACY_BLOCK_KEY)
+        .and_then(toml::Value::as_table);
+    let recorded = written_block.map_or("pending", recorded_review);
+    let spans_digest_after = written_block
+        .and_then(|b| b.get(PRIVACY_SPANS_DIGEST_KEY))
+        .and_then(toml::Value::as_str)
+        .unwrap_or(spans_digest_before.as_str());
+    if recorded != req.verdict.as_str() {
+        tracing::warn!(
+            note_id = %req.note_id,
+            requested = %req.verdict.as_str(),
+            recorded = %recorded,
+            "vault_privacy_review: the note does not carry the requested verdict — the \
+             write-time pass is the authority over the block (409)"
+        );
+        return Err(GradatumError::Conflict(format!(
+            "the note does not carry the requested verdict (requested {}, recorded {recorded})",
+            req.verdict.as_str()
+        )));
+    }
+
+    // Audit — obligatoire sur chaque appel abouti (SEC-P1-5). Le verdict et les deux
+    // digests voyagent dans `curator` ; `outcome` nomme l'opération et non le verdict, pour
+    // qu'un `rejected` ne puisse pas se lire comme un échec.
+    let sha_after = written.content_hash.hex();
+    let audit_evt = HttpAuditEvent {
+        ts: Utc::now(),
+        event: "vault_privacy_review".into(),
+        actor: actor_from_trust(trust),
+        tenant_id: tenant.clone(),
+        locus: written
+            .frontmatter
+            .locus
+            .as_ref()
+            .map_or_else(|| locus_for_tenant(&tenant), |l| l.as_str().to_owned()),
+        note_id: Some(req.note_id.clone()),
+        content_hash: Some(sha_after.clone()),
+        outcome: "reviewed".into(),
+        curator: Some(serde_json::json!({
+            "verdict": req.verdict.as_str(),
+            "spans_digest_before": spans_digest_before,
+            "spans_digest_after": spans_digest_after,
+            "expected_sha256": expected_hex,
+        })),
+        request_id: request_id.to_owned(),
+    };
+    if let Err(e) = state.audit.record(audit_evt).await {
+        tracing::warn!(error = %e, "vault_privacy_review_impl: audit emit failed — non fatal");
+    }
+
+    Ok(VaultPrivacyReviewResponse::new(
+        req.note_id,
+        req.verdict,
+        spans_digest_after.to_owned(),
+        sha_after,
+    ))
 }
 
 /// Logique métier de `POST /api/v1/vault_mutate_role` — mutation ciblée d'un rôle typé sur des

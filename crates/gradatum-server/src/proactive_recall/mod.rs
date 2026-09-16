@@ -199,11 +199,33 @@ pub async fn proactive_recall(
     // des âmes d'agents fuiteraient cross-agent via la surface proactive. Exclusion simple
     // (surface RAG générique, pas de matching par-agent). No-op pour Studio / main-agent.
     let identity_privileged = crate::api_v1::logic::is_identity_privileged(trust);
+
+    // Guard D-14(b) — marqueur `personal-classified` (ruling G22 / P1-1).
+    //
+    // `ProactiveHit` rend `ulid` + `title` + `snippet` : la surface est à la fois
+    // d'énumération ET de contenu. Le prédicat est celui de `PrivacyReadGuard` —
+    // partagé, jamais ré-écrit ici — et le vault évalué est celui **du résultat** : le
+    // vault propre du tenant, seul vault que la surface interroge.
+    //
+    // Le retrait précède le `take(limit)` ci-dessous : filtrer après la troncature
+    // ferait consommer un rang à une note marquée, la page sortirait courte et la
+    // forme de la réponse trahirait son existence (oracle de cardinalité).
+    let mut privacy_guard = crate::api_v1::logic::PrivacyReadGuard::new();
+    let privacy_hidden = privacy_guard
+        .hidden_ids(
+            state,
+            trust,
+            crate::api_v1::tenant_guard::own_vault_checked(&tenant).as_str(),
+            &hydrated.iter().map(|h| h.ulid.clone()).collect::<Vec<_>>(),
+        )
+        .await?;
+
     let items: Vec<ProactiveHit> = hydrated
         .into_iter()
         .filter(|hit| {
             section_readable(state, trust, &tenant, &hit.section)
                 && !crate::api_v1::logic::identity_section_hidden(identity_privileged, &hit.section)
+                && !privacy_hidden.contains(&hit.ulid)
         })
         .take(limit)
         .collect();

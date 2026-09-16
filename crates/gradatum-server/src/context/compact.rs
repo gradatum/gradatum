@@ -36,6 +36,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use gradatum_core::error::GradatumError;
+use gradatum_core::trust::TrustContext;
 use gradatum_dto::VaultContextRequest;
 use gradatum_search::{ScoringWeightsWire, resolve_weights};
 
@@ -108,6 +109,7 @@ pub async fn assemble_compact(
     tenant: &str,
     req: &VaultContextRequest,
     identity_privileged: bool,
+    trust: &TrustContext,
 ) -> Result<VaultContextResponse, GradatumError> {
     // ── 1. session_id obligatoire ────────────────────────────────────────────
     //
@@ -218,6 +220,17 @@ pub async fn assemble_compact(
             rrf_score: 0.0,
         });
     }
+
+    // ── Guard D-14(b) — candidats marqués retirés AVANT le scoring et la sélection ──
+    //
+    // Appliqué à l'**union** (retrieval courant + sent-only) : une note marquée remontée
+    // par le retrieval comme une note marquée déjà `sent` rendrait sinon un ULID (stub) ou
+    // un corps (inline). Le prédicat est celui de `PrivacyReadGuard` — partagé, jamais
+    // ré-écrit. Le retrait précède `candidates_considered`, qui est rendu dans les
+    // diagnostics et trahirait sinon la cardinalité retenue.
+    let ids: Vec<String> = candidates.iter().map(|c| c.note_id.clone()).collect();
+    let hidden = super::hidden_candidates(state, trust, tenant, &ids).await?;
+    candidates.retain(|c| !hidden.contains(&c.note_id));
 
     // Remplacer les rrf_scores par les scores compacts basés sur fold_score (Task 9).
     // En mode compact, le critère inline/stub est l'ancienneté×taille, pas le RRF courant.

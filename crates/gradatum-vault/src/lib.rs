@@ -36,6 +36,14 @@ pub mod lifecycle;
 /// Note-write convergence guard — crate-internal.
 mod note_write_guard;
 pub mod overrides;
+/// The personal-data detection pass at the single insertion point — crate-internal.
+mod privacy;
+/// The `extra.privacy` block a pass records — crate-internal.
+mod privacy_block;
+/// The sink a completed pass reports to — crate-internal.
+mod privacy_observer;
+/// The deferred privacy sweep — crate-internal except for its outcome.
+mod privacy_rescan;
 pub mod registry;
 pub mod write;
 
@@ -45,6 +53,8 @@ pub use lifecycle::{
     ARCHIVE_DIR_PREFIX, ArchiveOutcome, HISTORY_DIR_PREFIX, MAX_NOTE_TAGS, RestoreOutcome,
 };
 pub use overrides::NoteMetadataOverride;
+pub use privacy_observer::{PrivacyObserver, PrivacyPass};
+pub use privacy_rescan::PrivacyRescanOutcome;
 pub use registry::Vault;
 pub use write::WriteResult;
 
@@ -377,6 +387,45 @@ pub trait Registry: Send + Sync {
         let _ = (checked, frontmatter, body, id, expected_sha256);
         Err(gradatum_core::error::GradatumError::Storage(
             "write_if_match_internal: Registry without a real vault (fail-loud)".to_string(),
+        ))
+    }
+
+    /// Re-judges one note of the privacy frontier and returns what became of it.
+    ///
+    /// The deferred sweep's unit of work, and the **only** way the server reaches it:
+    /// the detection pass lives in this crate and reads the note's body, so a caller
+    /// that held only the index could not run it. See `crate::privacy_rescan` for the
+    /// four clauses the implementation is bound by — perimeter, the guard re-applied
+    /// after selection, the idempotent re-judgement that writes nothing when nothing
+    /// changed, and the bound carried by the caller's job.
+    ///
+    /// `vault_id` is the vault the note is expected to live in, and the note's own
+    /// resolved namespace is what the pass and the guard are evaluated on. Under D-11
+    /// the outcome can only ever add or clear a marker: a re-judgement may pose
+    /// `personal-classified` or retire `privacy-unscanned`, never the reverse.
+    ///
+    /// ## Default implementation
+    ///
+    /// **Fail-loud** (`GradatumError::Storage`): a `Registry` that is not the real
+    /// `Vault` cannot run a detection pass, and answering `Skipped` would report a
+    /// corpus that was re-judged when none was. Same rationale as
+    /// [`Registry::write_if_match_internal`] and [`Registry::delete_note_by_id_in`].
+    ///
+    /// ## Errors
+    ///
+    /// - `GradatumError::Storage` from the fail-loud default.
+    /// - `GradatumError::Storage` / `GradatumError::Markdown` on read or write error.
+    ///
+    /// A note that is gone, excluded, or judged to what it already carried is **not**
+    /// an error — it is a [`PrivacyRescanOutcome`] value.
+    async fn rescan_privacy_note(
+        &self,
+        vault_id: &str,
+        note_id: gradatum_core::identity::NoteId,
+    ) -> Result<PrivacyRescanOutcome, gradatum_core::error::GradatumError> {
+        let _ = (vault_id, note_id);
+        Err(gradatum_core::error::GradatumError::Storage(
+            "rescan_privacy_note: Registry without a real vault (fail-loud)".to_string(),
         ))
     }
 
@@ -827,6 +876,35 @@ impl Registry for Vault {
                 hash
             )),
         })
+    }
+
+    async fn rescan_privacy_note(
+        &self,
+        vault_id: &str,
+        note_id: gradatum_core::identity::NoteId,
+    ) -> Result<PrivacyRescanOutcome, gradatum_core::error::GradatumError> {
+        use gradatum_core::error::GradatumError;
+
+        // Aucun témoin ACL ici, et c'est délibéré : le balayage ne décide d'aucun accès.
+        // Il ne fait que rejouer la passe sur une note que sa propre sélection a déjà
+        // restreinte au périmètre du déploiement, et il écrit par le funnel commun — qui
+        // ré-applique Garde 0 sur le namespace RÉSOLU de la note. Un `vault_id` fourni par
+        // l'appelant ne peut donc pas élargir ce que la passe atteint : il nomme le vault
+        // où lire, et la note lue porte le sien.
+        self.rescan_privacy_in(vault_id, note_id)
+            .await
+            .map_err(|e| match e {
+                crate::error::VaultError::Core(inner) => inner,
+                crate::error::VaultError::Storage(msg) => GradatumError::Storage(msg),
+                crate::error::VaultError::Markdown(msg) => {
+                    GradatumError::Markdown(format!("rescan_privacy_note : {msg}"))
+                }
+                // `write_note_judged` écrit sous le verrou optimiste de la note relue ;
+                // un conflit reste une valeur de succès côté écriture, jamais une erreur.
+                crate::error::VaultError::Conflict(hash) => GradatumError::Storage(format!(
+                    "rescan_privacy_note : unexpected conflict hash={hash:?}"
+                )),
+            })
     }
 
     async fn archive_note_by_id(

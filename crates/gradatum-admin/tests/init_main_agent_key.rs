@@ -186,7 +186,6 @@ fn init_fails_when_bootstrap_identity_absent_and_leaves_no_half_root() {
 identity = "some-other-agent"
 read_patterns = ["foo/**"]
 write_patterns = ["foo/**"]
-sees_personal_classified = false
 "#,
     )
     .unwrap();

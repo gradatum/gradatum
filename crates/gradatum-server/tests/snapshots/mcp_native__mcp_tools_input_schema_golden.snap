@@ -838,13 +838,6 @@ expression: schema_map
           "null"
         ]
       },
-      "pattern": {
-        "description": "NOT IMPLEMENTED — the server reads this field and discards it, silently. Setting\nit filters nothing: the response is exactly the one you would get without it. Do\nnot use it to narrow a listing; filter on `section`, or filter client-side.",
-        "type": [
-          "string",
-          "null"
-        ]
-      },
       "role_kind": {
         "description": "Filter on the `kind` role of a project-map card (`FIX`, `FEATURE`,\n`ENHANCEMENT`, `TASK`). Absent or `null`: no filter — the routing to\n`list_notes` is unchanged. The value is the canonical SCREAMING_SNAKE wire form.",
         "type": [
@@ -861,6 +854,14 @@ expression: schema_map
       },
       "section": {
         "description": "Section to list (optional — if absent, lists all sections).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tag": {
+        "default": null,
+        "description": "Filter on an **exact tag**: a note is listed when it carries this name as a whole\ntoken of its tags, never as a substring (`personal-classified-2026` is a different\ntag). Absent or `null`: no filter — the routing to `list_notes` is unchanged.\n\nThe two reserved names (`personal-classified`, `privacy-unscanned`) are accepted\n**here** and refused everywhere a tag is written: a caller may ask which notes carry\na marker without being able to pose one. The answer still passes the read guard, so\nasking is not a way to see what the caller may not read.\n\nA value outside the tag form (uppercase, `%`, `_`, spaces, a leading `-`) is rejected\nwith `400` rather than answered with an empty page.",
         "type": [
           "string",
           "null"

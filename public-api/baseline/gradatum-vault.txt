@@ -76,11 +76,15 @@ pub async fn gradatum_vault::registry::Vault::open(&std::path::Path) -> core::re
 pub fn gradatum_vault::registry::Vault::root(&self) -> &std::path::Path
 pub fn gradatum_vault::registry::Vault::storage(&self) -> &dyn gradatum_storage::storage_trait::Storage
 pub fn gradatum_vault::registry::Vault::vault_id(&self) -> &gradatum_core::scope::VaultId
+pub fn gradatum_vault::registry::Vault::with_detector(self, alloc::sync::Arc<dyn gradatum_core::pii::PiiDetector>, gradatum_core::pii::PrivacyBudgets) -> Self
+pub fn gradatum_vault::registry::Vault::with_privacy_observer(self, alloc::sync::Arc<dyn gradatum_vault::PrivacyObserver>) -> Self
 pub async fn gradatum_vault::registry::Vault::with_shared_index(&std::path::Path, gradatum_core::scope::VaultId, alloc::sync::Arc<gradatum_index::sqlite::SqliteIndex>) -> core::result::Result<Self, gradatum_vault::error::VaultError>
 impl gradatum_vault::registry::Vault
 pub async fn gradatum_vault::registry::Vault::drift_check(&self) -> core::result::Result<gradatum_index::drift::DriftScanResult, gradatum_core::error::GradatumError>
 impl gradatum_vault::registry::Vault
 pub async fn gradatum_vault::registry::Vault::get_effective_note(&self, gradatum_core::identity::NoteId, &gradatum_core::scope::OverrideScope) -> core::result::Result<alloc::sync::Arc<gradatum_core::note::EffectiveNote>, gradatum_core::error::GradatumError>
+impl gradatum_vault::registry::Vault
+pub async fn gradatum_vault::registry::Vault::rescan_privacy_in(&self, &str, gradatum_core::identity::NoteId) -> core::result::Result<gradatum_vault::PrivacyRescanOutcome, gradatum_vault::error::VaultError>
 impl gradatum_vault::registry::Vault
 pub async fn gradatum_vault::registry::Vault::write_if_match(&self, gradatum_core::frontmatter::Frontmatter, alloc::string::String, gradatum_core::identity::NoteId, core::option::Option<[u8; 32]>) -> core::result::Result<gradatum_vault::write::WriteResult, gradatum_vault::error::VaultError>
 impl gradatum_vault::Registry for gradatum_vault::registry::Vault
@@ -101,6 +105,7 @@ pub fn gradatum_vault::registry::Vault::move_locus<'life0, 'life1, 'life2, 'life
 pub fn gradatum_vault::registry::Vault::note_indexed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::purge_archive_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::read_note_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_core::note::Note, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_vault::registry::Vault::rescan_privacy_note<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str, gradatum_core::identity::NoteId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_vault::PrivacyRescanOutcome, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::restore_archive_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_vault::lifecycle::RestoreOutcome, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::run_archive_gc<'life0, 'async_trait>(&'life0 self, i64, usize) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_vault::registry::Vault::tenant_count<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u32, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -113,6 +118,12 @@ pub gradatum_vault::write::WriteResult::Conflict
 pub gradatum_vault::write::WriteResult::Conflict::current_sha256: [u8; 32]
 pub gradatum_vault::write::WriteResult::Written
 pub gradatum_vault::write::WriteResult::Written::new_sha256: [u8; 32]
+#[non_exhaustive] pub enum gradatum_vault::PrivacyRescanOutcome
+pub gradatum_vault::PrivacyRescanOutcome::Rewritten
+pub gradatum_vault::PrivacyRescanOutcome::Skipped
+pub gradatum_vault::PrivacyRescanOutcome::Unchanged
+impl gradatum_vault::PrivacyRescanOutcome
+pub fn gradatum_vault::PrivacyRescanOutcome::as_str(self) -> &'static str
 pub enum gradatum_vault::VaultError
 pub gradatum_vault::VaultError::Conflict([u8; 32])
 pub gradatum_vault::VaultError::Core(gradatum_core::error::GradatumError)
@@ -154,6 +165,17 @@ pub fn gradatum_vault::overrides::NoteMetadataOverride::resolve(&gradatum_core::
 impl gradatum_core::overrides::OverridePayload for gradatum_vault::overrides::NoteMetadataOverride
 pub const gradatum_vault::overrides::NoteMetadataOverride::OVERRIDE_TYPE: &'static str
 pub const gradatum_vault::overrides::NoteMetadataOverride::SCHEMA_VERSION: gradatum_core::frontmatter::SchemaVersion
+#[non_exhaustive] pub struct gradatum_vault::PrivacyPass
+pub gradatum_vault::PrivacyPass::categories: alloc::vec::Vec<alloc::string::String>
+pub gradatum_vault::PrivacyPass::classified_tagged: bool
+pub gradatum_vault::PrivacyPass::rejected_out_of_bounds: u64
+pub gradatum_vault::PrivacyPass::rejected_utf8_boundary: u64
+pub gradatum_vault::PrivacyPass::status: alloc::string::String
+pub gradatum_vault::PrivacyPass::touching_window_edge: u64
+pub gradatum_vault::PrivacyPass::unmapped_labels: u64
+pub gradatum_vault::PrivacyPass::unscanned_tagged: bool
+impl gradatum_vault::PrivacyPass
+pub fn gradatum_vault::PrivacyPass::new(impl core::convert::Into<alloc::string::String>, alloc::vec::Vec<alloc::string::String>, bool, bool, u64, u64, u64, u64) -> Self
 pub struct gradatum_vault::RestoreOutcome
 pub gradatum_vault::RestoreOutcome::restored_path: alloc::string::String
 pub gradatum_vault::RestoreOutcome::section: alloc::string::String
@@ -185,11 +207,15 @@ pub async fn gradatum_vault::registry::Vault::open(&std::path::Path) -> core::re
 pub fn gradatum_vault::registry::Vault::root(&self) -> &std::path::Path
 pub fn gradatum_vault::registry::Vault::storage(&self) -> &dyn gradatum_storage::storage_trait::Storage
 pub fn gradatum_vault::registry::Vault::vault_id(&self) -> &gradatum_core::scope::VaultId
+pub fn gradatum_vault::registry::Vault::with_detector(self, alloc::sync::Arc<dyn gradatum_core::pii::PiiDetector>, gradatum_core::pii::PrivacyBudgets) -> Self
+pub fn gradatum_vault::registry::Vault::with_privacy_observer(self, alloc::sync::Arc<dyn gradatum_vault::PrivacyObserver>) -> Self
 pub async fn gradatum_vault::registry::Vault::with_shared_index(&std::path::Path, gradatum_core::scope::VaultId, alloc::sync::Arc<gradatum_index::sqlite::SqliteIndex>) -> core::result::Result<Self, gradatum_vault::error::VaultError>
 impl gradatum_vault::registry::Vault
 pub async fn gradatum_vault::registry::Vault::drift_check(&self) -> core::result::Result<gradatum_index::drift::DriftScanResult, gradatum_core::error::GradatumError>
 impl gradatum_vault::registry::Vault
 pub async fn gradatum_vault::registry::Vault::get_effective_note(&self, gradatum_core::identity::NoteId, &gradatum_core::scope::OverrideScope) -> core::result::Result<alloc::sync::Arc<gradatum_core::note::EffectiveNote>, gradatum_core::error::GradatumError>
+impl gradatum_vault::registry::Vault
+pub async fn gradatum_vault::registry::Vault::rescan_privacy_in(&self, &str, gradatum_core::identity::NoteId) -> core::result::Result<gradatum_vault::PrivacyRescanOutcome, gradatum_vault::error::VaultError>
 impl gradatum_vault::registry::Vault
 pub async fn gradatum_vault::registry::Vault::write_if_match(&self, gradatum_core::frontmatter::Frontmatter, alloc::string::String, gradatum_core::identity::NoteId, core::option::Option<[u8; 32]>) -> core::result::Result<gradatum_vault::write::WriteResult, gradatum_vault::error::VaultError>
 impl gradatum_vault::Registry for gradatum_vault::registry::Vault
@@ -210,6 +236,7 @@ pub fn gradatum_vault::registry::Vault::move_locus<'life0, 'life1, 'life2, 'life
 pub fn gradatum_vault::registry::Vault::note_indexed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::purge_archive_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::read_note_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_core::note::Note, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_vault::registry::Vault::rescan_privacy_note<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str, gradatum_core::identity::NoteId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_vault::PrivacyRescanOutcome, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::restore_archive_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_vault::lifecycle::RestoreOutcome, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::run_archive_gc<'life0, 'async_trait>(&'life0 self, i64, usize) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_vault::registry::Vault::tenant_count<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u32, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -220,6 +247,8 @@ pub const gradatum_vault::ARCHIVE_DIR_PREFIX: &str
 pub const gradatum_vault::HISTORY_DIR_PREFIX: &str
 pub const gradatum_vault::MAX_NOTE_TAGS: usize
 pub const gradatum_vault::VERSION: &str
+pub trait gradatum_vault::PrivacyObserver: core::marker::Send + core::marker::Sync
+pub fn gradatum_vault::PrivacyObserver::pass_observed(&self, &gradatum_vault::PrivacyPass)
 pub trait gradatum_vault::Registry: core::marker::Send + core::marker::Sync
 pub fn gradatum_vault::Registry::add_tags<'life0, 'life1, 'life2, 'life3, 'async_trait>(&'life0 self, &'life1 gradatum_core::scope::AclCheckedVaultId, &'life2 str, &'life3 [alloc::string::String]) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, 'life3: 'async_trait
 pub fn gradatum_vault::Registry::archive_note_by_id<'life0, 'async_trait>(&'life0 self, gradatum_core::identity::NoteId, core::option::Option<alloc::string::String>, i64) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_vault::lifecycle::ArchiveOutcome, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -238,6 +267,7 @@ pub fn gradatum_vault::Registry::move_locus<'life0, 'life1, 'life2, 'life3, 'asy
 pub fn gradatum_vault::Registry::note_indexed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::Registry::purge_archive_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::Registry::read_note_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_core::note::Note, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_vault::Registry::rescan_privacy_note<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str, gradatum_core::identity::NoteId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_vault::PrivacyRescanOutcome, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::Registry::restore_archive_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_vault::lifecycle::RestoreOutcome, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::Registry::run_archive_gc<'life0, 'async_trait>(&'life0 self, i64, usize) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_vault::Registry::tenant_count<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u32, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
@@ -262,6 +292,7 @@ pub fn gradatum_vault::registry::Vault::move_locus<'life0, 'life1, 'life2, 'life
 pub fn gradatum_vault::registry::Vault::note_indexed<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::purge_archive_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<bool, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::read_note_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_core::note::Note, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
+pub fn gradatum_vault::registry::Vault::rescan_privacy_note<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str, gradatum_core::identity::NoteId) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_vault::PrivacyRescanOutcome, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::restore_archive_by_id<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<gradatum_vault::lifecycle::RestoreOutcome, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn gradatum_vault::registry::Vault::run_archive_gc<'life0, 'async_trait>(&'life0 self, i64, usize) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u64, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn gradatum_vault::registry::Vault::tenant_count<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<u32, gradatum_core::error::GradatumError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait

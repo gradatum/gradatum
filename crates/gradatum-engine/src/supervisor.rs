@@ -263,7 +263,7 @@ fn build_child_args(cfg: &EngineConfig) -> Vec<String> {
 /// `true` if `extra_args` contains an explicit n-predict flag (`--n-predict` or its `-n`
 /// alias), in either `--flag value` or `--flag=value` form.
 ///
-/// Used by [`LlamaServerSupervisor::new`] to reject a config that sets both `max_tokens`
+/// Used by [`config_arg_conflicts`] to reject a config that sets both `max_tokens`
 /// (authoritative `--n-predict` emitter) and an `extra_args` n-predict flag — two sources
 /// would otherwise emit `--n-predict`.
 fn extra_args_has_n_predict(extra_args: &[String]) -> bool {
@@ -271,6 +271,43 @@ fn extra_args_has_n_predict(extra_args: &[String]) -> bool {
         let key = arg.split('=').next().unwrap_or(arg.as_str());
         key == "--n-predict" || key == "-n"
     })
+}
+
+/// Every conflict between an authoritative `[engine]` field and an `extra_args` flag.
+///
+/// Returns one message per conflict, in a stable order; an empty vector means the
+/// configuration carries none. Pure: no filesystem, no network, no process.
+///
+/// Exists so the same verdict is reachable from two call sites — the startup path
+/// ([`LlamaServerSupervisor::new`], which turns the first message into
+/// [`EngineError::BadRequest`]) and the pre-flight check of the `gradatum-engine`
+/// binary, which accumulates messages instead of aborting. Before this function existed
+/// the check accepted configurations the supervisor then refused at startup.
+///
+/// ## Why a single conflict is listed
+///
+/// A doubled flag is only reachable when the flag is BOTH allow-listed in `extra_args`
+/// and emitted by `build_child_args` from a typed field. `--n-predict`/`-n` is the only
+/// such flag: every other authoritative flag (`--model`, `--port`, `--host`,
+/// `--n-gpu-layers`, `--threads`, `--ctx-size`, `--parallel`, `--embedding`, `--mmproj`,
+/// `--spec-*`) is absent from the allow-list, so `validate_extra_args` already rejects it
+/// and no further guard is needed here. `--n-predict` stays allow-listed because
+/// `max_tokens` is optional — unset means unlimited, and `extra_args` remains a valid way
+/// to bound generation.
+#[must_use]
+pub fn config_arg_conflicts(config: &EngineConfig) -> Vec<String> {
+    let mut conflicts: Vec<String> = Vec::new();
+
+    if config.max_tokens.is_some() && extra_args_has_n_predict(&config.extra_args) {
+        conflicts.push(
+            "config conflict: max_tokens is set AND extra_args carries --n-predict/-n — \
+             both would emit --n-predict. Use a single source: remove --n-predict/-n from \
+             extra_args (max_tokens is authoritative), or unset max_tokens."
+                .to_string(),
+        );
+    }
+
+    conflicts
 }
 
 /// Result of a child health check.
@@ -332,17 +369,11 @@ impl LlamaServerSupervisor {
 
         validate_extra_args(&config.extra_args)?;
 
-        // Conflict guard: `max_tokens` (authoritative `--n-predict` emitter) and an
-        // `extra_args` `--n-predict`/`-n` must not both be present — a single source owns
-        // the flag. `--n-predict`/`-n` stay allow-listed so configs already tuning it via
-        // `extra_args` keep loading (when `max_tokens` is unset).
-        if config.max_tokens.is_some() && extra_args_has_n_predict(&config.extra_args) {
-            return Err(EngineError::BadRequest(
-                "config conflict: max_tokens is set AND extra_args carries --n-predict/-n — \
-                 both would emit --n-predict. Use a single source: remove --n-predict/-n from \
-                 extra_args (max_tokens is authoritative), or unset max_tokens."
-                    .to_string(),
-            ));
+        // Conflict guard: a single source must own each emitted flag. The rule itself
+        // lives in `config_arg_conflicts`, shared verbatim with the binary's pre-flight
+        // check — startup aborts on the first message, the check lists them all.
+        if let Some(conflict) = config_arg_conflicts(&config).into_iter().next() {
+            return Err(EngineError::BadRequest(conflict));
         }
 
         let child_port = config.child_port;

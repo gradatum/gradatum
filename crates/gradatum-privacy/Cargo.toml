@@ -1,0 +1,17 @@
+[package]
+name = "gradatum-privacy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Regex-based floor detector for the gradatum personal-data detection frontier"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/**"]
+
+[dependencies]
+gradatum-core = { workspace = true }
+regex = { workspace = true }

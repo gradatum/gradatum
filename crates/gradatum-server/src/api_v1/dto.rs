@@ -15,9 +15,12 @@
 //! - `POST /api/v1/vault_context` → [`VaultContextRequest`] / [`VaultContextResponse`]
 //! - `GET  /api/v1/vault_authors` → [`VaultAuthorsResponse`]
 //! - `GET  /api/v1/vault_tags`    → [`VaultTagsResponse`]
+//! - `POST /api/v1/vault_privacy_review` → [`VaultPrivacyReviewRequest`] /
+//!   [`VaultPrivacyReviewResponse`] — the one F-160 surface that is **not** mirrored on
+//!   MCP (D-13, deliberate: a review is an administrative act, not a tool call).
 
 use gradatum_core::scope::VaultId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ── Re-exports depuis gradatum-dto (single source of truth) ───────────────────
 pub use gradatum_dto::{
@@ -158,6 +161,13 @@ pub struct VaultSearchResponse {
     /// Does NOT indicate relevance or ANN semantic hits.
     /// `corpus_match_count == 0` means the subject is absent from the corpus (lexically).
     /// `corpus_match_count > len(items)` means matches exist beyond the K limit.
+    ///
+    /// Notes withheld from this response by the `personal-classified` read guard are
+    /// **subtracted** — the count is an adjustment scoped to what this response
+    /// withheld, never a second authority on the corpus (same rule as `vault_list`'s
+    /// `total`). The adjustment is therefore page-scoped: a marked note matching beyond
+    /// the ranked window remains counted, so the count may still overstate what an
+    /// unauthorised consumer could ever be shown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corpus_match_count: Option<u64>,
     /// `true` when `corpus_match_count` was capped at 10 000 (the real corpus contains
@@ -285,6 +295,13 @@ pub struct TraceEntry {
     /// Contextual excerpt of the note.
     pub snippet: Option<String>,
     /// Tags attached to the note.
+    ///
+    /// Always empty in 2.4.0 — the field exists for v1.6.2 wire parity and nothing
+    /// populates it. It is nonetheless enumerated among the tag-**rendering** surfaces,
+    /// so the D-14(b) read guard covers this endpoint: a note carrying
+    /// `personal-classified` is removed from the traced lineage for a consumer whose
+    /// `evaluate(Read, "{vault}/personal-classified")` is not `Allow`. Should this field
+    /// ever be populated, the guard already withholds the whole entry — no masking to add.
     pub tags: Vec<String>,
 }
 
@@ -471,6 +488,132 @@ pub struct EnqueuedResponseUlid {
     /// Format: 26-char alphanumeric ULID (e.g. `"01HZ..."`).
     /// Guaranteed to match the `note_id` stored by the worker.
     pub note_id: String,
+}
+
+// ── vault_privacy_review (F-160 D-13) ────────────────────────────────────────
+
+/// A human verdict on a note's personal-data scan.
+///
+/// The three values are the ones a note's `privacy` block already carries under its
+/// `review` key, spelled identically on the wire.
+///
+/// `Pending` is not the absence of a verdict: it is the **resting** value, what a block
+/// holds before any human has judged it. Submitting it therefore withdraws an earlier
+/// verdict rather than recording a new one, and a block whose `review` key is missing or
+/// unrecognised reads as `Pending` — the same rule the vault applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum PrivacyReviewVerdict {
+    /// No human judgement is recorded — the resting value.
+    Pending,
+    /// The marking is confirmed: the note keeps carrying personal data.
+    Accepted,
+    /// The marking is a false positive: the following write retires the marker.
+    Rejected,
+}
+
+impl PrivacyReviewVerdict {
+    /// The wire spelling, identical to the one the block carries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// `POST /api/v1/vault_privacy_review` — request body.
+///
+/// ## Why `expected_sha256` is an `Option` and not a `String`
+///
+/// The contract makes it **mandatory**, and the endpoint answers `400` when it is absent.
+/// A required `String` would have handed that rejection to the deserialiser, and the
+/// framework maps a missing field to `422 Unprocessable Entity` — a status this API does
+/// not otherwise use for a malformed body. The field is therefore *declared* optional so
+/// that the endpoint, and not serde, owns the `400`.
+///
+/// The one place the deserialiser still speaks for itself is an unrecognised `verdict`,
+/// which has no typed representation and is rejected with the framework's own status.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct VaultPrivacyReviewRequest {
+    /// ULID of the note to review. A bare ULID: like `vault_classify`, this endpoint does
+    /// not resolve `section/ULID`, a title or a slug — the target must be unambiguous,
+    /// since a verdict is formed on one exact version.
+    pub note_id: String,
+    /// The verdict to record.
+    pub verdict: PrivacyReviewVerdict,
+    /// SHA-256 (64 lowercase hex) of the version this verdict was formed on — the
+    /// compare-and-swap lock.
+    pub expected_sha256: Option<String>,
+}
+
+impl VaultPrivacyReviewRequest {
+    /// Builds a request. `expected_sha256` stays optional in the type for the reason given
+    /// on the struct: the endpoint, not serde, answers its absence.
+    ///
+    /// The constructor is the escape hatch `#[non_exhaustive]` requires: without it the
+    /// type cannot be built outside this crate at all. The endpoint itself never calls
+    /// it — a request arrives as JSON — so the binary target sees it as unused and the
+    /// lint is silenced deliberately, as `state::AppState` does for its own
+    /// externally-only constructors.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn new(
+        note_id: String,
+        verdict: PrivacyReviewVerdict,
+        expected_sha256: Option<String>,
+    ) -> Self {
+        Self {
+            note_id,
+            verdict,
+            expected_sha256,
+        }
+    }
+}
+
+/// `POST /api/v1/vault_privacy_review` — response body.
+///
+/// Deliberately narrow. The note's `privacy` block is **not** echoed, and no span appears
+/// here or anywhere else in the answer (D-14(c)): the digest is an opaque fingerprint over
+/// the spans, and it is the only representation of them this surface exposes.
+///
+/// It is returned only once the verdict has been **read back** from the note, so a `200`
+/// here means the note carries the verdict — not merely that a write was accepted.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct VaultPrivacyReviewResponse {
+    /// ULID of the reviewed note.
+    pub note_id: String,
+    /// The verdict the note now carries — equal to the one that was requested.
+    pub verdict: PrivacyReviewVerdict,
+    /// The block's `spans_digest`, unchanged by a review: a verdict never moves the spans
+    /// it is about.
+    pub spans_digest: String,
+    /// SHA-256 (64 lowercase hex) of the note after the review — the lock a following
+    /// write must carry.
+    pub sha256: String,
+}
+
+impl VaultPrivacyReviewResponse {
+    /// Builds a response.
+    #[must_use]
+    pub fn new(
+        note_id: String,
+        verdict: PrivacyReviewVerdict,
+        spans_digest: String,
+        sha256: String,
+    ) -> Self {
+        Self {
+            note_id,
+            verdict,
+            spans_digest,
+            sha256,
+        }
+    }
 }
 
 #[cfg(test)]

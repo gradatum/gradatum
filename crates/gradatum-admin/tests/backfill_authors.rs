@@ -53,8 +53,7 @@ fn setup(root: &Path) -> rusqlite::Connection {
          identity = \"main-agent\"\n\
          description = \"Orchestrator\"\n\
          read_patterns = [\"**\"]\n\
-         write_patterns = [\"**\"]\n\
-         sees_personal_classified = false\n",
+         write_patterns = [\"**\"]\n",
     )
     .expect("écrire preset");
 

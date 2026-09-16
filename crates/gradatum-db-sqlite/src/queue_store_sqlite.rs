@@ -31,8 +31,8 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use gradatum_core::{
-    JOB_KIND_MESSAGE, JobError, JobFilter, JobOrder, JobRecord, JobResult, JobStatus, QueueError,
-    QueueEvent, QueueStore, job_kind_str,
+    JOB_KIND_MESSAGE, Job, JobError, JobFilter, JobOrder, JobRecord, JobResult, JobStatus,
+    QueueError, QueueEvent, QueueStore, TERMINAL_PAYLOAD_KEEP, job_kind_str,
 };
 
 /// Broadcast channel capacity for [`QueueEvent`] — default value.
@@ -266,6 +266,36 @@ impl SqliteQueueStore {
             other => Err(QueueError::InvalidTransition(format!(
                 "unknown status: '{other}'"
             ))),
+        }
+    }
+
+    /// Applies the authoritative SQL columns onto a deserialized `JobRecord`.
+    ///
+    /// Fix E-12 : the payload BLOB holds the record as it was at `enqueue` time; the
+    /// `status`, `attempt_count`, `last_error` and `completed_at` columns are the ones
+    /// the lease/complete transactions update. Reading the BLOB alone would return a
+    /// stale status, so every point read re-injects the columns — shared here so
+    /// `get` and `get_many` cannot drift apart.
+    ///
+    /// An unknown status variant falls back to `Pending` (defensive, forward-compatible
+    /// with a schema written by a newer binary).
+    fn apply_sql_authority(
+        record: &mut JobRecord,
+        sql_status: &str,
+        sql_attempts: i64,
+        sql_last_error: Option<String>,
+        sql_completed_at: Option<String>,
+    ) {
+        record.lifecycle.status = Self::str_to_status(sql_status).unwrap_or(JobStatus::Pending);
+        record.retry.count = sql_attempts as u32;
+        if sql_last_error.is_some() {
+            record.retry.last_error = sql_last_error;
+        }
+        if let Some(completed_str) = sql_completed_at
+            && record.lifecycle.completed_at.is_none()
+        {
+            // Réhydrate completed_at depuis SQL si le BLOB ne l'a pas encore
+            record.lifecycle.completed_at = completed_str.parse::<DateTime<Utc>>().ok();
         }
     }
 
@@ -678,26 +708,110 @@ impl QueueStore for SqliteQueueStore {
             None => Ok(None),
             Some((payload, sql_status, sql_attempts, sql_last_error, sql_completed_at)) => {
                 let mut record = Self::deserialize_record(&payload)?;
-
-                // Synchronisation colonnes SQL → record (colonnes SQL font autorité).
-                // Fallback sur Pending si le variant est inconnu (defensive — ne devrait pas
-                // arriver en pratique, protège contre les migrations schema forward-compat).
-                record.lifecycle.status =
-                    Self::str_to_status(&sql_status).unwrap_or(JobStatus::Pending);
-                record.retry.count = sql_attempts as u32;
-                if sql_last_error.is_some() {
-                    record.retry.last_error = sql_last_error;
-                }
-                if let Some(completed_str) = sql_completed_at
-                    && record.lifecycle.completed_at.is_none()
-                {
-                    // Réhydrate completed_at depuis SQL si le BLOB ne l'a pas encore
-                    record.lifecycle.completed_at = completed_str.parse::<DateTime<Utc>>().ok();
-                }
-
+                Self::apply_sql_authority(
+                    &mut record,
+                    &sql_status,
+                    sql_attempts,
+                    sql_last_error,
+                    sql_completed_at,
+                );
                 Ok(Some(record))
             }
         }
+    }
+
+    /// Batch read — one `WHERE id IN (…)` query per chunk of at most 998 identifiers
+    /// (`SQLITE_LIMIT_VARIABLE_NUMBER` leaves one slot for the tenant filter).
+    ///
+    /// Regression guard: a paged scan (mailbox poll, delivery reconciliation) used to
+    /// read one delivery row per note, i.e. `page_size` queue reads per page. With a
+    /// batch read the page costs one read, whatever its size.
+    ///
+    /// Same contract as the trait default: at most one record per distinct id, in the
+    /// order of first occurrence — a repeated id is returned once, not twice.
+    async fn get_many(
+        &self,
+        ids: &[Ulid],
+        tenant_filter: Option<&str>,
+    ) -> Result<Vec<JobRecord>, QueueError> {
+        // Fix E-12 : la synchronisation de statut est la même que dans `get`.
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // `SQLITE_LIMIT_VARIABLE_NUMBER = 999` : la tranche réserve 998 slots aux ids,
+        // le 999e restant disponible pour `tenant_id` quand le filtre est actif.
+        const SQLITE_ID_BATCH: usize = 998;
+
+        let tenant_filter = tenant_filter.map(str::to_owned);
+
+        // Clé = l'id PORTÉ PAR LE RECORD (reconstruit depuis le payload), jamais celui de
+        // la demande : l'ordre de sortie est celui des `ids` demandés, pas celui de SQLite.
+        let mut found: std::collections::HashMap<Ulid, JobRecord> =
+            std::collections::HashMap::new();
+
+        for chunk in ids.chunks(SQLITE_ID_BATCH) {
+            let db = self.db.clone();
+            let mut sql = String::from(
+                "SELECT payload, status, attempt_count, last_error, completed_at \
+                 FROM gradatum_jobs WHERE id IN (",
+            );
+            for i in 0..chunk.len() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+            }
+            sql.push(')');
+            if tenant_filter.is_some() {
+                sql.push_str(" AND tenant_id = ?");
+            }
+
+            let mut bind: Vec<String> = chunk.iter().map(|id| id.to_string()).collect();
+            if let Some(t) = tenant_filter.as_ref() {
+                bind.push(t.clone());
+            }
+
+            let rows = tokio::task::spawn_blocking(
+                move || -> Result<Vec<(String, String, i64, Option<String>, Option<String>)>, QueueError> {
+                    let conn = db.blocking_lock();
+                    let mut stmt = conn.prepare(&sql).map_err(storage_err)?;
+                    let mapped = stmt
+                        .query_map(rusqlite::params_from_iter(bind.iter()), |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                            ))
+                        })
+                        .map_err(storage_err)?;
+                    let mut out = Vec::new();
+                    for row in mapped {
+                        out.push(row.map_err(storage_err)?);
+                    }
+                    Ok(out)
+                },
+            )
+            .await
+            .map_err(|_| blocking_err())??;
+
+            for (payload, sql_status, sql_attempts, sql_last_error, sql_completed_at) in rows {
+                let mut record = Self::deserialize_record(&payload)?;
+                Self::apply_sql_authority(
+                    &mut record,
+                    &sql_status,
+                    sql_attempts,
+                    sql_last_error,
+                    sql_completed_at,
+                );
+                found.insert(record.id, record);
+            }
+        }
+
+        // Ordre demandé, ids absents omis.
+        Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
     }
 
     async fn complete(&self, id: Ulid, result: JobResult) -> Result<(), QueueError> {
@@ -1787,6 +1901,144 @@ impl QueueStore for SqliteQueueStore {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
+    /// Purges the payloads of terminal jobs outside the keep window.
+    ///
+    /// A **read-modify-write that rewrites exactly one field**: the stored `JobRecord` is
+    /// deserialised, `spec.kind` is replaced by [`Job::PayloadPurged`], and the record is
+    /// written back. Everything else — `lifecycle.status`, `created_at`, `completed_at`,
+    /// `result_note`, `conflict_payload`, the whole `retry` history — is preserved, because
+    /// that is precisely what `JobStatusView::from_record` reads: replacing the payload
+    /// wholesale would lose `result_note`, the field through which an asynchronous
+    /// `vault_write` is confirmed. The note body lives **only** in `spec.kind`
+    /// (`CurateSpec.body`, `ValidateSpec.body`, …), so rewriting that one field is enough
+    /// to stop the queue from accumulating client content.
+    ///
+    /// # Keep window
+    ///
+    /// The [`TERMINAL_PAYLOAD_KEEP`] most recent terminal rows are never selected, so a
+    /// `job_status` read landing just after a job completes always sees a job whose
+    /// payload is still there.
+    ///
+    /// # Deliberate divergence — the `kind` column keeps the original kind
+    ///
+    /// After a purge the payload says `PayloadPurged` while the SQL `kind` column still
+    /// holds the kind stamped at `enqueue` (via [`job_kind_str`]). That column is what
+    /// keeps `dlq_counts_by_kind` (`GROUP BY kind`) and the `kind = ?` filters of the
+    /// queue-health surface meaningful — backfilling it from the payload would
+    /// erase that signal silently. See the prohibition comment next to the migration-010
+    /// registration below.
+    ///
+    /// # Transaction, idempotence, corrupt rows
+    ///
+    /// Selection and every rewrite run in **one transaction**: a purge is either entirely
+    /// visible or not at all. A row already carrying `Job::PayloadPurged` is skipped and
+    /// not counted, so a second call returns `Ok(0)`. A row whose payload cannot be
+    /// deserialised is **counted and skipped**, never fatal — one corrupted line must not
+    /// block the purge of the sound ones; that row keeps its payload, which is a residual
+    /// leak and is logged as a `warn`.
+    ///
+    /// # `VACUUM`
+    ///
+    /// This method does **not** run `VACUUM`: the rewrite removes the body from the row,
+    /// not from the file's free pages, which may retain the old text until SQLite reuses
+    /// them.
+    async fn purge_terminal_payloads(
+        &self,
+        older_than: Option<DateTime<Utc>>,
+    ) -> Result<u64, QueueError> {
+        let cutoff = older_than.map(|c| c.to_rfc3339());
+        let db = self.db.clone();
+
+        let purged = tokio::task::spawn_blocking(move || -> Result<u64, QueueError> {
+            let conn = db.blocking_lock();
+            // `unchecked_transaction` : la connexion est dédiée sous le Mutex — aucune
+            // transaction imbriquée n'est possible (même motif que `run_migrations`).
+            let tx = conn.unchecked_transaction().map_err(storage_err)?;
+
+            // Candidats : terminaux, hors fenêtre de conservation, et — si un cutoff est
+            // fourni — créés strictement avant lui. Les ULID font 26 caractères : l'ordre
+            // lexicographique de `id` est l'ordre chronologique (cf. `list`).
+            let select_sql = format!(
+                "SELECT id FROM gradatum_jobs \
+                 WHERE status IN ({terminal}) \
+                   AND (?1 IS NULL OR created_at < ?1) \
+                   AND id NOT IN ( \
+                       SELECT id FROM gradatum_jobs \
+                       WHERE status IN ({terminal}) \
+                       ORDER BY id DESC LIMIT {keep} \
+                   ) \
+                 ORDER BY id",
+                terminal = JobStatus::TERMINAL_SQL,
+                keep = TERMINAL_PAYLOAD_KEEP,
+            );
+
+            let ids: Vec<String> = {
+                let mut stmt = tx.prepare(&select_sql).map_err(storage_err)?;
+                let rows = stmt
+                    .query_map(params![cutoff], |row| row.get::<_, String>(0))
+                    .map_err(storage_err)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(storage_err)?
+            };
+
+            let mut purged = 0u64;
+            let mut skipped = 0u64;
+
+            for id in ids {
+                let payload: String = tx
+                    .query_row(
+                        "SELECT payload FROM gradatum_jobs WHERE id = ?1",
+                        params![id],
+                        |row| row.get(0),
+                    )
+                    .map_err(storage_err)?;
+
+                let mut record = match Self::deserialize_record(&payload) {
+                    Ok(record) => record,
+                    Err(e) => {
+                        // Jamais fatal : une ligne corrompue ne doit pas bloquer la purge
+                        // des lignes saines. Comptée, sautée, signalée — son payload reste
+                        // en place (résidu à traiter par un opérateur, pas par ce chemin).
+                        skipped += 1;
+                        warn!(
+                            job_id = %id,
+                            error = %e,
+                            "purge_terminal_payloads: payload deserialization failed — row skipped"
+                        );
+                        continue;
+                    }
+                };
+
+                // Idempotence : un payload déjà purgé n'est ni réécrit ni recompté.
+                if matches!(record.spec.kind, Job::PayloadPurged) {
+                    continue;
+                }
+
+                record.spec.kind = Job::PayloadPurged;
+                let rewritten = Self::serialize_record(&record)?;
+                tx.execute(
+                    "UPDATE gradatum_jobs SET payload = ?1 WHERE id = ?2",
+                    params![rewritten, id],
+                )
+                .map_err(storage_err)?;
+                purged += 1;
+            }
+
+            if skipped > 0 {
+                warn!(
+                    skipped,
+                    purged, "purge_terminal_payloads: corrupt rows skipped (payload intact)"
+                );
+            }
+
+            tx.commit().map_err(storage_err)?;
+            Ok(purged)
+        })
+        .await
+        .map_err(|_| blocking_err())??;
+
+        Ok(purged)
+    }
+
     /// DAG recovery: promotes `Waiting` jobs whose all dependencies are `Done`
     /// but whose post-commit cascade failed.
     ///
@@ -2078,6 +2330,16 @@ const MIGRATIONS: &[EmbeddedMigration] = &[
         description: "jobs v2 drain",
         sql: include_str!("../migrations/009_jobs_v2_drain.sql"),
     },
+    // ⚠️ INTERDICTION — ne JAMAIS ajouter de backfill `kind` ← payload après une purge
+    // (F-160, L-C). La migration 010 est antérieure à la purge et reste valide : elle
+    // s'exécute sur des payloads dont `spec.kind` porte encore le kind d'origine. Mais un
+    // backfill du même type écrit APRÈS la purge écraserait silencieusement un signal
+    // vivant : la colonne `kind` est délibérément laissée à sa valeur d'enqueue lors de la
+    // purge, parce que c'est elle qui alimente `dlq_counts_by_kind` (`GROUP BY kind`) et
+    // les filtres `kind = ?` de la santé de file (F-277). Réécrire la colonne depuis le
+    // payload ferait disparaître les jobs purgés de ces compteurs — sans erreur, sans log,
+    // sans rien qui le signale. Le payload dit `PayloadPurged` ; la colonne dit le kind
+    // d'origine : les deux divergent exprès.
     EmbeddedMigration {
         version: 10,
         description: "backfill kind",
@@ -2659,6 +2921,170 @@ mod tests {
         let fetched = store.get(id, None).await.expect("get doit réussir");
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().id, id);
+    }
+
+    /// `get_many` rend les enregistrements dans l'ordre des ids DEMANDÉS (jamais
+    /// l'ordre d'insertion ni celui de la table) et omet silencieusement les ids
+    /// inconnus — le résultat peut donc être plus court que la demande.
+    #[tokio::test]
+    async fn get_many_returns_records_in_requested_order_and_skips_unknown() {
+        let store = SqliteQueueStore::new(test_db().await);
+        let a = store
+            .enqueue(make_record(
+                Job::Backup,
+                JobClass::System,
+                JobStatus::Pending,
+            ))
+            .await
+            .expect("enqueue a");
+        let b = store
+            .enqueue(make_record(
+                Job::Backup,
+                JobClass::System,
+                JobStatus::Pending,
+            ))
+            .await
+            .expect("enqueue b");
+        let c = store
+            .enqueue(make_record(
+                Job::Backup,
+                JobClass::System,
+                JobStatus::Pending,
+            ))
+            .await
+            .expect("enqueue c");
+        let unknown = Ulid::generate();
+
+        // Ordre demandé : c, inconnu, a, b — l'ordre d'insertion était a, b, c.
+        let got = store
+            .get_many(&[c, unknown, a, b], None)
+            .await
+            .expect("get_many doit réussir");
+        let ids: Vec<Ulid> = got.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![c, a, b], "ordre demandé, id inconnu omis");
+        assert!(
+            got.iter().all(|r| r.lifecycle.status == JobStatus::Pending),
+            "les enregistrements rendus portent le statut SQL autoritatif"
+        );
+
+        // Aucun id demandé ⇒ aucun enregistrement (et aucune requête émise).
+        assert!(
+            store
+                .get_many(&[], None)
+                .await
+                .expect("get_many vide")
+                .is_empty(),
+            "liste vide ⇒ résultat vide"
+        );
+    }
+
+    /// Idem pour un id RÉPÉTÉ : le contrat du trait dit « au plus un enregistrement
+    /// par id distinct, à la position de sa première occurrence ». La surcharge
+    /// (`HashMap` puis `found.remove(id)`) le satisfait déjà ; ce test le verrouille,
+    /// car le défaut du trait et cette surcharge doivent répondre la même chose.
+    #[tokio::test]
+    async fn get_many_returns_one_record_per_repeated_id() {
+        let store = SqliteQueueStore::new(test_db().await);
+        let a = store
+            .enqueue(make_record(
+                Job::Backup,
+                JobClass::System,
+                JobStatus::Pending,
+            ))
+            .await
+            .expect("enqueue a");
+        let b = store
+            .enqueue(make_record(
+                Job::Backup,
+                JobClass::System,
+                JobStatus::Pending,
+            ))
+            .await
+            .expect("enqueue b");
+
+        let got = store
+            .get_many(&[a, a, b, a], None)
+            .await
+            .expect("get_many ids répétés");
+
+        assert_eq!(
+            got.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![a, b],
+            "un id répété ne rend qu'un enregistrement, à sa première occurrence"
+        );
+
+        let once = store
+            .get_many(&[a, a], None)
+            .await
+            .expect("get_many paire répétée");
+        assert_eq!(
+            once.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![a],
+            "get_many(&[a, a]) rend un seul enregistrement"
+        );
+    }
+
+    /// `get_many` applique le même filtre de tenant que `get` : `Some(t)` masque
+    /// les jobs des autres tenants (404 anti-disclosure), `None` ne filtre rien.
+    #[tokio::test]
+    async fn get_many_honours_tenant_filter() {
+        let store = SqliteQueueStore::new(test_db().await);
+        let mk = |tenant: &str| {
+            make_record(
+                Job::Curate(CurateSpec {
+                    tenant_id: tenant.to_string(),
+                    ..Default::default()
+                }),
+                JobClass::Api,
+                JobStatus::Pending,
+            )
+        };
+        let ja = store.enqueue(mk("alice")).await.expect("enqueue alice");
+        let jb = store.enqueue(mk("bob")).await.expect("enqueue bob");
+
+        let alice = store
+            .get_many(&[ja, jb], Some("alice"))
+            .await
+            .expect("get_many alice");
+        assert_eq!(
+            alice.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![ja],
+            "alice ne doit PAS voir le job de bob"
+        );
+
+        let all = store
+            .get_many(&[ja, jb], None)
+            .await
+            .expect("get_many None");
+        assert_eq!(all.len(), 2, "None = pas de filtre (byte-identical)");
+    }
+
+    /// Au-delà de la limite de variables liées de SQLite (999), `get_many` découpe
+    /// la demande en tranches et rend TOUS les enregistrements — aucune perte à la
+    /// frontière (1 000 ids > 998, soit deux requêtes).
+    #[tokio::test]
+    async fn get_many_handles_more_than_998_ids() {
+        let store = SqliteQueueStore::new(test_db().await);
+        let mut ids = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            ids.push(
+                store
+                    .enqueue(make_record(
+                        Job::Backup,
+                        JobClass::System,
+                        JobStatus::Pending,
+                    ))
+                    .await
+                    .expect("enqueue"),
+            );
+        }
+
+        let got = store.get_many(&ids, None).await.expect("get_many 1000 ids");
+        assert_eq!(
+            got.iter().map(|r| r.id).collect::<Vec<_>>(),
+            ids,
+            "1 000 ids demandés ⇒ 1 000 rendus, dans l'ordre demandé"
+        );
     }
 
     #[tokio::test]
@@ -3597,6 +4023,10 @@ mod tests {
         assert_eq!(job_kind_str(&Job::Classify), "Classify");
         assert_eq!(job_kind_str(&Job::Merge), "Merge");
         assert_eq!(job_kind_str(&Job::Annotate), "Annotate");
+        // Sentinelle de purge (L-C / F-160) : jamais posée dans la colonne `kind`
+        // (elle ne vit que dans le payload), mais le match exhaustif de `job_kind_str`
+        // doit la traiter — ce test l'y contraint.
+        assert_eq!(job_kind_str(&Job::PayloadPurged), "PayloadPurged");
 
         // Variants avec données
         assert_eq!(job_kind_str(&Job::ReIndex(ReIndexMode::FtsOnly)), "ReIndex");
@@ -4529,6 +4959,214 @@ mod tests {
         assert_eq!(
             deleted_future, 2,
             "cutoff futur → tous les jobs DLQ supprimés"
+        );
+    }
+
+    // ── purge_terminal_payloads (L-C / F-160) ───────────────────────────────
+
+    /// Enregistrement terminal à ULID **explicitement ordonné** : `seq` croissant
+    /// donne un id croissant, donc une fenêtre « les 200 derniers » déterministe
+    /// quelle que soit l'horloge. Le corps porte `body_text` — le témoin de la purge.
+    fn terminal_record_with_seq(seq: u64, status: JobStatus, body_text: &str) -> JobRecord {
+        let mut record = make_record(
+            Job::Curate(CurateSpec {
+                body: Some(body_text.to_string()),
+                ..Default::default()
+            }),
+            JobClass::Agent,
+            status,
+        );
+        record.id = Ulid::from_parts(1_700_000_000_000 + seq, u128::from(seq) + 1);
+        record
+    }
+
+    /// 250 payloads terminaux, fenêtre de 200 : les 50 plus anciens sont purgés,
+    /// les 200 plus récents gardent leur payload d'origine, intact.
+    #[tokio::test]
+    async fn purge_keeps_the_last_200_terminal_payloads() {
+        let pool = test_db().await;
+        let store = SqliteQueueStore::new(pool);
+
+        let mut ids = Vec::new();
+        for seq in 0..250u64 {
+            let record = terminal_record_with_seq(seq, JobStatus::Done, "corps-temoin");
+            ids.push(record.id);
+            store.enqueue(record).await.expect("enqueue doit réussir");
+        }
+
+        let purged = store
+            .purge_terminal_payloads(None)
+            .await
+            .expect("purge doit réussir");
+        assert_eq!(purged, 50, "250 terminaux − 200 conservés = 50 purgés");
+
+        for (i, id) in ids.iter().enumerate() {
+            let record = store
+                .get(*id, None)
+                .await
+                .expect("get doit réussir")
+                .expect("le job existe toujours");
+            if i < 50 {
+                assert!(
+                    matches!(record.spec.kind, Job::PayloadPurged),
+                    "id #{i} (hors fenêtre) doit être purgé"
+                );
+            } else {
+                assert!(
+                    matches!(record.spec.kind, Job::Curate(_)),
+                    "id #{i} (dans la fenêtre) doit garder son payload"
+                );
+            }
+        }
+    }
+
+    /// Un job **non terminal** garde son payload — `Failed` compris : un retry est en
+    /// cours, `Failed` n'est donc pas terminal et n'entre jamais dans le jeu purgéable.
+    ///
+    /// Les non-terminaux portent ici les plus PETITS ULID : seraient-ils candidats
+    /// qu'ils seraient purgés les premiers — le test rougirait.
+    #[tokio::test]
+    async fn purge_never_touches_a_non_terminal_job() {
+        let pool = test_db().await;
+        let store = SqliteQueueStore::new(pool);
+
+        let mut non_terminal_ids = Vec::new();
+        for (seq, status) in [
+            JobStatus::Pending,
+            JobStatus::Running,
+            JobStatus::Waiting,
+            JobStatus::Failed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let record = terminal_record_with_seq(seq as u64, status, "corps-non-terminal");
+            non_terminal_ids.push(record.id);
+            store.enqueue(record).await.expect("enqueue doit réussir");
+        }
+
+        // 210 terminaux derrière : la fenêtre (200) est pleine → 10 hors fenêtre.
+        for seq in 10..220u64 {
+            let record = terminal_record_with_seq(seq, JobStatus::Done, "corps-terminal");
+            store.enqueue(record).await.expect("enqueue doit réussir");
+        }
+
+        let purged = store
+            .purge_terminal_payloads(None)
+            .await
+            .expect("purge doit réussir");
+        assert_eq!(purged, 10, "seuls les terminaux hors fenêtre sont purgés");
+
+        for id in &non_terminal_ids {
+            let record = store
+                .get(*id, None)
+                .await
+                .expect("get doit réussir")
+                .expect("le job existe toujours");
+            assert!(
+                matches!(record.spec.kind, Job::Curate(_)),
+                "un job non terminal conserve son payload"
+            );
+        }
+    }
+
+    /// Deux purges consécutives : la seconde rend `Ok(0)` — un enregistrement déjà
+    /// `PayloadPurged` est ignoré, jamais recompté.
+    #[tokio::test]
+    async fn purge_is_idempotent() {
+        let pool = test_db().await;
+        let store = SqliteQueueStore::new(pool);
+
+        for seq in 0..250u64 {
+            let record = terminal_record_with_seq(seq, JobStatus::Done, "corps-temoin");
+            store.enqueue(record).await.expect("enqueue doit réussir");
+        }
+
+        let first = store
+            .purge_terminal_payloads(None)
+            .await
+            .expect("1re purge doit réussir");
+        assert_eq!(first, 50, "1re purge : 250 − 200 = 50");
+
+        let second = store
+            .purge_terminal_payloads(None)
+            .await
+            .expect("2e purge doit réussir");
+        assert_eq!(second, 0, "2e purge : plus rien à purger (Ok(0) légitime)");
+    }
+
+    /// `older_than` borne la purge par l'âge du job. Les enregistrements entrent par
+    /// le chemin réel (`QueueStore::enqueue`), jamais par un INSERT littéral.
+    #[tokio::test]
+    async fn purge_honours_older_than() {
+        let pool = test_db().await;
+        let store = SqliteQueueStore::new(pool);
+
+        for seq in 0..250u64 {
+            let record = terminal_record_with_seq(seq, JobStatus::Done, "corps-temoin");
+            store.enqueue(record).await.expect("enqueue doit réussir");
+        }
+
+        // Les jobs viennent d'être créés : un cutoff passé ne cible personne.
+        let past = Utc::now() - chrono::Duration::days(1);
+        let purged_past = store
+            .purge_terminal_payloads(Some(past))
+            .await
+            .expect("purge avec cutoff passé");
+        assert_eq!(purged_past, 0, "cutoff passé → aucun payload purgé");
+
+        // Un cutoff futur couvre tout le hors-fenêtre.
+        let future = Utc::now() + chrono::Duration::days(1);
+        let purged_future = store
+            .purge_terminal_payloads(Some(future))
+            .await
+            .expect("purge avec cutoff futur");
+        assert_eq!(purged_future, 50, "cutoff futur → 50 payloads purgés");
+    }
+
+    /// La **colonne** `kind` garde le kind d'origine après la purge, tandis que le
+    /// payload porte `PayloadPurged`.
+    ///
+    /// Divergence délibérée (R2-P1-1) : la colonne est posée à l'enqueue et jamais
+    /// recalculée — c'est elle qui fait vivre `dlq_counts_by_kind` (`GROUP BY kind`)
+    /// et les filtres `WHERE kind = ?` de la santé de file (F-277). La backfiller
+    /// depuis le payload détruirait ce signal en silence.
+    #[tokio::test]
+    async fn purged_job_keeps_its_original_kind_column() {
+        let pool = test_db().await;
+        let store = SqliteQueueStore::new(pool);
+
+        let mut ids = Vec::new();
+        for seq in 0..250u64 {
+            let record = terminal_record_with_seq(seq, JobStatus::Done, "corps-temoin");
+            ids.push(record.id);
+            store.enqueue(record).await.expect("enqueue doit réussir");
+        }
+        store
+            .purge_terminal_payloads(None)
+            .await
+            .expect("purge doit réussir");
+
+        let purged_id = ids[0];
+        let kind_column = select_str(
+            store.db(),
+            "SELECT kind FROM gradatum_jobs WHERE id = ?",
+            &purged_id.to_string(),
+        )
+        .await;
+        assert_eq!(
+            kind_column, "Curate",
+            "la colonne kind d'un payload purgé n'est PAS réécrite"
+        );
+
+        let record = store
+            .get(purged_id, None)
+            .await
+            .expect("get doit réussir")
+            .expect("le job existe toujours");
+        assert!(
+            matches!(record.spec.kind, Job::PayloadPurged),
+            "le payload, lui, porte bien la sentinelle"
         );
     }
 

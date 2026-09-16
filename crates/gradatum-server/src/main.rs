@@ -22,6 +22,8 @@ mod mcp_usage;
 mod metrics;
 mod middleware;
 mod note_usage_store;
+mod privacy_observer;
+mod privacy_rescan;
 mod proactive_recall;
 mod proactive_recall_store;
 mod proactive_surface_store;
@@ -252,6 +254,10 @@ async fn main() -> anyhow::Result<()> {
     // Construire AppState avec la clé JWT persistante (fix P0).
     // AppState::new() (éphémère) n'est plus utilisé en prod — uniquement via with_jwt().
     let state = AppState::with_jwt(jwt_service)
+        // F-160 — la frontière privacy se monte sur le vault à sa construction :
+        // `with_privacy` doit donc précéder `with_vault_path`. Sans `[privacy]`
+        // configuré, `PrivacyConfig::default()` monte le détecteur no-op.
+        .with_privacy(cfg.privacy.clone())
         .with_vault_path(&vault_path, gradatum_core::scope::VaultId::new("main"))
         .await
         .context("vault init failed")?
@@ -621,7 +627,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Seed des 7 tâches récurrentes au boot (v0.7.5 F-85).
+    // Seed des 10 tâches récurrentes au boot (v0.7.5 F-85).
     //
     // INSERT OR IGNORE → idempotent : un redémarrage ne remet pas run_count à zéro.
     // Les tâches non encore tickées apparaissent avec last_run_ms=None dans l'endpoint.
@@ -1409,6 +1415,58 @@ async fn main() -> anyhow::Result<()> {
                 {
                     tracing::warn!(error = %e, "record_task_run active-recall-purge failed (non fatal)");
                 }
+            }
+        });
+    }
+
+    // F-160 (L-D.2) — balayage différé de confidentialité.
+    //
+    // La tâche est TOUJOURS spawnée : c'est le TRAVAIL qui est gaté (`rescan_enabled`,
+    // catégories, détecteur monté), et le tick rapporte lui-même son exécution
+    // (`rescan_tick` enregistre son run, y compris à vide). Une tâche seedée, rapportée
+    // planifiée par `/api/v1/system/scheduled` et jamais exécutée serait une divergence
+    // par défaut sur toute installation.
+    //
+    // Aucun état capturé hors `state` : le tick ré-énumère les vaults du registre à
+    // chaque tour et re-dérive sa sélection depuis l'index, donc rien à reporter d'un
+    // tick au suivant. L'intervalle passe par la SSOT (`task_interval_secs`, plancher
+    // 60 s) — `interval(0)` panique.
+    {
+        let pr_state = state.clone();
+        let interval_secs_privacy = crate::scheduled_tasks::task_interval_secs(
+            crate::scheduled_tasks::TASK_PRIVACY_RESCAN,
+            &cfg,
+        );
+
+        tokio::spawn(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            use tokio::time::{Duration, MissedTickBehavior, interval};
+
+            let mut ticker = interval(Duration::from_secs(interval_secs_privacy));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Premier tick consommé immédiatement (comportement tokio::interval) —
+            // le premier balayage réel arrive à t=interval_secs.
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+
+                // Le tick enregistre son propre run (succès, gate off, ou erreur
+                // d'index) : rien à consigner ici, et surtout pas deux fois.
+                let stats = crate::privacy_rescan::rescan_tick(&pr_state, now_ms).await;
+                tracing::debug!(
+                    vaults_considered = stats.vaults_considered,
+                    vaults_selected = stats.vaults_selected,
+                    notes_seen = stats.notes_seen,
+                    jobs_enqueued = stats.jobs_enqueued,
+                    disabled = stats.disabled,
+                    "privacy-rescan tick complete"
+                );
             }
         });
     }

@@ -26,7 +26,6 @@ fn materialize_preset_backups_existing_bearer_toml() {
 identity = "custom-user-bot"
 read_patterns = ["custom/**"]
 write_patterns = ["custom/**"]
-sees_personal_classified = false
 "#;
     fs::write(&bearer, custom_content).unwrap();
 

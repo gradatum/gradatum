@@ -12,6 +12,671 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > file, the public release that carried its changes forward. That mapping follows the document's
 > order, not a change-by-change diff — see the `[2.0.0]` note below for a case worked out in full.
 
+## [2.4.0] — 2026-09-16
+
+### Added — the sweep's progress is observable, and the work it left is resumable (F-160)
+
+- **An incomplete scan is counted rather than inferred.** `GET /metrics` gains eight series
+  describing the personal-data pass: `gradatum_privacy_notes_tagged_total{category}`,
+  `gradatum_privacy_scanned_total`, `gradatum_privacy_unscanned_total`,
+  `gradatum_privacy_unmapped_labels_total{label}`, `gradatum_privacy_spans_rejected_total{reason}`,
+  `gradatum_privacy_spans_window_edge_total`, `gradatum_privacy_exception_hits_total{pattern_id}`
+  and `gradatum_privacy_input_too_large_total`. Each label is a closed vocabulary or an index —
+  a category, a bounded reason, a pattern index — never a detected value, never a label the
+  detector invented, never a matched string.
+- **`scanned` and `unscanned` are the two halves of every pass this process ran.** Counted
+  side by side, they are what makes "the detector judged nothing" distinguishable from "the
+  detector judged everything and found nothing" — the difference an operator would otherwise
+  have to infer from the corpus. They are process-lifetime counters, not corpus censuses: they
+  reset with the process, and a reader asking about a corpus asks the `privacy-unscanned` tag
+  filter instead.
+- **An oversized body is counted apart from a detector failure.** `_input_too_large_total` is
+  deliberately not folded into the pass failures: one is the corpus, the other is the
+  deployment, and a single counter would make a broken sidecar read as a large corpus.
+- **`/health/detailed` reports the privacy posture in four additive fields** — `privacy_mode`,
+  `privacy_scanned_total`, `privacy_unscanned_total`, `privacy_detector`. All four are present
+  on every report, defaulting to `0` and `"report_only"` on a corpus that carries no privacy
+  data at all, so a reader never has to tell an absent field from a zero one. The mounted
+  detector is reported by **name**, never by configuration.
+- **An unscanned note degrades the report and never makes it unhealthy.** A note the pass
+  could not judge is a real loss of coverage, not a service outage: it must be visible to
+  whoever reads the report and must not page anyone as `unhealthy` (the boot false-red of
+  2026-09-14 is the reason this is stated as a rule rather than left to the caller).
+- **The product enqueues its own sweep.** `Job::PrivacyRescan{vault_id, limit}` — a quota,
+  never a payload — is enqueued by the `privacy-rescan` scheduled task, per vault, with no
+  human action and with no new edge out of the vault layer: the vault registry holds no queue
+  handle, so the party that holds both the registry and the queue is the one that starts a
+  sweep. `POST /api/v1/jobs` still refuses the kind, so an authenticated client cannot start
+  one.
+- **The batch is re-judged through the write primitive, which is what bounds what it can do.**
+  The worker holds neither vault nor index: it transports the batch quota over the internal
+  loopback route and the server selects by tag and re-judges each note through the same funnel
+  every write uses. Under D-11 a sweep can therefore **add** `personal-classified` or **retire**
+  `privacy-unscanned` — never declassify a note, and never retire the payload marker except
+  through the two paths a completed pass already owns. Selection skips every `code-*`
+  namespace, and the guard is re-applied to each note's own resolved namespace and section
+  after selection, so a note that moved between the two moments is judged by the same code
+  that guards every write.
+- **A note the sweep judges to what it already carried is not written at all.** No `updated`,
+  no `ContentHash`, no index upsert, no `.history/` snapshot — which is what lets the sweep run
+  over a corpus that is almost always already judged without invalidating every `expected_sha256`
+  its clients hold.
+- **The task is always scheduled; the work is what is gated.** With `[privacy].rescan_enabled`
+  off, no category configured, or the pass-through detector mounted, the tick still runs, still
+  records its run, and selects nothing — and it says so. A task seeded and listed as scheduled
+  while never executing would be a divergence by default on every installation, right on the
+  surface the weekly audit reads. Bounded in turn: a per-tick ceiling on enqueued jobs, and a
+  per-execution batch bound the query honours.
+- **One series is declared without a producer in 2.4.0, stated rather than hidden.**
+  `gradatum_privacy_exception_hits_total{pattern_id}` is registered and documented so that its
+  contract — a pattern index or digest, never the pattern and never the matched text — is fixed
+  before anything emits it. The detector-breaker counter and its clause were dropped for this
+  release rather than shipped unwired.
+
+### Added — the note listing accepts an exact-tag filter (F-160)
+
+- **`vault_list` gains a `tag` filter, which is what makes an incomplete sweep
+  resumable.** A note whose personal-data pass did not complete carries
+  `privacy-unscanned`; `vault_list --tag privacy-unscanned` is how an operator finds that
+  corpus again. The filter matches a **whole token** of the note's tags and never a
+  substring: `personal-classified-2026` is a different tag from `personal-classified`, so
+  a query for the verdict never hands back the near-miss. The match is a SQL predicate
+  applied before the page limit — a whole-token comparison on the space-joined tags column
+  (`'% tag %'`), never a substring (`'%tag%'`) — so a sparsely-tagged corpus still
+  paginates in full pages.
+- **The two reserved names are accepted here as queries, and refused everywhere a tag is
+  written.** A caller may ask which notes carry a marker without being able to pose one —
+  the asymmetry is the point, and it is why this filter does not simply reuse the tag
+  constructors' validation. Asking is not a way to see what the caller may not read: the
+  result still passes the read guard, so a consumer negated on `personal-classified` gets
+  the same answers here as anywhere else.
+- **A value outside the tag form is a `400`, not an empty page.** `%`, `_`, uppercase, a
+  space, a leading hyphen: none of them name a tag a note can carry, and answering them
+  with `entries: []` would read as "no note is marked" — the one answer an operator
+  resuming a sweep cannot tell apart from the truth. A role filter and a tag filter in
+  the same request are refused too, rather than served with one of the two dropped.
+- **Without a `tag`, the response is byte-identical to what it was.** The field is
+  additive and inert when absent; the routing to the unfiltered listing is untouched.
+- **`total` is the returned page's cardinality, not a vault-wide count of matching notes.**
+  An exact vault-wide count would require a full scan under the connection lock, so the
+  value stays page-scoped — a caller compares it against `records.len()` and learns nothing
+  about rows it was not given.
+
+### Fixed — listing notes by tag no longer truncates sparse pages (F-160)
+
+- **A tag carried by a small fraction of a large corpus is now returned in full.** The tag
+  match moved from a post-fetch Rust filter over a bounded raw window to a SQL predicate
+  applied before the `LIMIT`. A page filled by non-matching rows used to come back short and
+  be read as the end of the store, silently dropping every tagged note behind the window —
+  including, on the deferred privacy sweep, a `privacy-unscanned` note that then never got
+  rescanned. Each page is now full while tagged rows remain, and the keyset cursor advances
+  exactly. The whole-token comparison (`'% tag %'`, never a substring) is unchanged.
+
+### Added — a marking false positive can be lifted by an administrative identity (F-160)
+
+- **`POST /api/v1/vault_privacy_review` records a human verdict on a note's personal-data
+  scan.** Until now a note carrying `personal-classified` had exactly one way back out of the
+  marker, and it was automatic: a completed pass finding no personal data in any activated
+  category. (Marking is all-or-nothing per category in 2.4.0: the `[privacy].thresholds` are read
+  but have no effect — parsed for schema completeness and not yet wired to the detector, planned
+  for 2.5.0.) A false positive therefore stayed one for as long as the note held its spans. The
+  new `rejected` verdict is the second and only other removal path, and this is the only API in
+  the product able to declassify a note durably.
+- **The verdict is not applied to the tags by this endpoint.** It writes `extra.privacy.review`
+  through the single insertion point and stops there; the tags are decided by the primitive from
+  what the note carries on disk. A `rejected` verdict therefore binds the **following** write,
+  never the review call itself. Retiring the marker here would have created a second authority
+  over it, free to diverge from the first.
+- **Authorization is the read guard's own predicate.** A review requires
+  `evaluate(Read, "{vault}/personal-classified") == Allow` — the same evaluation, on the same
+  synthetic locus, that D-14's read guard performs, so the two surfaces cannot drift. In
+  practice this makes the endpoint administrative or operator-only, and **the author of a note
+  does not review its own markings**: deliberately, a verdict on personal data is a human act,
+  and the identity that produced the content is excluded from it.
+- **Not delegable, and not exposed over MCP.** No tool is added and `api_v1/mcp.rs` is
+  untouched. Publishing the review as an MCP tool would put it one tool call away from every
+  agent on the fleet — the delegation the design refuses. The gap between the REST and MCP
+  surfaces is the control, not an oversight.
+- **The compare-and-swap is mandatory.** `expected_sha256` identifies the version the verdict
+  was formed on. Its absence is `400`, never a default; a value that no longer matches the note
+  is `409`, and the note keeps the verdict it had. The lock is the vault's own
+  `write_if_match_internal`, so the conflict is reported by the store rather than by a
+  re-implementation of its comparison.
+- **A verdict the note does not carry is a conflict, never a success.** Where a detector is
+  mounted, the write-time pass recomputes the block and the requested verdict does not land. The
+  note is read back after the write and the verdict verified before responding: this surface
+  never reports a verdict it did not record. That refusal is a `409` and emits no success event.
+- **Every successful call emits an audit event** carrying the actor from the trust context, the
+  note id, the verdict, the `spans_digest` before and after, and the `expected_sha256` that was
+  presented. Never the body, never a span, never a detected value. `outcome` names the operation
+  rather than the verdict, so a `rejected` cannot be read as a failed call.
+- **`spans_digest` is unchanged by a review.** It covers the spans the verdict is about, and
+  moving it would spend the verdict along with them. Only `privacy.review` moves; the rest of
+  the block stays byte-identical.
+
+### Added — marked notes leave the search results of unauthorised consumers (F-160)
+
+- **What this closes is the enumeration, not the read.** A note carrying `personal-classified`
+  no longer appears in the *results* of `vault_search`, `vault_list`, `vault_tags`, `vault_trace`,
+  lessons recall, proactive recall, the assembled context, `vault_graph`/`vault_links` or
+  `vault_timeline` for a consumer who may not read it. It remains readable by anyone who can
+  already name it: `vault_read` still returns the note, with the verdict masked out of
+  `metadata.tags`. Removing a note from the answers to "what is there?" is a different act from
+  denying access to the note, and only the first is claimed here.
+- **The guard is a property of the result set, not of a list of handlers.** Every read surface
+  that renders a note, its ULID, its title, an excerpt of its body or a count over it is covered
+  by the same predicate: the five surfaces added after the first pass (proactive recall, the
+  assembled context, the link graph, the chronology, the corpus match count) reuse
+  `PrivacyReadGuard` rather than restate it. A surface left out would have been a hole in the
+  same enumeration the guard exists to close.
+- **Each added surface is filtered at the point where filtering is still invisible.** Proactive
+  recall drops marked hits *before* the `limit` truncation and before the session is recorded,
+  so a withheld note consumes no rank and appears in no `recall_id`. The assembled context drops
+  marked candidates *before* body hydration and *before* `candidates_considered` — a counter that
+  is itself returned, and would otherwise announce the withheld cardinality. The link graph drops
+  nodes *and* edges, in exact parity with the identity filter it follows: a neighbour left in
+  would reveal an existence and a ULID by the very act of pointing at them.
+- **`vault_timeline` filters after the query, and fills its page.** The identity exclusion is
+  unconditional and lives in the SQL; the `personal-classified` exclusion is a per-consumer
+  verdict, and `TimelineFilter` is an exhaustive public struct, so the marker cannot join it
+  without a breaking change. The filter is therefore server-side, and the cursor advances on the
+  **raw** rows — a withheld note can neither be lost nor duplicated. The page is then refilled
+  until it is full or the timeline is exhausted: returning an empty page mid-chronology would
+  both truncate the chronology of a client that stops on an empty page and turn the *shape* of
+  the response into an oracle. This is deliberately stronger than `vault_list`'s page-scoped
+  adjustment.
+- **`corpus_match_count` excludes what this response withheld.** Otherwise
+  `corpus_match_count > len(items)` would tell an unauthorised consumer that marked notes match
+  their query — the same cardinality oracle already closed for `vault_list`'s `total`, closed
+  here by the same rule and with the same documented page scope.
+- **One predicate, evaluated on the result's own vault.** A result is withheld when
+  `evaluate(Read, "{result's vault_id}/personal-classified")` is not `Allow`. A result set may
+  span vaults — `vault_ids` and `all_readable` — so the vault is read off each result and the
+  verdict memoised per distinct vault id, never once per request. A consumer negated in one vault
+  keeps seeing the marked notes of every other.
+- **The predicate folds capacity and scope.** A read decision on that synthetic locus also
+  filters a consumer whose `read_patterns` simply do not cover it. No shipped preset is affected
+  — `admin` and `studio` carry `["**"]` — and the direction of the error is the safe one:
+  over-filtering, never a leak. Differential evaluation was considered for `2.4.0` and not
+  retained: it doubles the access-control calls for a case no preset produces.
+- **`privacy-unscanned` is never filtered.** It is an operational marker, not a confidentiality
+  verdict. Hiding it would make a detection outage indistinguishable from a clean corpus and
+  silently empty every agent's search for the duration of the incident. `metadata.tags` masks
+  `personal-classified` alone.
+- **The full-text index is untouched: the guard is at the query, never in the projection.** No
+  `upsert_note` change, no migration. Marking a note writes the same values to `notes` and
+  `notes_fts`, so `integrity-check` stays green and a `rebuild` restores nothing that was
+  removed — there is nothing to remove. The reserved name stays indexed, and remains reachable
+  as a query for a consumer who may read it.
+- **`vault_search` matches the `tags` column; it never renders it.** `SearchHit` carries no
+  `tags` field and gains none.
+- **New public surface:** `IndexStore::get_tags_batch` (and its `SqliteIndex` implementation),
+  which resolves the verdict for a page of results in one batch per vault instead of one read
+  per row. Its default implementation is fail-closed: it returns a storage error rather than an
+  empty map, so an implementation that cannot answer is never mistaken for "nothing is marked".
+
+### Added — a note records the state of its personal-data scan (F-160)
+
+- **A note write leaves a durable trace of the detection pass that observed it.** Under a mounted
+  detector the note carries an `extra.privacy` block: the pass's mode and status, the detector's
+  identity, a `scanned_at` instant as an RFC 3339 string, a digest of the policy the pass ran
+  under, a digest of what it found, and the spans themselves — each a byte offset, a length, a
+  category label and a score in integer thousandths. No float reaches `extra`: a re-serialiser
+  that renders `0.94` as `0.9399999976158142` would break the content hash, and the digest has
+  zero tolerance for that.
+- **`spans_digest` covers the triplets, never the scores and never the text.** It is a SHA-256
+  over the sorted sequence of `(start, end, category)` triplets, which is what lets a re-pass of
+  the same model over the same body leave a note's review state where it was. An empty result is
+  a recorded result: `counts` is written even when nothing was found, so "scanned, found nothing"
+  and "never scanned" stay distinguishable states.
+- **Past 256 spans the block says so rather than lying.** The span list is cut at the product
+  ceiling, `status` becomes `spans_truncated`, `counts` keeps counting the whole pass, and the
+  note is tagged `privacy-unscanned` — a scan that is no longer the whole picture is a scan to
+  redo. A detector that fails, times out or refuses an oversized input gets the same treatment: a
+  block with a typed status and an empty count, never a missing block.
+- **Writing the block changes the note's content hash.** The block lives in `extra`, so the
+  `sha256` that `vault_read` returns — and that a compare-and-swap caller echoes back — differs
+  from the one a note written without a detector carries. A caller holding a hash read before a
+  detector was mounted must re-read it.
+- **The block is invisible to copy-on-write history.** `privacy` joins `HISTORY_EXCLUDED_FIELDS`
+  alongside `processed`, `covered-by` and `rank`: `scanned_at` moves on every pass, and without
+  the exclusion a re-scan of unchanged content would snapshot a copy of the body. The consequence
+  is accepted and deliberate — a mutation of `privacy.review` is not historised either. A review
+  that needs an audit trail gets one from the audit log, never from copy-on-write.
+
+### Fixed — a note's extra fields are no longer dropped on a rewrite (F-160)
+
+- **A rewrite now carries forward the `extra` keys it does not recompute.** The curated persist
+  path rebuilds its frontmatter from scratch, so an `extra` key put there by an earlier pass — a
+  code-map entry, a curation marker, anything a worker added — was silently dropped by the next
+  rewrite, with nothing in the pipeline to put it back. The one shared write primitive now
+  re-reads the note on disk and re-reports every key the incoming frontmatter does not itself
+  set. The source is the stored note, never an echo of what the caller re-posted, and a key the
+  caller does set is never overwritten.
+- **The transit is corrected in the primitive, not at each call site.** Every write path funnels
+  through the same function, so a path that rebuilds its frontmatter gets the behaviour without
+  knowing it needs it. A per-site fix would have covered the sites someone remembered to list.
+
+### Added — a personal-data detection frontier, inert until a detector is configured (F-160)
+
+- **Gradatum now carries a detection frontier for personal data, with no effect until a
+  detector is configured.** A `PiiDetector` trait and its budgeted request and response types
+  live in `gradatum-core`, alongside a do-nothing `NoopDetector` that is the default: it always
+  reports an empty result and ignores its budget, so a note written under it is neither blocked
+  nor tagged. A new publishable crate, `gradatum-privacy`, provides a deterministic
+  `RegexDetector` covering e-mail addresses, IBANs, French phone numbers and French
+  social-security numbers, each reported with a maximal score. No detector is mounted by
+  default, so behaviour is unchanged: a note written today is byte-identical to one written
+  before. The frontier this entry describes is now reached by the write path — see the next
+  entry.
+
+### Added — every note write reaches the detection frontier once, and no failure of it can block a write (F-160)
+
+- **A note write is now observed by the detection frontier, at one single insertion point.**
+  `Vault` carries a detector and a set of budgets; the pass runs inside the one shared write
+  primitive every write path funnels through — the direct writes (`write_note`,
+  `write_note_with_id`, the compare-and-swap), the copy-on-write restore, and, above the crate,
+  the curate, forget and distill workers. One pass per write, never one per caller.
+- **The pass is consulted, never obeyed.** This release is `report_only`: it returns what it
+  found and not one byte of the note depends on the answer. A detector error — a timeout, a
+  refusal, a crash — is typed, logged without the note body and without any detected value, and
+  the write proceeds unchanged. Nothing about detection can turn into a failed write. The
+  in-place `mask` mode is not delivered in 2.4.0: a configuration that sets
+  `[privacy] mode = "mask"` is refused at load (in-place masking arrives in 2.5.0).
+- **Two guards hold in hardware and cannot be configured away.** A `code-*` write namespace and
+  the `identity` section are never submitted to a detector: a personal-data frontier over source
+  code, fixtures and agent souls would flag the material itself. They are evaluated on the
+  **resolved** write namespace, after the frontmatter's own `vault_id` has been filled in, so a
+  note left with an empty `vault_id` and written into a `code-*` vault is still skipped.
+- **The surface and the budget are derived, never supplied.** The surface follows from the note's
+  section — `Messaging` is written on the synchronous surface, every other section on the
+  asynchronous one. The budget follows from the vault's own bounds. No signature was widened for
+  either, so a request body can narrow neither.
+- **A body past the per-call ceiling is cut into overlapping windows, submitted one by one, and
+  the offsets come back rebased onto the body.** Fusion then runs across windows, so an entity
+  sitting in the overlap is one span and not two. A span whose range comes within a byte of an
+  interior cut is counted in the boundary tally; a body that fits in one window has no interior
+  cut and reports zero. That tally is the only signal that the overlap may have been shorter than
+  the entity it was meant to catch.
+- **Nothing mounts a detector unless asked.** The three `Vault` constructors hard-code the
+  no-op detector and the default budgets; `Vault::with_detector` is the only injection path. On
+  the server side a new `[privacy]` configuration section selects it — an empty `categories` list
+  leaves the no-op in place, so an existing deployment is untouched — and carries the ceiling and
+  overlap bounds down to the mounted budgets.
+
+### Added — note bodies stop piling up in the job queue without bound (F-160)
+
+- **The job queue can shed the note bodies it accumulates.** A terminal job — `Done`, `DLQ`,
+  `Cancelled` or `Conflict` — keeps its row and its whole lifecycle, but
+  `QueueStore::purge_terminal_payloads` replaces its payload's `spec.kind` with a
+  `Job::PayloadPurged` sentinel. That field is where a job's note body lives and nowhere else, so
+  the body is gone while `job_status` keeps answering exactly what it answered before: status,
+  terminality, timestamps, attempts and `result_note` are untouched, and a new additive
+  `payload_purged` field states outright that the payload was purged. The SQL `kind` column
+  deliberately keeps the *original* kind — it is what feeds the per-kind dead-letter breakdown and
+  the `kind = ?` filters of the queue-health surface — so only the payload diverges from it.
+- **The 200 most recent terminal jobs keep their payload.** That window is a product constant
+  (`TERMINAL_PAYLOAD_KEEP`), not a setting: the rows an operator is most likely to be inspecting,
+  and the ones a reader may still be consuming, are never the ones losing their body. Beyond the
+  window the body **cannot be replayed** — a purged job cannot be re-run from its payload.
+- **The purge is logical, not physical, and does not run `VACUUM`.** It takes the body out of the
+  row; it does not compact the file, so SQLite may leave bytes of the old payload in pages it has
+  freed until it reuses them. The end-to-end test measures that on the file — reporting how many
+  purged bodies are still readable in the raw bytes — instead of asserting their absence, which
+  would be false. A physical erase would need a `VACUUM`, which nothing triggers.
+- **Two residues are deliberately kept.** `retry.errors[].message` and `retry.last_error` are part
+  of the retry history and of what `job_status` reports; an error raised while handling a note can
+  quote a fragment of it (a project-map error quotes the offending link, for instance). Erasing
+  them would blind the operator and change the status contract, so they are named here rather than
+  removed.
+- **`message_ack` answers a purged delivery exactly as it answers an unknown one.** An
+  acknowledged delivery is terminal, hence purgeable, and its recipient is no longer recoverable
+  from the purged row — so ownership cannot be re-established from it. The mute `404` of an
+  unknown delivery is therefore the only answer that leaks nothing: any distinct status or
+  message (a `409` "already acknowledged", say) would tell any credited agent, recipient or not,
+  that the delivery exists and was acknowledged, and would make the answer depend on an internal
+  maintenance purge rather than on the caller's own state. This is the same `404` the recipient
+  already receives for a second acknowledgement of a non-purged delivery. The additive
+  `payload_purged` field is the only other surface delta. Nothing calls the purge yet: this
+  release ships the seam and its bounds, not a schedule.
+
+### Fixed — the worker health probe no longer degrades on a non-empty mailbox or a message delivery parked in the dead-letter queue, matching the server
+
+- **The worker `/health` now sets message deliveries apart, exactly as the server does.** A
+  `Job::Message` row is state-carrying: it stays `Pending` until its recipient acknowledges it,
+  and no worker ever leases it. The worker probe used to count these rows as queued work, so a
+  full mailbox — or a delivery parked in the dead-letter queue — flipped the worker to
+  `degraded`, a signal about the recipient rather than about the queue. The probe now excludes
+  pending deliveries from `queue_depth` and from the oldest-pending age, excludes dead-lettered
+  deliveries from the dead-letter age, and publishes the mailbox count apart in
+  `mailbox_pending`. A genuine backlog (a non-delivery job aging past the threshold) still
+  degrades the worker, in the queue and in the dead-letter queue alike.
+
+### Removed — the note-listing pattern parameter, which never filtered anything, is gone (F-296)
+
+- **`vault_list` no longer accepts a `pattern` field.** The field was never implemented: the
+  server read it and discarded it silently, so setting it changed nothing about the response. It
+  is removed from the request body and from `VaultListRequest`. A request that still carries
+  `pattern` is now rejected at deserialization with `422 Unprocessable Entity` — an unknown field
+  on syntactically valid JSON is a data error, not the `400` reserved for malformed JSON — and the
+  rejection names the field. To narrow a listing, filter on `section`, or filter the returned
+  entries client-side.
+- **An MCP client connected before the upgrade still advertises the field** in its frozen copy of
+  the tool catalogue until it reconnects; reconnecting re-reads the schema without it. See the
+  upgrade guide for the full break inventory and migration steps.
+
+### Added — an operator command validates an ACL preset off-server, read-only
+
+- **`gradatum-admin acl validate --preset <path>`** parses a preset through the server's own boot-time loader and reports whether it is valid — exiting non-zero and naming the offending key if the preset still carries a removed configuration key — while opening no store, minting nothing and writing nothing.
+
+### Tooling — end-to-end coverage of a version's card listing (F-296)
+
+The endpoint that lists a milestone's cards (`GET /api/v1/project-map/cards?version=`) is now
+covered end to end: filtering by version (with or without the `v` prefix), a project's full listing
+(including its internal cards, excluding another project's cards), exclusion of trashed notes, and
+an empty list for an unknown version. A second test exercises the underlying projection directly to
+prove the discriminating power of the version and project filters.
+
+### Added — the job queue store can read a set of jobs in one call
+
+- **`QueueStore::get_many`** reads several jobs by identifier in a single round-trip and
+  returns them in the order they were asked for, silently omitting identifiers that are
+  unknown or hidden by the tenant filter. It ships with a default implementation that
+  falls back to one read per identifier, so every existing backend keeps working
+  unchanged; the embedded SQLite store overrides it with one `WHERE id IN (…)` query per
+  998 identifiers (the SQLite bound-variable limit), which keeps a paged scan at a
+  bounded number of reads whatever the page size.
+
+### Added — a project's balance sheet is available as JSON, for audit tooling
+
+- **`gradatum-admin project-map scope --json`** prints the balance sheet of a project —
+  current version, per-status counters, versions seen, reconciliation verdict — as a
+  single JSON object on stdout and nothing else, so it can be piped straight into a
+  parser. Every card falls into exactly one status bucket, unaccounted cards included, so
+  a breakdown never silently drops one; the sum of the buckets is published next to the
+  total, which lets a reader spot a disagreement instead of recomputing the sum and
+  trusting its own copy of the rule. `unaccounted` is included in that sum.
+- **The verdict travels with the numbers.** The object carries `reconciled` and the
+  signed `gap` it rests on. The exit codes are unchanged — `0` when the reconciliation
+  holds, `2` when it does not — so a caller that wants the verdict should read the
+  payload (`jq -e 'has("reconciled")'`): `2` is also what the CLI returns for an argument
+  it does not recognise.
+- **The plain-text report is unchanged**, down to the lines its current consumer reads.
+
+### Added — the server's detailed health report exposes how many messages are waiting
+
+- **The server's `GET /health/detailed` now publishes `mailbox_pending`**, the number of
+  message deliveries awaiting acknowledgement. The figure was already computed alongside
+  the queue block and kept internal, so an operator asking whether a mailbox was filling
+  up had nothing to read: the queue deliberately excludes those deliveries, and the only
+  trace was a debug log line.
+- **The worker serves the same route and is unchanged.** The worker's `GET /health/detailed`
+  keeps the previous behaviour: its queue depth and its dead-letter age still include
+  message deliveries, and it publishes no `mailbox_pending` at all. Bringing the two
+  reports in line is tracked separately, so a reader comparing them should expect the
+  difference rather than read it as a regression.
+- **The two populations stay separate.** `queue_depth` counts queued work,
+  `mailbox_pending` counts deliveries waiting on their recipient. The field was added
+  rather than folded into the queue block, so a consumer that reads only the queue is
+  unaffected.
+- **The published figure is a lower bound.** The scan behind it is bounded (200 records
+  × 25 pages per probe pass), so past 5 000 pending deliveries it can under-count a very
+  large mailbox.
+- **Absent means "not measured", never `0`.** The field is optional on the wire: a
+  producer that does not count its mailbox omits the key instead of publishing a `0` a
+  reader cannot tell from a measured-empty one. Only the builder that carries a real
+  figure publishes one.
+- Additive to the detailed report only: `/health` itself still serves the minimal
+  liveness payload, with no queue or mailbox internals.
+
+### Fixed — a mailbox poll read the queue once per message
+
+- **`message_poll` read the delivery status of every note individually.** The status of
+  a message — delivered or still pending — lives in the job queue, and it was fetched one
+  note at a time: a full page of 200 messages cost 200 queue reads, and the
+  reconciliation sweep that runs ahead of each poll cost another 200 for the same page.
+  A single poll of a busy agent's mailbox therefore issued 400 reads, and the worst case
+  (20 pages) 4 000. Each read takes the queue store's write lock, so polling a large
+  mailbox competed with the workers enqueueing and completing jobs — a slow, chatty
+  request where one read per page is enough.
+- **Both call sites now read the page in one call.** The reconciliation sweep and the
+  poll loop each fetch the delivery status of the whole page at once: at most two queue
+  reads per page, whatever its size.
+- **Nothing else about the poll changed.** The `accepted`/`delivered` filter, the page
+  cap on `limit`, the resume-cursor contract, the message order and the reconciliation
+  result are all exactly as before.
+
+### Fixed — the deployment pre-flight accepted a configuration the engine refused at startup
+
+- **`gradatum-engine --check` never applied the `max_tokens` / `--n-predict` conflict
+  guard.** A configuration setting `max_tokens` while `extra_args` also carried
+  `--n-predict` (or its `-n` alias) passed the pre-flight, and the engine then aborted at
+  startup with `config conflict: …`. The check answered for a configuration the service
+  would not serve — precisely the question it exists to answer — and a fleet-wide rollout
+  could be declared green on hosts it was about to take down.
+- **The rule now lives in one place, called by both paths.** The supervisor's constructor
+  and the pre-flight share the same function, so the two verdicts cannot drift: the
+  constructor aborts on the first message, the check lists every problem in one pass
+  alongside the others it already reports.
+- The verdict is unchanged where there is no conflict: `max_tokens` alone, or
+  `--n-predict` alone with `max_tokens` unset, both remain accepted — an unset
+  `max_tokens` means unlimited, and `extra_args` stays a valid way to bound generation.
+
+### Fixed — the CPU embedding benchmark did not compile at all
+
+- **`b02a_fastembed_cpu` called a constructor that does not exist.** The benchmark
+  built its embedder with `FastEmbedCpu::new()`, but the type exposes a single
+  constructor, `FastEmbedCpu::try_default()`, and it returns a `Result`. With the
+  `fastembed-cpu` feature enabled the file therefore failed to compile, so the
+  benchmark could not be run at all — the measurement it exists to produce was
+  simply unavailable, and nothing in CI said so.
+- **The benchmark now goes through `try_default()`**, and a model that fails to load
+  is still reported with the same message as before.
+- **CI now builds the feature combinations no one builds by hand.** A nightly job
+  runs `clippy --workspace --all-targets --all-features` over the whole workspace, so
+  a `required-features` target that stops compiling is caught the night it breaks.
+  It is scheduled-only and nothing waits on it, so the pull-request chain is not
+  lengthened by it.
+
+### Fixed — a dead message delivery aged the dead-letter queue
+
+- **A message delivery sitting in the dead-letter queue pushed its oldest-entry age up**,
+  and past 24 hours that aged signal degraded the service. The field answers one question
+  — "has a dead job been forgotten?" — and a delivery is not work: it stays `Pending`
+  until its recipient acknowledges it, and one that ends up dead-lettered says something
+  about a mailbox, not about a job no one retried.
+- **On the server's `GET /health/detailed`, `dlq_oldest_age_secs` now ignores message
+  deliveries**, exactly as `queue_oldest_age_secs` already did for the pending queue.
+  `dlq_depth` is unchanged and still counts every entry; `dlq_by_kind` remains the place
+  to read the per-kind detail.
+- **The age is now exact, and reads only what it needs.** It is derived from the per-kind
+  dead-letter breakdown already computed for the same pass — an exact, unbounded
+  `GROUP BY kind`. A dead-letter queue holding nothing but message deliveries is answered
+  `0` without reading a single row, however large that mailbox grows; otherwise the oldest
+  entry of each non-message kind present is read directly. The previous bounded scan could
+  miss a processing entry sitting behind more than 5 000 deliveries and fall back to the
+  age of a delivery — the very population this change sets apart. That fallback survives
+  only as the conservative path when the breakdown itself cannot be read: a queue no one
+  can read must not look healthy.
+- A dead processing job still ages the dead-letter queue exactly as before.
+
+### Fixed — an unknown section on a read request produced a misleading access denial instead of a request error (F-297)
+
+- **A section name that designates nothing was still answered as a question of access.**
+  The section travelled from the request body straight into the ACL locus
+  (`{tenant}/{section}`), so a name that exists nowhere nonetheless received a verdict:
+  `403` under a restrictive preset, `200` with no result under a permissive one. Neither
+  answer named the real fault. The first sent the caller to audit its rights; the second
+  let it conclude the vault held nothing on the subject — while the request itself was
+  simply malformed, and a single typo was enough to produce either.
+- **`vault_search`, `vault_read`, `vault_list` and `vault_context` now answer `400`** on a
+  section that matches no canonical name, where they used to answer about access. Over
+  MCP, the error also carries a message naming the value received and the sections that
+  do exist; over HTTP the `400` comes bare, as every error on these routes does — the
+  status is the whole answer. The decision is taken before any locus is built, on every path of
+  the search handler, including the cross-vault and multi-vault resolvers.
+- Sections that exist, and requests carrying no section at all, are untouched: same
+  resolution, same verdict, same status as before. Writes never carried the defect — their
+  locus has always been the tenant's, never the section's.
+
+### Changed — access to "personal-classified" loci is refused by the preset's own patterns, not by a dedicated flag (F-297)
+
+- **The refusal now targets the `personal-classified` path segment, not any locus name
+  that merely contains that string.** Where a consumer used to be short-circuited whenever
+  the locus contained the substring `personal-classified`, each consumer that must be kept
+  out now carries the negations `!personal-classified`, `!personal-classified/**`,
+  `!**/personal-classified` and `!**/personal-classified/**` at the head of its
+  `read_patterns` and `write_patterns`. The verdict is unchanged for the segment itself, at
+  any depth and any position.
+- **Two consequences follow.** Affix variants such as `personal-classified-2026` or
+  `my-personal-classified` are no longer refused — they are different segments, and a
+  consumer whose allow patterns cover them now reaches them. And the `sees_personal_classified`
+  preset key is gone: a preset that still carries it is refused at load with an explicit
+  error asking to express the denial as a `!` negation, instead of being silently ignored
+  and losing the refusal.
+- **Read patterns are now deny-by-default**: a consumer whose `read_patterns` hold only
+  `!`-prefixed negations (or are empty) matches no locus and reads nothing — migrating a
+  preset requires adding an explicit positive pattern for anything that consumer must read.
+
+### Fixed — a role cited as an example in a card's prose was counted as a role of the card (F-296)
+
+- **A `[[…]]` role mentioned in a card's prose or inside a code fence was read as if it
+  were one of the card's own roles.** A card that documented the role syntax — say a
+  ROADMAP whose history line cited `` `[[version:gradatum/9.9.9]]` `` or `` `[[status:DONE]]` ``
+  as an example — had that citation folded into its kind, status, version, tracked release
+  or feature-number floor, exactly as the schema validator already refused it at write time.
+  The read projections and the write validator disagreed on what counted as a role.
+- **The read projections now read a card's structural zone only, the same surface the
+  validator enforces.** A role only counts when it sits on a line made of `[[…]]` tokens and
+  separators, outside any code fence; a role cited in prose or code no longer feeds the
+  milestone listing, the feature export, the title, the tracked-release derivation or the
+  allocation floor. A card that carries its roles on their own lines is unaffected.
+- **The derivation diagnostics are now emitted in a stable, input-order-independent order**,
+  so the same registry always produces the same diagnostic sequence for the caller to surface.
+
+### Security — what to expect when the personal-data marking pass runs (F-160)
+
+- Writing the `extra.privacy` report block **changes the note's `ContentHash`**.
+- The day an operator **activates a category**, agent search **loses the notes the pass then
+  marks** `personal-classified` — the read guard hides them from enumeration.
+- The `queue.sqlite` purge is logical, not physical: it does **not** run `VACUUM`, and it purges
+  neither `retry.last_error` nor `retry.errors[].message`.
+- A fresh install ships **`categories = []`**: the pass scans nothing until an operator opts in.
+- A **metadata-only mutation triggers a full personal-data pass** over the note body — the pass
+  keys off the write, not off which field changed.
+
+### Tooling — the 2.3.1 → 2.4.0 upgrade is covered end to end by an automated harness
+
+The migration from 2.3.1 to 2.4.0 is now exercised on every push, proving a 2.3.1-produced state
+migrates under 2.4.0 without loss and that the previous binary still serves the migrated state.
+
+- **`tests/upgrade/run-upgrade-test.sh` mounts a 2.3.1 state under the 2.4.0 server and compares
+  four readings at zero tolerance** — the schema migrations, the full note listing, a set of
+  literal searches, the card export and the record counts. It then restarts the 2.3.1 binary on the
+  mounted state, so the rollback is exercised, not assumed. The return codes keep a measured
+  divergence (`1`, every gap named with both values) apart from a tooling failure (`2`, nothing
+  measured): a `2` is never a green.
+- **A CI job runs it on every push, and the release gate runs the identical line.** An
+  `upgrade-test` job carries the command, and `RELEASE-MANIFEST.yaml` carries the same invocation
+  byte-for-byte under `validate:`, so a local replay, CI and the release gate all exercise the same
+  thing. The upgrade guide documents how to replay it by hand.
+- **The fixture is text only.** A manifest and per-section note files, which a generator turns into
+  a 2.3.1 state at test time, stand in for a committed binary state.
+
+### Added — container packaging: a multi-stage image with a measured health check
+
+The line now ships container packaging — a `Dockerfile` and a Compose file — building a small
+runtime image from source.
+
+- **The image is built in two stages.** A builder stage compiles the five binaries
+  (`gradatum-server`, `gradatum-worker`, `gradatum-admin`, `gradatum-gateway`, `gradatum-engine`)
+  with the toolchain pinned by `rust-toolchain.toml`; the runtime stage is a `debian:13-slim` that
+  copies only those five binaries and runs them as a non-root user. The build tree's `.git` is
+  copied into the builder alone — so `build_sha` on `/health` names the commit actually built — and
+  is discarded with that stage, never reaching the final image.
+- **The health check is measured, not guessed.** `HEALTHCHECK --start-period=90s`: on the reference
+  host the first green `/health` lands about 40 s after boot, so a shorter grace window flagged a
+  healthy server as unhealthy at every start. 90 s keeps a margin over that measurement and clears
+  the upgrade harness's 60 s floor; past it, a slow start is a real signal. The Compose file sets
+  the same start period.
+
+### Added — a release job builds and publishes the container image to the internal registry
+
+A `build-docker` job builds the `linux/amd64` image and pushes it to the internal OCI registry.
+
+- **The registry token never enters the job environment.** A single step logs in with an ephemeral
+  token first and falls back to a stored, narrowly-scoped named token only when the push is refused;
+  the token is passed to `docker login --password-stdin` alone, never as a job variable or a build
+  argument.
+- **`latest` is reserved for version tags.** It is pushed only when the ref name is a `v*` tag; any
+  other ref pushes only its own sanitised tag, so `latest` never points at an internal ref.
+- **The image is labelled and its registry is resolved deterministically.** Four OCI labels
+  (revision, version, created, source) are read from the build context, the registry host comes from
+  a repository variable with a derivation fallback, and the buildx builder runs on the host network
+  so it can resolve the registry name.
+
+### Fixed — the Docker quickstart rebuilds and stops the profile-gated init service (F-312)
+
+- **The quickstart now passes `--profile init` when it builds and when it stops.** The one-shot
+  `gradatum-init` service sits behind a Compose profile, so a plain `docker compose build` reused a
+  stale init image and a plain `docker compose down` left the init container behind. The quickstart
+  script and guide now run `docker compose --profile init build` and `--profile init down`, so the
+  init service is rebuilt and removed with the rest of the stack.
+
+### Docs — the 2.3.1 → 2.4.0 upgrade guide gains its operational half
+
+- [`docs/UPGRADING-2.3.1-to-2.4.0.md`](docs/UPGRADING-2.3.1-to-2.4.0.md) — the ACL-preset
+  re-alignment is now a **mandatory pre-flight** with its failure mode **measured** (server starts,
+  `/health` green, every authenticated read refused), followed by the deployment sequence in order
+  (backup → preset → binaries → units → `/health` and its boot window → fleet check), the
+  binary-only rollback and the same-`version`-and-same-`build_sha` fleet rule, and how to run the
+  2.3.1 → 2.4.0 upgrade harness outside CI.
+
+## [2.3.1] — 2026-09-13
+
+### Fixed — polling a mailbox returned an empty page while messages were waiting (F-276)
+
+- **`message_poll` applied the `accepted`/`delivered` filter *after* reading a single page
+  of the mailbox.** A mailbox whose leading notes had all been acknowledged returned an
+  empty page even though unacknowledged messages sat right behind them — the caller read
+  "nothing pending" and stopped, with no way to tell that conclusion apart from a genuinely
+  empty inbox. The only workaround was to ask for a page large enough to span the whole
+  archive.
+- **The poll now reads as many pages as it needs** to fill `limit` *selected* messages,
+  bounded at 20 pages of 200 records.
+- **`next_cursor` follows a single rule**: it is `null` **if and only if** the mailbox is
+  exhausted — proven by a page shorter than the one requested. Every other stop, whether
+  `limit` was reached or the scan bound was, returns the last record read. A bounded scan
+  therefore never looks like the end of the list, and a resume cursor is always available.
+- **`limit` caps the page** — at most `limit` messages come back, and the server caps
+  `limit` itself at 200. Whenever the mailbox is not exhausted the response carries a
+  `next_cursor`, so a capped page is always resumable and nothing is silently dropped.
+
+### Fixed — an unacknowledged message made the service report a degraded queue (F-277)
+
+- **A message delivery is state-carrying: it stays `Pending` until its recipient
+  acknowledges it, and no worker ever leases it.** Counted as queued work, a full mailbox
+  pushed `/health` to `degraded` — a signal about a recipient, reported as a signal about
+  the queue. A service could look unhealthy for hours while nothing was actually wrong with
+  its processing.
+- **`queue_depth` and `queue_oldest_age_secs` now exclude message deliveries.** A queue
+  holding nothing but unacknowledged messages reports `ok`; a genuinely stuck processing job
+  still degrades the service, even when thousands of older deliveries sit in front of it.
+- **The oldest-pending scan is bounded** (200 records × 25 pages per probe pass). Reaching
+  that bound never reports an age of `0` — it falls back to the oldest pending job of any
+  kind, because a `0` there would make a queue too large to read look perfectly healthy.
+- No public API change: the pending-delivery count stays internal to the server.
+
+### Fixed — the OpenAI-compatible gateway rejected tool-calling histories (F-278)
+
+- **A chat completion request carrying an assistant message with `"content": null` next to
+  its `tool_calls` failed to deserialize, and the whole request was rejected** — yet that is
+  the exact shape an OpenAI client emits on the second turn of a tool call, so any
+  multi-turn tool use against `/v1/chat/completions` broke at the first tool result.
+- **`content` now accepts an explicit `null`** and maps it to empty text, exactly as it
+  already did for an absent field. The plain-string and multimodal-array forms are
+  unchanged, as are `tool_calls` and `tool_call_id` on the messages around it.
+
 ## [2.3.0] — 2026-09-10
 
 > This release ships a first slice of agent-identity data (person cards) and inter-agent

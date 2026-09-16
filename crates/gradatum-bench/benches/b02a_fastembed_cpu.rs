@@ -17,13 +17,16 @@ use std::hint::black_box;
 
 #[cfg(feature = "fastembed-cpu")]
 fn bench_fastembed_cpu(c: &mut Criterion) {
-    use gradatum_embed::FastEmbedCpu;
+    // `Embedder` doit être en scope : `embed()` est une méthode de trait, pas une
+    // méthode inhérente de `FastEmbedCpu`.
+    use gradatum_embed::{Embedder, FastEmbedCpu};
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     // Chargement du modèle — hors boucle de mesure.
     let embedder = rt.block_on(async {
-        FastEmbedCpu::new().expect("FastEmbedCpu::new — modèle BGE-small-EN-v1.5 requis")
+        FastEmbedCpu::try_default()
+            .expect("FastEmbedCpu::try_default — modèle BGE-small-EN-v1.5 requis")
     });
 
     let mut group = c.benchmark_group("B2a-fastembed-cpu");

@@ -400,7 +400,6 @@ mod tests {
 identity = "gateway"
 read_patterns = []
 write_patterns = ["main/event-log"]
-sees_personal_classified = false
 token_hash = "placeholder"
 "#;
         AclEngine::from_preset_str(preset).expect("preset ACL valide")

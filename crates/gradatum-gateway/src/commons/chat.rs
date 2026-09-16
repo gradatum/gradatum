@@ -129,7 +129,13 @@ pub struct ImageUrlDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub role: Role,
-    #[serde(default)]
+    /// Contenu du message.
+    ///
+    /// Tolère les trois formes émises par les clients OpenAI : chaîne, tableau
+    /// de parts, et `null` explicite (un message `assistant` qui ne porte que
+    /// des `tool_calls`). `null` et champ absent donnent tous deux
+    /// `MessageContent::Text("")` (F-278).
+    #[serde(default, deserialize_with = "deserialize_content_or_null")]
     pub content: MessageContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -137,6 +143,23 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// Désérialise `content` en tolérant `null` explicite.
+///
+/// L'enum `MessageContent` est `untagged` : `null` ne correspond à aucune de
+/// ses variantes et faisait échouer la requête entière. On passe par
+/// `Option<MessageContent>` pour ramener `null` au défaut (texte vide).
+///
+/// # Errors
+///
+/// Propage l'erreur du désérialiseur si la valeur n'est ni `null`, ni une
+/// chaîne, ni un tableau de parts.
+fn deserialize_content_or_null<'de, D>(deserializer: D) -> Result<MessageContent, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<MessageContent>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl Message {
@@ -349,4 +372,73 @@ pub struct Usage {
 pub struct PromptTokensDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
+}
+
+#[cfg(test)]
+mod content_null_tests {
+    use super::{ChatCompletionRequest, ContentPart, MessageContent, Role};
+
+    /// Historique OpenAI typique d'un tour d'appel d'outil : l'assistant émet
+    /// `tool_calls` avec `content: null`, puis le rôle `tool` rend le résultat.
+    const TOOL_CALLING_HISTORY: &str = r#"{"model":"default-deep","messages":[
+ {"role":"system","content":"s"},
+ {"role":"user","content":"u"},
+ {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"mcp__gradatum__vault_search","arguments":"{\"query\":\"x\"}"}}]},
+ {"role":"tool","tool_call_id":"call_1","content":"{\"compact\":\"1 notes\"}"}]}"#;
+
+    #[test]
+    fn deserializes_explicit_null_content_as_empty_text() {
+        let req: ChatCompletionRequest = serde_json::from_str(TOOL_CALLING_HISTORY)
+            .expect("l'historique de tool-calling doit être accepté (F-278)");
+        assert_eq!(req.messages[2].content, MessageContent::Text(String::new()));
+    }
+
+    #[test]
+    fn preserves_tool_call_and_tool_result_around_null_content() {
+        let req: ChatCompletionRequest = serde_json::from_str(TOOL_CALLING_HISTORY)
+            .expect("l'historique de tool-calling doit être accepté (F-278)");
+        let assistant = &req.messages[2];
+        let tool_calls = assistant
+            .tool_calls
+            .as_ref()
+            .expect("le message assistant porte ses tool_calls malgré content:null");
+        assert_eq!(tool_calls[0].function.name, "mcp__gradatum__vault_search");
+
+        let tool_msg = &req.messages[3];
+        assert_eq!(tool_msg.role, Role::Tool);
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn deserializes_absent_content_as_empty_text() {
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"assistant"}]}"#)
+                .expect("un message sans champ content doit rester accepté");
+        assert_eq!(req.messages[0].content, MessageContent::Text(String::new()));
+    }
+
+    #[test]
+    fn deserializes_content_parts_array_unchanged() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
+        )
+        .expect("la forme multimodale doit rester acceptée");
+        assert_eq!(
+            req.messages[0].content,
+            MessageContent::Parts(vec![ContentPart::Text {
+                text: "hi".to_string()
+            }])
+        );
+    }
+
+    #[test]
+    fn deserializes_plain_string_content_unchanged() {
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .expect("la forme texte simple doit rester acceptée");
+        assert_eq!(
+            req.messages[0].content,
+            MessageContent::Text("hi".to_string())
+        );
+    }
 }

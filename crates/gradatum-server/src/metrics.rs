@@ -38,6 +38,14 @@
 //! | `gradatum_api_key_orphan_owners` | Gauge | (sans label) — clés actives dont l'owner n'est déclaré par aucun consumer du preset (B6′b) |
 //! | `gradatum_registry_heartbeat_rejected_total` | Counter | reason (6 motifs bornés) — ingress heartbeat F-156 P6b |
 //! | `gradatum_registry_heartbeat_accepted_total` | Counter | (sans label) — ingress heartbeat F-156 P6b |
+//! | `gradatum_privacy_notes_tagged_total` | Counter | category (vocabulaire fermé `PiiCategory`) — F-160 L-D.2 |
+//! | `gradatum_privacy_scanned_total` | Counter | (sans label) — passes complètes, dénominateur de `_unscanned_total` — F-160 L-D.2 |
+//! | `gradatum_privacy_unscanned_total` | Counter | (sans label) — passes incomplètes, lu par `/health/detailed` — F-160 L-D.2 |
+//! | `gradatum_privacy_unmapped_labels_total` | Counter | label (valeur unique bornée `unmapped`) — F-160 L-D.2 |
+//! | `gradatum_privacy_spans_rejected_total` | Counter | reason (2 motifs bornés) — F-160 L-D.2 |
+//! | `gradatum_privacy_spans_window_edge_total` | Counter | (sans label) — F-160 L-D.2 |
+//! | `gradatum_privacy_exception_hits_total` | Counter | pattern_id (index/empreinte, jamais le motif) — déclarée sans producteur en 2.4.0 — F-160 L-D.2 |
+//! | `gradatum_privacy_input_too_large_total` | Counter | (sans label) — **distincte** des échecs du détecteur — F-160 L-D.2 |
 
 use std::sync::{
     Arc,
@@ -228,6 +236,69 @@ pub struct HeartbeatRejectLabel {
 pub struct ContextEfficiencyLabel {
     /// Mode d'assemblage : `"assembled"` ou `"compact"` (borné, pas de cardinalité libre).
     pub mode: &'static str,
+}
+
+/// Canonical PII category label a detection pass reported a marker-bearing span for.
+///
+/// Cardinality is bounded by the closed [`PiiCategory`](gradatum_core::pii::PiiCategory)
+/// vocabulary — the value comes from `PiiCategory::as_str`, never from a detector's own
+/// label and never from the matched text. A category the product does not know is counted
+/// as an *unmapped label* (see [`PrivacyLabelLabel`]), not as a category.
+///
+/// `String` rather than `&'static str` because the pass hands the label over as an owned
+/// value; the closed vocabulary is what bounds it, and the `as_str` return type is what
+/// keeps a free-form string from entering the series.
+#[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
+pub struct PrivacyCategoryLabel {
+    /// Canonical category label (e.g. `"person"`, `"email"`).
+    pub category: String,
+}
+
+/// Why a detection pass rejected a span it had been handed.
+///
+/// Cardinality is bounded to **two** `&'static str` values:
+/// - `"out_of_bounds"` — the span does not lie inside the body it was reported against.
+/// - `"utf8_boundary"` — the span does not start and end on a code-point boundary.
+///
+/// A rejection is never silent: the two motives are separate series because they call for
+/// different work — the first says the detector's coordinates disagree with ours, the
+/// second says the two sides count bytes differently.
+#[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
+pub struct PrivacyReasonLabel {
+    /// Rejection motive (bounded `&'static str`, see the struct docs).
+    pub reason: &'static str,
+}
+
+/// A detector label that matched no [`PiiCategory`](gradatum_core::pii::PiiCategory).
+///
+/// Cardinality is bounded to **one** value in 2.4.0: `"unmapped"`. The core detection
+/// contract carries the *count* of unmapped labels and not the labels themselves, so the
+/// series is fed under a single constant and the names behind it stay in the sidecar's own
+/// logs. That is the intended shape, not a placeholder for a label that is coming: a label
+/// is a free-form string chosen by the mounted model, and reporting it would let a model
+/// change mint an unbounded number of series.
+#[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
+pub struct PrivacyLabelLabel {
+    /// The single bounded value `"unmapped"`.
+    pub label: &'static str,
+}
+
+/// Identifier of one exception pattern a detection hit.
+///
+/// The value is an **index or a digest** of the pattern as declared in the configuration —
+/// never the pattern itself, and never the text it matched. Exception patterns are literal
+/// snippets of personal data by nature (which is why [`PrivacyConfig`](crate::config::PrivacyConfig)
+/// redacts them from its `Debug`), so a series that carried one would publish to the
+/// loopback metrics channel exactly what the configuration was written to withhold.
+///
+/// **No producer in 2.4.0**: the exception pass is configured but its consumer is not
+/// delivered yet, so the family is declared and empty. It is registered anyway, for the
+/// same reason the boot gauges are: a series that appeared only once the feature shipped
+/// would be indistinguishable from a broken scrape.
+#[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
+pub struct PrivacyPatternLabel {
+    /// Stable identifier of the pattern (index or digest), never the pattern.
+    pub pattern_id: String,
 }
 
 /// Estimation du nombre de tokens économisés par stub produit dans la réponse.
@@ -470,6 +541,65 @@ pub struct AppMetrics {
     /// rejection ratio.
     pub registry_heartbeat_accepted: Counter,
 
+    // -- Personal-data frontier (F-160 L-D.2) ---------------------------------
+    /// Notes left carrying `personal-classified` by a completed pass, by category.
+    ///
+    /// Série : `gradatum_privacy_notes_tagged_total{category}`. Incremented **once per
+    /// category** a pass reported a marker-bearing span for, and only when the verdict
+    /// actually left the marker on the note — a human rejection that still binds, or a span
+    /// list past the block's ceiling, overrules the pass and is not counted here.
+    ///
+    /// The labels are the closed [`PrivacyCategoryLabel`] vocabulary. A detected value never
+    /// reaches this series: what a pass saw is a category and a count, never a fragment.
+    pub privacy_notes_tagged: Family<PrivacyCategoryLabel, Counter>,
+    /// Passes that completed over the whole of their input.
+    ///
+    /// Série : `gradatum_privacy_scanned_total`. The denominator of
+    /// [`Self::privacy_unscanned`]: together the two partition every pass the frontier ran
+    /// since boot, so "how much of this corpus has been judged" is a ratio of two series
+    /// rather than a number to be inferred.
+    pub privacy_scanned: Counter,
+    /// Writes left carrying `privacy-unscanned` because a pass did not complete.
+    ///
+    /// Série : `gradatum_privacy_unscanned_total`. Read back by `/health/detailed`, where a
+    /// figure above zero **degrades** the report and never makes it unhealthy: an unscanned
+    /// body is work the sweep owes, not a fault of the service.
+    pub privacy_unscanned: Counter,
+    /// Detector labels that matched no category, summed over the windows of a pass.
+    ///
+    /// Série : `gradatum_privacy_unmapped_labels_total{label}` — fed under the single
+    /// bounded value `"unmapped"` (see [`PrivacyLabelLabel`]). A figure above zero means the
+    /// mounted model reports labels this deployment does not map: the verdicts stay
+    /// conservative, and the operator learns it without a single detected value being
+    /// published.
+    pub privacy_unmapped_labels: Family<PrivacyLabelLabel, Counter>,
+    /// Spans a pass rejected before fusion, by motive.
+    ///
+    /// Série : `gradatum_privacy_spans_rejected_total{reason}` — bounded
+    /// [`PrivacyReasonLabel`] motives. A rejection here is a detector whose coordinates
+    /// disagree with the body it was handed; the pass continues on the spans that survived.
+    pub privacy_spans_rejected: Family<PrivacyReasonLabel, Counter>,
+    /// Spans sitting within one byte of an interior window boundary.
+    ///
+    /// Série : `gradatum_privacy_spans_window_edge_total`. The only observable signal that
+    /// `window_overlap_bytes` is shorter than the entities the detector can report — the
+    /// configuration error that silently truncates long matches at every window cut.
+    pub privacy_spans_window_edge: Counter,
+    /// Exception patterns a detection hit, by pattern identifier.
+    ///
+    /// Série : `gradatum_privacy_exception_hits_total{pattern_id}` — never the pattern and
+    /// never the matched text. Declared with **no producer** in 2.4.0 (see
+    /// [`PrivacyPatternLabel`]).
+    pub privacy_exception_hits: Family<PrivacyPatternLabel, Counter>,
+    /// Passes that ended because the input exceeded the per-call byte ceiling.
+    ///
+    /// Série : `gradatum_privacy_input_too_large_total`. **Deliberately distinct** from a
+    /// detector fault: an oversized body is a property of the corpus (a threshold to
+    /// calibrate, a window to widen), a fault is a property of the deployment. Conflating
+    /// the two would make a large body look like a broken sidecar, and a broken sidecar look
+    /// like a large body. Fed only by [`PiiDetectError::InputTooLarge`](gradatum_core::pii::PiiDetectError::InputTooLarge).
+    pub privacy_input_too_large: Counter,
+
     // -- Cardinality cap (tenant) --------------------------------------------
     /// Number of distinct tenant labels registered so far.
     tenant_count: Arc<AtomicUsize>,
@@ -550,6 +680,16 @@ impl AppMetrics {
         // -- Fleet heartbeat ingress (F-156 P6b) -----------------------------
         let registry_heartbeat_rejected: Family<HeartbeatRejectLabel, Counter> = Family::default();
         let registry_heartbeat_accepted: Counter = Counter::default();
+
+        // -- Personal-data frontier (F-160 L-D.2) ----------------------------
+        let privacy_notes_tagged: Family<PrivacyCategoryLabel, Counter> = Family::default();
+        let privacy_scanned: Counter = Counter::default();
+        let privacy_unscanned: Counter = Counter::default();
+        let privacy_unmapped_labels: Family<PrivacyLabelLabel, Counter> = Family::default();
+        let privacy_spans_rejected: Family<PrivacyReasonLabel, Counter> = Family::default();
+        let privacy_spans_window_edge: Counter = Counter::default();
+        let privacy_exception_hits: Family<PrivacyPatternLabel, Counter> = Family::default();
+        let privacy_input_too_large: Counter = Counter::default();
 
         let mut registry = Registry::default();
 
@@ -759,6 +899,50 @@ impl AppMetrics {
             "Fleet heartbeats accepted (stored or refreshed) at the ingress — F-156 P6b",
             registry_heartbeat_accepted.clone(),
         );
+        // -- Personal-data frontier (F-160 L-D.2) ----------------------------
+        // Toutes enregistrées INCONDITIONNELLEMENT, comme les jauges de boot : la série
+        // existe dès le boot, à `0`, même sans `[privacy]` configuré. Sans quoi « 0 note
+        // marquée » et « frontière non montée » auraient la même apparence côté Prometheus.
+        registry.register(
+            "gradatum_privacy_notes_tagged",
+            "Notes left carrying the personal-classified marker by a completed pass, by canonical category (F-160 L-D.2)",
+            privacy_notes_tagged.clone(),
+        );
+        registry.register(
+            "gradatum_privacy_scanned",
+            "Completed personal-data detection passes (F-160 L-D.2)",
+            privacy_scanned.clone(),
+        );
+        registry.register(
+            "gradatum_privacy_unscanned",
+            "Writes left carrying the privacy-unscanned marker because a pass did not complete (F-160 L-D.2)",
+            privacy_unscanned.clone(),
+        );
+        registry.register(
+            "gradatum_privacy_unmapped_labels",
+            "Detector labels matching no canonical category, summed over windows — single bounded label value `unmapped` (F-160 L-D.2)",
+            privacy_unmapped_labels.clone(),
+        );
+        registry.register(
+            "gradatum_privacy_spans_rejected",
+            "Spans a detection pass rejected before fusion, by motive (out_of_bounds|utf8_boundary) — F-160 L-D.2",
+            privacy_spans_rejected.clone(),
+        );
+        registry.register(
+            "gradatum_privacy_spans_window_edge",
+            "Spans sitting within one byte of an interior detection-window boundary — window_overlap_bytes shorter than the reported entities (F-160 L-D.2)",
+            privacy_spans_window_edge.clone(),
+        );
+        registry.register(
+            "gradatum_privacy_exception_hits",
+            "Exception patterns hit by a detection, by pattern identifier — never the pattern nor the matched text (F-160 L-D.2)",
+            privacy_exception_hits.clone(),
+        );
+        registry.register(
+            "gradatum_privacy_input_too_large",
+            "Personal-data passes ended by an input above the per-call byte ceiling — distinct from a detector fault (F-160 L-D.2)",
+            privacy_input_too_large.clone(),
+        );
 
         Self {
             registry: Arc::new(registry),
@@ -800,6 +984,14 @@ impl AppMetrics {
             api_key_orphan_owners,
             registry_heartbeat_rejected,
             registry_heartbeat_accepted,
+            privacy_notes_tagged,
+            privacy_scanned,
+            privacy_unscanned,
+            privacy_unmapped_labels,
+            privacy_spans_rejected,
+            privacy_spans_window_edge,
+            privacy_exception_hits,
+            privacy_input_too_large,
             tenant_count: Arc::new(AtomicUsize::new(0)),
             cap: 100,
         }

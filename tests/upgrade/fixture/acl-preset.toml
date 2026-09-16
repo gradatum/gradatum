@@ -1,0 +1,37 @@
+# Preset ACL de la fixture de montée de version — matérialisé par
+# `gradatum-admin init --preset <ce fichier>` dans <root>/config/bearer.toml.
+#
+# Trois identités, toutes FACTICES :
+#   - `main-agent` est l'identité d'amorçage obligatoire du produit (elle est
+#     déclarée par les presets livrés `hierarchical` et `flat`) ; `init` minte
+#     sa clé (R4) et refuse de démarrer sans elle.
+#   - `agent-alpha` et `agent-beta` sont les deux auteurs inventés du corpus.
+#
+# Pourquoi un preset dédié plutôt que le preset livré : la règle R2 interdit à un
+# client d'auto-déclarer son auteur — l'auteur d'une note est le sujet du porteur
+# (`trust.subject()`), jamais un champ de la requête. Un `{"author": ...}` dans le
+# corps d'un `vault_write` est refusé en 400. Deux auteurs distincts dans l'état
+# produit exigent donc deux identités réellement déclarées ici.
+#
+# Aucune clé, aucun jeton, aucun nom du parc : ce fichier est du texte.
+
+[[consumer]]
+identity = "main-agent"
+description = "Orchestrateur — amorçage produit, accès complet"
+read_patterns = ["**"]
+write_patterns = ["**"]
+sees_personal_classified = false
+
+[[consumer]]
+identity = "agent-alpha"
+description = "Auteur fictif A — accès complet en lecture et écriture"
+read_patterns = ["**"]
+write_patterns = ["**"]
+sees_personal_classified = false
+
+[[consumer]]
+identity = "agent-beta"
+description = "Auteur fictif B — accès complet en lecture et écriture"
+read_patterns = ["**"]
+write_patterns = ["**"]
+sees_personal_classified = false

@@ -28,8 +28,8 @@
 use anyhow::Context as _;
 use gradatum_admin::{
     BackfillArgs, BackfillAuthorsArgs, BackfillNoteLinksArgs, BackfillTitlesArgs,
-    DowngradeFromTrashArgs, ReindexOrphansArgs, RepairNoteLinksArgs, VaultRenameArgs, api_key_cmd,
-    code_cmd, init, jobs_cmd, token, vault_forget_cmd, vault_rename,
+    DowngradeFromTrashArgs, ReindexOrphansArgs, RepairNoteLinksArgs, VaultRenameArgs, acl_cmd,
+    api_key_cmd, code_cmd, init, jobs_cmd, token, vault_forget_cmd, vault_rename,
 };
 use gradatum_core::paths::vault_index_path;
 
@@ -86,6 +86,11 @@ enum Cmd {
     ApiKey {
         #[command(subcommand)]
         cmd: api_key_cmd::ApiKeyCmd,
+    },
+    /// Inspects an ACL preset (read-only — no store, no mint, no write).
+    Acl {
+        #[command(subcommand)]
+        cmd: acl_cmd::AclCmd,
     },
     /// Backfills embeddings for notes that have none (idempotent, LEFT JOIN).
     ///
@@ -477,6 +482,27 @@ enum ProjectMapCmd {
         /// Vault / tenant to read.
         #[arg(long)]
         vault: String,
+        /// Print the report as a single-line JSON object instead of the prose summary.
+        ///
+        /// Schema: `{"project":…, "current_version":…|null, "total":N,`
+        /// `"by_status":{"open":…,"in_progress":…,"blocked":…,"done":…,"obsolete":…,`
+        /// `"brainstorming":…,"unaccounted":…}, "status_sum":N, "gap":N,`
+        /// `"reconciled":bool, "versions":[…]}`.
+        ///
+        /// `unaccounted` is INCLUDED in `status_sum`: read `status_sum` as published
+        /// rather than adding the buckets up on the caller's side.
+        ///
+        /// On stdout this mode prints the JSON object and nothing else — no banner, no
+        /// trailing summary — so the output can be piped straight into a JSON parser.
+        ///
+        /// Exit codes are unchanged: `0` when `gap` is `0`, `2` when it is not. A failure
+        /// to run the command also yields a non-zero code, and clap reports an unknown
+        /// argument as `2` as well, so a caller must discriminate on the payload —
+        /// `jq -e 'has("reconciled")'` — and never on the exit code alone.
+        ///
+        /// The prose report remains frozen while its current consumer parses it.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Exports the project-map feature cards as JSON, sorted by feature identifier.
     ///
@@ -696,6 +722,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Init(args) => init::run(args).await,
         Cmd::Token { cmd } => token::run(cmd),
         Cmd::ApiKey { cmd } => api_key_cmd::run(cmd).await,
+        Cmd::Acl { cmd } => acl_cmd::run(cmd),
         Cmd::BackfillNoteLinks {
             root,
             tenant,
@@ -1171,34 +1198,45 @@ async fn main() -> anyhow::Result<()> {
                 project,
                 root,
                 vault,
+                json,
             } => {
                 use gradatum_admin::project_map_scope::project_scope;
                 let scope = project_scope(&root, &vault, &project).await?;
-                println!("project-map scope: {}", scope.project);
-                println!(
-                    "  version courante : {}",
-                    scope.current_version.as_deref().unwrap_or("—")
-                );
-                println!("  cartes total     : {}", scope.total_count);
-                println!("  OPEN             : {}", scope.open_count);
-                println!("  IN_PROGRESS      : {}", scope.in_progress_count);
-                println!("  BLOCKED          : {}", scope.blocked_count);
-                println!("  DONE             : {}", scope.done_count);
-                println!("  OBSOLETE         : {}", scope.obsolete_count);
-                println!("  BRAINSTORMING    : {}", scope.brainstorming_count);
-                println!("  unclassified    : {}", scope.unaccounted_count);
-                // Réconciliation explicite : total vs somme des statuts. Toute
-                // divergence est nommée dans la sortie, jamais laissée à déduire
-                // par comparaison de deux nombres non comparables (F-207).
-                println!("  somme statuts    : {}", scope.status_sum());
+                // Lu une seule fois, AVANT la branche de rendu : les deux rendus et
+                // l'ALERTE de stderr reposent sur le meme ecart, calcule au meme endroit.
                 let gap = scope.reconciliation_gap();
-                if gap == 0 {
-                    println!("  gap total−sum: 0 (reconciled)");
+                if json {
+                    // Rendu machine : l'objet JSON SEUL sur stdout, rien d'autre — un
+                    // consommateur le passe directement a un parseur. Le verdict et le
+                    // code de sortie restent ceux du rendu texte (chemin commun plus bas).
+                    let payload = gradatum_admin::project_map_scope::ProjectScopeJson::from(&scope);
+                    println!("{}", serde_json::to_string(&payload)?);
                 } else {
-                    println!("  gap total−sum: {gap} ⚠ NOT RECONCILED — uncounted cards");
-                }
-                if !scope.versions.is_empty() {
-                    println!("  versions         : {}", scope.versions.join(", "));
+                    println!("project-map scope: {}", scope.project);
+                    println!(
+                        "  version courante : {}",
+                        scope.current_version.as_deref().unwrap_or("—")
+                    );
+                    println!("  cartes total     : {}", scope.total_count);
+                    println!("  OPEN             : {}", scope.open_count);
+                    println!("  IN_PROGRESS      : {}", scope.in_progress_count);
+                    println!("  BLOCKED          : {}", scope.blocked_count);
+                    println!("  DONE             : {}", scope.done_count);
+                    println!("  OBSOLETE         : {}", scope.obsolete_count);
+                    println!("  BRAINSTORMING    : {}", scope.brainstorming_count);
+                    println!("  unclassified    : {}", scope.unaccounted_count);
+                    // Réconciliation explicite : total vs somme des statuts. Toute
+                    // divergence est nommée dans la sortie, jamais laissée à déduire
+                    // par comparaison de deux nombres non comparables (F-207).
+                    println!("  somme statuts    : {}", scope.status_sum());
+                    if gap == 0 {
+                        println!("  gap total−sum: 0 (reconciled)");
+                    } else {
+                        println!("  gap total−sum: {gap} ⚠ NOT RECONCILED — uncounted cards");
+                    }
+                    if !scope.versions.is_empty() {
+                        println!("  versions         : {}", scope.versions.join(", "));
+                    }
                 }
                 // F-207 critère 3 : un écart ne doit pas seulement s'IMPRIMER, il doit
                 // faire ÉCHOUER le contrôle qui l'observe. Rendre `Ok(())` laissait la
@@ -1215,9 +1253,16 @@ async fn main() -> anyhow::Result<()> {
                 if code != gradatum_admin::project_map_scope::EXIT_SCOPE_RECONCILED {
                     // Sans accent, comme l'ALERTE de `drift-scan` : meme canal (stderr),
                     // meme forme, et zero hit ajoute au gate `scan-fr-strings`.
+                    // La queue suit le mode : en `--json` il n'y a pas de « ligne
+                    // d'ecart » en clair sur stdout, l'ecart y est le champ `gap`.
+                    let hint = if json {
+                        "voir le champ gap de l'objet JSON"
+                    } else {
+                        "voir la ligne d'ecart ci-dessus"
+                    };
                     eprintln!(
                         "ALERTE: reconciliation non tenue — total={} somme des statuts={} \
-                         ecart={gap} (voir la ligne d'ecart ci-dessus)",
+                         ecart={gap} ({hint})",
                         scope.total_count,
                         scope.status_sum(),
                     );

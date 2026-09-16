@@ -54,9 +54,10 @@
 use gradatum_server::config::{
     AclConfig, ArchiveConfig, AuditConfig, AuthConfig, ContextConfig, CuratorConfig,
     DowngradeConfig, EmbedConfig, EventLogConfig, HealthConfig, HttpConfig, InternalApiConfig,
-    LlmConfig, LogConfig, MultiTenantConfig, PerVaultOverride, RateLimitConfig, RegistryConfig,
-    RegistryIngressConfig, ReviewPromoteConfig, SalienceConfig, ScoringConfig, SearchConfig,
-    ServerConfig, SessionTraceConfig, StorageConfig, StudioConfig, TlsConfig,
+    LlmConfig, LogConfig, MultiTenantConfig, PerVaultOverride, PrivacyConfig, PrivacyThresholds,
+    RateLimitConfig, RegistryConfig, RegistryIngressConfig, ReviewPromoteConfig, SalienceConfig,
+    ScoringConfig, SearchConfig, ServerConfig, SessionTraceConfig, StorageConfig, StudioConfig,
+    TlsConfig,
 };
 use gradatum_server::proactive_recall::ProactiveRecallConfig;
 use std::fs;
@@ -68,17 +69,18 @@ enum Wiring {
     /// token that must appear in the crate's production sources (excluding `config.rs`,
     /// excluding test modules). Removing the wiring removes the token.
     Wired { proof: &'static str },
-    /// The field is deliberately parsed-but-not-consumed. It MUST carry a `// not yet wired`
-    /// marker near its declaration in `config.rs`, and MUST NOT be read in production.
+    /// The field reaches config-load **validation only**, never a runtime consumer (G34).
+    /// `validation_marker` is a discriminating token that MUST appear in `config.rs`,
+    /// proving the load-time check still exists. Removing the check removes the token → RED.
     ///
-    /// No `ServerConfig` field is currently `NotWired` (all are wired or mirrored). The
-    /// variant — and its detection branch — is kept as the classification vocabulary: a
-    /// future parsed-but-unconsumed field must be classified here.
-    #[expect(
-        dead_code,
-        reason = "F-157 classification vocabulary kept for a future NotWired field"
-    )]
-    NotWired,
+    /// The `[privacy] mode` field is the delivered case: it is read only to be accepted or
+    /// refused at load (`mask` is refused in 2.4.0), and no masking path consumes it.
+    Validated { validation_marker: &'static str },
+    /// The field is deliberately **parsed-but-not-consumed** ("parsed-only", G34). It MUST
+    /// carry a `// not yet wired` marker near its declaration in `config.rs`, and its
+    /// `consumption_token` MUST NOT appear in this crate's production — if it does, the
+    /// field was wired without being reclassified `Wired`.
+    NotWired { consumption_token: &'static str },
     /// The field is parsed here for schema symmetry but consumed by **another crate** (a
     /// TOML section mirrored across services). `consumer` names that crate; `absent_token`
     /// is a discriminating token that must NOT appear in *this* crate's production — if it
@@ -141,6 +143,7 @@ fn server_registry(c: &ServerConfig) -> Vec<Entry> {
         context,
         proactive_recall,
         multi_tenant,
+        privacy,
         per_vault,
     } = c;
     vec![
@@ -311,6 +314,18 @@ fn server_registry(c: &ServerConfig) -> Vec<Entry> {
             multi_tenant,
             Wiring::Wired {
                 proof: "multi_tenant.enabled",
+            },
+        ),
+        // F-160 privacy frontier: the section is threaded from `main.rs` to the detector
+        // mount through the dedicated builder, which is the consumption site. The section
+        // being threaded does NOT mean every sub-field is consumed — the field-level
+        // classification lives in `privacy_registry` (G34), which is what makes the
+        // parsed-but-unconsumed sub-fields visible instead of masked by this one entry.
+        entry(
+            "privacy",
+            privacy,
+            Wiring::Wired {
+                proof: "with_privacy",
             },
         ),
         // per_vault map: read only through the `config.rs` resolvers.
@@ -1109,6 +1124,111 @@ fn multi_tenant_registry(c: &MultiTenantConfig) -> Vec<Entry> {
     )]
 }
 
+/// [`PrivacyConfig`] — F-160 personal-data frontier, classified at the FIELD level (G34).
+///
+/// The top-level `privacy` entry only proves the section is threaded; this registry is
+/// what makes the sub-field bypass visible. In 2.4.0 only the byte budgets, the rescan
+/// gate/interval and the *presence* of `categories` (its emptiness decides the mount)
+/// reach a consumer. `mode` is validated at load and consumed by no masking path;
+/// `thresholds` and `exceptions` are parsed but not yet wired to the detector (2.5.0).
+fn privacy_registry(c: &PrivacyConfig) -> Vec<Entry> {
+    let PrivacyConfig {
+        mode,
+        categories,
+        max_input_bytes,
+        window_overlap_bytes,
+        thresholds,
+        exceptions,
+        rescan_enabled,
+        rescan_interval_secs,
+    } = c;
+    vec![
+        entry(
+            "mode",
+            mode,
+            Wiring::Validated {
+                validation_marker: "PrivacyMaskUnavailable",
+            },
+        ),
+        entry(
+            "categories",
+            categories,
+            Wiring::Wired {
+                proof: "privacy.categories",
+            },
+        ),
+        // Both byte budgets reach the detector through `self.privacy.budgets()`.
+        entry(
+            "max_input_bytes",
+            max_input_bytes,
+            Wiring::Wired {
+                proof: "privacy.budgets",
+            },
+        ),
+        entry(
+            "window_overlap_bytes",
+            window_overlap_bytes,
+            Wiring::Wired {
+                proof: "privacy.budgets",
+            },
+        ),
+        entry(
+            "thresholds",
+            thresholds,
+            Wiring::NotWired {
+                consumption_token: "privacy.thresholds",
+            },
+        ),
+        entry(
+            "exceptions",
+            exceptions,
+            Wiring::NotWired {
+                consumption_token: "privacy.exceptions",
+            },
+        ),
+        entry(
+            "rescan_enabled",
+            rescan_enabled,
+            Wiring::Wired {
+                proof: "privacy.rescan_enabled",
+            },
+        ),
+        entry(
+            "rescan_interval_secs",
+            rescan_interval_secs,
+            Wiring::Wired {
+                proof: "privacy.rescan_interval_secs",
+            },
+        ),
+    ]
+}
+
+/// [`PrivacyThresholds`] — parsed for schema completeness, consumed by nothing in 2.4.0
+/// (2.5.0). Both fields are parsed-only; a future field added here cannot appear
+/// unclassified (exhaustive destructuring).
+fn privacy_thresholds_registry(c: &PrivacyThresholds) -> Vec<Entry> {
+    let PrivacyThresholds {
+        default_m,
+        per_category,
+    } = c;
+    vec![
+        entry(
+            "default_m",
+            default_m,
+            Wiring::NotWired {
+                consumption_token: ".default_m",
+            },
+        ),
+        entry(
+            "per_category",
+            per_category,
+            Wiring::NotWired {
+                consumption_token: ".per_category",
+            },
+        ),
+    ]
+}
+
 fn per_vault_override_registry(c: &PerVaultOverride) -> Vec<Entry> {
     let PerVaultOverride {
         salience,
@@ -1200,6 +1320,11 @@ fn full_registry() -> Vec<(&'static str, Vec<Entry>)> {
         (
             "MultiTenantConfig",
             multi_tenant_registry(&cfg.multi_tenant),
+        ),
+        ("PrivacyConfig", privacy_registry(&cfg.privacy)),
+        (
+            "PrivacyThresholds",
+            privacy_thresholds_registry(&cfg.privacy.thresholds),
         ),
         ("PerVaultOverride", per_vault_override_registry(&over)),
     ]
@@ -1512,6 +1637,28 @@ fn production_corpus() -> String {
     corpus
 }
 
+/// Raw `config.rs` source, untouched (for annotation-marker verification).
+fn config_source() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("config.rs");
+    fs::read_to_string(path).expect("reading config.rs")
+}
+
+/// True if `field` carries a `not yet wired` marker within the ~500 characters preceding
+/// its `pub <field>:` declaration in `config.rs` (i.e. within its own doc block), without
+/// slicing on a byte that is not a char boundary (`config.rs` holds multibyte em dashes).
+fn has_not_wired_marker(config_src: &str, field: &str) -> bool {
+    let decl = format!("pub {field}:");
+    let Some(idx) = config_src.find(&decl) else {
+        return false; // field not found → fail (forces investigation)
+    };
+    match config_src[..idx].rfind("not yet wired") {
+        Some(m) => idx - m < 500,
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scanner self-check.
 // ---------------------------------------------------------------------------
@@ -1558,8 +1705,11 @@ fn scanner_is_sound() {
 #[test]
 fn every_server_config_field_reaches_a_consumer_or_is_mirrored() {
     let corpus = production_corpus();
+    let config_src = config_source();
     let mut orphans: Vec<String> = Vec::new();
     let mut wired = 0usize;
+    let mut validated = 0usize;
+    let mut parsed_only = 0usize;
     let mut mirrored = 0usize;
 
     for (struct_name, entries) in full_registry() {
@@ -1575,14 +1725,36 @@ fn every_server_config_field_reaches_a_consumer_or_is_mirrored() {
                         ));
                     }
                 }
-                Wiring::NotWired => {
-                    // No NotWired field on the server today; branch kept for completeness.
-                    orphans.push(format!(
-                        "`{}::{}` classified NotWired — unexpected on the server; if a \
-                         parsed-but-unconsumed field was added, wire the `config.rs` \
-                         marker check as in volet 1",
-                        struct_name, e.name
-                    ));
+                Wiring::Validated { validation_marker } => {
+                    validated += 1;
+                    // The field reaches config-load validation only; the marker proves that
+                    // load-time check still exists in config.rs.
+                    if !config_src.contains(validation_marker) {
+                        orphans.push(format!(
+                            "`{}::{}` classified Validated but its validation marker `{}` is \
+                             absent from config.rs — the load-time check was removed?",
+                            struct_name, e.name, validation_marker
+                        ));
+                    }
+                }
+                Wiring::NotWired { consumption_token } => {
+                    parsed_only += 1;
+                    // (a) the `// not yet wired` marker must sit near the declaration.
+                    if !has_not_wired_marker(&config_src, e.name) {
+                        orphans.push(format!(
+                            "`{}::{}` classified NotWired but the `not yet wired` marker is \
+                             absent near its declaration in config.rs",
+                            struct_name, e.name
+                        ));
+                    }
+                    // (b) it must NOT be consumed (else it was wired without reclassifying).
+                    if reads(&corpus, consumption_token) {
+                        orphans.push(format!(
+                            "`{}::{}` classified NotWired but its consumption token `{}` now \
+                             appears in production — it was wired: reclassify it Wired",
+                            struct_name, e.name, consumption_token
+                        ));
+                    }
                 }
                 Wiring::Mirror {
                     consumer,
@@ -1604,9 +1776,12 @@ fn every_server_config_field_reaches_a_consumer_or_is_mirrored() {
 
     assert!(
         orphans.is_empty(),
-        "F-157 — {} server config field(s) in wiring default (wired={}, mirrored={}):\n  - {}",
+        "F-157 — {} server config field(s) in wiring default \
+         (wired={}, validated={}, parsed_only={}, mirrored={}):\n  - {}",
         orphans.len(),
         wired,
+        validated,
+        parsed_only,
         mirrored,
         orphans.join("\n  - ")
     );

@@ -12,10 +12,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-gradatum-core      = { path = "../gradatum-core", version = "2.3.0" }
+gradatum-core      = { path = "../gradatum-core", version = "2.4.0" }
 # gradatum-db-sqlite is publishable (no `publish` key); this dependency does not block
 # publication of gradatum-queue.
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.3.0" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.4.0" }
 # P2.0b dependencies (rusqlite-based async Queue trait + SqliteQueue)
 async-trait   = { workspace = true }
 chrono        = { workspace = true }
@@ -31,3 +31,7 @@ rusqlite      = { workspace = true }
 [dev-dependencies]
 tempfile      = { workspace = true }
 tokio         = { workspace = true, features = ["full", "test-util"] }
+# `trace` (dev-only) : `get_many_delegates_one_batched_read_for_n_ids` compte les
+# statements SQL de la connexion partagée — la façade détient un `SqliteQueueStore`
+# concret, aucun double de `QueueStore` ne peut s'intercaler pour compter les appels.
+rusqlite      = { workspace = true, features = ["trace"] }

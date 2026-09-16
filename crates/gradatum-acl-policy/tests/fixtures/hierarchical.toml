@@ -10,7 +10,7 @@
 #
 # Cette fixture exerce donc, à dessein, une identité concrète par FORME de scoping :
 #   admin        — accès plein, voit personal-classified
-#   main-agent   — accès plein SAUF personal-classified (négation deny-wins)
+#   main-agent   — accès plein SAUF le segment personal-classified (négation deny-wins)
 #   sub-agent-a  — écriture scopée par projet (allow project-a/**, deny hors périmètre)
 #   validator    — lecture cross-projet, aucune écriture
 #   expert-rust  — lecture scopée par thème (allow rust/**, deny hors thème)
@@ -22,7 +22,7 @@
 #   "*"                    match all loci
 #   "projecta/*"           match all loci under "projecta/"
 #   "*/briefing"           match any "X/briefing" locus
-#   "!personal-classified" exclude (negation)
+#   "!**/personal-classified" exclude the "personal-classified" segment (negation)
 
 # ─── Human admin (top of hierarchy) ───────────────────────────────────
 # identity="admin" — administrateur, accès complet, voit personal-classified.
@@ -31,66 +31,62 @@ identity = "admin"
 description = "Administrator — full vault read/write, sees personal-classified"
 read_patterns  = ["**"]
 write_patterns = ["**"]
-sees_personal_classified = true
 
 # ─── Main agent (orchestrator) ────────────────────────────────────────
 # identity="main-agent" — orchestrateur LLM, accès global sauf personal-classified.
-# Caveat B3 : sees_personal_classified=false → court-circuit DenyExplicit sur tout locus
-# contenant "personal-classified", avant même l'évaluation des patterns.
+# Caveat B3 : le refus de "personal-classified" s'exprime par des négations de motif
+# `!` scopées au segment (deny-wins), en tête de read_patterns/write_patterns — il
+# refuse le SEGMENT "personal-classified", jamais une sous-chaîne.
 [[consumer]]
 identity = "main-agent"
 description = "Orchestrator (any LLM-based agent) — sees everything except personal-classified, writes briefings"
-read_patterns  = ["**"]
-write_patterns = ["**"]
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
 
 # ─── Sub-agent writer : project-a ────────────────────────────────────
 # identity="sub-agent-a" — agent writer limité au projet project-a.
 [[consumer]]
 identity = "sub-agent-a"
 description = "Writer sub-agent scoped to project-a"
-read_patterns  = ["project-a/**"]
-write_patterns = ["project-a/**"]
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "project-a/**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "project-a/**"]
 
 # ─── Sub-agent validator (cross-project read-only) ────────────────────
 # identity="validator" — lecture cross-project, aucune écriture.
 [[consumer]]
 identity = "validator"
 description = "Validator sub-agent — cross-reads any project, writes nothing"
-read_patterns  = ["**"]
-write_patterns = []
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
 
 # ─── Domain expert : Rust theme ───────────────────────────────────────
 # identity="expert-rust" — lecture limitée au thème rust/, aucune écriture.
 [[consumer]]
 identity = "expert-rust"
 description = "Domain expert scoped to rust theme"
-read_patterns  = ["rust/**", "**/rust/**"]
-write_patterns = []
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "rust/**", "**/rust/**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
 
 # ─── Sub-agent template: writers (coder agents, prompt-engineer, etc.) ──
 [[consumer-template]]
 id = "sub-agent-writer"
 description = "Writer sub-agent — writes only its own locus, reads briefings + own work"
-read_patterns = ["main-agent", "${PROJECT}/briefing", "${PROJECT}/${AGENT}"]
-write_patterns = ["${PROJECT}/${AGENT}"]
+read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "${PROJECT}/briefing", "${PROJECT}/${AGENT}"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "${PROJECT}/${AGENT}"]
 
 # ─── Sub-agent template: validators (tester, reviewer, expert-security) ─
 [[consumer-template]]
 id = "sub-agent-validator"
 description = "Validator sub-agent — cross-reads project for audit, writes own findings"
-read_patterns = ["main-agent", "${PROJECT}/*"]
-write_patterns = ["${PROJECT}/${AGENT}"]
+read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "${PROJECT}/*"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "${PROJECT}/${AGENT}"]
 
 # ─── Expert template (domain specialists, monitoring) ────────────────
 [[consumer-template]]
 id = "expert"
 description = "Thematic expert — reads main-agent + their theme scope, writes findings"
-read_patterns = ["main-agent", "${THEME}/*"]
-write_patterns = ["${THEME}/${AGENT}"]
+read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "${THEME}/*"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "${THEME}/${AGENT}"]
 
 # ─── Comments ──────────────────────────────────────────────────────────
 #

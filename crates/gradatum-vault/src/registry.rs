@@ -28,6 +28,7 @@ use gradatum_cache::{EffectiveNoteCache, EffectiveNoteCacheConfig};
 use gradatum_core::config::VaultConfig;
 use gradatum_core::error::GradatumError;
 use gradatum_core::paths::vault_dir_index_path;
+use gradatum_core::pii::{NoopDetector, PiiDetector, PrivacyBudgets};
 use gradatum_core::scope::VaultId;
 use gradatum_index::SqliteIndex;
 use gradatum_storage::{Storage, build_storage};
@@ -35,6 +36,7 @@ use gradatum_storage::{Storage, build_storage};
 use crate::note_write_guard::NoteWriteGuard;
 
 use crate::error::VaultError;
+use crate::privacy_observer::PrivacyObserver;
 
 /// Entry point for a Gradatum vault.
 ///
@@ -75,6 +77,24 @@ pub struct Vault {
     /// Atomic to allow incrementing from `&self` references in async handlers.
     /// Used in tests (`cache_hits()`) to verify cache behaviour.
     pub(crate) cache_hits: Arc<AtomicU64>,
+    /// Personal-data detector consulted at the single insertion point of
+    /// [`write_note_inner`](crate::lifecycle). Every constructor writes
+    /// [`NoopDetector`] literally — the strict pass-through — so a constructor that
+    /// forgot it would not compile: `Vault` derives no `Clone` and the field has no
+    /// implicit default.
+    pub(crate) detector: Arc<dyn PiiDetector>,
+    /// Budgets the detection pass reads its per-call [`Budget`] from. Written
+    /// literally as [`PrivacyBudgets::default`] by every constructor, for the same
+    /// reason as [`detector`](Self::detector).
+    pub(crate) budgets: PrivacyBudgets,
+    /// Sink each completed pass reports to, when the deployment installed one.
+    ///
+    /// Unlike [`detector`](Self::detector), this field has a meaningful absence: the
+    /// write path runs identically with and without it, and the only difference is
+    /// whether anything is counted. `None` is therefore the default and the ordinary
+    /// state of a deployment that reports through nothing — including every test in
+    /// this crate, which is why the constructors below leave it unset.
+    pub(crate) privacy_observer: Option<Arc<dyn PrivacyObserver>>,
 }
 
 impl Vault {
@@ -131,6 +151,9 @@ impl Vault {
             index: Arc::new(index),
             cache: Arc::new(cache),
             cache_hits: Arc::new(AtomicU64::new(0)),
+            detector: Arc::new(NoopDetector),
+            budgets: PrivacyBudgets::default(),
+            privacy_observer: None,
         })
     }
 
@@ -174,6 +197,9 @@ impl Vault {
             index: Arc::new(index),
             cache: Arc::new(cache),
             cache_hits: Arc::new(AtomicU64::new(0)),
+            detector: Arc::new(NoopDetector),
+            budgets: PrivacyBudgets::default(),
+            privacy_observer: None,
         })
     }
 
@@ -238,7 +264,52 @@ impl Vault {
             index,
             cache: Arc::new(cache),
             cache_hits: Arc::new(AtomicU64::new(0)),
+            detector: Arc::new(NoopDetector),
+            budgets: PrivacyBudgets::default(),
+            privacy_observer: None,
         })
+    }
+
+    /// Injects the personal-data detector and the budgets its pass runs under.
+    ///
+    /// This is the **only** injection path: the three constructors keep their
+    /// signature and mount [`NoopDetector`] with [`PrivacyBudgets::default`], so a
+    /// vault that was not built through this method never consults anything and
+    /// writes exactly what it wrote before the detection frontier existed. The
+    /// method consumes and returns `self`, so a vault is configured once, before it
+    /// is shared — there is no setter that could swap a detector under a live
+    /// writer.
+    ///
+    /// The budgets are read from the vault at each pass and never from the caller:
+    /// no request body can narrow the ceiling or the delay a pass is given.
+    ///
+    /// Consumers that must stay detector-free — the administrative CLI, for one —
+    /// simply never call it.
+    #[must_use]
+    pub fn with_detector(self, detector: Arc<dyn PiiDetector>, budgets: PrivacyBudgets) -> Self {
+        Self {
+            detector,
+            budgets,
+            ..self
+        }
+    }
+
+    /// Installs the sink every completed detection pass reports to.
+    ///
+    /// Separate from [`with_detector`](Self::with_detector) because the two answer
+    /// different questions: that one decides **whether** a pass runs, this one decides
+    /// **who hears about it**. A deployment can mount a detector and report through
+    /// nothing (a CLI, a test), and the write path is byte-identical either way — the
+    /// observer never influences a verdict, only counts it.
+    ///
+    /// Consumes and returns `self`, like the detector: a vault is configured once,
+    /// before it is shared, so no live writer can have the sink swapped under it.
+    #[must_use]
+    pub fn with_privacy_observer(self, observer: Arc<dyn PrivacyObserver>) -> Self {
+        Self {
+            privacy_observer: Some(observer),
+            ..self
+        }
     }
 
     /// Returns the vault root path.

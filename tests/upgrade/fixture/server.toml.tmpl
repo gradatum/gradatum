@@ -1,0 +1,79 @@
+# Gabarit de configuration rendu par tests/upgrade/gen-fixture.sh.
+#
+# AUCUNE CLÉ N'EST COMMITÉE ICI. Les deux jetons ci-dessous sont écrits par
+# `gradatum-admin init` dans <root>/config/server.toml (section [internal_api]) ;
+# le script les relit dans ce fichier fraîchement généré et les réinjecte aux
+# emplacements @@INTERNAL_TOKEN@@ / @@ADMIN_TOKEN@@. Le gabarit n'en porte donc
+# que les marqueurs, jamais une valeur.
+#
+# Les quatre ports sont dérivés de `--port N` (N, N+1, N+2, N+3), sondés libres
+# avant tout démarrage. Aucun port du parc LIVE n'est visé.
+#
+# Deux sections sont délibérément neutralisées pour que la génération soit
+# hors ligne et déterministe :
+#   [embed]   enabled = false  → NoopEmbedder, aucun appel à :8436
+#   [curator] backend = "heuristic" → classification heuristique pure, aucun
+#             appel à un point de conversation externe
+# Sans ces deux bascules, la fixture dépendrait de services du parc et son
+# contenu varierait d'une exécution à l'autre.
+
+[server]
+bind = "127.0.0.1:@@API_PORT@@"
+metrics_bind = "127.0.0.1:@@METRICS_PORT@@"
+
+[storage]
+root = "@@ROOT@@"
+vault_index_path = "@@ROOT@@/vault/.gradatum/index.db"
+
+[auth]
+# La clé de signature JWT n'est pas configurable : le serveur crée et relit
+# @@ROOT@@/config/jwt-signing-key.secret (mode 0600).
+jwt_ttl_human_secs = 3600
+jwt_ttl_service_secs = 86400
+revocation_store = "sqlite"
+revocation_db_path = "@@ROOT@@/db/revocation.sqlite"
+api_keys_db_path = "@@ROOT@@/db/api_keys.sqlite"
+
+[acl]
+preset_path = "@@ROOT@@/config/bearer.toml"
+
+[log]
+format = "json"
+
+[embed]
+# Neutralisé : la génération de la fixture ne joint aucun serveur d'embedding.
+enabled = false
+endpoint = "http://127.0.0.1:9/v1/embeddings"
+model = "bge-m3-Q8_0"
+dim = 1024
+timeout_ms = 5000
+
+[curator]
+# Mode heuristique : déterministe, hors ligne, sans appel de modèle.
+backend = "heuristic"
+llm_review_enabled = false
+heuristic_admit_threshold = 0.8
+confidence_threshold = 0.7
+llm_review_fallback = "pending-review-fallback"
+llm_review_max_tokens = 128
+
+[apalis.workers.curate]
+# Le corpus de la fixture est entièrement heuristique : la concurrence ne change
+# pas les comptes produits, seulement la durée de la génération.
+concurrency = 4
+timeout_secs = 300
+
+[apalis.metrics]
+enabled = false
+
+[apalis.health]
+bind = "127.0.0.1"
+port = @@HEALTH_PORT@@
+
+[internal_api]
+# API de boucle locale serveur↔travailleur. SANS cette section, le serveur
+# n'ouvre jamais son écouteur interne et toute la curation reste silencieusement
+# inerte (le /health public reste vert).
+bind = "127.0.0.1:@@INTERNAL_PORT@@"
+token = "@@INTERNAL_TOKEN@@"
+admin_token = "@@ADMIN_TOKEN@@"

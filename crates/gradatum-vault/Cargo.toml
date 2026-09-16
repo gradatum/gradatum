@@ -18,6 +18,7 @@ exclude = ["tests/**"]
 [dependencies]
 gradatum-core.workspace = true
 gradatum-markdown.workspace = true
+gradatum-privacy.workspace = true
 gradatum-cache.workspace = true
 gradatum-index.workspace = true
 gradatum-storage.workspace = true

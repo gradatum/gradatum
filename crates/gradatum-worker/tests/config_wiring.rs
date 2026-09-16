@@ -107,6 +107,7 @@ fn workers_registry(c: &WorkersConfig) -> Vec<Entry> {
         forget,
         distill,
         validate,
+        privacy_rescan,
     } = c;
     vec![
         entry(
@@ -156,6 +157,13 @@ fn workers_registry(c: &WorkersConfig) -> Vec<Entry> {
             validate,
             Wiring::Wired {
                 proof: "workers.validate",
+            },
+        ),
+        entry(
+            "privacy_rescan",
+            privacy_rescan,
+            Wiring::Wired {
+                proof: "workers.privacy_rescan",
             },
         ),
     ]

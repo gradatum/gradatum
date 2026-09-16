@@ -2796,6 +2796,170 @@ impl SqliteIndex {
         Ok((records, total as u64))
     }
 
+    /// Paginated metadata listing filtered by an **exact tag token**.
+    ///
+    /// Identical to [`Self::list_notes`] (same `ORDER BY id ASC`, same keyset cursor, same
+    /// `downgraded` and sentinel exclusions, same `limit` clamp to `[1, 200]`) with one
+    /// mandatory filter: the returned notes carry `tag` as a whole token of their
+    /// space-separated `tags` column.
+    ///
+    /// ## Exact token, matched in SQL before the `LIMIT`
+    ///
+    /// The `tags` column stores tokens space-joined (`upsert_note` writes `tags.join(" ")`),
+    /// so the predicate wraps the column in spaces and matches `'% <tag> %'`: a whole token,
+    /// never a substring. `personal-classified-2026` cannot answer a `personal-classified`
+    /// query, in either direction. The match is a `WHERE` clause applied **before** the
+    /// `LIMIT`, so the keyset window returns `limit` matching rows — or fewer only at the
+    /// true end of the matching rows — and a caller's `page_full` test keeps its meaning: a
+    /// sparsely-tagged corpus paginates in full pages instead of ending early on a short one.
+    ///
+    /// `tag` is bound, and `parse_tag_query` — the sole caller-side validator of a query
+    /// value — already rejects the `LIKE` metacharacters `% _ \`, so no wildcard can reach
+    /// the pattern. The Rust exact-token filter is kept below as a redundant guard against a
+    /// malformed column value, never as the load-bearing match.
+    ///
+    /// ## `total`
+    ///
+    /// The second element is the number of rows **matching in the returned page**, not a
+    /// vault-wide count of matching notes: counting those exactly would require a full scan
+    /// under the connection mutex. The value is therefore page-scoped, and it never
+    /// over-counts — it is the page's own cardinality, which a caller can compare against
+    /// `records.len()` without learning anything about rows it was not given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradatumError::Storage`] if the SQLite query fails.
+    pub async fn list_notes_by_tag(
+        &self,
+        vault_id: &str,
+        section: Option<&str>,
+        tag: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        let conn = self.conn.lock().await;
+        let limit_clamped = limit.clamp(1, 200) as i64;
+        let cursor_val = cursor.unwrap_or("");
+
+        // Même keyset ULID, mêmes exclusions sentinelle/`downgraded` et mêmes colonnes que
+        // `list_notes`. Le filtre par jeton est un prédicat SQL appliqué AVANT le `LIMIT` : la
+        // colonne `tags` est une liste séparée par des espaces (`upsert_note` écrit
+        // `tags.join(" ")`), donc l'entourer d'espaces et apparier `'% <tag> %'` teste un
+        // jeton ENTIER, jamais une sous-chaîne. `tag` est bindé et `parse_tag_query` rejette
+        // déjà `% _ \` en amont, donc aucun joker n'atteint le motif. Sans sur-fetch : une
+        // page ne raccourcit qu'à la fin réelle des lignes appariées, jamais parce que la
+        // fenêtre était saturée de lignes non taguées.
+        let window: Vec<NoteRecord> = match section {
+            Some(sec) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, vault_id, section, status, body_text,
+                                COALESCE(author_display_name, author_id) AS author,
+                                tags, content_hash, created, updated, title, locus
+                         FROM notes
+                         WHERE vault_id = ?1
+                           AND section = ?4
+                           AND id NOT LIKE '__sentinel__%'
+                           AND status != 'downgraded'
+                           AND (?2 = '' OR id > ?2)
+                           AND (' ' || COALESCE(tags, '') || ' ') LIKE '% ' || ?5 || ' %'
+                         ORDER BY id ASC
+                         LIMIT ?3",
+                    )
+                    .map_err(|e| {
+                        GradatumError::Storage(format!("list_notes_by_tag prepare (section): {e}"))
+                    })?;
+
+                stmt.query_map(
+                    rusqlite::params![vault_id, cursor_val, limit_clamped, sec, tag],
+                    |row| {
+                        Ok(NoteRecord {
+                            id: row.get(0)?,
+                            vault_id: row.get(1)?,
+                            section: row.get(2)?,
+                            status: row.get(3)?,
+                            body_text: row.get(4)?,
+                            author: row.get(5)?,
+                            tags_raw: row.get(6)?,
+                            content_hash: row.get::<_, Vec<u8>>(7)?,
+                            created: row.get(8)?,
+                            updated: row.get(9)?,
+                            title: row.get(10)?,
+                            locus: row.get(11)?,
+                        })
+                    },
+                )
+                .map_err(|e| {
+                    GradatumError::Storage(format!("query list_notes_by_tag (section): {e}"))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| {
+                    GradatumError::Storage(format!("collect list_notes_by_tag (section): {e}"))
+                })?
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, vault_id, section, status, body_text,
+                                COALESCE(author_display_name, author_id) AS author,
+                                tags, content_hash, created, updated, title, locus
+                         FROM notes
+                         WHERE vault_id = ?1
+                           AND id NOT LIKE '__sentinel__%'
+                           AND status != 'downgraded'
+                           AND (?2 = '' OR id > ?2)
+                           AND (' ' || COALESCE(tags, '') || ' ') LIKE '% ' || ?4 || ' %'
+                         ORDER BY id ASC
+                         LIMIT ?3",
+                    )
+                    .map_err(|e| {
+                        GradatumError::Storage(format!("list_notes_by_tag prepare: {e}"))
+                    })?;
+
+                stmt.query_map(
+                    rusqlite::params![vault_id, cursor_val, limit_clamped, tag],
+                    |row| {
+                        Ok(NoteRecord {
+                            id: row.get(0)?,
+                            vault_id: row.get(1)?,
+                            section: row.get(2)?,
+                            status: row.get(3)?,
+                            body_text: row.get(4)?,
+                            author: row.get(5)?,
+                            tags_raw: row.get(6)?,
+                            content_hash: row.get::<_, Vec<u8>>(7)?,
+                            created: row.get(8)?,
+                            updated: row.get(9)?,
+                            title: row.get(10)?,
+                            locus: row.get(11)?,
+                        })
+                    },
+                )
+                .map_err(|e| GradatumError::Storage(format!("query list_notes_by_tag: {e}")))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| GradatumError::Storage(format!("collect list_notes_by_tag: {e}")))?
+            }
+        };
+
+        // Garde redondante : le prédicat SQL ci-dessus a déjà apparié un jeton entier, donc
+        // `window` ne contient que des lignes appariées et bornées à `limit`. Ce filtre les
+        // re-teste en Rust — `split_whitespace` par jeton exact — pour qu'une colonne `tags`
+        // qui aurait un jour une valeur malformée ne laisse pas passer une correspondance
+        // partielle. Il n'est jamais porteur : en marche nominale il ne retire rien.
+        let records: Vec<NoteRecord> = window
+            .into_iter()
+            .filter(|r| {
+                r.tags_raw
+                    .as_deref()
+                    .is_some_and(|raw| raw.split_whitespace().any(|token| token == tag))
+            })
+            .collect();
+
+        // Compte de PAGE, jamais un compte de vault : voir la doc ci-dessus.
+        let total = records.len() as u64;
+        Ok((records, total))
+    }
+
     /// Atomically allocates the next feature number for `vault_id`.
     ///
     /// Returns `floor + 1` where `floor = max(persistent_counter, max_derived_from_cards)`,
@@ -9941,6 +10105,79 @@ mod vault_list_tests {
             "les {N} allocations doivent couvrir 135..=154 sans trou ni doublon"
         );
     }
+
+    /// Invariant F-296 (Step 0) : `allocate_feature_number` rend TOUJOURS un numéro strictement
+    /// supérieur au compteur persistant, quelle que soit la valeur dérivée des cartes — dérivé nul,
+    /// dérivé < compteur, dérivé > compteur.
+    ///
+    /// C'est la graine `floor = counter.max(derived)` : abaisser le max dérivé d'UNE carte est sans
+    /// effet tant que le compteur (ou une autre carte) tient le plancher ; seul l'abaissement du
+    /// maximum GLOBAL sous le compteur compterait, et même alors le compteur borne par le bas. Cet
+    /// invariant est ce qui rend sûre la bascule de `max_feature_number` sur l'extraction
+    /// structurelle (F-296) : une carte qui ne cite un `[[feature:]]` qu'en prose cesse de compter
+    /// dans le dérivé, mais ne peut jamais faire reculer l'allocation sous le compteur — un numéro
+    /// ≤ compteur rouvrirait la collision silencieuse que le plancher ferme.
+    #[tokio::test]
+    async fn allocate_feature_number_never_returns_at_or_below_counter() {
+        async fn counter_of(idx: &SqliteIndex) -> i64 {
+            let conn = idx.conn.lock().await;
+            conn.query_row(
+                "SELECT value FROM feature_counter WHERE vault_id = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .unwrap_or(0)
+        }
+
+        let idx = SqliteIndex::open_in_memory().await.unwrap();
+
+        // Cas dérivé nul : aucune carte project-map, compteur à 0.
+        let before = counter_of(&idx).await;
+        let got = idx.allocate_feature_number("main").await.unwrap();
+        assert!(
+            i64::from(got) > before,
+            "dérivé nul : {got} doit être > compteur {before}"
+        );
+
+        // Cas dérivé < compteur : une petite carte (F-2), compteur monté bien au-dessus.
+        idx.seed_note(
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "project-map",
+            "[[feature:F-2]] [[project:gradatum]]",
+        )
+        .await
+        .unwrap();
+        for _ in 0..5 {
+            idx.allocate_feature_number("main").await.unwrap();
+        }
+        let before = counter_of(&idx).await; // compteur ≫ dérivé (2)
+        let got = idx.allocate_feature_number("main").await.unwrap();
+        assert!(
+            i64::from(got) > before,
+            "dérivé < compteur : {got} doit être > compteur {before}"
+        );
+
+        // Cas dérivé > compteur : carte hors-allocateur (F-500) bien au-dessus du compteur.
+        idx.seed_note(
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+            "project-map",
+            "[[feature:F-500]] [[project:gradatum]]",
+        )
+        .await
+        .unwrap();
+        let before = counter_of(&idx).await;
+        let got = idx.allocate_feature_number("main").await.unwrap();
+        assert!(
+            i64::from(got) > before,
+            "dérivé > compteur : {got} doit être > compteur {before}"
+        );
+        assert!(
+            got > 500,
+            "dérivé > compteur : {got} doit plancher au-dessus de la carte F-500"
+        );
+    }
 }
 
 // ── Tests list_messaging_notes (F-144, C1/C2) ────────────────────────────────
@@ -15363,6 +15600,335 @@ mod upsert_transaction_atomicity_tests {
         assert_eq!(
             body, "delta echo foxtrot",
             "notes doit porter la v2 après retry"
+        );
+    }
+}
+
+// ── F-160 — `list_notes_by_tag` : le filtre `tag` de `vault_list` (L-D.1) ─────
+
+#[cfg(test)]
+mod list_notes_by_tag_tests {
+    use super::*;
+    use chrono::Utc;
+    use gradatum_core::frontmatter::{ExtraFields, Frontmatter};
+    use gradatum_core::identity::{ContentHash, NoteId, NoteVersion};
+    use gradatum_core::index_store::IndexStore;
+    use gradatum_core::note::{Note, NoteBody};
+    use gradatum_core::scope::VaultId;
+    use gradatum_core::section::Section;
+    use gradatum_core::status::NoteStatus;
+    use gradatum_core::tag::{ReservedTag, Tag};
+
+    /// The verdict tag, through its one sanctioned pose path.
+    ///
+    /// `Tag::new("personal-classified")` is refused by design (D-12), so a fixture cannot
+    /// spell it: a note carrying the verdict is a note some pass marked, and
+    /// `Tag::from(ReservedTag::…)` is the only door left open on it.
+    fn classified() -> Tag {
+        Tag::from(ReservedTag::PERSONAL_CLASSIFIED)
+    }
+
+    /// The operational marker the deferred sweep selects on, through its one sanctioned pose
+    /// path — `Tag::new("privacy-unscanned")` is refused by design (D-12).
+    fn unscanned() -> Tag {
+        Tag::from(ReservedTag::PRIVACY_UNSCANNED)
+    }
+
+    /// A tag of the ordinary form.
+    fn ordinary(literal: &str) -> Tag {
+        Tag::new(literal).expect("a tag of the ordinary form")
+    }
+
+    /// A note of `section` carrying `tags`, with a ULID **derived** from `id_key`.
+    ///
+    /// Derived, never literal: `upsert_note` stores `note.id.to_string()`, which
+    /// round-trips through the `ulid` crate, so an arbitrary string cannot be imposed as an
+    /// identifier. Deriving also makes the identifier a pure function of the key — which is
+    /// what [`ordered_pairs`] leans on.
+    fn note_with_tags(id_key: &str, section: Section, tags: &[Tag]) -> Note {
+        let frontmatter = Frontmatter {
+            schema_version: 1,
+            vault_id: VaultId::new("main"),
+            locus: None,
+            section,
+            status: NoteStatus::Live,
+            status_reason: None,
+            status_changed: None,
+            tags: tags.iter().cloned().collect(),
+            author: None,
+            created: Utc::now(),
+            updated: None,
+            extra: ExtraFields::empty(),
+            provenance: None,
+            forgotten: None,
+            forgotten_at: None,
+            forgotten_by: None,
+        };
+        let body = NoteBody {
+            markdown: format!("body of {id_key}"),
+        };
+        let content_hash = ContentHash::compute(&frontmatter, &body.markdown);
+        Note {
+            id: NoteId::derived_from(id_key.as_bytes()),
+            frontmatter,
+            body,
+            version: NoteVersion::initial(),
+            content_hash,
+            integrity_signature: None,
+        }
+    }
+
+    /// `(id, key)` for every key, sorted in the lexicographic order `ORDER BY id ASC` uses.
+    ///
+    /// `NoteId::derived_from` is a pure function of the key, so the corpus order is known
+    /// *before* a single row is written. That is what lets a test decide which notes carry
+    /// the tag, instead of hoping the hash placed them where the assertion needs them.
+    fn ordered_pairs(keys: &[String]) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = keys
+            .iter()
+            .map(|key| {
+                (
+                    NoteId::derived_from(key.as_bytes()).to_string(),
+                    key.clone(),
+                )
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// The filter matches a whole token of the space-separated `tags` column, never a
+    /// substring of one.
+    ///
+    /// `personal-classified-2026` is a different tag, on a different note. A
+    /// `LIKE '%personal-classified%'` predicate would answer with both notes; the two must
+    /// not be interchangeable in either direction.
+    #[tokio::test]
+    async fn list_notes_by_tag_matches_exact_token_only() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+
+        let verdict = note_with_tags(
+            "f160-tag-exact-verdict",
+            Section::Reference,
+            &[classified()],
+        );
+        let lookalike = note_with_tags(
+            "f160-tag-exact-lookalike",
+            Section::Reference,
+            &[ordinary("personal-classified-2026")],
+        );
+        let unrelated = note_with_tags(
+            "f160-tag-exact-unrelated",
+            Section::Reference,
+            &[ordinary("ordinary-tag")],
+        );
+        for note in [&verdict, &lookalike, &unrelated] {
+            idx.upsert_note(note).await.expect("upsert_note");
+        }
+
+        let verdict_id = verdict.id.to_string();
+        let lookalike_id = lookalike.id.to_string();
+
+        let (records, total) = idx
+            .list_notes_by_tag("main", None, "personal-classified", 50, None)
+            .await
+            .expect("list_notes_by_tag");
+        assert_eq!(
+            records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![verdict_id.as_str()],
+            "exactly the note carrying the whole token — not the lookalike"
+        );
+        assert_eq!(total, 1, "the count is the page's own cardinality");
+
+        // The other direction: the lookalike is reachable by its own name, and only so.
+        let (records, _) = idx
+            .list_notes_by_tag("main", None, "personal-classified-2026", 50, None)
+            .await
+            .expect("list_notes_by_tag");
+        assert_eq!(
+            records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![lookalike_id.as_str()],
+            "the lookalike is a tag of its own, matched whole"
+        );
+
+        // Anti-vacuity: the corpus really does hold three notes, so the single-row answers
+        // above are a filter at work and not an index that lost two rows.
+        let (all, total_all) = idx
+            .list_notes("main", None, 50, None)
+            .await
+            .expect("list_notes");
+        assert_eq!(all.len(), 3, "the unfiltered listing sees the whole corpus");
+        assert_eq!(total_all, 3);
+    }
+
+    /// The trait override is traversed, not the default.
+    ///
+    /// `IndexStore::list_notes_by_tag` carries a default that returns `Ok((vec![], 0))`
+    /// (the `list_notes_filtered` pattern), and a call on the *inherent* method would never
+    /// reveal it — the inherent one wins. This test therefore calls through the **trait**
+    /// and requires rows: a store that quietly inherited the default would answer with an
+    /// empty page here, and the tag filter would be a filter that always finds nothing.
+    #[tokio::test]
+    async fn sqlite_index_overrides_list_notes_by_tag_and_returns_rows() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let tagged = note_with_tags(
+            "f160-tag-trait-tagged",
+            Section::Reference,
+            &[ordinary("rescan-me")],
+        );
+        let bare = note_with_tags(
+            "f160-tag-trait-bare",
+            Section::Reference,
+            &[ordinary("ordinary-tag")],
+        );
+        for note in [&tagged, &bare] {
+            idx.upsert_note(note).await.expect("upsert_note");
+        }
+        let tagged_id = tagged.id.to_string();
+        let bare_id = bare.id.to_string();
+
+        let (records, total) = <SqliteIndex as IndexStore>::list_notes_by_tag(
+            &idx,
+            "main",
+            None,
+            "rescan-me",
+            50,
+            None,
+        )
+        .await
+        .expect("list_notes_by_tag (trait)");
+
+        assert_eq!(
+            records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![tagged_id.as_str()],
+            "the trait method reaches the SQLite implementation"
+        );
+        assert_eq!(total, 1);
+        assert!(
+            !records.iter().any(|r| r.id == bare_id),
+            "the untagged note stays out"
+        );
+    }
+
+    /// A sparse tag fills each page up to `limit` and paginates in full — matches behind the
+    /// window are never lost.
+    ///
+    /// The match is a SQL predicate applied **before** the `LIMIT`, so a page ends short only
+    /// at the true end of the matching rows, never because the window happened to be
+    /// saturated by untagged notes. The corpus places seven matches at dispersed ranks over a
+    /// sixty-note store; the first matches lie past rank 20 (the old code's raw over-fetch
+    /// window for `limit = 5`), so a window-then-filter implementation would return a short
+    /// first page and drop the rest.
+    #[tokio::test]
+    async fn sparse_matches_fill_the_page_up_to_the_limit() {
+        const TOTAL: usize = 60;
+        // Ranks (in `ORDER BY id ASC`) that carry the tag, dispersed and mostly past rank 20.
+        let tagged_ranks = [3usize, 12, 25, 38, 44, 51, 58];
+
+        let keys: Vec<String> = (0..TOTAL)
+            .map(|i| format!("f160-tag-sparse-{i:02}"))
+            .collect();
+        let ordered = ordered_pairs(&keys);
+
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let mut matching_ids: Vec<String> = Vec::new();
+        for (rank, (id, key)) in ordered.iter().enumerate() {
+            let tags = if tagged_ranks.contains(&rank) {
+                matching_ids.push(id.clone());
+                vec![ordinary("sparse-tag")]
+            } else {
+                vec![ordinary("noise-tag")]
+            };
+            idx.upsert_note(&note_with_tags(key, Section::Reference, &tags))
+                .await
+                .expect("upsert_note");
+        }
+        assert_eq!(
+            matching_ids.len(),
+            tagged_ranks.len(),
+            "the fixture must place every match"
+        );
+
+        // Page one: five full matches, the smallest identifiers among the seven.
+        let (page1, total1) = idx
+            .list_notes_by_tag("main", None, "sparse-tag", 5, None)
+            .await
+            .expect("list_notes_by_tag page 1");
+        assert_eq!(
+            page1.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            matching_ids[..5].to_vec(),
+            "the first page is full — five matches even though they sit behind untagged rows"
+        );
+        assert_eq!(total1, 5, "the count is the page's own cardinality");
+
+        // Page two: the remaining two, keyed past the last identifier of page one.
+        let cursor = page1.last().expect("a non-empty first page").id.clone();
+        let (page2, total2) = idx
+            .list_notes_by_tag("main", None, "sparse-tag", 5, Some(&cursor))
+            .await
+            .expect("list_notes_by_tag page 2");
+        assert_eq!(
+            page2.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            matching_ids[5..].to_vec(),
+            "the second page carries exactly the matches behind the first page's cursor"
+        );
+        assert_eq!(
+            total2, 2,
+            "a short final page is the true end of the matches"
+        );
+    }
+
+    /// The sweep's cursor-less selection reaches matches dispersed past the window, and a
+    /// replay re-derives the identical page.
+    ///
+    /// This is the selection shape the deferred rescan uses: `list_notes_by_tag(v, None,
+    /// "privacy-unscanned", limit, None)`, re-run each tick with no cursor. A note marked
+    /// unscanned sitting behind more than `limit` smaller-identifier notes must still be
+    /// selected, and two consecutive selections on an unchanged store must be byte-for-byte
+    /// the same — otherwise a tick could see a note the previous tick could not.
+    #[tokio::test]
+    async fn rescan_style_selection_reaches_dispersed_matches_and_is_repeatable() {
+        const TOTAL: usize = 40;
+        let unscanned_ranks = [30usize, 35];
+
+        let keys: Vec<String> = (0..TOTAL)
+            .map(|i| format!("f160-tag-rescan-{i:02}"))
+            .collect();
+        let ordered = ordered_pairs(&keys);
+
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let mut unscanned_ids: Vec<String> = Vec::new();
+        for (rank, (id, key)) in ordered.iter().enumerate() {
+            let tags = if unscanned_ranks.contains(&rank) {
+                unscanned_ids.push(id.clone());
+                vec![unscanned()]
+            } else {
+                vec![ordinary("noise-tag")]
+            };
+            idx.upsert_note(&note_with_tags(key, Section::Reference, &tags))
+                .await
+                .expect("upsert_note");
+        }
+        assert_eq!(unscanned_ids.len(), unscanned_ranks.len());
+
+        let (first, _) = idx
+            .list_notes_by_tag("main", None, "privacy-unscanned", 5, None)
+            .await
+            .expect("list_notes_by_tag (rescan pass 1)");
+        assert_eq!(
+            first.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            unscanned_ids,
+            "the cursor-less selection reaches the marked notes behind the window"
+        );
+
+        let (second, _) = idx
+            .list_notes_by_tag("main", None, "privacy-unscanned", 5, None)
+            .await
+            .expect("list_notes_by_tag (rescan pass 2)");
+        assert_eq!(
+            second.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            first.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            "a replayed selection on an unchanged store is identical"
         );
     }
 }

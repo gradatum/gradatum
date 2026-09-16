@@ -37,6 +37,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use gradatum_core::error::GradatumError;
+use gradatum_core::trust::TrustContext;
 use gradatum_dto::{ContextMode, VaultContextRequest};
 use gradatum_search::{ResolvedWeights, ScoringWeightsWire, resolve_weights};
 use ulid::Ulid;
@@ -79,17 +80,27 @@ use crate::state::AppState;
 ///
 /// # Identity guard
 ///
-/// `identity_privileged` est résolu en amont (`vault_context_impl`, accès à `trust`)
-/// via `crate::api_v1::logic::is_identity_privileged`. Quand il vaut `false`, les
-/// notes de section `identity` (âmes d'agents) sont exclues des candidats AVANT toute
+/// `identity_privileged` est résolu ICI, depuis `trust`, via
+/// `crate::api_v1::logic::is_identity_privileged`. Quand il vaut `false`, les notes de
+/// section `identity` (âmes d'agents) sont exclues des candidats AVANT toute
 /// hydratation de corps — parité avec le guard `vault_search_impl` (surface RAG
 /// générique, exclusion simple sans matching par-agent).
+///
+/// # D-14(b) guard — `personal-classified`
+///
+/// The assembled context is a **generic** RAG surface: the body of a marked note
+/// would enter `assembled_text` and its ULID/title would enter `included`/`references`
+/// (P1-2 of review 7b). The predicate is the one of
+/// `PrivacyReadGuard` — never re-written here —, applied to the
+/// **candidates**, before `candidates_considered`: that counter is itself rendered in
+/// `diagnostics` and would otherwise reveal the retained cardinality.
 pub async fn assemble_context(
     state: &AppState,
     tenant: &str,
     req: &VaultContextRequest,
-    identity_privileged: bool,
+    trust: &TrustContext,
 ) -> Result<VaultContextResponse, GradatumError> {
+    let identity_privileged = crate::api_v1::logic::is_identity_privileged(trust);
     let start = Instant::now();
     // Label statique : les valeurs sont des string literals 'static (cardinalité bornée).
     let mode: &'static str = match req.mode {
@@ -100,12 +111,14 @@ pub async fn assemble_context(
 
     // Dispatch vers l'assembleur approprié.
     let result = match req.mode {
-        ContextMode::Raw => assemble_raw(state, tenant, req, identity_privileged).await,
+        ContextMode::Raw => assemble_raw(state, tenant, req, identity_privileged, trust).await,
         // Task 7 : pipeline complet (retrieval RRF → scoring composite → rendu structuré).
-        ContextMode::Assembled => assemble_assembled(state, tenant, req, identity_privileged).await,
+        ContextMode::Assembled => {
+            assemble_assembled(state, tenant, req, identity_privileged, trust).await
+        }
         // Task 8 : vue foldée F-30 (reset cache, top-K inline, reste en stubs).
         ContextMode::Compact => {
-            compact::assemble_compact(state, tenant, req, identity_privileged).await
+            compact::assemble_compact(state, tenant, req, identity_privileged, trust).await
         }
     };
 
@@ -144,6 +157,33 @@ pub async fn assemble_context(
     result
 }
 
+/// Candidats à retirer d'un assemblage de contexte — D-14(b), prédicat **partagé**.
+///
+/// Réutilise [`crate::api_v1::logic::PrivacyReadGuard`] tel quel : même évaluation ACL
+/// (`Read` sur `{vault}/personal-classified`), même mémoïsation par vault, même
+/// fail-closed (une lecture de tags en échec **propage** au lieu de rendre un contexte
+/// qu'on ne peut pas cautionner). Ne duplique aucun prédicat.
+///
+/// `vault` est le vault **du résultat** : `vault_context` est une surface own-vault, donc
+/// le vault propre du tenant — celui-là même qu'interroge le retrieval.
+///
+/// Court-circuite sans I/O quand le consommateur est habilité (`hidden_ids` → `allows`),
+/// donc le coût pour `admin`/`studio` est nul.
+///
+/// # Errors
+///
+/// Propage l'échec de la lecture batch des tags (fail-closed).
+async fn hidden_candidates(
+    state: &AppState,
+    trust: &TrustContext,
+    tenant: &str,
+    ids: &[String],
+) -> Result<std::collections::HashSet<String>, GradatumError> {
+    let vault = crate::api_v1::tenant_guard::own_vault_checked(tenant);
+    let mut guard = crate::api_v1::logic::PrivacyReadGuard::new();
+    guard.hidden_ids(state, trust, vault.as_str(), ids).await
+}
+
 /// Assemblage brut — parité bit-pour-bit avec le handler legacy `vault_context_impl` v0.6.x.
 ///
 /// ## Algorithme (fidèle à `logic.rs:1010-1093`)
@@ -179,6 +219,7 @@ async fn assemble_raw(
     tenant: &str,
     req: &VaultContextRequest,
     identity_privileged: bool,
+    trust: &TrustContext,
 ) -> Result<VaultContextResponse, GradatumError> {
     let max_tokens = req.max_tokens.unwrap_or(2000).clamp(1, 8000) as usize;
 
@@ -238,6 +279,16 @@ async fn assemble_raw(
             Err(e) => return Err(e),
         }
     };
+
+    // ── Guard D-14(b) — exclusion des candidats marqués, AVANT toute hydratation ──
+    // Le retrait précède `candidates_considered` : ce compteur est rendu dans les
+    // diagnostics et sa valeur trahirait la cardinalité retenue. Il précède aussi le
+    // `get_note` qui suit — le corps d'une note marquée n'est jamais lu.
+    let hidden = hidden_candidates(state, trust, tenant, &top_note_ids).await?;
+    let top_note_ids: Vec<String> = top_note_ids
+        .into_iter()
+        .filter(|id| !hidden.contains(id))
+        .collect();
 
     let candidates_considered = top_note_ids.len() as u32;
 
@@ -386,6 +437,7 @@ async fn assemble_assembled(
     tenant: &str,
     req: &VaultContextRequest,
     identity_privileged: bool,
+    trust: &TrustContext,
 ) -> Result<VaultContextResponse, GradatumError> {
     // ── P2-2 : validation session_id (ULID, format strict) ──────────────────
     //
@@ -428,7 +480,7 @@ async fn assemble_assembled(
     };
 
     // Retrieval RRF — embed_fallback et candidates_considered reflètent le vrai état.
-    let outcome = retrieval::retrieve_candidates(
+    let mut outcome = retrieval::retrieve_candidates(
         state,
         &vault_id,
         &req.query,
@@ -437,6 +489,19 @@ async fn assemble_assembled(
         state.context.embed_timeout_ms,
     )
     .await?;
+
+    // ── Guard D-14(b) — candidats marqués retirés AVANT la sélection ──────────
+    // Filtre sur les candidats eux-mêmes (et non sur `selected`/`stubs` en aval) : le
+    // compte ci-dessous, le scoring, la sélection et l'invariant
+    // `inline + stub + dropped == candidates_considered` restent cohérents sans
+    // traitement particulier, et aucun corps n'est hydraté pour une note retirée.
+    let ids: Vec<String> = outcome
+        .candidates
+        .iter()
+        .map(|c| c.note_id.clone())
+        .collect();
+    let hidden = hidden_candidates(state, trust, tenant, &ids).await?;
+    outcome.candidates.retain(|c| !hidden.contains(&c.note_id));
 
     let candidates_considered = outcome.candidates.len() as u32;
     let embed_fallback = outcome.embed_fallback;

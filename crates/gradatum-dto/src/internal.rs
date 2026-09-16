@@ -350,3 +350,66 @@ pub struct EmbeddingOkResponse {
     /// Dimension of the stored vector.
     pub dim: usize,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Privacy rescan (F-160 L-D.2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Request body for `POST /internal/v1/privacy/rescan` — one batch of a deferred sweep.
+///
+/// A **quota**, never a payload: the vault to sweep and the number of notes one
+/// execution may re-judge. The selection itself is derived from the index at execution
+/// time by the *server*, which owns the vault handles, so a replayed job carries no
+/// state and no note content crosses this route.
+///
+/// `#[non_exhaustive]` **and** a constructor: the two together are what keep a later
+/// field (a batch cursor, a deadline) from being a breaking change for the worker that
+/// builds this value, without letting an outside crate fabricate the shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PrivacyRescanRequest {
+    /// Vault whose unscanned notes are re-judged. Named in the body, not read from any
+    /// ambient scope: the sweep is per-tenant by construction.
+    pub vault_id: String,
+    /// Upper bound on the notes this execution may re-judge.
+    pub limit: usize,
+}
+
+impl PrivacyRescanRequest {
+    /// Builds a [`PrivacyRescanRequest`] from its two fields.
+    #[must_use]
+    pub fn new(vault_id: impl Into<String>, limit: usize) -> Self {
+        Self {
+            vault_id: vault_id.into(),
+            limit,
+        }
+    }
+}
+
+/// Response of `POST /internal/v1/privacy/rescan` — what the batch did.
+///
+/// The three counts are the three outcomes of one re-judgement, in the vocabulary the
+/// vault's primitive defines. They are counts of **notes**, never of data: no body, no
+/// span and no detector label can be rendered from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PrivacyRescanResponse {
+    /// Notes re-judged to something other than what they carried, and written.
+    pub rewritten: usize,
+    /// Notes re-judged to exactly what they carried: nothing was written.
+    pub unchanged: usize,
+    /// Notes no pass ran for — excluded by the guard, or no longer there.
+    pub skipped: usize,
+}
+
+impl PrivacyRescanResponse {
+    /// Builds a [`PrivacyRescanResponse`] from the three counts of one batch.
+    #[must_use]
+    pub fn new(rewritten: usize, unchanged: usize, skipped: usize) -> Self {
+        Self {
+            rewritten,
+            unchanged,
+            skipped,
+        }
+    }
+}

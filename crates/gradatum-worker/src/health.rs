@@ -54,7 +54,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::{Json, Router, extract::State, routing::get};
 use chrono::{DateTime, Utc};
 use gradatum_core::QueueStore;
-use gradatum_core::job::{JobFilter, JobOrder, JobStatus};
+use gradatum_core::job::{JOB_KIND_MESSAGE, JobFilter, JobOrder, JobStatus, job_kind_str};
 use gradatum_dto::{CapabilityReport, CapabilityState, HealthReport, HealthStatus, LivenessReport};
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +79,13 @@ const QUEUE_AGE_DEGRADED_SECS: u64 = 300;
 /// avoids flapping during active triage yet surfaces a forgotten job within a day (mirrors
 /// the server's `DLQ_MAX_AGE_SECS`).
 const DLQ_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Page size for the bounded message-delivery scans (mirrors the server's `QUEUE_SCAN_PAGE`).
+const QUEUE_SCAN_PAGE: usize = 200;
+
+/// Maximum pages a message-delivery scan reads before treating its result as a lower bound
+/// (mirrors the server's `QUEUE_SCAN_MAX_PAGES`) — a hard cap against an unbounded scan.
+const QUEUE_SCAN_MAX_PAGES: usize = 25;
 
 /// Seconds without a consumed job, **while jobs are pending**, past which the `consumption`
 /// capability flips to `unreachable` (consumer frozen although its lease keeps renewing).
@@ -440,19 +447,13 @@ pub async fn probe_once(deps: &ProbeDeps) -> HealthReport {
         probe_leadership(&deps.store, now_ms),
     );
 
-    // Queue depth + DLQ depth from a single GROUP BY status (no N+1); absent status ⇒ 0.
-    let status_counts = deps
-        .store
-        .count_jobs_by_status(None)
-        .await
-        .unwrap_or_default();
-    let queue_depth: u64 = status_counts.get(&JobStatus::Pending).copied().unwrap_or(0);
-    let dlq_depth: u64 = status_counts.get(&JobStatus::DLQ).copied().unwrap_or(0);
-
-    let dlq_by_kind = deps.store.dlq_counts_by_kind().await.unwrap_or_default();
-
-    let queue_oldest_age_secs = oldest_age_secs(&deps.store, JobStatus::Pending).await;
-    let dlq_oldest_age_secs = oldest_age_secs(&deps.store, JobStatus::DLQ).await;
+    // Queue/DLQ figures with message deliveries set apart (F-299 — parity with the server):
+    // a `Job::Message` awaiting acknowledgement is mailbox state, not queued work, so it must
+    // not degrade the worker. `mailbox_pending` is published apart, exactly as the server does.
+    let figures = queue_figures(&deps.store, Utc::now()).await;
+    let queue_depth = figures.depth;
+    let queue_oldest_age_secs = figures.queue_oldest_age_secs;
+    let dlq_oldest_age_secs = figures.dlq_oldest_age_secs;
 
     // Consumption signal + per-kind failure verdict from in-process metrics.
     let consumption_cap = derive_consumption(
@@ -497,30 +498,208 @@ pub async fn probe_once(deps: &ProbeDeps) -> HealthReport {
         .with_build_sha(Some(deps.build_sha.clone()))
         .with_uptime_secs(uptime_secs)
         .with_queue(queue_depth, queue_oldest_age_secs)
-        .with_dlq(dlq_depth, dlq_oldest_age_secs, dlq_by_kind)
+        .with_mailbox_pending(figures.mailbox_pending)
+        .with_dlq(figures.dlq_depth, dlq_oldest_age_secs, figures.dlq_by_kind)
         .with_started_at(Some(started_at))
         .with_capabilities(capabilities)
 }
 
-/// Age in seconds of the oldest job in `status`, from `lifecycle.created_at` via
-/// `list(order=CreatedAsc, limit=1)` (ULID monotone ≡ creation order). `0` if none/error.
-async fn oldest_age_secs(store: &Arc<dyn QueueStore + Send + Sync>, status: JobStatus) -> u64 {
-    let filter = JobFilter {
-        status: Some(status),
-        order: JobOrder::CreatedAsc,
-        limit: 1,
-        ..JobFilter::default()
+/// Queue figures published by the worker `/health`, message deliveries set apart.
+///
+/// Mirrors the server's aggregation (`gradatum-server::health`): a `Job::Message` row is
+/// state-carrying — it stays `Pending` until its recipient acknowledges it and no worker
+/// leases it — so counting it as queued work would flip `/health` to `degraded` for a full
+/// mailbox, a signal about the recipient rather than the queue. The worker keeps a private
+/// copy of this logic (no shared crate in this lot); a parity test guards against drift.
+struct QueueFigures {
+    /// `Pending` processing jobs — message deliveries excluded.
+    depth: u64,
+    /// Age in seconds of the oldest `Pending` **processing** job (`0` when there is none).
+    queue_oldest_age_secs: u64,
+    /// Total dead-lettered rows, all kinds — the `dlq_depth` published verbatim.
+    dlq_depth: u64,
+    /// Age in seconds of the oldest dead-lettered **processing** job (`0` when none).
+    dlq_oldest_age_secs: u64,
+    /// Per-kind dead-letter breakdown, published verbatim by `/health/detailed`.
+    dlq_by_kind: BTreeMap<String, u64>,
+    /// Message deliveries awaiting acknowledgement. A **lower bound** once the scan window
+    /// is exhausted, so `depth` can only ever be over-estimated — never under-reported.
+    mailbox_pending: u64,
+}
+
+/// Computes the `/health` queue figures with message deliveries set apart.
+///
+/// # Side effects
+/// Reads the shared queue DB: one `count_jobs_by_status`, one `dlq_counts_by_kind`, plus the
+/// bounded `list` scans of [`count_pending_message_deliveries`], [`oldest_processing_age_secs`]
+/// and [`oldest_dead_letter_age_secs`].
+async fn queue_figures(
+    store: &Arc<dyn QueueStore + Send + Sync>,
+    now: DateTime<Utc>,
+) -> QueueFigures {
+    let status_counts = store.count_jobs_by_status(None).await.unwrap_or_default();
+    let pending_total = status_counts.get(&JobStatus::Pending).copied().unwrap_or(0);
+    let dlq_depth = status_counts.get(&JobStatus::DLQ).copied().unwrap_or(0);
+
+    // Kept as a `Result`: an unavailable breakdown must not be read as "no processing job is
+    // dead" (a `0` that says "healthy" about a DLQ nobody could read) — the age computation
+    // degrades to a bounded scan instead.
+    let dlq_by_kind = store.dlq_counts_by_kind().await;
+
+    let mailbox_pending = count_pending_message_deliveries(store).await;
+    let dlq_oldest_age_secs =
+        oldest_dead_letter_age_secs(store, dlq_by_kind.as_ref().ok(), now).await;
+
+    QueueFigures {
+        // Saturating: `mailbox_pending` is a lower bound once the scan window is exhausted,
+        // so `depth` can only ever be over-estimated — never negative, never under-reported
+        // (an over-estimate cannot hide a backlog).
+        depth: pending_total.saturating_sub(mailbox_pending),
+        queue_oldest_age_secs: oldest_processing_age_secs(store, JobStatus::Pending, now).await,
+        dlq_depth,
+        dlq_oldest_age_secs,
+        dlq_by_kind: dlq_by_kind.unwrap_or_default(),
+        mailbox_pending,
+    }
+}
+
+/// Age in seconds of `created_at` relative to `now`; clock skew is bounded to `0`.
+fn age_secs(now: DateTime<Utc>, created_at: DateTime<Utc>) -> u64 {
+    u64::try_from((now - created_at).num_seconds().max(0)).unwrap_or(0)
+}
+
+/// Counts `Pending` message deliveries, scanning at most `QUEUE_SCAN_MAX_PAGES` pages.
+///
+/// Beyond that window the result is a **lower bound** (and `0` on a store error) — which
+/// keeps `queue_depth` conservative rather than optimistic (mirrors the server).
+async fn count_pending_message_deliveries(store: &Arc<dyn QueueStore + Send + Sync>) -> u64 {
+    let mut count: u64 = 0;
+    let mut cursor = None;
+    for _ in 0..QUEUE_SCAN_MAX_PAGES {
+        let filter = JobFilter {
+            status: Some(JobStatus::Pending),
+            kind: Some(JOB_KIND_MESSAGE.to_string()),
+            order: JobOrder::CreatedAsc,
+            limit: QUEUE_SCAN_PAGE,
+            cursor,
+            ..JobFilter::default()
+        };
+        let Ok(page) = store.list(filter).await else {
+            break;
+        };
+        count = count.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX));
+        if page.len() < QUEUE_SCAN_PAGE {
+            break;
+        }
+        cursor = page.last().map(|job| job.id);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    count
+}
+
+/// Age of the oldest job in `status` whose kind is **not** a message delivery.
+///
+/// Scans `status` oldest-first and stops at the first processing job. Returns `0` only when
+/// that status really holds no such job (a page shorter than `QUEUE_SCAN_PAGE` proves
+/// exhaustion). If the scan window runs out first, it falls back to the age of the oldest job
+/// of that status, whatever its kind: reporting `0` there would turn an unreadable queue into
+/// a healthy-looking one, so the fallback is a **lower bound** — never an optimistic zero.
+///
+/// Used for the `Pending` queue, where no per-kind breakdown exists, and as the conservative
+/// fail-safe of [`oldest_dead_letter_age_secs`] when the dead-letter breakdown cannot be read.
+async fn oldest_processing_age_secs(
+    store: &Arc<dyn QueueStore + Send + Sync>,
+    status: JobStatus,
+    now: DateTime<Utc>,
+) -> u64 {
+    let mut cursor = None;
+    let mut oldest_any: Option<DateTime<Utc>> = None;
+    for _ in 0..QUEUE_SCAN_MAX_PAGES {
+        let filter = JobFilter {
+            status: Some(status),
+            order: JobOrder::CreatedAsc,
+            limit: QUEUE_SCAN_PAGE,
+            cursor,
+            ..JobFilter::default()
+        };
+        let Ok(page) = store.list(filter).await else {
+            break;
+        };
+        if oldest_any.is_none() {
+            oldest_any = page.first().map(|job| job.lifecycle.created_at);
+        }
+        if let Some(job) = page
+            .iter()
+            .find(|job| job_kind_str(&job.spec.kind) != JOB_KIND_MESSAGE)
+        {
+            return age_secs(now, job.lifecycle.created_at);
+        }
+        if page.len() < QUEUE_SCAN_PAGE {
+            // Locus exhausted: no processing job is in this status at all.
+            return 0;
+        }
+        cursor = page.last().map(|job| job.id);
+        if cursor.is_none() {
+            return 0;
+        }
+    }
+    oldest_any.map_or(0, |created_at| age_secs(now, created_at))
+}
+
+/// Age in seconds of the oldest dead-lettered **processing** job.
+///
+/// Derived from `by_kind`, the per-kind dead-letter breakdown already computed for this pass
+/// by the single `GROUP BY kind` — an exact, unbounded aggregate. [`job_kind_str`] is the
+/// single source of truth for both the `kind` column written at enqueue time and the
+/// [`JOB_KIND_MESSAGE`] guard, so the breakdown names every non-delivery kind present in the
+/// DLQ; a kind it does not name cannot age the queue.
+///
+/// A DLQ holding nothing but message deliveries (a mailbox that filled up) is answered `0`
+/// **exactly**, without reading a row. When a non-delivery kind is present, its oldest entry
+/// is read directly (`limit 1` per kind) and the oldest of those answers — exact, no bounded
+/// window.
+///
+/// # Failure behaviour
+/// An unreadable queue must not look healthy. When the breakdown is unavailable (`None`) or a
+/// per-kind read fails, this degrades to [`oldest_processing_age_secs`] and its conservative
+/// fallback — never to an optimistic `0`.
+async fn oldest_dead_letter_age_secs(
+    store: &Arc<dyn QueueStore + Send + Sync>,
+    by_kind: Option<&BTreeMap<String, u64>>,
+    now: DateTime<Utc>,
+) -> u64 {
+    let Some(by_kind) = by_kind else {
+        return oldest_processing_age_secs(store, JobStatus::DLQ, now).await;
     };
-    store
-        .list(filter)
-        .await
-        .ok()
-        .and_then(|mut jobs| jobs.pop())
-        .map(|job| {
-            let age = Utc::now() - job.lifecycle.created_at;
-            u64::try_from(age.num_seconds().max(0)).unwrap_or(0)
-        })
-        .unwrap_or(0)
+    let processing_kinds: Vec<&String> = by_kind
+        .iter()
+        .filter(|(kind, count)| kind.as_str() != JOB_KIND_MESSAGE && **count > 0)
+        .map(|(kind, _)| kind)
+        .collect();
+    if processing_kinds.is_empty() {
+        return 0;
+    }
+    let mut oldest_created: Option<DateTime<Utc>> = None;
+    for kind in processing_kinds {
+        let filter = JobFilter {
+            status: Some(JobStatus::DLQ),
+            kind: Some(kind.clone()),
+            order: JobOrder::CreatedAsc,
+            limit: 1,
+            cursor: None,
+            ..JobFilter::default()
+        };
+        let Ok(page) = store.list(filter).await else {
+            return oldest_processing_age_secs(store, JobStatus::DLQ, now).await;
+        };
+        if let Some(job) = page.first() {
+            let created_at = job.lifecycle.created_at;
+            oldest_created = Some(oldest_created.map_or(created_at, |c| c.min(created_at)));
+        }
+    }
+    oldest_created.map_or(0, |created_at| age_secs(now, created_at))
 }
 
 // ── Probe loop ─────────────────────────────────────────────────────────────────
@@ -876,5 +1055,382 @@ mod tests {
         let (backend, url) = curator_probe_target(Path::new("/nonexistent/server.toml"));
         assert_eq!(backend, "heuristic");
         assert_eq!(url, None);
+    }
+
+    // ── F-299: message-delivery exclusions (parity with the server) ─────────────
+    //
+    // A `Job::Message` row is state-carrying — it stays `Pending` until its recipient
+    // acknowledges it and no worker ever leases it. Counting it as queued work made the
+    // worker `/health` degrade on a full mailbox or a message parked in the DLQ, while the
+    // server (F-277/F-280) already sets those deliveries apart. These tests pin the worker
+    // to the SAME verdict via `queue_figures` and the shared `derive_status`.
+
+    use std::time::Duration as StdDuration;
+
+    use async_trait::async_trait;
+    use chrono::Duration as ChronoDuration;
+    use gradatum_core::job::{
+        Job, JobClass, JobLifecycle, JobLineage, JobMode, JobPriority, JobRecord, JobResult,
+        JobRetry, JobScheduling, JobScope, JobSpec, MessageDeliverySpec, QueueError, TriggerSource,
+        job_kind_str,
+    };
+    use ulid::Ulid;
+
+    /// In-memory queue: only `list`, `count_jobs_by_status` and `dlq_counts_by_kind` are
+    /// significant — the subset `queue_figures` reads.
+    struct FakeQueue {
+        jobs: Vec<JobRecord>,
+    }
+
+    impl FakeQueue {
+        fn new(jobs: Vec<JobRecord>) -> Self {
+            Self { jobs }
+        }
+        fn arc(jobs: Vec<JobRecord>) -> Arc<dyn QueueStore + Send + Sync> {
+            Arc::new(Self::new(jobs))
+        }
+    }
+
+    #[async_trait]
+    impl QueueStore for FakeQueue {
+        async fn enqueue(&self, _job: JobRecord) -> Result<Ulid, QueueError> {
+            Err(QueueError::Storage("fake".into()))
+        }
+        async fn dequeue(&self, _t: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
+            Ok(None)
+        }
+        async fn get(&self, _id: Ulid, _t: Option<&str>) -> Result<Option<JobRecord>, QueueError> {
+            Ok(None)
+        }
+        async fn complete(&self, _id: Ulid, _r: JobResult) -> Result<(), QueueError> {
+            Ok(())
+        }
+        async fn fail(&self, _id: Ulid, _e: &str, _a: u32) -> Result<(), QueueError> {
+            Ok(())
+        }
+        async fn cancel(&self, _id: Ulid, _t: Option<&str>) -> Result<(), QueueError> {
+            Ok(())
+        }
+        async fn fail_dlq(&self, _id: Ulid, _e: &str) -> Result<(), QueueError> {
+            Ok(())
+        }
+        async fn find_awaiting(&self, _id: Ulid) -> Result<Vec<JobRecord>, QueueError> {
+            Ok(vec![])
+        }
+        async fn set_pending(&self, _id: Ulid) -> Result<(), QueueError> {
+            Ok(())
+        }
+        async fn recover_stale_leases(&self, _ttl: StdDuration) -> Result<Vec<Ulid>, QueueError> {
+            Ok(vec![])
+        }
+        async fn cancel_expired_deadlines(
+            &self,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Ulid>, QueueError> {
+            Ok(vec![])
+        }
+        async fn promote_retries(&self, _now: DateTime<Utc>) -> Result<Vec<Ulid>, QueueError> {
+            Ok(vec![])
+        }
+        async fn schedule_retry(&self, _id: Ulid, _at: DateTime<Utc>) -> Result<(), QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<gradatum_core::job::QueueEvent> {
+            tokio::sync::broadcast::channel(1).1
+        }
+
+        /// Honours `status`, `kind`, `CreatedAsc` order, the cursor and the limit — the
+        /// subset of `JobFilter` that `queue_figures` depends on.
+        async fn list(&self, filter: JobFilter) -> Result<Vec<JobRecord>, QueueError> {
+            let mut out: Vec<JobRecord> = self
+                .jobs
+                .iter()
+                .filter(|j| filter.status.is_none_or(|s| s == j.lifecycle.status))
+                .filter(|j| {
+                    filter
+                        .kind
+                        .as_deref()
+                        .is_none_or(|k| k == job_kind_str(&j.spec.kind))
+                })
+                .filter(|j| filter.cursor.is_none_or(|c| j.id > c))
+                .cloned()
+                .collect();
+            out.sort_by_key(|j| j.id);
+            out.truncate(filter.limit);
+            Ok(out)
+        }
+
+        async fn count_jobs_by_status(
+            &self,
+            _t: Option<&str>,
+        ) -> Result<std::collections::HashMap<JobStatus, u64>, QueueError> {
+            let mut m: std::collections::HashMap<JobStatus, u64> = std::collections::HashMap::new();
+            for j in &self.jobs {
+                *m.entry(j.lifecycle.status).or_insert(0) += 1;
+            }
+            Ok(m)
+        }
+
+        /// Real `GROUP BY kind` over the dead-lettered rows — a DB-backed store computes the
+        /// same, so `queue_figures` receives a faithful per-kind breakdown here.
+        async fn dlq_counts_by_kind(&self) -> Result<BTreeMap<String, u64>, QueueError> {
+            let mut m: BTreeMap<String, u64> = BTreeMap::new();
+            for j in self
+                .jobs
+                .iter()
+                .filter(|j| j.lifecycle.status == JobStatus::DLQ)
+            {
+                *m.entry(job_kind_str(&j.spec.kind).to_string()).or_insert(0) += 1;
+            }
+            Ok(m)
+        }
+    }
+
+    /// A `Pending` job of `job` kind, created `age_secs` before `now`.
+    fn pending(job: Job, now: DateTime<Utc>, age_secs: i64) -> JobRecord {
+        let created = now - ChronoDuration::seconds(age_secs);
+        JobRecord {
+            id: Ulid::from_datetime(created.into()),
+            spec: JobSpec {
+                kind: job,
+                class: JobClass::System,
+                mode: JobMode::Batch,
+                scope: JobScope::VaultWide,
+                priority: JobPriority::Low,
+            },
+            scheduling: JobScheduling {
+                trigger: TriggerSource::Demand,
+                scheduled_at: created,
+                await_jobs: vec![],
+                deadline: None,
+                cron_expr: None,
+            },
+            lifecycle: JobLifecycle {
+                status: JobStatus::Pending,
+                created_at: created,
+                started_at: None,
+                completed_at: None,
+                lease_until: None,
+                result: None,
+            },
+            retry: JobRetry::default(),
+            lineage: JobLineage {
+                triggered_by: None,
+                parent_job: None,
+                pipeline_id: None,
+                pipeline_step: None,
+                children: vec![],
+                cost_usd: None,
+            },
+        }
+    }
+
+    /// The same job pushed to the dead-letter queue (ULID stays derived from `created_at`,
+    /// so read order by id matches creation order — what the bounded scans rely on).
+    fn dead(job: Job, now: DateTime<Utc>, age_secs: i64) -> JobRecord {
+        let mut record = pending(job, now, age_secs);
+        record.lifecycle.status = JobStatus::DLQ;
+        record
+    }
+
+    fn message_job() -> Job {
+        Job::Message(MessageDeliverySpec {
+            message_id: Ulid::generate(),
+            recipient: "identity/agent/backend".to_string(),
+        })
+    }
+
+    fn embed_job() -> Job {
+        Job::Embed(gradatum_core::job::EmbedSpec {
+            note_id: Ulid::generate(),
+            tenant_id: "main".to_string(),
+            force_regenerate: false,
+        })
+    }
+
+    /// Capabilities that leave `derive_status` at whatever the queue thresholds decide
+    /// (critical `internal` + `leadership` both reachable ⇒ no capability degradation).
+    fn calm_caps() -> Vec<CapabilityReport> {
+        vec![
+            cap("internal", true, CapabilityState::Reachable),
+            cap("leadership", true, CapabilityState::Reachable),
+        ]
+    }
+
+    // (a) a non-empty mailbox: N Pending deliveries backdated past the age threshold, no
+    // other job ⇒ the worker stays `ok` with a zeroed queue.
+    #[tokio::test]
+    async fn pending_message_deliveries_alone_keep_the_worker_healthy() {
+        let now = Utc::now();
+        let store = FakeQueue::arc(vec![
+            pending(message_job(), now, 400),
+            pending(message_job(), now, 500),
+        ]);
+        let f = queue_figures(&store, now).await;
+        assert_eq!(f.depth, 0, "a delivery awaiting ack is not queued work");
+        assert_eq!(f.queue_oldest_age_secs, 0);
+        assert_eq!(f.mailbox_pending, 2);
+        assert_eq!(
+            derive_status(
+                &calm_caps(),
+                f.depth,
+                f.queue_oldest_age_secs,
+                f.dlq_oldest_age_secs
+            ),
+            HealthStatus::Ok
+        );
+    }
+
+    // (b) a message delivery parked in the DLQ ⇒ dlq_oldest_age_secs stays 0, status not
+    // degraded.
+    #[tokio::test]
+    async fn message_delivery_in_dlq_does_not_age_the_dead_letter_queue() {
+        let now = Utc::now();
+        let store = FakeQueue::arc(vec![dead(message_job(), now, 100_000)]);
+        let f = queue_figures(&store, now).await;
+        assert_eq!(
+            f.dlq_oldest_age_secs, 0,
+            "a dead delivery must not age the DLQ"
+        );
+        assert_eq!(f.dlq_depth, 1, "it is still counted in dlq_depth");
+        assert_eq!(
+            derive_status(
+                &calm_caps(),
+                f.depth,
+                f.queue_oldest_age_secs,
+                f.dlq_oldest_age_secs
+            ),
+            HealthStatus::Ok
+        );
+    }
+
+    // (c) non-vacuity guard: a non-Message Pending job backdated past the threshold still
+    // degrades — the exclusion must not mask a real backlog.
+    #[tokio::test]
+    async fn non_message_pending_job_still_degrades() {
+        let now = Utc::now();
+        let store = FakeQueue::arc(vec![
+            pending(message_job(), now, 10),
+            pending(embed_job(), now, 400),
+        ]);
+        let f = queue_figures(&store, now).await;
+        assert_eq!(f.depth, 1);
+        assert!(
+            f.queue_oldest_age_secs >= 400,
+            "âge = {}",
+            f.queue_oldest_age_secs
+        );
+        assert_eq!(f.mailbox_pending, 1);
+        assert_eq!(
+            derive_status(
+                &calm_caps(),
+                f.depth,
+                f.queue_oldest_age_secs,
+                f.dlq_oldest_age_secs
+            ),
+            HealthStatus::Degraded
+        );
+    }
+
+    // …and the same guard on the DLQ: a dead processing job ages the DLQ normally.
+    #[tokio::test]
+    async fn non_message_dead_job_still_ages_the_dlq() {
+        let now = Utc::now();
+        let store = FakeQueue::arc(vec![
+            dead(message_job(), now, 100_000),
+            dead(embed_job(), now, 500),
+        ]);
+        let f = queue_figures(&store, now).await;
+        assert!(
+            f.dlq_oldest_age_secs >= 500,
+            "âge = {}",
+            f.dlq_oldest_age_secs
+        );
+        assert_eq!(f.dlq_depth, 2);
+    }
+
+    // (d) parity: for three literally-built stores, the worker figures equal the server's
+    // documented contract (gradatum-server/src/health.rs, F-277/F-280). The worker keeps a
+    // private copy of the logic (no shared crate in this lot); these golden values are what
+    // the server yields for the identical stores — they guard the worker against drift.
+    #[tokio::test]
+    async fn parity_with_server_contract_on_three_stores() {
+        let now = Utc::now();
+
+        // Store 1 — empty.
+        let f = queue_figures(&FakeQueue::arc(vec![]), now).await;
+        assert_eq!(
+            (f.depth, f.queue_oldest_age_secs, f.dlq_oldest_age_secs),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            derive_status(
+                &calm_caps(),
+                f.depth,
+                f.queue_oldest_age_secs,
+                f.dlq_oldest_age_secs
+            ),
+            HealthStatus::Ok
+        );
+
+        // Store 2 — message deliveries only (Pending + one in DLQ), all backdated.
+        let f = queue_figures(
+            &FakeQueue::arc(vec![
+                pending(message_job(), now, 400),
+                pending(message_job(), now, 401),
+                dead(message_job(), now, 100_000),
+            ]),
+            now,
+        )
+        .await;
+        assert_eq!(f.depth, 0);
+        assert_eq!(f.queue_oldest_age_secs, 0);
+        assert_eq!(f.dlq_oldest_age_secs, 0);
+        assert_eq!(f.mailbox_pending, 2);
+        assert_eq!(
+            derive_status(
+                &calm_caps(),
+                f.depth,
+                f.queue_oldest_age_secs,
+                f.dlq_oldest_age_secs
+            ),
+            HealthStatus::Ok
+        );
+
+        // Store 3 — deliveries mixed with one ordinary backdated processing job.
+        let f = queue_figures(
+            &FakeQueue::arc(vec![
+                pending(message_job(), now, 1_000),
+                pending(embed_job(), now, 400),
+            ]),
+            now,
+        )
+        .await;
+        assert_eq!(f.depth, 1);
+        assert!(f.queue_oldest_age_secs >= 400);
+        assert_eq!(f.dlq_oldest_age_secs, 0);
+        assert_eq!(f.mailbox_pending, 1);
+        assert_eq!(
+            derive_status(
+                &calm_caps(),
+                f.depth,
+                f.queue_oldest_age_secs,
+                f.dlq_oldest_age_secs
+            ),
+            HealthStatus::Degraded
+        );
+    }
+
+    // Fail-safe: an unreadable per-kind breakdown must not read as "no dead processing job"
+    // — the DLQ age falls back to the bounded scan, never to an optimistic 0.
+    #[tokio::test]
+    async fn unreadable_dlq_breakdown_falls_back_to_the_bounded_scan() {
+        let now = Utc::now();
+        let store = FakeQueue::arc(vec![dead(embed_job(), now, 400)]);
+        let age = oldest_dead_letter_age_secs(&store, None, now).await;
+        assert!(
+            age >= 400,
+            "sans agrégat, un job de traitement mort doit vieillir la DLQ (obtenu {age})"
+        );
     }
 }

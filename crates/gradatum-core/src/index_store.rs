@@ -925,6 +925,25 @@ pub trait IndexStore: Send + Sync {
         Ok((Vec::new(), 0))
     }
 
+    /// # Default implementation
+    /// Returns `Ok((vec![], 0))` — only the real SQLite index produces results; test mocks
+    /// inherit the default unchanged (same pattern as `list_notes_filtered`).
+    /// The single production implementor is pinned by CI count (d).
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the SQLite query fails.
+    async fn list_notes_by_tag(
+        &self,
+        _vault_id: &str,
+        _section: Option<&str>,
+        _tag: &str,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        Ok((Vec::new(), 0))
+    }
+
     /// Lists the `k` most recently active notes in a vault.
     ///
     /// **"Recently active"** is defined as `ORDER BY COALESCE(updated, created) DESC`:
@@ -1040,6 +1059,54 @@ pub trait IndexStore: Send + Sync {
         _ids: &[String],
     ) -> Result<std::collections::HashMap<String, String>, GradatumError> {
         Ok(std::collections::HashMap::new())
+    }
+
+    /// Batch-reads the tags of a list of notes, space-split.
+    ///
+    /// Returns `HashMap<note_id, Vec<String>>` for the ids present in `vault_id`.
+    /// An id absent from `notes`, and an id whose `tags` column is `NULL`, are **absent**
+    /// from the map — never present with an empty vec: "no row" and "no tag" are different
+    /// states, and a caller that must tell them apart cannot do so through a shared empty
+    /// vector.
+    ///
+    /// ## Why this exists
+    ///
+    /// [`SearchHitRaw`] carries neither tags nor a projection of them, and
+    /// [`IndexStore::search_fts_with_snippet`] selects none, so a caller that has to decide
+    /// whether a hit carries a reserved tag name must ask for the tags separately. This is
+    /// the same gap [`Self::get_titles_sections`], [`Self::get_statuses`] and
+    /// [`Self::get_anchor_ms_batch`] each close for their own field: one batch for the whole
+    /// candidate set, never a lookup per row.
+    ///
+    /// ## Vault scoping
+    ///
+    /// `vault_id` is an unchecked `&str`, like [`Self::distinct_tags`] and
+    /// [`Self::trace_lineage`]. The caller owns it: it must be a vault identifier the
+    /// server itself resolved (a result's own vault), never a client-supplied string.
+    ///
+    /// # Default implementation — fail-closed, deliberately
+    ///
+    /// Returns `Err(GradatumError::Storage(..))`, and **never** an empty map. A backend that
+    /// does not implement this method does not know which notes carry a reserved tag, and
+    /// its only caller is a guard that filters on that answer: an `Ok(empty)` would tell the
+    /// guard that no note is marked, i.e. would serve every marked note it was meant to
+    /// withhold. The error direction is the safe one — a caller that cannot obtain the tags
+    /// fails the request instead of returning a result it cannot vouch for. `SqliteIndex`
+    /// overrides.
+    ///
+    /// # Errors
+    ///
+    /// `GradatumError::Storage` if the SQLite query fails.
+    async fn get_tags_batch(
+        &self,
+        _vault_id: &str,
+        _ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, GradatumError> {
+        Err(GradatumError::Storage(
+            "get_tags_batch: this backend does not expose note tags — refusing to answer \
+             an empty map, which would read as `no note carries a reserved tag` (fail-closed)"
+                .into(),
+        ))
     }
 
     /// Batch-reads `anchor_ms` from `temporal_index` for a list of note IDs.

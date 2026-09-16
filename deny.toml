@@ -48,9 +48,19 @@ unsound = "all"
 #   No fix available upstream as of 2026-05-05. Impact: none in default build (CPU embedder gated).
 #   Revisit when fastembed upgrades tokenizers or tokenizers drops paste.
 ignore = [
-    # RUSTSEC-2024-0436 (paste) — supprimé de l'arbre de dépendances post-bump reqwest 0.13
-    # (paste n'est plus tiré transitivement depuis fastembed 4.6.0 avec default-features=false).
-    # Entrée conservée en commentaire pour traçabilité — PR-3 HTTP stack bump.
+    # RUSTSEC-2024-0436 (paste, unmaintained) — RÉ-INTRODUIT, exempté le 2026-09-16.
+    #   paste 1.0.15 avait quitté l'arbre post-bump reqwest 0.13 (plus tirée par fastembed) ;
+    #   elle re-rentre désormais UNIQUEMENT en dev-dependency via parquet 54.3.1, elle-même
+    #   dev-dep du seul banc `gradatum-bench` (`publish = false`). `cargo tree -i paste
+    #   -e normal,dev,build` : paste -> parquet -> (dev) gradatum-bench, chemin unique.
+    #   C'est une proc-macro utilisée à la COMPILATION des tests/benches : elle n'entre dans
+    #   AUCUN binaire livré, ni dans la surface publiée (ni public-api ni baselines ne la voient).
+    #   Advisory = crate archivée par l'auteur, « No safe upgrade is available » (aucun
+    #   successeur drop-in adopté ici). Évincer paste imposerait un bump majeur parquet
+    #   54 -> 55/56 (donc arrow), non validable sans compiler le banc — hors périmètre de ce
+    #   fix CI. Revisiter au retrait de SQLite en 3.0.0 (RFC-0008 : la pile d'export bascule
+    #   sur Lance/Arrow natif et parquet/paste disparaissent).
+    "RUSTSEC-2024-0436",
     # RUSTSEC-2025-0068 (serde_yml) — RETIRÉ : lot I-013 a migré serde_yml → serde_norway.
     # Le motif de l'exemption était de surcroît faux sur deux points, mesurés avant retrait :
     #   1. Usage — il affirmait que « seul le Deserializer est utilisé ». Le chemin d'ÉCRITURE

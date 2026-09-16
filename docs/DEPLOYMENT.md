@@ -11,12 +11,15 @@ This is the normative statement — other documents link here rather than restat
 - **Linux aarch64** — CI builds and tests it internally (`.forgejo/workflows/release.yml`
   `build-arm64` job, `aarch64-unknown-linux-gnu` cross target), but that job is **best-effort**
   (`continue-on-error`, not required for `release` to run) and its output is never published to
-  the public GitHub Release — there are no aarch64 pre-built binaries to download. A multi-arch
-  `linux/amd64,linux/arm64` Docker image build also exists in the same workflow but is gated
-  `if: false` (no Docker-capable runner yet — see [Guide A § Docker
-  image](guides/A-docker-quickstart.md#docker-image)), so it is not published either.
+  the public GitHub Release — there are no aarch64 pre-built binaries to download.
   **[Guide C — build from source](guides/C-build-from-source.md) is the only path on arm64
   today.**
+- **Docker image** — a `linux/amd64`-only image is built and pushed to this project's
+  **internal** OCI registry by the `build-docker` job (`.forgejo/workflows/release.yml`), on
+  every version tag; `latest` is reserved for those tags and never points at an internal ref.
+  No image is published publicly today, so building locally (`docker compose build`) remains
+  the only way to run the container — see [Guide A § Docker
+  image](guides/A-docker-quickstart.md#docker-image).
 - **Minimum glibc: 2.34** (x86_64 pre-built archives). The public GitHub release binaries are
   dynamically linked against glibc and are compiled inside Debian 12 (bookworm), so they load on
   any Linux with **glibc ≥ 2.34** — this covers Debian 12 (2.36), Ubuntu 22.04 LTS (2.35),
@@ -411,6 +414,28 @@ silently override the configured value.
 
 > **Security note**: the default ACL is **fail-closed**. With no preset file at `[acl] preset_path` (default `/var/lib/gradatum/config/bearer.toml`), the engine falls back to DENY-ALL and every locus is denied — an identity with no matching `[[consumer]]` block is refused. Configure an ACL preset (shipped preset or your own) to grant access. Multi-tenant isolation (`multi_tenant.enabled`) is opt-in and off by default; note that per-key **write scopes** are only enforced when it is on — see `SECURITY.md` for that caveat.
 
+Since 2.4.0, `gradatum-admin acl validate --preset <path>` validates a preset off-server, as a
+pre-flight before rolling it out: it parses the file through the server's own boot-time loader,
+opens no store, writes nothing, and exits non-zero naming the offending key if the preset still
+carries a removed configuration key. The per-consumer `sees_personal_classified` flag no longer
+exists — a preset that still sets it is refused at load; express the same denial as a
+`!personal-classified` pattern (matched on a whole locus segment) in `read_patterns` /
+`write_patterns` instead — see `SECURITY.md` § Privacy posture.
+
+`acl validate` proves the file **parses**; it does not prove any given consumer can still read
+anything. Read patterns are deny-by-default, so a consumer left with only `!`-prefixed negations
+(or an empty list) parses cleanly and then denies every read. After realigning the preset, run
+`gradatum-admin acl validate --preset <path>` **and** exercise one read per consumer identity —
+the validator does not, and cannot, detect a consumer with no positive pattern.
+
+Personal-data detection (the `[privacy]` block) ships off by default: absent, or present with an
+empty `categories` list — the state on every upgrade unless an operator opts in — the write path
+mounts a no-op detector and scans nothing, so an existing deployment is unaffected. See
+[Guide E — Ports & configuration reference](guides/E-ports-and-config.md) for the full field
+reference. When enabled, a `privacy-rescan` scheduled task sweeps previously-unscanned notes on
+an interval; every scheduled task's status, interval and last run are readable on
+`GET /api/v1/system/scheduled`.
+
 ### 6.1 Bind address (fail-closed)
 
 `bind_addr` defaults to `127.0.0.1` (loopback). The engine rejects the following at
@@ -749,6 +774,14 @@ Stopping the worker first lets it drain against a server that is still up; start
 server first means the worker never runs a single job against an older server. The repo's
 `scripts/deploy-gradatum-local.sh` already applies this order — the constraint is written
 here for manual, partial, or rolling upgrades, which is where it gets broken.
+
+The order above is the general rule; a specific version line can add its own pre-flight and
+break inventory on top of it. For the 2.3.1 → 2.4.0 line, see
+[docs/UPGRADING-2.3.1-to-2.4.0.md](UPGRADING-2.3.1-to-2.4.0.md) — the ACL-preset re-alignment
+covered there is a **mandatory pre-flight**, and the same guide documents the deployment
+sequence in order, the binary-only rollback, the same-`version`-and-same-`build_sha` fleet
+rule, and how to replay the 2.3.1 → 2.4.0 upgrade harness (`tests/upgrade/run-upgrade-test.sh`)
+outside CI.
 
 ### Why the order matters
 

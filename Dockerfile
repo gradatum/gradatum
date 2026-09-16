@@ -10,8 +10,13 @@
 FROM rust:slim-bookworm AS builder
 WORKDIR /build
 
+# `git` : six build.rs du workspace (dont ceux des 5 binaires compilés ici)
+# résolvent le SHA court du commit par `git rev-parse --short HEAD` et retombent
+# SILENCIEUSEMENT sur `unknown` si la commande échoue — sans ce paquet, toute image
+# publiée annoncerait une provenance (`build_sha` dans /health) qui ne prouve rien.
+# Absent de rust:slim-bookworm. Le `rm -rf` final ne laisse aucun cache apt.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates \
+    pkg-config libssl-dev ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 # Toolchain épinglée AVANT les sources : couche cachée indépendamment du code.
@@ -22,6 +27,15 @@ RUN rustup toolchain install --no-self-update && rustc --version
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
+# Dépôt git copié APRÈS les sources et JUSTE AVANT la compilation : seule cette
+# dernière couche devient sensible au commit construit, tout ce qui précède
+# (toolchain, apt, manifestes, sources) garde son cache. L'arbre entier est copié,
+# pas un sous-ensemble `HEAD`/`refs` : `--short` résout l'abréviation dans la base
+# d'objets, qui doit donc être là — un sous-ensemble ferait échouer la résolution
+# en silence, soit exactement le défaut corrigé ici. Ce stage est discardé : le
+# stage runtime ne reprend que les 5 binaires ci-dessous, jamais ce répertoire.
+COPY .git ./.git
+
 RUN cargo build --release --workspace \
     --bin gradatum-server --bin gradatum-worker \
     --bin gradatum-admin \
@@ -31,6 +45,11 @@ RUN cargo build --release --workspace \
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM debian:13-slim
 
+# sqlite3 : gardé pour l'exploitation — inspection à chaud des bases depuis le
+# conteneur. Il n'est PAS sur le chemin d'exécution des binaires gradatum, qui lient
+# SQLite en bibliothèque (rusqlite/libsqlite3-sys) et n'invoquent jamais le CLI.
+# Retrait prévu en 3.0.0 ; pas purgé ici — la série 2.x ne retire pas un outil
+# d'exploitation en cours de vie.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 sqlite3 curl \
     && rm -rf /var/lib/apt/lists/*
@@ -55,7 +74,13 @@ WORKDIR /var/lib/gradatum
 
 EXPOSE 19090
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# 90 s, par la mesure et non par précaution : sur l'hôte de référence le premier
+# /health vert tombe ~40 s après le boot, donc une fenêtre de 10 s déclarait en
+# mauvaise santé un serveur sain (faux rouge à chaque démarrage). 90 s garde la marge
+# sur cette mesure et dépasse le plancher de 60 s du harnais de montée ; au-delà, un
+# démarrage lent est un signal réel. Vaut aussi hors compose : l'image porte son
+# propre HEALTHCHECK, qui s'applique quand le conteneur est lancé sans ce fichier.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
   CMD curl -fsS http://127.0.0.1:19090/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/gradatum-server"]

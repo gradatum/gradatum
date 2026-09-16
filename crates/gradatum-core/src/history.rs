@@ -8,8 +8,9 @@
 //!
 //! Two categories:
 //! 1. **`frontmatter.extra` (ExtraFields) keys**: `processed`, `covered-by`,
-//!    `derived-into`, `rank` — written by curator/warden jobs without modifying the
-//!    semantic content of the note.
+//!    `derived-into`, `rank`, `privacy` — written by curator/warden jobs, or
+//!    refreshed by a personal-data scan pass, without modifying the semantic content
+//!    of the note.
 //! 2. **Struct field `updated`** (`Option<DateTime<Utc>>`) — refreshed on every
 //!    `write_note_inner`, even when the content is unchanged.
 //!
@@ -41,9 +42,20 @@ use crate::note::Note;
 /// `.history/` snapshots on every job pass.
 ///
 /// - `processed`, `covered-by`, `derived-into`, `rank`: keys in `ExtraFields`.
+/// - `privacy`: the personal-data scan block. Its `scanned_at` changes on every
+///   pass, so a re-scan would snapshot a copy of the body for an unchanged note.
+///   The consequence is accepted: a mutation of `privacy.review` is not historised
+///   either, and a review that needs an audit trail gets one from the audit log,
+///   never from copy-on-write.
 /// - `updated`: struct field `Frontmatter::updated` (`Option<DateTime<Utc>>`).
-pub const HISTORY_EXCLUDED_FIELDS: &[&str] =
-    &["processed", "covered-by", "derived-into", "updated", "rank"];
+pub const HISTORY_EXCLUDED_FIELDS: &[&str] = &[
+    "processed",
+    "covered-by",
+    "derived-into",
+    "updated",
+    "rank",
+    "privacy",
+];
 
 /// Returns a filtered copy of `frontmatter` for the history hash.
 ///

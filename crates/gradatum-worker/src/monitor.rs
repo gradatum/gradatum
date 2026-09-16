@@ -1,6 +1,6 @@
 //! Apalis multi-worker monitor orchestration.
 //!
-//! Builds an Apalis `Monitor` that orchestrates the **seven** Gradatum job workers via the
+//! Builds an Apalis `Monitor` that orchestrates the **eight** Gradatum job workers via the
 //! custom `GradatumBackend` and Tower layers (default values from `WorkersConfig`,
 //! overridable per kind in `[apalis.workers.<kind>]`):
 //!
@@ -13,6 +13,7 @@
 //! | `forget` | 1 | 300s | 0 | Trace + Timeout + Retry + CatchPanic |
 //! | `distill` | 1 | 300s | 0 | Trace + Timeout + Retry + CatchPanic |
 //! | `validate` | 1 | 300s | 2 | Trace + Timeout + Retry + CatchPanic |
+//! | `privacy-rescan` | 1 | 300s | 0 | Trace + Timeout + Retry + CatchPanic |
 //!
 //! Two cron workers are registered on top of these: `cleanup-dlq-daily` and
 //! `distill-pressure`.
@@ -54,8 +55,8 @@ use crate::internal_client::InternalClient;
 
 use super::apalis_backend::build_gradatum_backend;
 use super::apalis_handlers::{
-    MultiTenantCfg, handle_curate, handle_distill, handle_embed, handle_forget, handle_purge,
-    handle_reindex, handle_validate,
+    MultiTenantCfg, handle_curate, handle_distill, handle_embed, handle_forget,
+    handle_privacy_rescan, handle_purge, handle_reindex, handle_validate,
 };
 use super::metrics::WorkerMetrics;
 use super::schedules::{
@@ -157,6 +158,15 @@ pub struct WorkersConfig {
     /// Transient failures must not make the job terminal and lose the note.
     #[serde(default = "WorkersConfig::default_validate")]
     pub validate: WorkerConfig,
+    /// Privacy-rescan worker — the deferred sweep's execution slot (F-160 L-D.2).
+    ///
+    /// Concurrency 1: the sweep re-judges a corpus and writes, so running slots in
+    /// parallel would only make two passes race over the same notes.
+    /// No automatic retry: the job re-selects its batch from the index at every
+    /// execution, so a retry would be a fresh batch rather than a resumed one — the
+    /// re-run belongs to the next tick, not to the retry policy of this one.
+    #[serde(default = "WorkersConfig::default_privacy_rescan")]
+    pub privacy_rescan: WorkerConfig,
 }
 
 impl WorkersConfig {
@@ -239,6 +249,21 @@ impl WorkersConfig {
             max_retries: 2,
         }
     }
+
+    fn default_privacy_rescan() -> WorkerConfig {
+        WorkerConfig {
+            // Concurrency 1 — a sweep writes, and two passes over one corpus would race.
+            concurrency: 1,
+            // Long timeout: one batch is up to `RESCAN_BATCH_LIMIT` notes, each of which
+            // is read, re-judged and possibly rewritten.
+            timeout_secs: 300,
+            // No automatic retry: a batch bound is a quota, not a cursor. The handler's
+            // batch is re-selected from the index at every execution, so a retry would
+            // re-select from the start — resumption is the next tick's job, and it loses
+            // nothing (the notes already re-judged are no longer unscanned).
+            max_retries: 0,
+        }
+    }
 }
 
 impl Default for WorkersConfig {
@@ -251,6 +276,7 @@ impl Default for WorkersConfig {
             forget: Self::default_forget(),
             distill: Self::default_distill(),
             validate: Self::default_validate(),
+            privacy_rescan: Self::default_privacy_rescan(),
         }
     }
 }
@@ -322,6 +348,7 @@ pub fn build_monitor(
     let forget_cfg = config.workers.forget.clone();
     let distill_cfg = config.workers.distill.clone();
     let validate_cfg = config.workers.validate.clone();
+    let privacy_rescan_cfg = config.workers.privacy_rescan.clone();
 
     // Isolated backends per kind — each worker fetches ONLY its own jobs.
     // DLQ routing fix: build_gradatum_backend(store, kind) calls dequeue_by_kind(kind)
@@ -337,6 +364,8 @@ pub fn build_monitor(
     let (forget_backend, forget_ack) = build_gradatum_backend(Arc::clone(&store), "Forget")?;
     let (distill_backend, distill_ack) = build_gradatum_backend(Arc::clone(&store), "Distill")?;
     let (validate_backend, validate_ack) = build_gradatum_backend(Arc::clone(&store), "Validate")?;
+    let (privacy_rescan_backend, privacy_rescan_ack) =
+        build_gradatum_backend(Arc::clone(&store), "PrivacyRescan")?;
 
     let m_curate = metrics.clone();
     let m_embed = metrics.clone();
@@ -345,6 +374,7 @@ pub fn build_monitor(
     let m_forget = metrics.clone();
     let m_distill = metrics.clone();
     let m_validate = metrics.clone();
+    let m_privacy_rescan = metrics.clone();
 
     let mut monitor = Monitor::new()
         // ── Curate worker ─────────────────────────────────────────────────────
@@ -595,6 +625,39 @@ pub fn build_monitor(
                         }
                     })
                     .build(handle_validate)
+            }
+        })
+        // ── Privacy-rescan worker (F-160 L-D.2) ───────────────────────────────
+        .register({
+            let cfg = privacy_rescan_cfg.clone();
+            let backend = privacy_rescan_backend;
+            let ack = privacy_rescan_ack;
+            let m = m_privacy_rescan;
+            let client_pr = Arc::clone(&client);
+            move |idx| {
+                let worker_name = format!("privacy-rescan-{idx}");
+                WorkerBuilder::new(&worker_name)
+                    .backend(backend.clone())
+                    // Order matches the parameter order of handle_privacy_rescan.
+                    .data(Arc::clone(&client_pr) as Arc<dyn InternalClient>)
+                    .data(multi_tenant)
+                    .ack_with(ack.clone())
+                    .enable_tracing()
+                    .timeout(Duration::from_secs(cfg.timeout_secs))
+                    .retry(RetryPolicy::retries(cfg.max_retries))
+                    .catch_panic()
+                    .concurrency(cfg.concurrency)
+                    .on_event({
+                        let m = m.clone();
+                        move |_ctx, ev| match ev {
+                            Event::Start => m.inc_workers_active("privacy-rescan"),
+                            Event::Stop => m.dec_workers_active("privacy-rescan"),
+                            Event::Success => m.inc_jobs_total("privacy-rescan", "done"),
+                            Event::Error(_) => m.inc_jobs_total("privacy-rescan", "error"),
+                            _ => {}
+                        }
+                    })
+                    .build(handle_privacy_rescan)
             }
         });
 

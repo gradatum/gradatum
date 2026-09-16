@@ -100,7 +100,7 @@ jobs:
 
   # test-engine — cargo nextest gradatum-engine (feature `serve`).
   # SKIPPÉ sur GitHub (Option A, 2026-08-04) : ce job est épinglé au runner
-  # a self-hosted homelab runner (le binaire llama-server on-disk est requis par
+  # a self-hosted runner (le binaire llama-server on-disk est requis par
   # plusieurs tests de gradatum-engine — canonicalisation + garde des préfixes
   # privilégiés SP-P0-4). Aucun runner self-hosted n'est enregistré sur
   # github.com/gradatum/gradatum, donc le job restait « queued » indéfiniment et

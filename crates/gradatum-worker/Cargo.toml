@@ -25,7 +25,7 @@ gradatum-dto.workspace = true
 gradatum-heartbeat.workspace = true
 # gradatum-db-sqlite is publishable (no `publish` key); this dependency does not block
 # publication of gradatum-worker.
-gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "2.3.0" }
+gradatum-db-sqlite      = { path = "../gradatum-db-sqlite", version = "2.4.0" }
 gradatum-distill.workspace = true
 gradatum-embed.workspace = true
 gradatum-queue.workspace = true

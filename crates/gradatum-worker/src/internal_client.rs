@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use gradatum_dto::{
     EmbeddingOkResponse, PersistCuratedRequest, PersistDistillRequest, PersistEmbeddingRequest,
-    PersistForgetRequest, PersistOkResponse,
+    PersistForgetRequest, PersistOkResponse, PrivacyRescanRequest, PrivacyRescanResponse,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -424,6 +424,34 @@ pub trait InternalClient: Send + Sync + 'static {
         Err(InternalClientError::ServerError {
             status: 501,
             body: "list_active_vaults not implemented by this InternalClient".to_string(),
+        })
+    }
+
+    /// `POST /internal/v1/privacy/rescan` — re-judges one bounded batch of a vault's
+    /// `privacy-unscanned` notes and returns the batch's counts.
+    ///
+    /// The sweep itself lives on the **server**: it is the only party holding both the
+    /// vault registry and the write primitive, and the worker holds neither. This call
+    /// therefore transports a quota (`vault`, `limit`) and receives three counts — no
+    /// note body, no span, no detector label crosses this route in either direction.
+    ///
+    /// The default implementation is **fail-closed** (`Err`, status 501): a rescan whose
+    /// call never reached the server must fail the job, never be reported as a sweep that
+    /// found nothing — "no work" and "no call" have to stay distinguishable.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the concrete client's HTTP or parse error; the default implementation
+    /// always returns `InternalClientError::ServerError`.
+    async fn privacy_rescan_batch(
+        &self,
+        vault_id: &str,
+        limit: usize,
+    ) -> Result<PrivacyRescanResponse, InternalClientError> {
+        let _ = (vault_id, limit);
+        Err(InternalClientError::ServerError {
+            status: 501,
+            body: "privacy_rescan_batch not implemented by this InternalClient".to_string(),
         })
     }
 }
@@ -887,5 +915,18 @@ impl InternalClient for InternalPersistClient {
         let resp = self.execute_with_retry(|| self.client.get(&url)).await?;
         let vaults: Vec<String> = Self::parse_json(resp, "vaults/active").await?;
         Ok(vaults)
+    }
+
+    async fn privacy_rescan_batch(
+        &self,
+        vault_id: &str,
+        limit: usize,
+    ) -> Result<PrivacyRescanResponse, InternalClientError> {
+        let url = format!("{}/internal/v1/privacy/rescan", self.base_url);
+        let body = PrivacyRescanRequest::new(vault_id, limit);
+        let resp = self
+            .execute_with_retry(|| self.client.post(&url).json(&body))
+            .await?;
+        Self::parse_json(resp, vault_id).await
     }
 }

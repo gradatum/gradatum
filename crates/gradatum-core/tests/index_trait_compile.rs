@@ -533,6 +533,26 @@ async fn mock_index_search_semantic_returns_empty() {
     assert!(results.is_empty());
 }
 
+/// The `list_notes_by_tag` default answers an empty page, unchanged from `list_notes_filtered`.
+///
+/// A mock that does not override it must not fail the call: the default is what a store
+/// without tag support inherits, and an error there would make the filter unusable on any
+/// backend that has not implemented it. The counter-measure to the silence that default
+/// buys is the SQLite override, exercised where the real index lives.
+#[tokio::test]
+async fn list_notes_by_tag_default_impl_returns_empty() {
+    let mock = MockIndex::new();
+    let (records, total) = mock
+        .list_notes_by_tag("main", None, "personal-classified", 20, None)
+        .await
+        .expect("the default must not fail");
+    assert!(
+        records.is_empty(),
+        "the default returns no row — it is not the SQLite store"
+    );
+    assert_eq!(total, 0);
+}
+
 /// Vérification que `get_note_created_and_indegree` retourne (0,0) sur le mock.
 #[tokio::test]
 async fn mock_index_note_created_and_indegree_returns_zero() {

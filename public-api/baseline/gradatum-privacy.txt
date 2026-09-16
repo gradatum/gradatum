@@ -1,0 +1,23 @@
+pub mod gradatum_privacy
+#[non_exhaustive] pub struct gradatum_privacy::MergeStats
+pub gradatum_privacy::MergeStats::merged: usize
+pub gradatum_privacy::MergeStats::rejected_out_of_bounds: usize
+pub gradatum_privacy::MergeStats::rejected_utf8_boundary: usize
+pub gradatum_privacy::MergeStats::touching_window_edge: usize
+impl gradatum_privacy::MergeStats
+pub const fn gradatum_privacy::MergeStats::new(usize, usize, usize, usize) -> Self
+pub struct gradatum_privacy::RegexDetector
+impl gradatum_privacy::RegexDetector
+pub fn gradatum_privacy::RegexDetector::new() -> Self
+impl core::default::Default for gradatum_privacy::RegexDetector
+pub fn gradatum_privacy::RegexDetector::default() -> Self
+impl gradatum_core::pii::PiiDetector for gradatum_privacy::RegexDetector
+pub fn gradatum_privacy::RegexDetector::detect(&self, &gradatum_core::pii::DetectInput<'_>) -> core::result::Result<gradatum_core::pii::Detection, gradatum_core::pii::PiiDetectError>
+#[non_exhaustive] pub struct gradatum_privacy::WindowPlan
+pub gradatum_privacy::WindowPlan::max_input_bytes: usize
+pub gradatum_privacy::WindowPlan::overlap_bytes: usize
+impl gradatum_privacy::WindowPlan
+pub const fn gradatum_privacy::WindowPlan::new(usize, usize) -> Self
+pub fn gradatum_privacy::WindowPlan::windows<'a>(&self, &'a str) -> alloc::vec::Vec<(usize, &'a str)>
+pub fn gradatum_privacy::rebase(&mut [gradatum_core::pii::PiiSpan], usize)
+pub fn gradatum_privacy::validate_and_merge(&str, alloc::vec::Vec<gradatum_core::pii::PiiSpan>) -> (alloc::vec::Vec<gradatum_core::pii::PiiSpan>, gradatum_privacy::MergeStats)

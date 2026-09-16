@@ -38,6 +38,14 @@
 //! | POST  | `/vault_downgrade` | `notes::vault_downgrade` |
 //! | PATCH | `/notes/{id}`      | `notes::patch_note` |
 //!
+//! # Administrative route (synchronous 200 OK, REST only)
+//!
+//! | Method | Path | Handler |
+//! |--------|------|---------|
+//! | POST | `/vault_privacy_review` | [`handlers::vault_privacy_review`] |
+//!
+//! Deliberately **not** mirrored on MCP (F-160 D-13) — see the handler's own note.
+//!
 //! # History routes (synchronous 200 OK)
 //!
 //! | Method | Path | ACL | Handler |
@@ -158,6 +166,19 @@ pub fn router() -> Router<AppState> {
         // F-144 — message_ack (fixe /messages AVANT paramétrique /messages/{id}/ack).
         .route("/messages/{id}/ack", post(messaging::message_ack))
         .route("/vault_classify", post(write::vault_classify))
+        // ── F-160 D-13 — revue d'un marquage personnel (synchrone 200 OK) ─────
+        //
+        // Route dédiée, et **sans contrepartie MCP** (`api_v1/mcp.rs` inchangé) :
+        // lever un marquage est un acte d'administration, l'exposer comme outil MCP
+        // le mettrait à un appel d'outil de chaque agent du parc — c'est la
+        // délégation que D-13 refuse. Cet écart entre les deux surfaces EST le
+        // contrôle, pas un oubli.
+        //
+        // Body limit 4 KiB : payload nominal < 256 o (ULID + verdict + 64 hex).
+        .route(
+            "/vault_privacy_review",
+            post(handlers::vault_privacy_review).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         // ── F-40 History CoW (v0.4.0 — synchrones 200 OK) ────────────────────
         // Règle fixed-before-parametric respectée : toutes les routes fixes.
         .route("/vault_history", post(history::vault_history))

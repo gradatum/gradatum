@@ -737,7 +737,10 @@ fn config_load_failure_message(config_path: &std::path::Path, e: &figment::Error
 ///    explicit guard for this: it fails later, at bind time).
 /// 4. `llama_server_bin` — canonicalizable, under an allowed prefix, correctly named
 ///    (`canonicalize_bin_path`), and executable by this process.
-/// 5. `extra_args` — within the allow-list (`validate_extra_args`).
+/// 5. `extra_args` — within the allow-list (`validate_extra_args`), and free of any
+///    conflict with an authoritative typed field
+///    ([`config_arg_conflicts`](gradatum_engine::supervisor::config_arg_conflicts), the
+///    supervisor's own rule rather than a copy of it).
 /// 6. Referenced model files are actually **readable** (existence alone is what
 ///    `validate()` proves; a `0600 root:root` GGUF passes it and still breaks the child).
 /// 7. When `gradatum_url` is set — the loopback policy (anti-SSRF), which aborts the
@@ -770,7 +773,8 @@ fn config_load_failure_message(config_path: &std::path::Path, e: &figment::Error
 ///
 /// Steps 3-5 re-use the very functions the supervisor calls, but the call sites are
 /// duplicated: a new invariant added inside `LlamaServerSupervisor::new` itself would not
-/// be seen here. Extending that constructor requires extending this list.
+/// be seen here. Extending that constructor requires extending this list — or, better,
+/// adding the rule to a function both call, as the argument conflicts of step 5 now are.
 #[cfg(feature = "serve")]
 #[must_use]
 fn collect_check_failures(
@@ -779,7 +783,7 @@ fn collect_check_failures(
 ) -> CheckFindings {
     use gradatum_engine::{
         config::RuntimeKind,
-        supervisor::{canonicalize_bin_path, validate_extra_args},
+        supervisor::{canonicalize_bin_path, config_arg_conflicts, validate_extra_args},
     };
 
     let mut failures: Vec<String> = Vec::new();
@@ -854,10 +858,13 @@ fn collect_check_failures(
         },
     }
 
-    // 5. Pass-through arguments allow-list.
+    // 5. Pass-through arguments allow-list, then conflicts between an authoritative
+    //    typed field and an allow-listed `extra_args` flag. The conflict rule is the
+    //    supervisor's own function, not a copy: the check cannot drift from startup.
     if let Err(e) = validate_extra_args(&config.extra_args) {
         failures.push(format!("extra_args: {e}"));
     }
+    failures.extend(config_arg_conflicts(config));
 
     // 6. Readability of the referenced model files (existence is already covered by
     //    validate(); this catches the permission case it cannot see).
@@ -1607,6 +1614,74 @@ mod check_tests {
         assert_reports(
             &collect_check_failures(&c, &CheckIdentity::CallingProcess).failures,
             "'--rm-rf-slash' is not allowed",
+        );
+    }
+
+    // --- Conflit max_tokens / --n-predict vu par `--check` ---
+
+    /// Préfixe exact du motif de conflit, partagé par le superviseur et le pré-vol.
+    const CONFLICT_PREFIX: &str = "config conflict: max_tokens is set AND extra_args carries \
+                                   --n-predict/-n";
+
+    #[test]
+    fn check_reports_max_tokens_n_predict_conflict() {
+        // `max_tokens` ET `--n-predict` dans `extra_args` : deux sources pour le même
+        // drapeau. Le superviseur refuse au démarrage ; le pré-vol doit le dire avant.
+        let c = cfg(
+            "model_path=\"x\"\nmodel_kind=\"chat\"\nport=11435\nchild_port=11455\n\
+             metrics_port=11438\nmax_tokens=32000\nextra_args=[\"--n-predict\",\"32000\"]\n",
+        );
+        let failures = collect_check_failures(&c, &CheckIdentity::CallingProcess).failures;
+        // Jamais `is_empty()` : cette configuration en produit d'autres (modèle illisible,
+        // binaire absent). Seul le motif de conflit est discriminant ici.
+        assert!(
+            failures.iter().any(|f| f.starts_with(CONFLICT_PREFIX)),
+            "aucun échec ne porte le motif de conflit — échecs obtenus : {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn check_reports_max_tokens_n_alias_conflict() {
+        // L'alias `-n` est la même source : la garde ne doit pas dépendre de la forme
+        // longue, sinon le pré-vol rougit moins que le démarrage.
+        let c = cfg(
+            "model_path=\"x\"\nmodel_kind=\"chat\"\nport=11435\nchild_port=11455\n\
+             metrics_port=11438\nmax_tokens=32000\nextra_args=[\"-n\",\"32000\"]\n",
+        );
+        let failures = collect_check_failures(&c, &CheckIdentity::CallingProcess).failures;
+        assert!(
+            failures.iter().any(|f| f.starts_with(CONFLICT_PREFIX)),
+            "l'alias -n doit déclencher la même garde — échecs obtenus : {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn check_accepts_max_tokens_without_n_predict() {
+        // Source unique : aucun conflit à signaler. Sans ce test, la garde pourrait
+        // rougir toute configuration portant `max_tokens` sans qu'on le voie.
+        let c = cfg(
+            "model_path=\"x\"\nmodel_kind=\"chat\"\nport=11435\nchild_port=11455\n\
+             metrics_port=11438\nmax_tokens=32000\n",
+        );
+        let failures = collect_check_failures(&c, &CheckIdentity::CallingProcess).failures;
+        assert!(
+            !failures.iter().any(|f| f.starts_with("config conflict:")),
+            "aucun conflit ne doit être signalé ici — échecs obtenus : {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn check_accepts_n_predict_when_max_tokens_is_unset() {
+        // `max_tokens` absent = illimité : `extra_args` reste une voie valide, c'est
+        // exactement la configuration que le parc porte aujourd'hui.
+        let c = cfg(
+            "model_path=\"x\"\nmodel_kind=\"chat\"\nport=11435\nchild_port=11455\n\
+             metrics_port=11438\nextra_args=[\"--n-predict\",\"32000\"]\n",
+        );
+        let failures = collect_check_failures(&c, &CheckIdentity::CallingProcess).failures;
+        assert!(
+            !failures.iter().any(|f| f.starts_with("config conflict:")),
+            "--n-predict seul doit rester accepté — échecs obtenus : {failures:#?}"
         );
     }
 

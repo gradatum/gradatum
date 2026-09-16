@@ -179,18 +179,39 @@ pub struct HealthReport {
     /// Number of known loci in the vault registry.
     #[serde(default)]
     pub locus_count: u32,
-    /// Processing queue depth (`Pending` jobs).
+    /// Processing queue depth — `Pending` jobs, **excluding message deliveries**.
+    ///
+    /// A message delivery stays `Pending` until its recipient acknowledges it and is never
+    /// leased by a worker; it is mailbox state, not queued work, so it is not counted here.
     #[serde(default)]
     pub queue_depth: u64,
-    /// Age in seconds of the oldest queued entry.
+    /// Age in seconds of the oldest queued entry — same population as [`Self::queue_depth`],
+    /// i.e. `Pending` jobs **excluding message deliveries**.
+    ///
+    /// `0` means no such job is pending. An unacknowledged message, however old, does not
+    /// age this field.
     #[serde(default)]
     pub queue_oldest_age_secs: u64,
+    /// Message deliveries awaiting acknowledgement — the mailbox, counted apart from
+    /// [`Self::queue_depth`].
+    ///
+    /// A delivery stays `Pending` until its recipient acknowledges it and is never leased
+    /// by a worker: a full mailbox is normal operation, not queued work.
+    ///
+    /// `None` when the producer does not measure the mailbox — the key is then absent from
+    /// the wire, rather than a fabricated `0` a reader cannot tell from a measured-empty
+    /// mailbox. Only [`Self::with_mailbox_pending`] sets a value. When present, the figure
+    /// is a **lower bound**: beyond 5 000 pending deliveries the producer's bounded scan
+    /// window is exhausted, so it can under-count a very large mailbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_pending: Option<u64>,
     /// Dead-letter queue depth — jobs whose retries were exhausted (terminal, silent
     /// failures).
     #[serde(default)]
     pub dlq_depth: u64,
     /// Age in seconds of the oldest dead-letter job. Staleness (not count) is the signal
-    /// that a dead job has been forgotten.
+    /// that a dead job has been forgotten. Message deliveries are excluded from this
+    /// population (their count stays in [`Self::dlq_depth`]).
     #[serde(default)]
     pub dlq_oldest_age_secs: u64,
     /// Per-kind dead-letter breakdown (`job kind` → count). Additive forward field; empty
@@ -209,6 +230,33 @@ pub struct HealthReport {
     /// field; empty when the producer does not (yet) expose capabilities.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<CapabilityReport>,
+    // F-160.
+    /// Effective personal-data detection mode: `report_only` or `mask`.
+    ///
+    /// **Effective**, not configured: the value the write path is actually running under,
+    /// so an external probe can observe that an installation destroys data instead of
+    /// having to be told. Defaults to `"report_only"`, the delivered mode, and is present
+    /// on the wire even on a corpus that carries no privacy data at all.
+    #[serde(default = "HealthReport::default_privacy_mode")]
+    pub privacy_mode: String,
+    /// **Passes since boot** that completed and judged their note — a monotone
+    /// process-lifetime counter, not a corpus census: it is read back from the running
+    /// process's own metric and resets with it. No pass yet ⇒ `0`, field present.
+    #[serde(default)]
+    pub privacy_scanned_total: u64,
+    /// **Passes since boot** that fell short and could not judge their note — no data
+    /// ⇒ `0`, field present. Same series semantics as [`Self::privacy_scanned_total`]:
+    /// the two partition the passes this process ran, and the pair therefore says
+    /// nothing about notes the process never looked at.
+    ///
+    /// A figure **above zero degrades** the report (see [`Self::with_privacy`]) — the
+    /// 2026-09-14 boot false-red is the reason: an unscanned note is a real loss of
+    /// coverage, not a service outage, so it must not page anyone as `unhealthy`.
+    #[serde(default)]
+    pub privacy_unscanned_total: u64,
+    /// Name of the mounted detector, empty when the producer does not expose one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub privacy_detector: String,
 }
 
 impl HealthReport {
@@ -226,13 +274,24 @@ impl HealthReport {
             locus_count: 0,
             queue_depth: 0,
             queue_oldest_age_secs: 0,
+            mailbox_pending: None,
             dlq_depth: 0,
             dlq_oldest_age_secs: 0,
             dlq_by_kind: BTreeMap::new(),
             sqlite_wal_size_bytes: 0,
             started_at: None,
             capabilities: Vec::new(),
+            privacy_mode: Self::default_privacy_mode(),
+            privacy_scanned_total: 0,
+            privacy_unscanned_total: 0,
+            privacy_detector: String::new(),
         }
+    }
+
+    /// Delivered personal-data detection mode (`report_only`).
+    #[must_use]
+    pub fn default_privacy_mode() -> String {
+        "report_only".to_string()
     }
 
     /// Sets the (public) build commit SHA.
@@ -262,6 +321,20 @@ impl HealthReport {
     pub fn with_queue(mut self, depth: u64, oldest_age_secs: u64) -> Self {
         self.queue_depth = depth;
         self.queue_oldest_age_secs = oldest_age_secs;
+        self
+    }
+
+    /// Sets the mailbox block — message deliveries awaiting acknowledgement.
+    ///
+    /// Kept separate from [`Self::with_queue`]: the two populations are disjoint by
+    /// construction, and widening `with_queue` to three parameters would break its
+    /// existing two-argument callers.
+    ///
+    /// Calling this is what turns the field into a *measurement*: a producer that never
+    /// calls it leaves `mailbox_pending` `None`, and the key is omitted from the wire.
+    #[must_use]
+    pub fn with_mailbox_pending(mut self, mailbox_pending: u64) -> Self {
+        self.mailbox_pending = Some(mailbox_pending);
         self
     }
 
@@ -297,6 +370,49 @@ impl HealthReport {
     #[must_use]
     pub fn with_capabilities(mut self, capabilities: Vec<CapabilityReport>) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Sets the personal-data block (effective mode, scanned count, unscanned count).
+    ///
+    /// # The one side effect, and why it lives here
+    ///
+    /// An `unscanned_total` above zero raises the report from [`HealthStatus::Ok`] to
+    /// [`HealthStatus::Degraded`] — and **never further**: an unscanned note means a
+    /// pass did not complete, which is a loss of detection coverage, not a service
+    /// outage. The raise applies only from `Ok`, which keeps the direction monotone: a
+    /// probe that was already `Degraded` or `Unhealthy` for its own reasons is left
+    /// alone, and this field can never improve a status either.
+    ///
+    /// The correlation is enforced inside the builder rather than at each producer so
+    /// that no call site can publish a report contradicting it. A separate builder
+    /// carries the mounted detector's name: widening this one would break its existing
+    /// caller's arity.
+    #[must_use]
+    pub fn with_privacy(self, mode: &str, scanned_total: u64, unscanned_total: u64) -> Self {
+        let status = if unscanned_total > 0 && self.status == HealthStatus::Ok {
+            HealthStatus::Degraded
+        } else {
+            self.status
+        };
+        Self {
+            status,
+            privacy_mode: mode.to_string(),
+            privacy_scanned_total: scanned_total,
+            privacy_unscanned_total: unscanned_total,
+            ..self
+        }
+    }
+
+    // F-160.
+    /// Sets the name of the mounted detector.
+    ///
+    /// Detached from [`Self::with_privacy`] on purpose: the name answers "which detector
+    /// judged these notes", a question a probe asks independently of the counts — and
+    /// the counts' arity is fixed by callers that predate the name.
+    #[must_use]
+    pub fn with_privacy_detector(mut self, detector: &str) -> Self {
+        self.privacy_detector = detector.to_string();
         self
     }
 }
@@ -411,6 +527,26 @@ mod tests {
         // Additive blocks absent from the 2.2.0 wire → empty, no deserialization error.
         assert!(report.dlq_by_kind.is_empty());
         assert!(report.capabilities.is_empty());
+        // A payload that predates the field carries no mailbox measurement at all.
+        assert_eq!(report.mailbox_pending, None);
+    }
+
+    /// A producer that does not measure the mailbox must not publish a fabricated `0`.
+    ///
+    /// `mailbox_pending` answers "how many deliveries are waiting?"; a producer with no
+    /// counter for it can only answer "I did not measure" — which the wire must carry as
+    /// an absent key, exactly like `build_sha`, `started_at`, `dlq_by_kind` and
+    /// `capabilities`. Before this, the field was a `u64` always serialized: every
+    /// producer published `0`, and a reader could not tell a measured-empty mailbox from
+    /// an unmeasured one.
+    #[test]
+    fn detailed_report_omits_mailbox_pending_when_unmeasured() {
+        let report = HealthReport::new(HealthStatus::Ok, "2.4.0".to_string());
+        let wire = serde_json::to_value(&report).unwrap();
+        assert!(
+            wire.get("mailbox_pending").is_none(),
+            "an unmeasured mailbox must not be published at all, got {wire}"
+        );
     }
 
     #[test]

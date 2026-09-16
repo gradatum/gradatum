@@ -34,10 +34,14 @@ gradatum-vault.workspace = true
 # écrit ses artefacts via cette couche, jamais en accès fichier direct. Crate first-party
 # déjà présente transitivement via gradatum-vault ; l'edge direct rend la dépendance honnête.
 gradatum-storage.workspace = true
+# Frontière de détection de données personnelles (F-160) — le montage (`state.rs`)
+# choisit le détecteur regex sur configuration explicite ; sans configuration, le
+# no-op de `gradatum-core` reste seul en jeu.
+gradatum-privacy.workspace = true
 gradatum-index = { workspace = true, features = ["sqlite-vec-ann"] }
 gradatum-search.workspace = true
 gradatum-queue.workspace = true
-gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.3.0" }
+gradatum-db-sqlite = { path = "../gradatum-db-sqlite", version = "2.4.0" }
 gradatum-acl-policy.workspace = true
 gradatum-acl-auth.workspace = true
 gradatum-auth.workspace = true
@@ -95,6 +99,11 @@ s3 = ["gradatum-vault/s3", "gradatum-storage/s3"]
 [dev-dependencies]
 tempfile.workspace = true
 reqwest.workspace = true
+# The on-disk frontmatter parser (F-160 SEC §4(c)) — the injection test must read a
+# note back from disk with the same parser the vault uses, not with a test-local one.
+# First-party crate already present transitively via gradatum-vault; the direct edge
+# is what makes the dev-dependency honest.
+gradatum-markdown.workspace = true
 gradatum-dto.workspace = true
 nix.workspace = true
 gradatum-worker.workspace = true

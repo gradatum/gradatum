@@ -58,6 +58,14 @@ path = "src/bin/gen_synthetic_corpus.rs"
 [dev-dependencies]
 criterion          = { workspace = true, features = ["async_tokio"] }
 wiremock           = { workspace = true }
+# F-160 ruling L-G — banc fixture d'exclusion d'export (tests/export_exclusion.rs).
+# dev-dep de gradatum-bench SEULEMENT (crate `publish = false`) : aucune surface
+# publiée ni baseline ne bouge. `default-features = false` retire arrow + tous les
+# codecs de compression — le banc n'écrit qu'en PLAIN/UNCOMPRESSED via l'API
+# bas-niveau ; aucune dépendance externe supplémentaire, aucun égress. Apache-2.0,
+# couverte par l'allow-list `deny.toml`. Le prédicat d'export appartient à
+# F-146/F-290 : rien de tout cela n'entre en surface de produit.
+parquet            = { version = "54", default-features = false }
 
 [features]
 default = []

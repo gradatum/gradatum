@@ -11,7 +11,7 @@
 //! A message is **two disjoint durable artefacts**:
 //!
 //! 1. the mailbox content = a note in [`gradatum_core::section::Section::Messaging`]
-//!    (vault of the sender's tenant — the shared homelab `main`), whose
+//!    (vault of the sender's tenant — the shared `main` vault of the installation), whose
 //!    `locus = "messaging/<recipient_identity>"` is the C4 channel, `author` is the
 //!    credited sender identity and `extra["subject"]` the optional subject. The
 //!    content is read back through the standard vault registry (`read_note_by_id`,
@@ -32,6 +32,8 @@
 //! - Note-first, then enqueue (réserve 5): if the enqueue fails the note is already
 //!   written and stays pollable; a reconciliation pass (`reconcile_delivery_jobs`)
 //!   recreates the missing job row at the next poll.
+
+use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::{Extension, State};
@@ -183,8 +185,8 @@ pub async fn message_send_impl(
         return Err(GradatumError::Forbidden("denied".into()));
     }
 
-    // Target vault = the sender's effective (tenant) vault — the shared mailbox
-    // vault of the homelab (`main`). Cross-tenant addressing is out of F-144 scope.
+    // Target vault = the sender's effective (tenant) vault — the installation's
+    // shared mailbox vault (`main`). Cross-tenant addressing is out of F-144 scope.
     let vault = effective_write_vault(state, trust, None)
         .await
         .map_err(|r| r.into_forbidden("message_send vault resolution"))?;
@@ -277,16 +279,27 @@ pub async fn reconcile_delivery_jobs(
         .list_messaging_notes(vault_ids, recipient, 200, None)
         .await?;
 
+    // Une seule lecture de file pour toute la page : la présence des lignes de
+    // livraison se lit en bloc (`get_many`), jamais note par note.
+    let page_ids: Vec<Ulid> = records
+        .iter()
+        // Un id de note est un ULID valide (les messages sont créés avec un ULID).
+        .filter_map(|rec| Ulid::from_string(&rec.id).ok())
+        .collect();
+    let existing = state
+        .job_store
+        .get_many(&page_ids, None)
+        .await
+        .map_err(|e| GradatumError::Storage(format!("reconcile get_many deliveries: {e}")))?;
+    let existing: HashMap<Ulid, JobRecord> =
+        existing.into_iter().map(|job| (job.id, job)).collect();
+
     let mut recreated = 0usize;
     for rec in &records {
-        // Un id de note est un ULID valide (les messages sont créés avec un ULID).
         let Ok(message_id) = Ulid::from_string(&rec.id) else {
             continue;
         };
-        let existing = state.job_store.get(message_id, None).await.map_err(|e| {
-            GradatumError::Storage(format!("reconcile get delivery {message_id}: {e}"))
-        })?;
-        if existing.is_some() {
+        if existing.contains_key(&message_id) {
             continue;
         }
         // La ligne manque → recréer la livraison (vault = celui de la note).
@@ -337,9 +350,11 @@ pub struct MessageAckResponse {
 /// Acknowledges a message delivery (F-144) — `message_ack`.
 ///
 /// Authority = the **recipient** of the delivery (credited identity derived from the
-/// credential). A non-recipient (or an unknown/already-terminal delivery) receives a
-/// **mute 404** (C2) — nothing reveals the existence of another actor's message.
-/// Success transitions the state-carrying row to terminal `Done` via
+/// credential). Everyone else — a non-recipient, or any caller facing a delivery that
+/// is unknown, already terminal, or whose payload has been purged — receives a **mute
+/// 404** (C2): nothing reveals the existence of another actor's message, and an unknown
+/// delivery stays indistinguishable from one an internal maintenance purge has since
+/// emptied. Success transitions the state-carrying row to terminal `Done` via
 /// [`gradatum_core::QueueStore::complete_message_delivery`] — never a worker lease.
 ///
 /// # Errors
@@ -347,8 +362,9 @@ pub struct MessageAckResponse {
 /// - `Unauthorized` — unauthenticated caller.
 /// - `Forbidden` — the caller is not a credited agent (Studio/mTLS).
 /// - `InvalidInput` — `message_id` is not a valid ULID.
-/// - `Storage` ("…not found…", → 404 mute) — unknown delivery, already terminal, or
-///   addressed to another recipient.
+/// - `Storage` ("…not found…", → 404 mute) — unknown delivery, addressed to another
+///   recipient, already terminal, or terminal whose payload was purged (F-160, L-C).
+///   All four are deliberately one and the same answer.
 pub async fn message_ack_impl(
     state: &AppState,
     trust: &TrustContext,
@@ -373,6 +389,16 @@ pub async fn message_ack_impl(
     let Some(job) = job else {
         return Err(GradatumError::Storage("message delivery not found".into()));
     };
+    // Une livraison acquittée est terminale, donc purgeable (F-160, L-C) : sa purge
+    // remplace `spec.kind` par `Job::PayloadPurged` et le destinataire, lui, est perdu.
+    // Le `_ => false` ci-dessous rapporte alors « not owned » — y compris au
+    // destinataire légitime — et c'est VOULU : personne ne peut plus ré-établir
+    // l'appartenance depuis la ligne, donc la réponse ne peut pas en dépendre.
+    // Une réponse distinctive (un 409 « already acknowledged ») rendrait la livraison
+    // purgée distinguable d'une livraison inconnue : oracle d'existence pour tout agent
+    // crédité, et réponse gouvernée par une purge de maintenance interne plutôt que par
+    // l'état propre de l'appelant. Les deux tests de `messaging_f144.rs` verrouillent
+    // ce 404 muet, destinataire comme non-destinataire : ne pas « corriger » ce bras.
     let owned = match &job.spec.kind {
         Job::Message(spec) => spec.recipient == recipient,
         _ => false,
@@ -451,7 +477,7 @@ impl MessagePollStatus {
 
 /// Returns the mailbox vaults the caller may read messaging in (C1 allow-list).
 ///
-/// Mono-vault (default, homelab) → `["main"]`, byte-identical legacy (grants never
+/// Mono-vault (default, single-installation) → `["main"]`, byte-identical legacy (grants never
 /// consulted). `multi_tenant` ON → intersection tenant-grants ∩ agent-grants whose
 /// access allows read of the `messaging` section (vault-wide or messaging-scoped).
 async fn readable_messaging_vaults(
@@ -506,6 +532,17 @@ fn read_registry(
     }
 }
 
+/// Hard bound on the poll's page size — mirrors the clamp of `list_messaging_notes`.
+const MESSAGE_POLL_PAGE_MAX: usize = 200;
+
+/// Maximum number of locus pages scanned per poll call.
+///
+/// Bounds the cost of a poll on a heavily archived mailbox: each scanned page costs
+/// one delivery-status read, plus one for the reconciliation pass that precedes the
+/// poll — never one read per record. Reaching this guard never truncates silently:
+/// the call returns a resume cursor.
+const MESSAGE_POLL_MAX_PAGES: usize = 20;
+
 /// Polls the caller's mailbox (F-144) — `message_poll`.
 ///
 /// Recipient = the caller's credited identity (never a request parameter).
@@ -549,74 +586,115 @@ pub async fn message_poll_impl(
     // re-enfilée avant la lecture → aucun `accepted` muet.
     let _reconciled = reconcile_delivery_jobs(state, &vaults, &recipient).await?;
 
-    let (records, _total) = state
-        .search
-        .list_messaging_notes(&vaults, &recipient, limit, cursor)
-        .await?;
+    // F-276 : le filtre `accepted`/`delivered` s'applique APRÈS la lecture du locus.
+    // Lire une seule page rendait donc une page vide dès que les notes de tête étaient
+    // toutes du mauvais statut, alors que des messages sélectionnables suivaient. On lit
+    // autant de pages que nécessaire pour remplir `want` messages SÉLECTIONNÉS.
+    let want = limit.clamp(1, MESSAGE_POLL_PAGE_MAX);
+    let mut messages = Vec::with_capacity(want);
+    let mut page_cursor: Option<String> = cursor.map(str::to_owned);
+    let mut next_cursor: Option<String> = None;
 
-    let mut messages = Vec::with_capacity(records.len());
-    for rec in &records {
-        // Statut de livraison (ligne état-porteuse) : Done → delivered, sinon accepted.
-        let Ok(id) = Ulid::from_string(&rec.id) else {
-            continue;
-        };
-        let job = state
+    for _ in 0..MESSAGE_POLL_MAX_PAGES {
+        let (records, _total) = state
+            .search
+            .list_messaging_notes(&vaults, &recipient, want, page_cursor.as_deref())
+            .await?;
+        // Une page plus courte que demandée prouve l'épuisement du locus — le seul cas où
+        // « fin de liste » est un fait et non une supposition.
+        let exhausted = records.len() < want;
+        let last_read = records.last().map(|r| r.id.clone());
+
+        // Statuts de livraison de la page entière, en une lecture de file : lire la
+        // ligne de chaque note ramènerait une requête par note sur une page de 200.
+        let page_ids: Vec<Ulid> = records
+            .iter()
+            .filter_map(|rec| Ulid::from_string(&rec.id).ok())
+            .collect();
+        let jobs = state
             .job_store
-            .get(id, None)
+            .get_many(&page_ids, None)
             .await
-            .map_err(|e| GradatumError::Storage(format!("delivery get {id}: {e}")))?;
-        let delivered = matches!(
-            job.as_ref().map(|j| &j.lifecycle.status),
-            Some(JobStatus::Done)
-        );
-        let is_selected = match filter {
-            MessagePollStatus::Accepted => !delivered,
-            MessagePollStatus::Delivered => delivered,
-        };
-        if !is_selected {
-            continue;
+            .map_err(|e| GradatumError::Storage(format!("delivery get_many: {e}")))?;
+        let jobs: HashMap<Ulid, JobRecord> = jobs.into_iter().map(|job| (job.id, job)).collect();
+
+        for rec in &records {
+            // Statut de livraison (ligne état-porteuse) : Done → delivered, sinon accepted.
+            let Ok(id) = Ulid::from_string(&rec.id) else {
+                continue;
+            };
+            let delivered = matches!(
+                jobs.get(&id).map(|j| &j.lifecycle.status),
+                Some(JobStatus::Done)
+            );
+            let is_selected = match filter {
+                MessagePollStatus::Accepted => !delivered,
+                MessagePollStatus::Delivered => delivered,
+            };
+            if !is_selected {
+                continue;
+            }
+
+            // Sujet porté dans le frontmatter extra de la note (lu via le registre vault,
+            // même point d'ACL que vault_read — C5). Une note ghost (impossible ici) est
+            // ignorée silencieusement.
+            let Ok(note) = read_registry(state, &rec.vault_id)?
+                .read_note_by_id(&rec.id)
+                .await
+            else {
+                continue;
+            };
+            let subject = note
+                .frontmatter
+                .extra
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+
+            let created_at = match chrono::DateTime::<Utc>::from_timestamp_millis(rec.created) {
+                Some(ts) => ts,
+                None => continue,
+            };
+
+            messages.push(
+                gradatum_dto::MessageEnvelope::new(
+                    rec.id.clone(),
+                    rec.author.clone().unwrap_or_default(),
+                    recipient.clone(),
+                    subject,
+                    rec.body_text.clone(),
+                    created_at,
+                )
+                .with_vault_id(rec.vault_id.clone()),
+            );
+
+            // `limit` borne la PAGE (contrat du DTO), pas la moisson : on rompt DANS la
+            // page, sinon une page qui démarre sous la limite peut la franchir d'un bloc
+            // et rendre jusqu'à `2 × want − 1` messages. Le curseur porte le dernier
+            // message RENDU — et non le dernier enregistrement LU : tronquer après coup
+            // rendrait les messages coupés définitivement inatteignables.
+            if messages.len() >= want {
+                return Ok(MessagePollResponse {
+                    messages,
+                    next_cursor: Some(rec.id.clone()),
+                });
+            }
         }
 
-        // Sujet porté dans le frontmatter extra de la note (lu via le registre vault,
-        // même point d'ACL que vault_read — C5). Une note ghost (impossible ici) est
-        // ignorée silencieusement.
-        let Ok(note) = read_registry(state, &rec.vault_id)?
-            .read_note_by_id(&rec.id)
-            .await
-        else {
-            continue;
-        };
-        let subject = note
-            .frontmatter
-            .extra
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-
-        let created_at = match chrono::DateTime::<Utc>::from_timestamp_millis(rec.created) {
-            Some(ts) => ts,
-            None => continue,
-        };
-
-        messages.push(
-            gradatum_dto::MessageEnvelope::new(
-                rec.id.clone(),
-                rec.author.clone().unwrap_or_default(),
-                recipient.clone(),
-                subject,
-                rec.body_text.clone(),
-                created_at,
-            )
-            .with_vault_id(rec.vault_id.clone()),
-        );
+        if exhausted {
+            next_cursor = None;
+            break;
+        }
+        // Page pleine : des notes restent derrière. Le curseur de reprise est rendu dans
+        // TOUS les cas d'arrêt non-épuisement — la limite est déjà sortie plus haut, il
+        // reste la garde de balayage. Un `None` ici serait une fin de liste feinte : le
+        // client conclurait « plus rien » alors que des messages restent inatteignables.
+        next_cursor = last_read.clone();
+        page_cursor = last_read;
+        if page_cursor.is_none() {
+            break;
+        }
     }
-
-    // Pagination : page pleine → cursor = dernier id ; sinon fin de liste.
-    let next_cursor = if records.len() == limit.clamp(1, 200) {
-        records.last().map(|r| r.id.clone())
-    } else {
-        None
-    };
 
     Ok(MessagePollResponse {
         messages,

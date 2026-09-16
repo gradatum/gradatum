@@ -2,18 +2,14 @@
 //!
 //! Evaluation invariants:
 //! - **Default deny**: any request with no explicit match returns [`AclDecision::DenyImplicit`].
-//! - **Personal-classified short-circuit**: when `sees_personal_classified == false`
-//!   and the locus contains the string `"personal-classified"`, the decision is
-//!   [`AclDecision::DenyExplicit`] before pattern evaluation begins.
 //!
 //! ## Evaluation logic (descending priority order)
 //!
 //! 1. `TrustContext::Unauthenticated` → [`AclDecision::DenyImplicit`] immediately.
 //! 2. Unknown identity (no matching consumer) → [`AclDecision::DenyImplicit`].
-//! 3. Personal-classified short-circuit → [`AclDecision::DenyExplicit`].
-//! 4. Negation pattern (`!glob`) matches → [`AclDecision::DenyExplicit`] (**deny-wins**).
-//! 5. Allow pattern matches → [`AclDecision::Allow`].
-//! 6. Otherwise → [`AclDecision::DenyImplicit`].
+//! 3. Negation pattern (`!glob`) matches → [`AclDecision::DenyExplicit`] (**deny-wins**).
+//! 4. Allow pattern matches → [`AclDecision::Allow`].
+//! 5. Otherwise → [`AclDecision::DenyImplicit`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -50,7 +46,7 @@ pub enum AclOp {
 pub enum AclDecision {
     /// Access granted.
     Allow,
-    /// Explicit denial — a negation pattern matched, or the personal-classified short-circuit fired.
+    /// Explicit denial — a negation pattern matched (deny-wins), or tenant isolation fired.
     DenyExplicit,
     /// Implicit denial — no allow pattern matched (default deny).
     DenyImplicit,
@@ -66,6 +62,16 @@ pub enum AclError {
     /// Invalid glob pattern.
     #[error("invalid glob pattern: {0}")]
     Glob(#[from] globset::Error),
+    /// A preset still carries a configuration key removed in 2.4.0. The denial it
+    /// used to express must now be written as a `!` negation pattern in the
+    /// consumer's `read_patterns`/`write_patterns`.
+    #[error(
+        "removed preset field `{field}`: express the denial with a `!` negation pattern instead"
+    )]
+    RemovedPresetField {
+        /// Name of the removed configuration key found in a consumer table.
+        field: &'static str,
+    },
 }
 
 // ── Sérialisation TOML ───────────────────────────────────────────────────────
@@ -95,10 +101,6 @@ pub struct ConsumerEntry {
     pub read_patterns: Vec<String>,
     /// Write glob patterns. A `!` prefix marks a negation (deny-wins).
     pub write_patterns: Vec<String>,
-    /// When `false` (default), any access to a locus containing `"personal-classified"`
-    /// is explicitly denied.
-    #[serde(default)]
-    pub sees_personal_classified: bool,
 }
 
 // ── Moteur ACL ───────────────────────────────────────────────────────────────
@@ -118,7 +120,6 @@ struct CompiledConsumer {
     read_deny: GlobSet,
     write_allow: GlobSet,
     write_deny: GlobSet,
-    sees_personal_classified: bool,
 }
 
 impl AclEngine {
@@ -127,9 +128,17 @@ impl AclEngine {
     /// # Errors
     ///
     /// Returns [`AclError::Toml`] if the TOML is invalid,
-    /// or [`AclError::Glob`] if a glob pattern cannot be compiled.
+    /// [`AclError::Glob`] if a glob pattern cannot be compiled, or
+    /// [`AclError::RemovedPresetField`] if a consumer table still carries a
+    /// configuration key removed in 2.4.0.
     pub fn from_preset_str(toml_str: &str) -> Result<Self, AclError> {
-        let preset: AclPreset = toml::from_str(toml_str)?;
+        // Parse once as a generic document to run the migration guard on the parsed
+        // structure — never a substring scan of the raw text (a comment or a
+        // `description` value naming the key must not trigger it), then deserialize
+        // the same document into the typed preset.
+        let doc: toml::Value = toml::from_str(toml_str)?;
+        reject_removed_preset_field(&doc)?;
+        let preset: AclPreset = doc.try_into()?;
         let consumers = preset
             .consumer
             .into_iter()
@@ -172,10 +181,9 @@ impl AclEngine {
     /// 3. Tenant isolation (P1 #3) → `DenyExplicit` if the locus prefix
     ///    belongs to a different tenant than the token's `tenant_id`.
     ///    The `tenant_vault_grants` system (higher level) can override this.
-    /// 4. Personal-classified short-circuit → `DenyExplicit`.
-    /// 5. Deny pattern (negation `!`) matched → `DenyExplicit`.
-    /// 6. Allow pattern matched → `Allow`.
-    /// 7. Otherwise → `DenyImplicit`.
+    /// 4. Deny pattern (negation `!`) matched → `DenyExplicit`.
+    /// 5. Allow pattern matched → `Allow`.
+    /// 6. Otherwise → `DenyImplicit`.
     #[must_use]
     pub fn evaluate(&self, trust: &TrustContext, op: AclOp, locus: &str) -> AclDecision {
         // Step 1: Unauthenticated → immediate denial.
@@ -221,27 +229,24 @@ impl AclEngine {
             return AclDecision::DenyExplicit;
         }
 
-        // Step 4: personal-classified short-circuit.
-        if !c.sees_personal_classified && locus.contains("personal-classified") {
-            return AclDecision::DenyExplicit;
-        }
-
         let (allow, deny) = match op {
             AclOp::Read => (&c.read_allow, &c.read_deny),
             AclOp::Write => (&c.write_allow, &c.write_deny),
         };
 
-        // Step 5: deny-wins — negation takes priority over allow.
+        // Step 4: deny-wins — negation takes priority over allow. The
+        // personal-classified denial is now carried here, by segment-scoped `!`
+        // negations in the preset, instead of a dedicated short-circuit (F-297).
         if deny.is_match(locus) {
             return AclDecision::DenyExplicit;
         }
 
-        // Step 6: explicit allow.
+        // Step 5: explicit allow.
         if allow.is_match(locus) {
             return AclDecision::Allow;
         }
 
-        // Step 7: implicit default — no pattern matched.
+        // Step 6: implicit default — no pattern matched.
         AclDecision::DenyImplicit
     }
 
@@ -286,6 +291,38 @@ pub fn messaging_channel_locus(recipient_identity: &str) -> String {
 
 // ── Helpers internes ─────────────────────────────────────────────────────────
 
+/// Configuration key removed in 2.4.0: the personal-classified denial is now
+/// expressed as `!` negation patterns in the preset, per consumer.
+const REMOVED_FIELD_SEES_PERSONAL_CLASSIFIED: &str = "sees_personal_classified";
+
+/// Rejects a preset that still carries a removed configuration key on a consumer table.
+///
+/// Operates on the **parsed** document, never on the raw text: it inspects only the
+/// keys of each `[[consumer]]` table. A comment or a `description` value naming the
+/// removed key does not trigger it — which matters because `materialize_preset`
+/// copies the preset (comments included) verbatim into the deployed `bearer.toml`.
+/// `[[consumer-template]]` blocks are not read by [`AclPreset`] at runtime and are
+/// left untouched here as well.
+///
+/// # Errors
+///
+/// Returns [`AclError::RemovedPresetField`] naming the offending key.
+fn reject_removed_preset_field(doc: &toml::Value) -> Result<(), AclError> {
+    let Some(consumers) = doc.get("consumer").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    for c in consumers {
+        if c.as_table()
+            .is_some_and(|t| t.contains_key(REMOVED_FIELD_SEES_PERSONAL_CLASSIFIED))
+        {
+            return Err(AclError::RemovedPresetField {
+                field: REMOVED_FIELD_SEES_PERSONAL_CLASSIFIED,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Compiles a [`ConsumerEntry`] into a [`CompiledConsumer`] with pre-built `GlobSet`s.
 fn compile_consumer(c: ConsumerEntry) -> Result<CompiledConsumer, AclError> {
     let (read_allow, read_deny) = split_patterns(&c.read_patterns)?;
@@ -296,7 +333,6 @@ fn compile_consumer(c: ConsumerEntry) -> Result<CompiledConsumer, AclError> {
         read_deny,
         write_allow,
         write_deny,
-        sees_personal_classified: c.sees_personal_classified,
     })
 }
 

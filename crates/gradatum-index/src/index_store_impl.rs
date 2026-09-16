@@ -429,6 +429,21 @@ impl IndexStore for SqliteIndex {
             .await
     }
 
+    /// Tag-filtered note listing — delegates to the inherent `SqliteIndex::list_notes_by_tag`
+    /// (inherent method takes priority over this trait method, so this is delegation, not
+    /// recursion — same shape as `list_notes_filtered`).
+    async fn list_notes_by_tag(
+        &self,
+        vault_id: &str,
+        section: Option<&str>,
+        tag: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NoteRecord>, u64), GradatumError> {
+        self.list_notes_by_tag(vault_id, section, tag, limit, cursor)
+            .await
+    }
+
     /// Lists `k` most recently active notes — delegates to `SqliteIndex::list_recent_notes`.
     async fn list_recent_notes(
         &self,
@@ -469,6 +484,18 @@ impl IndexStore for SqliteIndex {
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, String>, GradatumError> {
         self.get_statuses(vault_id.as_str(), ids).await
+    }
+
+    /// Note tags for a batch of note IDs — delegates to `SqliteIndex::get_tags_batch`.
+    ///
+    /// Overrides the fail-closed default of the trait: without this override the call
+    /// answers `Err`, and the D-14(b) read guard would refuse every search.
+    async fn get_tags_batch(
+        &self,
+        vault_id: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, GradatumError> {
+        self.get_tags_batch(vault_id, ids).await
     }
 
     /// Trust score from the `notes.trust` column — delegates to `SqliteIndex::get_trust`.

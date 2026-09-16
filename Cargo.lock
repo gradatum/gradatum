@@ -26,6 +26,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
+ "const-random",
  "getrandom 0.3.4",
  "once_cell",
  "serde",
@@ -344,9 +345,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.3"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -354,14 +355,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.40.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -1779,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "gradatum-core",
  "gradatum-sdk-rs",
@@ -1787,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-acl-auth"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1806,10 +1808,11 @@ dependencies = [
 
 [[package]]
 name = "gradatum-acl-policy"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "globset",
  "gradatum-core",
+ "insta",
  "serde",
  "thiserror",
  "toml 1.1.3+spec-1.1.0",
@@ -1818,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-admin"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1840,6 +1843,7 @@ dependencies = [
  "gradatum-vault",
  "hex",
  "rand 0.8.6",
+ "regex",
  "reqwest 0.13.4",
  "rusqlite",
  "serde",
@@ -1857,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-auth"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1881,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-bench"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1896,6 +1900,7 @@ dependencies = [
  "gradatum-index",
  "gradatum-storage",
  "once_cell",
+ "parquet",
  "regex",
  "reqwest 0.13.4",
  "rusqlite",
@@ -1912,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-cache"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -1922,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-chat"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1943,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-cli"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "clap",
  "reqwest 0.13.4",
@@ -1954,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-core"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1980,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-curator"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2006,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-db-sqlite"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2016,7 +2021,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
- "thiserror",
  "tokio",
  "tracing",
  "ulid 3.0.0",
@@ -2024,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-distill"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "gradatum-core",
@@ -2034,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-dto"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -2045,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-embed"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "fastembed",
@@ -2061,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-engine"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2089,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-gateway"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2125,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-heartbeat"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "gradatum-dto",
  "reqwest 0.13.4",
@@ -2136,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-index"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2149,7 +2153,6 @@ dependencies = [
  "smallvec",
  "sqlite-vec",
  "tempfile",
- "thiserror",
  "tokio",
  "tracing",
  "ulid 3.0.0",
@@ -2157,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-ingest"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "gradatum-core",
  "gradatum-index",
@@ -2176,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-markdown"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "gradatum-core",
  "once_cell",
@@ -2189,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-mcp-stub"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2208,8 +2211,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gradatum-privacy"
+version = "2.4.0"
+dependencies = [
+ "gradatum-core",
+ "regex",
+]
+
+[[package]]
 name = "gradatum-queue"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2227,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-sdk-rs"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "reqwest 0.13.4",
  "serde",
@@ -2237,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-search"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -2253,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-server"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "apalis",
@@ -2274,6 +2285,8 @@ dependencies = [
  "gradatum-embed",
  "gradatum-heartbeat",
  "gradatum-index",
+ "gradatum-markdown",
+ "gradatum-privacy",
  "gradatum-queue",
  "gradatum-search",
  "gradatum-storage",
@@ -2313,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-storage"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "gradatum-core",
@@ -2329,11 +2342,11 @@ dependencies = [
 
 [[package]]
 name = "gradatum-studio"
-version = "2.3.0"
+version = "2.4.0"
 
 [[package]]
 name = "gradatum-vault"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2341,6 +2354,7 @@ dependencies = [
  "gradatum-core",
  "gradatum-index",
  "gradatum-markdown",
+ "gradatum-privacy",
  "gradatum-storage",
  "serde",
  "serde_json",
@@ -2355,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-warden"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2374,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-worker"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "apalis",
@@ -2444,6 +2458,7 @@ checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
  "cfg-if",
  "crunchy",
+ "num-traits",
  "zerocopy",
 ]
 
@@ -2884,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "index-parity-tests"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -2946,6 +2961,12 @@ dependencies = [
  "similar",
  "tempfile",
 ]
+
+[[package]]
+name = "integer-encoding"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 
 [[package]]
 name = "interpolate_name"
@@ -3537,6 +3558,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "num"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
+dependencies = [
+ "num-complex",
+ "num-integer",
+ "num-iter",
+ "num-rational",
+ "num-traits",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3869,6 +3903,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "ordered-float"
+version = "2.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "ordered-multimap"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3939,6 +3982,25 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "parquet"
+version = "54.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bfb15796ac6f56b429fd99e33ba133783ad75b27c36b4b5ce06f1f82cc97754e"
+dependencies = [
+ "ahash",
+ "bytes",
+ "chrono",
+ "half",
+ "hashbrown 0.15.5",
+ "num",
+ "num-bigint",
+ "paste",
+ "seq-macro",
+ "thrift",
+ "twox-hash",
 ]
 
 [[package]]
@@ -5042,9 +5104,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -5107,9 +5169,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -5263,6 +5325,12 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "seq-macro"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bc711410fbe7399f390ca1c3b60ad0f53f80e95c5eb935e52268a0e2cd49acc"
 
 [[package]]
 name = "serde"
@@ -5759,6 +5827,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "thrift"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e54bc85fc7faa8bc175c4bab5b92ba8d9a3ce893d0e9f42cc455c8ab16a9e09"
+dependencies = [
+ "byteorder",
+ "integer-encoding",
+ "ordered-float",
+]
+
+[[package]]
 name = "tiff"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6230,6 +6309,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "twox-hash"
+version = "1.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
+dependencies = [
+ "cfg-if",
+ "static_assertions",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6385,7 +6474,7 @@ dependencies = [
 
 [[package]]
 name = "v1-parity-tests"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "async-trait",
  "axum",

@@ -779,6 +779,71 @@ impl SqliteIndex {
 
         Ok(out)
     }
+
+    /// Batch tag read — the D-14(b) read guard's input.
+    ///
+    /// Returns the `tags` column **space-split**, for the ids present in `vault_id`.
+    /// Rows absent from `notes`, and rows whose `tags` column is `NULL`, are **absent**
+    /// from the map: "no row" and "no tag" are different states, and a caller that
+    /// needs to tell them apart cannot do so through a shared empty vector.
+    ///
+    /// A sentinel id is never returned, exactly like [`Self::get_titles_sections`].
+    pub async fn get_tags_batch(
+        &self,
+        vault_id: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, GradatumError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // SQLite limite SQLITE_LIMIT_VARIABLE_NUMBER à 999.
+        // vault_id occupe 1 slot → chaque lot peut contenir au plus 998 IDs.
+        const CHUNK_SIZE: usize = 998;
+
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        let conn = self.conn.lock().await;
+
+        for chunk in ids.chunks(CHUNK_SIZE) {
+            let placeholders: String = (2..=chunk.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let sql = format!(
+                "SELECT id, tags \
+                 FROM notes \
+                 WHERE vault_id = ?1 \
+                   AND id IN ({placeholders}) \
+                   AND id NOT LIKE '__sentinel__%'"
+            );
+
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| GradatumError::Storage(format!("get_tags_batch prepare: {e}")))?;
+
+            let mut param_values: Vec<String> = Vec::with_capacity(chunk.len() + 1);
+            param_values.push(vault_id.to_owned());
+            param_values.extend_from_slice(chunk);
+
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| GradatumError::Storage(format!("get_tags_batch query: {e}")))?;
+
+            for row in rows {
+                let (id, tags) =
+                    row.map_err(|e| GradatumError::Storage(format!("get_tags_batch row: {e}")))?;
+                // `NULL` → no entry, never an empty vec (see the trait doc-comment).
+                let Some(tags) = tags else { continue };
+                let decoded: Vec<String> = tags.split_whitespace().map(str::to_owned).collect();
+                out.insert(id, decoded);
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

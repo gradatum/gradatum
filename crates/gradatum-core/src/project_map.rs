@@ -929,7 +929,7 @@ impl StructureIndex {
     fn from_bodies<'a>(bodies: impl Iterator<Item = &'a str>) -> Self {
         let mut by_identity: BTreeMap<String, StructureFacts> = BTreeMap::new();
         for body in bodies {
-            let links: Vec<ProjectMapLink> = extract_wikilink_targets(body)
+            let links: Vec<ProjectMapLink> = extract_structural_targets(body)
                 .into_iter()
                 .filter_map(|t| parse_link(&t).ok())
                 .collect();
@@ -2086,7 +2086,7 @@ pub fn reserved_node_target(raw: &str) -> Option<String> {
 /// not brick live writes before it exists).
 #[must_use]
 pub fn derivable_track_target(body: &str) -> Option<String> {
-    let links: Vec<ProjectMapLink> = extract_wikilink_targets(body)
+    let links: Vec<ProjectMapLink> = extract_structural_targets(body)
         .iter()
         .filter_map(|t| parse_link(t).ok())
         .collect();
@@ -2200,7 +2200,7 @@ fn feature_sort_key(id: &str) -> u32 {
 /// The scan is char-safe and allocation-free beyond the parse; no `regex` dependency.
 #[must_use]
 pub fn max_feature_number(body: &str) -> Option<u32> {
-    extract_wikilink_targets(body)
+    extract_structural_targets(body)
         .iter()
         .filter_map(|target| match parse_link(target).ok()? {
             ProjectMapLink::Feature(id)
@@ -2282,7 +2282,7 @@ pub fn project_map_feature_entries_scoped(
 
     for (body, title) in notes {
         // Parser les wikilinks — ignorer silencieusement les cibles invalides.
-        let links: Vec<ProjectMapLink> = extract_wikilink_targets(body)
+        let links: Vec<ProjectMapLink> = extract_structural_targets(body)
             .into_iter()
             .filter_map(|t| parse_link(&t).ok())
             .collect();
@@ -2474,7 +2474,7 @@ pub fn project_map_feature_entries_derived_scoped(
     let mut diagnostics: Vec<DerivationDiagnostic> = Vec::new();
 
     for (body, title) in notes {
-        let links: Vec<ProjectMapLink> = extract_wikilink_targets(body)
+        let links: Vec<ProjectMapLink> = extract_structural_targets(body)
             .into_iter()
             .filter_map(|t| parse_link(&t).ok())
             .collect();
@@ -2587,6 +2587,25 @@ pub fn project_map_feature_entries_derived_scoped(
     }
 
     entries.sort_by_key(|e| feature_sort_key(&e.feature));
+
+    // Ordre TOTAL et déterministe des diagnostics — ils sont poussés en ordre de note, mais la CLI
+    // les émet sur stderr et l'appelant doit les surfacer : l'ordre d'entrée ne doit pas transparaître.
+    // `feature` seul n'est PAS une clé totale (des homonymes `F-XX` coexistent dans le corpus), d'où
+    // le départage sur tous les axes observables. `feature_sort_key` donne le MÊME ordre numérique
+    // que les `entries` ci-dessus (jamais l'ordre lexical `F-10 < F-9`). La représentation `Debug` de
+    // `reason` est l'axe le moins coûteux (pas de `derive` d'`Ord`/`Hash` à propager sur
+    // `DerivationFallbackReason`) : axe stable POUR CE BINAIRE, non contractuel — la forme `Debug`
+    // dérivée n'est pas garantie entre versions de rustc, et `DerivationFallbackReason` est
+    // `#[non_exhaustive]` : ne jamais adosser un snapshot des diagnostics à cet axe.
+    diagnostics.sort_by_cached_key(|d| {
+        (
+            feature_sort_key(&d.feature),
+            d.feature.clone(),
+            d.stored.clone(),
+            format!("{:?}", d.reason),
+        )
+    });
+
     DerivedExport {
         entries,
         diagnostics,
@@ -2702,7 +2721,7 @@ pub fn project_map_card_index(
     let mut entries: Vec<ProjectMapCardEntry> = Vec::new();
 
     for (id, body, title) in notes {
-        let links: Vec<ProjectMapLink> = extract_wikilink_targets(body)
+        let links: Vec<ProjectMapLink> = extract_structural_targets(body)
             .into_iter()
             .filter_map(|t| parse_link(&t).ok())
             .collect();
@@ -2811,38 +2830,19 @@ pub fn project_map_card_index(
     entries
 }
 
-/// Extracts the raw `[[target]]` wikilink targets from a body.
-///
-/// A char-safe scan with no `regex` dependency. Returns whatever sits between `[[` and
-/// `]]` — the raw target, `role:` prefix included, ready for `parse_link`.
-///
-/// Internal helper, factored out of [`project_map_feature_entries`].
-fn extract_wikilink_targets(body: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut rest = body;
-    while let Some(start) = rest.find("[[") {
-        let after_open = &rest[start + 2..];
-        if let Some(end) = after_open.find("]]") {
-            result.push(after_open[..end].to_string());
-            rest = &after_open[end + 2..];
-        } else {
-            break;
-        }
-    }
-    result
-}
-
 /// Extracts the wikilink targets of a body's **structural zone** only — the lines composed
 /// solely of `[[…]]` tokens and visual separators, outside fenced code blocks.
 ///
-/// This is the write-time counterpart of [`extract_wikilink_targets`] (whole-body scan). A role
+/// This is the **single** target extractor of the registry: every read projection and the
+/// write-path validator ([`validate_card_body`]) read roles through it, so a role is counted
+/// identically whether a card is being written or projected (read/write parity). A role
 /// **cited** in prose or inside a ```` ``` ```` fence — the way a card documents the role syntax —
-/// is deliberately excluded, so it never inflates a cardinality count. A **structural line** is a
-/// line that, once every `[[…]]` token is removed, contains only whitespace and the separator
-/// punctuation actually used between role links (`·`, `•`, `|`, `,`, `—`, `–`, `-`). A prose line
-/// keeps letters/digits/backticks in its residue and is therefore skipped; role wikilinks the
-/// server injects on their own trailing line (`\n\n[[track:…]]`, `\n\n[[feature:…]]`) are kept,
-/// as their residue is empty.
+/// is deliberately excluded, so it never inflates a cardinality count nor a read projection. A
+/// **structural line** is a line that, once every `[[…]]` token is removed, contains only
+/// whitespace and the separator punctuation actually used between role links
+/// (`·`, `•`, `|`, `,`, `—`, `–`, `-`). A prose line keeps letters/digits/backticks in its residue
+/// and is therefore skipped; role wikilinks the server injects on their own trailing line
+/// (`\n\n[[track:…]]`, `\n\n[[feature:…]]`) are kept, as their residue is empty.
 fn extract_structural_targets(body: &str) -> Vec<String> {
     /// Separators tolerated between role wikilinks on a structural line. Deliberately excludes
     /// the backtick: a role cited as `` `[[release:planned]]` `` in prose must stay non-structural.
@@ -2946,7 +2946,7 @@ pub struct ProjectMapRoles {
 #[must_use]
 pub fn roles_of_body(body: &str) -> ProjectMapRoles {
     let mut roles = ProjectMapRoles::default();
-    for target in extract_wikilink_targets(body) {
+    for target in extract_structural_targets(body) {
         match parse_link(&target) {
             Ok(ProjectMapLink::Kind(k)) if roles.kind.is_none() => roles.kind = Some(k.as_wire()),
             Ok(ProjectMapLink::Status(s)) if roles.status.is_none() => {
@@ -4659,13 +4659,257 @@ mod card_index_tests {
 }
 
 #[cfg(test)]
+mod code_prose_exclusion_f296_tests {
+    //! F-296 reliquat 2 — the read projections read the card's **structural zone** only, exactly
+    //! like the write-path validator. A role merely *cited* in prose or inside a code fence must
+    //! never feed a projection (defect ANO-DEFER-SILENT, A6 sweep 2026-09-14).
+    use super::*;
+
+    fn card(id: &str, body: &str, title: &str) -> (String, String, String) {
+        (id.to_string(), body.to_string(), title.to_string())
+    }
+
+    /// A structure card whose structural zone carries `[[version:gradatum/2.4.0]]` and whose prose
+    /// history line *cites* `` `[[version:gradatum/9.9.9]]` `` between code marks: the projection
+    /// keeps 2.4.0 only. `[[version:]]` is last-wins in the card loop, so a whole-body scan would
+    /// let the prose 9.9.9 override the structural version — the exact defect.
+    #[test]
+    fn history_line_citing_a_role_in_code_is_not_counted() {
+        let notes = vec![card(
+            "01STRUCT0000000000000024AA",
+            "[[project:gradatum]] [[kind:ROADMAP]] [[version:gradatum/2.4.0]]\n\
+             \n\
+             History: this roadmap documents the version syntax `[[version:gradatum/9.9.9]]` \
+             and the status syntax `[[status:DONE]]` as inline prose examples.",
+            "ROADMAP 2.4.0",
+        )];
+
+        let out = project_map_card_index(&notes, None, Some("gradatum"));
+        assert_eq!(
+            out.len(),
+            1,
+            "one card in, one entry out, never two: {out:?}"
+        );
+        assert_eq!(
+            out[0].version.as_deref(),
+            Some("v2.4.0"),
+            "the prose-cited 9.9.9 must not override the structural version"
+        );
+
+        // The 9.9.9 cited in prose must not attach the card to that version filter.
+        let filtered_999 = project_map_card_index(&notes, Some("9.9.9"), Some("gradatum"));
+        assert!(
+            filtered_999.is_empty(),
+            "a version cited in prose must not make the card match that version: {filtered_999:?}"
+        );
+    }
+
+    /// The same body: `roles_of_body` reports the structural-zone kind, never the `[[status:DONE]]`
+    /// cited in prose (the structural zone carries no status).
+    #[test]
+    fn roles_of_body_reads_the_structural_zone_only() {
+        let body = "[[project:gradatum]] [[kind:ROADMAP]] [[version:gradatum/2.4.0]]\n\
+             \n\
+             History: this roadmap documents the version syntax `[[version:gradatum/9.9.9]]` \
+             and the status syntax `[[status:DONE]]` as inline prose examples.";
+
+        let roles = roles_of_body(body);
+        assert_eq!(roles.kind, Some("ROADMAP"), "structural kind is kept");
+        assert_eq!(
+            roles.status, None,
+            "a status cited in prose is not a role of the card"
+        );
+    }
+
+    /// Parity guard: for a body **without** any prose/code citation, the seven migrated read sites
+    /// return exactly what they returned under the whole-body scan (literal values). Structural
+    /// extraction is a strict subset — it only ever removes prose/code citations.
+    #[test]
+    fn clean_body_projections_are_unchanged() {
+        let structure_body = "[[project:gradatum]] [[kind:ROADMAP]] [[status:DONE]] \
+             [[version:gradatum/2.4.0]] [[visibilite:public]]";
+        let work_body = "[[feature:F-42]] [[project:gradatum]] [[status:DONE]] [[kind:FEATURE]] \
+             [[release:released]] [[version:gradatum/2.4.0]] [[track:gradatum/2.4.0]] \
+             [[supersedes:F-7]]";
+
+        // Site 1 — StructureIndex::from_bodies (via from_notes) indexes the structure card.
+        let bt: Vec<(String, String)> = vec![
+            (structure_body.to_string(), "ROADMAP 2.4.0".to_string()),
+            (work_body.to_string(), "F-42 fix".to_string()),
+        ];
+        let index = StructureIndex::from_notes(&bt);
+        assert!(
+            index.resolve_track("gradatum", "2.4.0").is_ok(),
+            "structure card 2.4.0 is indexed"
+        );
+
+        // Site 2 — derivable_track_target on a single-version, track-less work card.
+        let derivable_body = "[[feature:F-42]] [[project:gradatum]] [[status:OPEN]] [[kind:FIX]] \
+             [[version:gradatum/2.4.0]]";
+        assert_eq!(
+            derivable_track_target(derivable_body),
+            Some("gradatum/2.4.0".to_string())
+        );
+
+        // Site 3 — max_feature_number over feature/supersedes/parent on a structural line.
+        assert_eq!(max_feature_number(work_body), Some(42));
+
+        // Site 4 — project_map_feature_entries_scoped.
+        let scoped =
+            project_map_feature_entries_scoped(&bt, ExportOptions::default(), Some("gradatum"));
+        assert_eq!(scoped.len(), 1, "only the work card projects: {scoped:?}");
+        assert_eq!(scoped[0].feature, "F-42");
+        assert_eq!(scoped[0].release, "released");
+        assert_eq!(scoped[0].version.as_deref(), Some("v2.4.0"));
+
+        // Site 5 — project_map_feature_entries_derived_scoped (no diagnostic on a clean corpus).
+        let derived = project_map_feature_entries_derived_scoped(
+            &bt,
+            ExportOptions::default(),
+            Some("gradatum"),
+        );
+        assert_eq!(derived.entries.len(), 1);
+        assert_eq!(derived.entries[0].release, "released");
+        assert!(
+            derived.diagnostics.is_empty(),
+            "clean corpus derives cleanly: {:?}",
+            derived.diagnostics
+        );
+
+        // Site 6 — project_map_card_index.
+        let ibt = vec![
+            (
+                "01STRUCTCLEAN0000000024AA".to_string(),
+                structure_body.to_string(),
+                "ROADMAP 2.4.0".to_string(),
+            ),
+            (
+                "01WORKCLEAN000000000042AA".to_string(),
+                work_body.to_string(),
+                "F-42 fix".to_string(),
+            ),
+        ];
+        let listed = project_map_card_index(&ibt, None, Some("gradatum"));
+        assert_eq!(listed.len(), 2, "structure + work: {listed:?}");
+        let fix = listed
+            .iter()
+            .find(|e| e.feature.as_deref() == Some("F-42"))
+            .expect("F-42 listed");
+        assert_eq!(fix.kind.as_deref(), Some("FEATURE"));
+        assert_eq!(fix.status.as_deref(), Some("DONE"));
+        assert_eq!(fix.release.as_deref(), Some("released"));
+        assert_eq!(fix.version.as_deref(), Some("v2.4.0"));
+
+        // Site 7 — roles_of_body.
+        let roles = roles_of_body(work_body);
+        assert_eq!(roles.kind, Some("FEATURE"));
+        assert_eq!(roles.status, Some("DONE"));
+    }
+
+    /// Step 3b — the derivation diagnostics are emitted in a **deterministic** total order,
+    /// independent of card (input) order. Two cards with **distinct** `F-XX`, both failing to
+    /// derive (no `[[track:]]`), sort **numerically**: `F-90` before `F-100`. Lexicographically
+    /// `"F-100" < "F-90"`, so a plain `String` sort would reverse them — and contradict the
+    /// numerically-sorted `entries`. (`F-90`/`F-100` are both well-formed 2-/3-digit idents;
+    /// a 1-digit `F-9` is rejected by `parse_link`.)
+    #[test]
+    fn diagnostics_are_sorted_deterministically_across_distinct_features() {
+        let card_90 = (
+            "[[feature:F-90]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+             [[release:planned]] [[version:gradatum/2.4.0]]"
+                .to_string(),
+            "F-90".to_string(),
+        );
+        let card_100 = (
+            "[[feature:F-100]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+             [[release:planned]] [[version:gradatum/2.4.0]]"
+                .to_string(),
+            "F-100".to_string(),
+        );
+
+        let forward = project_map_feature_entries_derived_scoped(
+            &[card_90.clone(), card_100.clone()],
+            ExportOptions::default(),
+            None,
+        );
+        let reverse = project_map_feature_entries_derived_scoped(
+            &[card_100, card_90],
+            ExportOptions::default(),
+            None,
+        );
+
+        let features: Vec<&str> = forward
+            .diagnostics
+            .iter()
+            .map(|d| d.feature.as_str())
+            .collect();
+        assert_eq!(
+            features,
+            vec!["F-90", "F-100"],
+            "F-90 sorts numerically before F-100"
+        );
+        assert_eq!(
+            forward.diagnostics, reverse.diagnostics,
+            "diagnostic order is independent of input order"
+        );
+    }
+
+    /// Step 3b (collision) — two cards carrying the **same** `F-XX`, both failing to derive, with
+    /// **different** `stored` releases: `feature` is not a total key, so the tie must break on the
+    /// remaining axes for the order to be deterministic across input order.
+    #[test]
+    fn diagnostics_are_sorted_deterministically_on_feature_collision() {
+        let planned = (
+            "[[feature:F-60]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+             [[release:planned]] [[version:gradatum/2.4.0]]"
+                .to_string(),
+            "F-60 a".to_string(),
+        );
+        let released = (
+            "[[feature:F-60]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+             [[release:released]] [[version:gradatum/2.4.0]]"
+                .to_string(),
+            "F-60 b".to_string(),
+        );
+
+        let forward = project_map_feature_entries_derived_scoped(
+            &[planned.clone(), released.clone()],
+            ExportOptions::default(),
+            None,
+        );
+        let reverse = project_map_feature_entries_derived_scoped(
+            &[released, planned],
+            ExportOptions::default(),
+            None,
+        );
+
+        assert_eq!(forward.diagnostics.len(), 2, "two colliding diagnostics");
+        let stored: Vec<Option<&str>> = forward
+            .diagnostics
+            .iter()
+            .map(|d| d.stored.as_deref())
+            .collect();
+        assert_eq!(
+            stored,
+            vec![Some("planned"), Some("released")],
+            "same F-60, tie broken on stored: planned before released"
+        );
+        assert_eq!(
+            forward.diagnostics, reverse.diagnostics,
+            "collision order is independent of input order"
+        );
+    }
+}
+
+#[cfg(test)]
 mod max_feature_number_tests {
     use super::*;
 
-    /// The highest `[[feature:F-XX]]` role in the body wins, 2- and 3-digit forms mixed.
+    /// The highest `[[feature:F-XX]]` role in the body wins, 2- and 3-digit forms mixed. The roles
+    /// sit on the card's structural line (F-296: a role cited off the structural zone is not read).
     #[test]
     fn returns_max_over_feature_roles() {
-        let body = "[[feature:F-37]] [[project:gradatum]] see also [[feature:F-134]]";
+        let body = "[[feature:F-37]] [[project:gradatum]] [[feature:F-134]]";
         assert_eq!(max_feature_number(body), Some(134));
     }
 
@@ -4692,8 +4936,9 @@ mod max_feature_number_tests {
     #[test]
     fn ignores_non_wikilink_text_and_malformed_ids() {
         // `f-999` lowercase is not a valid feature ident; `[[feature:F-1]]` is malformed
-        // (1 digit) and rejected by parse_link → ignored. Only F-50 counts.
-        let body = "f-999 tag noise [[feature:F-1]] [[feature:F-50]]";
+        // (1 digit) and rejected by parse_link → ignored. Only F-50 counts. The prose noise
+        // sits on its own line so the structural line carries only the two wikilinks (F-296).
+        let body = "f-999 tag noise\n[[feature:F-1]] [[feature:F-50]]";
         assert_eq!(max_feature_number(body), Some(50));
     }
 

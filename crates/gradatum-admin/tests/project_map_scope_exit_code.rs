@@ -3,7 +3,7 @@
 //! Ces tests invoquent le VRAI binaire (`CARGO_BIN_EXE_gradatum-admin`) et mesurent son
 //! code de sortie, comme `api_key_cmd.rs` : la décision vit dans la commande, pas dans
 //! le module — la tester au seul niveau de `scope_exit_code` ne prouverait rien sur le
-//! CLI livré, qui est ce que le consommateur (`homelab-audit.sh`, bloc A7.2) exécute.
+//! CLI livré, qui est ce que le consommateur (le consommateur d'audit externe, bloc A7.2) exécute.
 //!
 //! ## Ce que ce fichier couvre, et ce qu'il ne couvre pas
 //!

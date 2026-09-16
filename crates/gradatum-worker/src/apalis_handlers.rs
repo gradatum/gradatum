@@ -409,7 +409,7 @@ fn ensure_main_tenant(tenant_id: &str) -> Result<(), HandlerError> {
 /// # Timeout
 ///
 /// Per-job timeout is enforced by the Apalis Tower layer (see `monitor.rs`
-/// `cfg.timeout_secs`, default 30 s for curate). This handler adds no redundant
+/// `cfg.timeout_secs`, default 300 s for curate). This handler adds no redundant
 /// timeout — the Tower layer is outer and takes effect first.
 pub async fn handle_curate(
     job: GradatumJob,
@@ -1345,6 +1345,106 @@ pub async fn handle_purge(
         files: vec![],
         result_note_md: format!(
             "purge lifecycle: {deleted_count} note(s) deleted, {skipped} skipped"
+        ),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Handler — Job::PrivacyRescan (F-160 L-D.2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for [`gradatum_core::Job::PrivacyRescan`] — one batch of a deferred sweep.
+///
+/// # Contract
+///
+/// - Receives a `GradatumJob` with `record.spec.kind = Job::PrivacyRescan(PrivacyRescanSpec)`.
+/// - Checks `DryRunAware::is_dry_run()` as the **first instruction**.
+/// - The job is enqueued by the product itself, from the `TASK_PRIVACY_RESCAN` tick, so
+///   `POST /api/v1/jobs` never carries this kind and no client can start a sweep.
+///
+/// # Where the work happens
+///
+/// **Not here.** The worker holds no vault and no index: it transports the spec's quota
+/// to `POST /internal/v1/privacy/rescan` and reports what came back. The server
+/// selects by tag and re-judges each note through the write primitive, which is the only
+/// funnel that can pose or retire a reserved tag — so D-11 holds on this path exactly as
+/// it does on a write, and a resumed pass may add `personal-classified` or clear
+/// `privacy-unscanned`, never declassify.
+///
+/// # Bounds
+///
+/// The batch bound is the spec's, and the server clamps it to the ceiling its own index
+/// honours. Nothing here loops over a corpus, and a replayed job re-selects from the
+/// index — the notes already re-judged are no longer `privacy-unscanned`, so no cursor
+/// has to be carried and nothing is lost by a failed attempt.
+///
+/// # Reporting
+///
+/// The counts are reported in `result_note_md`; `notes_modified` stays empty on purpose.
+/// The internal route returns *how many* notes were rewritten, never *which*: a note
+/// identity is not needed to resume a sweep, so it does not cross that route.
+pub async fn handle_privacy_rescan(
+    job: GradatumJob,
+    client: Data<Arc<dyn InternalClient>>,
+    mt: Data<MultiTenantCfg>,
+) -> Result<JobOutput, HandlerError> {
+    // DryRun guard — first instruction.
+    if job.record.is_dry_run() {
+        return Ok(JobOutput::dry_run(
+            0,
+            "privacy-rescan — a sweep is a re-judgement of notes the deployment already holds",
+        ));
+    }
+
+    let spec = match &job.record.spec.kind {
+        Job::PrivacyRescan(spec) => spec.clone(),
+        other => {
+            return Err(HandlerError::UnexpectedVariant(format!("{other:?}")));
+        }
+    };
+
+    // The vault is named by the spec **and** carried by the scope, and the two must
+    // agree: the scope is what the queue routed on, and a sweep that re-judged one
+    // tenant's notes under another tenant's name is the split-brain this check closes.
+    // At `multi_tenant.enabled = false` the scope resolver is the one that also refuses
+    // a non-`main` vault terminally (fail-closed).
+    let scoped_vault = resolve_job_vault(&job.record.spec.scope, mt.enabled)?;
+    if scoped_vault != spec.vault_id {
+        return Err(HandlerError::Business(format!(
+            "privacy-rescan: spec vault '{}' ≠ scope vault '{scoped_vault}'",
+            spec.vault_id
+        )));
+    }
+    // A batch of zero notes would be a sweep that cannot make progress while reporting
+    // success: the bound is a quota, and a null quota is a caller error, not a no-op.
+    if spec.limit == 0 {
+        return Err(HandlerError::Business(
+            "privacy-rescan: limit must be at least 1".to_string(),
+        ));
+    }
+
+    let batch = client
+        .privacy_rescan_batch(&spec.vault_id, spec.limit)
+        .await
+        .map_err(|e| HandlerError::Business(format!("privacy-rescan: {e}")))?;
+
+    tracing::info!(
+        job_id = %job.record.id,
+        vault = %spec.vault_id,
+        limit = spec.limit,
+        rewritten = batch.rewritten,
+        unchanged = batch.unchanged,
+        skipped = batch.skipped,
+        "privacy-rescan: batch complete"
+    );
+
+    Ok(JobOutput {
+        notes_created: vec![],
+        notes_modified: vec![],
+        files: vec![],
+        result_note_md: format!(
+            "privacy rescan ({}): {} rewritten, {} unchanged, {} skipped",
+            spec.vault_id, batch.rewritten, batch.unchanged, batch.skipped
         ),
     })
 }
@@ -3538,5 +3638,67 @@ mod tests {
                 "format invalide `{s}` → None attendu"
             );
         }
+    }
+
+    // ── F-160 — les tags du curateur ne peuvent pas porter un nom réservé ────
+
+    /// The curator's tag inputs cannot carry either reserved name.
+    ///
+    /// `build_frontmatter_from_spec` is the worker's tag-assembly point: it merges
+    /// `spec.tags` (client-supplied through `vault_write`) with `curator_tags` (model
+    /// output), then normalises. Both are untrusted, and both reach the note's
+    /// frontmatter — the two reserved names are therefore refused at the constructor,
+    /// whichever vector carried them.
+    ///
+    /// The ordinary tag rides along in the same call so the assertion cannot pass by
+    /// producing nothing: the merge must still let legitimate tags through.
+    #[test]
+    fn worker_curate_tags_cannot_carry_a_reserved_name() {
+        let spec = CurateSpec {
+            note_id: Ulid::generate(),
+            tenant_id: "main".to_string(),
+            title: Some("t".to_string()),
+            body: Some("b".to_string()),
+            tags: vec![
+                "personal-classified".to_string(),
+                "Personal Classified".to_string(),
+                "ordinary-tag".to_string(),
+            ],
+            ..Default::default()
+        };
+        let curator_tags = vec![
+            "privacy-unscanned".to_string(),
+            "PRIVACY_UNSCANNED".to_string(),
+            "curator-kept".to_string(),
+        ];
+
+        let fm = build_frontmatter_from_spec(
+            "main",
+            Section::Reference,
+            NoteStatus::Live,
+            &spec,
+            &curator_tags,
+        );
+
+        let literals: Vec<&str> = fm.tags.iter().map(Tag::as_str).collect();
+        assert!(
+            !literals.contains(&"personal-classified"),
+            "the reserved verdict tag reached the frontmatter: {literals:?}"
+        );
+        assert!(
+            !literals.contains(&"privacy-unscanned"),
+            "the reserved marker tag reached the frontmatter: {literals:?}"
+        );
+        // Anti-vacuity: the merge is live and still carries ordinary tags from both
+        // vectors — an empty `tags` would satisfy the two assertions above for the
+        // wrong reason.
+        assert!(
+            literals.contains(&"ordinary-tag"),
+            "spec.tags lost an ordinary tag: {literals:?}"
+        );
+        assert!(
+            literals.contains(&"curator-kept"),
+            "curator_tags lost an ordinary tag: {literals:?}"
+        );
     }
 }

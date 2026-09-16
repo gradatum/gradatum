@@ -39,7 +39,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{
     Extension, Json,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use gradatum_core::error::GradatumError;
 use gradatum_core::trust::TrustContext;
@@ -49,8 +49,9 @@ use crate::api_v1::compact::{self, CompactBody};
 use crate::api_v1::dto::{
     VaultAuthorsResponse, VaultContextRequest, VaultContextResponse, VaultGraphRequest,
     VaultGraphResponse, VaultLinksRequest, VaultLinksResponse, VaultListRequest, VaultListResponse,
-    VaultReadRequest, VaultSearchRequest, VaultStatusResponse, VaultTagsRequest, VaultTagsResponse,
-    VaultTraceRequest, VaultTraceResponse,
+    VaultPrivacyReviewRequest, VaultPrivacyReviewResponse, VaultReadRequest, VaultSearchRequest,
+    VaultStatusResponse, VaultTagsRequest, VaultTagsResponse, VaultTraceRequest,
+    VaultTraceResponse,
 };
 use crate::state::AppState;
 
@@ -453,6 +454,9 @@ pub async fn vault_read(
             match &e {
                 gradatum_core::error::GradatumError::NoteNotFound(_)
                 | gradatum_core::error::GradatumError::Storage(_) => {}
+                // A malformed request is not a backend failure: logging it at `error!`
+                // mislabels a `400`, and the message carries a value the caller chose.
+                gradatum_core::error::GradatumError::InvalidInput(_) => {}
                 other => {
                     tracing::error!(err = %other, "vault_read: backend failed");
                 }
@@ -718,6 +722,58 @@ pub async fn vault_tags(
 // SearchHit est utilisé directement dans vault_search (T10 — FTS5 réel).
 // Les autres types (GraphEdge, TraceEntry, AuthorEntry, TagEntry) sont utilisés
 // dans les 7 handlers câblés en T3 P2.0c.
+
+// ── vault_privacy_review (F-160 D-13) ────────────────────────────────────────
+
+/// Extracts the `request_id` from the `X-Request-ID` header, or generates a fresh ULID.
+///
+/// A local copy, like the ones in `write.rs`, `capture.rs` and `event_log.rs`: the helper
+/// is three lines and each call site owns its own view of the header map.
+fn extract_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("X-Request-ID")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| ulid::Ulid::generate().to_string())
+}
+
+/// `POST /api/v1/vault_privacy_review`
+///
+/// Records a human verdict on a note's personal-data scan, under a mandatory
+/// compare-and-swap and the `personal-classified` read grant. Thin wrapper — the logic
+/// lives in [`crate::api_v1::logic::vault_privacy_review_impl`].
+///
+/// ## This endpoint has no MCP counterpart, deliberately
+///
+/// `api_v1/mcp.rs` is untouched and exposes no review tool. Lifting a marking is an act
+/// reserved to an administrative identity (D-13); publishing it as an MCP tool would put
+/// it one tool call away from every agent on the fleet, which is exactly the delegation
+/// the design refuses. The gap between the two surfaces is the control, not an oversight.
+///
+/// # Returns
+///
+/// - **200 OK** + JSON [`VaultPrivacyReviewResponse`] — the note carries the verdict.
+/// - **400 Bad Request** — `note_id` is not a ULID, or `expected_sha256` is absent or
+///   malformed.
+/// - **401 Unauthorized** — bearer absent or invalid.
+/// - **403 Forbidden** — tenant scope, or the `personal-classified` read grant refused.
+/// - **404 Not Found** — the note is unknown **or** outside the readable perimeter; the
+///   two are deliberately indistinguishable.
+/// - **409 Conflict** — no `privacy` block, no `spans_digest`, a stale lock, or a verdict
+///   the note does not carry after the write.
+/// - **500 Internal Server Error** — vault I/O error.
+pub async fn vault_privacy_review(
+    State(state): State<AppState>,
+    Extension(trust): Extension<TrustContext>,
+    headers: HeaderMap,
+    Json(req): Json<VaultPrivacyReviewRequest>,
+) -> Result<Json<VaultPrivacyReviewResponse>, StatusCode> {
+    let request_id = extract_request_id(&headers);
+    crate::api_v1::logic::vault_privacy_review_impl(&state, &trust, req, &request_id)
+        .await
+        .map(Json)
+        .map_err(|e| crate::api_v1::logic::err_to_status(&e))
+}
 
 // ── Tests unitaires ───────────────────────────────────────────────────────────
 

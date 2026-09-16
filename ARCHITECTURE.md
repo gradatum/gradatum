@@ -599,7 +599,7 @@ The core knows nothing about "human", "main-agent", or "sub-agent" — those are
 
 ```
 [HUMAN]                   you
-   read=*  write=human,*  sees_personal_classified=true
+   read=*  write=human,*
        ↓
 [MAIN AGENT]              orchestrator (any LLM-based agent)
    read=*,!personal-classified  write=main-agent,*/briefing
@@ -616,6 +616,18 @@ The core knows nothing about "human", "main-agent", or "sub-agent" — those are
          read=main-agent,${THEME}/*
          write=${THEME}/${A}
 ```
+
+The `!personal-classified` negation matches on a **locus segment**, not a substring: a
+locus is denied only when one of its `/`-delimited segments equals `personal-classified`
+exactly. So `main-agent/personal-classified` is denied, while `personal-classified-2026`
+and `my-personal-classified` are not. `[HUMAN]`, `admin`, and `studio` carry no such
+negation and read every segment.
+
+This short-circuit evaluates on the **locus**, not on the note's `personal-classified`
+tag: a note's tag never enters the ACL decision, and denying a locus segment named
+`personal-classified` is unrelated to the F-160 tag of the same name (which designates a
+note but governs no access). The migration from the former per-consumer flag to these
+preset negations is tracked by **F-297**.
 
 ---
 

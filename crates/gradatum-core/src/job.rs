@@ -136,6 +136,47 @@ pub enum Job {
     /// kind, so it produces zero poll/churn. Terminal `Done` is reached **only** via
     /// [`QueueStore::complete`], never by a handler.
     Message(MessageDeliverySpec),
+
+    // F-160 (L-C) — tombstone left behind by the terminal-payload purge.
+    /// Sentinel left in place of a **purged terminal payload**.
+    ///
+    /// [`QueueStore::purge_terminal_payloads`] rewrites the payload of a terminal job,
+    /// replacing `spec.kind` with this variant and leaving every other field of the
+    /// [`JobRecord`] untouched: the lifecycle status, the timestamps, `result_note`,
+    /// `conflict_payload` and the retry history survive, so `job_status` keeps answering
+    /// exactly what it answered before the purge.
+    ///
+    /// **A tombstone, not a job.** It is never enqueued, never accepted by `POST /jobs`,
+    /// and no worker handler exists for it — [`job_kind_str`] returns `"PayloadPurged"`, a
+    /// value no `dequeue_by_kind` caller ever asks for. The SQL `kind` column deliberately
+    /// keeps the *original* kind after a purge (see the backfill prohibition next to the
+    /// migration-010 registration in `gradatum-db-sqlite`): that column is what keeps
+    /// `dlq_counts_by_kind` and the `kind = ?` filters meaningful for a purged row.
+    ///
+    /// The variant is additive on an already `#[non_exhaustive]` enum, so it breaks no
+    /// matcher outside this crate. Inside it, [`job_kind_str`] and [`spec_tenant`] match
+    /// [`Job`] exhaustively and therefore carry an explicit arm for it.
+    ///
+    /// The variant is a **unit** variant on purpose: it carries no data at all — not even
+    /// a redacted shape — so a purged `spec.kind` has nothing left to leak, and the purge
+    /// implementation in `gradatum-db-sqlite` can construct it from another crate.
+    PayloadPurged,
+
+    // F-160 (L-D.2) — deferred privacy rescan.
+    /// Re-judges a bounded batch of a vault's `privacy-unscanned` notes.
+    ///
+    /// The work is a **re-run of the write primitive** over notes an earlier pass
+    /// could not judge (detector down, input too large, pass truncated) and never a
+    /// new mutation path: each selected note is rewritten through the same
+    /// `write_note_inner`, under `Surface::Async`, so the D-11 monotone rule holds
+    /// unchanged — a resumed pass may add `personal-classified` or clear
+    /// `privacy-unscanned`, never declassify.
+    ///
+    /// Enqueued by the product itself, from the `TASK_PRIVACY_RESCAN` tick, which is
+    /// the path the public `POST /api/v1/jobs` guard names explicitly (a rescan costs
+    /// CPU, so an authenticated client cannot trigger one). The kind stays out of that
+    /// endpoint's whitelist.
+    PrivacyRescan(PrivacyRescanSpec),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -157,6 +198,43 @@ pub struct MessageDeliverySpec {
     /// Recipient credited identity (`identity/<kind>/<id>`) whose channel
     /// (`messaging/<recipient>`, C4) this delivery targets.
     pub recipient: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PrivacyRescanSpec — Job::PrivacyRescan (F-160, L-D.2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Specification of a deferred privacy rescan of one vault (`Job::PrivacyRescan`).
+///
+/// A **quota**, never a payload: the variant names the vault to sweep and how many
+/// notes of it one pass may re-judge. The selection itself is derived at execution
+/// time from the index (`privacy-unscanned`), so a resumed run needs no state carried
+/// in the row — a job that failed, timed out or was cancelled is replayed by
+/// enqueuing the same two fields again, and the notes already re-judged are simply
+/// no longer selected.
+///
+/// The vault is part of the spec, not of the job scope alone: a sweep is per-tenant
+/// by construction (`list_notes_by_tag` takes a `vault_id`), and a rescan that
+/// elected its vault from the ambient scope would sweep the wrong tenant the day the
+/// two disagree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PrivacyRescanSpec {
+    /// Vault whose `privacy-unscanned` notes are re-judged.
+    pub vault_id: String,
+    /// Upper bound on the notes one execution may re-judge.
+    pub limit: usize,
+}
+
+impl PrivacyRescanSpec {
+    /// Builds a [`PrivacyRescanSpec`] from its two fields.
+    #[must_use]
+    pub fn new(vault_id: impl Into<String>, limit: usize) -> Self {
+        Self {
+            vault_id: vault_id.into(),
+            limit,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -847,6 +925,10 @@ pub fn job_kind_str(job: &Job) -> &'static str {
         Job::Embed(_) => "Embed",
         // F-144 : "Message" — garde anti-dequeue partagée (voir JOB_KIND_MESSAGE).
         Job::Message(_) => JOB_KIND_MESSAGE,
+        // F-160 (L-C) : sentinelle de purge — aucun `dequeue_by_kind` ne la demande.
+        Job::PayloadPurged => "PayloadPurged",
+        // F-160 (L-D.2) : balayage différé — le seul enfileur est le tick produit.
+        Job::PrivacyRescan(_) => JOB_KIND_PRIVACY_RESCAN,
     }
 }
 
@@ -857,6 +939,15 @@ pub fn job_kind_str(job: &Job) -> &'static str {
 /// state-carrying: no apalis backend may ever lease it). [`job_kind_str`] returns
 /// this constant for the `Message` variant, so the two cannot drift.
 pub const JOB_KIND_MESSAGE: &str = "Message";
+
+/// Denormalised `kind` value of a [`Job::PrivacyRescan`] sweep.
+///
+/// Single source of truth for the string used both as the `kind` column value at
+/// enqueue time and as the filter the worker's dedicated apalis backend leases on.
+/// [`job_kind_str`] returns this constant for the `PrivacyRescan` variant, so the two
+/// cannot drift. The value is deliberately **absent** from the whitelist of
+/// `POST /api/v1/jobs`: a rescan is CPU-bound, and the product enqueues its own.
+pub const JOB_KIND_PRIVACY_RESCAN: &str = "PrivacyRescan";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // JobSpec — ce que fait le job
@@ -944,8 +1035,16 @@ pub fn spec_tenant(spec: &JobSpec) -> &str {
         | Job::Merge
         | Job::Annotate
         | Job::Notify(_)
-        // F-144 : la livraison porte le vault du job (mono-vault homelab = "main").
+        // F-144 : la livraison porte le vault du job (mono-vault installation = "main").
         | Job::Message(_) => job_vault,
+        // F-160 (L-C) : la sentinelle de purge ne porte plus aucun spec → repli commun
+        // (vault du job, sinon mono-vault). Le tenant estampillé à l'enqueue reste, lui,
+        // dans la colonne `tenant_id` : la purge ne réécrit que le payload.
+        Job::PayloadPurged => job_vault,
+        // F-160 (L-D.2) : le balayage porte SON vault — la sélection (`list_notes_by_tag`)
+        // exige un `vault_id`, et un repli sur le scope enverrait le balayage d'un tenant
+        // lire les notes d'un autre le jour où les deux divergent.
+        Job::PrivacyRescan(r) => r.vault_id.as_str(),
     }
 }
 
@@ -1695,6 +1794,17 @@ pub trait JobSource {
 // QueueStore trait — L0
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Number of most recent **terminal** jobs whose payload
+/// [`QueueStore::purge_terminal_payloads`] always leaves in place.
+///
+/// A product constant, deliberately not a setting: no `[queue]` key, no environment
+/// variable, no CLI flag. The window exists so that the rows an operator is most likely
+/// to be inspecting (a job that just finished, a message delivery still being
+/// acknowledged) are never the ones losing their body, and so that a purge cannot race a
+/// reader that is still consuming a job's output. Widening or narrowing it is a code
+/// change with a review, never a deployment knob.
+pub const TERMINAL_PAYLOAD_KEEP: u64 = 200;
+
 /// Job queue storage contract — L0 `gradatum-core`.
 ///
 /// Implementations:
@@ -1760,6 +1870,48 @@ pub trait QueueStore: Send + Sync {
         id: Ulid,
         tenant_filter: Option<&str>,
     ) -> Result<Option<JobRecord>, QueueError>;
+
+    /// Retrieves several jobs by identifier in a single call.
+    ///
+    /// Records are returned in the order of `ids`. Identifiers that are unknown, or
+    /// that `tenant_filter` hides, are silently omitted — the result may therefore be
+    /// shorter than the request, and callers must not assume a positional match.
+    ///
+    /// A repeated identifier yields a single record: the result holds at most one
+    /// entry per distinct identifier, placed at the position of its first occurrence.
+    /// Unknown and tenant-hidden identifiers are skipped. Every implementation —
+    /// this default and the batched overrides alike — must answer exactly that.
+    ///
+    /// `tenant_filter`: `None` = no tenant clause (byte-identical / OFF) ;
+    /// `Some(t)` = `AND tenant_id = t` (isolation ON — a job of another tenant is
+    /// omitted, same anti-disclosure rule as [`QueueStore::get`]).
+    ///
+    /// # Default implementation
+    ///
+    /// Loops over [`QueueStore::get`], which is correct on every backend but costs one
+    /// round-trip per identifier. Backends able to batch natively (e.g.
+    /// `SqliteQueueStore`, `WHERE id IN (…)`) should override it to keep a paged scan
+    /// at a bounded number of reads.
+    ///
+    /// Deduplicates as it goes (`seen`), so a repeated identifier is fetched once and
+    /// the returned records are the distinct identifiers in order of first occurrence.
+    async fn get_many(
+        &self,
+        ids: &[Ulid],
+        tenant_filter: Option<&str>,
+    ) -> Result<Vec<JobRecord>, QueueError> {
+        let mut records = Vec::with_capacity(ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(*id) {
+                continue;
+            }
+            if let Some(record) = self.get(*id, tenant_filter).await? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
 
     /// Marks a job as `Done` with its result.
     async fn complete(&self, id: Ulid, result: JobResult) -> Result<(), QueueError>;
@@ -1926,6 +2078,57 @@ pub trait QueueStore: Send + Sync {
     #[must_use = "the number of deleted DLQ jobs must be consumed (prune report)"]
     async fn delete_dlq_jobs(&self, _older_than: Option<DateTime<Utc>>) -> Result<u64, QueueError> {
         Ok(0)
+    }
+
+    /// Purges the payloads of **terminal** jobs, keeping the most recent ones.
+    ///
+    /// A terminal job keeps its row — status, timestamps, `result_note`, retry history —
+    /// but loses the note body it carried: `spec.kind` is replaced by
+    /// [`Job::PayloadPurged`]. The body lives exclusively in `spec.kind`
+    /// (`CurateSpec.body`, `ValidateSpec.body`, …), which is the only field of a
+    /// [`JobRecord`] that carries client content, so rewriting that one field is what
+    /// keeps the queue from accumulating note bodies without bound.
+    ///
+    /// # Keep window
+    ///
+    /// The [`TERMINAL_PAYLOAD_KEEP`] most recent terminal rows are left untouched: those
+    /// are the rows an operator is most likely to be inspecting (a job that just
+    /// finished, a delivery still being acknowledged) and the ones a late reader may
+    /// still be consuming. Purging is therefore **not** reversible beyond that window — a
+    /// purged body cannot be replayed.
+    ///
+    /// # Parameters
+    ///
+    /// - `older_than`: if `Some(cutoff)`, only purges jobs created **before** `cutoff`;
+    ///   if `None`, purges every terminal job outside the keep window.
+    ///
+    /// # Returns
+    ///
+    /// The number of payloads actually purged. `Ok(0)` is a legitimate answer *from an
+    /// implementation*: it means "nothing left to purge". It is never a legitimate answer
+    /// from a *missing* implementation.
+    ///
+    /// # Default implementation
+    /// Returns `Err(QueueError::NotImplemented { method: "purge_terminal_payloads" })` —
+    /// NEVER `Ok(0)`: a missing implementation must not be indistinguishable from a clean queue.
+    ///
+    /// Contrast with [`QueueStore::delete_dlq_jobs`] just above, whose default `Ok(0)` is
+    /// precisely the shape refused here: a purge that silently does nothing is a privacy
+    /// leak reported as a success — the caller cannot tell "purged nothing" from "cannot
+    /// purge at all". This default fails loudly instead of lying.
+    ///
+    /// # Idempotence
+    ///
+    /// A payload already carrying [`Job::PayloadPurged`] is neither rewritten nor counted:
+    /// two consecutive calls return `n`, then `0`.
+    #[must_use = "the number of purged payloads must be consumed"]
+    async fn purge_terminal_payloads(
+        &self,
+        _older_than: Option<DateTime<Utc>>,
+    ) -> Result<u64, QueueError> {
+        Err(QueueError::NotImplemented {
+            method: "purge_terminal_payloads",
+        })
     }
 
     /// Counts DLQ jobs that would be deleted by `delete_dlq_jobs` with the
@@ -2939,6 +3142,256 @@ mod tests {
             )),
             "main",
             "mono-vault : 'main' reste LA réponse quand aucun vault n'est porté"
+        );
+    }
+
+    // ── get_many — contrat du défaut du trait ─────────────────────────────
+
+    /// Store minimal : `get` est réel, le reste est inatteignable.
+    ///
+    /// Il ne surcharge **pas** `get_many` : c'est l'implémentation par défaut du
+    /// trait qui est sous test ici.
+    struct MinimalGetStore {
+        rows: std::collections::HashMap<Ulid, JobRecord>,
+    }
+
+    #[async_trait::async_trait]
+    impl QueueStore for MinimalGetStore {
+        async fn enqueue(&self, _job: JobRecord) -> Result<Ulid, QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn dequeue(
+            &self,
+            _tenant_filter: Option<&str>,
+        ) -> Result<Option<JobRecord>, QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn get(
+            &self,
+            id: Ulid,
+            tenant_filter: Option<&str>,
+        ) -> Result<Option<JobRecord>, QueueError> {
+            Ok(self
+                .rows
+                .get(&id)
+                .filter(|record| match tenant_filter {
+                    None => true,
+                    Some(tenant) => spec_tenant(&record.spec) == tenant,
+                })
+                .cloned())
+        }
+
+        async fn complete(&self, _id: Ulid, _result: JobResult) -> Result<(), QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn fail(&self, _id: Ulid, _err: &str, _attempt: u32) -> Result<(), QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn cancel(&self, _id: Ulid, _tenant_filter: Option<&str>) -> Result<(), QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn fail_dlq(&self, _id: Ulid, _err: &str) -> Result<(), QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn find_awaiting(&self, _job_id: Ulid) -> Result<Vec<JobRecord>, QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn set_pending(&self, _id: Ulid) -> Result<(), QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn recover_stale_leases(&self, _ttl: Duration) -> Result<Vec<Ulid>, QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn cancel_expired_deadlines(
+            &self,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Ulid>, QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn promote_retries(&self, _now: DateTime<Utc>) -> Result<Vec<Ulid>, QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn schedule_retry(&self, _id: Ulid, _at: DateTime<Utc>) -> Result<(), QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn list(&self, _filter: JobFilter) -> Result<Vec<JobRecord>, QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        fn subscribe(&self) -> Receiver<QueueEvent> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+
+        async fn mark_conflict(
+            &self,
+            _id: Ulid,
+            _result_note_md: String,
+            _duration_ms: u32,
+        ) -> Result<(), QueueError> {
+            unimplemented!("hors périmètre du test du défaut de get_many")
+        }
+    }
+
+    /// Le défaut du trait rend **au plus un** enregistrement par id distinct, à la
+    /// position de sa première occurrence — la surcharge SQLite (`HashMap` puis
+    /// `found.remove(id)`) fait déjà exactement cela, et un contrat qui divergent
+    /// entre deux implémentations du même trait n'en est plus un.
+    #[tokio::test]
+    async fn get_many_returns_one_record_per_repeated_id() {
+        let a = make_job_record(Job::Backup, JobClass::System);
+        let b = make_job_record(Job::Backup, JobClass::System);
+        let store = MinimalGetStore {
+            rows: [(a.id, a.clone()), (b.id, b.clone())].into_iter().collect(),
+        };
+
+        let got = store
+            .get_many(&[a.id, a.id, b.id, a.id], None)
+            .await
+            .expect("get_many (défaut du trait)");
+
+        assert_eq!(
+            got.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![a.id, b.id],
+            "un id répété ne rend qu'un enregistrement, à sa première occurrence"
+        );
+
+        // Le cas nominal du finding : deux fois le même id, une seule réponse.
+        let once = store
+            .get_many(&[a.id, a.id], None)
+            .await
+            .expect("get_many paire répétée");
+        assert_eq!(
+            once.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![a.id],
+            "get_many(&[a, a]) rend un seul enregistrement"
+        );
+    }
+
+    /// Le défaut du trait omet un id que `tenant_filter` masque — la déduplication
+    /// ne doit pas ressusciter un enregistrement hors tenant.
+    #[tokio::test]
+    async fn get_many_default_honours_tenant_filter() {
+        let alice = make_job_record(
+            Job::Curate(CurateSpec {
+                tenant_id: "alice".into(),
+                ..Default::default()
+            }),
+            JobClass::Api,
+        );
+        let bob = make_job_record(
+            Job::Curate(CurateSpec {
+                tenant_id: "bob".into(),
+                ..Default::default()
+            }),
+            JobClass::Api,
+        );
+        let store = MinimalGetStore {
+            rows: [(alice.id, alice.clone()), (bob.id, bob.clone())]
+                .into_iter()
+                .collect(),
+        };
+
+        let got = store
+            .get_many(&[alice.id, bob.id, alice.id], Some("alice"))
+            .await
+            .expect("get_many alice");
+
+        assert_eq!(
+            got.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![alice.id],
+            "bob est masqué, alice n'apparaît qu'une fois"
+        );
+    }
+
+    // ── purge_terminal_payloads — défaut du trait ─────────────────────────
+
+    /// Le défaut du trait **échoue** — il ne rend jamais `Ok(0)`.
+    ///
+    /// `Ok(0)` est le défaut de `delete_dlq_jobs` (`Ok(0)`, no-op) : une implémentation
+    /// manquante y est indiscernable d'une file déjà propre — un vert par cécité. Ici le
+    /// refus est explicite : `Err(QueueError::NotImplemented { method })`.
+    ///
+    /// `MinimalGetStore` ne surcharge pas `purge_terminal_payloads` : c'est bien le corps
+    /// par défaut du trait qui est sous test.
+    #[tokio::test]
+    async fn default_purge_terminal_payloads_returns_err_not_ok_zero() {
+        let store = MinimalGetStore {
+            rows: std::collections::HashMap::new(),
+        };
+
+        let err = store
+            .purge_terminal_payloads(None)
+            .await
+            .expect_err("le défaut du trait doit échouer, jamais rendre Ok(0)");
+
+        match err {
+            QueueError::NotImplemented { method } => assert_eq!(
+                method, "purge_terminal_payloads",
+                "le défaut doit nommer la méthode non implémentée"
+            ),
+            other => panic!("NotImplemented attendu, obtenu {other:?}"),
+        }
+
+        // Un `older_than` renseigné ne change rien : le défaut refuse dans les deux cas.
+        assert!(
+            store
+                .purge_terminal_payloads(Some(Utc::now()))
+                .await
+                .is_err(),
+            "le défaut refuse aussi avec une borne de date"
+        );
+    }
+
+    /// `JobStatus::TERMINAL_SQL` liste **exactement** les statuts terminaux de
+    /// `is_terminal()` — et notamment, `Failed` n'y figure pas.
+    ///
+    /// Test de divergence jumeau de `job_status_sql_fragment_matches_is_terminal`
+    /// (qui fige le littéral) : celui-ci compare le littéral à `is_terminal()`, donc
+    /// il rougit aussi si `is_terminal()` change sans que le fragment SQL suive.
+    #[test]
+    fn terminal_sql_matches_is_terminal() {
+        let all = [
+            JobStatus::Pending,
+            JobStatus::Running,
+            JobStatus::Waiting,
+            JobStatus::Done,
+            JobStatus::Failed,
+            JobStatus::DLQ,
+            JobStatus::Cancelled,
+            JobStatus::Conflict,
+        ];
+
+        for status in all {
+            let listed = JobStatus::TERMINAL_SQL.contains(&format!("'{status:?}'"));
+            assert_eq!(
+                listed,
+                status.is_terminal(),
+                "{status:?} : présence dans TERMINAL_SQL ({listed}) ≠ is_terminal() ({})",
+                status.is_terminal()
+            );
+        }
+
+        // Anti-vacité : le jeu testé contient bien les deux classes.
+        assert!(all.iter().any(|s| s.is_terminal()), "aucun terminal testé");
+        assert!(
+            all.iter().any(|s| !s.is_terminal()),
+            "aucun non-terminal testé"
+        );
+        assert!(
+            !JobStatus::TERMINAL_SQL.contains("'Failed'"),
+            "`Failed` n'est pas terminal : il ne doit pas être purgé"
         );
     }
 }

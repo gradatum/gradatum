@@ -5,6 +5,8 @@ pub gradatum_acl_policy::AclDecision::DenyExplicit
 pub gradatum_acl_policy::AclDecision::DenyImplicit
 #[non_exhaustive] pub enum gradatum_acl_policy::AclError
 pub gradatum_acl_policy::AclError::Glob(globset::Error)
+pub gradatum_acl_policy::AclError::RemovedPresetField
+pub gradatum_acl_policy::AclError::RemovedPresetField::field: &'static str
 pub gradatum_acl_policy::AclError::Toml(toml::de::error::Error)
 #[non_exhaustive] pub enum gradatum_acl_policy::AclOp
 pub gradatum_acl_policy::AclOp::Read
@@ -20,7 +22,6 @@ pub gradatum_acl_policy::AclPreset::consumer: alloc::vec::Vec<gradatum_acl_polic
 pub struct gradatum_acl_policy::ConsumerEntry
 pub gradatum_acl_policy::ConsumerEntry::identity: alloc::string::String
 pub gradatum_acl_policy::ConsumerEntry::read_patterns: alloc::vec::Vec<alloc::string::String>
-pub gradatum_acl_policy::ConsumerEntry::sees_personal_classified: bool
 pub gradatum_acl_policy::ConsumerEntry::write_patterns: alloc::vec::Vec<alloc::string::String>
 pub const gradatum_acl_policy::VERSION: &str
 pub fn gradatum_acl_policy::messaging_channel_locus(&str) -> alloc::string::String

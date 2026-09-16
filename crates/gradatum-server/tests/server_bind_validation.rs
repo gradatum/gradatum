@@ -55,6 +55,7 @@ fn cfg(bind: &str, tls: Option<TlsConfig>) -> ServerConfig {
         context: ContextConfig::default(),
         proactive_recall: ProactiveRecallConfig::default(),
         multi_tenant: gradatum_server::config::MultiTenantConfig::default(),
+        privacy: gradatum_server::config::PrivacyConfig::default(),
         per_vault: std::collections::HashMap::new(),
     }
 }

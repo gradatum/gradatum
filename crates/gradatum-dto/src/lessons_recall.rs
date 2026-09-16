@@ -150,6 +150,16 @@ pub struct LessonHit {
     /// Native FTS5 snippet localized on the searched class.
     pub snippet: String,
     /// Tags of the lesson (the `codified` tag is guaranteed absent).
+    ///
+    /// This field is one of the surfaces that **render** tags, so it is covered by the
+    /// D-14(b) read guard: a lesson carrying `personal-classified` is **not returned at
+    /// all** to a consumer whose `evaluate(Read, "{vault}/personal-classified")` is not
+    /// `Allow`. The field therefore never needs masking — the whole hit is withheld —
+    /// and the guarantee to read here is that a returned lesson's `tags` never contain
+    /// the reserved privacy verdict.
+    ///
+    /// `privacy-unscanned` is **never** filtered (D-14): it is an operational marker, not
+    /// a confidentiality verdict, and a returned lesson may carry it.
     pub tags: Vec<String>,
     /// Temporal anchor: creation timestamp (`created`), Unix epoch ms.
     pub anchor_ms: i64,

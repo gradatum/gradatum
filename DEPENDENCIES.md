@@ -2,7 +2,8 @@
 
 > Arbre de dépendances Cargo. Établi par lecture des `Cargo.toml` du workspace (source de
 > vérité) ; à recouper avec `cargo tree --workspace --depth 1`.
-> Version workspace `2.1.1`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> Version workspace `2.4.0`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> MAJ 2026-09-15 (`b2cb32b1..f99c5241`, lots D1 + F, workspace `2.4.0`) : `rustls` épinglé `=0.23.45` (plancher RUSTSEC-2026-0285 ; bornes collatérales `aws-lc-rs` 1.16.3→1.18.1, `aws-lc-sys` 0.40→0.45, `rustls-webpki` 0.103.13→0.103.15) ; `insta` ajouté en dev-dependency workspace (`gradatum-acl-policy`, snapshots) ; bornes intra-famille propagées à `2.4.0`. Aucune autre dépendance externe ajoutée ni retirée.
 > MAJ 2026-09-02 (`6a7515a5..3a981130`) : aucune dépendance externe ajoutée, retirée ni bumpée —
 > le delta `Cargo.lock` (32/32) est la propagation des 34 bornes intra-famille à `2.1.1`.
 > MAJ 2026-08-23 (delta `c942cb15..687b7ac5`, 9 commits sur les manifestes — paliers 2.0.2→2.0.9) :

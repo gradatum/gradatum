@@ -681,6 +681,21 @@ impl VaultRegistry {
         self.read_handles().len()
     }
 
+    /// Les clés de tous les handles enregistrés, en ordre déterministe.
+    ///
+    /// Consommé par les tâches récurrentes qui doivent couvrir **tous** les vaults sans
+    /// en élire un : le balayage de confidentialité différé (F-160 L-D.2) en est le
+    /// premier. L'ordre est celui de la `BTreeMap` sous-jacente — trié, donc stable
+    /// d'un tick à l'autre, ce dont dépend un plafond de travail par tick qui laisse
+    /// les mêmes vaults au tick suivant.
+    ///
+    /// Le verrou est relâché à la sortie (aucun borrow ne franchit un `.await` chez
+    /// l'appelant) ; les clés sont clonées, ce qui est le coût d'un `VaultId`.
+    #[must_use]
+    pub fn vault_ids(&self) -> Vec<gradatum_core::scope::VaultId> {
+        self.read_handles().keys().cloned().collect()
+    }
+
     /// `true` si le registre ne contient aucun handle.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -1018,6 +1033,13 @@ pub struct AppState {
     /// Wired via `AppState::with_server_config` dans `main.rs`.
     pub server_config: Arc<crate::config::ServerConfig>,
 
+    /// Frontière de détection de données personnelles (F-160), lue **au montage du
+    /// vault** — donc `with_privacy` doit précéder `with_vault_path`, faute de quoi
+    /// le vault est construit avec le détecteur par défaut (no-op).
+    ///
+    /// Défaut : [`crate::config::PrivacyConfig::default`] ⇒ aucun détecteur monté.
+    pub privacy: Arc<crate::config::PrivacyConfig>,
+
     /// Configuration for the context assembly pipeline.
     ///
     /// Governs `assemble_assembled`: default budget, top_n candidates, max skills,
@@ -1042,6 +1064,20 @@ pub struct AppState {
     /// [`crate::registry_store::DEFAULT_TTL`]; the boot wires the config TTL via
     /// [`AppState::with_registry_ttl`].
     pub registry: Arc<RegistryStore>,
+}
+
+/// Which personal-data detector a configuration mounts (F-160).
+///
+/// The verdict is named rather than returned as a detector because both detectors
+/// sit behind an `Arc<dyn PiiDetector>`, which does not compare: naming it is what
+/// lets a test observe the mount decision itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetectorMount {
+    /// No detector is mounted: the strict pass-through. The delivered default.
+    Noop,
+    /// The deterministic regex floor, mounted only on an explicit non-empty
+    /// `categories` list.
+    Regex,
 }
 
 impl AppState {
@@ -1102,6 +1138,8 @@ impl AppState {
             mcp_tool_counters: Arc::new(McpToolCounters::new()),
             skills_index: Arc::new(tokio::sync::RwLock::new(None)),
             server_config: Arc::new(crate::config::ServerConfig::default()),
+            // F-160 : aucun détecteur monté par défaut (passe-through strict).
+            privacy: Arc::new(crate::config::PrivacyConfig::default()),
             context: Arc::new(crate::config::ContextConfig::default()),
             health_snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::health::starting_report(
@@ -1157,6 +1195,8 @@ impl AppState {
             mcp_tool_counters: Arc::new(McpToolCounters::new()),
             skills_index: Arc::new(tokio::sync::RwLock::new(None)),
             server_config: Arc::new(crate::config::ServerConfig::default()),
+            // F-160 : aucun détecteur monté par défaut (passe-through strict).
+            privacy: Arc::new(crate::config::PrivacyConfig::default()),
             context: Arc::new(crate::config::ContextConfig::default()),
             health_snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::health::starting_report(
@@ -1293,6 +1333,19 @@ impl AppState {
         } else {
             gradatum_vault::Vault::create(path, vault_id).await?
         };
+        // F-160 — injection du détecteur au point d'insertion unique. Le vault racine
+        // est le seul vault `main` du chemin d'écriture ; sans [privacy] configuré,
+        // c'est le détecteur no-op, donc une écriture inchangée à l'octet.
+        let (detector, budgets) = self.mounted_detector();
+        // F-160 L-D.2 — le même montage installe le rapporteur de passes : le vault
+        // exécute la passe et n'a pas de registre, le serveur a le registre et n'exécute
+        // pas de passe. Les deux sont posés ensemble parce qu'un détecteur monté sans
+        // observateur serait une frontière qui travaille sans rendre de comptes.
+        let vault = vault
+            .with_detector(detector, budgets)
+            .with_privacy_observer(Arc::new(
+                crate::privacy_observer::MetricsPrivacyObserver::new(self.metrics.clone()),
+            ));
         // Un seul `Arc<Vault>` sert à la fois la façade `Registry` (chemin actuel) et le
         // registre de handles `{main}` (design cible, W3). LIVE reste mono-vault singleton :
         // le registre porte exactement le vault ouvert (byte-identical, aucun consommateur
@@ -1333,6 +1386,17 @@ impl AppState {
             .root()
             .to_path_buf();
         let vault = gradatum_vault::Vault::with_shared_index(&root, vault_id, shared_index).await?;
+        // F-160 — même montage que le vault racine : un handle de 2e vault est un
+        // chemin d'écriture à part entière, il n'a pas de détecteur implicite.
+        let (detector, budgets) = self.mounted_detector();
+        // …et le même rapporteur : les passes d'un 2e vault alimentent les mêmes séries
+        // que celles du vault racine. Un observateur par handle serait une seconde
+        // source pour un seul chiffre.
+        let vault = vault
+            .with_detector(detector, budgets)
+            .with_privacy_observer(Arc::new(
+                crate::privacy_observer::MetricsPrivacyObserver::new(self.metrics.clone()),
+            ));
         Ok(Arc::new(vault))
     }
 
@@ -1978,8 +2042,82 @@ impl AppState {
     /// par défaut). Wired via `main.rs` après le parsing du config.toml de production.
     #[must_use]
     pub fn with_server_config(mut self, cfg: crate::config::ServerConfig) -> Self {
+        // `with_server_config` arrive après `with_vault_path` dans `main.rs` : reprendre
+        // ici la frontière privacy ne re-monte PAS le vault racine déjà construit (le
+        // montage est lu à la construction). Elle sert aux handles instanciés ensuite
+        // (multi-vault ON) et évite une divergence silencieuse entre les deux lectures.
+        // Le montage du vault racine se pilote par `with_privacy`, appelé AVANT.
+        self.privacy = Arc::new(cfg.privacy.clone());
         self.server_config = Arc::new(cfg);
         self
+    }
+
+    /// Injecte la frontière de détection de données personnelles (F-160).
+    ///
+    /// **À appeler avant [`with_vault_path`](Self::with_vault_path)** : le détecteur
+    /// est monté à la construction du vault, et un vault est configuré une fois —
+    /// il n'existe pas de setter qui remplacerait un détecteur sous un écrivain
+    /// vivant. Sans appel explicite, la frontière reste au défaut : aucun détecteur
+    /// monté, écriture inchangée.
+    #[must_use]
+    pub fn with_privacy(mut self, privacy: crate::config::PrivacyConfig) -> Self {
+        self.privacy = Arc::new(privacy);
+        self
+    }
+
+    /// Which detector the current configuration mounts.
+    ///
+    /// **Règle de montage (normative)** : `[privacy]` absent, ou `categories` vide
+    /// ⇒ `Noop`. Le détecteur regex n'est monté que sur une configuration explicite
+    /// à `categories` non vide. Aucune autre combinaison n'existe en 2.4.0 : le
+    /// sidecar est reporté, donc la règle ne comporte pas de troisième branche.
+    ///
+    /// Le verdict est rendu sous forme d'énumération plutôt que de détecteur : les
+    /// deux détecteurs sont derrière un `Arc<dyn PiiDetector>`, qui ne se compare
+    /// pas, et c'est la DÉCISION de montage qu'un test doit pouvoir observer.
+    pub(crate) fn detector_mount(&self) -> DetectorMount {
+        if self.privacy.categories.is_empty() {
+            DetectorMount::Noop
+        } else {
+            DetectorMount::Regex
+        }
+    }
+
+    /// The name of the detector [`detector_mount`](Self::detector_mount) resolves to.
+    ///
+    /// Reported by `/health/detailed`, which is the only place an outside observer can
+    /// learn **which** detector judged the corpus. `""` when the deployment exposes no
+    /// name — the field is then omitted from the report rather than published empty,
+    /// so a client can tell "no name" from "a name that happens to be blank".
+    ///
+    /// Spelling is the wire vocabulary of the mount point, not of the Rust type: the
+    /// two detectors are `noop` (nothing is mounted, writes are byte-identical to
+    /// pre-frontier) and `regex` (the delivered detector). A name is published for the
+    /// pass-through too — "nothing is mounted" is itself the answer an operator asks
+    /// for, and an absent field could not say it.
+    pub(crate) fn mounted_detector_name(&self) -> &'static str {
+        match self.detector_mount() {
+            DetectorMount::Noop => "noop",
+            DetectorMount::Regex => "regex",
+        }
+    }
+
+    /// Détecteur et budgets effectivement montés sur un vault de cet état.
+    fn mounted_detector(
+        &self,
+    ) -> (
+        Arc<dyn gradatum_core::pii::PiiDetector>,
+        gradatum_core::pii::PrivacyBudgets,
+    ) {
+        let detector: Arc<dyn gradatum_core::pii::PiiDetector> = match self.detector_mount() {
+            DetectorMount::Noop => Arc::new(gradatum_core::pii::NoopDetector),
+            DetectorMount::Regex => Arc::new(gradatum_privacy::RegexDetector),
+        };
+        // F-160: only the byte budgets are threaded to the detector in 2.4.0. The
+        // category set, `thresholds`, `exceptions` and `mode` are parsed but not yet
+        // wired here (2.5.0) — `mask` is refused at config load, and the regex floor runs
+        // report_only over every category it recognises regardless of the enabled set.
+        (detector, self.privacy.budgets())
     }
 
     /// Injects the context assembly pipeline configuration.
@@ -2282,5 +2420,60 @@ mod vault_registry_tests {
             state.vaults.resolve(&VaultId::new("vault-b")).is_err(),
             "aucun 2e vault à flag OFF"
         );
+    }
+}
+
+#[cfg(test)]
+mod privacy_mount_tests {
+    use super::{AppState, DetectorMount};
+    use crate::config::PrivacyConfig;
+
+    /// Sans `[privacy]` configuré — ou avec le bloc livré, dont `categories` est
+    /// vide — le montage est le détecteur no-op : aucune écriture n'est modifiée.
+    #[test]
+    fn server_without_privacy_config_mounts_noop_detector() {
+        assert_eq!(
+            AppState::new().detector_mount(),
+            DetectorMount::Noop,
+            "aucune config ⇒ aucun détecteur"
+        );
+        assert_eq!(
+            AppState::new()
+                .with_privacy(PrivacyConfig::default())
+                .detector_mount(),
+            DetectorMount::Noop,
+            "le bloc livré a `categories` vide ⇒ même cas"
+        );
+    }
+
+    /// Contre-épreuve : c'est `categories` qui décide, pas la présence du bloc.
+    ///
+    /// Sans elle, un montage qui ignorerait la configuration passerait le test
+    /// précédent pour la mauvaise raison.
+    #[test]
+    fn a_non_empty_categories_list_is_what_mounts_a_real_detector() {
+        let explicit = PrivacyConfig {
+            categories: vec!["email".to_owned()],
+            ..PrivacyConfig::default()
+        };
+        assert_eq!(
+            AppState::new().with_privacy(explicit).detector_mount(),
+            DetectorMount::Regex
+        );
+    }
+
+    /// Les bornes de fenêtre et le plafond d'octets viennent de la config, jamais
+    /// d'un défaut caché : une valeur configurée se retrouve telle quelle dans les
+    /// budgets montés sur le vault.
+    #[test]
+    fn window_bounds_travel_from_the_config_to_the_mounted_budgets() {
+        let cfg = PrivacyConfig {
+            max_input_bytes: 4_096,
+            window_overlap_bytes: 64,
+            ..PrivacyConfig::default()
+        };
+        let budgets = cfg.budgets();
+        assert_eq!(budgets.max_input_bytes, 4_096);
+        assert_eq!(budgets.window_overlap_bytes, 64);
     }
 }

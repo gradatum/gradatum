@@ -10,11 +10,11 @@
 # substituting ${PROJECT}, ${AGENT}, ${THEME} based on --projects flags.
 #
 # ACL pattern syntax (globset):
-#   "*"                   match all loci
-#   "projecta/*"          match all loci under "projecta/"
-#   "*/briefing"          match any "X/briefing" locus
-#   "!personal-classified" exclude (negation)
-#   "${VAR}"              variable substituted at init time
+#   "*"                    match all loci
+#   "projecta/*"           match all loci under "projecta/"
+#   "*/briefing"           match any "X/briefing" locus
+#   "!**/personal-classified" exclude the "personal-classified" segment (negation)
+#   "${VAR}"               variable substituted at init time
 
 # ─── Human admin (top of hierarchy) ───────────────────────────────────
 # identity="admin" — administrator, full vault access, sees personal-classified.
@@ -23,7 +23,6 @@ identity = "admin"
 description = "Administrator — full vault read/write, sees personal-classified"
 read_patterns  = ["**"]
 write_patterns = ["**"]
-sees_personal_classified = true
 
 # ─── Human operator: the studio UI ────────────────────────────────────
 # identity="studio" — GRADATUM_STUDIO_APIKEY bearer, full access including
@@ -33,40 +32,39 @@ identity = "studio"
 description = "Studio UI — full vault read/write, sees personal-classified"
 read_patterns  = ["**"]
 write_patterns = ["**"]
-sees_personal_classified = true
 
 # ─── Main agent (orchestrator) ────────────────────────────────────────
 # identity="main-agent" — LLM orchestrator, global access except personal-classified.
-# Caveat B3: sees_personal_classified=false → short-circuits DenyExplicit on any locus
-# containing "personal-classified", before pattern evaluation.
+# Caveat B3: the denial of "personal-classified" is expressed as segment-scoped `!`
+# negations at the head of read_patterns/write_patterns (deny-wins), no longer by a
+# dedicated flag — it refuses the "personal-classified" segment, not any substring.
 [[consumer]]
 identity = "main-agent"
 description = "Orchestrator (any LLM-based agent) — sees everything except personal-classified, writes briefings"
-read_patterns  = ["**"]
-write_patterns = ["**"]
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
 
 
 # ─── Sub-agent template: writers (coder agents, prompt-engineer, etc.) ──
 [[consumer-template]]
 id = "sub-agent-writer"
 description = "Writer sub-agent — writes only its own locus, reads briefings + own work"
-read_patterns = ["main-agent", "${PROJECT}/briefing", "${PROJECT}/${AGENT}"]
-write_patterns = ["${PROJECT}/${AGENT}"]
+read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "${PROJECT}/briefing", "${PROJECT}/${AGENT}"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "${PROJECT}/${AGENT}"]
 
 # ─── Sub-agent template: validators (tester, reviewer, security expert) ─
 [[consumer-template]]
 id = "sub-agent-validator"
 description = "Validator sub-agent — cross-reads project for audit, writes own findings"
-read_patterns = ["main-agent", "${PROJECT}/*"]
-write_patterns = ["${PROJECT}/${AGENT}"]
+read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "${PROJECT}/*"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "${PROJECT}/${AGENT}"]
 
 # ─── Expert template (domain specialists, monitoring) ────────────────
 [[consumer-template]]
 id = "expert"
 description = "Thematic expert — reads main-agent + their theme scope, writes findings"
-read_patterns = ["main-agent", "${THEME}/*"]
-write_patterns = ["${THEME}/${AGENT}"]
+read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "${THEME}/*"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "${THEME}/${AGENT}"]
 
 # ─── Comments ──────────────────────────────────────────────────────────
 #
@@ -94,57 +92,50 @@ write_patterns = ["${THEME}/${AGENT}"]
 [[consumer]]
 identity = "expert-prompt"
 description = "Domain expert — prompt engineering, terminology coherence"
-read_patterns  = ["**"]
-write_patterns = []
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
 
 # expert-llm — LLM model selection, tuning, cost
 [[consumer]]
 identity = "expert-llm"
 description = "Domain expert — LLM model selection, tuning, cost"
-read_patterns  = ["**"]
-write_patterns = []
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
 
 # expert-infra — infrastructure, virtualization, networking, storage
 [[consumer]]
 identity = "expert-infra"
 description = "Domain expert — infrastructure, virtualization, networking, storage"
-read_patterns  = ["**"]
-write_patterns = []
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
 
 # expert-clouds — VPS, IaC, CI/CD, multi-cloud
 [[consumer]]
 identity = "expert-clouds"
 description = "Domain expert — VPS, IaC, CI/CD, multi-cloud"
-read_patterns  = ["**"]
-write_patterns = []
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
 
 # expert-pulse — IoT, MQTT, Zigbee, home automation
 [[consumer]]
 identity = "expert-pulse"
 description = "Domain expert — IoT, MQTT, Zigbee, home automation"
-read_patterns  = ["**"]
-write_patterns = []
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
 
 # expert-monitoring — transversal monitoring, anomaly detection
 [[consumer]]
 identity = "expert-monitoring"
 description = "Domain expert — transversal monitoring, anomaly detection"
-read_patterns  = ["**"]
-write_patterns = []
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
 
 # expert-security — application security, auth, secrets, TLS
 [[consumer]]
 identity = "expert-security"
 description = "Domain expert — application security, auth, secrets, TLS"
-read_patterns  = ["**"]
-write_patterns = []
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
 
 # ─── Engine (gradatum-engine — event-log writer) ──────────────────────
 # identity="engine" — internal service shared by gradatum-engine curator + embed,
@@ -152,9 +143,8 @@ sees_personal_classified = false
 [[consumer]]
 identity = "engine"
 description = "gradatum-engine service (curator + embed) — POST /api/v1/event-log"
-read_patterns  = []
-write_patterns = ["main/event-log"]
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main/event-log"]
 
 # ─── Example agent wrappers ───────────────────────────────────────────
 # Illustrative consumers — one active key per identity. Replace these with the
@@ -163,13 +153,11 @@ sees_personal_classified = false
 [[consumer]]
 identity = "agent-wrapper"
 description = "Local agent wrapper — full read/write except personal-classified"
-read_patterns  = ["**"]
-write_patterns = ["**"]
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
 
 [[consumer]]
 identity = "third-party-agent"
 description = "Third-party agent wrapper — same rights as the orchestrator"
-read_patterns  = ["**"]
-write_patterns = ["**"]
-sees_personal_classified = false
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]

@@ -150,3 +150,32 @@ else overrides it (see "Override matrix" above — env beats TOML).
 
 Verified empirically: `gradatum-admin init --root <tmp-dir> --non-interactive`, then inspecting
 the resulting `server.toml` and `config/internal-worker.token.txt`.
+
+---
+
+## `[privacy]` — personal-data marking (F-160)
+
+Optional, and **not** written by `gradatum-admin init`. With `[privacy]` absent — or present
+with `categories = []` — the write path mounts a no-op detector and scans nothing; the block is
+opt-in, added by hand.
+
+```toml
+[privacy]
+mode = "report_only"          # "report_only" (default, and the only mode accepted in 2.4.0) marks only; "mask" (2.5.0) is refused at load
+categories = []               # enabled categories; empty by default — nothing is scanned until an operator opts in
+max_input_bytes = 262144      # 256 KiB — largest body a single detector call may be handed
+window_overlap_bytes = 512    # overlap between consecutive windows of a larger body
+rescan_enabled = false        # the deferred rescan task is always spawned; this gates its work, never the spawn
+rescan_interval_secs = 300    # interval of the deferred rescan pass
+# [privacy.thresholds]        # per-category score thresholds, integer thousandths
+# [privacy.exceptions]        # literal exception patterns, per tenant, applied after detection
+```
+
+- `mode = "mask"` redacts detected spans in place and is **irreversible**. It is a **2.5.0**
+  addition and is **not delivered in 2.4.0**: setting `mode = "mask"` in 2.4.0 is **refused at
+  load** (only `report_only` is accepted), the same way the `sidecar` field is not present yet.
+- The detection **sidecar** is a **2.5.0** addition and is not present in 2.4.0: there is no
+  `sidecar` field here yet. When it lands it will speak over a Unix socket at mode `0600` under
+  `/run/gradatum/` — a filesystem socket, **not a TCP port**, so it claims no offset in the port
+  matrix above. Its systemd hardening and peer-authentication properties are described in
+  [SECURITY.md § Personal-data marking (F-160)](../../SECURITY.md#personal-data-marking-f-160).

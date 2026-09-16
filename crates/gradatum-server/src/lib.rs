@@ -42,6 +42,10 @@ pub mod middleware;
 #[doc(hidden)]
 pub mod note_usage_store;
 #[doc(hidden)]
+pub mod privacy_observer;
+#[doc(hidden)]
+pub mod privacy_rescan;
+#[doc(hidden)]
 pub mod proactive_recall;
 #[doc(hidden)]
 pub mod proactive_recall_store;

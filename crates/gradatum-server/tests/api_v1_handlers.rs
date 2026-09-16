@@ -624,7 +624,7 @@ fn write_path_validator_rejects_uncardinal_role_bodies() {
 }
 
 /// Accord entre les DEUX scanners `[[…]]` pré-existants sur toute carte VALIDE :
-/// core (`extract_wikilink_targets` via `roles_of_body`) et curator (`extract_wikilinks`), tous
+/// core (`extract_structural_targets` via `roles_of_body`) et curator (`extract_wikilinks`), tous
 /// deux alimentant `parse_link`. Unique garde de la dette core↔curator (surveillée
 /// ici) : le jour où ils divergeraient sur une carte valide, ce test tombe.
 #[test]

@@ -71,6 +71,7 @@ pub mod paths;
 /// Descriptive profiles of humans, *referenced* by agents, never executed as a system
 /// prompt — distinct from [`soul`] (agent souls). See [`person::validate_person_card`].
 pub mod person;
+pub mod pii;
 pub mod project_map;
 pub mod provenance;
 pub mod scheduled_health;
@@ -109,6 +110,8 @@ pub use job::{
     IngestStrategy,
     // F-144 — kind dénormalisé d'une livraison de message (garde anti-dequeue)
     JOB_KIND_MESSAGE,
+    // F-160 (L-D.2) — kind dénormalisé d'un balayage de confidentialité différé
+    JOB_KIND_PRIVACY_RESCAN,
     // Enum principal + helper routing
     Job,
     JobClass,
@@ -147,6 +150,8 @@ pub use job::{
     MigrateSource,
     NotifyChannel,
     NotifySource,
+    // F-160 (L-D.2) — spécification d'un balayage de confidentialité différé.
+    PrivacyRescanSpec,
     // Purge lifecycle F-32C
     PurgeMode,
     PurgeSpec,
@@ -157,6 +162,8 @@ pub use job::{
     // ReIndex
     ReIndexMode,
     RetryBackoff,
+    // F-160 (L-C) — fenêtre de conservation de la purge des payloads terminaux.
+    TERMINAL_PAYLOAD_KEEP,
     TriggerCondition,
     TriggerSource,
     // Memory validation F-43

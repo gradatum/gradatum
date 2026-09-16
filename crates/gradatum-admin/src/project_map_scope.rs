@@ -23,6 +23,7 @@
 use anyhow::{Context, Result};
 use gradatum_core::paths::vault_index_path;
 use gradatum_core::project_map::StatusKind;
+use serde::Serialize;
 
 /// Summary of a single project's project-map cards.
 #[derive(Debug, Default)]
@@ -118,6 +119,91 @@ pub fn scope_exit_code(scope: &ProjectScope) -> i32 {
         EXIT_SCOPE_RECONCILED
     } else {
         EXIT_SCOPE_UNRECONCILED
+    }
+}
+
+/// Per-status breakdown of a [`ProjectScope`], as published by `--json`.
+///
+/// One field per bucket, `unaccounted` included: a card is classified into exactly one
+/// of them, so the buckets are exhaustive and their sum is expected to equal the total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScopeByStatus {
+    /// Cards in status `OPEN`.
+    pub open: usize,
+    /// Cards in status `IN_PROGRESS`.
+    pub in_progress: usize,
+    /// Cards in status `BLOCKED`.
+    pub blocked: usize,
+    /// Cards in status `DONE`.
+    pub done: usize,
+    /// Cards in status `OBSOLETE`.
+    pub obsolete: usize,
+    /// Cards in status `BRAINSTORMING`.
+    pub brainstorming: usize,
+    /// Cards carrying no recognised `[[status:…]]` wikilink.
+    pub unaccounted: usize,
+}
+
+/// Machine-readable rendering of a [`ProjectScope`], printed by `project-map scope --json`.
+///
+/// ## Schema stability
+///
+/// The key set is a contract with the tooling that consumes it: each value is read by
+/// name, so renaming a key or re-nesting a counter is a silent breakage for the reader —
+/// it either fails to parse or, worse, falls back to a default and reports a number it
+/// never measured.
+///
+/// ## Why `status_sum` is published
+///
+/// The sum of the buckets is emitted rather than left for the consumer to recompute. A
+/// consumer that added the buckets up itself would be measuring its own copy of the
+/// classification rule, and would silently disagree with the command the day a bucket is
+/// added — while still passing its own checks. Publishing it keeps a single source of
+/// truth: `unaccounted` is INCLUDED in `status_sum`, and [`ProjectScopeJson::gap`] is
+/// derived from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectScopeJson {
+    /// Project name, as carried by the `[[project:<name>]]` link.
+    pub project: String,
+    /// Highest version among the `DONE` cards; `null` when there is none.
+    pub current_version: Option<String>,
+    /// Total number of active cards — the same quantity the prose report calls `total`.
+    pub total: usize,
+    /// Per-status breakdown.
+    pub by_status: ScopeByStatus,
+    /// Sum of every bucket in [`ProjectScopeJson::by_status`], `unaccounted` included.
+    pub status_sum: usize,
+    /// Signed gap between [`ProjectScopeJson::total`] and [`ProjectScopeJson::status_sum`].
+    pub gap: i64,
+    /// `true` when `gap` is `0` — the same verdict that drives the process exit code.
+    pub reconciled: bool,
+    /// Distinct versions found on the cards, newest first.
+    pub versions: Vec<String>,
+}
+
+impl From<&ProjectScope> for ProjectScopeJson {
+    fn from(scope: &ProjectScope) -> Self {
+        // Read once: `reconciled` is derived from the emitted `gap` itself, so the verdict
+        // and the number it rests on can never drift apart.
+        let gap = scope.reconciliation_gap();
+        Self {
+            project: scope.project.clone(),
+            current_version: scope.current_version.clone(),
+            total: scope.total_count,
+            by_status: ScopeByStatus {
+                open: scope.open_count,
+                in_progress: scope.in_progress_count,
+                blocked: scope.blocked_count,
+                done: scope.done_count,
+                obsolete: scope.obsolete_count,
+                brainstorming: scope.brainstorming_count,
+                unaccounted: scope.unaccounted_count,
+            },
+            status_sum: scope.status_sum(),
+            gap,
+            reconciled: gap == 0,
+            versions: scope.versions.clone(),
+        }
     }
 }
 
@@ -613,6 +699,40 @@ mod tests {
         const EXIT_EXECUTION_FAILURE: i32 = 1;
         assert_ne!(EXIT_SCOPE_UNRECONCILED, EXIT_SCOPE_RECONCILED);
         assert_ne!(EXIT_SCOPE_UNRECONCILED, EXIT_EXECUTION_FAILURE);
+    }
+
+    // ─── F-285 — the JSON rendering carries the same verdict as the prose one ──
+
+    /// A non-zero gap reaches the JSON payload as a negative verdict, never as a zero.
+    ///
+    /// End-to-end coverage cannot reach this case: `project_scope_from_conn` classifies
+    /// every row into exactly one bucket, so the gap is zero by construction on any real
+    /// index (see the header of `tests/project_map_scope_exit_code.rs`). A `--json`
+    /// rendering that hard-coded `reconciled: true` would therefore look correct in every
+    /// e2e run — the trap this unit test closes.
+    #[test]
+    fn scope_json_reports_unreconciled_gap() {
+        let scope = ProjectScope {
+            project: "gradatum".to_string(),
+            total_count: 366,
+            open_count: 100,
+            done_count: 259,
+            unaccounted_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(scope.reconciliation_gap(), 6, "prémisse du test");
+
+        let payload = ProjectScopeJson::from(&scope);
+
+        assert_eq!(payload.project, "gradatum");
+        assert_eq!(payload.total, 366);
+        assert_eq!(payload.gap, 6);
+        assert!(!payload.reconciled);
+        // Invariant `unaccounted ⊂ status_sum`: the unaccounted card IS counted in the
+        // sum. Were it left out, the gap would be zero and the verdict positive — the
+        // exact silent success this whole command exists to refuse.
+        assert_eq!(payload.by_status.unaccounted, 1);
+        assert_eq!(payload.status_sum, 360);
     }
 
     #[test]

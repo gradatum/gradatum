@@ -24,9 +24,12 @@
 #   2. Generates GRADATUM_INTERNAL_TOKEN if absent (docker-compose.yml requires it:
 #      `${GRADATUM_INTERNAL_TOKEN:?...}` on the gradatum-worker service) and PERSISTS
 #      it to `.env` (0600) so `docker compose` keeps working in a fresh shell
-#   3. `docker compose build` (the image is built locally — `build: .` —
-#      there is NO `docker pull`: the ghcr.io/gradatum/gradatum image is
-#      private as of today, see docs/guides/A-docker-quickstart.md)
+#   3. `docker compose --profile init build` (images built locally — `build: .` —
+#      the `--profile init` is REQUIRED: a plain `docker compose build` skips the
+#      profile-gated `gradatum-init` service, so its image is silently reused stale
+#      (a pre-existing init image, e.g. a broken ACL, is never rebuilt). There is
+#      NO `docker pull`, and no public image to pull: CI pushes the image to an
+#      INTERNAL registry only, see docs/guides/A-docker-quickstart.md)
 #   4. `docker compose --profile init up gradatum-init` (one-shot vault init)
 #   5. `docker compose up -d gradatum-server gradatum-worker llama-embed llama-chat`
 #   6. Poll `/health` until available (60s timeout)
@@ -276,8 +279,10 @@ ok
 # ─── [3/8] Build ────────────────────────────────────────────────────────────────
 
 if [[ "$DO_BUILD" == "true" ]]; then
-    step "docker compose build (local image — no pull, ghcr.io/gradatum/gradatum is private)"
-    docker compose build
+    step "docker compose --profile init build (local images — no pull, no public image published today)"
+    # `--profile init` ALSO rebuilds the profile-gated gradatum-init service:
+    # a plain `build` skips it and silently reuses a stale init image.
+    docker compose --profile init build
     ok
 else
     step "Build skipped (--no-build)"

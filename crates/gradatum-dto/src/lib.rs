@@ -128,5 +128,6 @@ pub fn default_main_vault() -> VaultId {
 
 pub use internal::{
     CuratorDecisionDto, EmbeddingOkResponse, LinkDto, PersistCuratedRequest, PersistDistillRequest,
-    PersistEmbeddingRequest, PersistForgetRequest, PersistOkResponse, TemporalEntryDto,
+    PersistEmbeddingRequest, PersistForgetRequest, PersistOkResponse, PrivacyRescanRequest,
+    PrivacyRescanResponse, TemporalEntryDto,
 };

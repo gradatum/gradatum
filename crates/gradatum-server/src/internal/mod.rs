@@ -65,11 +65,16 @@
 //! - `GET /internal/v1/notes/garbage`            — notes Garbage expirées
 //! - `GET /internal/v1/forget/search`            — FTS5 pour scope Topic forget
 //! - `GET /internal/v1/notes/by-agent`           — notes par agent (scope Agent forget)
+//!
+//! ### Confidentialité
+//! - `POST /internal/v1/privacy/rescan`   — re-jugement d'un lot borné de notes
+//!   `privacy-unscanned` (balayage différé F-160 L-D.2)
 
 pub(crate) mod admin;
 pub(crate) mod admin_auth;
 pub(crate) mod auth;
 pub(crate) mod persist;
+pub(crate) mod privacy;
 pub(crate) mod reads;
 
 use std::net::SocketAddr;
@@ -209,6 +214,13 @@ pub fn build_internal_router(state: AppState) -> Router {
         .route(
             "/internal/v1/notes/by-agent",
             get(reads::handle_notes_by_agent),
+        )
+        // F-160 (L-D.2) — balayage différé de confidentialité : le worker transporte
+        // la borne du lot, le serveur sélectionne et réécrit (il est la seule partie à
+        // tenir à la fois le registre des vaults et la primitive d'écriture).
+        .route(
+            "/internal/v1/privacy/rescan",
+            post(privacy::handle_privacy_rescan),
         )
         .route_layer(from_fn_with_state(
             state.clone(),

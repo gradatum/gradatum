@@ -40,8 +40,10 @@ below for the historical record, kept for reference.
 # 1. A worker↔server internal-API token is required by the compose file
 export GRADATUM_INTERNAL_TOKEN="$(openssl rand -hex 32)"
 
-# 2. Build locally — see "Docker image" below for why this isn't `docker pull`
-docker compose build
+# 2. Build locally — see "Docker image" below for why this isn't `docker pull`.
+#    `--profile init` is required: a plain `docker compose build` skips the
+#    profile-gated `gradatum-init` service, leaving its image stale.
+docker compose --profile init build
 
 # 3. One-shot vault init (writes only under --root: /var/lib/gradatum; NOT /etc/gradatum)
 docker compose --profile init up gradatum-init
@@ -62,11 +64,15 @@ docker compose exec gradatum-server \
 ## Docker image
 
 `docker-compose.yml` builds every service from the local `Dockerfile` (`build: .`) — there is
-**no `docker pull`** in this flow. `ghcr.io/gradatum/gradatum` exists, but as a **private**
-image (org GitHub `gradatum`, `.forgejo/workflows/release.yml` job `build-docker`, currently
-gated `if: false` pending a Docker-capable runner). Until that image is made public, building
-locally is the only path — plan for the first `docker compose build` to compile the image's five
-`--bin` targets (below), which takes several minutes.
+**no `docker pull`** in this flow, and there is **no public image to pull**. The `build-docker`
+job in `.forgejo/workflows/release.yml` does build an image on a version tag, but it pushes it to
+this project's **internal** registry only: nothing is published publicly today. Until a public
+image exists, building locally is the only path — plan for the first `docker compose build` to
+compile the image's five `--bin` targets (below), which takes several minutes.
+
+Do not infer a public tag from CI: `build-docker` runs on a tag ref and pushes to the internal
+registry, so it never publishes an image the quickstart could pull. `build: .` is what every
+command below actually uses.
 
 **The image does not ship `gradatum-cli`.** The `Dockerfile`'s builder stage runs
 `cargo build --release --workspace --bin gradatum-server --bin gradatum-worker --bin
@@ -90,10 +96,10 @@ target CI validated, not a separate Windows build.
 
 This has not been tested on an actual Windows machine — the paragraph above states which target
 gets built and run, not that someone has run it there. The [Docker image](#docker-image) section
-above applies unchanged on Windows: there is no public image (`ghcr.io/gradatum/gradatum` is
-private, `build: .` in `docker-compose.yml`), so `docker compose build` compiles the image's five
-`--bin` targets (not the full 31-member workspace — see [Docker image](#docker-image) above)
-**inside the WSL2 VM**.
+above applies unchanged on Windows: there is no public image (CI pushes to an internal registry
+only, and `build: .` in `docker-compose.yml` remains the supported path), so `docker compose build`
+compiles the image's five `--bin` targets (not the full 31-member workspace — see
+[Docker image](#docker-image) above) **inside the WSL2 VM**.
 
 Two different numbers matter here, and they are not the same budget: a `cargo test --workspace`
 run (debug profile, every crate, all dev-dependencies) is far heavier than the release build this
@@ -212,16 +218,18 @@ docker run --rm -v gradatum_gradatum-state:/data -v "$PWD":/backup debian:13-sli
 **1. Stop and remove the containers** (does not touch volumes):
 
 ```bash
-docker compose down
+docker compose --profile init down
 ```
 
-`down` tears down every container Compose created for this project regardless of which
-`--profile` brought it up — you don't need to repeat the profile flags you used at `up` time.
-This step alone gets you back to "nothing running" while every volume, and the vault inside it,
-is intact.
+A plain `docker compose down` only removes containers whose profile is currently active, so the
+profile-gated `gradatum-init` container survives it (and, still attached to a volume, blocks a
+later `docker volume rm`). Repeat the `--profile init` flag you used at `up` time so `down`
+reaches it too. This step then gets you back to "nothing running" while every volume, and the
+vault inside it, is intact.
 
-**2. Remove the built images** (does not touch data — a later `docker compose build` rebuilds
-them). Every service here uses `build: .` with no explicit `image:` key, so Compose tags one
+**2. Remove the built images** (does not touch data — a later `docker compose --profile init build`
+rebuilds them; the `--profile init` is required, otherwise the profile-gated `gradatum-init` image
+is not rebuilt). Every service here uses `build: .` with no explicit `image:` key, so Compose tags one
 image per service as `<project>-<service>` (project name is `gradatum`, set by `name: gradatum`
 at the top of `docker-compose.yml`) — list what's actually on your host rather than guessing the
 full set:
@@ -234,7 +242,7 @@ docker image rm $(docker images -q --filter reference='gradatum-*')
 **3. Remove the volumes — destructive, only after your backup from above is confirmed good**:
 
 ```bash
-docker compose down -v
+docker compose --profile init down -v
 # or, targeting them by hand if `down -v` doesn't reach a profile-gated volume:
 docker volume rm gradatum_gradatum-state gradatum_gradatum-config gradatum_gradatum-audit
 ```
