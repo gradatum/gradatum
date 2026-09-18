@@ -7,9 +7,51 @@
 //!
 //! 1. `TrustContext::Unauthenticated` → [`AclDecision::DenyImplicit`] immediately.
 //! 2. Unknown identity (no matching consumer) → [`AclDecision::DenyImplicit`].
-//! 3. Negation pattern (`!glob`) matches → [`AclDecision::DenyExplicit`] (**deny-wins**).
-//! 4. Allow pattern matches → [`AclDecision::Allow`].
-//! 5. Otherwise → [`AclDecision::DenyImplicit`].
+//! 3. Tenant isolation — a token-borne `tenant_id` conflicting with a tenant-root
+//!    locus → [`AclDecision::DenyExplicit`] (see below).
+//! 4. Negation pattern (`!glob`) matches → [`AclDecision::DenyExplicit`] (**deny-wins**).
+//! 5. Allow pattern matches → [`AclDecision::Allow`].
+//! 6. Otherwise → [`AclDecision::DenyImplicit`].
+//!
+//! ## Tenant isolation
+//!
+//! A bearer token carries a `tenant_id`. When the evaluated locus is a **tenant
+//! root** — a single segment, no `/`, e.g. `main` or `tenant-c` — and that segment
+//! is not the token's own tenant, evaluation stops at [`AclDecision::DenyExplicit`]
+//! before any pattern is consulted. A preset cannot re-open that door: the check
+//! sits above the glob steps, so no `read_patterns`/`write_patterns` entry in a
+//! consumer table reaches across it.
+//!
+//! The guard is deliberately scoped to tenant roots only. A multi-segment locus
+//! (`project-a/backend`, `tenant-b/decisions/x`) is a vault or project locus whose
+//! first segment is a `vault_id`, not a tenant identifier — comparing it with the
+//! token's tenant would deny a vault named `project-a` that legitimately lives
+//! under the tenant `main`. Access to those loci is decided by the glob patterns
+//! (steps 4-5) and by the higher-level `tenant_vault_grants` system, which is also
+//! the authority able to grant explicit exceptions on tenant roots. This check is
+//! a safety net beneath it, never a replacement for it.
+//!
+//! ## Decision — a configured-but-unusable preset refuses the boot
+//!
+//! The loader that reads a preset file and the engine above have different
+//! failure semantics, and the split is deliberate: the engine is total (every
+//! input yields a [`AclDecision`]), while the *loader* can fail.
+//!
+//! A preset file that is configured and readable but does not compile into an
+//! engine refuses the boot. An absent file, or no configured path at all, keeps
+//! the deny-all fallback. The reason for the asymmetry is observability: once the
+//! server is running, an abandoned preset and a deliberately restrictive one both
+//! answer `403` to every request, so a silent fallback converts a configuration
+//! defect into a server that looks correctly locked down. Absence is the one case
+//! where the fallback is the intended answer — a first run has no preset yet, and
+//! refusing it would make that first run impossible.
+//!
+//! The refusal gate is *"the file cannot be turned into an engine"*, never
+//! *"the engine it yields is restrictive"*. A **present but empty** preset — zero
+//! bytes, or whitespace only — is on the booting side of that line: it parses to
+//! a valid preset that declares no consumer, so the server starts and denies
+//! everything. That is a deliberately restrictive policy, and it is served as
+//! such; only a file that fails to parse or fails to compile refuses the boot.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -215,7 +257,7 @@ impl AclEngine {
         // segment est un vault_id et non un identifiant de tenant. La comparaison
         // directe avec le tenant_id du token serait incorrecte (un vault "project-a"
         // peut exister sous le tenant "main"). L'autorisation de ces loci est gérée
-        // par les patterns glob (étapes 5-6) et le système `tenant_vault_grants`
+        // par les patterns glob (étapes 4-5) et le système `tenant_vault_grants`
         // (niveau supérieur, autorité).
         //
         // Le système `tenant_vault_grants` peut accorder des exceptions explicites

@@ -23,8 +23,8 @@ fn agent(sub: &str, scopes: &[&str]) -> TrustContext {
 fn preset() -> AclEngine {
     // Matrice ACL synthétique locale (fixtures/hierarchical.toml) : PAS une copie du preset
     // livré — une identité concrète par forme de scoping. Voir l'en-tête de la fixture pour
-    // la raison technique (le moteur ignore les [[consumer-template]], seuls porteurs du
-    // scoping par sous-arbre dans le preset livré).
+    // la raison technique (cette fixture isole le matching par sous-arbre ; le preset livré
+    // vérifie la distribution des identités d'une installation, pas le moteur de motifs).
     AclEngine::from_preset_str(include_str!("fixtures/hierarchical.toml")).unwrap()
 }
 

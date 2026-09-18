@@ -1,99 +1,111 @@
-//! Tests backup atomique `bearer.toml`.
+//! What happens to `config/bearer.toml` when it is already there.
 //!
-//! Valide les deux scénarios du backup minimaliste :
-//! 1. `bearer.toml` préexistant → backup `.bak.<ISO-TS>` créé, contenu original préservé,
-//!    fichier actif réécrit avec le preset.
-//! 2. Fresh install (pas de `bearer.toml`) → aucun backup créé.
+//! The preset is the access policy the server enforces, not a generated file. A
+//! re-run of `init` over a live root must therefore leave a hand-maintained
+//! policy exactly as it is, and replacing it has to be an explicit act:
+//!
+//! 1. `ExistingPreset::Keep` + file present → byte-identical, no backup;
+//! 2. `ExistingPreset::Overwrite` + file present → backup `.bak.<TS>` holding the
+//!    original bytes, then the requested preset is written;
+//! 3. no file present → written, no backup (nothing to save).
 
-use gradatum_admin::materialize_preset;
+use gradatum_admin::{ExistingPreset, materialize_preset};
 use std::fs;
 use tempfile::TempDir;
 
-/// Vérifie qu'un `bearer.toml` existant est backupé avant écrasement.
-///
-/// Cas terrain : `install-gradatum-services.sh --force` sur une instance LIVE avec un
-/// `bearer.toml` contenant des entrées consumer customisées.
-#[test]
-fn materialize_preset_backups_existing_bearer_toml() {
-    let tmp = TempDir::new().unwrap();
-    let config_dir = tmp.path().join("config");
-    fs::create_dir_all(&config_dir).unwrap();
-    let bearer = config_dir.join("bearer.toml");
-
-    let custom_content = r#"
-# Customisation user — doit être backupé avant écrasement.
+/// A policy an operator maintains by hand, distinct from every shipped preset.
+const HAND_MAINTAINED: &str = r#"
+# Hand-maintained — must survive every `init` that did not ask to replace it.
 [[consumer]]
 identity = "custom-user-bot"
 read_patterns = ["custom/**"]
 write_patterns = ["custom/**"]
 "#;
-    fs::write(&bearer, custom_content).unwrap();
 
-    // materialize_preset doit détecter le fichier existant, le backuper, puis écraser.
-    materialize_preset(tmp.path(), "hierarchical", Some("main"))
-        .expect("materialize_preset ne doit pas échouer");
-
-    // Vérifier qu'exactement 1 fichier .bak.<TS> existe dans config/
-    let backups: Vec<_> = fs::read_dir(&config_dir)
+/// Names of the backups sitting next to the preset.
+fn backups(config_dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(config_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("bearer.toml.bak.")
-        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("bearer.toml.bak."))
         .collect();
+    names.sort();
+    names
+}
 
-    assert_eq!(backups.len(), 1, "exactement 1 backup attendu");
+/// Case 1 — the file survives a re-materialisation that did not ask for it.
+#[test]
+fn existing_preset_is_kept_byte_identical() {
+    let tmp = TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let bearer = config_dir.join("bearer.toml");
+    fs::write(&bearer, HAND_MAINTAINED).unwrap();
+    let before = fs::read(&bearer).unwrap();
 
-    // Le backup doit contenir le contenu original
-    let backup_content = fs::read_to_string(backups[0].path()).unwrap();
-    assert!(
-        backup_content.contains("custom-user-bot"),
-        "le backup doit contenir le contenu original customisé"
+    materialize_preset(tmp.path(), "hierarchical", None, ExistingPreset::Keep)
+        .expect("keeping an existing preset is not an error");
+
+    assert_eq!(
+        fs::read(&bearer).unwrap(),
+        before,
+        "a kept preset must come back byte-for-byte"
     );
-
-    // Le bearer.toml actuel doit avoir été réécrit avec le preset hierarchical.
-    // Le preset "hierarchical" embarqué contient l'identité "admin" (renommage de
-    // l'ancienne "maintainer", doctrine d'identité v2.0.0).
-    let new_content = fs::read_to_string(&bearer).unwrap();
     assert!(
-        new_content.contains("identity = \"admin\""),
-        "bearer.toml doit être réécrit avec le preset hierarchical (identity admin)"
-    );
-    assert!(
-        !new_content.contains("custom-user-bot"),
-        "le custom consumer ne doit pas apparaître dans le bearer.toml réécrit \
-        (merge consumer-aware out of scope patch.3)"
+        backups(&config_dir).is_empty(),
+        "nothing was rewritten, so nothing was backed up: {:?}",
+        backups(&config_dir)
     );
 }
 
-/// Vérifie qu'aucun backup n'est créé lors d'un fresh install (pas de `bearer.toml` existant).
+/// Case 2 — the explicit replacement, which is the only path that writes over it.
 #[test]
-fn materialize_preset_no_backup_on_fresh_install() {
+fn existing_preset_is_backed_up_then_replaced_when_overwrite_is_asked_for() {
+    let tmp = TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let bearer = config_dir.join("bearer.toml");
+    fs::write(&bearer, HAND_MAINTAINED).unwrap();
+
+    materialize_preset(tmp.path(), "hierarchical", None, ExistingPreset::Overwrite)
+        .expect("an explicit overwrite must succeed");
+
+    let names = backups(&config_dir);
+    assert_eq!(names.len(), 1, "exactly one backup expected, got {names:?}");
+    let saved = fs::read_to_string(config_dir.join(&names[0])).unwrap();
+    assert_eq!(
+        saved, HAND_MAINTAINED,
+        "the backup is the only remaining copy of the replaced policy"
+    );
+
+    // The shipped `hierarchical` preset declares the `admin` identity (renamed
+    // from the former `maintainer` by the v2.0.0 identity doctrine).
+    let written = fs::read_to_string(&bearer).unwrap();
+    assert!(
+        written.contains("identity = \"admin\""),
+        "the requested preset must be the one now on disk"
+    );
+    assert!(
+        !written.contains("custom-user-bot"),
+        "the replaced policy must not survive in the active file (a consumer-aware \
+         merge is out of scope here)"
+    );
+}
+
+/// Case 3 — a fresh install has nothing to save.
+#[test]
+fn fresh_install_writes_the_preset_without_a_backup() {
     let tmp = TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
 
-    // Pas de bearer.toml préexistant.
-    materialize_preset(tmp.path(), "hierarchical", Some("main"))
-        .expect("materialize_preset ne doit pas échouer sur fresh install");
+    materialize_preset(tmp.path(), "hierarchical", None, ExistingPreset::Overwrite)
+        .expect("materializing on a fresh root must succeed");
 
-    // Aucun fichier backup ne doit avoir été créé
-    let has_backup = fs::read_dir(&config_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .any(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("bearer.toml.bak.")
-        });
-
-    assert!(!has_backup, "aucun backup attendu sur fresh install");
-
-    // Le bearer.toml doit avoir été créé
     assert!(
-        config_dir.join("bearer.toml").exists(),
-        "bearer.toml doit être créé sur fresh install"
+        backups(&config_dir).is_empty(),
+        "no pre-existing file means no backup"
     );
+    assert!(config_dir.join("bearer.toml").exists());
 }

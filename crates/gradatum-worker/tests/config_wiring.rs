@@ -6,33 +6,45 @@
 //! site**, while its documentation describes an active behaviour. The volet 1
 //! (`gradatum-engine`) and volet 2 (`gradatum-server`) guards locked that class down for
 //! their config structs; this volet extends the same mechanism to the worker's TOML
-//! sections (`[apalis]`, `[distill_cron]`, `[multi_tenant]`, `[apalis.metrics]`,
+//! sections (`[apalis]`, `[distill_cron]`, `[multi_tenant]`, `[queue]`, `[apalis.metrics]`,
 //! `[apalis.health]`, `[curator]` / `[curator.llm]`).
 //!
-//! ## The finding of this volet
+//! ## The finding of this volet, and its resolution
 //!
-//! [`WorkerLlmConfig::max_tokens`] (`[curator.llm] max_tokens`) is parsed but **never
-//! read**: only the top-level `[curator] llm_review_max_tokens` is propagated into the
-//! pipeline (see the `From<&WorkerCuratorConfig>` impl). It is documented as redundant and
-//! deliberately not propagated, so it is classified [`Wiring::NotWired`] here (the guard
-//! asserts the marker persists and the field stays unread). Wiring it would decide which
-//! of two `max_tokens` sources wins — a runtime-behaviour change, out of this test's
-//! scope; the finding is reported rather than silently fixed.
+//! `[curator.llm] max_tokens` was parsed and **never read**: only the top-level
+//! `[curator] llm_review_max_tokens` is propagated into the pipeline (see the
+//! `From<&WorkerCuratorConfig>` impl). Wiring it would have made a second source live for
+//! a value already arbitrated elsewhere, so the field has been **removed** instead of
+//! wired. `[curator] llm_review_max_tokens` is the only key carrying the effect; a
+//! `server.toml` still carrying the removed key keeps loading — the struct declares no
+//! `deny_unknown_fields`, so the retired key is ignored rather than rejected.
+//! `a_config_still_carrying_the_removed_llm_max_tokens_key_loads` below pins exactly that.
+//!
+//! With that field gone, no worker config field is deliberately left unread, so this
+//! volet's guard carries **no exemption vocabulary**: every field must reach a consumer.
 //!
 //! ## Coverage boundary
 //!
-//! Ten config structs are exposed through the worker's `lib` surface and covered here.
+//! Eleven config structs are exposed through the worker's `lib` surface and covered here.
 //! Two more are **not** reachable from an external integration test and are left
-//! uncovered by design (reported as a follow-up, not silently dropped):
+//! uncovered **on purpose** — widening a production visibility, or moving a DTO out of the
+//! binary root, is a production change made for a test's convenience, and neither is
+//! worth it:
 //!   - `WorkerEmbedConfig` (`[embed]`) — a private DTO defined in `main.rs` (the binary
 //!     root), absent from the `lib` surface tests compile against.
-//!   - `WorkerStorageConfig` (`[storage] root`) — a module-private struct in `queue_path`;
-//!     covering it would require widening its visibility, avoided here (test-additive).
+//!   - `WorkerStorageConfig` (`[storage] root`) — a module-private struct in `queue_path`
+//!     whose `root` field is private too; covering it would take two widenings.
+//!
+//! The risk that matters is not these two but a **third** struct appearing unnoticed, so
+//! `every_figment_extraction_site_is_whitelisted` below pins the exhaustive set of
+//! extraction sites against a bounded whitelist and fails, naming the newcomer, if one is
+//! added outside it. Assumed partial coverage, made visible — not silently dropped.
 //!
 //! ## Mechanism (identical to the earlier volets, no macro, no dependency)
 //!
 //! 1. **Compile-time completeness** — one *exhaustive destructuring* (no `..`) per struct.
-//! 2. **Classification registry** — `Wired { proof }` or `NotWired { decl_file, marker }`.
+//! 2. **Consumption registry** — one witness token per field, required to occur in
+//!    production sources.
 //! 3. **Production scan** — all crate sources (worker has no `config.rs`), `#[cfg(test)]`
 //!    stripped, comments neutralised. Config struct declarations are in scanned files, but
 //!    a bare `field:` declaration carries no leading dot, so binding-qualified proofs
@@ -40,43 +52,40 @@
 //!
 //! Run with: `cargo test -p gradatum-worker --test config_wiring`
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use figment::Figment;
+use figment::providers::{Format, Toml};
 use gradatum_worker::apalis_handlers::MultiTenantCfg;
 use gradatum_worker::curator_loader::{WorkerCuratorConfig, WorkerLlmConfig};
 use gradatum_worker::health::HealthServerConfig;
 use gradatum_worker::metrics::MetricsConfig;
 use gradatum_worker::monitor::{ApalisConfig, WorkerConfig, WorkersConfig};
-use gradatum_worker::schedules::{DistillCronConfig, ScheduleConfig};
+use gradatum_worker::schedules::{DistillCronConfig, QueueConfig, ScheduleConfig};
 
-/// Classification of a config field with respect to its runtime consumption.
-enum Wiring {
-    /// Wired: its value reaches a consumption site. `proof` is a discriminating token
-    /// that must appear in production sources (test modules stripped). Removing the
-    /// wiring removes the token → RED.
-    Wired { proof: &'static str },
-    /// Deliberately parsed-but-not-consumed. `decl_file` is the crate source (relative to
-    /// `src/`) where the field is declared; `marker` is the doc phrase that must persist
-    /// near the `pub <field>:` declaration. The field must ALSO stay unread in production
-    /// (a `.<field>` read → it was wired without reclassification → RED).
-    NotWired {
-        decl_file: &'static str,
-        marker: &'static str,
-    },
-}
-
-/// One registry entry: a field name plus its classification.
+/// One registry entry: a config field name plus the production token that witnesses its
+/// consumption. `proof` is a discriminating token that must appear in production sources
+/// (test modules stripped, comments neutralised). Removing the wiring removes the token,
+/// and the guard turns RED naming the field.
+///
+/// There is **no exemption variant**. The earlier volets of this guard carried a
+/// `NotWired { decl_file, marker }` classification for a field parsed and deliberately
+/// left unread; the worker's single such field (`[curator.llm] max_tokens`) has been
+/// removed rather than wired, so every field of every covered struct now has to reach a
+/// consumer. A field with no consumption site cannot be silenced here — only wired or
+/// deleted, which is the property the guard exists to enforce.
 struct Entry {
     name: &'static str,
-    wiring: Wiring,
+    proof: &'static str,
 }
 
 /// Builds an entry, **consuming** the binding produced by the destructuring. The unused
 /// binding forces the mechanical link between the exhaustive destructuring and the
 /// registry (adding a field forces naming it, else E0027; silenced only by an entry).
-fn entry<T>(name: &'static str, _binding: &T, wiring: Wiring) -> Entry {
-    Entry { name, wiring }
+fn entry<T>(name: &'static str, _binding: &T, proof: &'static str) -> Entry {
+    Entry { name, proof }
 }
 
 // ---------------------------------------------------------------------------
@@ -86,14 +95,8 @@ fn entry<T>(name: &'static str, _binding: &T, wiring: Wiring) -> Entry {
 fn apalis_registry(c: &ApalisConfig) -> Vec<Entry> {
     let ApalisConfig { workers, schedules } = c;
     vec![
-        entry("workers", workers, Wiring::Wired { proof: ".workers" }),
-        entry(
-            "schedules",
-            schedules,
-            Wiring::Wired {
-                proof: ".schedules",
-            },
-        ),
+        entry("workers", workers, ".workers"),
+        entry("schedules", schedules, ".schedules"),
     ]
 }
 
@@ -110,62 +113,14 @@ fn workers_registry(c: &WorkersConfig) -> Vec<Entry> {
         privacy_rescan,
     } = c;
     vec![
-        entry(
-            "curate",
-            curate,
-            Wiring::Wired {
-                proof: "workers.curate",
-            },
-        ),
-        entry(
-            "embed",
-            embed,
-            Wiring::Wired {
-                proof: "workers.embed",
-            },
-        ),
-        entry(
-            "reindex",
-            reindex,
-            Wiring::Wired {
-                proof: "workers.reindex",
-            },
-        ),
-        entry(
-            "purge",
-            purge,
-            Wiring::Wired {
-                proof: "workers.purge",
-            },
-        ),
-        entry(
-            "forget",
-            forget,
-            Wiring::Wired {
-                proof: "workers.forget",
-            },
-        ),
-        entry(
-            "distill",
-            distill,
-            Wiring::Wired {
-                proof: "workers.distill",
-            },
-        ),
-        entry(
-            "validate",
-            validate,
-            Wiring::Wired {
-                proof: "workers.validate",
-            },
-        ),
-        entry(
-            "privacy_rescan",
-            privacy_rescan,
-            Wiring::Wired {
-                proof: "workers.privacy_rescan",
-            },
-        ),
+        entry("curate", curate, "workers.curate"),
+        entry("embed", embed, "workers.embed"),
+        entry("reindex", reindex, "workers.reindex"),
+        entry("purge", purge, "workers.purge"),
+        entry("forget", forget, "workers.forget"),
+        entry("distill", distill, "workers.distill"),
+        entry("validate", validate, "workers.validate"),
+        entry("privacy_rescan", privacy_rescan, "workers.privacy_rescan"),
     ]
 }
 
@@ -178,27 +133,9 @@ fn worker_registry(c: &WorkerConfig) -> Vec<Entry> {
         max_retries,
     } = c;
     vec![
-        entry(
-            "concurrency",
-            concurrency,
-            Wiring::Wired {
-                proof: ".concurrency",
-            },
-        ),
-        entry(
-            "timeout_secs",
-            timeout_secs,
-            Wiring::Wired {
-                proof: ".timeout_secs",
-            },
-        ),
-        entry(
-            "max_retries",
-            max_retries,
-            Wiring::Wired {
-                proof: ".max_retries",
-            },
-        ),
+        entry("concurrency", concurrency, ".concurrency"),
+        entry("timeout_secs", timeout_secs, ".timeout_secs"),
+        entry("max_retries", max_retries, ".max_retries"),
     ]
 }
 
@@ -211,27 +148,9 @@ fn schedule_registry(c: &ScheduleConfig) -> Vec<Entry> {
         retention_days,
     } = c;
     vec![
-        entry(
-            "name",
-            name,
-            Wiring::Wired {
-                proof: "sched_cfg.name",
-            },
-        ),
-        entry(
-            "cron",
-            cron,
-            Wiring::Wired {
-                proof: "sched_cfg.cron",
-            },
-        ),
-        entry(
-            "retention_days",
-            retention_days,
-            Wiring::Wired {
-                proof: ".retention_days",
-            },
-        ),
+        entry("name", name, "sched_cfg.name"),
+        entry("cron", cron, "sched_cfg.cron"),
+        entry("retention_days", retention_days, ".retention_days"),
     ]
 }
 
@@ -246,28 +165,34 @@ fn distill_cron_registry(c: &DistillCronConfig) -> Vec<Entry> {
         max_jobs_per_tick,
     } = c;
     vec![
+        entry("enabled", enabled, "distill_cron.enabled"),
+        entry("cron", cron, "self.cron"),
+        entry("sections", sections, ".sections"),
+        entry("pressure_min", pressure_min, ".pressure_min"),
+        entry("max_jobs_per_tick", max_jobs_per_tick, ".max_jobs_per_tick"),
+    ]
+}
+
+/// [`QueueConfig`] (`[queue]`): both fields are read on the tick path — the cutoff in
+/// `run_queue_purge_once` (`cfg.purge_after_secs`, journalised with the count) and in
+/// `QueueConfig::purge_cutoff` (`self.purge_after_secs`); the cadence in
+/// `QueueConfig::purge_interval` (`self.purge_interval_secs.max(60)`), which is what the
+/// `tokio::time::interval` in `main.rs` is built from.
+///
+/// The keep window is deliberately **not** a field: it is `TERMINAL_PAYLOAD_KEEP` in
+/// `gradatum-core`, a product constant documented as having no key, no environment
+/// variable and no flag.
+fn queue_registry(c: &QueueConfig) -> Vec<Entry> {
+    let QueueConfig {
+        purge_after_secs,
+        purge_interval_secs,
+    } = c;
+    vec![
+        entry("purge_after_secs", purge_after_secs, ".purge_after_secs"),
         entry(
-            "enabled",
-            enabled,
-            Wiring::Wired {
-                proof: "distill_cron.enabled",
-            },
-        ),
-        entry("cron", cron, Wiring::Wired { proof: "self.cron" }),
-        entry("sections", sections, Wiring::Wired { proof: ".sections" }),
-        entry(
-            "pressure_min",
-            pressure_min,
-            Wiring::Wired {
-                proof: ".pressure_min",
-            },
-        ),
-        entry(
-            "max_jobs_per_tick",
-            max_jobs_per_tick,
-            Wiring::Wired {
-                proof: ".max_jobs_per_tick",
-            },
+            "purge_interval_secs",
+            purge_interval_secs,
+            ".purge_interval_secs",
         ),
     ]
 }
@@ -275,13 +200,7 @@ fn distill_cron_registry(c: &DistillCronConfig) -> Vec<Entry> {
 fn multi_tenant_registry(c: &MultiTenantCfg) -> Vec<Entry> {
     let MultiTenantCfg { enabled } = c;
     // read as `mt.enabled` in the handlers' tenant guard.
-    vec![entry(
-        "enabled",
-        enabled,
-        Wiring::Wired {
-            proof: "mt.enabled",
-        },
-    )]
+    vec![entry("enabled", enabled, "mt.enabled")]
 }
 
 /// [`MetricsConfig`] and [`HealthServerConfig`] both spawn from a `config` binding and read
@@ -295,47 +214,17 @@ fn metrics_registry(c: &MetricsConfig) -> Vec<Entry> {
         port,
     } = c;
     vec![
-        entry(
-            "enabled",
-            enabled,
-            Wiring::Wired {
-                proof: "metrics_cfg.enabled",
-            },
-        ),
-        entry(
-            "bind",
-            bind,
-            Wiring::Wired {
-                proof: "config.bind",
-            },
-        ),
-        entry(
-            "port",
-            port,
-            Wiring::Wired {
-                proof: "config.port",
-            },
-        ),
+        entry("enabled", enabled, "metrics_cfg.enabled"),
+        entry("bind", bind, "config.bind"),
+        entry("port", port, "config.port"),
     ]
 }
 
 fn health_registry(c: &HealthServerConfig) -> Vec<Entry> {
     let HealthServerConfig { bind, port } = c;
     vec![
-        entry(
-            "bind",
-            bind,
-            Wiring::Wired {
-                proof: "config.bind",
-            },
-        ),
-        entry(
-            "port",
-            port,
-            Wiring::Wired {
-                proof: "config.port",
-            },
-        ),
+        entry("bind", bind, "config.bind"),
+        entry("port", port, "config.port"),
     ]
 }
 
@@ -358,77 +247,55 @@ fn curator_registry(c: &WorkerCuratorConfig) -> Vec<Entry> {
         llm_review_fallback,
     } = c;
     vec![
-        entry("backend", backend, Wiring::Wired { proof: "w.backend" }),
-        entry("llm", llm, Wiring::Wired { proof: "w.llm" }),
+        entry("backend", backend, "w.backend"),
+        entry("llm", llm, "w.llm"),
         entry(
             "heuristic_admit_threshold",
             heuristic_admit_threshold,
-            Wiring::Wired {
-                proof: ".heuristic_admit_threshold",
-            },
+            ".heuristic_admit_threshold",
         ),
         entry(
             "heuristic_default_status",
             heuristic_default_status,
-            Wiring::Wired {
-                proof: ".heuristic_default_status",
-            },
+            ".heuristic_default_status",
         ),
         entry(
             "llm_review_enabled",
             llm_review_enabled,
-            Wiring::Wired {
-                proof: ".llm_review_enabled",
-            },
+            ".llm_review_enabled",
         ),
         entry(
             "confidence_threshold",
             confidence_threshold,
-            Wiring::Wired {
-                proof: ".confidence_threshold",
-            },
+            ".confidence_threshold",
         ),
         entry(
             "llm_review_endpoint",
             llm_review_endpoint,
-            Wiring::Wired {
-                proof: ".llm_review_endpoint",
-            },
+            ".llm_review_endpoint",
         ),
-        entry(
-            "llm_review_model",
-            llm_review_model,
-            Wiring::Wired {
-                proof: ".llm_review_model",
-            },
-        ),
+        entry("llm_review_model", llm_review_model, ".llm_review_model"),
         entry(
             "llm_review_timeout_ms",
             llm_review_timeout_ms,
-            Wiring::Wired {
-                proof: ".llm_review_timeout_ms",
-            },
+            ".llm_review_timeout_ms",
         ),
         entry(
             "llm_review_max_tokens",
             llm_review_max_tokens,
-            Wiring::Wired {
-                proof: ".llm_review_max_tokens",
-            },
+            ".llm_review_max_tokens",
         ),
         entry(
             "llm_review_fallback",
             llm_review_fallback,
-            Wiring::Wired {
-                proof: ".llm_review_fallback",
-            },
+            ".llm_review_fallback",
         ),
     ]
 }
 
-/// [`WorkerLlmConfig`]: five fields propagated via the `From` impl (`l.<field>`).
-/// `max_tokens` is the F-157 finding of this volet — parsed but never read (only
-/// `[curator] llm_review_max_tokens` is propagated), documented redundant → `NotWired`.
+/// [`WorkerLlmConfig`]: every field propagated via the `From` impl (`l.<field>`). The
+/// former `max_tokens` field — this volet's finding — was removed rather than wired; the
+/// struct's own set is now exactly the set the pipeline consumes.
 fn worker_llm_registry(c: &WorkerLlmConfig) -> Vec<Entry> {
     let WorkerLlmConfig {
         backend,
@@ -436,40 +303,13 @@ fn worker_llm_registry(c: &WorkerLlmConfig) -> Vec<Entry> {
         model,
         api_key_env,
         timeout_ms,
-        max_tokens,
     } = c;
     vec![
-        entry("backend", backend, Wiring::Wired { proof: "l.backend" }),
-        entry(
-            "base_url",
-            base_url,
-            Wiring::Wired {
-                proof: "l.base_url",
-            },
-        ),
-        entry("model", model, Wiring::Wired { proof: "l.model" }),
-        entry(
-            "api_key_env",
-            api_key_env,
-            Wiring::Wired {
-                proof: "l.api_key_env",
-            },
-        ),
-        entry(
-            "timeout_ms",
-            timeout_ms,
-            Wiring::Wired {
-                proof: "l.timeout_ms",
-            },
-        ),
-        entry(
-            "max_tokens",
-            max_tokens,
-            Wiring::NotWired {
-                decl_file: "curator_loader.rs",
-                marker: "not propagated",
-            },
-        ),
+        entry("backend", backend, "l.backend"),
+        entry("base_url", base_url, "l.base_url"),
+        entry("model", model, "l.model"),
+        entry("api_key_env", api_key_env, "l.api_key_env"),
+        entry("timeout_ms", timeout_ms, "l.timeout_ms"),
     ]
 }
 
@@ -493,6 +333,7 @@ fn full_registry() -> Vec<(&'static str, Vec<Entry>)> {
     let metrics = MetricsConfig::default();
     let health = HealthServerConfig::default();
     let mt = MultiTenantCfg::default();
+    let queue = QueueConfig::default();
     let curator = WorkerCuratorConfig::default();
     let llm = WorkerLlmConfig {
         backend: String::new(),
@@ -500,7 +341,6 @@ fn full_registry() -> Vec<(&'static str, Vec<Entry>)> {
         model: String::new(),
         api_key_env: None,
         timeout_ms: 0,
-        max_tokens: None,
     };
 
     vec![
@@ -510,6 +350,7 @@ fn full_registry() -> Vec<(&'static str, Vec<Entry>)> {
         ("ScheduleConfig", schedule_registry(&schedule)),
         ("DistillCronConfig", distill_cron_registry(&distill)),
         ("MultiTenantCfg", multi_tenant_registry(&mt)),
+        ("QueueConfig", queue_registry(&queue)),
         ("MetricsConfig", metrics_registry(&metrics)),
         ("HealthServerConfig", health_registry(&health)),
         ("WorkerCuratorConfig", curator_registry(&curator)),
@@ -804,11 +645,22 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Crate root, resolved at run time.
+///
+/// The value baked in at compile time goes stale as soon as a test binary is reused
+/// from another checkout directory (shared build artefacts): the environment variable
+/// wins, and the compile-time value only serves as a fallback outside cargo.
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
 /// Production corpus: concatenation of all crate sources (the worker has no `config.rs` —
 /// its config structs live across module files), test modules removed, comments
 /// neutralised.
 fn production_corpus() -> String {
-    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src_dir = manifest_dir().join("src");
     let mut files = Vec::new();
     collect_rs(&src_dir, &mut files);
     files.sort();
@@ -820,26 +672,6 @@ fn production_corpus() -> String {
         corpus.push('\n');
     }
     corpus
-}
-
-/// Raw source of `src/<file>` (unmodified — for the NotWired marker check, which must see
-/// doc comments the corpus neutralises).
-fn raw_source(file: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file);
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("reading src/{file}: {e}"))
-}
-
-/// `true` if `field` carries `marker` within the ~500 bytes preceding its `pub <field>:`
-/// declaration in `raw` (its doc block).
-fn has_marker(raw: &str, field: &str, marker: &str) -> bool {
-    let decl = format!("pub {field}:");
-    let Some(idx) = raw.find(&decl) else {
-        return false; // declaration not found → force investigation (RED)
-    };
-    match raw[..idx].rfind(marker) {
-        Some(m) => idx - m < 500,
-        None => false,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -880,60 +712,214 @@ fn scanner_is_sound() {
 // ---------------------------------------------------------------------------
 
 /// Every field of every deserialised `gradatum-worker` config struct (lib surface) reaches
-/// a consumption site, OR is a documented `NotWired` field (marker present + still unread).
+/// a consumption site. There is no exemption: a field with no consumption site fails here,
+/// named.
 ///
-/// Verified by scanning the sources — not by re-reading. Removing a `Wired` field's
-/// consumption makes this red by naming the field; wiring a `NotWired` field (or dropping
-/// its marker) makes it red too. Adding/removing a field breaks compilation.
+/// Verified by scanning the sources — not by re-reading. Removing a field's consumption
+/// makes this red by naming the field. Adding or removing a field breaks compilation.
 #[test]
-fn every_worker_config_field_reaches_a_consumer_or_is_annotated() {
+fn every_worker_config_field_reaches_a_consumer() {
     let corpus = production_corpus();
     let mut orphans: Vec<String> = Vec::new();
     let mut wired = 0usize;
-    let mut not_wired = 0usize;
 
     for (struct_name, entries) in full_registry() {
         for e in &entries {
-            match &e.wiring {
-                Wiring::Wired { proof } => {
-                    wired += 1;
-                    if !reads(&corpus, proof) {
-                        orphans.push(format!(
-                            "`{}::{}` classified Wired but its consumption token `{}` is \
-                             absent from production sources — wiring removed?",
-                            struct_name, e.name, proof
-                        ));
-                    }
-                }
-                Wiring::NotWired { decl_file, marker } => {
-                    not_wired += 1;
-                    let raw = raw_source(decl_file);
-                    if !has_marker(&raw, e.name, marker) {
-                        orphans.push(format!(
-                            "`{}::{}` classified NotWired but the marker `{}` disappeared near \
-                             its declaration in {} — reclassify if it was wired",
-                            struct_name, e.name, marker, decl_file
-                        ));
-                    }
-                    let read_token = format!(".{}", e.name);
-                    if reads(&corpus, &read_token) {
-                        orphans.push(format!(
-                            "`{}::{}` classified NotWired but it is READ in production (`{}`) — \
-                             it was wired: reclassify it Wired",
-                            struct_name, e.name, read_token
-                        ));
-                    }
-                }
+            wired += 1;
+            if !reads(&corpus, e.proof) {
+                orphans.push(format!(
+                    "`{}::{}` has no consumption site: its witness token `{}` is absent from \
+                     production sources — wiring removed?",
+                    struct_name, e.name, e.proof
+                ));
             }
         }
     }
 
     assert!(
         orphans.is_empty(),
-        "F-157 — {} worker config field(s) in wiring default (wired={}, not_wired={}):\n  - {}",
+        "F-157 — {} worker config field(s) reach no consumer (checked={}):\n  - {}",
         orphans.len(),
         wired,
-        not_wired,
         orphans.join("\n  - ")
     );
+}
+
+/// A `server.toml` that still carries the removed `[curator.llm] max_tokens` key loads
+/// unchanged.
+///
+/// The removal changes what the product *documents*, not what an existing file is allowed
+/// to say: `WorkerLlmConfig` declares no `deny_unknown_fields`, so the retired key is
+/// ignored exactly as any unknown key always was. A configuration that loaded before the
+/// upgrade still loads after it — the operator is handed a guide to follow, not an outage
+/// to repair.
+#[test]
+fn a_config_still_carrying_the_removed_llm_max_tokens_key_loads() {
+    let toml = r#"
+[llm]
+backend = "openai_compat"
+base_url = "http://example.invalid"
+model = "example-model"
+timeout_ms = 5000
+max_tokens = 2048
+"#;
+
+    let cfg: WorkerCuratorConfig = Figment::new()
+        .merge(Toml::string(toml))
+        .extract()
+        .expect("a config carrying the removed [curator.llm] max_tokens key must still load");
+
+    let llm = cfg.llm.expect("the [curator.llm] section must be present");
+    assert_eq!(
+        llm.model, "example-model",
+        "the surviving keys must keep their values around the ignored one"
+    );
+    assert_eq!(llm.timeout_ms, 5000);
+}
+
+// ---------------------------------------------------------------------------
+// Coverage boundary, pinned rather than assumed.
+// ---------------------------------------------------------------------------
+
+/// Config types extracted from the server TOML at a figment site **and covered** by the
+/// registries above — the crate's `lib` surface exposes all seven.
+const COVERED_EXTRACTION_SITES: [&str; 7] = [
+    "ApalisConfig",
+    "DistillCronConfig",
+    "HealthServerConfig",
+    "MetricsConfig",
+    "MultiTenantCfg",
+    "QueueConfig",
+    "WorkerCuratorConfig",
+];
+
+/// Config types extracted at a figment site but **not covered**, on purpose — named here
+/// so the gap is a decision on the record rather than an omission.
+///
+///   - `WorkerEmbedConfig` — a private DTO in `main.rs`, the binary root. Reaching it from
+///     `tests/` would mean moving it into the lib: a structural change to production code,
+///     made for a test's convenience.
+///   - `WorkerStorageConfig` — a module-private struct in `queue_path` whose `root` field
+///     is private too. Reaching it would take two visibility widenings.
+///
+/// Neither is worth a production change; what is worth it is that a **third** struct cannot
+/// appear unnoticed, which is what the test below enforces.
+const UNCOVERED_EXTRACTION_SITES: [&str; 2] = ["WorkerEmbedConfig", "WorkerStorageConfig"];
+
+/// The generic parameter of the `load_section` helper itself. Its signature is
+/// `pub fn load_section<T>(` and its body forwards to `extract_inner::<T>`, so **both**
+/// scan shapes meet it — at the helper's definition, not at a config site. It names no
+/// config type, and no config struct in this crate is named by a single letter.
+const HELPER_TYPE_PARAM: &str = "T";
+
+/// The type named at a `load_section` binding site: `let <b>: <Type> = load_section(`.
+/// `at` is the index just past the opening `(`. Returns the last path segment.
+///
+/// The check that the text between the `=` and the call is exactly `load_section(` is what
+/// separates a **call site** from the helper's own **definition**: without it, the scan
+/// walks back to an unrelated `=` earlier in the file and reports whatever preceded it.
+fn type_bound_before(corpus: &str, at: usize) -> Option<String> {
+    let head = &corpus[..at];
+    let eq = head.rfind('=')?;
+    if corpus[eq + 1..at].trim() != "load_section(" {
+        return None;
+    }
+    let annotated = head[..eq].trim_end();
+    let ty = annotated[annotated.rfind(':')? + 1..].trim();
+    if ty.is_empty()
+        || !ty
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    {
+        return None;
+    }
+    Some(last_segment(ty))
+}
+
+/// The type named by a turbofish: `extract_inner::<Type>(`. `at` is the index just past
+/// the opening `<`. Returns the last path segment.
+fn type_in_turbofish(corpus: &str, at: usize) -> Option<String> {
+    let ty = corpus[at..].split('>').next()?.trim();
+    if ty.is_empty()
+        || !ty
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    {
+        return None;
+    }
+    Some(last_segment(ty))
+}
+
+/// `a::b::C` → `C`; a bare `C` is returned unchanged.
+fn last_segment(path: &str) -> String {
+    path.rsplit("::").next().unwrap_or(path).trim().to_string()
+}
+
+/// Types extracted from the TOML at a figment site in production sources. Two shapes are
+/// recognised, and they are the only two the crate uses: the `load_section` helper
+/// (annotated binding) and an explicit `extract_inner::<T>` turbofish.
+///
+/// [`HELPER_TYPE_PARAM`] is dropped: it is the helper's own parameter, met at its
+/// definition and inside its body, and never a config type.
+fn extraction_sites(corpus: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for (pattern, turbofish) in [("load_section(", false), ("extract_inner::<", true)] {
+        let mut from = 0usize;
+        while let Some(rel) = corpus[from..].find(pattern) {
+            let at = from + rel + pattern.len();
+            let named = if turbofish {
+                type_in_turbofish(corpus, at)
+            } else {
+                type_bound_before(corpus, at)
+            };
+            if let Some(ty) = named
+                && ty != HELPER_TYPE_PARAM
+            {
+                found.insert(ty);
+            }
+            from = at;
+        }
+    }
+    found
+}
+
+/// Every figment extraction site in production is on the whitelist.
+///
+/// The guard above covers eleven structs; two extracted types are knowingly outside it. This
+/// test does not widen anything — it makes the boundary **countable**. Each extraction site
+/// is enumerated mechanically, and the set must equal the seven covered types plus the two
+/// named exceptions, exactly. A struct extracted outside that set fails this test **naming
+/// it**, so the coverage gap can grow only on purpose.
+#[test]
+fn every_figment_extraction_site_is_whitelisted() {
+    let corpus = production_corpus();
+    let found = extraction_sites(&corpus);
+
+    let expected: BTreeSet<String> = COVERED_EXTRACTION_SITES
+        .iter()
+        .chain(UNCOVERED_EXTRACTION_SITES.iter())
+        .map(|s| (*s).to_string())
+        .collect();
+
+    let newcomer: Vec<&String> = found.difference(&expected).collect();
+    let vanished: Vec<&String> = expected.difference(&found).collect();
+    assert!(
+        newcomer.is_empty() && vanished.is_empty(),
+        "figment extraction sites drifted from the whitelist.\n  \
+         extracted but not whitelisted (a new site needs a decision): {newcomer:?}\n  \
+         whitelisted but no longer extracted (stale entry): {vanished:?}\n  \
+         found: {found:?}"
+    );
+
+    // The whitelist's `covered` half must still name structs the registries actually
+    // cover — otherwise an entry could be moved to the uncovered half to silence a
+    // regression, and the gap would read as a decision.
+    let registered: BTreeSet<&str> = full_registry().into_iter().map(|(n, _)| n).collect();
+    for name in COVERED_EXTRACTION_SITES {
+        assert!(
+            registered.contains(name),
+            "`{name}` is listed as covered but no registry covers it — the coverage \
+             whitelist and the registries disagree"
+        );
+    }
 }

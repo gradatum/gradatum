@@ -17,8 +17,13 @@
 
 mod merge;
 mod regex_detector;
+mod sidecar;
 mod windowing;
 
 pub use merge::{MergeStats, rebase, validate_and_merge};
 pub use regex_detector::RegexDetector;
+pub use sidecar::{
+    ADAPTER_TABLE_V, MAX_RESPONSE_FRAME_BYTES, SUPPORTED_MAPPING_V_MIN, SidecarConfig,
+    SidecarDetector, SidecarDiagnostics,
+};
 pub use windowing::WindowPlan;

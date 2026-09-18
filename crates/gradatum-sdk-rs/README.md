@@ -2,7 +2,7 @@
 
 > Rust SDK client for the gradatum-server HTTP API.
 
-**Status**: v2.0.0 — public, Apache-2.0. **Placeholder — no client surface is implemented yet.**
+**Status**: v2.5.0 — public, Apache-2.0. **Placeholder — no client surface is implemented yet.**
 The crate compiles and exports only a `VERSION` constant; there is no public API to be stable
 about. A typed async client is planned for a future release.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
@@ -19,7 +19,7 @@ is planned for a future release.
 
 ```toml
 [dependencies]
-gradatum-sdk-rs = "2.0.0"
+gradatum-sdk-rs = "2.5.0"
 ```
 
 No public types are implemented yet. Use direct HTTP calls to `gradatum-server`

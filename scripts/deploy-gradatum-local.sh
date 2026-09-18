@@ -110,6 +110,31 @@ BINARIES=("gradatum-server" "gradatum-worker" "gradatum-admin")
 INSTALL_DIR="/usr/bin"
 OPT_INSTALL_DIR="/opt/gradatum/bin"   # préfixe partagé gateway + engine
 
+# Racine d'installation servie par les units systemd (vault, index, DBs). Sert de
+# `--root` à gradatum-admin : la CLI en dérive le chemin de l'index. Les INVOCATIONS
+# de la CLI passent donc par `--root`, jamais par un chemin d'index recomposé ici.
+# Seule exception, tolérée et documentée sur place : la sonde d'existence read-only de
+# l'étape 3b, qui ne PILOTE rien (au pire un skip non fatal, annoncé et compté).
+GRADATUM_ROOT="/var/lib/gradatum"
+
+# Vault logique de la carte de code du dépôt déployé (`code-<projet>`).
+CODE_VAULT="code-gradatum"
+
+# Borne de temps du rafraîchissement de l'index code (secondes), étape 3b. Un
+# `code update` incrémental est O(diff) et dure quelques secondes ; cette borne n'existe
+# que pour le cas dégénéré (index verrouillé, dépôt illisible, montage qui ne répond
+# plus) où l'appel s'installerait dans une fenêtre où les services sont ARRÊTÉS — donc
+# allongerait la panne au lieu de la raccourcir. Surchargeable par l'environnement :
+# une première indexation légitime est plus longue que la borne, et c'est à l'opérateur
+# qui la lance de le dire, pas au script de le supposer.
+CODE_INDEX_TIMEOUT_S="${CODE_INDEX_TIMEOUT_S:-60}"
+
+# Issue de l'étape 3b, posée par refresh_code_index() et rendue au récapitulatif final
+# (étape 8) : le deploy qui se termine doit DIRE ce qu'il est advenu de la carte de
+# code, sans quoi un index périmé se lit comme un index à jour.
+CODE_INDEX_STATUS="non exécutée"
+CODE_INDEX_DEGRADED=false
+
 # Unité LIVE de la passerelle (F-173). PAS gradatum-gateway-spike.service (celle-là
 # est marquée « non-LIVE » dans le packaging et porte After=gradatum-server — que la
 # prod évite délibérément).
@@ -272,6 +297,145 @@ install_dir_for() {
         gradatum-engine|gradatum-gateway) echo "$OPT_INSTALL_DIR" ;;
         *)                                echo "$INSTALL_DIR" ;;
     esac
+}
+
+# ---------------------------------------------------------------------------
+# Étape 3b — rafraîchissement de l'index de la carte de code (F-286)
+# ---------------------------------------------------------------------------
+# POURQUOI ICI, et pas ailleurs :
+#   - l'index est MONO-PROPRIÉTAIRE : `index.db` est tenu par le serveur LIVE, donc
+#     un `code update` ne peut écrire que services arrêtés. Le deploy a déjà cette
+#     fenêtre — la réutiliser est le seul moyen d'un rafraîchissement AUTOMATIQUE,
+#     sans ajouter une seconde opération manuelle que personne ne pensera à faire.
+#   - AVANT l'étape 4 (installation des binaires) À DESSEIN. C'est l'admin ENCORE
+#     INSTALLÉ — donc celui qui a produit le schéma courant — qui ouvre l'index.
+#     Placée après l'installation, l'écriture appliquerait les migrations de schéma
+#     AVANT l'ExecStartPre de l'étape 5 : la sauvegarde « pre-migration » capturerait
+#     un index DÉJÀ migré, et la garantie d'en-tête du script tomberait en silence.
+#     (Corollaire : un échec ici laisse les binaires LIVE INTACTS — rien à restaurer.)
+#
+# L'ÉTAPE N'EST JAMAIS FATALE, et c'est le point dur de sa conception. Elle s'exécute
+# APRÈS l'arrêt des services : un `fail` ici laisserait le parc à l'arrêt, sans
+# redémarrage — le remède (une carte de code en retard) coûterait plus cher que le mal
+# (un service éteint), et le script se terminerait sur un état strictement pire que
+# celui qu'il a trouvé. Toute issue non nominale rend donc un WARN proéminent, une ligne
+# dédiée au récapitulatif (étape 8), et le deploy CONTINUE : installation puis démarrage.
+# La carte de code se réindexe hors-bande, avec l'outil que l'opérateur a sous la main ;
+# ce qu'aucune exécution ne doit produire, c'est une fenêtre d'arrêt qui s'éternise ou
+# un deploy qui s'interrompt sans avoir redémarré ce qu'il a arrêté.
+# Aucun chemin fatal n'est ajouté ici : les chemins fatals du script restent ceux qui
+# l'étaient déjà (pré-vol, intégrité des migrations, backup) et cette étape n'en porte
+# aucun — c'est vérifiable d'un `grep`, il n'y a pas un seul `fail` entre l'arrêt des
+# services et leur redémarrage.
+#
+# Éprouvette (8 issues + point d'appel) : scripts/internal/deploy-gradatum-local.eprouvette.sh
+refresh_code_index() {
+    local admin="${INSTALL_DIR}/gradatum-admin"
+    # JOIN MANUEL ASSUMÉ, et c'est la seule exception du fichier (cf. GRADATUM_ROOT) :
+    # la CLI, elle, dérive son index de `--root`, mais elle n'expose AUCUNE sous-commande
+    # d'interrogation — `code` n'a que `ingest` et `update`, tous deux mutants. Cette
+    # sonde ne peut donc pas demander son chemin à la CLI. Elle ne PILOTE rien : sa
+    # seule conséquence possible est un skip non fatal, annoncé en WARN et compté au
+    # récapitulatif. Une dérive de chemin se voit donc ; elle ne peut pas faire tomber
+    # une étape utile en silence.
+    local index_db="${GRADATUM_ROOT}/vault/.gradatum/index.db"
+    local rc=0
+
+    # Première installation : l'index n'existe pas encore (c'est le premier démarrage
+    # du worker qui le crée) et un `code update` sur une base absente refuserait. Cas
+    # ANNONCÉ, jamais silencieux.
+    if ! sudo test -f "$index_db"; then
+        info "  ${index_db} absent (première installation) — aucun index code à rafraîchir."
+        CODE_INDEX_STATUS="absent (première installation) — rien à rafraîchir"
+        return 0
+    fi
+
+    # Index présent, outil absent : installation incohérente (les deux viennent du même
+    # deploy). Ce n'est PAS un refus : l'étape 4 installe précisément cet outil, donc le
+    # déployé sortira cohérent — l'index a un deploy de retard, et c'est dit.
+    if ! sudo test -x "$admin"; then
+        warn "  !!! INDEX CODE NON RAFRAÎCHI : ${admin} introuvable alors que ${index_db} existe."
+        warn "  Installation incohérente (index sans l'outil qui le maintient). L'étape 4 installe"
+        warn "  cet outil : le déployé sortira cohérent, l'index aura un deploy de retard."
+        warn "  Pour le rafraîchir avant le prochain deploy, hors-bande :"
+        warn "    sudo bash ~/scripts/reindex-code-vault.sh ${CODE_VAULT} ${PROJECT_DIR} --full"
+        CODE_INDEX_STATUS="NON rafraîchi (${admin} absent — installation incohérente)"
+        CODE_INDEX_DEGRADED=true
+        return 0
+    fi
+
+    # Aucun ingest préalable : `code update` le détecte et bascule en ingest COMPLET
+    # (« No prior ingest → full ingest fallback », crates/gradatum-admin/src/code_cmd.rs).
+    # Ce n'est plus un rafraîchissement, c'est une première indexation : minutes de CPU
+    # et de lecture de dépôt, dans une fenêtre où les services sont arrêtés. Refusée ici,
+    # renvoyée à l'outil hors-bande.
+    #
+    # Sonde HEURISTIQUE : `code_freshness` avec le MÊME prédicat que la CLI (`vault_id`
+    # et `ingested_sha != ''`) — l'absence de ligne est exactement la condition du repli,
+    # et c'est la table que la CLI consulte. Elle est non pilotante et à double garde :
+    # seul un décompte EXPLICITEMENT nul fait sauter l'étape. Base absente, schéma
+    # antérieur à la table, ou sqlite3 en échec ⇒ « indéterminé », et l'update est tenté
+    # (le repli éventuel reste alors borné par CODE_INDEX_TIMEOUT_S).
+    if ! $FLAG_DRY_RUN; then
+        local prior="" probe_rc=0
+        prior="$(sudo sqlite3 -readonly "$index_db" \
+            "SELECT COUNT(*) FROM code_freshness WHERE vault_id='${CODE_VAULT}' AND ingested_sha != '';" \
+            2>/dev/null)" || probe_rc=$?
+        if [[ $probe_rc -eq 0 && "$prior" == "0" ]]; then
+            warn "  !!! INDEX CODE NON RAFRAÎCHI : aucun ingest préalable pour ${CODE_VAULT}."
+            warn "  Un 'code update' basculerait en ingest COMPLET (ré-analyse de tout le dépôt) :"
+            warn "  ce n'est pas un rafraîchissement, et ça n'a rien à faire services arrêtés."
+            warn "  Première indexation, hors-bande :"
+            warn "    sudo bash ~/scripts/reindex-code-vault.sh ${CODE_VAULT} ${PROJECT_DIR} --full"
+            CODE_INDEX_STATUS="NON rafraîchi (aucun ingest préalable — plein ingest refusé en fenêtre)"
+            CODE_INDEX_DEGRADED=true
+            return 0
+        fi
+        if [[ $probe_rc -ne 0 ]]; then
+            warn "  ${index_db} illisible (sqlite3 rc=${probe_rc}) — ingest préalable INDÉTERMINÉ ; 'code update' est tenté."
+        fi
+    fi
+
+    info "  code update --vault ${CODE_VAULT} --root ${GRADATUM_ROOT} ${PROJECT_DIR} (borne ${CODE_INDEX_TIMEOUT_S}s)"
+    # Sous le compte de service, et pas sous le compte de connexion : `index.db`
+    # appartient à l'utilisateur des units systemd — c'est aussi l'identité sous
+    # laquelle la réindexation manuelle écrit. Le dépôt est lu par ACCÈS DIRECT (aucune
+    # copie) : ce compte doit pouvoir le lire (groupe de lecture + git safe.directory,
+    # propriétés de l'installation, pas du produit).
+    # `timeout` s'applique DANS le sudo, donc au processus de la CLI elle-même.
+    dry sudo -u gradatum timeout "$CODE_INDEX_TIMEOUT_S" "$admin" code update --vault "$CODE_VAULT" --root "$GRADATUM_ROOT" "$PROJECT_DIR" || rc=$?
+    if [[ $rc -eq 124 ]]; then
+        warn "  !!! INDEX CODE NON RAFRAÎCHI : borne de ${CODE_INDEX_TIMEOUT_S}s dépassée ('code update' interrompu)."
+        warn "  Le dépassement est délibérément NON FATAL : allonger la fenêtre services arrêtés serait"
+        warn "  un remède pire que le mal. Réindexer hors-bande, ou relever la borne :"
+        warn "    sudo bash ~/scripts/reindex-code-vault.sh ${CODE_VAULT} ${PROJECT_DIR} --full"
+        warn "    (ou relancer ce deploy avec CODE_INDEX_TIMEOUT_S=<secondes>)"
+        CODE_INDEX_STATUS="NON rafraîchi (borne de ${CODE_INDEX_TIMEOUT_S}s dépassée)"
+        CODE_INDEX_DEGRADED=true
+        return 0
+    fi
+    if [[ $rc -ne 0 ]]; then
+        warn "  !!! INDEX CODE NON RAFRAÎCHI : 'code update' rc=${rc}."
+        warn "  Le deploy CONTINUE (installation + démarrage) : les services arrêtés à l'étape 3"
+        warn "  doivent être redémarrés, c'est la priorité. La carte de code, elle, restera en"
+        warn "  retard sur le commit déployé — elle répondra sur du code qui n'est plus celui du"
+        warn "  binaire servi. À réindexer hors-bande :"
+        warn "    sudo bash ~/scripts/reindex-code-vault.sh ${CODE_VAULT} ${PROJECT_DIR} --full"
+        CODE_INDEX_STATUS="NON rafraîchi ('code update' rc=${rc})"
+        CODE_INDEX_DEGRADED=true
+        return 0
+    fi
+    if $FLAG_DRY_RUN; then
+        # Volontairement PAS « serait rafraîchi » : la sonde d'ingest préalable ne tourne
+        # pas en dry-run (elle interroge une base que le serveur LIVE tient, et le plan
+        # n'a rien à lui demander). Le plan annonce donc que l'étape serait TENTÉE — pas
+        # qu'elle irait au bout, ce que lui seul pourrait dire.
+        CODE_INDEX_STATUS="rafraîchissement prévu (dry-run — issue non vérifiée)"
+    else
+        info "  index code rafraîchi (vault ${CODE_VAULT}, rc=0)"
+        CODE_INDEX_STATUS="rafraîchi (vault ${CODE_VAULT})"
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -752,7 +916,7 @@ rollback() {
 # le reste encore sur l'ancien processus. L'échec était lisible, pas atomique.
 #
 # Ordre imposé : DISTANT d'abord (le plus exposé — binaire partagé par tous les moteurs
-# d'un hôte, moteurs de supervision/curation du homelab), LOCAL ensuite, puis sortie
+# d'un hôte, moteurs de supervision/curation de l'infrastructure locale), LOCAL ensuite, puis sortie
 # non-zéro. Le local vient en second parce que le distant dépend du local qui tourne :
 # on rend d'abord aux moteurs leur binaire, on ramène ensuite le serveur en arrière.
 #
@@ -960,10 +1124,13 @@ if $FLAG_ENGINE; then
 fi
 
 # 0b. Vérifier les prérequis
-for cmd in sqlite3 sha384sum jq curl systemctl sudo git; do
+# `timeout` : borne l'étape 3b (rafraîchissement de l'index code). Vérifié ICI, avant
+# toute mutation, plutôt que découvert dans la fenêtre services arrêtés — l'étape 3b
+# n'est pas fatale, mais un outil manquant y produirait un skip silencieux de plus.
+for cmd in sqlite3 sha384sum jq curl systemctl sudo git timeout; do
     command -v "$cmd" >/dev/null 2>&1 || fail "Prérequis manquant : $cmd"
 done
-info "Prérequis : OK (sqlite3, sha384sum, jq, curl, systemctl, sudo, git)"
+info "Prérequis : OK (sqlite3, sha384sum, jq, curl, systemctl, sudo, git, timeout)"
 
 # Prérequis du périmètre étendu (guardés : n'altèrent pas la ligne de base ci-dessus).
 # objdump : mesure du plancher glibc. ssh/scp : opérations sur les hôtes distants.
@@ -1453,6 +1620,13 @@ if ! $FLAG_DRY_RUN; then
 fi
 
 # ---------------------------------------------------------------------------
+# ÉTAPE 3b — Rafraîchissement de l'index code (fenêtre mono-propriétaire)
+# ---------------------------------------------------------------------------
+info "=== ÉTAPE 3b : INDEX CODE (services arrêtés) ==="
+
+refresh_code_index
+
+# ---------------------------------------------------------------------------
 # ÉTAPE 4 — Copie des nouveaux binaires
 # ---------------------------------------------------------------------------
 info "=== ÉTAPE 4 : INSTALLATION BINAIRES ==="
@@ -1558,7 +1732,7 @@ fi
 # de non-retour. Les unités sont ensuite redémarrées UNE À LA FOIS, porte de santé entre
 # chaque et
 # ARRÊT à la première anomalie (piège #3 — ces moteurs servent la supervision et la
-# curation de tout le homelab, jamais les trois en bloc). Cet arrêt n'abandonne PAS le
+# curation de toute l'infrastructure locale, jamais les trois en bloc). Cet arrêt n'abandonne PAS le
 # parc en l'état : il enchaîne sur engine_abort_restore (restauration distante puis
 # locale, sortie non-zéro) — F-173 critère 2, tout-ou-rien.
 if $FLAG_ENGINE && [[ ${#ENGINE_REMOTE[@]} -gt 0 ]]; then
@@ -1630,6 +1804,7 @@ if $FLAG_DRY_RUN; then
     info "  Version cible     : ${VERSION_CIBLE}"
     info "  Commit cible      : ${COMMIT_REF}"
     info "  Divergences sqlx  : ${DIV_COUNT}"
+    info "  Index code        : ${CODE_INDEX_STATUS}"
     info "  Engine            : $FLAG_ENGINE"
     if $FLAG_GATEWAY; then
         info "  Gateway           : $FLAG_GATEWAY"
@@ -1643,6 +1818,13 @@ if $FLAG_DRY_RUN; then
 else
     info "  Version LIVE      : ${VERSION_CIBLE}"
     info "  Commit LIVE       : ${COMMIT_REF}"
+    # L'étape 3b n'est jamais fatale : son issue doit donc être LUE ici. Un deploy qui
+    # rendrait un succès muet sur une carte de code en retard rendrait un succès faux.
+    if $CODE_INDEX_DEGRADED; then
+        warn "  Index code        : ${CODE_INDEX_STATUS} — voir les WARN de l'étape 3b"
+    else
+        info "  Index code        : ${CODE_INDEX_STATUS}"
+    fi
     info "  Services          : gradatum-server=$(sudo systemctl is-active gradatum-server 2>/dev/null) / gradatum-worker=$(sudo systemctl is-active gradatum-worker 2>/dev/null)"
     if $FLAG_GATEWAY; then
         info "  Gateway           : ${GATEWAY_UNIT}=$(sudo systemctl is-active "$GATEWAY_UNIT" 2>/dev/null)"

@@ -71,6 +71,21 @@ pub mod studio;
 #[doc(hidden)]
 pub mod telemetry_flush;
 
+/// The fake sidecar the personal-data mount tests drive.
+///
+/// Included, not copied: the mount tests and the privacy crate's client tests speak the
+/// same protocol, and a second copy of the wire would be a second description of it.
+///
+/// Declared from the crate root because `#[path]` is resolved against the directory of
+/// the file it is written in, and the mount tests live inside an inline module of
+/// `state.rs`, whose directory (`src/state/`) exists in the module tree and not on disk —
+/// any relative path written there fails at the first traversal. The crate root is the
+/// one place in this crate whose directory is real, and this is a test-only item: the
+/// integration tests reach the same file from `tests/`, where the base is real too.
+#[cfg(test)]
+#[path = "../../gradatum-privacy/tests/sidecar_fake/mod.rs"]
+pub(crate) mod sidecar_fake;
+
 /// Builds a minimal Axum router for rate-limit E2E tests.
 ///
 /// Exposed route: `GET /ping` → 200 "pong" (no authentication required).

@@ -2,7 +2,7 @@
 
 > Semantic distillation primitives: cosine clustering, cluster synthesis and distilled trust scoring.
 
-**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.5.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -23,7 +23,7 @@ The job vocabulary (`DistillMode`, `DistillSource`, `Job::Distill`) stays in `gr
 
 ```toml
 [dependencies]
-gradatum-distill = "2.1.0"
+gradatum-distill = "2.5.0"
 ```
 
 ```rust

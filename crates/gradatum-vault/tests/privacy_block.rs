@@ -31,6 +31,7 @@ use gradatum_core::frontmatter::ExtraFields;
 use gradatum_core::identity::NoteId;
 use gradatum_core::pii::{
     DetectInput, Detection, PiiCategory, PiiDetectError, PiiDetector, PiiSpan, PrivacyBudgets,
+    PrivacyPolicy,
 };
 use gradatum_core::scope::VaultId;
 use gradatum_core::section::Section;
@@ -85,6 +86,29 @@ async fn vault_with(root: &Path, detector: Arc<dyn PiiDetector>) -> Vault {
         .await
         .expect("vault creation")
         .with_detector(detector, PrivacyBudgets::default())
+}
+
+/// The activation the fixtures that need a **marked** note run under: `email` is
+/// declared and calibrated below the 0.94 span they report, and the mode is left at its
+/// default.
+fn marking_policy() -> PrivacyPolicy {
+    PrivacyPolicy::new(
+        false,
+        std::collections::BTreeMap::from([(PiiCategory::Email, 900)]),
+        std::collections::BTreeMap::new(),
+    )
+}
+
+/// A vault whose detector is `detector` **and** whose activation marks.
+///
+/// Distinct from [`vault_with`] because a mounted detector alone poses nothing:
+/// [`PrivacyPolicy::default`] enables no category, so no span clears a threshold and a
+/// note seeded through that vault carries no marker — which would leave the assertions
+/// below green for the wrong reason.
+async fn marking_vault(root: &Path, detector: Arc<dyn PiiDetector>) -> Vault {
+    vault_with(root, detector)
+        .await
+        .with_privacy_policy(marking_policy())
 }
 
 /// The `privacy` block read back from a note, as a TOML table.
@@ -462,6 +486,219 @@ async fn extra_transits_through_the_rmw_path() {
         string_field(&block, "status"),
         "ok",
         "the rewritten note carries the block of the second pass"
+    );
+}
+
+// ── (h) a verdict posed under a mounted detector ─────────────────────────────
+
+/// The reserved marker a rejection retires.
+const CLASSIFIED: &str = "personal-classified";
+
+/// The verdict a note carries, read off its block.
+fn review_of(note: &gradatum_core::note::Note) -> String {
+    string_field(&block_of(note), "review")
+}
+
+/// The digest a note's block was recorded over.
+fn digest_of(note: &gradatum_core::note::Note) -> String {
+    string_field(&block_of(note), "spans_digest")
+}
+
+/// Whether the note carries `tag`, by exact token.
+fn carries(note: &gradatum_core::note::Note, tag: &str) -> bool {
+    note.frontmatter
+        .tags
+        .iter()
+        .any(|held| held.as_str() == tag)
+}
+
+/// The frontmatter the review surface posts: the note as read back, its `review`
+/// moved to `rejected`, and nothing else touched.
+fn fm_carrying_rejected_verdict(
+    note: &gradatum_core::note::Note,
+) -> gradatum_core::frontmatter::Frontmatter {
+    let mut frontmatter = note.frontmatter.clone();
+    let mut extra = frontmatter.extra.clone();
+    let mut block = block_of(note);
+    block.insert(
+        "review".to_owned(),
+        toml::Value::String("rejected".to_owned()),
+    );
+    extra.insert("privacy".to_owned(), toml::Value::Table(block));
+    frontmatter.extra = extra;
+    frontmatter
+}
+
+/// A rejection posed while a detector is mounted is inscribed by that write, retires
+/// the marker it was made about, and survives the pass that follows.
+///
+/// The review surface writes `extra.privacy.review` and lets the insertion point decide
+/// the tags (D-11): it never poses or retires a marker itself. Where a detector is
+/// mounted, a pass runs on that same write and the block it recomputes is the authority
+/// over the note — so the verdict is only preserved if the write resolves it from the
+/// block **it carries**, not from the note on disk, which still holds the previous pass's
+/// `pending`.
+///
+/// `spans_digest` is what keeps that safe: the verdict covers the spans it was made
+/// about, so a pass that re-reports the very same spans carries it forward, and a note
+/// whose spans moved spends it. Both halves are asserted here — the second is what makes
+/// the first a judgement rather than a blanket override.
+#[tokio::test]
+async fn rejected_verdict_binds_under_mounted_detector_and_survives_a_pass() {
+    let dir = TempDir::new().unwrap();
+    let body = "contact alice@example.org maintenant".to_string();
+    let span = PiiSpan::new(8, 17, PiiCategory::Email, 0.94);
+    let vault = marking_vault(dir.path(), Arc::new(FixedSpans(vec![span]))).await;
+
+    let seeded = vault
+        .write_note(fm_for("main"), body.clone())
+        .await
+        .expect("seed a marked note");
+    assert!(
+        carries(&seeded, CLASSIFIED),
+        "the fixture must seed a marked note, otherwise the assertions below are \
+         green for the wrong reason — got {:?}",
+        seeded
+            .frontmatter
+            .tags
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(review_of(&seeded), "pending", "a fresh block awaits review");
+    let digest_before = digest_of(&seeded);
+
+    // The write the review surface performs: a compare-and-swap on the note as read
+    // back, with `review` moved to `rejected`. The detector is mounted, so a pass runs
+    // on this very write.
+    let posed = vault
+        .write_if_match(
+            fm_carrying_rejected_verdict(&seeded),
+            body.clone(),
+            seeded.id,
+            Some(seeded.content_hash.0),
+        )
+        .await
+        .expect("the current hash is accepted");
+    assert!(
+        matches!(posed, WriteResult::Written { .. }),
+        "the review write must take effect"
+    );
+
+    let read_back = vault.read_note(seeded.id).await.expect("read back");
+    assert_eq!(
+        review_of(&read_back),
+        "rejected",
+        "the pass must resolve the verdict from the block this write carries — reading it \
+         off the note on disk would leave the previous pass's `pending` in place and undo \
+         a human judgement"
+    );
+    assert!(
+        !carries(&read_back, CLASSIFIED),
+        "a rejection that still covers the re-reported spans binds the marker off, and it \
+         does so on the write that poses it — the pass re-detects the very same spans"
+    );
+    assert_eq!(
+        digest_of(&read_back),
+        digest_before,
+        "the digest covers the spans the verdict was made about; the pass re-reported them, \
+         so it is unchanged and the verdict still covers them"
+    );
+
+    // The write that follows: the same body, a frontmatter built from scratch, the same
+    // mounted detector, so a second pass re-reports the very same spans.
+    let rewritten = vault
+        .write_note_with_id(fm_for("main"), body, seeded.id)
+        .await
+        .expect("the write that follows");
+
+    assert_eq!(
+        review_of(&rewritten),
+        "rejected",
+        "a verdict is spent by the spans moving, never by a pass that simply runs again"
+    );
+    assert!(
+        !carries(&rewritten, CLASSIFIED),
+        "…and the marker stays retired for as long as the verdict covers the spans"
+    );
+}
+
+/// A block a caller composed — the recorded block with more than the verdict moved — is
+/// not a verdict the note is shown to have received, and retires nothing.
+///
+/// The pass resolves a verdict out of the block a write carries, which is the only way a
+/// review is recorded rather than recomputed. That makes the block an input to a privacy
+/// decision, so what may be stated is bounded: only the block the note already carries,
+/// with `review` moved. A block that differs anywhere else reads as no verdict at all and
+/// the pass re-judges from disk. The bound is asserted here on a block a caller could
+/// write with no detector, no pass and no human: it declares `rejected` over spans the
+/// note does carry, and the marker stays.
+///
+/// What this bound is **not**: a signature. A caller able to place a block into a write
+/// could echo the note's own block and move nothing but the verdict, and that is exactly
+/// the shape the review surface posts — the two are indistinguishable in the block, so no
+/// comparison of blocks can tell them apart. The property that closes it is the one the
+/// whole frontier rests on: no write DTO carries `extra`, and every production write site
+/// builds it empty, the review surface excepted. This bound narrows the surface; it does
+/// not replace that one.
+#[tokio::test]
+async fn a_composed_rejected_block_reads_as_no_verdict_and_retires_nothing() {
+    let dir = TempDir::new().unwrap();
+    let body = "contact alice@example.org maintenant".to_string();
+    let span = PiiSpan::new(8, 17, PiiCategory::Email, 0.94);
+    let vault = marking_vault(dir.path(), Arc::new(FixedSpans(vec![span]))).await;
+
+    let seeded = vault
+        .write_note(fm_for("main"), body.clone())
+        .await
+        .expect("seed a marked note");
+    assert!(
+        carries(&seeded, CLASSIFIED),
+        "the fixture must seed a marked note, otherwise the assertions below are green for \
+         the wrong reason"
+    );
+    assert_eq!(review_of(&seeded), "pending", "a fresh block awaits review");
+    let recorded = block_of(&seeded);
+    assert!(
+        recorded.contains_key("scanned_at"),
+        "the deviation below has to move a key the block actually carries, otherwise the \
+         block is not composed at all and the test proves nothing"
+    );
+
+    // The caller's block: `rejected` over the note's own spans, and one other key moved.
+    let mut frontmatter = seeded.frontmatter.clone();
+    let mut extra = frontmatter.extra.clone();
+    let mut composed = recorded.clone();
+    composed.insert(
+        "scanned_at".to_owned(),
+        toml::Value::String("1999-01-01T00:00:00Z".to_owned()),
+    );
+    composed.insert(
+        "review".to_owned(),
+        toml::Value::String("rejected".to_owned()),
+    );
+    extra.insert("privacy".to_owned(), toml::Value::Table(composed));
+    frontmatter.extra = extra;
+
+    let written = vault
+        .write_if_match(frontmatter, body, seeded.id, Some(seeded.content_hash.0))
+        .await
+        .expect("the current hash is accepted");
+    assert!(
+        matches!(written, WriteResult::Written { .. }),
+        "the write itself takes effect — it is the verdict it states that does not"
+    );
+
+    let read_back = vault.read_note(seeded.id).await.expect("read back");
+    assert_eq!(
+        review_of(&read_back),
+        "pending",
+        "a block the caller composed is not a verdict the note received; the pass re-judges \
+         from disk, where no verdict was ever posed"
+    );
+    assert!(
+        carries(&read_back, CLASSIFIED),
+        "…and the marker the caller's block would have retired is still there"
     );
 }
 

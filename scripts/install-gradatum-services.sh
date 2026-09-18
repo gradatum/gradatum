@@ -615,8 +615,15 @@ INIT_CMD=(
     --non-interactive
 )
 
+# Re-init d'une installation existante : `--force` re-minte le bearer admin et rafraîchit
+# server.toml (jeton interne + gabarit). Il ne touche PAS le preset ACL : `init` ne réécrit
+# config/bearer.toml que s'il est absent, et ce script ne passe jamais --overwrite-preset.
+# Une politique d'accès maintenue à la main survit donc à chaque passage de l'installateur.
+# La réinitialiser au gabarit livré est une décision d'opérateur, hors de ce script :
+#   gradatum-admin init --root <ROOT> --force --overwrite-preset
 if [[ -f "$BEARER_MARKER" ]] && [[ "$DO_CLEAN" != "true" ]]; then
     echo "  Déjà initialisé ($BEARER_MARKER existe) — re-init avec --force"
+    echo "  Preset ACL conservé : $ROOT/config/bearer.toml n'est pas réécrit (--overwrite-preset requis)"
     INIT_CMD+=(--force)
 fi
 
@@ -779,20 +786,19 @@ if [[ "$SERVER_ACTIVE" == "active" ]] && [[ "$WORKER_ACTIVE" == "active" ]]; the
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  PASS — Gradatum opérationnel sur $BIND"
     echo ""
-    # Détection dynamique du dernier smoke alpha-N disponible
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    SMOKE_LATEST=$(ls "$SCRIPT_DIR"/smoke-alpha-*.sh 2>/dev/null \
-        | sed 's/.*smoke-alpha-\([0-9]*\).*/\1 &/' \
-        | sort -n | tail -1 | awk '{print $2}')
-    SMOKE_LATEST="${SMOKE_LATEST##*/}"
-    [ -z "$SMOKE_LATEST" ] && SMOKE_LATEST="smoke-alpha-13.sh"
-
+    # Les deux smokes post-déploiement, cités par leur nom. Un glob sur smoke-alpha-*.sh ne
+    # résoudrait plus que les shims dépréciés : le conseil enverrait l'opérateur vers la
+    # couche de compatibilité au lieu de la cible.
     echo "  Étapes suivantes :"
-    echo "    1. Récupérer le bearer admin : sudo cat $ROOT/config/admin.bearer.txt"
-    echo "    2. Lancer le smoke test      :"
-    echo "         export GRADATUM_BEARER=\$(sudo cat $ROOT/config/admin.bearer.txt)"
-    echo "         bash scripts/$SMOKE_LATEST"
-    echo "       (ou : sudo -E bash scripts/$SMOKE_LATEST si lancement sudo nécessaire)"
+    echo "    Bearer admin (actions admin) : sudo cat $ROOT/config/admin.bearer.txt"
+    echo "    1. Smoke système (7 étapes) — clé de sonde statique, 0600 compte gradatum :"
+    echo "         bash scripts/smoke-post-deploy-1.sh"
+    echo "       Sans clé lisible : GRADATUM_API_KEY=<clé> bash scripts/smoke-post-deploy-1.sh"
+    echo "    2. Smoke cycle de vie de la clé (9 étapes) — forge puis révoque la sienne :"
+    echo "         bash scripts/smoke-post-deploy-2.sh"
+    echo "       (exige que le preset ACL déclare l'identité smoke-dyn, distincte de smoke ;"
+    echo "        sans elle l'étape 2 sort en INCOMPLETE, jamais en PASS)"
+    echo "       Les deux lisent SERVER / ROOT / ADMIN_BIN ; préfixer par sudo -E si nécessaire."
     echo "    3. Logs serveur              : sudo journalctl -u gradatum-server -f"
     echo "    4. Logs worker               : sudo journalctl -u gradatum-worker -f"
 

@@ -15932,3 +15932,178 @@ mod list_notes_by_tag_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod get_notes_many_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+    use gradatum_core::DocumentStore;
+
+    /// Compteur de statements SQL exécutés sur la connexion de l'index.
+    ///
+    /// `Connection::trace_v2` n'accepte qu'un pointeur de fonction — pas de fermeture
+    /// capturante : l'état est donc un statique de processus. Seule la connexion qui a
+    /// installé le hook l'incrémente, et un seul test l'installe.
+    static SQL_STATEMENTS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_sql_statement(_event: rusqlite::trace::TraceEvent<'_>) {
+        SQL_STATEMENTS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Insère une note vivante minimale (vault `main`).
+    async fn insert_note(idx: &SqliteIndex, id: &str) {
+        let conn = idx.conn.lock().await;
+        conn.execute(
+            "INSERT INTO notes (id, vault_id, section, status, schema_version, created, content_hash, body_text)
+             VALUES (?1, 'main', 'decisions', 'live', 1, 1, X'00', ?1)",
+            rusqlite::params![id],
+        )
+        .expect("insert de note de test");
+    }
+
+    /// Insère une note vivante dans un vault explicite.
+    async fn insert_note_in_vault(idx: &SqliteIndex, id: &str, vault_id: &str) {
+        let conn = idx.conn.lock().await;
+        conn.execute(
+            "INSERT INTO notes (id, vault_id, section, status, schema_version, created, content_hash, body_text)
+             VALUES (?1, ?2, 'decisions', 'live', 1, 1, X'00', ?1)",
+            rusqlite::params![id, vault_id],
+        )
+        .expect("insert de note de test");
+    }
+
+    fn ulid(i: usize) -> String {
+        format!("01{i:024}")
+    }
+
+    /// La lecture groupée rend les enregistrements dans l'ordre DEMANDÉ, en omettant un
+    /// identifiant inconnu et sans jamais dupliquer un identifiant répété.
+    #[tokio::test]
+    async fn get_notes_many_returns_records_in_requested_order() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        insert_note(&idx, &ulid(1)).await;
+        insert_note(&idx, &ulid(2)).await;
+        insert_note(&idx, &ulid(3)).await;
+
+        let asked = vec![ulid(3), ulid(9), ulid(1), ulid(3), ulid(2)];
+        let got = idx
+            .get_notes_many("main", &asked)
+            .await
+            .expect("get_notes_many");
+
+        let order: Vec<&str> = got.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![ulid(3).as_str(), ulid(1).as_str(), ulid(2).as_str()],
+            "ordre demandé, inconnu omis, doublon rendu une seule fois"
+        );
+    }
+
+    /// La lecture groupée est scopée au vault : une note homonyme d'un AUTRE vault ne
+    /// remonte jamais par cette porte (pas d'oracle d'existence cross-vault).
+    #[tokio::test]
+    async fn get_notes_many_is_vault_scoped() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        insert_note_in_vault(&idx, &ulid(1), "main").await;
+        insert_note_in_vault(&idx, &ulid(2), "other").await;
+
+        let got = idx
+            .get_notes_many("main", &[ulid(1), ulid(2)])
+            .await
+            .expect("get_notes_many");
+
+        let ids: Vec<&str> = got.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![ulid(1).as_str()],
+            "le vault du homonyme est étanche"
+        );
+    }
+
+    /// Au-delà de la limite de variables liées de SQLite (999), la lecture groupée
+    /// découpe en lots — et rend quand même TOUS les enregistrements demandés.
+    #[tokio::test]
+    async fn get_notes_many_handles_more_than_998_ids() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let ids: Vec<String> = (0..1000).map(ulid).collect();
+        for id in &ids {
+            insert_note(&idx, id).await;
+        }
+
+        let got = idx
+            .get_notes_many("main", &ids)
+            .await
+            .expect("get_notes_many 1000 ids");
+
+        assert_eq!(got.len(), 1000, "aucun id ne doit se perdre au découpage");
+        assert_eq!(got[0].id, ids[0]);
+        assert_eq!(got[999].id, ids[999]);
+    }
+
+    /// `get_notes_many` remplace N lectures unitaires par UN statement : c'est le N+1
+    /// que cette lecture groupée supprime.
+    ///
+    /// Le contrôle en tête de test établit que le compteur SAIT distinguer les deux
+    /// chemins : N `get_note` coûtent N statements (le prix du défaut du trait), là où
+    /// la lecture groupée en coûte un seul.
+    ///
+    /// SEUL test qui installe le hook de trace : `SQL_STATEMENTS` est un statique de
+    /// processus, partagé par toutes les connexions de ce binaire de test. Un second
+    /// test qui l'installerait ferait compter les statements d'une AUTRE connexion.
+    #[tokio::test]
+    async fn get_notes_many_issues_one_statement_for_fifty_ids() {
+        let idx = SqliteIndex::open_in_memory().await.expect("open_in_memory");
+        let ids: Vec<String> = (0..50).map(ulid).collect();
+        for id in &ids {
+            insert_note(&idx, id).await;
+        }
+
+        idx.conn.lock().await.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(count_sql_statement),
+        );
+
+        // Une tranche vide ne touche pas la base.
+        SQL_STATEMENTS.store(0, Ordering::SeqCst);
+        let none = idx
+            .get_notes_many("main", &[])
+            .await
+            .expect("get_notes_many vide");
+        assert!(none.is_empty(), "une tranche vide ne rend rien");
+        assert_eq!(
+            SQL_STATEMENTS.load(Ordering::SeqCst),
+            0,
+            "une tranche vide ne doit émettre aucun statement"
+        );
+
+        // Contrôle : le chemin NON groupé — celui du défaut du trait — paie un statement
+        // par identifiant.
+        SQL_STATEMENTS.store(0, Ordering::SeqCst);
+        for id in &ids {
+            let fetched = DocumentStore::get_note(&idx, "main", id)
+                .await
+                .expect("get_note");
+            assert!(fetched.is_some(), "la note {id} doit être relue");
+        }
+        assert_eq!(
+            SQL_STATEMENTS.load(Ordering::SeqCst),
+            ids.len(),
+            "un `get_note` par id coûte un statement par id — c'est le N+1 supprimé"
+        );
+
+        // Sujet : la lecture groupée tient en UN statement pour la MÊME longueur d'entrée.
+        SQL_STATEMENTS.store(0, Ordering::SeqCst);
+        let got = idx
+            .get_notes_many("main", &ids)
+            .await
+            .expect("get_notes_many");
+
+        assert_eq!(got.len(), ids.len(), "50 ids demandés ⇒ 50 rendus");
+        assert_eq!(
+            SQL_STATEMENTS.load(Ordering::SeqCst),
+            1,
+            "50 notes lues en UNE requête, quel que soit `limit`"
+        );
+    }
+}

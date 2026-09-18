@@ -643,10 +643,22 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Racine du crate, résolue à l'exécution.
+///
+/// La valeur figée à la compilation devient périmée dès qu'un binaire de test est
+/// réutilisé depuis un autre répertoire de checkout (artefacts de build partagés) :
+/// la variable d'environnement prime, la valeur de compilation ne servant que de
+/// repli hors cargo.
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
 /// Corpus de production : concaténation de toutes les sources du crate sauf `config.rs`,
 /// modules de test retirés, commentaires neutralisés.
 fn production_corpus() -> String {
-    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src_dir = manifest_dir().join("src");
     let mut files = Vec::new();
     collect_rs(&src_dir, &mut files);
     files.sort();
@@ -665,9 +677,7 @@ fn production_corpus() -> String {
 
 /// Source de `config.rs`, non modifiée (pour la vérification des marqueurs d'annotation).
 fn config_source() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("config.rs");
+    let path = manifest_dir().join("src").join("config.rs");
     fs::read_to_string(path).expect("lecture de config.rs")
 }
 

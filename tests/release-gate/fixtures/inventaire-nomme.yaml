@@ -1,0 +1,22 @@
+# Fixture inventory -- test data, NOT a release derogation list.
+# The two entries name exactly the breaks carried by fixtures/semver-inscrite.out,
+# so a populated inventory under a minor rank authorizes that measured output.
+semver_deviations:
+  - crate: gradatum-core
+    symbol: "fixture::KindKind::Chore"
+    lint: enum_variant_missing
+    rendered: "variant KindKind::Chore"
+    kind: fixture
+    introduced_in: "0.0.0"
+    ships_in: "0.0.0"
+    reason: "test data -- named entry of the populated fixture inventory"
+    card: FIXTURE
+  - crate: gradatum-core
+    symbol: "fixture::KindKind::Spike"
+    lint: enum_variant_missing
+    rendered: "variant KindKind::Spike"
+    kind: fixture
+    introduced_in: "0.0.0"
+    ships_in: "0.0.0"
+    reason: "test data -- named entry of the populated fixture inventory"
+    card: FIXTURE

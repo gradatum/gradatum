@@ -113,17 +113,20 @@ the preset: as `!` **negation patterns** at the head of the consumer's `read_pat
 
 A preset that still carries `sees_personal_classified` **does not parse**. And a preset that does not
 parse **does not stop the server from starting**: the loader (`with_acl_preset_path`) logs a single
-`warn` and **falls back to the empty engine**, which is **DENY-ALL**. Every authenticated request is
-then refused on every locus — indistinguishable from an outage, except that the server reports
-itself healthy.
+`warn` and **falls back to the empty engine**, which is **DENY-ALL** *(behaviour of 2.4.0; changed in
+2.5.0 — the server now refuses the boot, see the next guide)*. Every authenticated request is then
+refused on every locus — indistinguishable from an outage, except that the server reports itself
+healthy.
 
-There is therefore **no automatic safety net at boot**. The only real safeguard is the **order of
-operations**: re-align the preset *first*, confirm it loads, *then* deploy 2.4.0.
+There is therefore **no automatic safety net at boot** on this line. The only real safeguard is the
+**order of operations**: re-align the preset *first*, confirm it loads, *then* deploy 2.4.0.
 
 ### What was measured — the failure is silent, and it is not a hypothesis
 
 The failure mode above was not read off the code. It was **measured** by starting 2.4.0 against a
-real state whose preset still carried the removed key:
+real state whose preset still carried the removed key. **The measurements below are those of a
+2.4.0 server** *(behaviour of 2.4.0; changed in 2.5.0, see the next guide)* — in particular, "server
+startup: succeeds" is not what a 2.5.0 server does with the same state:
 
 | Observation | Result |
 |---|---|
@@ -133,8 +136,8 @@ real state whose preset still carried the removed key:
 | An authenticated read | **403**, empty body; a request with no token gets **401** |
 | Boot journal | `WARN ACL preset unreadable (parse error) — DENY-ALL fallback` followed by the parse error naming the removed field, then one `ERROR` per active key whose owner no consumer declares |
 
-**No start ever fails.** That is precisely what makes this dangerous: the upgrade looks successful
-and the service is mute.
+**No start ever fails** on this line. That is precisely what makes this dangerous: the upgrade looks
+successful and the service is mute.
 
 **The re-alignment is reversible, and that too was measured.** A re-aligned preset is loaded and
 served correctly by the **older** 2.3.1 binary as well — the negations are ordinary patterns its
@@ -231,6 +234,10 @@ unset preset path, a file the process cannot read, or a parse error — means th
 the empty engine and the server is serving **DENY-ALL**. Do not infer health from the process being
 up; infer it from this line being present.
 
+> *(behaviour of 2.4.0; the line was renamed in 2.5.0 — a 2.5.0 server logs `ACL preset gate: engine
+> loaded from preset`, and it no longer starts at all when the preset is present but unusable, so
+> two of the three causes above cannot reach this point. See the next guide.)*
+
 Then run a **positive functional check before any negative one**: as an ordinary consumer that is
 allowed to read (not the admin), read a benign section — e.g. `section=decisions` — and confirm it
 returns **200**. A DENY-ALL server fails this check, so it can no longer be mistaken for a healthy
@@ -242,8 +249,9 @@ one. Only after this positive check passes should you probe that `personal-class
 ## Mandatory pre-flight — make before break
 
 **This is a pre-flight, not advice.** Everything in it is done *before* a 2.4.0 binary runs, and
-the one check that can fail silently is the preset. The failure it prevents was measured, not
-inferred — the measurement is stated in full under
+the one check that can fail silently is the preset *(on this line — a 2.5.0 server refuses the boot
+instead of failing silently, and its pre-flight is in the next guide)*. The failure it prevents was
+measured, not inferred — the measurement is stated in full under
 [§The ACL preset field removal](#the-acl-preset-field-removal) above.
 
 The ordering is not optional, because the failure mode is silent-at-boot:
@@ -251,10 +259,12 @@ The ordering is not optional, because the failure mode is silent-at-boot:
 1. **Edit the preset first** — remove the key, add the negations.
 2. **Verify it loads** with `gradatum-admin acl validate --preset <path>` (exit `0`).
 3. **Then deploy 2.4.0.** A server started against an un-migrated preset serves DENY-ALL and reports
-   itself healthy; only step 2 catches that before it reaches production.
+   itself healthy *(behaviour of 2.4.0; changed in 2.5.0, see the next guide)*; only step 2 catches
+   that before it reaches production.
 4. **After deploy, confirm the running server loaded the preset** — `AclEngine loaded from preset`
-   present in `journalctl -u gradatum-server`, then a positive read (`section=decisions` under an
-   ordinary consumer returns 200) before any negative probe.
+   present in `journalctl -u gradatum-server` *(this is the 2.4.0 name of the line; it was renamed in
+   2.5.0)*, then a positive read (`section=decisions` under an ordinary consumer returns 200) before
+   any negative probe.
 
 Update any API client and Rust consumer (drop `pattern`, correct invented section names) in the same
 window.

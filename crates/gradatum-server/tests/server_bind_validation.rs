@@ -30,7 +30,7 @@ fn cfg(bind: &str, tls: Option<TlsConfig>) -> ServerConfig {
             api_keys_db_path: None,
         },
         acl: AclConfig {
-            preset_path: PathBuf::from("/tmp/acl"),
+            preset_path: Some(PathBuf::from("/tmp/acl")),
         },
         log: LogConfig {
             format: "json".into(),

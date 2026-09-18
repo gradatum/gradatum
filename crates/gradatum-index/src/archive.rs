@@ -235,6 +235,63 @@ impl SqliteIndex {
         }
     }
 
+    /// Resolves the archived `.md` path of several notes of one vault, in **one** query.
+    ///
+    /// The `archive_index` row of a note is the only place its path survives once the note
+    /// itself is gone from the index, so a caller that has to reach the archived content of
+    /// a whole listing needs this map rather than one lookup per row.
+    ///
+    /// Every row of `(vault_id, note_id)` is eligible, whatever its state: `gc_at` and
+    /// `restored_at` are **not** filtered out. A caller that resolves a path only to read it
+    /// must be told about a row whose file was destroyed, not silently handed nothing —
+    /// absence from the result means no row exists for that pair, which is a different
+    /// answer from a row whose content is gone. The `vault_id` is part of the key, so a
+    /// ULID another vault also archived is not resolved here.
+    ///
+    /// Bounded by the caller's `note_ids`, which a listing holds at
+    /// [`ARCHIVE_LIST_MAX`] at most; an empty slice costs no query.
+    ///
+    /// # Errors
+    ///
+    /// [`GradatumError::Storage`] on SQL failure.
+    pub async fn archive_paths_by_ids(
+        &self,
+        vault_id: &str,
+        note_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, GradatumError> {
+        let mut out = std::collections::HashMap::new();
+        if note_ids.is_empty() {
+            return Ok(out);
+        }
+
+        // Placeholders are generated from the slice length, never from its contents: the
+        // values travel as binds.
+        let placeholders = vec!["?"; note_ids.len()].join(",");
+        let sql = format!(
+            "SELECT note_id, archive_path FROM archive_index
+             WHERE vault_id = ? AND note_id IN ({placeholders})"
+        );
+        let mut binds: Vec<SqlVal> = Vec::with_capacity(note_ids.len() + 1);
+        binds.push(SqlVal::Text(vault_id.to_owned()));
+        binds.extend(note_ids.iter().cloned().map(SqlVal::Text));
+
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| GradatumError::Storage(format!("prepare archive_paths_by_ids : {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| GradatumError::Storage(format!("query archive_paths_by_ids : {e}")))?;
+        for row in rows {
+            let (note_id, path) =
+                row.map_err(|e| GradatumError::Storage(format!("row archive_paths_by_ids : {e}")))?;
+            out.insert(note_id, path);
+        }
+        Ok(out)
+    }
+
     /// Selects archives whose retention has expired and that are not destroyed yet
     /// (`gc_due < now AND gc_at IS NULL AND restored_at IS NULL`).
     ///

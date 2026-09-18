@@ -64,7 +64,7 @@ use gradatum_core::{Job, JobFilter, JobRecord, QueueStore};
 use gradatum_db_sqlite::{QueueDb, SqliteQueueStore, run_migrations};
 // `gradatum_dto::health` is a private module: these two are re-exported at the crate root.
 use gradatum_dto::{HealthReport, HealthStatus};
-use gradatum_server::config::{LlmConfig, PrivacyConfig, PrivacyMode, ServerConfig};
+use gradatum_server::config::{LlmConfig, PrivacyConfig, PrivacyThresholds, ServerConfig};
 use gradatum_server::health;
 use gradatum_server::metrics::{AppMetrics, PrivacyPatternLabel, metrics_handler};
 use gradatum_server::privacy_observer::MetricsPrivacyObserver;
@@ -248,6 +248,26 @@ impl VaultSpec {
     }
 }
 
+/// The activation the fixtures that expect a **mark** are mounted with.
+///
+/// A span alone marks nothing: its category has to be activated by the configuration, at a
+/// strictly positive threshold, before the pass can pose `personal-classified`. The scripts
+/// below report [`PiiCategory::Person`] at 0.9, so this activates that single category at
+/// the smallest positive calibration — the delivered reading of the "span above threshold"
+/// these fixtures are built on. Tests whose subject is *not* the marker keep
+/// [`PrivacyConfig::default`], whose empty activation marks nothing, so a mark they did not
+/// ask for would be a defect they catch.
+fn marking_config() -> PrivacyConfig {
+    PrivacyConfig {
+        categories: vec!["person".to_owned()],
+        thresholds: PrivacyThresholds {
+            default_m: 1,
+            ..PrivacyThresholds::default()
+        },
+        ..PrivacyConfig::default()
+    }
+}
+
 /// The world one test runs in.
 struct Env {
     state: AppState,
@@ -306,12 +326,17 @@ impl Env {
 /// shared by the observer and the state.
 ///
 /// `privacy` is the *server* configuration the tick gates on and the health report
-/// describes. It is deliberately independent of the mount each vault was given, because in
-/// production those two answers come from two different places — the report names the
-/// detector the configuration declares, and a vault is handed whichever handle the boot path
-/// built. Tests that assert on the name keep the two aligned by construction.
+/// describes. Its **activation** — which categories are on, at which thousandth, with which
+/// exception literals — is mounted on every vault here, exactly as the deployment's single
+/// mount site derives it from this same section; a fixture that decided it separately would
+/// be testing a frontier no deployment assembles. The byte budgets stay per-vault through
+/// [`VaultSpec::budgets`], and the detector *kind* stays the fixture's choice, because in
+/// production the report names the detector the configuration declares while a vault is
+/// handed whichever handle the boot path built. Tests that assert on that name keep the two
+/// aligned by construction.
 async fn env_of(specs: &[VaultSpec], privacy: PrivacyConfig) -> Env {
     let metrics = AppMetrics::new();
+    let policy = privacy.policy();
     let mut dirs: Vec<TempDir> = Vec::new();
     let mut listeners: Vec<tokio::net::TcpListener> = Vec::new();
     let mut vaults: Vec<Arc<Vault>> = Vec::new();
@@ -332,7 +357,8 @@ async fn env_of(specs: &[VaultSpec], privacy: PrivacyConfig) -> Env {
             Mount::Crafted => opened
                 .with_detector(Arc::new(Crafted), spec.budgets)
                 .with_privacy_observer(observer),
-        };
+        }
+        .with_privacy_policy(policy.clone());
         dirs.push(dir);
         vaults.push(Arc::new(vault));
         scripts.push(switch);
@@ -383,6 +409,7 @@ async fn env_of(specs: &[VaultSpec], privacy: PrivacyConfig) -> Env {
     let mut state = AppState::with_jwt_and_acl(JwtService::new_ephemeral(), acl)
         .with_vault_arc(Arc::clone(&vaults[0]) as Arc<dyn Registry>)
         .with_privacy(privacy)
+        .expect("this configuration mounts no sidecar, so nothing is reached")
         .with_job_store(store as Arc<dyn QueueStore>, pool);
     state.vaults = Arc::new(registry);
     // The index the state reads must be a real one: a placeholder answers `NoteNotFound` and
@@ -607,6 +634,28 @@ fn label_keys(text: &str, series: &str) -> Vec<String> {
         .collect()
 }
 
+/// The label **values** of a single-label series, sorted — the set of keys the family was
+/// actually fed, read back without assuming how many there are.
+///
+/// The count of a series says how often one of them fired; this says which exist, which is
+/// the claim a cardinality bound rests on.
+fn label_values(text: &str, series: &str) -> Vec<String> {
+    let mut values: Vec<String> = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.strip_prefix(series))
+        .filter_map(|rest| rest.split_once('{'))
+        .filter_map(|(_, rest)| rest.split_once('}'))
+        .filter_map(|(labels, _)| {
+            labels
+                .split_once('=')
+                .map(|(_, value)| value.trim_matches('"').to_owned())
+        })
+        .collect();
+    values.sort();
+    values
+}
+
 // ── HTTP ─────────────────────────────────────────────────────────────────────
 
 fn build_router(state: AppState) -> Router {
@@ -682,6 +731,69 @@ async fn listed_paths(state: AppState, token: &str, tag: &str) -> Vec<String> {
 
 // ── /metrics ─────────────────────────────────────────────────────────────────
 
+/// An exception that fires is counted **by pattern identifier**, and the exposition never
+/// carries the literal it covers.
+///
+/// The two halves are one claim: the counter exists so an operator can see *which* configured
+/// exception is doing the work — a stale literal, or one permissive enough to swallow
+/// legitimate data — and the label is a digest so that the same series cannot publish the
+/// value the configuration was written to withhold.
+#[tokio::test]
+async fn metrics_expose_exception_hits_by_digest_and_never_by_literal() {
+    let env = env_of(
+        &[VaultSpec::new("main", Script::Marking)],
+        PrivacyConfig {
+            exceptions: std::collections::BTreeMap::from([(
+                "main".to_owned(),
+                vec![MARK.to_owned()],
+            )]),
+            ..marking_config()
+        },
+    )
+    .await;
+
+    // The span sits on the needle, and the needle is the exception: the pass observes it
+    // and then drops it, so the note carries no marker while the firing is still counted.
+    let id = seed(
+        env.vault("main"),
+        "main",
+        Section::Decisions,
+        &[],
+        MARKED_BODY,
+    )
+    .await;
+    assert!(
+        !tags_of(env.vault("main"), &id)
+            .await
+            .contains(&PERSONAL_CLASSIFIED.to_owned()),
+        "premise: the exception covers the only span the pass reported"
+    );
+
+    let text = exposition(&env.metrics).await;
+    assert_eq!(
+        count(
+            &text,
+            &format!(
+                "gradatum_privacy_exception_hits_total{{pattern_id=\"{}\"}}",
+                gradatum_core::pii::pattern_id(MARK)
+            )
+        ),
+        1.0,
+        "the exception that fired is counted under its digest:\n{text}"
+    );
+    assert!(
+        !text.contains(MARK),
+        "no exposition may carry the configured literal — the label is a digest precisely so \
+         that the metrics channel cannot read back what the configuration withholds:\n{text}"
+    );
+    assert_eq!(
+        label_values(&text, "gradatum_privacy_exception_hits_total"),
+        vec![gradatum_core::pii::pattern_id(MARK)],
+        "and the digest is the **only** value this family carries: a second label value would \
+         mean a pattern the configuration does not declare"
+    );
+}
+
 /// A completed pass that marks a note feeds `notes_tagged{category}` for the categories the
 /// marker can rest on, and the scanned/unscanned pair advances once per pass.
 ///
@@ -690,11 +802,7 @@ async fn listed_paths(state: AppState, token: &str, tag: &str) -> Vec<String> {
 /// fragment and no detector label is representable in a privacy series.
 #[tokio::test]
 async fn metrics_expose_tagged_by_category() {
-    let env = env_of(
-        &[VaultSpec::new("main", Script::Marking)],
-        PrivacyConfig::default(),
-    )
-    .await;
+    let env = env_of(&[VaultSpec::new("main", Script::Marking)], marking_config()).await;
 
     let first = seed(
         env.vault("main"),
@@ -833,11 +941,13 @@ async fn metrics_count_input_too_large_apart_from_detector_failures() {
 
 /// The exception series carries an identifier, and its label set could hold nothing else.
 ///
-/// **What is enforced here, and what is not.** The identifier names a pattern declared in the
-/// configuration; the family is declared with **no producer** in 2.4.0 — the exception pass is
-/// configured but its consumer is not delivered — so this test pins the *shape* a future
-/// producer must respect, and cannot pin a producer that does not exist. Read it as a contract
-/// on the label set, never as a guard on a value.
+/// **What is enforced here, and what is not.** The label set is asserted on a sample this test
+/// feeds by hand, so the claim is about the *shape* — one key, named for an identifier — and it
+/// holds whatever any producer does. That it is a shape and not a value is the point: a
+/// producer could faithfully compute an identifier and the family still be free to carry a
+/// second key beside it, which is what this pins. The producer itself is pinned where it
+/// belongs, end to end, by
+/// [`metrics_expose_exception_hits_by_digest_and_never_by_literal`].
 #[tokio::test]
 async fn exception_hit_metric_carries_pattern_id_never_the_pattern() {
     let metrics = AppMetrics::new();
@@ -958,24 +1068,44 @@ async fn metrics_expose_rejected_spans_and_window_edge_by_bounded_reason() {
 
 // ── /health/detailed ─────────────────────────────────────────────────────────
 
+/// Reads a `[privacy]` section out of inline TOML through the delivered load path, so the
+/// mode a report states is the one an operator's file produces — parsed, validated, and
+/// resolved by the same code the boot path runs. Handing `env_of` a `PrivacyConfig` built
+/// field by field would assert the report against the fixture, not against the product.
+fn privacy_from_toml(toml: &str) -> PrivacyConfig {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    file.write_all(toml.as_bytes()).expect("write TOML");
+    ServerConfig::load(Some(file.path()))
+        .expect("the fixture configuration loads")
+        .privacy
+}
+
 /// The report states the mode the write path runs under, and a corpus with no privacy data
 /// reports zeros rather than an absent field.
 ///
 /// The distinction matters because an absent field and a zero would otherwise be the same
 /// JSON: an external probe could not tell a deployment that has judged nothing from one that
 /// does not report at all.
+///
+/// Both halves are driven from TOML text. The first is an **empty** configuration — no
+/// `[privacy]` block at all — because "the delivered default observes" is a claim about what
+/// an operator who writes nothing gets, and a default read from `PrivacyConfig::default()`
+/// would only restate the struct. The second is a file that declares the destructive mode
+/// over a calibrated category: the report is the deployment's own word about what it runs,
+/// so it is measured against the word the deployment wrote.
 #[tokio::test]
 async fn detailed_health_reports_effective_mode_and_zero_on_empty_corpus() {
     let env = env_of(
         &[VaultSpec::new("main", Script::Silent)],
-        PrivacyConfig::default(),
+        privacy_from_toml(""),
     )
     .await;
     let report = health::probe_once(&env.state, Duration::from_millis(800)).await;
 
     assert_eq!(
         report.privacy_mode, "report_only",
-        "the delivered mode is the effective one"
+        "a configuration that declares no [privacy] block is the observing mode"
     );
     assert_eq!(report.privacy_scanned_total, 0, "empty corpus ⇒ zero");
     assert_eq!(report.privacy_unscanned_total, 0, "empty corpus ⇒ zero");
@@ -991,18 +1121,23 @@ async fn detailed_health_reports_effective_mode_and_zero_on_empty_corpus() {
     assert_eq!(wire["privacy_scanned_total"], serde_json::json!(0));
     assert_eq!(wire["privacy_unscanned_total"], serde_json::json!(0));
 
-    // `mask` is not reachable in 2.4.0, and the report says so from the configuration rather
-    // than from a constant: the mode is *effective*, not asserted.
+    // The destructive mode is announced from the configuration rather than from a
+    // constant: the mode is *effective*, not asserted. A report that printed `"mask"` from a
+    // build constant would say so on a deployment running `report_only`, which is the one
+    // thing an operator reading it must be able to trust.
     let masked = env_of(
         &[VaultSpec::new("main", Script::Silent)],
-        PrivacyConfig {
-            mode: PrivacyMode::Mask,
-            ..PrivacyConfig::default()
-        },
+        privacy_from_toml(
+            "[privacy]\nmode = \"mask\"\ncategories = [\"email\"]\n\
+             [privacy.thresholds]\nemail = 900\n",
+        ),
     )
     .await;
     let report = health::probe_once(&masked.state, Duration::from_millis(800)).await;
-    assert_eq!(report.privacy_mode, "mask");
+    assert_eq!(
+        report.privacy_mode, "mask",
+        "the report states the mode the configuration declared"
+    );
 }
 
 /// Which detector judged the corpus is the one thing a caller cannot infer from the counts,
@@ -1537,7 +1672,7 @@ async fn privacy_rescan_sweeps_by_tag_and_can_only_add_or_clear_never_declassify
             VaultSpec::new("other", Script::Failing),
             VaultSpec::new("third", Script::Failing),
         ],
-        PrivacyConfig::default(),
+        marking_config(),
     )
     .await;
 

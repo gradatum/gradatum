@@ -1,3 +1,6 @@
+# Harness return codes and captured output (.rc/<step>.rc conventions)
+/.rc/
+
 # Rust build artifacts
 target/
 **/*.rs.bk

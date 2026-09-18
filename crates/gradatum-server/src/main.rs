@@ -33,6 +33,14 @@ mod registry_store;
 mod review_promote;
 mod scheduled_tasks;
 mod session_trace_store;
+/// The fake sidecar the personal-data mount tests drive.
+///
+/// Declared here as well as in `lib.rs` because the binary compiles the same module
+/// tree from its own root: the mount tests inside `state.rs` are compiled for both
+/// targets, and `crate::sidecar_fake` has to name the same file from either root.
+#[cfg(test)]
+#[path = "../../gradatum-privacy/tests/sidecar_fake/mod.rs"]
+mod sidecar_fake;
 mod state;
 mod stubs;
 mod studio;
@@ -53,6 +61,7 @@ use tracing_subscriber::EnvFilter;
 use std::sync::Arc;
 
 use crate::config::ServerConfig;
+use crate::config::effective_acl_preset_path;
 use crate::state::AppState;
 use gradatum_core::paths::{queue_db_path, vault_index_path as canon_vault_index_path};
 // Import du boot_guard_check (caveat C2 — interdit memory store en bind non-loopback).
@@ -257,7 +266,13 @@ async fn main() -> anyhow::Result<()> {
         // F-160 — la frontière privacy se monte sur le vault à sa construction :
         // `with_privacy` doit donc précéder `with_vault_path`. Sans `[privacy]`
         // configuré, `PrivacyConfig::default()` monte le détecteur no-op.
+        //
+        // F-315 — un sidecar configuré qui ne répond pas, ou qui annonce une
+        // construction autre que celle épinglée, fait échouer le montage : le serveur
+        // refuse de démarrer plutôt que de scanner avec un moteur que l'opérateur n'a
+        // pas choisi. Aucun repli vers le détecteur in-process.
         .with_privacy(cfg.privacy.clone())
+        .context("the configured personal-data detector could not be mounted")?
         .with_vault_path(&vault_path, gradatum_core::scope::VaultId::new("main"))
         .await
         .context("vault init failed")?
@@ -296,6 +311,18 @@ async fn main() -> anyhow::Result<()> {
         // F-156 P6a — registre de flotte : TTL des heartbeats depuis [registry] (clampé au
         // plancher). Le store est peuplé par l'ingress P6b ; lu ici par GET /registry loopback.
         .with_registry_ttl(cfg.registry.effective_ttl_secs());
+
+    // La frontière de données personnelles annonce son mode une fois par démarrage : un
+    // mode qui réécrit le corps des notes doit être lisible au boot, pas seulement dans
+    // le fichier de configuration. Non-fatal — le mode est déjà en vigueur par la
+    // configuration, et refuser de servir ne le retirerait pas, cela retirerait le
+    // service. Le puits d'audit est monté à l'étape précédente, donc l'annonce y arrive.
+    if let Err(e) = state.announce_privacy_mode().await {
+        tracing::warn!(
+            error = %e,
+            "personal-data mode announcement failed — service continues"
+        );
+    }
 
     // A7 (Task 4) — bootstrap des handles de vaults au boot. À flag `multi_tenant` OFF
     // (défaut LIVE) : no-op strict, le registre reste le singleton `{main}` (byte-identical).
@@ -470,8 +497,22 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // E1 fix P2.0c-bis : charger le preset ACL depuis cfg.acl.preset_path.
-    // Fail-closed : si le fichier est absent, DENY-ALL (warn loggé dans with_acl_preset_path).
-    let state = state.with_acl_preset_path(&cfg.acl.preset_path);
+    // Fail-closed, sans fail-fast aveugle : absence du fichier → DENY-ALL (warn) ;
+    // fichier présent mais illisible ou invalide → démarrage REFUSÉ (cf. la
+    // décision documentée sur `with_acl_preset_path` — un repli y convertirait un
+    // défaut de configuration en serveur vivant qui refuse tout).
+    //
+    // La clé absente n'est pas un chemin : le chemin effectif est alors dérivé de
+    // `storage.root` (SSOT : `gradatum_core::paths::config_dir`), comme les autres
+    // chemins du déploiement. Un défaut absolu ici ferait lire à toute instance un
+    // fichier global de l'hôte — que la porte, le trouvant présent et illisible,
+    // classerait « configuré » et refuserait le démarrage d'un serveur qui n'a
+    // configuré aucun preset.
+    let acl_preset_path =
+        effective_acl_preset_path(cfg.acl.preset_path.as_deref(), &cfg.storage.root);
+    let state = state
+        .with_acl_preset_path(&acl_preset_path)
+        .context("ACL preset gate (acl.preset_path) refused startup")?;
 
     // B6′b : intégrité référentielle `api_keys.owner` ↔ `consumer.identity`, mesurée ici
     // parce que c'est le premier point du boot où les DEUX moitiés de la relation sont

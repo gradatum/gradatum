@@ -172,6 +172,17 @@ const SECTIONS: [&str; 4] = ["debug", "reference", "architecture", "decisions"];
 /// Thèmes de titre synthétiques (neutres, sans chaîne de version).
 const THEMES: [&str; 5] = ["build", "recherche", "graphe", "banc", "corpus"];
 
+/// Crate root, resolved at run time.
+///
+/// The value baked in at compile time goes stale as soon as this binary is reused from
+/// another checkout directory (shared build artefacts): the environment variable wins,
+/// and the compile-time value only serves as a fallback outside cargo.
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
 fn main() -> Result<()> {
     let ids: Vec<String> = (0..N_NOTES).map(id_synthetique).collect();
 
@@ -300,7 +311,7 @@ fn main() -> Result<()> {
         ],
     };
 
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let dir = manifest_dir().join("fixtures");
     fs::create_dir_all(&dir).with_context(|| format!("création {}", dir.display()))?;
 
     // Corpus JSONL — une note par ligne, ordre stable (indice croissant).

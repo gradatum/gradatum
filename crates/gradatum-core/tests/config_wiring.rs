@@ -759,10 +759,21 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Crate root, resolved at run time.
+///
+/// The value baked in at compile time goes stale as soon as a test binary is reused
+/// from another checkout directory (shared build artefacts): the environment variable
+/// wins, and the compile-time value only serves as a fallback outside cargo.
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
 /// Production corpus: concatenation of all core sources except `config.rs`, test modules
 /// removed, comments neutralised.
 fn production_corpus() -> String {
-    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src_dir = manifest_dir().join("src");
     let mut files = Vec::new();
     collect_rs(&src_dir, &mut files);
     files.sort();
@@ -782,9 +793,7 @@ fn production_corpus() -> String {
 /// Raw source of `config.rs` (unmodified — for the NotWired marker check, which must see
 /// doc comments the corpus neutralises).
 fn config_source() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("config.rs");
+    let path = manifest_dir().join("src").join("config.rs");
     fs::read_to_string(path).expect("reading config.rs")
 }
 

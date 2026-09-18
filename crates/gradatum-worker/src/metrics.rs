@@ -10,6 +10,7 @@
 //! | `gradatum_jobs_dlq_total` | Counter | `kind` | Jobs sent to DLQ by kind |
 //! | `gradatum_workers_active` | Gauge | `kind` | Active workers by kind |
 //! | `gradatum_distill_cron_enqueued_total` | Counter | — | Distill jobs enqueued by the F-112 cron |
+//! | `gradatum_queue_payloads_purged_total` | Counter | — | Terminal job payloads erased by the periodic queue purge |
 //! | `gradatum_config_degraded` | Gauge | `section`, `cause` | Config section on defaults (`0`/`1`) |
 //!
 //! The table is the reference; no count is stated in prose, so adding a metric cannot
@@ -77,6 +78,14 @@ pub struct WorkerMetrics {
     /// reaches a terminal outcome (via [`WorkerMetrics::inc_jobs_total`]), so a stalled
     /// consumer is visible even while its lease keeps renewing.
     pub last_consumed_ts: Gauge,
+    /// Terminal job payloads erased by the periodic queue purge (total).
+    ///
+    /// Counts **rewrites**, as `purge_terminal_payloads` reports them: a row already
+    /// carrying the purge tombstone is not counted, so the counter is monotone and the
+    /// purge's idempotence is visible in it. A value of `0` is not by itself evidence that
+    /// the purge runs — this counter is registered at boot and never increments before the
+    /// first tick — which is why every tick also logs its count at `info`.
+    pub queue_payloads_purged: IntCounter,
     /// Unix-epoch milliseconds of the last consumed job, or `0` if none has been consumed
     /// since boot. Read by the `/health` readiness probe with no Prometheus round-trip.
     last_consumed_ms: Arc<AtomicI64>,
@@ -142,6 +151,12 @@ impl WorkerMetrics {
         )
         .expect("gradatum_distill_cron_enqueued_total metric invalid — static bug");
 
+        let queue_payloads_purged = IntCounter::new(
+            "gradatum_queue_payloads_purged_total",
+            "Total terminal job payloads erased by the periodic queue purge",
+        )
+        .expect("gradatum_queue_payloads_purged_total metric invalid — static bug");
+
         let config_degraded = GaugeVec::new(
             Opts::new(
                 "gradatum_config_degraded",
@@ -182,6 +197,10 @@ impl WorkerMetrics {
                 registry.register(Box::new(distill_cron_enqueued.clone())),
             ),
             (
+                "queue_payloads_purged",
+                registry.register(Box::new(queue_payloads_purged.clone())),
+            ),
+            (
                 "config_degraded",
                 registry.register(Box::new(config_degraded.clone())),
             ),
@@ -202,6 +221,7 @@ impl WorkerMetrics {
             jobs_dlq_total,
             workers_active,
             distill_cron_enqueued,
+            queue_payloads_purged,
             config_degraded,
             last_consumed_ts,
             last_consumed_ms: Arc::new(AtomicI64::new(0)),

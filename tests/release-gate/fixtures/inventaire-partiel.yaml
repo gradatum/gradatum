@@ -1,0 +1,14 @@
+# Fixture inventory -- test data, NOT a release derogation list.
+# One entry only, naming a strict subset of the breaks carried by
+# fixtures/semver-inscrite.out: the unnamed break of the same (crate, lint) pair
+# must still block, which proves the matching is per entry, not per crate.
+semver_deviations:
+  - crate: gradatum-core
+    symbol: "fixture::KindKind::Chore"
+    lint: enum_variant_missing
+    rendered: "variant KindKind::Chore"
+    kind: fixture
+    introduced_in: "0.0.0"
+    ships_in: "0.0.0"
+    reason: "test data -- partial inventory, the Spike entry is deliberately absent"
+    card: FIXTURE

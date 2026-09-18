@@ -412,7 +412,7 @@ silently override the configured value.
 
 ## 7. Security properties
 
-> **Security note**: the default ACL is **fail-closed**. With no preset file at `[acl] preset_path` (default `/var/lib/gradatum/config/bearer.toml`), the engine falls back to DENY-ALL and every locus is denied — an identity with no matching `[[consumer]]` block is refused. Configure an ACL preset (shipped preset or your own) to grant access. Multi-tenant isolation (`multi_tenant.enabled`) is opt-in and off by default; note that per-key **write scopes** are only enforced when it is on — see `SECURITY.md` for that caveat.
+> **Security note**: the default ACL is **fail-closed**. When `[acl] preset_path` is absent, the path is derived from `storage.root` as `<root>/config/bearer.toml`; if no preset file is there, the engine falls back to DENY-ALL and every locus is denied — an identity with no matching `[[consumer]]` block is refused. Configure an ACL preset (shipped preset or your own) to grant access. Multi-tenant isolation (`multi_tenant.enabled`) is opt-in and off by default; note that per-key **write scopes** are only enforced when it is on — see `SECURITY.md` for that caveat.
 
 Since 2.4.0, `gradatum-admin acl validate --preset <path>` validates a preset off-server, as a
 pre-flight before rolling it out: it parses the file through the server's own boot-time loader,
@@ -422,11 +422,20 @@ exists — a preset that still sets it is refused at load; express the same deni
 `!personal-classified` pattern (matched on a whole locus segment) in `read_patterns` /
 `write_patterns` instead — see `SECURITY.md` § Privacy posture.
 
-`acl validate` proves the file **parses**; it does not prove any given consumer can still read
-anything. Read patterns are deny-by-default, so a consumer left with only `!`-prefixed negations
-(or an empty list) parses cleanly and then denies every read. After realigning the preset, run
-`gradatum-admin acl validate --preset <path>` **and** exercise one read per consumer identity —
-the validator does not, and cannot, detect a consumer with no positive pattern.
+`acl validate` proves the file **parses**, and it reports on stderr — without changing its exit
+code — every consumer that holds no positive read pattern. Read patterns are deny-by-default, so
+a consumer left with only `!`-prefixed negations (or an empty list) parses cleanly and then
+denies every read:
+
+```
+warning: consumer '<name>' has no positive read pattern — it reads nothing
+```
+
+A consumer that is *meant* to read nothing, such as a service declared with write patterns only,
+produces this warning legitimately: it is a report, not a refusal, and the exit code stays `0`.
+What the validator still cannot decide is whether the positive patterns it does find are the ones
+the deployment intended, so after realigning the preset, run `gradatum-admin acl validate
+--preset <path>` **and** exercise one read per consumer identity.
 
 Personal-data detection (the `[privacy]` block) ships off by default: absent, or present with an
 empty `categories` list — the state on every upgrade unless an operator opts in — the write path
@@ -779,9 +788,54 @@ The order above is the general rule; a specific version line can add its own pre
 break inventory on top of it. For the 2.3.1 → 2.4.0 line, see
 [docs/UPGRADING-2.3.1-to-2.4.0.md](UPGRADING-2.3.1-to-2.4.0.md) — the ACL-preset re-alignment
 covered there is a **mandatory pre-flight**, and the same guide documents the deployment
-sequence in order, the binary-only rollback, the same-`version`-and-same-`build_sha` fleet
-rule, and how to replay the 2.3.1 → 2.4.0 upgrade harness (`tests/upgrade/run-upgrade-test.sh`)
-outside CI.
+sequence in order, the binary-only rollback and the same-`version`-and-same-`build_sha` fleet
+rule.
+
+For the 2.4.0 → 2.5.0 line, see
+[docs/UPGRADING-2.4.0-to-2.5.0.md](UPGRADING-2.4.0-to-2.5.0.md) — it carries a pre-flight of
+its own, both parts done before the new binary runs: a configured-but-unusable ACL preset now
+**refuses the boot** (validate it, and confirm the service user can read it, rather than relying
+on a silent DENY-ALL fallback), and a one-time queue rewrite is recommended because purged job
+payloads are now physically scrubbed and the scrub is not retroactive. The sequence and the
+ordering rule above are unchanged by that line.
+
+The automated upgrade harness is **retargeted at each version pair** rather than kept per line:
+`tests/upgrade/run-upgrade-test.sh` currently replays **2.4.0 → 2.5.0**, produced by the same
+generator and the same zero-tolerance readings, with the same rule that a tooling failure is
+never a green. Replaying an older line means checking out the harness at that line's commit, not
+re-running this one.
+
+### Re-running `init` on an existing installation
+
+`gradatum-admin init` writes `config/bearer.toml` — the ACL preset — **only when that file is
+absent**. On a root that is already initialised (it carries `config/admin.bearer.txt`), the preset
+is left exactly as it is, byte for byte, and the command says so on stderr.
+
+This matters because the file is not generated output: it is the access policy `gradatum-server`
+enforces. An installation whose preset is hand-maintained would otherwise have that policy replaced
+by the shipped template on an ordinary re-run — `scripts/install-gradatum-services.sh` re-runs
+`init --force` on an existing root to refresh `server.toml` and the `[internal_api]` tokens, and
+that refresh used to rewrite the preset as a side effect.
+
+**`--force` does not change this.** It keeps its other meanings — the admin bearer is re-minted, the
+`[internal_api]` tokens and the `server.toml` template are refreshed — and `config/bearer.toml` is
+not among them.
+
+To replace the preset as well, ask for it explicitly:
+
+```bash
+# Backs up the current file to config/bearer.toml.bak.<timestamp>, then writes the requested preset
+gradatum-admin init --root /var/lib/gradatum --preset hierarchical --force --overwrite-preset
+```
+
+The installer never passes `--overwrite-preset`: refreshing a deployment is not the same act as
+resetting its access control, so replacing a preset stays a deliberate operator gesture. Validate a
+replacement before you run it — an unusable preset now **refuses the boot** rather than degrading to
+DENY-ALL, see [docs/UPGRADING-2.4.0-to-2.5.0.md](UPGRADING-2.4.0-to-2.5.0.md).
+
+A root that is *not* initialised has no policy in force, so its preset is still written: a first
+install, and the retry after a failed one (which deliberately leaves no `admin.bearer.txt` marker
+behind, so the install stays repairable without `--force`).
 
 ### Why the order matters
 
@@ -871,3 +925,9 @@ upgrade, and it is the one worth running after any manual deploy.
 | GPU not used despite `gpu_layers > 0` | Missing GPU runtime or env vars not injected | Verify the GPU runtime is installed; env vars prefixed `VK_*`/`CUDA_*` etc. are auto-injected |
 | Engine restarts in a loop | Child crashes immediately (model incompatible, OOM) | Check `journalctl` for child output; reduce `context_len` or `gpu_layers` |
 | `bind_addr '0.0.0.0' interdit` | Wildcard bind rejected | Set a specific unicast IP or use `127.0.0.1` |
+
+---
+
+## 14. Backup scope
+
+**Backup scope.** `gradatum-db-backup` (daily, off-host) archives `index.db`, `api_keys.sqlite`, and `revocation.sqlite`. `db/queue.sqlite` is **excluded on purpose**: job payloads carry the full note body/title in plaintext, outside the vault's own downgrade/forget lifecycle, and logical purges of that table do not scrub the raw bytes. Backing it up would create a retention channel the vault cannot control. The queue is transient by design — losing it on disaster only costs in-flight jobs, replayable from the caller, not durable note content (which lives in `index.db`).

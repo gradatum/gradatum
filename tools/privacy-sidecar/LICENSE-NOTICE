@@ -1,0 +1,43 @@
+# Third-party licence notice — privacy-sidecar
+
+The sidecar's own source (`src/`, `CMakeLists.txt`, `fetch-upstream.sh`,
+`tests/`) is part of this repository and is covered by its licence:
+**Apache-2.0**.
+
+It links against two third-party works. Neither is vendored in this repository:
+both are acquired at a pinned revision by `fetch-upstream.sh` into a directory
+outside the working tree, so what is distributed here is a reference to a
+revision and a digest, not a copy.
+
+## privacy-filter.cpp — MIT
+
+- Source: <https://github.com/localai-org/privacy-filter.cpp>
+- Pinned: commit `735a6c28607ee82afc3a670383f41b55266a3b9a`
+- Licence: MIT (the upstream `LICENSE` file)
+- Includes its `ggml` submodule, pinned at commit
+  `3af5f5760e19a96427f5f7a93b79cbdf3d4b265b` (MIT).
+
+The sidecar is a *client* of this work: it calls the C API in `include/pf.h` and
+links the `pf` target built from that revision. The engine ships no model; the
+weights are a separate artefact with its own licence, supplied by the operator
+and never committed here.
+
+## nlohmann/json — MIT
+
+- Source: <https://github.com/nlohmann/json>
+- Pinned: v3.11.3, single header `json.hpp`
+- Licence: MIT (the header carries its own notice)
+- Digest: `sha256:9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6`
+
+Upstream `privacy-filter.cpp` carries no header-only JSON library, so the wire
+format needs one. It is fetched by content digest rather than assumed present on
+the host: a system package would be an undocumented dependency, and a tag can be
+moved where a digest cannot.
+
+## Model weights
+
+Not covered by this notice and not distributed here. The operator supplies the
+GGUF file; its licence is the one published with the weights. The sidecar
+reports the digest of whatever it is pointed at, and refuses to start if it does
+not match the digest the operator pinned — so the artefact in use is always
+identifiable from the process itself.

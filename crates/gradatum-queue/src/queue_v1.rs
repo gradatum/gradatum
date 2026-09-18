@@ -18,7 +18,15 @@
 //! PRAGMA synchronous   = NORMAL;
 //! PRAGMA busy_timeout  = 5000;
 //! PRAGMA foreign_keys  = ON;
+//! PRAGMA secure_delete = ON;
 //! ```
+//!
+//! `secure_delete = ON` is what makes an erasure **physical**: without it, SQLite
+//! leaves the bytes of a rewritten value in the page that held it, so a purge removes
+//! the content from the column while the file keeps it. `ON` overwrites deleted content
+//! with zeros — whole freed pages included, which covers the overflow pages of a body
+//! too large for one page. `FAST` would stop at the space freed inside the page where
+//! the deletion happens, and such a body would survive there.
 
 use std::path::Path;
 
@@ -87,7 +95,8 @@ impl LegacyQueue {
             "PRAGMA journal_mode  = WAL;
              PRAGMA synchronous   = NORMAL;
              PRAGMA busy_timeout  = 5000;
-             PRAGMA foreign_keys  = ON;",
+             PRAGMA foreign_keys  = ON;
+             PRAGMA secure_delete = ON;",
         )?;
 
         // DDL — idempotent via IF NOT EXISTS.

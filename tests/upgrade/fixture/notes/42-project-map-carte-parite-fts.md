@@ -1,4 +1,4 @@
-[[project:gradatum]] [[status:IN_PROGRESS]] [[kind:FEATURE]] [[track:gradatum/2.4.0]]
+[[project:gradatum]] [[status:IN_PROGRESS]] [[kind:FEATURE]] [[track:gradatum/2.5.0]]
 
 Verifier que la recherche litterale rend les memes identifiants, dans le meme ordre, avant et apres la montee.
 

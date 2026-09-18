@@ -44,7 +44,7 @@
 //! | `gradatum_privacy_unmapped_labels_total` | Counter | label (valeur unique bornée `unmapped`) — F-160 L-D.2 |
 //! | `gradatum_privacy_spans_rejected_total` | Counter | reason (2 motifs bornés) — F-160 L-D.2 |
 //! | `gradatum_privacy_spans_window_edge_total` | Counter | (sans label) — F-160 L-D.2 |
-//! | `gradatum_privacy_exception_hits_total` | Counter | pattern_id (index/empreinte, jamais le motif) — déclarée sans producteur en 2.4.0 — F-160 L-D.2 |
+//! | `gradatum_privacy_exception_hits_total` | Counter | pattern_id (empreinte du motif, jamais le motif) — F-160 L-D.2 |
 //! | `gradatum_privacy_input_too_large_total` | Counter | (sans label) — **distincte** des échecs du détecteur — F-160 L-D.2 |
 
 use std::sync::{
@@ -285,16 +285,16 @@ pub struct PrivacyLabelLabel {
 
 /// Identifier of one exception pattern a detection hit.
 ///
-/// The value is an **index or a digest** of the pattern as declared in the configuration —
-/// never the pattern itself, and never the text it matched. Exception patterns are literal
-/// snippets of personal data by nature (which is why [`PrivacyConfig`](crate::config::PrivacyConfig)
-/// redacts them from its `Debug`), so a series that carried one would publish to the
-/// loopback metrics channel exactly what the configuration was written to withhold.
+/// The value is a **digest** of the pattern as declared in the configuration — never the
+/// pattern itself, and never the text it matched. Exception patterns are literal snippets of
+/// personal data by nature (which is why [`PrivacyConfig`](crate::config::PrivacyConfig)
+/// redacts them from its `Debug`), so a series that carried one would publish to the loopback
+/// metrics channel exactly what the configuration was written to withhold. The digest is
+/// computed by the pass that drops the span, so this type never sees the literal: an observer
+/// can only relay an identifier it was handed.
 ///
-/// **No producer in 2.4.0**: the exception pass is configured but its consumer is not
-/// delivered yet, so the family is declared and empty. It is registered anyway, for the
-/// same reason the boot gauges are: a series that appeared only once the feature shipped
-/// would be indistinguishable from a broken scrape.
+/// Cardinality is bounded by the operator's own exception list — the only party who can mint
+/// a label here is the one who wrote the configuration.
 #[derive(Clone, Hash, Eq, PartialEq, Debug, prometheus_client::encoding::EncodeLabelSet)]
 pub struct PrivacyPatternLabel {
     /// Stable identifier of the pattern (index or digest), never the pattern.
@@ -588,8 +588,9 @@ pub struct AppMetrics {
     /// Exception patterns a detection hit, by pattern identifier.
     ///
     /// Série : `gradatum_privacy_exception_hits_total{pattern_id}` — never the pattern and
-    /// never the matched text. Declared with **no producer** in 2.4.0 (see
-    /// [`PrivacyPatternLabel`]).
+    /// never the matched text. Fed by [`crate::privacy_observer::MetricsPrivacyObserver`]
+    /// from the identifiers a pass reports, so the label is always a digest this process
+    /// computed, never a value read out of the configuration (see [`PrivacyPatternLabel`]).
     pub privacy_exception_hits: Family<PrivacyPatternLabel, Counter>,
     /// Passes that ended because the input exceeded the per-call byte ceiling.
     ///

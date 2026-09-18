@@ -12,6 +12,782 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > file, the public release that carried its changes forward. That mapping follows the document's
 > order, not a change-by-change diff — see the `[2.0.0]` note below for a case worked out in full.
 
+## [Unreleased]
+
+## [2.5.0] — 2026-09-17
+
+### Security — the leak blocklist now catches the bare noun naming the operator's private infrastructure (F-319)
+
+- **The leak-detection gate covered the compound forms of that name and missed the bare noun
+  (F-319).** Neighbouring patterns caught a hyphenated service label, host aliases and a hardware
+  model, so a file could name the private installation outright as an ordinary common noun and
+  pass both the CI job and the local hook. The pattern is added at the same rank in
+  `.forgejo/workflows/ci.yml` and in `scripts/internal/pre-commit-leak-scrub.sh`, which must stay
+  identical (no parity is checked mechanically), anchored on the existing `$LB`/`$RB` boundaries
+  and therefore case-insensitive like the rest of the blocklist. The four occurrences the widened
+  gate then found on the publishable perimeter — one generated fixture label, two comments in the
+  deployment script, one comment in the French-prose linter — are reworded to neutral language.
+  The detector returns `0` over the publishable perimeter; the copies that legitimately carry the
+  patterns are excluded from that perimeter, exactly as the other pattern carriers are.
+
+### Changed — `acl validate` reports the consumer that reads nothing (F-318)
+
+- **`gradatum-admin acl validate` now names every consumer whose read patterns hold no positive
+  pattern (F-318).** Read patterns are deny-by-default: the engine admits a read on a match in
+  the allow set, which is built from the non-negated entries alone. A consumer left with only
+  `!`-prefixed negations — or with an empty list — therefore parses cleanly, lets the server
+  boot, and then denies every read, which at run time is indistinguishable from an identity that
+  holds no rights at all. The command that exists to be run as a pre-flight before a rollout
+  reported such a preset as valid, with nothing to notice. It now prints
+  `warning: consumer '<name>' has no positive read pattern — it reads nothing` on stderr, once
+  per consumer concerned, and the exit code stays `0`. A consumer declared with write patterns
+  only — an event-log writer, for instance — produces this warning legitimately: the report is a
+  report, not a refusal, and no flag turns it into a failure.
+
+### Fixed — the post-deploy smoke assertions match the contract the product serves (F-313)
+
+- **Post-deploy smokes: the audit assertion filters on the produced note instead of the last
+  line, and `vault_downgrade` is asserted as the synchronous 200 it has been since 2.3.x
+  (F-313).** The audit journal has several writers — the gateway posts on
+  `POST /api/v1/event-log` into the same `<storage.root>/audit/audit.<date>.jsonl` — so reading
+  its last line raced that traffic and failed on a healthy product. A run that wrote nothing
+  could still be reported green off someone else's line, and a run that wrote correctly could
+  be reported red off the same line. The line is now selected by the `note_id` the write step
+  produced: a journal that carries no line for that note fails, and an unattributable journal
+  is skipped rather than passed. `POST /vault_downgrade` has been synchronous — 200 plus a
+  `VaultDowngradeResponse` — since the queued variant was removed with the legacy engine; both
+  smokes now accept exactly that 200 and check the body's `status`, instead of one accepting
+  `202` and the other a status set no handler can return.
+
+### Added — the personal-data filter ships complete and disabled, its activation deferred (F-298)
+
+- **The whole frontier is in this release, and every part of it is inert by default.** What a
+  2.5.0 deployment receives is the out-of-process detector and its client, the confined service
+  that supervises that process, the masking mode, the `[privacy]` wiring that makes thresholds,
+  categories and exceptions decide, and the command that purges the note history a masking write
+  cannot reach. None of it marks, rewrites or refuses anything until an operator activates a
+  category: the shipped `[privacy].categories` is empty, an empty activation mounts no detector,
+  and a deployment that configures neither sidecar nor category is unaffected in either mode.
+- **Why no category ships activated.** A threshold is a calibration over a measured corpus, and a
+  category activated on an unmeasured threshold marks on noise — which is worse than not marking,
+  because the marker is a read restriction every consumer then has to work around. The campaign
+  that measures those thresholds and the activation that consumes them are a delivery of their
+  own.
+- **Stated rather than implied: category activation is deferred to 2.6.0; the filter ships
+  disabled.** The entries below describe what is delivered and how it is switched on; none of
+  them describes a running filter, and a reader of this line alone should not conclude otherwise.
+
+### Changed — the measurement-campaign card was absorbed into the privacy-activation card (F-314 → F-298)
+
+- **The measurement-campaign card was absorbed into the privacy-activation card (F-314 →
+  F-298).** The dropped card named no change of its own: the campaign it described is the
+  calibration half of the activation, and both halves are now carried by the single card. Nothing
+  a consumer of this release can observe rests on it.
+
+### Added — a client for the out-of-process personal-data detector
+
+- **`gradatum-privacy` gains a `SidecarDetector`, the client half of a detector that runs in a
+  process of its own behind a unix socket.** A heavy detection model needs a memory budget and a
+  crash domain of its own; reaching it over a socket keeps the workspace free of an in-process
+  foreign-function edge and keeps the model's memory out of the server's. The client speaks the
+  length-prefixed JSON frame format, hands the body over in windows and returns spans in the
+  coordinates of the body it was given.
+- **A call that did not complete is never reported as a scan that found nothing.** `Timeout`,
+  `Unavailable`, `Protocol` and `InputTooLarge` stay apart, because the caller's policy differs
+  for each and being unable to scan is what marks a note as unscanned. An over-sized window is a
+  size state rather than a fault, and is deliberately kept out of the circuit breaker: counting
+  it would let ordinary large writes trip a breaker that then marks every write unscanned.
+- **The sidecar's identity is checked before a single body is sent.** Every connection opens with
+  a handshake naming the build digest, the model digest, the label-set digest, the
+  label-mapping revision, the score mode and the readiness of the process; a divergence, or a
+  sidecar that is not ready, leaves the detector unavailable for the life of the process rather
+  than being re-checked on every call.
+- **A label the mapping table does not carry is counted, not guessed at.** The table from model
+  labels to product categories is a versioned constant, and the count of unmapped labels is how a
+  model whose label set moved becomes visible before its spans are read under the wrong mapping.
+- **This change carries the client and its configuration type only.** Nothing mounts it yet: the
+  supervision of the sidecar process is a separate change, and a deployment that configures no
+  sidecar is unaffected.
+- **`[privacy.sidecar]` mounts the out-of-process detector on the server; startup refuses a
+  sidecar that does not answer the handshake (F-315).** The block is read from the server's own
+  configuration and is mounted when it is present **and** `categories` is non-empty: a block over
+  an empty activation is admitted and mounts nothing, because it names a detector no write would
+  ask for. `socket_path`, `binary_digest` and `model_digest` are required, and a digest that is
+  not 64 lowercase hexadecimal characters — or an empty socket path — is refused when the file is
+  read, naming the field and never the value. Mounting opens the socket and takes the handshake
+  before the process serves: an unreachable sidecar, a timeout, or a binary, model or score mode
+  other than the pinned one **fails the start** with the cause named, and there is deliberately
+  no fallback to the in-process detector. Mounting hands the client its configuration, including
+  the `max_input_bytes` / `window_overlap_bytes` pair, which stays in `[privacy]` as the single
+  authority for how a body is cut. The activation is unchanged: the vault still applies the regex
+  floor under the model, the thresholds on the fused score, and the exceptions last, whatever
+  engine classified.
+
+### Fixed — the sidecar client reads the handshake the sidecar actually writes
+
+- **Three fields of the handshake were read under the wrong type or compared for the wrong
+  reason, and between them no correctly deployed sidecar could have been reached.** The
+  protocol header is the reference the client follows, never the reverse, so the corrections
+  are on this side of the socket.
+- **The label-set digest is text, and was read as an integer.** The sidecar announces
+  `labels_v` as a `sha256:`-tagged hexadecimal digest; a field of integer type made every
+  handshake undecodable. It is now a string, reported to the caller, and never compared: it is a
+  digest of the model's label set, so pinning it here would refuse every model refresh while
+  looking like a safety measure.
+- **The label-mapping revision was compared for equality against a constant derived from this
+  client's own table.** The two are not the same number, and never were: the revision the
+  sidecar announces numbers its own label renumbering, while the client's table has a revision
+  of its own. Requiring equality refused a sidecar whose revision was newer, which is the
+  ordinary case after a sidecar upgrade, and refused it as a permanent unavailability. The
+  client now requires the announced revision to be at or above the floor it can read, reports
+  it, and names its own table revision separately.
+- **The request identifier round-trips as a string, and was decoded as a number.** The protocol
+  defines it as a bounded string over a fixed character set; a numeric field could not carry
+  one. It is now a string, drawn from a monotonic counter, and the guard against a reply that
+  belongs to another exchange compares strings.
+- **A body cut into windows spent the caller's timeout once per window.** The per-window
+  allowance now derives from one call-wide deadline fixed before the first window is sent, so a
+  body in twenty windows is still bounded by one budget rather than twenty; a window that opens
+  after the deadline has passed is refused without being sent.
+- **A round trip the client accepts now ends a run of consecutive failures, and a frame it refuses
+  does not.** The counter exists to notice a sidecar that is not answering; a refused body is an
+  answer, so counting it let ordinary over-sized writes carry a healthy sidecar toward a breaker
+  that would then mark every subsequent write unscanned. Recording the round trip before the answer
+  was read carried the opposite defect: a sidecar answering a well-framed body that no client can
+  accept — a scan reported with no span list behind it, a reversed offset pair — cleared the count
+  on every request and never opened the breaker, so a detector that had stopped working reported
+  itself healthy while scanning nothing. The round trip is recorded only once the answer has been
+  accepted, which is what makes the counter count consecutive non-answers.
+
+### Added — the masking mode rewrites the bodies it marks, and a deployment says so at every boot
+
+- **`[privacy] mode = "mask"` is delivered, and it is destructive.** Every passage the
+  activation marks is replaced with `[redacted]`: no copy of the replaced text is kept. What
+  it destroys is bounded by the same rule as the marker — a span whose category is not
+  activated, or whose score sits below its threshold, is left exactly where it was, and a span
+  an exception covers never reaches the rewrite at all. The `identity` section and the `code-*`
+  vaults are not scanned by this frontier in either mode, so nothing there is rewritten.
+- **The refusal is on the value, not on the mode.** A `mask` whose activated categories all sit
+  at the observation point would read as a running redaction while rewriting nothing — and a
+  corpus where nothing matched cannot tell that deployment from a working one. It is now
+  **refused at load**: `mask` is admitted only over an activation with at least one threshold
+  strictly above zero. A `report_only` over the same uncalibrated categories still loads, because
+  observing is what that mode does.
+- **A masking deployment is told what it runs, once per boot.** The server emits a `WARN` line
+  and one audit event (`event = "privacy_mode"`, outcome `announced`, actor `system`, tenant `*`)
+  naming the mode and the mounted detector. A deployment in `report_only` writes neither: a
+  setting that changes no byte should not fill the trail that has to carry the ones that do.
+- **An incomplete detection pass refuses the write rather than persisting the body unmasked.**
+  Under `mask`, a pass that did not complete (`detector_unavailable`) returns an error and no
+  note is written — the write path cannot tell which passages it would have destroyed. Under
+  `report_only` the long-standing fail-open behaviour is unchanged: the write lands and the note
+  is marked unscanned, which is what lets the deferred sweep pay the debt later.
+- **The masked note keeps its counts and drops its spans.** The block's offsets would otherwise
+  point a reader at text that no longer exists; the per-category counts stay, so the campaign
+  that calibrates the thresholds still measures what the detector saw.
+- **A write that masked anything destroys the note's whole version history.** Suppressing only
+  the snapshot of the version being replaced would leave the versions before it untouched —
+  snapshots holding the very text the mode exists to remove, in the one directory the rewrite
+  does not reach. Every snapshot already under `.history/<id>/` is removed instead, and the
+  destruction is recorded as a `WARN` line carrying the note identifier, the number of snapshots
+  destroyed and the number that resisted removal (`snapshots_destroyed`, `snapshots_failed`),
+  never their text. Both counts, because one does not describe the purge: a snapshot the
+  filesystem kept is not a snapshot that was destroyed, and the write lands anyway — a history
+  that could not be emptied is a fact to read, not an error to raise after the text is gone. A
+  note that masked nothing keeps its history, and a write that masks nothing is unchanged.
+- **`gradatum-admin privacy history-purge` reaches what the switch to `mask` left behind.** A
+  masking write destroys the snapshots of the note it rewrites, so no note masked *after* the
+  switch keeps an earlier copy. What no write reaches is everything written *before* it: those
+  snapshots hold the clear text of notes an operator has since decided to rewrite, and only a
+  write masking that same note would destroy them. The new sub-command
+  (`privacy history-purge --root <root> [--dry-run]`) selects the notes whose privacy block
+  records `mode = "mask"` — durable on-disk evidence, readable without the index — removes their
+  `.history/` snapshots, and reports notes, snapshots and bytes; `--dry-run` reports the same
+  count and removes nothing. The history of every other note is left alone, and this is not an
+  erasure: `index.db`, `queue.sqlite`, the audit journal and the embedding index are untouched.
+  The upgrade guide says when to run it.
+- **The asynchronous embedding path reads the body as persisted.** A vector is computed over the
+  masked text, so the passage the mode destroyed cannot survive in a similarity search after it
+  has left the note.
+
+### Changed — the mask-mode load refusal is renamed for what it now refuses
+
+- **`ConfigError::PrivacyMaskUnavailable` becomes `ConfigError::PrivacyMaskWithoutActivation`.**
+  The old name said the mode was unavailable, which was true of 2.4.0: `mode = "mask"` was
+  refused outright because masking was not delivered. In 2.5.0 the mode is delivered, and the
+  refusal that remains is narrower — `mask` is refused only over an activation that can rewrite
+  nothing, where the configuration would read as a running redaction while every activated
+  category sits at the observation point. The variant testifies to that state, so it is named for
+  it. The config contract is unchanged: the same configurations load and the same one is refused.
+- **The rename is a source break for a Rust consumer matching the old variant**, including one
+  outside this workspace: the item stays callable for anyone who names it. It is invisible to the
+  `public-api` surface gate, which reads rustdoc JSON and does not emit `#[doc(hidden)]` items —
+  the enum sits in a `#[doc(hidden)]` module of `gradatum-server`, so the measured surface is
+  unchanged and no `semver_deviations` entry can be paired to it. A break a tool cannot see is
+  still a break, so it is declared here rather than left to the gate's silence. No other item of
+  that module changes.
+
+### Added — the local deploy refreshes the code map of the deployed checkout, without ever leaving the host down (F-286)
+
+- **`scripts/deploy-gradatum-local.sh` now runs `gradatum-admin code update` on the checkout
+  it is deploying, in the window where the services are already stopped and before the
+  binaries are replaced.** A code index that lags the code it describes answers
+  confidently about code that is no longer there; folding the refresh into the deploy is
+  what keeps the two from drifting, since the deploy is the moment the two are known to
+  move together.
+- **The step never aborts the deploy.** It runs *after* the services have been stopped, so a
+  hard failure there would end the run with the host still down — the remedy (a stale code
+  map) costing more than the harm (a stopped service). Every non-nominal outcome is a
+  prominent warning, a dedicated line in the final summary, and the deploy carries on to
+  install and start. The only fatal paths remain the ones that were fatal before this step
+  existed, none of which sit inside the stopped-services window.
+- **The refresh is bounded in time** (`CODE_INDEX_TIMEOUT_S`, 60 s by default, overridable).
+  The bound only matters in the degenerate case — a locked index, an unreadable checkout, a
+  mount that stopped answering — where an unbounded call would stretch the outage instead of
+  shortening it. Exceeding it warns and hands control back.
+- **A full ingest is refused inside the window.** With no prior ingest for the code vault,
+  `code update` falls back to ingesting the whole repository (minutes of CPU and I/O). That
+  is a first indexation, not a refresh: the step skips it, says so, and points at the
+  out-of-band tool. The check reads the same table and predicate the CLI consults; an
+  unreadable index leaves the answer undetermined, and an undetermined probe attempts the
+  update rather than skipping — the worst case of trying is bounded by the timeout, whereas
+  taking a doubt for an answer would silently leave the code map stale forever.
+- **It is placed before the binary install on purpose.** The service units take the only
+  `index.db` backup at start time (`ExecStartPre`), immediately before the migration runner
+  touches the schema. A write that migrates the index earlier would make that backup capture
+  an already-migrated index while still being named "pre-migration" — a documented guarantee
+  quietly voided. Running the refresh before the install keeps the window honest, and has the
+  side effect that a failure leaves the running binaries untouched.
+- **A missing index is announced and skipped**, and a present index with no `gradatum-admin`
+  warns rather than aborting: the install step ships that very tool, so the deployed host
+  still ends up coherent, one deploy behind on its code map — which the summary states.
+- **The behaviour is covered by a harness** (`scripts/internal/deploy-gradatum-local.eprouvette.sh`)
+  proving the eight outcomes — including that the deploy *reaches* the next step under
+  `set -e` on every failure path — and the call site's position between the stop and the
+  install. It is not wired into CI.
+
+### Fixed — the ACL preset path follows the deployment root instead of a host-global default
+
+- **An absent `[acl] preset_path` no longer makes a deployment read a file it never
+  named.** The key defaulted to an absolute path outside `storage.root`, so every
+  instance whose root was elsewhere still read that host-global file — and because the
+  boot gate separates a preset that *cannot be loaded* from one that was *never
+  configured*, a file sitting there and not readable by the server's user refused the
+  startup of a deployment that had configured no preset at all. The path is now derived
+  from `storage.root` as `<root>/config/bearer.toml`, the location `gradatum-admin init`
+  materialises the preset at and the one `gradatum-admin` reads back.
+- **An operator-set value is still honoured verbatim**, the empty string included: the
+  empty path remains the gate's "not configured" door, and no default closes a door that
+  was opened on purpose.
+- **What an upgrade changes: nothing for a deployment whose `storage.root` is the
+  installation default**, where the derived path is the same file. A deployment that
+  omits the key and runs from another root now reads its *own* `config/bearer.toml`: if
+  the file is absent, the documented DENY-ALL fallback applies with a warning; if it is
+  present but unusable, the gate refuses the boot, exactly as for any configured preset.
+
+### Fixed — a re-run of `init` no longer replaces a hand-maintained ACL preset
+
+- **`gradatum-admin init` writes `config/bearer.toml` only when that file is absent.** On a root
+  that is already initialised the preset was rewritten unconditionally, the previous content being
+  kept only in a `.bak.<timestamp>` file. The file is not generated output: it is the access policy
+  `gradatum-server` enforces, so for an installation whose preset is maintained by hand the rewrite
+  replaced a live policy with the shipped template. The policy now survives a re-run, and the
+  command reports on stderr which file was kept.
+- **`--force` keeps every other meaning it had, and does not imply the rewrite.** It still re-mints
+  the admin bearer and refreshes `server.toml` (the `[internal_api]` tokens included), which is what
+  refreshing an existing deployment actually needs. `config/bearer.toml` is not among its effects.
+- **Replacing the preset is a new, explicit gesture: `--overwrite-preset`.** The current file is
+  copied to `.bak.<timestamp>` before the requested preset is written, and the message names both
+  the file and the backup. Installers do not pass it: refreshing a deployment is not the same act as
+  resetting its access control.
+- **A root that is not initialised still gets its preset written.** A first install, and the retry
+  after a failed one — which deliberately leaves no `admin.bearer.txt` marker behind — are not
+  governed by the guard, so an install that fails on the bootstrap key stays repairable without
+  `--force`.
+
+### Changed — the write-check warning names the channels it is actually read on, and the one it is not (F-199)
+
+- **The warning never blocked a write, and no window ever existed in which a finding could be acted
+  on before the write landed.** The coherence check on note ingestion is an absolute warning: it
+  adds no error path, the write proceeds, and the note is persisted whatever the check reports. Any
+  prose describing a review that precedes the write describes a guarantee this control cannot give —
+  holding a write is a different control, deferred rather than wired.
+- **The two read channels are named, each with its mode of access.** The counter
+  `gradatum_write_check_total{rule}` is read by scraping `GET /metrics`: it answers in aggregate,
+  how many drifts per rule. The audit event `write_check_category_section` is read from the daily
+  audit file (`audit.YYYY-MM-DD.jsonl`): it answers per write, carrying the rule, the category,
+  the expected and the actual section, and the request id.
+- **The job event stream is deliberately not the transport.** `GET /api/v1/jobs/{id}/events` is
+  keyed by a job and closes when that job reaches a terminal state; a write-check warning belongs
+  to no job and has no end. Serving it there would key a channel by a lifecycle it does not share,
+  so the finding is not published on it — and is not planned to be.
+
+### Changed — the sidecar client's configuration is built by its constructor, and its table follows the model's real label set
+
+- **`SidecarConfig` gains `new(socket_path, binary_digest, model_digest)` and chained setters,
+  and is `#[non_exhaustive]`.** The three fields a caller cannot guess are now required at
+  construction, the rest carry documented defaults and are overridden one at a time, and
+  `#[non_exhaustive]` leaves a later field additive rather than breaking. The default values
+  and their units are written out in the type's own documentation.
+- **The label-to-category table is rebuilt on the label set the shipped model really carries**,
+  at revision 2. Every group of the model's own list is either mapped to a product category or
+  named in an explicit unmapped list, and a test asserts that partition: a label that silently
+  fell out of the mapping would otherwise be counted as a label the model invented, and read as
+  a model problem rather than a table problem.
+- **The announced values are reported through `SidecarDiagnostics`**, which carries the
+  label-set digest and the announced mapping revision. They are not added to the detector's
+  persisted identity: that type belongs to the detection frontier's public surface, which this
+  change does not alter.
+- **The label table is crate-private**, and the test that checks it against the model's
+  vocabulary moved into the crate with it. The mapping is the detector's own reading of the
+  wire, not an interface: a caller handed it would be handed the decision of which category a
+  body's spans carry, and the detector would stop being the one place where that reading is
+  versioned and reviewed. No released surface carried the name — the feature is still
+  unreleased — so nothing published changes.
+- **The label fixture now carries its provenance, and a test holds it to it.** The table is
+  checked against a fixture of the model's entity groups, and a fixture nobody can reproduce
+  drifts away from the model it names: the check then goes green against a list that no longer
+  describes anything. `tools/privacy-sidecar/tests/dump-labels.sh` derives those groups from the
+  model — the label array of its GGUF metadata, with the BIOES tag stripped and the outside label
+  dropped — and cross-checks the count and both boundaries against what `pf-cli --info`
+  announces. A test, ignored unless the binary and the weights are named in the environment,
+  compares that output to the fixture line for line; a second hands the same script a file that
+  is not the model and requires it to fail and print nothing, so a script that printed a constant
+  list cannot pass for provenance.
+
+### Changed — a configuration key with no reader is removed, and the key that carries the effect is named (F-157)
+
+- **`[curator.llm] max_tokens` is gone from the schema of `server.toml`.** The key was parsed
+  and read by nothing: the review token budget has always been `[curator] llm_review_max_tokens`,
+  the one value propagated into the curator pipeline. A second key for a setting that is already
+  arbitrated is the divergence this sweep exists to remove, so the dead key is **deleted rather
+  than wired** — wiring it would have made two sources live for one value. **A `server.toml` that
+  still carries it keeps loading**: the worker's LLM section declares no `deny_unknown_fields`, so
+  the retired key is ignored exactly as any unknown key always was, and
+  `[curator] llm_review_max_tokens` remains the only key with an effect. Migration:
+  [docs/UPGRADING-2.4.0-to-2.5.0.md](docs/UPGRADING-2.4.0-to-2.5.0.md).
+
+### Fixed — a rejection is inscribed by the write that poses it, and the marker follows it (F-310)
+
+- **The write-time pass resolved a verdict from the wrong block, so a review under a mounted
+  detector was reported as a conflict instead of being recorded.** `POST /vault_privacy_review`
+  writes `extra.privacy.review` through the single insertion point; where a detector is mounted, a
+  pass runs on that same write and recomputes the block. It read the verdict off the note as it
+  stood on disk — still `pending` — so the human judgement was recomputed away and the endpoint
+  truthfully answered `409`. The pass now resolves the verdict from the block **the write states**
+  when that block is the note's own block with `review` moved — the shape the review surface posts
+  — and from the note on disk otherwise. A block that differs anywhere else is one the caller
+  composed rather than one the note is shown to have received, and it reads as no verdict at all.
+  `spans_digest` remains the whole of the guard.
+- **The limit this release carries, stated rather than implied.** With no detector mounted — the
+  delivered configuration, an empty `categories` list — nothing recomputes the block, and the
+  verdict is inscribed as the caller wrote it. With a detector mounted, the verdict is inscribed
+  and binds the marker **only while the pass re-reports the very spans the verdict was made
+  about**: the moment the digest moves, the verdict is spent and the endpoint answers `409` rather
+  than record a judgement about spans that are no longer there. The post-write verification is
+  unchanged — the endpoint re-reads the note and never reports a verdict it did not record.
+- **What the bound on the incoming block is, and what it is not.** The comparison refuses a
+  composed block; it is not a signature. A caller already able to place a block into a write could
+  echo the note's own block and move nothing but the verdict, which is the shape the review surface
+  posts, and no comparison of blocks tells the two apart. What closes that is the property the
+  frontier has always rested on and no part of this change touches: no write DTO carries `extra`,
+  and every production write site builds it empty, the review surface excepted.
+
+### Security — the archives listing withholds a marked note from a consumer the preset denies (F-311)
+
+- **`POST /api/v1/vault_archives_list` was the one read surface that could not carry the read
+  guard, and the most exposed of them.** Its entries carry the ULID, the H1 title, the section and
+  the archived path of a note, so a consumer to whom the note is withheld everywhere else could
+  still enumerate it here — and read its title. The reason was structural: an archive is listed
+  from the registry, the note is gone from the search index, and the registry row holds no tags.
+  The tags live in the archived `.md` alone.
+- **The guard is now applied, and the reason it could not be is what the release answers.**
+  `Registry::archived_note_tags` resolves the tags of a whole page of archives in one batch — one
+  registry query for the paths, then one read per entry — and `vault_archives_list_impl` withholds
+  every entry carrying `personal-classified` from a consumer not authorised on `{vault}/personal-classified`.
+  Both the public endpoint and the MCP tool go through that function; the internal admin listing
+  keeps the complete view it needs to prepare a CLI command, because it calls the core directly.
+- **The direction it fails in is the closed one, in both scopes.** A note whose tags could not be
+  established — no archive row for this vault, a file destroyed by retention, content that does not
+  parse — is **withheld**, never served: absence means "nothing was established", never "nothing
+  marked". A batch resolution that fails outright fails the request rather than answer with what it
+  could not vouch for. The reported `count` describes what the response carries, which is also what
+  makes a withheld entry indistinguishable from an archive that does not exist.
+- **Additive, and the addition is where the compatibility question is.** The method carries a
+  default (`Ok(empty)`), so a registry that does not implement it keeps compiling — and it then
+  establishes nothing about any archived note, which withholds everything from a denied consumer.
+  That is the closed direction, and it is stated because it is a behaviour change for such an
+  implementor rather than a silent no-op. Verified with `cargo-semver-checks` against the release
+  baseline under `--release-type minor` (196 checks executed, none failing); removing the default
+  body makes the same command report `trait_method_added` and require a major version, so the pass
+  is a measurement and not a lint that stayed silent.
+
+### Changed — a polled page costs one note read, not one per message (F-301)
+
+- **Reading a mailbox no longer costs one note read per selected message.** `message_poll`
+  resolved the subject of each message by reading its note on its own, so a page of 50 messages
+  cost 50 reads and a single call could reach 4 000 across the scan guard. The notes behind a
+  page are now read in one batched call, whatever the page size.
+- **The message envelope is unchanged**, field for field: same identifier, sender, recipient,
+  subject, body, creation instant and provenance vault, in the same order, with the same resume
+  cursor. What changed is the number of reads behind it, not what a caller receives.
+- **Two additive trait methods carry the batched read**, each with a default implementation so
+  that every existing implementor keeps compiling and behaving as before:
+  `DocumentStore::get_notes_many` and `Registry::read_notes_many`. Losing one note no longer
+  fails the batch: a note whose content cannot be materialised is omitted, which is the same
+  omission a caller already got from a failed unit read — and it is why the result may be shorter
+  than the request, with no positional match to assume.
+- **The subject of a note stays read through the vault registry, never through the index.** The
+  batched call changes how many queries are issued, not which access-control point answers: the
+  content read-back remains the one `vault_read` uses.
+- **A batch that cannot be resolved at all is reported**, not answered with an empty page: a
+  failing index query is a storage error, where a single unreadable note is only an omission.
+
+### Fixed — the queue's terminal payloads are erased physically, in bounded batches and on a schedule (F-309)
+
+- **The purge of terminal payloads erases physically, not only logically — overflow pages
+  included.** Emptying the column left the bytes of the body in the file, readable by anyone who
+  could read the file. The queue now opens with `secure_delete=ON`, so the content a rewrite
+  deletes is overwritten with zeros **wherever it stood, whole freed pages included**: a
+  `CurateSpec.body` is not bounded, so a large one is stored in overflow pages, and
+  `secure_delete=FAST` — the cheaper setting — hands those pages back with their bytes intact
+  while scrubbing only the space freed inside the page the statement touched. The purge then ends
+  with a truncating write-ahead-log checkpoint, which drops the page images taken *before* the
+  rewrite. **After that checkpoint — and only then** — a body written and purged is no longer
+  findable in the raw bytes of `queue.sqlite` or of its `-wal`. Measured, not asserted: a witness
+  placed past offset 8 192 of a 12 288-byte body is still readable after the purge under `FAST`
+  (the test fails there) and absent under `ON`; before this change, a 250-row queue left a
+  4 140 632-byte log still holding the purged bodies. The guarantee covers the bytes of the bodies
+  the purge reaches: content deleted by an **earlier** build, when the setting was not in place,
+  is not retroactively scrubbed — those pages keep it until SQLite reuses them.
+- **The purge runs in bounded batches instead of one transaction over the whole loop.** It now
+  selects and rewrites at most 500 rows per batch, one short `BEGIN IMMEDIATE` transaction each,
+  releasing the write lock between batches, and takes its selection statement once per batch
+  rather than once per row. The single transaction it used before was deferred, read then wrote,
+  and held the lock across the whole loop: a concurrent enqueue made its write-lock upgrade fail
+  with `database is locked` — a failure the busy handler does not retry, so the purge died
+  instead of waiting. Measured on 1 501 rows, the longest a concurrent write waited went from
+  failing outright to 34 ms over 278 writes, against 1 178 ms for the whole purge — under half
+  the purge, which is the criterion: the write lock is released between batches.
+- **The scrubbing costs no extra write amplification, and no measurable extra time.** The
+  write-ahead log receives the same bytes for a 1 000-row rewrite whether `secure_delete` is
+  `OFF`, `FAST` or `ON` — 1 376 112 bytes, 335 pages of 4 096 — and the database file is
+  unchanged in the three cases; a full purge of 1 000 rows takes 63 ms under `ON` against 64 ms
+  under `FAST` on the reference run. The price of the scrub is processor time, not volume.
+  Measured, not assumed: the same rewrite is run under each setting and the log size before and
+  after is compared, and the test prints the figures rather than asserting thresholds that
+  belong to SQLite and to the machine.
+
+- **The purge of terminal payloads now has a caller on both sides — a schedule and a command.**
+  The store implemented it, its batching and physical erasure were measured, and **nothing called
+  it**: no scheduled task, no operator command. The retention rule was in the code and enforced
+  nowhere, so a deployment kept every terminal job's note body in `db/queue.sqlite` for good — a
+  `CurateSpec.body` *is* the note body. `gradatum-worker` now runs it every
+  `queue.purge_interval_secs` (1 h) with a `queue.purge_after_secs` (24 h) window, on the
+  connection it already owns in write mode as the queue's consumer and from the process that
+  holds the leadership lease — no second writer is opened, and exactly one purge runs. Each tick
+  logs its count **including zero**, and increments
+  `gradatum_queue_payloads_purged_total`: a counter at zero is ambiguous between "runs and has
+  nothing to do" and "is scheduled nowhere", and that ambiguity is what let the gap stand.
+  `gradatum-admin queue purge [--dry-run] [--older-than <N>d|<N>h>]` reaches the same store
+  method by hand, and its dry-run counts through the very predicate an execution applies, so the
+  number it prints is the number it would erase. Both keys are emitted in the `server.toml`
+  template, both are already in force when the section is absent, and `0` retention is
+  **refused at parse** rather than clamped — a cutoff of "now" would erase every terminal payload
+  outside the keep window on the next tick, irreversibly. The keep window stays a product
+  constant: it is deliberately not a key, and the new section says why in place.
+
+### Fixed — the crate READMEs name the version the tree is at (F-321)
+
+- **Crate READMEs name the version the tree is at.** Every publishable crate README announced an
+  earlier release in its status line and pinned that same stale version in its installation
+  snippet, so the registry page and a copy-paste out of the README both pointed at a release that
+  is not this one. The alignment is now checked rather than assumed: the release readiness scan
+  fails on a publishable README whose status line does not carry the workspace version, on an
+  installation extract pinned to another version of that crate itself, and on a missing
+  milestone row in the root README.
+
+### Fixed — a card whose code fence is never closed no longer reports a cause that is not there (F-306)
+
+- **A body that opens a ```` ``` ```` fence and never closes it reads, from that line to the end
+  of the body, as code.** Every role below the opening mark is therefore counted by neither the
+  read projection nor the write validator — the two agree, so nothing desynchronises and nothing
+  looks broken. A card in that state typically lost its `[[track:]]` and `[[status:]]` to the
+  fence, which made the derivation report "no track pointer": a diagnostic pointing at a dangling
+  pointer that does not exist. The derivation now names the real cause instead —
+  `UnterminatedCodeFence` — when, and only when, the unclosed fence actually swallowed roles.
+- **The reading is deliberately left unchanged.** The swallowed role stays uncounted, so read and
+  write keep agreeing; this entry repairs the *silence*, not the extraction. A card is never
+  silently repaired, and no role is counted that was not counted before.
+- **Narrow on purpose.** A fence that does close is the documented way to cite a role without
+  counting it, and still raises nothing. A track that was present and resolved-but-failed, or that
+  dangles, keeps its own reason — those are not caused by a fence, and reporting the fence instead
+  would trade one visible anomaly for a wrong one.
+- **The new reason is surfaced, not swallowed by a catch-all.** The derived export logs it as its
+  own warning line, distinct from the generic derivation-failure line, so an operator reading logs
+  sees "the body is malformed" rather than "the graph is broken".
+
+### Fixed — the feature export renders the version its own title already carries (F-304)
+
+- **The `version` column and the generated title disagreed on a card whose stored `[[version:…]]`
+  had gone stale.** The title has always been built from the card's *structural* version source,
+  the `[[track:…]]` target first and the stored `[[version:…]]` only as a fallback; the export
+  column read the stored role alone. A card retired from `2.4.0` onto `track:gradatum/2.3.0` but
+  still carrying the zeroed bootstrap sentinel as its stored `[[version:…]]` therefore exported
+  that placeholder as if it were a release, while its own title said `v2.3.0`. The two now read
+  the same source, in the same order, in both the stored and the derived projection, so a card
+  renders `v2.3.0` as soon as its title does.
+- **No version is invented where none exists.** The fallback chain is the title's, unchanged: a
+  card with neither a resolvable track target nor a stored `[[version:…]]` still renders `null`,
+  not a zero. `0.0.0` remains what it was — the sentinel a card carries when it means "no target
+  set", never a version to report as the card's own.
+
+### Added — the export tells the visibility axis instead of leaving it to be guessed (F-304)
+
+- **Each exported feature now carries a `visibility` field**, holding the `[[visibilite:…]]` role's
+  value verbatim (`interne`, `public`), and `null` when the card carries no such role. The axis was
+  previously dropped by the export: a caller could not tell an internal-only card from a public one,
+  and the two rendered identically. The value is reported **as written**, never normalised,
+  defaulted or completed — an absent role stays absent, because a defaulted axis would read as a
+  property of the card rather than of the export.
+- **Rendered, not migrated.** The role keeps its non-taxonomy spelling in the vault: no card is
+  rewritten, so the change carries no bulk write and no migration. What was missing was the
+  rendering, not the role.
+- **Not additive for a consumer that constructs the type.** `FeatureEntry` is now marked
+  `#[non_exhaustive]`, so code outside the crate that builds one with a struct literal no longer
+  compiles; reading the fields of an instance is unchanged. The break is an assumed SemVer deviation,
+  inscribed in `RELEASE-MANIFEST.yaml` (`semver_deviations`, card F-304) and carried under the minor
+  rank — the tool reports it as requiring a new major version.
+
+### Added — the card listing can name its project instead of assuming one (F-305)
+
+- **`GET /api/v1/project-map/cards` gains an optional `project` query parameter**, filtering on
+  the card's `[[project:…]]` role. It composes with `version` as an AND. Previously the project
+  filter was wired to a single hard-coded value inside the handler: a card belonging to another
+  project could not be listed at all, and which project the listing assumed was not observable
+  from the request — two cards differing only by project were indistinguishable to a caller.
+- **The default is `gradatum`, and it is a default, not a disabled filter.** Omitting the
+  parameter does not widen the result set to every project: a caller that names nothing still
+  gets one project's cards. Widening on omission would have turned a missing parameter into a
+  disclosure of neighbouring projects' cards — a listing is read-scoped, and "unfiltered" is
+  not a safe reading of "unspecified" here. A project name with no carrier renders `[]`, never
+  a fallback to the default.
+- **Additive at the HTTP surface.** A request that passes no `project` is answered exactly as
+  before (the same single project, resolved once in the handler rather than twice), so no
+  existing caller changes behaviour. The core projection's signature is unchanged — it already
+  accepted a project filter; only the API layer was unable to reach it.
+
+### Fixed — the preset `init` writes no longer carries an unsubstituted template token (F-308)
+
+- **The generated `config/bearer.toml` held a literal `${PROJECT}`.** The materializer
+  substituted `${PROJECTS}` — a token no shipped preset contains — while the preset
+  declares `${PROJECT}`, singular. The placeholder therefore reached the deployed file
+  verbatim, in the header and inside `[[consumer-template]]` blocks, so an operator reading
+  their own configuration could not tell a placeholder they were meant to fill in from a
+  value the tool had failed to compute.
+- **The shipped `hierarchical` preset declares concrete consumers only.** The engine reads
+  `[[consumer]]` and ignores `[[consumer-template]]`, so those blocks were inert in a
+  deployed file while promising project-scoped identities that never existed. They are
+  replaced by a worked, copy-pasteable expansion. The consumer set is unchanged — same
+  thirteen identities, same patterns — so no installation's effective policy moves.
+- **A preset whose *value* still holds a template token is refused, not written.** Values
+  are inspected because that is what the engine evaluates: a `read_patterns` entry holding
+  a placeholder is a glob matching nothing, and writing it would leave that trap on disk
+  for a server that then boots into a silent deny-all. Tokens in comments are left alone —
+  documenting the syntax is what comments are for. `--projects` with a single name fills
+  `${PROJECT}`; a comma-separated list fills `${PROJECTS}` and is refused where
+  `${PROJECT}` is also used, since one placeholder cannot take several values.
+
+### Changed — a preset that is present but unusable now refuses the boot (F-307)
+
+- **An installation whose `acl.preset_path` points at a file that exists but cannot be
+  turned into an engine no longer starts.** That covers invalid TOML, a pattern that does
+  not compile, and any I/O error other than `NotFound`. Such a deployment used to boot,
+  keep the engine's deny-all default, and answer `403` to every request; it must now fix or
+  remove the preset before the next start. Nothing else in the configuration has to move.
+- **No configured path, or an absent preset file, still boots with the deny-all
+  fallback** — the first-run case, where refusing would make a first run impossible. A
+  present but **empty** preset (zero bytes, or whitespace only) is not a failure either: it
+  parses to a preset that declares no consumer, so the server starts and denies everything.
+  It is a deliberately restrictive policy, and it takes the same path as any other
+  well-formed preset.
+
+### Fixed — an ACL preset that is configured but cannot be loaded was discarded in silence (F-307)
+
+- **A preset file that was present and unreadable, or present and invalid TOML, was
+  discarded in silence.** The server started anyway, kept the engine's deny-all default,
+  and answered `403` to every request. That outcome is byte-for-byte what a deliberately
+  restrictive preset produces, so a configuration defect and a correct policy were
+  indistinguishable from the outside — including from a health check, which stays green
+  throughout.
+- **The gate now separates the doors by *why* the read failed, not by *whether* it
+  failed.** A file that exists and cannot be turned into an engine — parse error, an
+  uncompilable pattern, or any I/O error other than `NotFound` — aborts the startup, with
+  an error naming the configuration gate (`acl.preset_path`) and the offending path.
+
+### Changed — the post-deploy smokes are named after what they do and authenticate as identities the preset declares (F-313)
+
+- **The two post-deploy smokes are named after what they do.** `scripts/smoke-alpha-4.sh` and
+  `scripts/smoke-alpha-5.sh` become `scripts/smoke-post-deploy-1.sh` and
+  `scripts/smoke-post-deploy-2.sh` (7 and 9 steps, unchanged). Both now authenticate as an
+  identity the ACL preset declares, so no unknown-identity escape hatch is involved at
+  any point: the first reads its credential from `API_KEY_FILE` (default
+  `/etc/gradatum/probe-smoke-post-deploy.api-key`), the second mints and revokes its own — under
+  a **second** declared identity, `smoke-dyn`. One identity carries a single active key and the
+  static probe holds `smoke`, so a mint under that same identity would have been refused for as
+  long as the deployment is nominal, leaving the create → exchange → revoke cycle the second
+  smoke exists to exercise unreachable by construction. It also reads the JWT `sub` claim back
+  and compares it to that identity, so the token is provably the one requested. Their
+  notes carry the `[SMOKE]` title marker instead of a production category marker and are routed
+  to the `reference` section. The old names remain as shims that warn and exec the new ones.
+  The second smoke stops polling a job as soon as its status is terminal on the failure side
+  (DLQ / Cancelled / Conflict) instead of waiting out the 30 s timeout — same FAIL verdict,
+  minus the dead wait. The installer's closing advice cites the two smokes by name rather than
+  globbing the deprecated `smoke-alpha-*.sh` shims.
+- **The backup scope is documented, exclusions included (F-309).** `docs/DEPLOYMENT.md` §14 states which
+  databases `gradatum-db-backup` archives and why `db/queue.sqlite` is excluded on purpose: job
+  payloads carry note bodies in plaintext, outside the vault's own lifecycle, so backing that
+  table up would create a retention channel the vault cannot control.
+
+### Added — the personal-data activation is wired: thresholds and exceptions now decide
+
+- **`[privacy].thresholds` reaches the marking decision.** The pass used to mark on the mere
+  presence of a span: a category was either on or off, and the calibration table was parsed,
+  validated, and read by nothing. A span now marks only when its category is **activated** and
+  its score meets that category's threshold, compared on the integer `score_m` a note records
+  — never on a float, so no rounding separates what an operator configured from what a note
+  says. A threshold of `0` means **not calibrated** and enables nothing; it is not a floor that
+  passes everything. An activated category with an uncalibrated threshold is therefore still
+  scanned and counted — that matter is what a campaign measures its curve on — and simply
+  cannot mark.
+- **`[privacy].categories` is the activation list, not a filter on detection.** A category the
+  configuration does not activate is still reported, fused and recorded in the note's block.
+- **`[privacy].exceptions` is applied last and removes the spans it covers.** An exception
+  declares a literal to be *not* personal data, so what it covers leaves the pass's output
+  entirely: no marker, no span in the block, no count, and nothing in the digest the next pass
+  compares against. It is keyed by tenant, so one tenant's literals cannot exempt another's
+  data. Each firing is counted as `gradatum_privacy_exception_hits_total`, labelled with a
+  **digest** of the pattern and never the pattern — the metric channel cannot read back a value
+  the configuration was written to withhold. A pattern that covers nothing excepts nothing and
+  is not counted.
+- **Three configuration defects are now refused at load instead of read as "enabled nothing":**
+  a category label outside the product taxonomy, a threshold outside `0..=1000`, and a
+  per-category threshold for a category the configuration does not activate. Each one
+  previously left an operator convinced a category was calibrated. A threshold of zero is
+  accepted: it is the delivered default.
+
+### Changed — the mask mode is no longer refused for being undelivered (F-298)
+
+- **`[privacy] mode = "mask"` is no longer refused for being undelivered.** It loads when the
+  activation can perform a rewrite and is refused when it cannot — see the masking entry at the
+  top of this section.
+
+### Fixed — the French phone pattern is anchored, capped and no longer reads a timestamp as a number (F-324)
+
+- **A ten-digit run is now a telephone number only when nothing around it says otherwise.** The
+  pattern was unanchored, accepted a bare `.` as a separator and carried no ceiling on what it
+  could take: over a real documentary corpus it produced 97 predictions of which every single one
+  was false — fractions of an ISO-8601 timestamp (`…T14:01:04.341719759Z`) and migration
+  identifiers such as `20260506000001`.
+- **The match is now checked against its surrounding bytes**, a left boundary the pattern
+  language cannot express on its own: a candidate is rejected when it is glued to a digit on
+  either side, when a `.` abutting it is itself abutting a digit, and when it is touched by `:`
+  or by the ISO-8601 date/time separator `T`. A trailing sentence period is not a digit, so
+  `joignable au 06 12 34 56 78, merci` still reports exactly one span at the right offsets.
+- **The accepted spellings are named rather than implied.** Ten digits opening on a non-zero
+  digit, or `+33` followed by nine; space, dot and hyphen separate the digit pairs and are
+  optional, so `06 12 34 56 78`, `0612345678`, `06.12.34.56.78`, `06-12-34-56-78` and
+  `+33 6 12 34 56 78` are one span each. A digit run longer than the number it contains yields
+  nothing rather than a truncated prefix.
+
+### Fixed — the regex floor reports addresses, the category a real corpus carries most (F-323)
+
+- **The floor had no address pattern at all.** Over a real documentary corpus `address` is the
+  most frequent category — bare IPv4 addresses, private and public, addresses carrying a port, or
+  a prefix length, and `/mnt` mount paths — so a deployment relying on the regex floor alone
+  reported none of them: the category was empty by construction, not by finding.
+- **Four address families are now read**, each bounded so a version number, a MAC address or a
+  library path is not one of them: IPv4 (`0`–`255` per octet, four groups), IPv4 with a port or
+  with a `/8`–`/32` prefix length, IPv6 in its full or compressed form, and `/mnt/<segment>/…`
+  mount paths.
+- **The span of a compound address is the whole pair.** An address carrying a port, or a prefix
+  length, is one span covering the address and its suffix: a host and the port it answers on are
+  one observed location, and a prefix length is not an address of its own. Where both the
+  compound and the bare address match, pruning keeps the wider span, so an address nested in a
+  CIDR is reported once.
+- **Two address blocks are deliberately not reported.** The loopback range and the unspecified
+  address name the host itself or no host at all, and reporting them would mark every note that
+  mentions a local service. IPv6 is read in its full form and in a compressed form carrying at
+  least two groups before `::` and one after; shorter spellings (`::1`, `fe80::1`) are not read —
+  a deliberate false negative that keeps `std::io`-style paths out of the count.
+- **One limit is stated rather than hidden.** A four-group dotted run is an address by shape, so
+  a version of exactly four groups is reported as one; nothing in the bytes distinguishes them. A
+  version of three groups never reaches the pattern, and a fifth group disqualifies the run.
+
+### Fixed — the tests and the CI jobs stop sharing mutable state across checkouts (F-325, F-326)
+
+- **Tests and tools now resolve `CARGO_MANIFEST_DIR` at runtime: a binary reused from a
+  different checkout no longer panics (F-325).**
+- **CI: jobs that run tests hold a file lock on their shared build directory for the whole
+  run; two concurrent runs of the same job no longer overwrite each other's binaries (F-326).**
+
+### Changed — the release gate's semver harness asserts behaviour per rank, and the manifest carries no test anchor (F-269, F-302)
+
+- **The two `KindKind` entries that sat in `semver_deviations` were the harness's anchor, not
+  derogations.** They authorized nothing — the breaks they named had been published in 2.1.0 — and
+  they could not be purged: the matcher read the delivered inventory, one test asserted that
+  inventory held at least two entries, and another asserted the presence of a named triplet. Both
+  assertions encoded the *minor* regime, so emptying the inventory — the whole purpose of the
+  2.4.0 sweep — turned the semver job red.
+- **The matcher now reads the inventory its caller names**, through `SEMVER_INVENTORY_PATH`, and
+  the gate's tests carry their own fixture inventories under `tests/release-gate/fixtures/`. What
+  they assert is the *outcome*, per rank: an inventory that exists and holds no entry was read and
+  authorizes nothing, an inventory that is absent was never read at all — two different outcomes,
+  and neither is a pass. Confusing the two would read a missing file as a green.
+- **`semver_deviations` now holds derogations only.** A test entry written there would make the
+  delivered inventory depend on the harness, and the harness on the delivered inventory, each
+  hiding the other's degradation.
+
+### Fixed — the CI build-dir guard reads every workflow that invokes cargo, not only `ci.yml` (F-300)
+
+- **The guard that keeps each job's cargo build directory explicit and distinct stopped at
+  `ci.yml`.** The release workflow compiles on two architectures and its image job compiles inside
+  a container, and none of those jobs carried the variable the guard exists to require — with
+  nothing able to say so, because a file absent from the call is not a green file, it is an unread
+  one.
+- **Both workflows are now read, and the anti-vacuity floor is declared per file**, at the count
+  measured on that file. A workflow whose base name is not in the floor table fails hard rather
+  than receiving a defaulted pass, and the aggregate fails as soon as one file is unmeasured: one
+  violation does not erase an unread file. A TDD derived from the real files holds the guard to
+  the shape it guards; it was red before this change.
+
+### Infrastructure — the maintenance this release rests on, performed outside this repository
+
+- **CI: the test build directory is bounded per job and garbage-collected on the runners (F-303,
+  F-317).** Both entries stay open on an observation window, not on missing work: the change is
+  deployed, and what closes them is a normal-regime measurement that has not run its course.
+- **The runners that compile the release jobs reuse one build directory per job instead of
+  starting from a fresh hash on each one (F-281).** Same shape — configuration in place, window
+  open. Neither of these is observable from the shipped product, which is why they are recorded
+  here and not among the changes above.
+- **The audit's state block is published as a note of its own, so a reader no longer pays for the
+  whole report to read one section (F-240).**
+- **`gradatum-admin project-map scope` is consumed through its JSON output rather than through its
+  prose (F-285).** A human-readable report that a script parses is a contract nobody declared;
+  naming the machine-readable surface ends that.
+
+### Fixed — `init` refuses `--projects` for a preset that declares no project placeholder
+
+- **`gradatum-admin init` now refuses `--projects` when the chosen preset declares no project
+  placeholder in its values.** The `hierarchical` preset ships concrete `[[consumer]]` blocks and
+  no `${PROJECT}`/`${PROJECTS}` token, so `--projects=<v>` was substituted nowhere: the command
+  returned `rc=0` while writing a `bearer.toml` with no project-scoped identity, and an operator
+  was led to believe they had a per-project boundary they never configured. The refusal now
+  precedes any backup or write, names the preset, and points at adding concrete `[[consumer]]`
+  blocks per project (see the preset header) or dropping the flag. Presets that carry a project
+  placeholder are unaffected. The `hierarchical` preset header no longer advertises `--projects`.
+
+
 ## [2.4.0] — 2026-09-16
 
 ### Added — the sweep's progress is observable, and the work it left is resumable (F-160)
@@ -1245,6 +2021,21 @@ version effectivement publiée qui expose enfin la rupture annoncée : l'entrée
 - La clé JSON `corpus_match_count` (le nombre lui-même) est inchangée. Si votre code parse ce
   texte d'accompagnement pour distinguer les états, adaptez-le aux deux formulations
   ci-dessus — l'ancienne chaîne n'est plus émise.
+
+### Added — retroactive note (F-257, F-258)
+
+- **Two release-gate guards shipped in this version with no entry here; they are recorded now.**
+  F-257 made the semver gate's anti-vacuity guard tell the two states of an empty comparison
+  apart — under `--release-type major` a `0 checks` result is expected and reported, while under
+  patch or minor it stays a failure; before it, the major case was dead code that could never be
+  reached. F-258 extracted the `Failed in:` parsing, the volatile `<path>:<line>` strip and the
+  triple matching into `scripts/internal/classify-semver-output.sh` — a single artefact consumed
+  by the semver job, by the G8 gate of `release-readiness-scan.sh` and by the end-to-end test —
+  replacing three copies that had drifted apart.
+- **They are held by the `semver-regimes` job of `.forgejo/workflows/ci.yml`**, through
+  `test-regime-major.sh`, `test-regime-vacuite.sh`, `test-non-divergence.sh` and `test-regimes.sh`
+  under `tests/release-gate/`: each is a step of that job, so a guard that stopped biting turns
+  the job red rather than passing unseen.
 
 ## [2.0.9] — 2026-08-23 — *internal milestone, published in 2.1.0*
 

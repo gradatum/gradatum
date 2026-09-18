@@ -122,6 +122,14 @@ Local inference infrastructure — optional, deploy alongside the memory layer w
 | **Gateway** | `gradatum-gateway` | Unified LLM router. Maps logical aliases (`curator`, `embed`, …) to providers, circuit-breaker, primary + fallback routing. Covers both chat and embeddings. |
 | **Event log** | `gradatum-server` (B1) | Structured event log for inference calls (table `event_log`, retention-aware). |
 
+### Privacy layer
+
+Optional, and deliberately outside the process that owns the data: an out-of-process detector for personal data in note content.
+
+| Component | Crate(s) | Role |
+|---|---|---|
+| **Privacy sidecar** | `tools/privacy-sidecar` (C++) | Loads a token-classification model once and answers over a Unix socket with the *positions* of personal data — category, offsets, score — never the matched values, and never in a log. Confined unit, pinned weights and binary digests. |
+
 ### In one diagram
 
 ```
@@ -187,6 +195,7 @@ Gradatum is built in three chapters: **memory first, then agents, then the sover
 | **v2.2.0** | ✅ shipped | The `project-map` registry write contract changes: a version milestone becomes a structure card and `release` is no longer stored but derived server-side from card status. The Rust public API is additive only (80 additions, 0 removals, all under `#[non_exhaustive]`), so the breaking changes affect `project-map` registry operators, not library consumers. Read the [2.1.0 → 2.2.0 upgrade guide](docs/UPGRADING-2.1.0-to-2.2.0.md) before moving. |
 | **v2.3.0** | ✅ shipped | First slice of agent-identity data — person cards under `identity/person/*` — plus durable inter-agent messaging, an in-memory fleet registry fed by a token-authenticated heartbeat ingress, a typed `project-map` role-mutation endpoint, and multi-vault search. Three deliberate, minor-scoped Rust public-API breaks: `Job` becomes `#[non_exhaustive]`, `derive_release` is no longer public, and `EngineConfig::warm_up` is removed. |
 | **v2.4.0** | ✅ shipped | Personal-data marking mechanism (F-160) ships inert: a write-time detection pass runs `report_only` with no category activated by default, so nothing is marked out of the box. ACL `read_patterns` are now deny-by-default, and the `personal-classified` refusal is expressed as a path-segment negation rather than a dedicated flag. The 2.3.1 → 2.4.0 upgrade is exercised end to end by an automated harness on every push and by the release gate. Container packaging ships — a multi-stage Docker image with OCI labels and a measured `HEALTHCHECK` start period. Read the [2.3.1 → 2.4.0 upgrade guide](docs/UPGRADING-2.3.1-to-2.4.0.md) before moving. |
+| **v2.5.0** | ✅ shipped | Privacy sidecar (`gradatum-privacy`, F-315/F-298) ships inert; dead config key removed (F-157), write-check warnings (F-199), audit report (F-240), release gate (F-269), queue erasure (F-309), ACL gates (F-307/F-318). |
 | — | ⬜ planned | Agent runtime — terminal agent that reasons over the codebase using the vault as its memory. No version is committed to it yet. |
 
 > **What the Status column means.** ✅ *shipped* = the milestone is complete in this repository
@@ -206,6 +215,25 @@ Gradatum is built in three chapters: **memory first, then agents, then the sover
 Condensed — the authoritative, detailed log for every version lives in
 **[CHANGELOG.md](CHANGELOG.md)**.
 
+- **v2.5.0** — **Privacy sidecar** (`gradatum-privacy`, F-315/F-298) ships complete and
+  inert: an out-of-process detector reached over a unix socket, mounted by
+  `[privacy.sidecar]` only when `categories` is non-empty, with startup refusing a
+  sidecar that does not answer the handshake. The shipped `[privacy].categories` is
+  empty, so nothing is marked, rewritten or refused until an operator activates a
+  category — activation itself is deferred to 2.6.0. A dead `[curator.llm] max_tokens`
+  key is removed from `server.toml`'s schema, leaving `[curator] llm_review_max_tokens`
+  as the only key with an effect (F-157). The write-check warning now names the two
+  channels it is actually read on — the `gradatum_write_check_total{rule}` counter and
+  the `write_check_category_section` audit event — and states plainly that it never
+  blocks the write it warns about (F-199). The audit's state block is published as a
+  note of its own, so a reader no longer pays for the whole report to read one section
+  (F-240). The release gate's semver harness now reads its inventory through
+  `SEMVER_INVENTORY_PATH` and asserts behaviour per rank, so `semver_deviations` holds
+  derogations only (F-269). The job queue's terminal payloads are now erased physically
+  — `secure_delete=ON`, overflow pages included — in bounded batches of 500 rows, on a
+  schedule (F-309). An ACL preset that is present but unusable now refuses the boot
+  instead of silently falling back to deny-all, and `acl validate` names every consumer
+  whose read patterns hold no positive pattern (F-307, F-318).
 - **v2.4.0** — **Personal-data marking mechanism** (F-160) ships inert: a write-time detection
   pass runs `report_only` with an empty category list by default, so a fresh install scans
   nothing until an operator opts in. A note found positive under an activated category carries
@@ -263,7 +291,7 @@ Condensed — the authoritative, detailed log for every version lives in
   scoring); agent identity injection via MCP `initialize`; curated metrics timeseries with
   Studio charts; deterministic distill quality gate.
 
-See [CHANGELOG.md](CHANGELOG.md) `[2.3.0]`, `[2.2.0]`, `[2.1.0]`, `[2.0.0]`, `[1.0.0]`, `[0.7.6]` for the full field-by-field
+See [CHANGELOG.md](CHANGELOG.md) `[2.4.0]`, `[2.3.0]`, `[2.2.0]`, `[2.1.0]`, `[2.0.0]`, `[1.0.0]`, `[0.7.6]` for the full field-by-field
 detail, including every breaking change and deprecation.
 
 ---
@@ -310,6 +338,7 @@ detail, including every breaking change and deprecation.
 | Document | Purpose |
 |---|---|
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Engine multi-instance deployment — topology, sizing, upgrade ordering, troubleshooting. |
+| [docs/PRIVACY-SIDECAR.md](docs/PRIVACY-SIDECAR.md) | Privacy sidecar deployment — confined systemd unit, socket ownership, memory caps, verification. |
 | [packaging/systemd/README.md](packaging/systemd/README.md) | Systemd unit reference — server, worker, engine template, gateway service, smoke tests. |
 
 > **Security note**: the default ACL is fail-closed — with no preset file present, every locus is denied. Configure an ACL preset (`[acl] preset_path`, a TOML of `[[consumer]]` blocks — from a shipped preset or your own) to grant access. See [SECURITY.md](SECURITY.md) for the hardening defaults and their known limitations.

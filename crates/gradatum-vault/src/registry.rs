@@ -28,7 +28,7 @@ use gradatum_cache::{EffectiveNoteCache, EffectiveNoteCacheConfig};
 use gradatum_core::config::VaultConfig;
 use gradatum_core::error::GradatumError;
 use gradatum_core::paths::vault_dir_index_path;
-use gradatum_core::pii::{NoopDetector, PiiDetector, PrivacyBudgets};
+use gradatum_core::pii::{NoopDetector, PiiDetector, PrivacyBudgets, PrivacyPolicy};
 use gradatum_core::scope::VaultId;
 use gradatum_index::SqliteIndex;
 use gradatum_storage::{Storage, build_storage};
@@ -87,6 +87,15 @@ pub struct Vault {
     /// literally as [`PrivacyBudgets::default`] by every constructor, for the same
     /// reason as [`detector`](Self::detector).
     pub(crate) budgets: PrivacyBudgets,
+    /// Activation the pass runs under: the enabled categories and their thresholds,
+    /// the exception patterns per tenant, and the mode.
+    ///
+    /// Written literally as [`PrivacyPolicy::default`] by every constructor, for the
+    /// same reason as [`detector`](Self::detector): it is total, and its default is
+    /// the empty activation — no category enabled, nothing excepted, `report_only`. A
+    /// detector mounted without a policy observes and marks nothing, which is what an
+    /// unconfigured deployment must do.
+    pub(crate) privacy_policy: PrivacyPolicy,
     /// Sink each completed pass reports to, when the deployment installed one.
     ///
     /// Unlike [`detector`](Self::detector), this field has a meaningful absence: the
@@ -153,6 +162,7 @@ impl Vault {
             cache_hits: Arc::new(AtomicU64::new(0)),
             detector: Arc::new(NoopDetector),
             budgets: PrivacyBudgets::default(),
+            privacy_policy: PrivacyPolicy::default(),
             privacy_observer: None,
         })
     }
@@ -199,6 +209,7 @@ impl Vault {
             cache_hits: Arc::new(AtomicU64::new(0)),
             detector: Arc::new(NoopDetector),
             budgets: PrivacyBudgets::default(),
+            privacy_policy: PrivacyPolicy::default(),
             privacy_observer: None,
         })
     }
@@ -266,6 +277,7 @@ impl Vault {
             cache_hits: Arc::new(AtomicU64::new(0)),
             detector: Arc::new(NoopDetector),
             budgets: PrivacyBudgets::default(),
+            privacy_policy: PrivacyPolicy::default(),
             privacy_observer: None,
         })
     }
@@ -290,6 +302,25 @@ impl Vault {
         Self {
             detector,
             budgets,
+            ..self
+        }
+    }
+
+    /// Installs the activation the detection pass runs under.
+    ///
+    /// Separate from [`with_detector`](Self::with_detector) because the two answer
+    /// different questions: that one decides **what can be seen**, this one decides
+    /// **what is done about it**. A detector without a policy observes and marks
+    /// nothing — [`PrivacyPolicy::default`] enables no category, so no span can clear
+    /// a threshold — which is why the pair is only ever wired together by the
+    /// deployment that configures both.
+    ///
+    /// Consumes and returns `self`, like the detector: a vault is configured once,
+    /// before it is shared, so no live writer can have the activation swapped under it.
+    #[must_use]
+    pub fn with_privacy_policy(self, policy: PrivacyPolicy) -> Self {
+        Self {
+            privacy_policy: policy,
             ..self
         }
     }

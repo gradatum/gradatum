@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-gradatum-core = { path = "../gradatum-core", version = "2.4.0" }
+gradatum-core = { path = "../gradatum-core", version = "2.5.0" }
 
 async-trait   = { workspace = true }
 chrono        = { workspace = true }
@@ -27,3 +27,7 @@ ulid          = { workspace = true }
 [dev-dependencies]
 tempfile      = { workspace = true }
 tokio         = { workspace = true, features = ["full", "test-util"] }
+# `trace` (dev-only): the batched-purge test counts the batch selection statements on the
+# store's own connection, and opens a second connection as the concurrent writer. A test
+# cannot observe either from outside the process without that hook.
+rusqlite      = { workspace = true, features = ["trace"] }

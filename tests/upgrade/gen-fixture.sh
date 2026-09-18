@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 #
-# gen-fixture.sh — génère, HORS DÉPÔT, un répertoire d'état gradatum 2.3.1
-# destiné à être monté en version par le binaire 2.4.0.
+# gen-fixture.sh — génère, HORS DÉPÔT, un répertoire d'état gradatum 2.4.0
+# destiné à être monté en version par le binaire 2.5.0.
 #
 # Le dépôt ne reçoit que du texte (corpus markdown, manifeste, gabarits). Rien de
 # binaire n'est commité : les bases (`index.db`, `queue.sqlite`, `vault/`) sont
-# produites à l'exécution par le binaire 2.3.1 fourni par l'appelant.
+# produites à l'exécution par le binaire 2.4.0 fourni par l'appelant.
 #
 # Trois gabarits texte sont lus dans fixture/ :
 #   server.toml.tmpl   — configuration rendue après `init`, sans aucune clé
 #   acl-preset.toml    — preset ACL déclarant les identités d'auteur du corpus
-#   manifest.jsonl     — ordre d'écriture, auteurs attendus, comptes attendus
+#   manifest.jsonl     — ordre d'écriture, auteurs attendus, comptes attendus,
+#                        et les cartes de fonctionnalité à créer par le serveur
 #
 # Usage :
 #   bash tests/upgrade/gen-fixture.sh \
-#       --admin-bin  <chemin du gradatum-admin 2.3.1> \
-#       --server-bin <chemin du gradatum-server 2.3.1> \
-#       --worker-bin <chemin du gradatum-worker 2.3.1> \
+#       --admin-bin  <chemin du gradatum-admin 2.4.0> \
+#       --server-bin <chemin du gradatum-server 2.4.0> \
+#       --worker-bin <chemin du gradatum-worker 2.4.0> \
 #       --out <répertoire d'état, hors dépôt> \
 #       [--port N] [--force]
 #
@@ -230,7 +231,7 @@ chmod 600 -- "$GEN_CONFIG"
 
 # ── Démarrage du serveur ─────────────────────────────────────────────────────
 
-log "démarrage du serveur 2.3.1"
+log "démarrage du serveur 2.4.0"
 "$SERVER_BIN" --config "$GEN_CONFIG" >>"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 log "serveur pid=$SERVER_PID (journal : $SERVER_LOG)"
@@ -291,7 +292,7 @@ while IFS= read -r author; do
   JWT_OF["$author"]="$token"
   [[ -n "$first_author" ]] || first_author="$author"
   log "identité $author : clé mintée, jeton obtenu"
-done < <(jq -r 'select(.type == "write") | .author' "$MANIFEST" | sort -u)
+done < <(jq -r 'select(.type == "write" or .type == "feature_card") | .author' "$MANIFEST" | sort -u)
 
 [[ -n "$first_author" ]] || die 1 "aucun auteur dans le manifeste"
 (( ${#JWT_OF[@]} >= 2 )) \
@@ -303,7 +304,7 @@ JWT="${JWT_OF[$first_author]}"
 
 # ── Démarrage du travailleur ─────────────────────────────────────────────────
 
-log "démarrage du travailleur 2.3.1"
+log "démarrage du travailleur 2.4.0"
 GRADATUM_INTERNAL_URL="http://127.0.0.1:$INTERNAL_PORT" \
 GRADATUM_INTERNAL_TOKEN="$INTERNAL_TOKEN" \
   "$WORKER_BIN" --config "$GEN_CONFIG" --db "$OUT/db/queue.sqlite" \
@@ -400,6 +401,69 @@ done
   || die 1 "file non vidée après 300 s (pending=$pending running=$running)"
 log "file vidée"
 
+# ── Cartes de fonctionnalité — identité allouée par le serveur ───────────────
+#
+# L'axe « export de cartes » du harnais de montée compare le relevé
+# `project-map export-features` octet à octet entre l'état d'avant et l'état
+# monté. Un état sans aucune carte de fonctionnalité rendrait cet axe VACUE :
+# deux exports vides sont identiques, la parité serait vraie sans rien couvrir.
+# Ces cartes rendent l'axe opérant — c'est leur unique raison d'être ici.
+#
+# Le numéro d'une carte est son IDENTITÉ : le serveur l'alloue, l'appelant ne le
+# fournit jamais (une écriture externe qui porterait ce rôle est refusée). Le
+# corps ne porte donc que les cinq rôles non-identitaires, et la route de
+# création fait le reste. Chaque travail est attendu jusqu'à son état terminal
+# avant de passer au suivant : une carte créée mais non curée ne serait pas dans
+# l'index, donc pas dans l'export.
+
+feature_count=0
+feature_list=""
+while IFS= read -r line; do
+  [[ "$(jq -r '.type' <<<"$line")" == "feature_card" ]] || continue
+  f_file="$(jq -r '.file' <<<"$line")"
+  f_author="$(jq -r '.author' <<<"$line")"
+  f_title="$(jq -r '.title' <<<"$line")"
+  f_token="${JWT_OF[$f_author]:-}"
+  [[ -n "$f_token" ]] || die 1 "aucun jeton pour l'auteur $f_author ($f_file)"
+  [[ -f "$FIXTURE_DIR/$f_file" ]] || die 1 "corps de carte absent : $FIXTURE_DIR/$f_file"
+  f_resp="$(curl -sS -X POST "$BASE_URL/api/v1/project-map/create-feature" \
+    -H "Authorization: Bearer $f_token" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n \
+          --arg t "$f_title" \
+          --arg b "$(cat "$FIXTURE_DIR/$f_file")" \
+          --argjson tags "$(jq -c '.tags' <<<"$line")" \
+          '{title: $t, body: $b, tags: $tags, tenant_id: "main"}')")" \
+    || die 1 "create-feature injoignable ($f_file)"
+  f_job="$(jq -r '.job_id // empty' <<<"$f_resp")"
+  f_feature="$(jq -r '.feature // empty' <<<"$f_resp")"
+  f_number="$(jq -r '.number // empty' <<<"$f_resp")"
+  [[ -n "$f_job" && -n "$f_feature" ]] \
+    || die 1 "create-feature refusé ($f_file) : $f_resp"
+  wait_job_done "$f_job" "carte de fonctionnalité $f_file"
+  feature_count=$((feature_count + 1))
+  feature_list="$feature_list $f_feature"
+  log "carte de fonctionnalité créée : $f_feature (numéro $f_number) — $f_file"
+done <"$MANIFEST"
+(( feature_count >= 2 )) \
+  || die 1 "moins de 2 cartes de fonctionnalité dans le manifeste ($feature_count)"
+notes_total=$((write_count + feature_count))
+log "cartes de fonctionnalité posées :$feature_list"
+
+# La fixture se vérifie ELLE-MÊME sur la commande que le harnais compare : une
+# carte créée mais absente de l'export ferait échouer la montée pour une raison
+# qu'il vaut mieux voir ici, à la production de l'état.
+"$ADMIN_BIN" project-map export-features --root "$OUT" --vault main --include-dropped \
+  >"$OUT/logs/export-features.json" 2>"$OUT/logs/export-features.err" \
+  || die 1 "export-features a échoué sur l'état produit (voir $OUT/logs/export-features.err)"
+exported="$(jq 'length' "$OUT/logs/export-features.json" 2>/dev/null || printf 'x')"
+[[ "$exported" =~ ^[0-9]+$ ]] \
+  || die 1 "export-features illisible : $OUT/logs/export-features.json"
+(( exported >= feature_count )) \
+  || die 1 "export-features rend $exported carte(s) pour $feature_count carte(s) créée(s)"
+log "export des cartes : $exported entrée(s) —$(jq -r '[.[].feature] | map(" " + .) | add // ""' \
+  "$OUT/logs/export-features.json")"
+
 # ── Une entrée en file morte ─────────────────────────────────────────────────
 
 dlq_line="$(grep -m 1 '"type": "dlq_job"' "$MANIFEST" || true)"
@@ -468,8 +532,8 @@ SERVER_PID=""
 
 log "état produit dans $OUT"
 log "  build_sha (générateur) : $BUILD_SHA"
-log "  notes posées           : $write_count"
+log "  notes posées           : $notes_total (dont $feature_count carte(s) de fonctionnalité)"
 log "  travaux en attente     : $final_pending"
 log "  travaux en file morte  : $dlq_count"
-printf 'gen-fixture: build_sha=%s notes=%s pending=%s dlq=%s out=%s\n' \
-  "$BUILD_SHA" "$write_count" "$final_pending" "$dlq_count" "$OUT"
+printf 'gen-fixture: build_sha=%s notes=%s cartes=%s pending=%s dlq=%s out=%s\n' \
+  "$BUILD_SHA" "$notes_total" "$feature_count" "$final_pending" "$dlq_count" "$OUT"

@@ -107,6 +107,43 @@ pub trait Registry: Send + Sync {
         note_id: &str,
     ) -> Result<gradatum_core::note::Note, gradatum_core::error::GradatumError>;
 
+    /// Reads several notes in a single call — the batched form of
+    /// [`Registry::read_note_by_id`].
+    ///
+    /// Notes come back in the order of `note_ids`; a repeated identifier yields a single
+    /// note, placed at the position of its first occurrence. A note that cannot be read
+    /// is **omitted** rather than failing the call, exactly as a caller walking a page
+    /// today skips the one identifier `read_note_by_id` refuses: the result may be
+    /// shorter than the request, and callers must never assume a positional match.
+    ///
+    /// ## Default
+    ///
+    /// Loops over [`Registry::read_note_by_id`]. That is correct on every implementation
+    /// but costs one index query per distinct identifier; an implementation backed by a
+    /// batch-capable index should override it, so that a walk over a page of notes stays
+    /// at a bounded number of index round-trips.
+    ///
+    /// ## Errors
+    ///
+    /// - `GradatumError::Storage` when a batch-level failure prevents resolving the slice
+    ///   at all. A per-note failure is not an error — it is an omission.
+    async fn read_notes_many(
+        &self,
+        note_ids: &[String],
+    ) -> Result<Vec<gradatum_core::note::Note>, gradatum_core::error::GradatumError> {
+        let mut notes = Vec::with_capacity(note_ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(note_ids.len());
+        for note_id in note_ids {
+            if !seen.insert(note_id.as_str()) {
+                continue;
+            }
+            if let Ok(note) = self.read_note_by_id(note_id).await {
+                notes.push(note);
+            }
+        }
+        Ok(notes)
+    }
+
     /// Indicates whether a note is present in the index, regardless of the on-disk `.md`.
     ///
     /// Distinguishes a **phantom** note (index entry present but `.md` file absent —
@@ -546,6 +583,45 @@ pub trait Registry: Send + Sync {
         note_id: &str,
     ) -> Result<Option<gradatum_index::ArchiveEntry>, gradatum_core::error::GradatumError>;
 
+    /// The tags each archived note carries, resolved from its archived `.md`.
+    ///
+    /// An archived note is gone from the search index, so a listing of archives has no tag
+    /// to read anywhere but the archived file itself — which is what makes this a registry
+    /// question rather than an index one, and why it is asked here.
+    ///
+    /// The slice is the whole rendered page at once: the caller has already truncated to
+    /// its `limit`, so this is one batch per listing, never one lookup per row.
+    ///
+    /// ## When a note is absent from the result
+    ///
+    /// Absent means **nothing was established** about that note, never "it carries no
+    /// tag". A note whose archive row does not name this vault, whose file is no longer
+    /// readable, or whose content does not parse, is absent — and a caller applying a read
+    /// guard must treat absence as a reason to withhold, not as a clean bill of health.
+    ///
+    /// ## Default
+    ///
+    /// `Ok(HashMap::new())` — a registry that does not implement this method establishes
+    /// nothing about any archived note. The addition is therefore backward-compatible for
+    /// implementors, and the direction it fails in is the closed one: a caller that
+    /// withholds what it cannot vouch for withholds everything.
+    ///
+    /// ## Errors
+    ///
+    /// - `GradatumError::Storage` only when the batch resolution itself fails — a case in
+    ///   which nothing is known about any of the notes, and a caller must fail rather than
+    ///   answer.
+    async fn archived_note_tags(
+        &self,
+        _vault_id: &str,
+        _note_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, Vec<gradatum_core::tag::Tag>>,
+        gradatum_core::error::GradatumError,
+    > {
+        Ok(std::collections::HashMap::new())
+    }
+
     /// Purges on demand the active archive of a note before the retention deadline
     /// (operator CLI): destroys the `.md` and `.history` files and marks `gc_at`, the
     /// registry row surviving as a trace. Delegates to [`Vault::purge_archive`].
@@ -619,6 +695,15 @@ impl Registry for Vault {
                 hash
             )),
         })
+    }
+
+    /// Batched read — delegates to `read_notes_many_inner`, which resolves the whole
+    /// slice with a single index query before materialising each note from its `.md`.
+    async fn read_notes_many(
+        &self,
+        note_ids: &[String],
+    ) -> Result<Vec<gradatum_core::note::Note>, gradatum_core::error::GradatumError> {
+        self.read_notes_many_inner(note_ids).await
     }
 
     async fn note_indexed(
@@ -1009,6 +1094,56 @@ impl Registry for Vault {
         self.index
             .get_active_archive(self.vault_id.as_str(), note_id)
             .await
+    }
+
+    async fn archived_note_tags(
+        &self,
+        vault_id: &str,
+        note_ids: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, Vec<gradatum_core::tag::Tag>>,
+        gradatum_core::error::GradatumError,
+    > {
+        use gradatum_storage::Storage; // the read method is a trait method of the guard's inner
+
+        let mut out = std::collections::HashMap::new();
+        // A vault answers for its own archives only. A ULID archived by another vault is
+        // not this vault's to describe — it is absent, which is the answer the caller
+        // withholds on.
+        if vault_id != self.vault_id.as_str() || note_ids.is_empty() {
+            return Ok(out);
+        }
+
+        // One query for every path of the page. A batch failure says nothing about any
+        // note, so it propagates rather than emptying the map: an empty map and an
+        // unanswered question must not be reachable as the same value.
+        let paths = self.index.archive_paths_by_ids(vault_id, note_ids).await?;
+
+        for (note_id, path) in paths {
+            // One unreadable or unparseable archive is that note's answer, not the page's:
+            // it stays absent while the rest of the page resolves. The read motif is the
+            // one `restore_archive` uses — `.md` bytes, then the shared parser.
+            let parsed = match self.storage.read(&path).await {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(text) => gradatum_markdown::parse(&text).map_err(|e| e.to_string()),
+                    Err(e) => Err(format!("archive utf8 : {e}")),
+                },
+                Err(e) => Err(format!("archive read : {e}")),
+            };
+            match parsed {
+                Ok(parsed) => {
+                    out.insert(note_id, parsed.frontmatter.tags.into_iter().collect());
+                }
+                Err(message) => tracing::warn!(
+                    note_id = %note_id,
+                    archive_path = %path,
+                    error = %message,
+                    "archived_note_tags: the archived note left no tags to read — it is left \
+                     unresolved, which the caller withholds on"
+                ),
+            }
+        }
+        Ok(out)
     }
 
     async fn purge_archive_by_id(

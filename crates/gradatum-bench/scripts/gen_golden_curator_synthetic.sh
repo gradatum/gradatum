@@ -58,7 +58,7 @@ json_str() {
 
   # ── council (préfixe [COUNCIL]) — 5 cas ───────────────────────────────────
   emit council "[COUNCIL]" "verdict-art19-prompt"   "Verdict council Art.19 4/4 GO sur le prompt curator v2, caveats intégrés."
-  emit council "[COUNCIL]" "art15bis-homelab-flotte" "Délibération multi-experts art15bis sur la flotte engines, GO-CAVEATS."
+  emit council "[COUNCIL]" "art15bis-flotte-engines" "Délibération multi-experts art15bis sur la flotte engines, GO-CAVEATS."
   emit council "[COUNCIL]" "leader-override-modeles" "Leader-override acté, modèles agents mis à jour pour la fenêtre courante." "council"
   emit council "[COUNCIL]" "art18-amendement-const"  "Council Art.18 sur l'amendement de la constitution, 3 voix requises."
   emit council "[COUNCIL]" "rollback-decision-go"    "Verdict council : rollback armé non déclenché, smoke 5/5 vert."

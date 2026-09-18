@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "gradatum-core",
  "gradatum-sdk-rs",
@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-acl-auth"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-acl-policy"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "globset",
  "gradatum-core",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-admin"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-auth"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-bench"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-cache"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -1927,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-chat"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-cli"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "clap",
  "reqwest 0.13.4",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-core"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-curator"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-db-sqlite"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-distill"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "gradatum-core",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-dto"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-embed"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "fastembed",
@@ -2065,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-engine"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-gateway"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-heartbeat"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "gradatum-dto",
  "reqwest 0.13.4",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-index"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2160,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-ingest"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "gradatum-core",
  "gradatum-index",
@@ -2179,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-markdown"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "gradatum-core",
  "once_cell",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-mcp-stub"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2212,15 +2212,20 @@ dependencies = [
 
 [[package]]
 name = "gradatum-privacy"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "gradatum-core",
  "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
 name = "gradatum-queue"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2238,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-sdk-rs"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "reqwest 0.13.4",
  "serde",
@@ -2248,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-search"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -2264,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-server"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "apalis",
@@ -2326,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-storage"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "gradatum-core",
@@ -2342,11 +2347,11 @@ dependencies = [
 
 [[package]]
 name = "gradatum-studio"
-version = "2.4.0"
+version = "2.5.0"
 
 [[package]]
 name = "gradatum-vault"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2369,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-warden"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2388,7 +2393,7 @@ dependencies = [
 
 [[package]]
 name = "gradatum-worker"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "apalis",
@@ -2899,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "index-parity-tests"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "chrono",
  "gradatum-core",
@@ -6474,7 +6479,7 @@ dependencies = [
 
 [[package]]
 name = "v1-parity-tests"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "axum",

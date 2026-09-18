@@ -48,7 +48,7 @@ use gradatum_core::identity::NoteId;
 use gradatum_core::note::Note;
 use gradatum_core::pii::{
     DetectInput, Detection, NoopDetector, PiiCategory, PiiDetectError, PiiDetector, PiiSpan,
-    PrivacyBudgets,
+    PrivacyBudgets, PrivacyPolicy,
 };
 use gradatum_core::scope::{AclCheckedVaultId, VaultId};
 use gradatum_core::section::Section;
@@ -112,13 +112,34 @@ fn fm_for(vault: &str, section: Section) -> Frontmatter {
     fm
 }
 
-/// A vault with `detector` mounted — the only injection path.
+/// The activation these fixtures mount.
+///
+/// A detector alone marks nothing: a span reaches the marker only when its category is
+/// activated **and** its score clears a strictly positive threshold. Every test here
+/// opens with "a completed pass over a span poses the marker", so the fixture has to
+/// declare an activation — one calibration saturating the category these detectors
+/// report, which is the posture of a deployment that has calibrated `email`.
+///
+/// Mounting the detector without it would leave the frontier in the state of a
+/// deployment that declared no `[privacy]` block, and the properties measured below —
+/// monotonicity, the binding of a verdict — would be asserted over a marker that was
+/// never posed.
+fn marking_policy() -> PrivacyPolicy {
+    PrivacyPolicy::new(
+        false,
+        std::collections::BTreeMap::from([(PiiCategory::Email, 1000)]),
+        std::collections::BTreeMap::new(),
+    )
+}
+
+/// A vault with `detector` mounted, under [`marking_policy`] — the only injection path.
 async fn vault_with(root: &Path, detector: Arc<dyn PiiDetector>) -> Vault {
     std::fs::create_dir_all(root).expect("vault root");
     Vault::create(root, VaultId::new("main"))
         .await
         .expect("vault creation")
         .with_detector(detector, PrivacyBudgets::default())
+        .with_privacy_policy(marking_policy())
 }
 
 /// A vault built the way the CLI builds one: no `with_detector` call, so the

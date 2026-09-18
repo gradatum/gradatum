@@ -82,6 +82,46 @@ pub trait DocumentStore: Send + Sync {
         note_id_ulid: &str,
     ) -> Result<Option<NoteRecord>, GradatumError>;
 
+    /// Returns the full records of several notes by ULID — the batched form of
+    /// [`DocumentStore::get_note`].
+    ///
+    /// Records come back in the order of `note_ids`. A repeated identifier yields a
+    /// **single** record, placed at the position of its first occurrence; an identifier
+    /// the index does not know is omitted, so the result may be shorter than the request
+    /// and callers must never assume a positional match.
+    ///
+    /// Every implementation — this default and the batched overrides alike — must answer
+    /// exactly that.
+    ///
+    /// # Default implementation
+    ///
+    /// Loops over [`DocumentStore::get_note`], which is correct on every backend but costs
+    /// one round-trip per distinct identifier. A backend able to batch natively (e.g. a
+    /// single `WHERE id IN (…)` statement) should override it, so that a walk over a page
+    /// of notes stays at a bounded number of reads — the same split as the queue store's
+    /// `get_many`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if a query fails.
+    async fn get_notes_many(
+        &self,
+        tenant_id: &str,
+        note_ids: &[String],
+    ) -> Result<Vec<NoteRecord>, GradatumError> {
+        let mut records = Vec::with_capacity(note_ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(note_ids.len());
+        for note_id in note_ids {
+            if !seen.insert(note_id.as_str()) {
+                continue;
+            }
+            if let Some(record) = self.get_note(tenant_id, note_id).await? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// Lists notes in a vault filtered by status.
     ///
     /// Results sorted by `updated DESC NULLS LAST, created DESC`.
@@ -294,4 +334,242 @@ pub trait DocumentStore: Send + Sync {
         &self,
         vault_id: &str,
     ) -> Result<std::collections::HashMap<String, u64>, GradatumError>;
+}
+
+#[cfg(test)]
+mod get_notes_many_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// Store minimal : `get_note` est réel (et compté), le reste est inatteignable.
+    ///
+    /// Il ne surcharge **pas** `get_notes_many` : c'est l'implémentation par défaut du
+    /// trait qui est sous test ici.
+    struct MinimalNoteStore {
+        rows: std::collections::HashMap<String, NoteRecord>,
+        unit_reads: AtomicUsize,
+    }
+
+    impl MinimalNoteStore {
+        fn with(ids: &[&str]) -> Self {
+            let rows = ids
+                .iter()
+                .map(|id| (id.to_string(), record(id)))
+                .collect::<std::collections::HashMap<_, _>>();
+            Self {
+                rows,
+                unit_reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn unit_reads(&self) -> usize {
+            self.unit_reads.load(Ordering::SeqCst)
+        }
+    }
+
+    fn record(id: &str) -> NoteRecord {
+        NoteRecord {
+            id: id.to_string(),
+            vault_id: "main".to_string(),
+            section: "notes".to_string(),
+            locus: None,
+            status: "live".to_string(),
+            body_text: format!("body of {id}"),
+            author: None,
+            tags_raw: None,
+            content_hash: vec![0u8; 32],
+            created: 1,
+            updated: None,
+            title: None,
+        }
+    }
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[async_trait]
+    impl DocumentStore for MinimalNoteStore {
+        async fn write_note(&self, _note: &Note) -> Result<(), GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn get_content_hash(
+            &self,
+            _vault_id: &str,
+            _id: NoteId,
+        ) -> Result<Option<ContentHash>, GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn get_note(
+            &self,
+            _tenant_id: &str,
+            note_id_ulid: &str,
+        ) -> Result<Option<NoteRecord>, GradatumError> {
+            self.unit_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.rows.get(note_id_ulid).cloned())
+        }
+
+        async fn list_by_status(
+            &self,
+            _vault_id: &VaultId,
+            _status: NoteStatus,
+        ) -> Result<Vec<NoteId>, GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn downgrade_note(
+            &self,
+            _vault: &AclCheckedVaultId,
+            _note_id: &NoteId,
+            _reason: &str,
+            _replaced_by: Option<&NoteId>,
+        ) -> Result<(), GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn patch_note_status(
+            &self,
+            _vault: &AclCheckedVaultId,
+            _note_id: &NoteId,
+            _status: Option<&str>,
+            _status_reason: Option<&str>,
+            _replaced_by: Option<&NoteId>,
+        ) -> Result<(), GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn update_note_locus(
+            &self,
+            _vault: &AclCheckedVaultId,
+            _note_id: &NoteId,
+            _locus: &crate::scope::LocusId,
+        ) -> Result<(), GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn upsert_note_title(
+            &self,
+            _vault_id: &str,
+            _note_id: &NoteId,
+            _title: &str,
+        ) -> Result<usize, GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn mark_forgotten(
+            &self,
+            _vault_id: &str,
+            _note_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn reassert_forgotten(
+            &self,
+            _vault_id: &str,
+            _note_id: &str,
+        ) -> Result<(), GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn unmark_forgotten(
+            &self,
+            _vault_id: &str,
+            _note_id: &str,
+        ) -> Result<(), GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn list_forgotten(
+            &self,
+            _vault_id: &str,
+            _limit: usize,
+            _cursor: Option<&str>,
+        ) -> Result<Vec<(String, Option<String>, String, i64, Option<String>)>, GradatumError>
+        {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn count_forgotten(&self, _vault_id: &str) -> Result<usize, GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+
+        async fn count_notes_by_status(
+            &self,
+            _vault_id: &str,
+        ) -> Result<std::collections::HashMap<String, u64>, GradatumError> {
+            unimplemented!("hors périmètre du test du défaut de get_notes_many")
+        }
+    }
+
+    /// Le défaut rend les enregistrements dans l'ordre DEMANDÉ (jamais celui de la
+    /// base), et omet silencieusement un identifiant inconnu.
+    #[tokio::test]
+    async fn get_notes_many_default_returns_records_in_requested_order_and_skips_unknown() {
+        let store = MinimalNoteStore::with(&["a", "b", "c"]);
+
+        let got = store
+            .get_notes_many("main", &ids(&["c", "unknown", "a", "b"]))
+            .await
+            .expect("get_notes_many doit réussir");
+
+        let order: Vec<&str> = got.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["c", "a", "b"],
+            "l'ordre demandé prime ; un id inconnu est omis sans erreur"
+        );
+    }
+
+    /// Un identifiant répété rend un seul enregistrement, à la position de sa
+    /// PREMIÈRE occurrence.
+    #[tokio::test]
+    async fn get_notes_many_default_deduplicates_repeated_ids() {
+        let store = MinimalNoteStore::with(&["a", "b"]);
+
+        let got = store
+            .get_notes_many("main", &ids(&["b", "a", "b", "a"]))
+            .await
+            .expect("get_notes_many ids répétés");
+
+        let order: Vec<&str> = got.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(order, vec!["b", "a"], "un doublon ne rend pas deux lignes");
+    }
+
+    /// Le défaut coûte **une** lecture unitaire par identifiant DISTINCT — jamais
+    /// une par entrée de la tranche. C'est le coût que l'override groupé supprime.
+    #[tokio::test]
+    async fn get_notes_many_default_reads_once_per_distinct_id() {
+        let store = MinimalNoteStore::with(&["a", "b"]);
+
+        let got = store
+            .get_notes_many("main", &ids(&["a", "b", "a", "unknown"]))
+            .await
+            .expect("get_notes_many compteur");
+
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            store.unit_reads(),
+            3,
+            "3 ids distincts (dont un inconnu) → 3 lectures unitaires, pas 4"
+        );
+    }
+
+    /// Une tranche vide ne déclenche aucune lecture.
+    #[tokio::test]
+    async fn get_notes_many_default_empty_slice_reads_nothing() {
+        let store = MinimalNoteStore::with(&["a"]);
+
+        let got = store
+            .get_notes_many("main", &[])
+            .await
+            .expect("get_notes_many vide");
+
+        assert!(got.is_empty());
+        assert_eq!(store.unit_reads(), 0);
+    }
 }

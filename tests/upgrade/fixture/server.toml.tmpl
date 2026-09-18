@@ -57,6 +57,27 @@ confidence_threshold = 0.7
 llm_review_fallback = "pending-review-fallback"
 llm_review_max_tokens = 128
 
+[curator.llm]
+# Section LLM du curateur : INERTE ici (`[curator] backend = "heuristic"` la rend
+# sans lecteur), mais présente À DESSEIN — elle porte la clé que la version qui
+# monte retire du schéma.
+#
+# `max_tokens` a été supprimé en 2.5.0. Il était lu puis ignoré depuis l'origine :
+# le budget de revue effectif a toujours été `[curator] llm_review_max_tokens`
+# ci-dessus. Un `server.toml` qui porte encore la clé CONTINUE DE CHARGER — la
+# section ne déclare pas `deny_unknown_fields` — et c'est précisément ce que la
+# montée doit exercer : retirer une clé morte du schéma ne doit pas empêcher le
+# démarrage. Voir `docs/UPGRADING-2.4.0-to-2.5.0.md`.
+#
+# L'URL est inatteignable (port 9, discard) et le backend du curateur reste
+# heuristique : aucun appel n'est émis, la génération demeure hors ligne et
+# déterministe.
+backend    = "openai_compat"
+base_url   = "http://127.0.0.1:9/v1"
+model      = "fixture-inerte"
+timeout_ms = 5000
+max_tokens = 2048
+
 [apalis.workers.curate]
 # Le corpus de la fixture est entièrement heuristique : la concurrence ne change
 # pas les comptes produits, seulement la durée de la génération.

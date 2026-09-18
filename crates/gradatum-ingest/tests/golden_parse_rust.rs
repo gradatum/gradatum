@@ -17,6 +17,19 @@
 #![cfg(feature = "code-rust")]
 
 use gradatum_ingest::{build_derived_notes, content_hash_source, parse_rust_file};
+use std::path::PathBuf;
+
+/// Racine du crate, résolue à l'exécution.
+///
+/// La valeur figée à la compilation devient périmée dès qu'un binaire de test est
+/// réutilisé depuis un autre répertoire de checkout (artefacts de build partagés) :
+/// la variable d'environnement prime, la valeur de compilation ne servant que de
+/// repli hors cargo.
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
 
 // ── Golden test 1 : snippet struct + fn pub ──────────────────────────────────
 
@@ -286,11 +299,9 @@ fn golden_body_text_cap_60_lines() {
 /// Parse le fichier scope.rs de gradatum-core — vérifie VaultId struct.
 #[test]
 fn golden_real_scope_rs() {
-    let content = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../crates/gradatum-core/src/scope.rs"
-    ))
-    .expect("lire scope.rs");
+    let content =
+        std::fs::read_to_string(manifest_dir().join("../../crates/gradatum-core/src/scope.rs"))
+            .expect("lire scope.rs");
 
     let symbols = parse_rust_file("crates/gradatum-core/src/scope.rs", &content, false)
         .expect("parse scope.rs");
@@ -327,11 +338,9 @@ fn golden_real_scope_rs() {
 /// Parse le fichier identity.rs de gradatum-core — vérifie NoteId.
 #[test]
 fn golden_real_identity_rs() {
-    let content = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../crates/gradatum-core/src/identity.rs"
-    ))
-    .expect("lire identity.rs");
+    let content =
+        std::fs::read_to_string(manifest_dir().join("../../crates/gradatum-core/src/identity.rs"))
+            .expect("lire identity.rs");
 
     let symbols = parse_rust_file("crates/gradatum-core/src/identity.rs", &content, false)
         .expect("parse identity.rs");
@@ -357,11 +366,9 @@ fn golden_real_identity_rs() {
 /// Parse le fichier sqlite.rs (gros fichier) — vérifie scalabilité et pas de panique.
 #[test]
 fn golden_real_sqlite_rs_no_panic() {
-    let content = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../crates/gradatum-index/src/sqlite.rs"
-    ))
-    .expect("lire sqlite.rs");
+    let content =
+        std::fs::read_to_string(manifest_dir().join("../../crates/gradatum-index/src/sqlite.rs"))
+            .expect("lire sqlite.rs");
 
     let symbols = parse_rust_file("crates/gradatum-index/src/sqlite.rs", &content, false)
         .expect("parse sqlite.rs");

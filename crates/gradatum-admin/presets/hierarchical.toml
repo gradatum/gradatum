@@ -4,17 +4,23 @@
 # Mirrors a typical multi-agent pipeline (orchestrator + specialized sub-agents).
 #
 # Apply with:
-#   gradatum-admin init --preset=hierarchical --projects=projecta,projectb
+#   gradatum-admin init --preset=hierarchical
 #
-# The init command materializes consumer-templates into concrete consumers,
-# substituting ${PROJECT}, ${AGENT}, ${THEME} based on --projects flags.
+# This preset takes no --projects: it carries no template placeholder, so scope it
+# per project by adding a concrete [[consumer]] block per project (the example is
+# below), not with --projects.
+#
+# This preset declares concrete consumers only: every identity below is one the
+# engine evaluates as written. `init` substitutes only what it is given a value
+# for (`--projects`), so a preset may not carry a placeholder nothing resolves —
+# see the `acl validate` guard in the admin CLI and the materialization step in
+# `init`, which refuses to write a preset whose values still hold a token.
 #
 # ACL pattern syntax (globset):
 #   "*"                    match all loci
 #   "projecta/*"           match all loci under "projecta/"
 #   "*/briefing"           match any "X/briefing" locus
 #   "!**/personal-classified" exclude the "personal-classified" segment (negation)
-#   "${VAR}"               variable substituted at init time
 
 # ─── Human admin (top of hierarchy) ───────────────────────────────────
 # identity="admin" — administrator, full vault access, sees personal-classified.
@@ -45,44 +51,33 @@ read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/person
 write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
 
 
-# ─── Sub-agent template: writers (coder agents, prompt-engineer, etc.) ──
-[[consumer-template]]
-id = "sub-agent-writer"
-description = "Writer sub-agent — writes only its own locus, reads briefings + own work"
-read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "${PROJECT}/briefing", "${PROJECT}/${AGENT}"]
-write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "${PROJECT}/${AGENT}"]
-
-# ─── Sub-agent template: validators (tester, reviewer, security expert) ─
-[[consumer-template]]
-id = "sub-agent-validator"
-description = "Validator sub-agent — cross-reads project for audit, writes own findings"
-read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "${PROJECT}/*"]
-write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "${PROJECT}/${AGENT}"]
-
-# ─── Expert template (domain specialists, monitoring) ────────────────
-[[consumer-template]]
-id = "expert"
-description = "Thematic expert — reads main-agent + their theme scope, writes findings"
-read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "${THEME}/*"]
-write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "${THEME}/${AGENT}"]
-
-# ─── Comments ──────────────────────────────────────────────────────────
+# ─── Project-scoped sub-agents: add one [[consumer]] per role ─────────
 #
-# After init, the resulting bearer.toml will have one [[consumer]] block per
-# (project × agent) pair derived from --projects and standard agent names.
+# There is no template block here on purpose. The engine reads `[[consumer]]`
+# only, so a `[[consumer-template]]` block would reach a deployed bearer.toml as
+# inert text carrying placeholders nothing resolves — the file would promise
+# project-scoped identities that never exist, and name a project literally after
+# the placeholder. A project-scoped consumer is therefore written out concrete,
+# one per project, as below (writer: reads briefings + its own locus; validator:
+# cross-reads the project, writes its findings).
 #
-# Example expansion for --projects=projecta,projectb with default agents:
+# Each identity gets a freshly generated argon2id token_hash, displayed once in
+# cleartext at init for distribution to consumers. Mint a key per identity with
+# `gradatum-admin api-key create`.
 #
-#   [[consumer]] id = "projecta-backend"          (writer template)
-#   [[consumer]] id = "projecta-frontend"         (writer template)
-#   [[consumer]] id = "projecta-tester"           (validator template)
-#   [[consumer]] id = "projecta-reviewer"          (validator template)
-#   [[consumer]] id = "projectb-backend"       (writer template)
-#   [[consumer]] id = "projectb-frontend"      (writer template)
-#   ...
+# Example for two projects, projecta and projectb:
 #
-# Each gets a freshly generated argon2id token_hash.
-# Tokens are displayed once in cleartext at init for distribution to consumers.
+#   [[consumer]]
+#   identity = "projecta-backend"
+#   description = "Writer sub-agent — writes only its own locus, reads briefings + own work"
+#   read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "projecta/briefing", "projecta/backend"]
+#   write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "projecta/backend"]
+#
+#   [[consumer]]
+#   identity = "projecta-tester"
+#   description = "Validator sub-agent — cross-reads project for audit, writes own findings"
+#   read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "main-agent", "projecta/*"]
+#   write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "projecta/tester"]
 
 # ─── Domain experts (thematic, read-only by default) ──────────────────
 # Thematic experts scoped to the whole vault, read-only (write_patterns empty).
@@ -140,6 +135,9 @@ write_patterns = ["!personal-classified", "!personal-classified/**", "!**/person
 # ─── Engine (gradatum-engine — event-log writer) ──────────────────────
 # identity="engine" — internal service shared by gradatum-engine curator + embed,
 # write only on the main tenant's event-log. No vault locus.
+# The read patterns are negations only, and that is deliberate: this consumer reads
+# nothing. `gradatum-admin acl validate` therefore reports it as holding no positive
+# read pattern — the expected output for a write-only consumer, not a misconfiguration.
 [[consumer]]
 identity = "engine"
 description = "gradatum-engine service (curator + embed) — POST /api/v1/event-log"

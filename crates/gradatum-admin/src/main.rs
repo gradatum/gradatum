@@ -23,13 +23,15 @@
 //! gradatum-admin jobs cancel --root /var/lib/gradatum <id>
 //! gradatum-admin jobs dlq    --root /var/lib/gradatum [--replay <id>] [--replay-all]
 //! gradatum-admin code ingest <repo_path> --vault code-<projet> --root /var/lib/gradatum
+//! gradatum-admin privacy history-purge --root /var/lib/gradatum [--dry-run]
 //! ```
 
 use anyhow::Context as _;
 use gradatum_admin::{
     BackfillArgs, BackfillAuthorsArgs, BackfillNoteLinksArgs, BackfillTitlesArgs,
     DowngradeFromTrashArgs, ReindexOrphansArgs, RepairNoteLinksArgs, VaultRenameArgs, acl_cmd,
-    api_key_cmd, code_cmd, init, jobs_cmd, token, vault_forget_cmd, vault_rename,
+    api_key_cmd, code_cmd, init, jobs_cmd, privacy_cmd, queue_cmd, token, vault_forget_cmd,
+    vault_rename,
 };
 use gradatum_core::paths::vault_index_path;
 
@@ -91,6 +93,18 @@ enum Cmd {
     Acl {
         #[command(subcommand)]
         cmd: acl_cmd::AclCmd,
+    },
+    /// Destroys the version history a masking deployment may have left behind.
+    ///
+    /// Run once after a deployment switches `[privacy] mode` to `mask`: the snapshots
+    /// written before the switch hold the clear text of notes the mode has since been
+    /// told to rewrite, and no later write reaches them. Unrelated to the index and to
+    /// the current versions: only the `.history/` directories of the selected notes are
+    /// touched, and a retention policy that also applies to them is the operator's own.
+    #[command(name = "privacy")]
+    Privacy {
+        #[command(subcommand)]
+        cmd: privacy_cmd::PrivacyCmd,
     },
     /// Backfills embeddings for notes that have none (idempotent, LEFT JOIN).
     ///
@@ -259,6 +273,14 @@ enum Cmd {
     Jobs {
         #[command(subcommand)]
         cmd: jobs_cmd::JobsCmd,
+    },
+    /// Queue maintenance an operator runs by hand (purge of terminal payloads).
+    ///
+    /// The same operation the worker schedules on its own every `queue.purge_interval`;
+    /// this is the surface for running it once, now, and for asking what it would take.
+    Queue {
+        #[command(subcommand)]
+        cmd: queue_cmd::QueueCmd,
     },
     /// Migrates notes from the legacy vault `.vault-trash` to gradatum via `status='downgraded'`.
     ///
@@ -723,6 +745,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Token { cmd } => token::run(cmd),
         Cmd::ApiKey { cmd } => api_key_cmd::run(cmd).await,
         Cmd::Acl { cmd } => acl_cmd::run(cmd),
+        Cmd::Privacy { cmd } => privacy_cmd::dispatch(cmd),
         Cmd::BackfillNoteLinks {
             root,
             tenant,
@@ -885,6 +908,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Jobs { cmd } => jobs_cmd::run(cmd).await,
+        Cmd::Queue { cmd } => queue_cmd::run(cmd).await,
         Cmd::BackfillEmbeddings {
             root,
             tenant,

@@ -69,6 +69,11 @@ pub(crate) struct PassOutcome {
     /// How the pass ended.
     pub(crate) status: Status,
     /// Validated, fused spans, in body order — empty for a failed pass.
+    ///
+    /// **After** the exception pass: a span a configured exception covers is not
+    /// here. An exception is the operator's statement that a literal is not personal
+    /// data, so a span it covers is not an observation the frontier holds — it is the
+    /// false positive the exception was written to remove.
     pub(crate) spans: Vec<PiiSpan>,
     /// Labels the detector reported that no category matched, summed over the windows.
     pub(crate) unmapped_labels: u64,
@@ -78,6 +83,13 @@ pub(crate) struct PassOutcome {
     pub(crate) rejected_utf8_boundary: u64,
     /// Spans sitting within one byte of an interior window boundary.
     pub(crate) touching_window_edge: u64,
+    /// Spans the exception pass dropped, counted **per pattern identifier**.
+    ///
+    /// The identifier is a digest of the pattern, never the pattern: the exception
+    /// lists are literal personal data by nature, and this map travels to a metric
+    /// label and to a log line. The keys are sorted, so a report built from it does
+    /// not vary with the body's span order.
+    pub(crate) exception_hits: std::collections::BTreeMap<String, u64>,
 }
 
 /// What one re-judgement did with the note it was given.
@@ -139,26 +151,35 @@ impl Vault {
     ) -> Option<PassOutcome> {
         match crate::privacy::pass(&self.detector, vault_id, section, body, &self.budgets).await {
             Ok(Some(scan)) => {
+                // Last step of the pass, after fusion and after the thresholds have
+                // had their say. An exception is applied to the spans themselves and
+                // not to the marking decision alone: what it covers is declared not
+                // personal, so it is no longer an observation — neither in the block,
+                // nor in the counts, nor in the digest the next pass compares against.
+                let (spans, exception_hits) =
+                    self.privacy_policy.retain(vault_id, body, scan.spans);
                 tracing::debug!(
                     section = section.as_str(),
                     windows = scan.windows,
-                    spans = scan.spans.len(),
+                    spans = spans.len(),
                     merged = scan.stats.merged,
                     touching_window_edge = scan.stats.touching_window_edge,
+                    exceptions = exception_hits.len(),
                     "F-160: detection pass complete"
                 );
                 Some(PassOutcome {
                     status: Status::Ok,
-                    spans: scan.spans,
+                    spans,
                     unmapped_labels: scan.unmapped_labels,
                     rejected_out_of_bounds: scan.stats.rejected_out_of_bounds as u64,
                     rejected_utf8_boundary: scan.stats.rejected_utf8_boundary as u64,
                     touching_window_edge: scan.stats.touching_window_edge as u64,
+                    exception_hits,
                 })
             }
             // Guard 0 (`code-*`, `identity` section) or a detector declaring no
             // identity: no pass — no block, no tag, and no removal of a block already
-            // there.
+            // there. No exception is consulted either: there is no span to except.
             Ok(None) => None,
             Err(err) => {
                 tracing::warn!(
@@ -173,9 +194,67 @@ impl Vault {
                     rejected_out_of_bounds: 0,
                     rejected_utf8_boundary: 0,
                     touching_window_edge: 0,
+                    exception_hits: std::collections::BTreeMap::new(),
                 })
             }
         }
+    }
+
+    /// Rewrites the body of one write, when the policy destroys what it scanned.
+    ///
+    /// Returns the body to persist and whether anything was removed from it. Both are
+    /// needed by the caller: the body because every byte written from here on — the
+    /// [`ContentHash`](gradatum_core::identity::ContentHash), the file on disk, the note
+    /// handed back — must describe the rewritten text rather than the text handed in; the
+    /// flag because the version history a write normally keeps must not gain a copy of
+    /// what this one destroyed.
+    ///
+    /// ## What it destroys, and what it leaves
+    ///
+    /// The spans the **activation marks**, and only those: the mode and the thresholds are
+    /// one decision, so a category the operator did not activate, or calibrated at `0`,
+    /// survives a masking write exactly as it survives a reporting one. A span a declared
+    /// exception covered never reaches here at all — the pass applies exceptions to the
+    /// spans before anything else reads them, so what an operator declared benign is not
+    /// destroyed by the mode either.
+    ///
+    /// The block's ceiling applies here as it applies to the record: a pass that reported
+    /// more spans than a block carries is `spans_truncated`, carries
+    /// `privacy-unscanned`, and the sweep finishes the work. Masking past the ceiling
+    /// would destroy text no note accounts for.
+    ///
+    /// ## No pass, no destruction
+    ///
+    /// `None` is a write that was excluded before any detector ran, or an installation
+    /// with no detector mounted: there is no verdict to act on, and the body is returned
+    /// untouched rather than emptied on a policy that was never consulted.
+    pub(crate) fn masked_body(
+        &self,
+        body: String,
+        outcome: Option<&PassOutcome>,
+    ) -> (String, bool) {
+        let Some(outcome) = outcome else {
+            return (body, false);
+        };
+        if !self.privacy_policy.masks() {
+            return (body, false);
+        }
+        let marked: Vec<PiiSpan> = outcome
+            .spans
+            .iter()
+            .take(privacy_block::MAX_SPANS)
+            .filter(|span| self.privacy_policy.marks(span))
+            .copied()
+            .collect();
+        if marked.is_empty() {
+            return (body, false);
+        }
+        let masked = gradatum_core::pii::mask_spans(&body, &marked);
+        // Compared rather than assumed: the rewrite is the fact, and a caller that
+        // suppressed a version snapshot on the strength of an empty marked list would be
+        // hiding a history entry for a write that changed nothing.
+        let changed = masked != body;
+        (masked, changed)
     }
 
     // Insertion-point spec §5.1, steps 3/3ter/4 (F-160).
@@ -210,13 +289,15 @@ impl Vault {
     /// state of an installation, no pass would ever put it back.
     ///
     /// One named exception: a `rejected` verdict that still covers the note's spans
-    /// (path (b) of D-11, cf. [`privacy_block::binds_the_tag`]) binds the marker. The
-    /// binding verdict is read from the note as read back, NEVER from the incoming block:
-    /// `spans_digest` is readable in the note, so a block that declares itself `rejected`
-    /// proves nothing, and accepting it would be enough to retire the marker in a single
-    /// write with no human having judged. Only the review surface
+    /// (path (b) of D-11, cf. [`privacy_block::binds_the_tag`]) binds the marker. This
+    /// re-carry reads the verdict from the note as read back, NEVER from the incoming
+    /// block: `spans_digest` is readable in the note, so a block that declares itself
+    /// `rejected` proves nothing, and accepting it here would be enough to retire the
+    /// marker in a single write with no human having judged. Only the review surface
     /// (`vault_privacy_review`, D-13) poses a verdict; until then, only what a verdict has
-    /// already left on disk counts.
+    /// already left on disk counts. Step 4 below is the one place the incoming block is
+    /// read, and it is a different question: the pass asks what verdict the write states,
+    /// not whether the marker must be restored.
     ///
     /// Accepted residual, bounded by the delivered surface: no write DTO carries an
     /// `extra` field and every production site builds `ExtraFields::empty()`, so no
@@ -253,11 +334,42 @@ impl Vault {
             }
         }
 
+        // The block the note carried **before** this write, as read back from disk: the
+        // only evidence that a verdict was ever posed, and the source of the re-carry
+        // exception. Never the incoming block — a block that declares itself `rejected`
+        // proves nothing, and honouring one here would be enough to retire the marker in
+        // a single write with no human having judged.
         let previous_block = existing
             .as_ref()
             .and_then(|prev| prev.frontmatter.extra.get(privacy_block::BLOCK_KEY));
         let binds =
             previous_block.is_some_and(|block| privacy_block::binds_the_tag(block, previous_block));
+
+        // What the pass re-judges. The note's own block on every ordinary path; the block
+        // **entering** this write on the one surface that posts a block back — the review,
+        // which moves `review` over the block the note carries and states it. Resolving
+        // the verdict from disk on that path would recompute `pending` over it and undo a
+        // human judgement on the very write that poses it.
+        //
+        // What may be stated is bounded, not assumed: an entering block counts only when
+        // it moves the verdict over a block the note already carries, so a block the
+        // caller composed reads as no verdict and the pass re-judges from disk. That
+        // bound is what keeps the exception narrow — the pass is not an override any
+        // write can aim.
+        //
+        // `spans_digest` is the remaining guard, and it is what makes this a judgement
+        // rather than a blanket carry: a verdict is kept only while it covers the very
+        // spans the pass re-reported, so a note whose spans moved spends it.
+        let carried_block = match frontmatter.extra.get(privacy_block::BLOCK_KEY) {
+            Some(incoming)
+                if previous_block.is_some_and(|recorded| {
+                    privacy_block::moves_only_the_review(incoming, recorded)
+                }) =>
+            {
+                Some(incoming)
+            }
+            _ => previous_block,
+        };
 
         if let Some(prev) = existing {
             // La valeur réinsérée est celle que porte la note relue — clonée telle
@@ -290,7 +402,8 @@ impl Vault {
                     outcome.status,
                     &outcome.spans,
                     &self.budgets,
-                    previous_block,
+                    &self.privacy_policy,
+                    carried_block,
                 );
                 // Une réécriture ne duplique pas `privacy-unscanned` : chaque action est
                 // idempotente sur la liste de tags.
@@ -350,16 +463,19 @@ impl Vault {
             .get("status")
             .and_then(toml::Value::as_str)
             .unwrap_or_default();
-        observer.pass_observed(&PrivacyPass::new(
-            status,
-            privacy_block::markable_categories(&outcome.spans),
-            classified == privacy_block::TagAction::Pose,
-            unscanned == privacy_block::TagAction::Pose,
-            outcome.unmapped_labels,
-            outcome.rejected_out_of_bounds,
-            outcome.rejected_utf8_boundary,
-            outcome.touching_window_edge,
-        ));
+        observer.pass_observed(
+            &PrivacyPass::new(
+                status,
+                privacy_block::markable_categories(&outcome.spans, &self.privacy_policy),
+                classified == privacy_block::TagAction::Pose,
+                unscanned == privacy_block::TagAction::Pose,
+                outcome.unmapped_labels,
+                outcome.rejected_out_of_bounds,
+                outcome.rejected_utf8_boundary,
+                outcome.touching_window_edge,
+            )
+            .with_exception_hits(outcome.exception_hits.clone()),
+        );
     }
 
     /// Re-judges one note of `vault_id` through the write primitive.

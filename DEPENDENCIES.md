@@ -2,7 +2,31 @@
 
 > Arbre de dépendances Cargo. Établi par lecture des `Cargo.toml` du workspace (source de
 > vérité) ; à recouper avec `cargo tree --workspace --depth 1`.
-> Version workspace `2.4.0`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> Version workspace `2.5.0`, edition 2024, MSRV 1.91, `resolver = "3"`.
+> MAJ 2026-09-17 (`b9026abc..4d9fe02f`, cycle 2.5.0 — **2.5.0 en cours, non taguée**) : **aucune
+> dépendance externe ajoutée, retirée ni bumpée**. Le delta `Cargo.lock` fait 5 lignes et
+> n'est que l'arête de `gradatum-privacy` dans la liste `dependencies` de sa propre entrée ;
+> le nombre de paquets du verrou est **inchangé à 679**, mesuré `grep -c '^name = '` de part
+> et d'autre. Trois manifestes de crate bougent, dont deux par une feature **dev-only** :
+> `gradatum-privacy` gagne `serde` + `serde_json` en dépendances normales et `sha2`,
+> `tempfile`, `tokio` en dev-dependencies — `tokio` y est **épinglée `=1.53.0`** avec un jeu
+> de features *restreint* (`rt`, `net`, `io-util`, `time`) au lieu du `full` que le workspace
+> accorde à chaque membre, et sa description passe de « regex-based floor detector » à
+> « detector implementations and span geometry » ; `gradatum-db-sqlite` et `gradatum-index`
+> ajoutent la feature `trace` à `rusqlite` (observation du nombre de statements émis par les
+> tests de purge par lots — une dev-dependency n'entre pas dans le graphe de features d'un
+> `cargo build`, aucun coût de trace en production). Le composant **hors-processus**
+> `tools/privacy-sidecar/` (C++17, CMake) n'entre pas dans cet arbre Cargo : voir
+> § *Composant hors-processus — sidecar de confidentialité*.
+> **Correction de décompte, dérive ANTÉRIEURE au cycle** : `cargo metadata --no-deps` compte
+> **34 membres** de workspace et non 31, dont **28 publiables** et **6 portant
+> `publish = false`**. Ces trois valeurs étaient déjà les vraies à `b9026abc` : la section
+> § *Périmètre du workspace* était périmée avant l'ouverture du cycle, pas à cause de lui.
+> MAJ 2026-09-16 (`2fabf9bc..b9026abc`, ouverture cycle 2.5.0 — 2.4.0 publiée 2026-09-16, tag `v2.4.0` = `2fabf9bc`) : bump workspace `2.4.0` → `2.5.0`
+> (9 `Cargo.toml` du workspace, 37 lignes changées — bornes intra-famille + `expected_rank`
+> minor). Aucune dépendance externe ajoutée, retirée ni bumpée (diff `Cargo.lock` = 0 occurrence
+> `^[-+]name`). Le reste du delta (`2fabf9bc`, `1093de0c`, `d343f73c`) est purement
+> documentaire (rustdoc, commentaires de tests) — sans effet sur l'arbre.
 > MAJ 2026-09-15 (`b2cb32b1..f99c5241`, lots D1 + F, workspace `2.4.0`) : `rustls` épinglé `=0.23.45` (plancher RUSTSEC-2026-0285 ; bornes collatérales `aws-lc-rs` 1.16.3→1.18.1, `aws-lc-sys` 0.40→0.45, `rustls-webpki` 0.103.13→0.103.15) ; `insta` ajouté en dev-dependency workspace (`gradatum-acl-policy`, snapshots) ; bornes intra-famille propagées à `2.4.0`. Aucune autre dépendance externe ajoutée ni retirée.
 > MAJ 2026-09-02 (`6a7515a5..3a981130`) : aucune dépendance externe ajoutée, retirée ni bumpée —
 > le delta `Cargo.lock` (32/32) est la propagation des 34 bornes intra-famille à `2.1.1`.
@@ -70,30 +94,34 @@
 
 ## Périmètre du workspace
 
-**31 membres** déclarés dans `[workspace] members` (`ls crates/` = 31 répertoires).
-**26 sont publiables** ; 5 portent `publish = false` :
+**34 membres** déclarés dans `[workspace] members` (`ls crates/` = 34 répertoires, tous
+déclarés — aucun répertoire hors liste). Le décompte se mesure sur `cargo metadata --no-deps`,
+jamais sur une lecture partielle des manifestes.
+**28 sont publiables** ; 6 portent `publish = false` :
 
 | Crate | Raison du `publish = false` |
 |---|---|
 | `gradatum-cli` | republication reportée, aucune version cible fixée — ⚠️ déjà publiée en 0.7.6 sur crates.io |
 | `gradatum-mcp-stub` | **retiré de la distribution `2.0.0`** — plus construit ni publié ; dernière version publiée `1.0.0` sur crates.io ; source conservée, retrait réversible (voir `ARCHITECTURE.md` § API surface topology) |
+| `gradatum-sdk-rs` | façade SDK, non distribuée — le paquet `gradatum` (umbrella) est le point d'entrée publié |
 | `gradatum-bench` | benchmarks internes |
 | `index-parity-tests` | suite de parité backend-agnostique |
 | `v1-parity-tests` | suite de parité v1 |
 
-> ⚠️ Piège de décompte : **26 = crates publiés sur crates.io**, **31 = membres du workspace**.
+> ⚠️ Piège de décompte : **28 = crates publiables** (celles qui ne portent pas
+> `publish = false` et sont donc distribuées sur crates.io), **34 = membres du workspace**.
 > Les deux chiffres sont corrects et ne se substituent pas.
 
-Répartition fonctionnelle des 31 (3 + 1 + 19 + 1 + 2 + 5) :
+Répartition fonctionnelle des 34 (3 + 1 + 22 + 1 + 1 + 6) :
 
 | Groupe | N | Membres |
 |---|---|---|
 | Binaires control plane | 3 | `gradatum-server`, `gradatum-worker`, `gradatum-admin` |
 | Binaire gateway | 1 | `gradatum-gateway` |
-| Bibliothèques data plane | 19 | `core`, `dto`, `markdown`, `vault`, `storage`, `index`, `search`, `queue`, `db-sqlite`, `cache`, `chat`, `curator`, `embed`, `engine`, `ingest`, `warden`, `acl-policy`, `acl-auth`, `auth` (préfixe `gradatum-`) |
+| Bibliothèques data plane | 22 | `core`, `dto`, `markdown`, `vault`, `storage`, `index`, `search`, `queue`, `db-sqlite`, `cache`, `chat`, `curator`, `embed`, `engine`, `ingest`, `warden`, `acl-policy`, `acl-auth`, `auth`, `privacy`, `distill`, `heartbeat` (préfixe `gradatum-`) |
 | Binaire web UI | 1 | `gradatum-studio` (bundle React+TS servi à `/ui/*`, publiable depuis F-131) |
-| Clients | 2 | `gradatum-sdk-rs`, `gradatum` (umbrella) |
-| Non publiables | 5 | `gradatum-cli`, `gradatum-mcp-stub`, `gradatum-bench`, `index-parity-tests`, `v1-parity-tests` |
+| Clients | 1 | `gradatum` (umbrella ; `gradatum-sdk-rs` est passée non publiable et compte dans la ligne suivante) |
+| Non publiables | 6 | `gradatum-cli`, `gradatum-mcp-stub`, `gradatum-sdk-rs`, `gradatum-bench`, `index-parity-tests`, `v1-parity-tests` |
 
 ---
 
@@ -444,6 +472,38 @@ Table établie par lecture des blocs `[features]` de chaque `Cargo.toml`.
 
 ---
 
+## Composant hors-processus — sidecar de confidentialité
+
+`tools/privacy-sidecar/` est le seul composant du dépôt **hors Cargo** : C++17, bâti par
+**CMake** (`cmake_minimum_required 3.21`, `CMAKE_CXX_STANDARD 17`), il produit un exécutable
+`pf-sidecar` installé sous `libexec`, plus un comparateur de spans `pf-ref-cli`. Il n'entre
+donc **pas** dans l'arbre de dépendances ci-dessus, qui ne décrit que le workspace Cargo — et
+il ne crée aucune arête dans `Cargo.lock`.
+
+**Aucune dépendance amont n'est vendue dans ce dépôt.** Les deux sont acquises à une révision
+épinglée, hors de l'arbre de travail, par `tools/privacy-sidecar/fetch-upstream.sh` :
+
+| Amont | Licence | Approvisionnement | Épingle |
+|---|---|---|---|
+| `privacy-filter.cpp` (moteur GGML derrière l'API C appelée) | MIT | `git clone` du dépôt amont puis `checkout` de la révision, sous-module `ggml` inclus et vérifié séparément | commit `735a6c28607ee82afc3a670383f41b55266a3b9a` ; `ggml` `3af5f5760e19a96427f5f7a93b79cbdf3d4b265b` |
+| `nlohmann/json` (en-tête unique, format de fil) | MIT | téléchargement de la release `v3.11.3`, **vérifié par empreinte** et non par URL — une étiquette peut être déplacée, une empreinte non | `json.hpp` `sha256:9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6` |
+| Poids du modèle (GGUF) | celle publiée avec les poids | **fournis par l'opérateur**, jamais committés ni couverts par la notice de licence | empreinte pinnée par le déploiement |
+
+`fetch-upstream.sh` vérifie chaque révision et chaque empreinte et sort non-zéro sur toute
+divergence ; il n'écrit jamais dans le dépôt. Le script échoue aussi si le sous-module `ggml`
+est absent. `LICENSE-NOTICE` porte le détail des licences ; le code du sidecar lui-même
+(`src/`, `CMakeLists.txt`, `fetch-upstream.sh`, `tests/`) est sous la licence du dépôt.
+
+**Le serveur ne fait pas confiance au binaire qu'il trouve : il vérifie deux empreintes.**
+`binary_digest` et `model_digest` sont des pins obligatoires du bloc `[privacy.sidecar]`
+(64 caractères hexadécimaux minuscules, refusés au chargement sous toute autre forme), et la
+poignée de main compare le binaire, le modèle et le mode d'agrégation annoncés par le sidecar
+à ces valeurs. Une divergence — ou un sidecar injoignable — **fait échouer le démarrage**,
+sans repli sur le détecteur in-process (voir `ARCHITECTURE.md` § *Personal-data detection
+frontier*).
+
+---
+
 ## Mise à jour
 
 Régénérer après `cargo build --workspace` :
@@ -474,14 +534,24 @@ cd /path/to/gradatum
 Contrôles rapides utiles :
 
 ```bash
-ls crates/ | wc -l                                   # nombre de membres du workspace
-grep -L 'publish = false' crates/*/Cargo.toml | wc -l  # nombre de crates publiables
+# Nombre de membres du workspace — mesuré sur le manifeste résolu, pas sur une
+# lecture partielle : `ls crates/ | wc -l` compte des répertoires, pas des membres
+# déclarés, et les deux ne coïncident que tant qu'aucun répertoire n'est hors liste.
+cargo metadata --no-deps --format-version 1 | jq '.packages | length'
+# Nombre de crates publiables (celles sans `publish = false`) :
+cargo metadata --no-deps --format-version 1 \
+  | jq '[.packages[] | select((.publish // ["x"]) | length > 0)] | length'
+grep -L 'publish = false' crates/*/Cargo.toml | wc -l  # équivalent, par lecture des manifestes
 git diff <ref>..HEAD -- Cargo.toml 'crates/*/Cargo.toml'  # tout changement de dépendance
 ```
 
 ---
 
-*Document maintenu par les mainteneurs Gradatum. Dernière mise à jour : 2026-08-04 — réalignement
+*Document maintenu par les mainteneurs Gradatum. Dernière mise à jour : 2026-09-17 — delta du
+cycle 2.5.0 (`b9026abc..4d9fe02f`), aucune dépendance externe ajoutée/retirée/bumpée ; correction
+de la table de répartition du workspace (**34** membres, **28** publiables, **6** `publish = false`
+— dérive antérieure au cycle) et nouvelle section § *Composant hors-processus — sidecar de
+confidentialité*. Précédent : 2026-08-04 — réalignement
 arbres workspace / table de répartition (studio publiable F-131, `gradatum-cli` non-publiable), déjà
 committé `1a7d01c8`. Précédent : 2026-07-31 — bump `opendal` `=0.51.0` → `=0.58.1` (MSRV workspace
 1.88 → 1.91, `Cargo.lock` 688 → 705 paquets). Réalignement complet précédent : 2026-07-24, `fb0742e5`

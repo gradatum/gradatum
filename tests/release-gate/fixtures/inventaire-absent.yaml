@@ -1,0 +1,4 @@
+# Fixture manifest -- test data, NOT a release derogation list.
+# No semver_deviations key at all: nothing to read, so the gate cannot run.
+# Not-reading is never a green light.
+expected_rank: minor

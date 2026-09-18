@@ -8,6 +8,7 @@ pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::open_in_memory() -
 pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::with_conn<T, F>(&self, F) -> core::result::Result<T, gradatum_core::job::QueueError> where F: core::ops::function::FnOnce(&rusqlite::Connection) -> core::result::Result<T, rusqlite::error::Error> + core::marker::Send + 'static, T: core::marker::Send + 'static
 pub struct gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore
 impl gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore
+pub async fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::count_purgeable_terminal_payloads(&self, core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>) -> core::result::Result<u64, gradatum_core::job::QueueError>
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::db(&self) -> &gradatum_db_sqlite::queue_store_sqlite::QueueDb
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::new(gradatum_db_sqlite::queue_store_sqlite::QueueDb) -> Self
 impl gradatum_core::job::QueueStore for gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore
@@ -54,6 +55,7 @@ pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::open_in_memory() -
 pub async fn gradatum_db_sqlite::queue_store_sqlite::QueueDb::with_conn<T, F>(&self, F) -> core::result::Result<T, gradatum_core::job::QueueError> where F: core::ops::function::FnOnce(&rusqlite::Connection) -> core::result::Result<T, rusqlite::error::Error> + core::marker::Send + 'static, T: core::marker::Send + 'static
 pub struct gradatum_db_sqlite::SqliteQueueStore
 impl gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore
+pub async fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::count_purgeable_terminal_payloads(&self, core::option::Option<chrono::datetime::DateTime<chrono::offset::utc::Utc>>) -> core::result::Result<u64, gradatum_core::job::QueueError>
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::db(&self) -> &gradatum_db_sqlite::queue_store_sqlite::QueueDb
 pub fn gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore::new(gradatum_db_sqlite::queue_store_sqlite::QueueDb) -> Self
 impl gradatum_core::job::QueueStore for gradatum_db_sqlite::queue_store_sqlite::SqliteQueueStore

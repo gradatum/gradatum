@@ -38,6 +38,58 @@ use gradatum_core::{
 /// Broadcast channel capacity for [`QueueEvent`] — default value.
 const BROADCAST_CAPACITY: usize = 256;
 
+/// Rows one purge batch may carry.
+///
+/// The bound is what keeps the queue's write lock **reachable** by other writers: a batch
+/// is one short transaction, and the lock is released between two batches. Widening it
+/// lengthens each transaction without changing what a batch costs per row; narrowing it
+/// multiplies the number of transactions for the same work.
+const PURGE_BATCH_ROWS: usize = 500;
+
+/// Marker carried by the batch selection statement.
+///
+/// A batch is a statement, and a statement is observable from outside the process through
+/// SQLite's statement trace. That is how a test can count batches — and therefore
+/// transactions — without the production code exposing a counter for it.
+const PURGE_BATCH_MARKER: &str = "/* purge-batch */";
+
+/// Outcome of one purge batch.
+struct PurgeBatch {
+    /// Rows the batch selected. A batch that selected fewer than [`PURGE_BATCH_ROWS`] rows
+    /// was the last one: nothing was left behind its cursor.
+    selected: usize,
+    /// Rows actually rewritten.
+    purged: u64,
+    /// Rows whose payload could not be deserialised — left in place, reported.
+    skipped: u64,
+    /// Identifier of the last selected row — the cursor the next batch starts after.
+    last_id: Option<String>,
+}
+
+/// Applies the pragmas a connection opened **on a file** owes its callers.
+///
+/// - `journal_mode = WAL` before any transaction: SQLite refuses the change inside one.
+/// - `busy_timeout = 5000` ms, for WAL contention between processes.
+/// - `secure_delete = ON`: SQLite overwrites deleted content with zeros, **including the
+///   whole pages a statement frees** — the overflow pages of a body too large for one
+///   page. `FAST` is not enough for a purge: it scrubs only the space freed inside the
+///   page where the deletion happens, and hands back the freed overflow pages with their
+///   bytes intact, so a body past the inline threshold survives the rewrite. The queue's
+///   file test measures exactly that: red under `FAST`, green under `ON`, with the witness
+///   placed in the overflow region. The price is processor time, not volume — the
+///   write-ahead log receives the same bytes under either setting, and the database file
+///   grows by nothing. Without this setting the purge is **logical only**: the column no
+///   longer carries the body, and the bytes still do.
+fn apply_file_pragmas(conn: &Connection) -> Result<(), QueueError> {
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(storage_err)?;
+    conn.pragma_update(None, "busy_timeout", 5000i32)
+        .map_err(storage_err)?;
+    conn.pragma_update(None, "secure_delete", "ON")
+        .map_err(storage_err)?;
+    Ok(())
+}
+
 /// Maps any error (rusqlite, driver) to `QueueError::Storage`.
 fn storage_err(e: impl std::fmt::Display) -> QueueError {
     QueueError::Storage(e.to_string())
@@ -60,9 +112,13 @@ pub struct QueueDb {
 }
 
 impl QueueDb {
-    /// Opens (or creates) the database at `path` on a blocking thread, with WAL and a 5 s `busy_timeout`.
+    /// Opens (or creates) the database at `path` on a blocking thread, with WAL, a 5 s
+    /// `busy_timeout` and `secure_delete=ON`.
     ///
-    /// Aligned with the original sqlx settings (`journal_mode=WAL`, `busy_timeout=5000 ms`).
+    /// Aligned with the original sqlx settings (`journal_mode=WAL`, `busy_timeout=5000 ms`),
+    /// plus what the purge owes: the file pragmas set `secure_delete=ON`, without which a
+    /// purged body stays readable in the file's bytes — overflow pages included, which is
+    /// why `ON` and not the cheaper `FAST`.
     /// `synchronous` stays at the SQLite default (FULL) — not changed here, as the server/worker
     /// `SqliteConnectOptions` were. `apply_sqlite_pragmas` goes further (`synchronous=NORMAL`,
     /// `foreign_keys=ON`) for callers that require it.
@@ -76,12 +132,7 @@ impl QueueDb {
                     | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .map_err(storage_err)?;
-            // WAL AVANT toute transaction : SQLite interdit le changement de journal_mode
-            // dans une transaction. `busy_timeout` 5 s conservé (contention WAL multi-process).
-            conn.pragma_update(None, "journal_mode", "WAL")
-                .map_err(storage_err)?;
-            conn.pragma_update(None, "busy_timeout", 5000i32)
-                .map_err(storage_err)?;
+            apply_file_pragmas(&conn)?;
             Ok(conn)
         })
         .await
@@ -107,7 +158,8 @@ impl QueueDb {
     ///
     /// sqlx `create_if_missing(false)` parity: used by admin paths that require a pre-existing
     /// database (fail-fast rather than a spurious creation).
-    /// WAL + a 5 s `busy_timeout` applied, identical to [`QueueDb::open`].
+    /// The same file pragmas as [`QueueDb::open`] are applied (WAL, 5 s `busy_timeout`,
+    /// `secure_delete=ON`).
     pub async fn open_existing(path: &Path) -> Result<Self, QueueError> {
         let path = path.to_path_buf();
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, QueueError> {
@@ -116,10 +168,7 @@ impl QueueDb {
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .map_err(storage_err)?;
-            conn.pragma_update(None, "journal_mode", "WAL")
-                .map_err(storage_err)?;
-            conn.pragma_update(None, "busy_timeout", 5000i32)
-                .map_err(storage_err)?;
+            apply_file_pragmas(&conn)?;
             Ok(conn)
         })
         .await
@@ -375,6 +424,234 @@ impl SqliteQueueStore {
         .map_err(|_| blocking_err())??;
 
         Ok(done_count as usize == ids.len())
+    }
+
+    /// The statement that selects the rows a purge rewrites, one batch at a time.
+    ///
+    /// Candidates are: terminal rows (`status IN (…)`), outside the keep window
+    /// (`id NOT IN (… ORDER BY id DESC LIMIT TERMINAL_PAYLOAD_KEEP)`), after the cursor
+    /// `?2`, and — when a cutoff is bound to `?1` — created strictly before it. ULIDs are
+    /// 26 characters, so the lexicographic order of `id` is the chronological order
+    /// (cf. `list`).
+    ///
+    /// **Single source for [`Self::purge_one_batch`] and
+    /// [`Self::count_purgeable_terminal_payloads`].** A dry-run selecting its rows with its
+    /// own copy of this predicate would drift from the purge it claims to describe, and the
+    /// count would name a set the purge never touches — the defect `count_dlq_jobs` exists
+    /// to prevent on the DLQ side, refused here by construction rather than by comment.
+    fn purge_candidate_sql() -> String {
+        format!(
+            "SELECT id, payload FROM gradatum_jobs {marker} \
+             WHERE status IN ({terminal}) \
+               AND (?1 IS NULL OR created_at < ?1) \
+               AND (?2 IS NULL OR id > ?2) \
+               AND id NOT IN ( \
+                   SELECT id FROM gradatum_jobs \
+                   WHERE status IN ({terminal}) \
+                   ORDER BY id DESC LIMIT {keep} \
+               ) \
+             ORDER BY id LIMIT {batch}",
+            marker = PURGE_BATCH_MARKER,
+            terminal = JobStatus::TERMINAL_SQL,
+            keep = TERMINAL_PAYLOAD_KEEP,
+            batch = PURGE_BATCH_ROWS,
+        )
+    }
+
+    /// The rule both the purge and its dry-run apply to an already-deserialised row:
+    /// `true` if this row is one the purge would **rewrite**.
+    ///
+    /// A row already carrying the [`Job::PayloadPurged`] tombstone is skipped by the purge
+    /// and is not counted by it — that is the idempotence that makes a second call return
+    /// `Ok(0)`. A row whose payload cannot be deserialised never reaches this rule: it is
+    /// skipped before, and counted by neither path (the purge reports it under `skipped`,
+    /// never under `purged`).
+    ///
+    /// Read from both call sites rather than restated in each, so that the number a
+    /// dry-run prints is the number the purge produces — by construction, not by comment.
+    fn record_is_purgeable(record: &JobRecord) -> bool {
+        !matches!(record.spec.kind, Job::PayloadPurged)
+    }
+
+    /// Counts the payloads a purge would rewrite — the read-only counterpart of
+    /// [`QueueStore::purge_terminal_payloads`] with the same `older_than`.
+    ///
+    /// Reads the candidate rows with the **same statement** the purge selects them with
+    /// (the shared `purge_candidate_sql` helper) and applies the **same two Rust-side
+    /// filters** (`record_is_purgeable`, shared with `purge_one_batch`): a row already
+    /// tombstoned, or whose payload cannot be deserialised, is not counted here because the
+    /// purge does not rewrite it. The cursor loop and its termination rule are the purge's,
+    /// so a queue larger than one batch is counted in full.
+    ///
+    /// **Read-only.** No transaction is opened, no row is written, no checkpoint is run:
+    /// nothing this call does can erase a body. That is what separates it from a dry-run
+    /// implemented as "purge, look at the number, restore" — a shape that cannot restore
+    /// anything here, since a purged body is not recoverable.
+    ///
+    /// **Not a promise about a concurrent writer.** The batches are read outside any
+    /// transaction, so a job that reaches a terminal state, or is enqueued, while the count
+    /// runs may or may not be included. The number is exact for a queue at rest, which is
+    /// the state an operator runs the command in.
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError::Storage`] on a SQLite error.
+    pub async fn count_purgeable_terminal_payloads(
+        &self,
+        older_than: Option<DateTime<Utc>>,
+    ) -> Result<u64, QueueError> {
+        let cutoff = older_than.map(|c| c.to_rfc3339());
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<u64, QueueError> {
+            let conn = db.blocking_lock();
+            let select_sql = Self::purge_candidate_sql();
+            let mut after: Option<String> = None;
+            let mut count = 0u64;
+
+            loop {
+                let rows: Vec<(String, String)> = {
+                    let mut stmt = conn.prepare(&select_sql).map_err(storage_err)?;
+                    let mapped = stmt
+                        .query_map(params![cutoff, after], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(storage_err)?;
+                    mapped.collect::<Result<Vec<_>, _>>().map_err(storage_err)?
+                };
+
+                let selected = rows.len();
+                for (_, payload) in &rows {
+                    // A payload that cannot be deserialised is not counted: the purge
+                    // skips it (under `skipped`), it does not rewrite it.
+                    if let Ok(record) = Self::deserialize_record(payload)
+                        && Self::record_is_purgeable(&record)
+                    {
+                        count += 1;
+                    }
+                }
+                after = rows.last().map(|(id, _)| id.clone());
+
+                if selected < PURGE_BATCH_ROWS {
+                    break;
+                }
+            }
+
+            Ok(count)
+        })
+        .await
+        .map_err(|_| blocking_err())?
+    }
+
+    /// Purges up to [`PURGE_BATCH_ROWS`] candidate rows, in one short transaction.
+    ///
+    /// The transaction is opened **and committed here**: the caller holds the queue's
+    /// write lock for the length of one batch, not for the length of the purge.
+    ///
+    /// `after` is the cursor — the identifier of the last row the previous batch handled,
+    /// `None` for the first batch. The cursor is required, not an optimisation: a purged
+    /// row stays a candidate (its column is rewritten, its row is not deleted), so a
+    /// `LIMIT` without a cursor would select the same first rows on every pass.
+    fn purge_one_batch(
+        conn: &mut Connection,
+        cutoff: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<PurgeBatch, QueueError> {
+        // **Immediate**, not deferred: the batch reads its candidates and then writes them,
+        // and on a deferred transaction SQLite takes the write lock only at the first write
+        // — an upgrade that fails outright, without consulting the busy timeout, when a
+        // concurrent writer has committed in between (`SQLITE_BUSY_SNAPSHOT`). Taking the
+        // lock at the start makes a concurrent writer a wait bounded by the busy timeout
+        // instead of a failed purge. The connection is the queue's own, under the Mutex, so
+        // there is no nested transaction to check — the same reason `run_migrations` uses
+        // `unchecked_transaction`.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_err)?;
+
+        // Candidats : voir `purge_candidate_sql`, source unique du prédicat — le décompte
+        // (`count_purgeable_terminal_payloads`) sélectionne avec la même instruction.
+        let select_sql = Self::purge_candidate_sql();
+
+        // One selection per batch, carrying the rows it needs: each row's payload is read
+        // with its identifier, never by a second query per row.
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(&select_sql).map_err(storage_err)?;
+            let mapped = stmt
+                .query_map(params![cutoff, after], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage_err)?;
+            mapped.collect::<Result<Vec<_>, _>>().map_err(storage_err)?
+        };
+
+        let selected = rows.len();
+        let last_id = rows.last().map(|(id, _)| id.clone());
+        let mut purged = 0u64;
+        let mut skipped = 0u64;
+
+        {
+            let mut update = tx
+                .prepare_cached("UPDATE gradatum_jobs SET payload = ?1 WHERE id = ?2")
+                .map_err(storage_err)?;
+
+            for (id, payload) in rows {
+                let mut record = match Self::deserialize_record(&payload) {
+                    Ok(record) => record,
+                    Err(e) => {
+                        // Jamais fatal : une ligne corrompue ne doit pas bloquer la purge
+                        // des lignes saines. Comptée, sautée, signalée — son payload reste
+                        // en place (résidu à traiter par un opérateur, pas par ce chemin).
+                        skipped += 1;
+                        warn!(
+                            job_id = %id,
+                            error = %e,
+                            "purge_terminal_payloads: payload deserialization failed — row skipped"
+                        );
+                        continue;
+                    }
+                };
+
+                // Idempotence : un payload déjà purgé n'est ni réécrit ni recompté.
+                // La règle est celle que lit aussi `count_purgeable_terminal_payloads`.
+                if !Self::record_is_purgeable(&record) {
+                    continue;
+                }
+
+                record.spec.kind = Job::PayloadPurged;
+                let rewritten = Self::serialize_record(&record)?;
+                update
+                    .execute(params![rewritten, id])
+                    .map_err(storage_err)?;
+                purged += 1;
+            }
+        }
+
+        tx.commit().map_err(storage_err)?;
+
+        Ok(PurgeBatch {
+            selected,
+            purged,
+            skipped,
+            last_id,
+        })
+    }
+
+    /// Truncating write-ahead-log checkpoint: moves the log's pages back into the database
+    /// file, then truncates the sidecar to zero bytes.
+    ///
+    /// This is the half of the erasure the rewrite cannot do on its own: SQLite writes the
+    /// image of a page **as it was before** the rewrite into the log, so as long as no
+    /// checkpoint has run, the body is readable in `queue.sqlite-wal` even though the
+    /// column no longer carries it.
+    ///
+    /// Private on purpose: the queue's public surface is held by a committed public-API
+    /// baseline, and this is a step of the purge rather than a capability the queue offers
+    /// — the purge runs it itself, so nothing a caller can forget stands between a purge
+    /// and its physical effect.
+    fn checkpoint_wal(conn: &Connection) -> Result<(), QueueError> {
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(storage_err)
     }
 }
 
@@ -1928,20 +2205,55 @@ impl QueueStore for SqliteQueueStore {
     /// erase that signal silently. See the prohibition comment next to the migration-010
     /// registration below.
     ///
-    /// # Transaction, idempotence, corrupt rows
+    /// # Batches, idempotence, corrupt rows
     ///
-    /// Selection and every rewrite run in **one transaction**: a purge is either entirely
-    /// visible or not at all. A row already carrying `Job::PayloadPurged` is skipped and
-    /// not counted, so a second call returns `Ok(0)`. A row whose payload cannot be
-    /// deserialised is **counted and skipped**, never fatal — one corrupted line must not
-    /// block the purge of the sound ones; that row keeps its payload, which is a residual
-    /// leak and is logged as a `warn`.
+    /// The purge runs in **batches of at most `PURGE_BATCH_ROWS` rows**, each batch in
+    /// its own transaction: the write lock is taken for one batch and released before the
+    /// next one starts, so a concurrent writer waits for a batch — not for the purge.
+    /// The statement that selects a batch carries the rows it needs, so no row costs a
+    /// second query.
+    ///
+    /// A batch that selected fewer than `PURGE_BATCH_ROWS` rows was the last one: the
+    /// loop stops there, at the cost of one extra empty selection when the number of rows
+    /// is an exact multiple of the batch size. A row already carrying `Job::PayloadPurged`
+    /// is skipped and not counted, so a second call returns `Ok(0)`. A row whose payload
+    /// cannot be deserialised is **counted and skipped**, never fatal — one corrupted line
+    /// must not block the purge of the sound ones; that row keeps its payload, which is a
+    /// residual leak and is logged as a `warn`.
+    ///
+    /// # Physical erasure
+    ///
+    /// **What this guarantees.** Once the call returns, a purged body is no longer
+    /// readable in the bytes of the database file or of its write-ahead log: the payload
+    /// is zeroed where it stood, **overflow pages included** — a `CurateSpec.body` is not
+    /// bounded, so a large one is stored in overflow pages, and those are exactly what a
+    /// weaker setting leaves behind.
+    ///
+    /// The guarantee is the work of two steps, and it holds **after the checkpoint that
+    /// ends the call** — not before it. `secure_delete = ON` on the connection (set at open
+    /// with the file pragmas) makes SQLite overwrite deleted content with zeros, whole
+    /// freed pages included, before they join the free list; `FAST` would scrub only the
+    /// space freed inside the page where the deletion happened, and a body past the inline
+    /// threshold would survive in its overflow pages. The **truncating write-ahead-log
+    /// checkpoint** run at the end, on the queue's own connection, then drops the
+    /// pre-rewrite images the log still holds; without it the body is readable in
+    /// `queue.sqlite-wal` however well the rewrite scrubbed. Without either step, the
+    /// column is cleared and the bytes are not.
+    ///
+    /// What the guarantee does **not** cover: content deleted by an earlier build, while
+    /// the setting was not in place. Those bytes are not scrubbed retroactively — they stay
+    /// in the file until SQLite reuses the pages that hold them. This call makes the bodies
+    /// it reaches unrecoverable; it does not rewrite the history of the file.
+    ///
+    /// The cost is **processor time, not volume**: the log receives the same bytes for the
+    /// same rewrite under `ON` as under `FAST`, and the database file grows by nothing.
     ///
     /// # `VACUUM`
     ///
-    /// This method does **not** run `VACUUM`: the rewrite removes the body from the row,
-    /// not from the file's free pages, which may retain the old text until SQLite reuses
-    /// them.
+    /// This method does **not** run `VACUUM`. It compacts the file — a different property
+    /// from erasing a body, and one that would cost a full rewrite of the database on
+    /// every purge. It is not needed for the guarantee above: `ON` zeroes the content of
+    /// the pages it frees, so what `VACUUM` would reclaim carries no body by then.
     async fn purge_terminal_payloads(
         &self,
         older_than: Option<DateTime<Utc>>,
@@ -1950,77 +2262,26 @@ impl QueueStore for SqliteQueueStore {
         let db = self.db.clone();
 
         let purged = tokio::task::spawn_blocking(move || -> Result<u64, QueueError> {
-            let conn = db.blocking_lock();
-            // `unchecked_transaction` : la connexion est dédiée sous le Mutex — aucune
-            // transaction imbriquée n'est possible (même motif que `run_migrations`).
-            let tx = conn.unchecked_transaction().map_err(storage_err)?;
-
-            // Candidats : terminaux, hors fenêtre de conservation, et — si un cutoff est
-            // fourni — créés strictement avant lui. Les ULID font 26 caractères : l'ordre
-            // lexicographique de `id` est l'ordre chronologique (cf. `list`).
-            let select_sql = format!(
-                "SELECT id FROM gradatum_jobs \
-                 WHERE status IN ({terminal}) \
-                   AND (?1 IS NULL OR created_at < ?1) \
-                   AND id NOT IN ( \
-                       SELECT id FROM gradatum_jobs \
-                       WHERE status IN ({terminal}) \
-                       ORDER BY id DESC LIMIT {keep} \
-                   ) \
-                 ORDER BY id",
-                terminal = JobStatus::TERMINAL_SQL,
-                keep = TERMINAL_PAYLOAD_KEEP,
-            );
-
-            let ids: Vec<String> = {
-                let mut stmt = tx.prepare(&select_sql).map_err(storage_err)?;
-                let rows = stmt
-                    .query_map(params![cutoff], |row| row.get::<_, String>(0))
-                    .map_err(storage_err)?;
-                rows.collect::<Result<Vec<_>, _>>().map_err(storage_err)?
-            };
-
             let mut purged = 0u64;
             let mut skipped = 0u64;
+            let mut after: Option<String> = None;
 
-            for id in ids {
-                let payload: String = tx
-                    .query_row(
-                        "SELECT payload FROM gradatum_jobs WHERE id = ?1",
-                        params![id],
-                        |row| row.get(0),
-                    )
-                    .map_err(storage_err)?;
-
-                let mut record = match Self::deserialize_record(&payload) {
-                    Ok(record) => record,
-                    Err(e) => {
-                        // Jamais fatal : une ligne corrompue ne doit pas bloquer la purge
-                        // des lignes saines. Comptée, sautée, signalée — son payload reste
-                        // en place (résidu à traiter par un opérateur, pas par ce chemin).
-                        skipped += 1;
-                        warn!(
-                            job_id = %id,
-                            error = %e,
-                            "purge_terminal_payloads: payload deserialization failed — row skipped"
-                        );
-                        continue;
-                    }
+            loop {
+                // The lock is taken for one batch and released at the end of this block —
+                // never held across the loop, which is the whole point of batching.
+                let batch = {
+                    let mut conn = db.blocking_lock();
+                    Self::purge_one_batch(&mut conn, cutoff.as_deref(), after.as_deref())?
                 };
 
-                // Idempotence : un payload déjà purgé n'est ni réécrit ni recompté.
-                if matches!(record.spec.kind, Job::PayloadPurged) {
-                    continue;
-                }
+                purged += batch.purged;
+                skipped += batch.skipped;
+                let selected = batch.selected;
+                after = batch.last_id;
 
-                record.spec.kind = Job::PayloadPurged;
-                let rewritten = Self::serialize_record(&record)?;
-                tx.execute(
-                    "UPDATE gradatum_jobs SET payload = ?1 WHERE id = ?2",
-                    params![rewritten, id],
-                )
-                .map_err(storage_err)?;
-                purged += 1;
+                if selected < PURGE_BATCH_ROWS {
+                    break;
+                }
             }
 
             if skipped > 0 {
@@ -2030,7 +2291,13 @@ impl QueueStore for SqliteQueueStore {
                 );
             }
 
-            tx.commit().map_err(storage_err)?;
+            // The checkpoint the physical erasure owes the caller: without it the
+            // pre-rewrite images — bodies included — stay in the write-ahead log.
+            {
+                let conn = db.blocking_lock();
+                Self::checkpoint_wal(&conn)?;
+            }
+
             Ok(purged)
         })
         .await
@@ -2558,7 +2825,19 @@ mod tests {
         MessageDeliverySpec, RetryBackoff, TriggerCondition, TriggerSource, job_kind_str,
     };
     use rusqlite::Connection;
+    use std::path::PathBuf;
     use ulid::Ulid;
+
+    /// Crate root, resolved at run time.
+    ///
+    /// The value baked in at compile time goes stale as soon as a test binary is reused
+    /// from another checkout directory (shared build artefacts): the environment variable
+    /// wins, and the compile-time value only serves as a fallback outside cargo.
+    fn manifest_dir() -> PathBuf {
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    }
 
     /// Crée une base SQLite in-memory pour les tests, migrations 006 → 012 appliquées.
     async fn test_db() -> QueueDb {
@@ -5800,11 +6079,8 @@ mod tests {
     fn embedded_migrations_match_disk_files() {
         for m in MIGRATIONS {
             let filename = format!("{:03}_{}.sql", m.version, m.description.replace(' ', "_"));
-            let disk = std::fs::read(format!(
-                "{}/migrations/{filename}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .expect("lire la migration sur disque");
+            let disk = std::fs::read(manifest_dir().join("migrations").join(&filename))
+                .expect("lire la migration sur disque");
             let disk_checksum = Sha384::digest(&disk).to_vec();
             let embedded_checksum = Sha384::digest(m.sql.as_bytes()).to_vec();
             assert_eq!(

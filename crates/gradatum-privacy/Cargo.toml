@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Regex-based floor detector for the gradatum personal-data detection frontier"
+description = "Detector implementations and span geometry for the gradatum personal-data detection frontier"
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -15,3 +15,15 @@ exclude = ["tests/**"]
 [dependencies]
 gradatum-core = { workspace = true }
 regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+# Stated rather than inherited from the workspace, which turns on `full` for every
+# member: the tests here run a current-thread runtime, a unix listener and the async
+# read/write extensions, and ask for nothing else. Feature unification across the
+# graph is not this crate's to decide, so narrowing here narrows what this crate
+# requests — not necessarily what a given build compiles.
+tokio = { version = "=1.53.0", features = ["rt", "net", "io-util", "time"] }

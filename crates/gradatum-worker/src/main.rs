@@ -75,7 +75,7 @@ use internal_client::InternalPersistClient;
 use leader::{LeaderConfig, LeaderElection};
 use metrics::{MetricsConfig, WorkerMetrics, spawn_metrics_server};
 use monitor::{ApalisConfig, MonitorDeps, build_monitor};
-use schedules::{DistillCronConfig, run_sweep_once};
+use schedules::{DistillCronConfig, QueueConfig, run_queue_purge_once, run_sweep_once};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -364,9 +364,20 @@ async fn main() -> anyhow::Result<()> {
         "strict single-vault path, vaults other than \"main\" rejected",
         &mut config_health,
     );
+    // Top-level [queue] — retention of terminal job payloads. Unlike [distill_cron], the
+    // fallback is not inert: the defaults (24 h / hourly) are the deployed behaviour, so a
+    // missing or malformed section still purges.
+    let queue_cfg: QueueConfig = load_section(
+        &cli.config,
+        "queue",
+        "terminal payloads older than 24 h erased hourly (compiled defaults)",
+        &mut config_health,
+    );
     info!(
         distill_cron_enabled = distill_cron_cfg.enabled,
-        "distill_cron config loaded"
+        purge_after_secs = queue_cfg.purge_after_secs,
+        purge_interval_secs = queue_cfg.purge_interval_secs,
+        "distill_cron and queue config loaded"
     );
 
     // ── Prometheus metrics ────────────────────────────────────────────────────
@@ -466,6 +477,27 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // ── Periodic purge of terminal payloads ───────────────────────────────────
+    // The scheduled caller `QueueStore::purge_terminal_payloads` did not have. Detached
+    // tokio task, on the process that owns the queue in write mode and holds the leadership
+    // lease — so exactly one purge runs at a time, on the connection the consumer already
+    // uses (no second writer is opened).
+    //
+    // `tokio::time::interval` completes its first tick immediately: the backlog left by a
+    // previous build is erased at boot rather than one interval later.
+    let purge_store = Arc::clone(&store);
+    let purge_cfg = queue_cfg.clone();
+    let purge_metrics = metrics.clone();
+    let purge_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(purge_cfg.purge_interval());
+        // A purge longer than the interval must not make the ticks it missed replay back-to-back.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            run_queue_purge_once(purge_store.as_ref(), &purge_cfg, &purge_metrics).await;
+        }
+    });
+
     // ── Build the Monitor ─────────────────────────────────────────────────────
     let monitor = build_monitor(
         Arc::clone(&store),
@@ -514,6 +546,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     sweep_handle.abort();
+    purge_handle.abort();
     health_probe_handle.abort();
 
     // Best-effort release of the leadership lease.

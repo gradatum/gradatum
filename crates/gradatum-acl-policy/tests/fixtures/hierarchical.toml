@@ -2,11 +2,11 @@
 #
 # CE N'EST PAS une copie de crates/gradatum-admin/presets/hierarchical.toml, et ne
 # doit jamais le devenir. Raison technique : AclEngine::from_preset_str ne désérialise
-# que les blocs [[consumer]] concrets — il IGNORE les [[consumer-template]]. Or, dans le
-# preset livré, tout le scoping par sous-arbre (projet, thème) vit UNIQUEMENT dans des
-# templates, donc invisible au moteur. Aligner cette fixture sur le preset livré
-# supprimerait la seule preuve que le matching globset allow/deny par sous-arbre
-# fonctionne (gold.rs t04/t05/t08).
+# que les blocs [[consumer]] concrets. Cette fixture existe pour prouver, isolément, que
+# le matching globset allow/deny par sous-arbre fonctionne (gold.rs t04/t05/t08) ; le
+# preset livré, lui, teste la distribution des identités d'une installation réelle, pas
+# le moteur de motifs. Aligner la fixture sur le preset livré ferait disparaître la seule
+# preuve de ce matching, en plus de coupler deux objets qui doivent diverger librement.
 #
 # Cette fixture exerce donc, à dessein, une identité concrète par FORME de scoping :
 #   admin        — accès plein, voit personal-classified
@@ -16,7 +16,9 @@
 #   expert-rust  — lecture scopée par thème (allow rust/**, deny hors thème)
 #
 # Les [[consumer-template]] plus bas sont inertes ici (ignorés par le moteur) : ils
-# documentent la forme du preset livré, ils ne produisent aucun consumer testable.
+# illustrent une forme qu'un preset peut porter sans que le moteur la lise. Le preset
+# livré n'en porte plus — un gabarit non matérialisé atteignait le bearer.toml déployé
+# avec des jetons non substitués.
 #
 # ACL pattern syntax (globset):
 #   "*"                    match all loci

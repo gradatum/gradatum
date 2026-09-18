@@ -284,6 +284,18 @@ pub async fn run(conn: &Arc<Mutex<Connection>>) -> Result<(), GradatumError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Crate root, resolved at run time.
+    ///
+    /// The value baked in at compile time goes stale as soon as a test binary is reused
+    /// from another checkout directory (shared build artefacts): the environment variable
+    /// wins, and the compile-time value only serves as a fallback outside cargo.
+    fn manifest_dir() -> PathBuf {
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    }
 
     /// Vérifie que chaque fichier *.sql présent dans migrations/ est enregistré dans
     /// le const array MIGRATIONS.
@@ -298,9 +310,9 @@ mod tests {
     #[test]
     fn all_sql_files_are_registered_in_migrations_array() {
         // Répertoire des migrations — chemin relatif depuis la racine du crate,
-        // résolu via CARGO_MANIFEST_DIR injecté au moment de la compilation des tests.
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let migrations_dir = std::path::Path::new(manifest_dir).join("migrations");
+        // résolu à l'exécution : l'empreinte de compilation se périme dès que le
+        // binaire de test est réutilisé depuis un autre répertoire de checkout.
+        let migrations_dir = manifest_dir().join("migrations");
 
         let mut sql_files: Vec<String> = std::fs::read_dir(&migrations_dir)
             .unwrap_or_else(|e| panic!("impossible de lire {}: {}", migrations_dir.display(), e))

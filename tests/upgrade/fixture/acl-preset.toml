@@ -14,24 +14,35 @@
 # produit exigent donc deux identités réellement déclarées ici.
 #
 # Aucune clé, aucun jeton, aucun nom du parc : ce fichier est du texte.
+#
+# DIALECTE : ce preset est écrit dans le dialecte 2.4.0, celui de l'état que ce
+# dossier décrit. La clé `sees_personal_classified` a été retirée du schéma des
+# entrées de consommateur, et les consommateurs qui la portaient à `false` (ou
+# rien — c'était le défaut) reçoivent les quatre négations de motif en tête de
+# leurs deux listes. Un consommateur virtuellement à `true` n'en recevrait
+# aucune : la négation dit « ce consommateur ne voit pas la classification
+# personnelle », et l'écrire pour un consommateur autorisé serait un mensonge.
+#
+# La procédure de réalignement et sa raison d'être sont dans le guide
+# `docs/UPGRADING-2.3.1-to-2.4.0.md` §« The ACL preset field removal ». Le
+# harnais de montée re-contrôle ce dialecte avant de monter (sous-step 2a) et
+# consigne `preset_deja_conforme` : un état hérité qui porterait encore la clé
+# est mesuré, pas supposé.
 
 [[consumer]]
 identity = "main-agent"
 description = "Orchestrateur — amorçage produit, accès complet"
-read_patterns = ["**"]
-write_patterns = ["**"]
-sees_personal_classified = false
+read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
 
 [[consumer]]
 identity = "agent-alpha"
 description = "Auteur fictif A — accès complet en lecture et écriture"
-read_patterns = ["**"]
-write_patterns = ["**"]
-sees_personal_classified = false
+read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
 
 [[consumer]]
 identity = "agent-beta"
 description = "Auteur fictif B — accès complet en lecture et écriture"
-read_patterns = ["**"]
-write_patterns = ["**"]
-sees_personal_classified = false
+read_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]

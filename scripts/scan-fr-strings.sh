@@ -408,7 +408,7 @@ for _s in _MUST_NOT_MATCH:
         print(f"ERREUR : auto-test du noyau FR — « {_s} » est anglais et n'aurait "
               f"PAS dû matcher. Gate BRUYANT, corriger les délimiteurs.", file=sys.stderr)
         sys.exit(2)
-# Jargon interne : références de plan/gouvernance homelab sans aucun sens pour un
+# Jargon interne : références de plan/gouvernance locales sans aucun sens pour un
 # lecteur de docs.rs. `§` est flaggé nu (renvoi de spec interne dans tous les cas).
 JARGON = re.compile(
     r"(?<![\w-])(?:F-\d{2,3}|EX-C\d|Lot \d|Phase \d|R-\d|P0-\d|v81)(?![\w-])"

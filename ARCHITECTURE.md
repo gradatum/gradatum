@@ -2,6 +2,28 @@
 
 > Source of truth for technical design. Updated as the project evolves.
 > Last architectural review : 2026-08-23 — workspace version 2.1.0, Rust edition 2024, MSRV 1.91.
+> Delta 2026-09-17 (`b9026abc..4d9fe02f`, 133 commits): the 2.5.0 cycle. **Workspace `2.5.0` is
+> in progress and unshipped — it carries no git tag and nothing below should be read as
+> released.** One subsystem becomes material and three surfaces change around it. The
+> personal-data frontier stops being inert: `[privacy]` gains an activation that decides
+> (`categories`, integer-thousandth `thresholds`, per-tenant `exceptions`), `mode = "mask"` is
+> delivered as a destructive rewrite, and a `[privacy.sidecar]` block mounts an out-of-process
+> detector whose handshake is taken before the process serves — an unreachable or divergent
+> sidecar **fails the boot**, with no fallback to the in-process floor
+> (see § Personal-data detection frontier). The **crate graph is unchanged**: no external
+> dependency added, removed or bumped, the lockfile holding the same package count. Around it:
+> a polled message page now costs one batched read rather than one read per message
+> (§ Inter-agent messaging), the queue's terminal-payload purge runs in bounded batches and
+> erases physically rather than logically (§ Queue topology), and the administration surface
+> gains two guards and a deploy step (§ Administration guards).
+> Delta 2026-09-16 (`2fabf9bc..b9026abc`): version bump only, workspace `2.4.0` → `2.5.0` cycle
+> opened — no change to the crate graph, module boundaries or data model. Two facts shipped in
+> `2.4.0` (published 2026-09-16, tag `v2.4.0` = `2fabf9bc`) worth noting here: the
+> F-160 personal-data marking mechanism runs in `report_only` mode with an empty category list
+> by default (`crates/gradatum-privacy/README.md`) — shipped inert, no enforcement until a
+> category is configured. ACL `read_patterns` are now deny-by-default: a consumer whose
+> patterns hold only `!`-negations (or are empty) matches no locus and reads nothing (see
+> § ACL integration below, unchanged in substance, hardened at the preset level).
 > Delta since 2026-08-15: no change to the crate graph, the module boundaries or the data model.
 > Increments 2.0.2 through 2.0.9 touched the delivery chain only — CI gates, release manifest and
 > release policy. Notably `2.0.9`: the public-surface gate now derives its escalation regime from
@@ -134,9 +156,23 @@ MCP initialize →
 
 write_check (warn-only)
     vault_write_impl → check_category_section(category, section)
-        drift detected → WARN + metric gradatum_write_check_total{rule}
-        no write blocked
+        drift detected → WARN (service log)
+                       → counter gradatum_write_check_total{rule}
+                             read mode: scrape GET /metrics — aggregate, counts per rule
+                       → audit event write_check_category_section
+                             read mode: the daily audit file audit.YYYY-MM-DD.jsonl
+                             per write — rule, category, expected and actual section, request id
+        no write blocked — the check adds no error path, so the note is persisted either way
 ```
+
+**The warning is an absolute warning: it never holds the write.** The check adds no error path, so
+there is no instant at which a caller, an operator or a higher-level workflow could inspect a finding
+and act on it before the note lands — by the time anyone can read the finding, the write it describes
+has already been accepted. A mode that does hold a write is a different control, deferred rather than
+wired. The **job event stream** (`GET /api/v1/jobs/{id}/events`, `text/event-stream`, resumable on
+`Last-Event-ID`, shared circular buffer) is deliberately **not** the transport for this finding: it is
+keyed by a job and closes when that job reaches a terminal state, whereas a write-check warning belongs
+to no job and has no end — serving it there would key a channel by a lifecycle it does not share.
 
 - `title_lookup`: deterministic column-first resolution (parity between wikilink and path lookup).
 - Worker guard: reclassification of an `identity` note is a no-op.
@@ -553,6 +589,51 @@ GRADATUM-SERVER                GRADATUM-WORKER
   Filtering is conditional: `None` → no clause (byte-identical, flag OFF) ·
   `Some(t)` → `AND tenant_id = ?` (isolation ON, 404 anti-disclosure)
 
+### Terminal-payload purge — physical erasure, in bounded batches
+
+The payload of a terminal job **is** the note body it carried, so without the purge those bodies
+stay in `db/queue.sqlite` indefinitely — a retention channel outside the vault's own lifecycle.
+The purge **rewrites** rows rather than deleting them: a purged job keeps its status, timestamps,
+`result_note` and retry history, and only `spec.kind` — the single field of a `JobRecord` that
+carries client content — is replaced by the `PayloadPurged` sentinel. `job_status` keeps answering
+what it answered before. The `TERMINAL_PAYLOAD_KEEP` most recent terminal rows are never touched:
+those are the rows an operator is most likely to be inspecting and the ones a late reader may still
+be consuming, so purging is **not reversible** beyond that window — a purged body cannot be
+replayed.
+
+Retention lives in `[queue]` (`purge_after_secs`, `purge_interval_secs`), read by `gradatum-worker`
+and ignored by `gradatum-server`. `purge_after_secs = 0` is refused at parse — the section is
+refused whole and the defaults apply, published as a degraded-config metric; it is never clamped,
+because a cutoff of "now" would erase every terminal payload outside the keep window on the next
+tick, irreversibly.
+
+Two properties changed in 2.5.0, and the second is the one that makes the first true:
+
+- **The erase is physical, not only logical.** `secure_delete=FAST` — the cheaper setting — hands
+  overflow pages back with their bytes intact while scrubbing only the space freed inside the page
+  the statement touched. A `CurateSpec.body` is not bounded, so a large one is stored in overflow
+  pages, and the purge would have ended with the body still readable. The freed region is now
+  overwritten with zeros **wherever it stood, whole freed pages included**, followed by a
+  truncating write-ahead-log checkpoint. The guarantee covers the bodies the purge reaches: content
+  deleted by an **earlier** build, when the setting was not in place, is not retroactively
+  scrubbed and keeps its bytes until the pages are reused.
+- **The loop runs in bounded batches** — at most `PURGE_BATCH_ROWS` rows selected and rewritten per
+  batch, one short `BEGIN IMMEDIATE` transaction each, releasing the write lock **between**
+  batches, with the selection statement taken once per batch rather than re-prepared. A batch that
+  selected fewer rows than the batch size was the last one. Before this, one transaction spanned
+  the whole loop and a concurrent writer could meet `database is locked` — a failure the busy
+  handler does not retry, so the purge died, leaving the bodies it had not reached in place.
+
+Run it by hand, or ask what it would take, with `gradatum-admin queue purge --older-than 12h` and
+`gradatum-admin queue purge --dry-run`. Running it by hand opens a **second writer connection** on
+`db/queue.sqlite`: safe while the worker is up (WAL, a busy timeout, and an idempotent purge — a row
+already carrying `PayloadPurged` is neither rewritten nor counted), but it can meet the scheduled
+purge in a write transaction and come back with a transient `SQLITE_BUSY` that asks to be run again.
+
+The store's default implementation of the purge fails loudly rather than lying: it returns
+`NotImplemented`, **never** `Ok(0)`. A purge that silently does nothing is a privacy leak reported
+as a success — the caller cannot tell "purged nothing" from "cannot purge at all".
+
 ---
 
 ## Semantic hierarchy (6 levels)
@@ -628,6 +709,171 @@ tag: a note's tag never enters the ACL decision, and denying a locus segment nam
 `personal-classified` is unrelated to the F-160 tag of the same name (which designates a
 note but governs no access). The migration from the former per-consumer flag to these
 preset negations is tracked by **F-297**.
+
+---
+
+## Personal-data detection frontier (workspace 2.5.0)
+
+A second policy gate on the **write path**, distinct from the ACL above: the ACL decides *who may
+read which locus*, the frontier decides *what a note body may retain*. It runs after the ACL
+decision and before persistence, and it is **delivered inert** — with `[privacy]` absent nothing is
+scanned, and a mounted detector marks nothing while `categories` is empty.
+
+### Activation — `[privacy]`
+
+Three keys decide, and each one is a distinct question:
+
+| Key | Meaning |
+|---|---|
+| `categories` | **The activation list.** A category absent from it is still detected, fused and recorded in the note's block — the detector reports what it sees — but nothing of that category can pose a marker or rewrite a body. Empty by default, which is why a mounted detector is inert until an operator activates something. |
+| `thresholds` | Per-category score thresholds in integer **thousandths** (`0..=1000`). A span marks only when its category is activated **and** its score meets that threshold, compared on the integer `score_m` a note records — never on a float, so no rounding separates the configured value from what the note says. A threshold of `0` means *not calibrated*: it enables nothing, it is not a floor that passes everything. |
+| `exceptions` | Literal patterns, keyed by tenant, applied **last** — after fusion and after the thresholds. A span an exception covers leaves the pass's output entirely: no marker, no span, no count. Each firing increments `gradatum_privacy_exception_hits_total`, labelled with a **digest** of the pattern and never the pattern, so the metric channel cannot read back a value the configuration was written to withhold. |
+
+Three configuration defects are refused **at load** rather than silently read as "enabled
+nothing": a category label outside the product taxonomy, a threshold outside `0..=1000`, and a
+per-category threshold for a category the configuration does not activate.
+
+### Mode — `report_only` (default) and `mask`
+
+`mode = "mask"` is **destructive**: every passage the activation marks is replaced in place with
+`[redacted]`, and no copy of the replaced text is kept. What it destroys is bounded by exactly
+the same rule as the marker — an unactivated category, a span below threshold, or a span an
+exception covers never reaches the rewrite. The `identity` section and the `code-*` vaults are
+not scanned by this frontier in either mode, so nothing there is rewritten.
+
+The mode is refused at load unless the activation can actually rewrite something: `mask` is
+admitted only over an activation carrying at least one threshold strictly above zero. A
+`report_only` over the same uncalibrated categories still loads, because observing is what that
+mode does. The distinction matters because a redaction that rewrites nothing is
+indistinguishable, from a note alone, from a working one.
+
+Four consequences follow from the fact that the rewrite is irreversible:
+
+- **An incomplete pass refuses the write.** Under `mask`, a pass that did not complete returns an
+  error and **no note is written** — the write path cannot tell which passages it would have
+  destroyed. Under `report_only` the long-standing fail-open behaviour is unchanged: the write
+  lands and the note is marked unscanned, which is what lets the deferred sweep pay the debt later.
+- **A masking write destroys the note's whole version history.** Suppressing only the snapshot of
+  the version being replaced would leave the versions before it intact — snapshots holding the
+  very text the mode exists to remove. Every snapshot under `.history/<id>/` is removed instead,
+  and the destruction is recorded as a `WARN` line carrying the note identifier, the number of
+  snapshots destroyed and the number that resisted removal (`snapshots_destroyed`,
+  `snapshots_failed`), never their text. Both counts, because one does not describe the purge: a
+  snapshot the filesystem kept is not a snapshot that was destroyed, and the write lands either
+  way. A note that masked nothing keeps its history.
+- **The masked note keeps its counts and drops its spans.** The recorded offsets would otherwise
+  point a reader at text that no longer exists; the per-category counts stay, so the campaign
+  that calibrates the thresholds still measures what the detector saw.
+- **The switch is announced, once per boot.** A masking deployment emits a `WARN` line and one
+  audit event (`event = "privacy_mode"`, outcome `announced`, actor `system`) naming the mode and
+  the mounted detector. A `report_only` deployment writes neither — a setting that changes no
+  byte should not fill the trail that has to carry the ones that do.
+
+A masking write cannot reach what was written *before* the switch: only a write masking that same
+note destroys its older snapshots. `gradatum-admin privacy history-purge --root <root>
+[--dry-run]` closes that gap — it selects the notes whose privacy block records `mode = "mask"`
+(durable on-disk evidence, readable without the index), removes their `.history/` snapshots and
+reports notes, snapshots and bytes; `--dry-run` reports the same count and removes nothing. The
+history of every other note is left alone, and this is not an erasure: `index.db`, `queue.sqlite`,
+the audit journal and the embedding index are untouched. The asynchronous embedding path reads the
+body **as persisted**, so a vector is computed over the masked text.
+
+### Detector mounting — three mounts, one name published
+
+`DetectorMount` resolves the configured activation and the configured sidecar into one of three
+states, in this precedence:
+
+| Mount | Condition | Meaning |
+|---|---|---|
+| `Noop` | `categories` is empty — **whatever `[privacy.sidecar]` says** | Strict pass-through: writes are byte-identical to the pre-frontier behaviour. A sidecar block over an empty activation is admitted and mounts nothing, because it names a detector no write would ask for. |
+| `Regex` | non-empty `categories`, no sidecar block | The deterministic in-process floor. |
+| `Sidecar` | non-empty `categories` **and** a `[privacy.sidecar]` block whose handshake was taken at start | The out-of-process engine. |
+
+The block alone is not enough and the activation alone is not enough: the first names a detector
+nothing would ask for, the second asks for one nothing names.
+
+`/health/detailed` publishes the resolved mount by name — `noop`, `regex` or `sidecar` — and it is
+the only place an outside observer can learn **which** detector judged the corpus. A name is
+published for the pass-through too: "nothing is mounted" is itself the answer an operator asks
+for, and an absent field could not say it. The spelling is the wire vocabulary of the mount
+point, not of the Rust type.
+
+One detector serves the whole deployment, not one per vault: the frontend is built once at start
+and shared, so every vault is scanned by the same mount under the same pins.
+
+### Out-of-process detector — `[privacy.sidecar]`
+
+A heavy detection model needs a memory budget and a crash domain of its own. Reaching it over a
+Unix socket keeps the workspace free of an in-process foreign-function edge and keeps the model's
+memory out of the server's.
+
+| Key | Required | Role |
+|---|---|---|
+| `socket_path` | yes | Where the sidecar listens. A path the product does not choose: the unit that runs the sidecar decides it. |
+| `binary_digest` | yes | 64 lowercase hex characters — the build the deployment pins. |
+| `model_digest` | yes | 64 lowercase hex characters, same form — the weights the deployment pins. |
+| `score_mode` | no | Aggregation mode of the reported scores; defaults to the mode the protocol defines. |
+| `timeout_ms_sync_per_kib` | no | Per-kilobyte term of a synchronous call's allowance — **calibrated on a measurement of the deployed model, never guessed** from a note's token count. |
+| `breaker_n`, `breaker_cooldown_s` | no | The client's circuit breaker: consecutive failures that open it, and how long it stays open before a probe is allowed. |
+
+The two digests are bare, without a `sha256:` tag: they are compared by exact string equality
+against what the handshake announces, and a pin written in another form is refused **at load**
+rather than left to fail a handshake — a divergence that would otherwise surface at start, naming
+a build the operator believes they pinned. An empty `socket_path`, or a digest that is not 64
+lowercase hex characters, is refused when the file is read, naming the field and **never the
+value**.
+
+**Startup refuses a sidecar that does not answer.** Mounting opens the socket and takes the
+handshake **before the process begins serving**: an unreachable socket, a timeout, or a binary,
+model or score mode other than the pinned one fails the start with the cause named. There is
+deliberately **no fallback to the in-process detector** — a deployment that configured an
+out-of-process engine asked for it, and a silent substitution would leave it scanning with an
+engine it did not choose. This is a *deployment* refusal rather than a configuration refusal: a
+file can be repaired by the operator who wrote it, whereas a sidecar that does not answer is a
+running state, and refusing the start is what makes it visible at start rather than at the first
+write.
+
+Mounting hands the client its configuration, including the `max_input_bytes` /
+`window_overlap_bytes` pair — the two byte keys stay in `[privacy]` as the single authority for
+how a body is cut, so the ceiling is stated once rather than in two places that would drift.
+
+### The sidecar process itself
+
+`tools/privacy-sidecar/` (C++17, built with CMake; see `DEPENDENCIES.md` § *Composant
+hors-processus*) carries the label-classification model and answers over a Unix socket with a
+length-prefixed JSON frame protocol.
+
+- **It returns offsets and categories only.** The matched text is never copied out of the model
+  result, so a client reading the socket learns *where* an address sits, not *what* it says.
+- **Admission re-checks the peer, and fails closed.** The socket permissions already restrict who
+  can connect; `SO_PEERCRED` is the second lock. A peer is admitted when its **uid** equals the
+  sidecar's own, **or** its **primary gid** equals the group the sidecar process runs under —
+  the shared group that carries the socket's group permission. Note the asymmetry: `SO_PEERCRED`
+  reports the peer's *primary* group only, so membership through a **secondary** group is not
+  seen, and a peer relying on one is refused.
+- **The socket is `0660`**, owned by the sidecar's service account and the server's group. It
+  lives in a **runtime directory of the sidecar unit's own**, traversable by that group — not in
+  the server's runtime directory, which would be re-chowned on every start of either unit.
+- **The client budgets and breaks.** One call-wide deadline is fixed before the first window is
+  sent, so a body cut into twenty windows is still bounded by one budget rather than twenty; a
+  window that opens after the deadline is refused without being sent. A response frame declaring
+  more than the accepted maximum is refused **on its length alone**, before any body byte is read
+  or allocated, so a hostile or broken sidecar cannot make the client reserve memory on demand.
+- **A call that did not complete is never reported as a scan that found nothing.** `Timeout`,
+  `Unavailable`, `Protocol` and `InputTooLarge` stay apart, because being unable to scan is what
+  marks a note as unscanned. An over-sized window is a **size state** rather than a fault and is
+  deliberately kept out of the circuit breaker: counting it would let ordinary large writes trip a
+  breaker that then marks every write unscanned. Conversely the round trip is recorded only once
+  the answer has been **accepted** — recording it earlier would let a sidecar that answers
+  well-framed bodies no client can accept clear the count on every request and never open the
+  breaker, reporting itself healthy while scanning nothing.
+- **The label-to-category mapping is versioned on the client**, and a label the table does not
+  carry is **counted, not guessed at**: the count of unmapped labels is how a model whose label set
+  moved becomes visible before its spans are read under the wrong mapping. The revision the sidecar
+  announces numbers *its* renumbering, while the client's table has a revision of its own; the
+  client therefore requires the announced revision to be at or above the floor it can read rather
+  than equal to its own, which is what makes an ordinary sidecar upgrade admissible instead of a
+  permanent unavailability.
 
 ---
 
@@ -1158,7 +1404,7 @@ this one is a pointer rather than a duplicate.
 **Health checks**:
 
 - `/health` endpoint returns `{"status":"ok"|"degraded", ...}`
-- `smoke-alpha-5.sh`: 9-step acceptance test (auth path 2 criteria, write→curator→read, audit JSONL generation)
+- `smoke-post-deploy-2.sh`: 9-step acceptance test (auth path 2 criteria, write→curator→read, audit JSONL generation)
 - Smoke result (2026-05-07): 4 PASS / 5 WARN / 0 FAIL (auth runtime + deploy patterns validated, docs/non-blocking warnings)
 
 **Post-tag fixes** :
@@ -1301,6 +1547,46 @@ admin/       delete · archives/{list,purge,restore}
 
 ---
 
+## Inter-agent messaging
+
+Inter-agent messaging (F-144) is carried by the vault itself rather than by a broker: a message
+*is* a note delivered to a recipient's mailbox locus, so it inherits the vault's persistence, its
+ACL and its audit trail rather than reimplementing them. The surface is two endpoints —
+`GET /api/v1/messages` (poll) and `POST /api/v1/messages/{id}/ack` (acknowledge) — served on the
+same path, which the router merges.
+
+### A polled page costs one batched read, not one per message
+
+Resolving a page used to read each message's note on its own, so a page of 50 messages cost 50
+reads. The page is now resolved in **one batched call per axis**:
+
+| Axis | Trait | Batched method |
+|---|---|---|
+| Note subjects of the page | `DocumentStore` | `get_notes_many` |
+| Delivery rows of the page (read/ack state) | `QueueStore` | `get_many` |
+
+Both are **additive** trait methods, each with a default implementation that loops over its
+single-identifier counterpart. The default is correct on every backend but costs one round-trip
+per identifier; a backend able to batch natively (a single `WHERE id IN (…)` statement) overrides
+it, which is what keeps a paged scan at a bounded number of reads. The two share one shape, and
+the contract is stated once for both: **a batch that cannot be resolved at all fails the
+request** rather than answering with an empty page — an empty answer and a failed read are not
+the same fact, and only one of them is worth retrying.
+
+Resolution is defensive on the same axis. Repeated identifiers are deduplicated as the batch is
+built, so an identifier fetched twice is fetched once, and the returned records are the distinct
+identifiers in order of first occurrence. A note whose content cannot be materialised is
+**omitted** rather than substituted, so the result may be *shorter* than the request and a caller
+must never assume a positional match. Empty results and partial results are therefore both
+possible and mean different things.
+
+Paging compounds this: a poll asks for a number of *selected* messages, not a number of locus
+pages, so it walks as many pages as it needs to fill the request. A page **shorter than the one
+requested** is the proof that the locus is exhausted — the only case in which the walk stops
+short of the count.
+
+---
+
 ## Workspace dependencies
 
 All workspace dependencies but two are **exact-pinned** (`=x.y.z`) in the root `Cargo.toml`.
@@ -1370,6 +1656,90 @@ only ever runs from internal surfaces must live under `scripts/internal/`.
 | `scripts/internal/` | Internal registry publishing, historical data import, leak remediation, name reservation, unpublished smokes, internal CI gates. | no |
 
 **Auth deployment** : API key stored at `/etc/gradatum/gradatum-mcp.api-key` (mode 600) → `POST /auth/exchange` → JWT (24h TTL). MCP stub auto-refreshes when TTL < 30%.
+
+---
+
+## Administration guards
+
+Three guards were added around the operations that touch a live deployment: two on the CLI, one
+inside the deploy itself. Each closes a state that a command reported as successful while leaving
+the deployment in a different shape than the operator believed.
+
+### `acl validate` names the consumer that reads nothing
+
+Read patterns are deny-by-default: the engine admits a read on a match in the **allow** set, built
+from the non-negated entries alone. A consumer left with only `!`-prefixed negations — or with an
+empty list — therefore parses cleanly, lets the server boot, and then denies every read, which at
+run time is indistinguishable from an identity holding no rights at all. The command exists to be
+run as a pre-flight before a rollout, and it reported such a preset as valid with nothing to
+notice.
+
+It now prints `warning: consumer '<name>' has no positive read pattern — it reads nothing` on
+stderr, once per consumer concerned, and **the exit code stays `0`**. A consumer declared with
+write patterns only — an event-log writer, for instance — produces this warning legitimately: the
+report is a report, not a refusal, and no flag turns it into a failure.
+
+### ACL preset path, and a re-run that no longer overwrites a live policy
+
+Two defects shared one root: an absent `[acl] preset_path` defaulted to an absolute path **outside**
+`storage.root`, so a deployment whose root was elsewhere still read a host-global file it had never
+named. Because the boot gate separates a preset that *cannot be loaded* from one that was *never
+configured*, a file sitting there and not readable by the server's user refused the startup of a
+deployment that had configured no preset at all.
+
+The path is now **derived from `storage.root`** as `<root>/config/bearer.toml` — the location
+`gradatum-admin init` materialises the preset at and the one the CLI reads back. An operator-set
+value is still honoured verbatim, **the empty string included**: the empty path remains the gate's
+"not configured" door, and no default closes a door that was opened on purpose. Nothing changes for
+a deployment whose `storage.root` is the installation default, where the derived path is the same
+file.
+
+Separately, `gradatum-admin init` writes `config/bearer.toml` **only when that file is absent**. On
+an already-initialised root the preset was rewritten unconditionally, the previous content surviving
+only as a `.bak.<timestamp>` file. That file is not generated output — it is the access policy
+`gradatum-server` enforces — so for an installation whose preset is maintained by hand, a re-run
+replaced a live policy with the shipped template. The policy now survives a re-run, and the command
+reports on stderr which file was kept.
+
+`--force` keeps every other meaning it had and **does not imply the rewrite**: it still re-mints the
+admin bearer and refreshes `server.toml`, `[internal_api]` tokens included. Replacing the preset is
+a separate, explicit act (`--overwrite-preset`), which backs the current file up before writing.
+
+### The deploy refreshes the code map, and never leaves the host down
+
+`scripts/deploy-gradatum-local.sh` runs `gradatum-admin code update` on the checkout it is
+deploying — in the window where the services are **already stopped** and before the binaries are
+replaced. A code index that lags the code it describes answers confidently about code that is no
+longer there, and the deploy is the moment the two are known to move together.
+
+The step is deliberately **non-fatal**. Because it runs inside the stopped-services window, a hard
+failure there would end the run with the host still down, the remedy (a stale code map) costing more
+than the harm (a stopped service). Every non-nominal outcome is a prominent warning, a dedicated
+line in the final summary, and the deploy carries on to install and start; the only fatal paths
+remain the ones that were fatal before this step existed.
+
+Three bounds keep it from becoming the outage it exists to avoid:
+
+- **Bounded in time** (`CODE_INDEX_TIMEOUT_S`, 60 s by default, overridable). The bound only
+  matters in the degenerate case — a locked index, an unreadable checkout, a mount that stopped
+  answering — where an unbounded call would stretch the outage instead of shortening it.
+- **A full ingest is refused inside the window.** With no prior ingest for the code vault,
+  `code update` falls back to ingesting the whole repository, which is a first indexation rather
+  than a refresh: the step skips it, says so, and points at the out-of-band tool. An **unreadable**
+  index leaves the answer undetermined, and an undetermined probe *attempts* the update rather than
+  skipping — the worst case of trying is bounded by the timeout, whereas taking a doubt for an
+  answer would leave the code map stale forever.
+- **Placed before the binary install, on purpose.** The service units take the only `index.db`
+  backup at start time, immediately before the migration runner touches the schema. A write that
+  migrated the index earlier would make that backup capture an already-migrated index while still
+  being named "pre-migration" — a documented guarantee quietly voided. Running the refresh before
+  the install keeps the window honest, and has the side effect that a failure leaves the running
+  binaries untouched.
+
+The behaviour is covered by a harness (`scripts/internal/deploy-gradatum-local.eprouvette.sh`) that
+proves the eight outcomes — including that the deploy *reaches* the next step under `set -e` on
+every failure path — and the call site's position between the stop and the install. It is not wired
+into CI.
 
 ---
 
@@ -1604,6 +1974,33 @@ evolved as follows (this delta re-verified at `761f9625` on 2026-08-04):
   guards into `effective_write_vault` / `effective_read_vault` (`945f853f`). A1 `792d64bb` removed
   13 CLI `default_value="main"` so agent identity comes from the JWT only (holes 1+2 also fixed in
   `5cf6c9b9`: rotate guard + lying-key detection in api-key list). Re-baseline `761f9625`.
+
+---
+
+## Services externes
+
+What a deployment reaches **out** to, and what it exposes. Ports and listeners are not restated
+here: they have their own authority in § Endpoints (the router's own table) and in
+`docs/guides/E-ports-and-config.md` (the port matrix). This table answers a different question —
+*which endpoint, under which configuration key, for which purpose* — and every row here is an
+endpoint the process must be able to reach or that an operator must be able to reach it on.
+
+| Sens | Service | Point d'accès | Clé de configuration | Usage |
+|---|---|---|---|---|
+| Consomme | Sidecar de confidentialité (hors-processus) | socket Unix `/run/gradatum-privacy/privacy-sidecar.sock` | `[privacy.sidecar] socket_path` | Détection des données personnelles sur le chemin d'écriture, quand `[privacy].categories` est non vide. Le socket est `0660`, dans un répertoire d'exécution propre au sidecar ; `binary_digest` et `model_digest` sont des pins obligatoires et le démarrage échoue si la poignée de main ne les confirme pas (§ Personal-data detection frontier). |
+| Consomme | Gateway compatible OpenAI | Base URL du gateway | `[engine]` (endpoint + credentials) | Curator LLM et calcul d'embeddings. **Pluggable** — aucune URL n'est gravée dans le code. |
+| Consomme | Litestream | Cible définie par l'opérateur | hors configuration Gradatum | Sauvegarde continue de la base. |
+| Consomme | Sink SIEM / journal d'audit | Cible définie par l'opérateur | hors configuration Gradatum | Ingestion des journaux d'audit. |
+| Consomme | Système de notification | Cible définie par l'opérateur | hors configuration Gradatum | Alertes d'exploitation. |
+| Fournit | `gradatum-server` — API HTTP REST | `[server] bind` | `[server] bind` | Surface d'ingestion et de lecture du vault (§ Endpoints). |
+| Fournit | `gradatum-server` — serveur MCP natif | `[server] bind`, chemin `/mcp` | `[server] bind` | Surface MCP (StreamableHTTP). |
+| Fournit | `gradatum-server` — métriques Prometheus | `[server] metrics_bind` | `[server] metrics_bind` | Séries d'exploitation ; **écouteur séparé**, doit rester loopback. |
+
+Aucun de ces services n'est requis par le cœur : les lignes « Consomme » hors sidecar sont
+pluggables ou optionnelles, et un déploiement qui n'en configure aucun démarre et sert. Le sidecar
+est la seule exception, et elle est **conditionnelle** : dès lors qu'un bloc `[privacy.sidecar]`
+est présent *et* que l'activation est non vide, il devient requis — un sidecar injoignable fait
+échouer le démarrage plutôt que de se replier en silence sur le détecteur in-process.
 
 ---
 

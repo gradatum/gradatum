@@ -18,16 +18,20 @@
 //! 1. **Colonne `payload`, fichier rouvert** — *assertion*. Les 50 lignes purgées ne
 //!    portent plus leur témoin (la sentinelle `PayloadPurged` a remplacé `spec.kind`), les
 //!    200 conservées le portent encore. C'est la garantie que la purge apporte.
-//! 2. **Octets bruts du fichier** — *constat, non asserté*. La purge réécrit la ligne ;
-//!    elle ne compacte pas le fichier. SQLite peut donc laisser des octets de l'ancienne
-//!    charge utile dans des pages libérées, jusqu'à ce qu'elles soient réutilisées : le
-//!    test **compte** ces témoins résiduels et les imprime (`--nocapture`), sans en faire
-//!    une assertion. Une assertion dans un sens figerait une limite en attendant qu'elle
-//!    disparaisse ; dans l'autre, elle rougirait sur une amélioration de SQLite.
+//! 2. **Octets bruts du fichier** — *assertion*. Ce test **comptait** les témoins purgés
+//!    encore lisibles dans les octets et les imprimait : c'était vrai tant que la purge
+//!    n'était que logique. Depuis que la connexion s'ouvre avec `secure_delete=ON` et que
+//!    la purge termine par un checkpoint tronquant, le compte vaut **0** — les octets que
+//!    la réécriture libère sont effacés, y compris les pages entières qu'elle rend au
+//!    libre, et le journal qui portait l'ancienne image de page est tronqué. Le constat est
+//!    donc devenu l'assertion qu'il mesurait : 0 témoin résiduel, fichier principal **et**
+//!    `-wal`. `VACUUM` n'est exécuté nulle part — ni ici ni dans la purge — et n'est pas
+//!    nécessaire à ce résultat : il compacterait le fichier, ce qui n'est pas la même
+//!    propriété.
 //!
-//! La limite elle-même est consignée — `VACUUM` **n'est pas exécuté**, ni ici ni dans la
-//! purge : un effacement physique du fichier demanderait un `VACUUM`, qui n'est déclenché
-//! nulle part.
+//! Le contrôle qui garde l'assertion honnête : les témoins des 200 lignes conservées
+//! doivent, eux, être présents — sans quoi l'absence serait verte sur un fichier vide,
+//! illisible, ou qui n'est pas celui qu'on a purgé.
 
 use std::path::Path;
 
@@ -138,7 +142,7 @@ async fn purged_bodies_are_gone_from_the_file() {
         assert_eq!(purged, PURGED, "250 terminaux − 200 conservés = 50 purgés");
     } // store ET poignée `QueueDb` lâchés → connexion fermée
 
-    // ── Mesure 2 (constat) : octets bruts, par fichier ────────────────────────────
+    // ── Mesure 2 (assertion) : octets bruts, par fichier ──────────────────────────
     let files = read_db_files(dir.path());
     let whole: String = files.iter().map(|(_, text)| text.as_str()).collect();
     for seq in (TOTAL - PURGED)..TOTAL {
@@ -146,25 +150,28 @@ async fn purged_bodies_are_gone_from_the_file() {
         assert!(
             whole.contains(&w),
             "témoin {w} (dans la fenêtre de conservation) doit survivre à la purge — \
-             sans lui, le constat ci-dessous ne prouverait rien : il serait vert parce que \
+             sans lui, l'absence ci-dessous ne prouverait rien : elle serait verte parce que \
              le fichier est vide ou illisible"
         );
     }
-    let mut residual_total = 0usize;
     for (name, text) in &files {
-        let residual = (0..PURGED)
+        let residual: Vec<u64> = (0..PURGED)
             .filter(|seq| text.contains(&witness(*seq)))
-            .count();
-        residual_total += residual;
-        eprintln!(
-            "purge L-C — {name} : {residual}/{PURGED} témoins purgés encore lisibles dans les \
-             octets bruts (pages libérées, VACUUM non exécuté)"
+            .collect();
+        assert!(
+            residual.is_empty(),
+            "purge L-C — {name} : {}/{PURGED} témoins purgés encore lisibles dans les octets \
+             bruts (lignes {:?}) ; attendu 0 : secure_delete=ON + checkpoint tronquant \
+             effacent les octets que la réécriture libère, pages d'overflow comprises. \
+             VACUUM n'est pas exécuté et n'est pas nécessaire",
+            residual.len(),
+            residual,
         );
     }
     eprintln!(
-        "purge L-C — total : {residual_total}/{PURGED} témoins purgés présents dans les \
-         octets du fichier ; la purge est LOGIQUE (la ligne ne porte plus le corps), elle \
-         n'est pas physique"
+        "purge L-C — {} fichier(s) relu(s) en octets bruts : 0/{PURGED} témoin purgé \
+         résiduel ; la purge retire le corps de la ligne ET les octets qu'il occupait",
+        files.len(),
     );
 
     // ── Mesure 1 (assertion) : la colonne `payload`, fichier rouvert ──────────────

@@ -64,17 +64,35 @@ pub struct PrivacyPass {
     /// observable signal that `window_overlap_bytes` is shorter than the entities
     /// the detector can report.
     pub touching_window_edge: u64,
+    /// Spans the exception pass dropped, counted per **pattern identifier**.
+    ///
+    /// The identifier is a digest of the configured pattern, never the pattern: an
+    /// exception list is literal personal data by nature, and this payload ends up in
+    /// a metric label. An observer may therefore alert on *which* configured exception
+    /// fires and how often, and can never read back the literal it holds.
+    ///
+    /// Keys are sorted, and a pattern that covered nothing is absent rather than
+    /// present at zero: the map states what fired, not what was declared.
+    pub exception_hits: std::collections::BTreeMap<String, u64>,
 }
 
 impl PrivacyPass {
-    /// Builds a [`PrivacyPass`] from its fields.
+    /// Builds a [`PrivacyPass`] from its fields, with no exception firing recorded.
     ///
     /// Eight arguments rather than a params struct: this is the seam's **wire shape**,
     /// and the counters it carries are flat by design — one field per observable
     /// quantity, so an installer reads exactly the names the metric labels use. A
-    /// struct would move the same eight fields one level down without bounding
-    /// anything, and would hide from a reader that the report is closed: every value
-    /// here is a count or a bounded status, never a body, a label or an identity.
+    /// struct would move the same fields one level down without bounding anything,
+    /// and would hide from a reader that the report is closed: every value here is a
+    /// count, a bounded status or an identifier that is a digest — never a body, a
+    /// pattern or an identity.
+    ///
+    /// The exception firings are the one part a caller adds separately, through
+    /// [`Self::with_exception_hits`]: they are the only field whose *keys* a
+    /// configuration mints, and keeping them out of the constructor is what let the
+    /// activation be delivered without moving a signature an installer already compiled
+    /// against. A pass built here and never given firings reports none, which is the
+    /// ordinary case for a deployment that declares no exception.
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
@@ -99,7 +117,20 @@ impl PrivacyPass {
             rejected_out_of_bounds,
             rejected_utf8_boundary,
             touching_window_edge,
+            exception_hits: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Records the exception firings this pass exercised, keyed by pattern identifier.
+    ///
+    /// See [`Self::exception_hits`] for why the keys are digests and never patterns.
+    #[must_use]
+    pub fn with_exception_hits(
+        mut self,
+        exception_hits: std::collections::BTreeMap<String, u64>,
+    ) -> Self {
+        self.exception_hits = exception_hits;
+        self
     }
 }
 

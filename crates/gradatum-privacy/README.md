@@ -2,14 +2,23 @@
 
 > Regex-based floor detector and span geometry for the gradatum personal-data detection frontier.
 
-**Status**: Apache-2.0. Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
+**Status**: v2.5.0 — public, Apache-2.0. Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
 
 `gradatum-privacy` supplies the always-available detector that sits beneath any heavier
 model detector at the personal-data frontier. `RegexDetector` implements
 `gradatum_core::pii::PiiDetector` with a small, deterministic set of patterns (e-mail, IBAN,
-French phone numbers, French social-security numbers) and depends on no external process.
+French phone numbers, French social-security numbers, addresses) and depends on no external
+process.
+
+An *address* here is an IPv4 address with an optional port or prefix length, an IPv6 address,
+or a `/mnt` mount path. Each pattern is checked against its surrounding bytes after matching,
+because a regex has no lookaround: a ten-digit run is a phone number only when nothing around
+it says timestamp or identifier, and a four-group dotted run is an address only when its
+boundary says so. The floor is deliberately precise rather than eager — it does not report the
+loopback range, the unspecified address, or IPv6 spellings shorter than the compressed form it
+accepts, all of which cost it recall rather than precision.
 
 The crate also carries the geometry a detector needs around it:
 

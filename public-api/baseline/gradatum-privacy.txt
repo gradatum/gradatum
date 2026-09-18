@@ -13,11 +13,45 @@ impl core::default::Default for gradatum_privacy::RegexDetector
 pub fn gradatum_privacy::RegexDetector::default() -> Self
 impl gradatum_core::pii::PiiDetector for gradatum_privacy::RegexDetector
 pub fn gradatum_privacy::RegexDetector::detect(&self, &gradatum_core::pii::DetectInput<'_>) -> core::result::Result<gradatum_core::pii::Detection, gradatum_core::pii::PiiDetectError>
+#[non_exhaustive] pub struct gradatum_privacy::SidecarConfig
+pub gradatum_privacy::SidecarConfig::binary_digest: alloc::string::String
+pub gradatum_privacy::SidecarConfig::breaker_n: u32
+pub gradatum_privacy::SidecarConfig::cooldown_s: u64
+pub gradatum_privacy::SidecarConfig::max_input_bytes: usize
+pub gradatum_privacy::SidecarConfig::model_digest: alloc::string::String
+pub gradatum_privacy::SidecarConfig::score_mode: alloc::string::String
+pub gradatum_privacy::SidecarConfig::socket_path: std::path::PathBuf
+pub gradatum_privacy::SidecarConfig::timeout_ms_sync_per_kib: u64
+pub gradatum_privacy::SidecarConfig::window_overlap_bytes: usize
+impl gradatum_privacy::SidecarConfig
+pub fn gradatum_privacy::SidecarConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gradatum_privacy::SidecarConfig::with_breaker(self, u32, u64) -> Self
+pub fn gradatum_privacy::SidecarConfig::with_max_input_bytes(self, usize) -> Self
+pub fn gradatum_privacy::SidecarConfig::with_score_mode(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn gradatum_privacy::SidecarConfig::with_timeout_ms_sync_per_kib(self, u64) -> Self
+pub fn gradatum_privacy::SidecarConfig::with_window_overlap_bytes(self, usize) -> Self
+pub struct gradatum_privacy::SidecarDetector
+impl gradatum_privacy::SidecarDetector
+pub fn gradatum_privacy::SidecarDetector::connect(gradatum_privacy::SidecarConfig) -> core::result::Result<Self, gradatum_core::pii::PiiDetectError>
+pub fn gradatum_privacy::SidecarDetector::diagnostics(&self) -> gradatum_privacy::SidecarDiagnostics
+impl gradatum_core::pii::PiiDetector for gradatum_privacy::SidecarDetector
+pub fn gradatum_privacy::SidecarDetector::detect(&self, &gradatum_core::pii::DetectInput<'_>) -> core::result::Result<gradatum_core::pii::Detection, gradatum_core::pii::PiiDetectError>
+pub fn gradatum_privacy::SidecarDetector::identity(&self) -> core::option::Option<gradatum_core::pii::DetectorIdentity>
+#[non_exhaustive] pub struct gradatum_privacy::SidecarDiagnostics
+pub gradatum_privacy::SidecarDiagnostics::available: bool
+pub gradatum_privacy::SidecarDiagnostics::breaker_open: bool
+pub gradatum_privacy::SidecarDiagnostics::breaker_openings: u64
+pub gradatum_privacy::SidecarDiagnostics::labels_v: core::option::Option<alloc::string::String>
+pub gradatum_privacy::SidecarDiagnostics::mapping_v: core::option::Option<i64>
+pub gradatum_privacy::SidecarDiagnostics::window_edge_spans: u64
 #[non_exhaustive] pub struct gradatum_privacy::WindowPlan
 pub gradatum_privacy::WindowPlan::max_input_bytes: usize
 pub gradatum_privacy::WindowPlan::overlap_bytes: usize
 impl gradatum_privacy::WindowPlan
 pub const fn gradatum_privacy::WindowPlan::new(usize, usize) -> Self
 pub fn gradatum_privacy::WindowPlan::windows<'a>(&self, &'a str) -> alloc::vec::Vec<(usize, &'a str)>
+pub const gradatum_privacy::ADAPTER_TABLE_V: u16
+pub const gradatum_privacy::MAX_RESPONSE_FRAME_BYTES: usize
+pub const gradatum_privacy::SUPPORTED_MAPPING_V_MIN: i64
 pub fn gradatum_privacy::rebase(&mut [gradatum_core::pii::PiiSpan], usize)
 pub fn gradatum_privacy::validate_and_merge(&str, alloc::vec::Vec<gradatum_core::pii::PiiSpan>) -> (alloc::vec::Vec<gradatum_core::pii::PiiSpan>, gradatum_privacy::MergeStats)

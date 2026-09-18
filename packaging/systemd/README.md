@@ -220,14 +220,21 @@ journalctl -u gradatum-gateway-spike -f
 After deployment, run the smoke test:
 
 ```bash
-GRADATUM_API_KEY=<api-key> bash scripts/smoke-alpha-4.sh
+GRADATUM_API_KEY=<api-key> bash scripts/smoke-post-deploy-1.sh
 ```
 
 The script executes 7 acceptance steps. It authenticates through the standard
 flow (api-key → `POST /auth/exchange` → JWT), so it needs an api-key: either
 `GRADATUM_API_KEY` in the environment, or a readable `API_KEY_FILE`
-(default `/etc/gradatum/gradatum-mcp.api-key`, mode `0600` owned by `gradatum`
-— an unprivileged account cannot read it, hence the environment variable above).
+(default `/etc/gradatum/probe-smoke-post-deploy.api-key`, mode `0600` owned by
+`gradatum` — an unprivileged account cannot read it, hence the environment
+variable above). The credential belongs to an identity the ACL preset declares
+with the bounded locus the smoke needs; no unknown-identity escape hatch is
+involved. The companion `scripts/smoke-post-deploy-2.sh` covers the credential
+lifecycle (create → exchange → revoke) and mints its own key instead, under a
+second declared identity (`smoke-dyn`): an identity carries one active key, and
+this static probe holds `smoke`, so minting under the same identity would be
+refused for as long as the deployment is nominal.
 
 Exit codes: `0` = PASS (all 7 steps verified), `1` = FAIL, `2` = INCOMPLETE or
 gate not executed (missing api-key, unreachable server, skipped step). A run

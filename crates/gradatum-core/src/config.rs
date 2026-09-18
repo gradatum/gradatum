@@ -147,7 +147,17 @@ pub struct VaultSection {
     /// Default tenant. `None` → `"main"` applied by the storage layer.
     pub default_tenant_id: Option<String>,
 
-    /// Expected SQLite schema version. `None` → no strict version check.
+    /// Expected storage-format version. `None` → no strict version check.
+    ///
+    /// **Not enforced — nothing reads this field.** The check it anticipates was never
+    /// implemented. A 2.x state must stay readable without demanding a version that no
+    /// migration writes, and refusing to boot on an existing corpus would be a worse
+    /// failure than the silence it removes. Stating a value here, or stating none, has the
+    /// same effect: no strict version check — by decision, not by omission.
+    ///
+    /// **What would flip it.** When the store changes, this field becomes the version of the
+    /// *format* rather than of the schema, and the check stops being optional — a reader
+    /// that cannot tell two formats apart has no safe default.
     pub schema_version: Option<u32>,
 }
 

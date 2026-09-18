@@ -1,4 +1,4 @@
-//! E2E tests for `GET /api/v1/project-map/cards?version=<v>`.
+//! E2E tests for `GET /api/v1/project-map/cards?version=<v>&project=<p>`.
 //!
 //! The endpoint has existed since 2.2.0 — this file cannot go red on a missing
 //! route. The non-vacuity guard is that every assertion pins a **literal value**
@@ -18,7 +18,10 @@
 //! Cases: (a) `?version=2.4.0` → exactly card A ; (b) `?version=v2.4.0` → same (the `v`
 //! prefix is normalised) ; (c) no `version` → the `gradatum` cards including the interne
 //! one and **without** the `autre` one ; (d) the garbage note never appears ; (e) an
-//! unknown version → empty list and 200, never 404.
+//! unknown version → empty list and 200, never 404 ; (f) no `project` → the `gradatum`
+//! cards (the parameter defaults, it does not disable the filter) ; (g) `?project=autre`
+//! → exactly card D (the second project is reachable by name) ; (h) an unknown project →
+//! `[]`, and `?project=gradatum` ≡ the default.
 //!
 //! The last two tests prove the discriminating power of `project_map_card_index` directly
 //! (P1-6): mechanical, replayable by a third party, zero transient mutation of the tree.
@@ -300,15 +303,80 @@ async fn unknown_version_returns_empty_list_and_200() {
     assert!(entries.is_empty(), "version inexistante → [] : {entries:?}");
 }
 
+// (f) No `project` parameter: the handler defaults to `gradatum`. Card D (`project:autre`)
+//     is off that default and must not appear — a default of `None` (all projects) would
+//     make this test green on cardinality alone, so the literal feature list is the pin.
+#[tokio::test]
+async fn list_cards_defaults_to_gradatum_project() {
+    let (app, state, idx) = build_app(TEST_ACL).await;
+    let token = sign(&state);
+    seed_fixture(&idx).await;
+
+    let entries = cards_json(&app, &token, "").await;
+
+    let features: Vec<&str> = entries
+        .iter()
+        .map(|e| e["feature"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        features,
+        vec!["F-300", "F-301", "F-302"],
+        "défaut = projet gradatum, la carte autre (F-303) exclue : {entries:?}"
+    );
+}
+
+// (g) `?project=autre` — the filter reaches the second project. Value pinned literally:
+//     F-303 is the only card carrying `[[project:autre]]`.
+#[tokio::test]
+async fn list_cards_project_param_filters_to_named_project() {
+    let (app, state, idx) = build_app(TEST_ACL).await;
+    let token = sign(&state);
+    seed_fixture(&idx).await;
+
+    let entries = cards_json(&app, &token, "?project=autre").await;
+
+    assert_eq!(
+        entries.len(),
+        1,
+        "un seul porteur de [[project:autre]] : {entries:?}"
+    );
+    assert_eq!(entries[0]["feature"], "F-303");
+    assert_eq!(entries[0]["id"], ID_D);
+    assert_eq!(entries[0]["version"], "v1.0.0");
+}
+
+// (h) An unknown project name → empty list and 200, never 404 and never an unfiltered
+//     fallback. `project=gradatum` (the default) and the explicit parameter agree.
+#[tokio::test]
+async fn unknown_project_returns_empty_list_and_explicit_default_agrees() {
+    let (app, state, idx) = build_app(TEST_ACL).await;
+    let token = sign(&state);
+    seed_fixture(&idx).await;
+
+    let unknown = cards_json(&app, &token, "?project=inexistant").await;
+    assert!(unknown.is_empty(), "projet inexistant → [] : {unknown:?}");
+
+    let explicit = cards_json(&app, &token, "?project=gradatum").await;
+    let defaulted = cards_json(&app, &token, "").await;
+    let features = |v: &[serde_json::Value]| -> Vec<String> {
+        v.iter()
+            .map(|e| e["feature"].as_str().unwrap_or("").to_string())
+            .collect()
+    };
+    assert_eq!(
+        features(&explicit),
+        features(&defaulted),
+        "?project=gradatum ≡ défaut"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Discriminating power — `project_map_card_index` called directly (P1-6)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// DETTE NOMMÉE (Step 4) : le handler `list_cards` câble `project_filter` en dur à
-// `Some("gradatum")` (`crates/gradatum-server/src/api_v1/project_map.rs`, l. ~408) — il
-// n'existe aucun paramètre de requête pour lister les cartes d'un autre projet. Non traité
-// dans ce lot. Les tests ci-dessous appellent la projection directement pour exercer, et
-// discriminer, les deux filtres (version, projet) que le handler fige.
+// The handler exposes both axes as query parameters (`version`, `project`), the latter
+// defaulting to `gradatum`. The tests below call the projection directly to exercise, and
+// discriminate, the two filters the handler forwards — independently of the HTTP layer.
 
 // (i) Project filter — cardinality AND content differ. `version_filter` is `None` in both:
 //     the version filter applies *before* the project filter, so a non-null version here

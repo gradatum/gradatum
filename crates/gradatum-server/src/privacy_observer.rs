@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use gradatum_vault::{PrivacyObserver, PrivacyPass};
 
-use crate::metrics::{AppMetrics, PrivacyCategoryLabel, PrivacyLabelLabel, PrivacyReasonLabel};
+use crate::metrics::{
+    AppMetrics, PrivacyCategoryLabel, PrivacyLabelLabel, PrivacyPatternLabel, PrivacyReasonLabel,
+};
 
 /// The single label value the unmapped-label series is fed under.
 ///
@@ -109,6 +111,23 @@ impl PrivacyObserver for MetricsPrivacyObserver {
             self.metrics
                 .privacy_spans_window_edge
                 .inc_by(pass.touching_window_edge);
+        }
+
+        // The exceptions the configuration declared and this write actually exercised. The
+        // key is the **pattern identifier** the pass computed — a digest — and never the
+        // configured literal: an exception list names real values by nature, and a label is
+        // the one place this process writes text that outlives the request. Cardinality is
+        // bounded by the operator's own configuration, so a series per pattern is a
+        // deliberate trade: it answers "which exception is doing the work" (a stale literal,
+        // a pattern permissive enough to cover legitimate data) without ever restating it.
+        // An empty map renders nothing, which is the ordinary case.
+        for (pattern_id, hits) in &pass.exception_hits {
+            self.metrics
+                .privacy_exception_hits
+                .get_or_create(&PrivacyPatternLabel {
+                    pattern_id: pattern_id.clone(),
+                })
+                .inc_by(*hits);
         }
 
         // The completed/unfinished partition. The key is the **resolved** verdict and not

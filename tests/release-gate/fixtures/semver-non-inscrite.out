@@ -1,23 +1,22 @@
-# FIXTURE CONSTRUITE — lire ceci avant de la « corriger ».
+# CONSTRUCTED FIXTURE — read this before "fixing" it.
 #
-# Role : prouver qu'au rang MINEUR une rupture NON INSCRITE a RELEASE-MANIFEST.yaml
-# fait BLOQUER le garde. C'est la seule epreuve de ce regime, et 2.1.0 est taguee
-# sous ce regime precis.
+# Role: prove that under a MINOR rank a break NOT REGISTERED in the fixture inventory
+# (fixtures/inventaire-nomme.yaml, the one this specimen injects) makes the gate BLOCK.
+# It is the only evidence of that regime.
 #
-# Le symbole `__FixtureNeverInventoried::Synthetic` est SYNTHETIQUE A DESSEIN :
-# il n'appartient a aucune crate du projet et ne figure sur aucune feuille de route,
-# donc il ne pourra JAMAIS etre inscrit a l'inventaire.
+# Le symbole `__FixtureNeverInventoried::Synthetic` is SYNTHETIC BY DESIGN: it belongs to
+# no crate of the project and appears on no roadmap, so it can NEVER be registered in an
+# inventory.
 #
-# Pourquoi : cette fixture citait auparavant `variant KindKind::Task 5 -> 3`, une
-# rupture REELLE du projet. Le lot 2.1.0 l'a legitimement inscrite au manifeste
-# (F-220, corollaire du retrait de Chore/Spike) — l'appariement a donc reussi, le
-# classificateur a rendu PASS, et l'epreuve a cesse de prouver quoi que ce soit
-# SANS QUE RIEN NE CASSE VISIBLEMENT ailleurs. Une eprouvette dont la validite depend
-# de l'etat de la feuille de route n'est pas une eprouvette.
+# Why: this fixture used to cite `variant KindKind::Task 5 -> 3`, a REAL break of the
+# project. A release lot legitimately registered it in the manifest (a corollary of the
+# Chore/Spike removal) — the break then matched, the classifier returned PASS, and the
+# specimen stopped proving anything WITHOUT ANYTHING ELSE BREAKING VISIBLY. A specimen
+# whose validity depends on the state of the roadmap is not a specimen.
 #
-# INVARIANT : ne jamais remplacer ce symbole par une rupture reelle, meme « pas encore
-# inscrite » — toute rupture reelle est destinee a etre inscrite un jour, ce qui
-# reproduirait exactement le meme faux vert.
+# INVARIANT: never replace this symbol with a real break, not even an "as yet unregistered"
+# one — every real break is destined to be registered one day, which would reproduce exactly
+# the same false green.
 #
 # Le reste du fichier est une sortie reelle de cargo-semver-checks 0.50 (vs
 # internal/2.0.8, 2026-08-23), inchangee a l'octet pres : le lint, la forme du bloc

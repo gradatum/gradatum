@@ -53,6 +53,17 @@ impl DocumentStore for SqliteIndex {
         self.get_note_inner(tenant_id, note_id_ulid).await
     }
 
+    /// Batched note read — delegates to `SqliteIndex::get_notes_many_inner`, which issues
+    /// one `WHERE id IN (…)` statement per chunk of 998 identifiers instead of the trait
+    /// default's one statement per identifier.
+    async fn get_notes_many(
+        &self,
+        tenant_id: &str,
+        note_ids: &[String],
+    ) -> Result<Vec<NoteRecord>, GradatumError> {
+        self.get_notes_many_inner(tenant_id, note_ids).await
+    }
+
     /// Lists notes by status — delegates to the `list_by_status` inherent method.
     async fn list_by_status(
         &self,

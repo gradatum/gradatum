@@ -1,6 +1,13 @@
-//! Vérifie que les 4 PRAGMA C12 sont appliquées à l'ouverture de la Queue.
+//! Vérifie que les PRAGMA C12 sont appliquées à l'ouverture de la Queue.
 //!
 //! Spec §0.3 contrainte C12.
+//!
+//! `secure_delete = ON` s'ajoute aux quatre : une purge qui réécrit une ligne doit
+//! effacer les octets qu'elle libère, sans quoi la donnée n'est retirée que logiquement
+//! et reste lisible dans le fichier. `ON` et non `FAST` : un corps de job plus gros
+//! qu'une page — `CurateSpec.body` n'est pas borné — est stocké dans des pages
+//! d'overflow, que `FAST` rend au libre avec leurs octets intacts. La valeur relue est
+//! `1` (ON), `2` valant `FAST` et `0` `OFF`.
 
 // Rétrocompatibilité P2.0b : LegacyQueue préserve l'API rusqlite Phase 1.
 use gradatum_queue::LegacyQueue as Queue;
@@ -27,6 +34,9 @@ async fn pragmas_applied_at_open() {
 
     let foreign_keys: i64 = q.pragma_value("foreign_keys").await.unwrap();
     assert_eq!(foreign_keys, 1);
+
+    let secure_delete: i64 = q.pragma_value("secure_delete").await.unwrap();
+    assert_eq!(secure_delete, 1, "secure_delete=ON (1) attendu");
 }
 
 /// Sur base fichier, WAL doit être actif (pas de fallback MEMORY).
@@ -51,4 +61,7 @@ async fn pragmas_applied_at_open_file_db() {
 
     let foreign_keys: i64 = q.pragma_value("foreign_keys").await.unwrap();
     assert_eq!(foreign_keys, 1);
+
+    let secure_delete: i64 = q.pragma_value("secure_delete").await.unwrap();
+    assert_eq!(secure_delete, 1, "secure_delete=ON (1) attendu");
 }

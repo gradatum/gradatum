@@ -53,7 +53,7 @@
 //! tags has no way to express either of them.
 
 use gradatum_core::identity::ContentHash;
-use gradatum_core::pii::{DetectorIdentity, PiiSpan, PrivacyBudgets};
+use gradatum_core::pii::{DetectorIdentity, PiiSpan, PrivacyBudgets, PrivacyPolicy, score_m};
 use gradatum_core::tag::{ReservedTag, Tag};
 use sha2::{Digest, Sha256};
 
@@ -99,12 +99,22 @@ pub(crate) const MAX_SPANS: usize = 256;
 /// Version of the block layout a reader must expect.
 const BLOCK_VERSION: i64 = 1;
 
-/// Effective mode recorded by the block. `mask` is delivered disabled: the pass
-/// reports, it never rewrites a body.
+/// Effective mode recorded by the block when the policy reports and never rewrites.
 const MODE_REPORT_ONLY: &str = "report_only";
+
+/// Effective mode recorded by the block when the policy rewrites the bodies it
+/// scans.
+///
+/// Read from the policy, never from a constant: the mode a note carries is the mode
+/// its pass actually ran under, and a note that claims `report_only` while its body
+/// was rewritten is a false record of what happened to it.
+const MODE_MASK: &str = "mask";
 
 /// Review state of a freshly written block: a human verdict is a separate act,
 /// applied by the review surface, never by a pass.
+/// Key the human verdict is written under inside the block.
+const REVIEW_KEY: &str = "review";
+
 const REVIEW_PENDING: &str = "pending";
 
 /// Review state of a block a human accepted.
@@ -210,7 +220,7 @@ impl Review {
     /// data in a note a foreign writer could have produced, and an unknown spelling
     /// must not be able to retire a marker.
     fn of(block: &toml::Value) -> Self {
-        match block.get("review").and_then(toml::Value::as_str) {
+        match block.get(REVIEW_KEY).and_then(toml::Value::as_str) {
             Some(REVIEW_ACCEPTED) => Self::Accepted,
             Some(REVIEW_REJECTED) => Self::Rejected,
             _ => Self::Pending,
@@ -255,6 +265,28 @@ pub(crate) fn binds_the_tag(block: &toml::Value, previous: Option<&toml::Value>)
     Review::of(block) == Review::Rejected && digest_of(block) == previous.and_then(digest_of)
 }
 
+/// Whether an incoming block is a verdict stated over a block the note already carries:
+/// the recorded block with [`REVIEW_KEY`] moved, and nothing else.
+///
+/// A block that enters a write is caller-supplied data on every path that has one, and
+/// the pass resolves a verdict out of it. What a caller may *state* is therefore bounded
+/// here rather than assumed: a block may only move the human verdict over a block the
+/// note already carries. A block that differs anywhere else is one the caller composed
+/// rather than one the note is shown to have received, and it reads as no verdict at all
+/// — the pass then re-judges from what is on disk, which is what it does when no block
+/// enters. Both directions of the bound matter: it is what lets the review surface record
+/// a verdict instead of having it recomputed, and it is what keeps a composed block from
+/// outranking a pass over spans no one judged.
+pub(crate) fn moves_only_the_review(incoming: &toml::Value, recorded: &toml::Value) -> bool {
+    let (Some(incoming), Some(recorded)) = (incoming.as_table(), recorded.as_table()) else {
+        return false;
+    };
+    incoming.len() == recorded.len()
+        && incoming
+            .iter()
+            .all(|(key, value)| key == REVIEW_KEY || recorded.get(key) == Some(value))
+}
+
 /// Compares two blocks ignoring `scanned_at`.
 ///
 /// The field is the pass's wall clock, so it differs between two passes that decided
@@ -277,33 +309,40 @@ pub(crate) fn same_block_modulo_scanned_at(a: &toml::Value, b: &toml::Value) -> 
     stripped(a) == stripped(b)
 }
 
-/// Whether a pass reported at least one span a marker can rest on.
+/// Whether a pass reported at least one span the activation policy marks.
 ///
-/// The threshold that decides is the detector's. Activation gates the *mount* — a
-/// detector is mounted only once a category is activated — and the spans a mounted
-/// detector reports are the ones that cleared its thresholds; the insertion point
-/// re-applies no threshold of its own, having none. What it can still assert is the
-/// clause's necessary condition: a strictly positive threshold is only ever cleared
-/// by a strictly positive score. A span at `score_m == 0` — the shape an observation
-/// threshold produces, and the reason `categories = []` tags nothing — poses no
-/// marker.
-fn markable(spans: &[PiiSpan]) -> bool {
-    spans.iter().any(|span| score_m(span.score) > 0)
+/// The decision is the policy's, and only the policy's: a span marks when its
+/// category is enabled **and** its threshold is strictly positive **and** its
+/// `score_m` clears that threshold. Three ways to fail, and each is a real state:
+///
+/// - the category is not in the enabled set — the detector may well have reported it
+///   (it reports what it sees), but a category the operator did not activate poses no
+///   marker;
+/// - the threshold is `0` — the observation point, which measures a distribution and
+///   never tags. This is what keeps `categories = []`, or a threshold set the campaign
+///   has not calibrated yet, from tagging a whole corpus;
+/// - the score is below a positive threshold.
+///
+/// A regex span is not a special case here: it carries the top of the scale, and
+/// clearing every threshold a policy can declare is exactly what that means.
+pub(crate) fn markable(spans: &[PiiSpan], policy: &PrivacyPolicy) -> bool {
+    spans.iter().any(|span| policy.marks(span))
 }
 
 /// The canonical category labels a marker can rest on, sorted and deduplicated.
 ///
-/// Derived from the same predicate as [`markable`] — a strictly positive score — so a
-/// count taken here and the marker the note ends up carrying cannot disagree: every
-/// label returned is one the pass would tag the note for, and a label the pass found
-/// only at score zero is not returned. Sorted and deduplicated because the caller
-/// reports these as bounded counter labels, and a label set that varied with the
-/// detector's span order would fragment one series into many.
+/// Derived from the same predicate as [`markable`] — the policy's marking decision —
+/// so a count taken here and the marker the note ends up carrying cannot disagree:
+/// every label returned is one the pass would tag the note for, and a label the pass
+/// found only under its threshold, or for a category it did not activate, is not
+/// returned. Sorted and deduplicated because the caller reports these as bounded
+/// counter labels, and a label set that varied with the detector's span order would
+/// fragment one series into many.
 #[must_use]
-pub(crate) fn markable_categories(spans: &[PiiSpan]) -> Vec<String> {
+pub(crate) fn markable_categories(spans: &[PiiSpan], policy: &PrivacyPolicy) -> Vec<String> {
     let mut labels: Vec<&'static str> = spans
         .iter()
-        .filter(|span| score_m(span.score) > 0)
+        .filter(|span| policy.marks(span))
         .map(|span| span.category.as_str())
         .collect();
     labels.sort_unstable();
@@ -355,14 +394,27 @@ where
 /// is applied here rather than at the caller: a pass reports what it saw, and the
 /// block decides how much of it fits.
 ///
+/// The **whole** span list is recorded, scores included, whatever the policy marks:
+/// the block is the matter a later calibration reads, and a span the activation
+/// thresholds left unmarked is precisely the observation the campaign is made of.
+/// What the policy decides is the tags — see [`verdict`] — never what is written
+/// down here. One exception, and it is the mode's: under `mask` the list is emptied,
+/// because the text those offsets describe was replaced by the time this block is
+/// persisted.
+///
 /// `review` is the human verdict this block carries: [`Review::Pending`] for a
 /// freshly judged pass, and the verdict the note already carried when the pass
 /// re-reports the very same spans — see [`verdict`], which is what decides it.
+///
+/// `policy` is recorded, not applied: the mode it ran under is written verbatim, and
+/// its fingerprint goes into `policy`, so a note scanned under one activation is
+/// distinguishable from the same note scanned under another.
 pub(crate) fn block(
     identity: &DetectorIdentity,
     status: Status,
     spans: &[PiiSpan],
     budgets: &PrivacyBudgets,
+    policy: &PrivacyPolicy,
     review: Review,
 ) -> Block {
     // The ceiling turns a completed pass into a truncated one: it is a property of
@@ -378,7 +430,14 @@ pub(crate) fn block(
     root.insert("v".to_owned(), toml::Value::Integer(BLOCK_VERSION));
     root.insert(
         "mode".to_owned(),
-        toml::Value::String(MODE_REPORT_ONLY.to_owned()),
+        toml::Value::String(
+            if policy.masks() {
+                MODE_MASK
+            } else {
+                MODE_REPORT_ONLY
+            }
+            .to_owned(),
+        ),
     );
     root.insert(
         "status".to_owned(),
@@ -420,7 +479,7 @@ pub(crate) fn block(
     );
     root.insert(
         "policy".to_owned(),
-        toml::Value::String(policy_digest(identity, budgets)),
+        toml::Value::String(policy_digest(identity, budgets, policy)),
     );
     root.insert(
         "spans_digest".to_owned(),
@@ -429,9 +488,18 @@ pub(crate) fn block(
     // Present even when empty: a pass that found nothing and a pass that never ran
     // are different states, and a missing key would collapse them.
     root.insert("counts".to_owned(), toml::Value::Table(counts(spans)));
+    // Emptied by the mode that destroyed what the list pointed at: under `mask` the
+    // offsets describe text the note no longer holds, and a block that kept them would
+    // be aiming a later reader — a review surface, a calibration export — at the filler.
+    // The counts survive, because a per-category tally names no offset, and so does the
+    // digest, which is what the next pass compares against.
     root.insert(
         "spans".to_owned(),
-        toml::Value::Array(carried.iter().map(span_value).collect()),
+        toml::Value::Array(if policy.masks() {
+            Vec::new()
+        } else {
+            carried.iter().map(span_value).collect()
+        }),
     );
 
     Block {
@@ -442,9 +510,13 @@ pub(crate) fn block(
 
 /// Resolves what one pass decides for the note that ran it.
 ///
-/// `previous` is the block the note carried before this write, when it carried one.
-/// It is the whole of the state this resolution reads: the verdict it holds, and the
-/// digest that tells whether that verdict still covers the spans being re-reported.
+/// `previous` is the block this write states, when it states one — the block the note
+/// carried before this write for every ordinary path, and the block the caller posts
+/// when it is the review surface moving `review` (D-13). It is the whole of the state
+/// this resolution reads: the verdict it holds, and the digest that tells whether that
+/// verdict still covers the spans being re-reported. The digest is the guard — a block
+/// that declares itself `rejected` over spans the pass no longer reports has its verdict
+/// spent like any other.
 ///
 /// The ordering is the one D-11 fixes: the caller re-reports the note's tags before
 /// this runs, and the pass recomputes after — so a completed pass is the only thing
@@ -454,6 +526,7 @@ pub(crate) fn verdict(
     status: Status,
     spans: &[PiiSpan],
     budgets: &PrivacyBudgets,
+    policy: &PrivacyPolicy,
     previous: Option<&toml::Value>,
 ) -> Verdict {
     // The digest covers the spans the block will carry, ceiling included, so a pass
@@ -468,7 +541,7 @@ pub(crate) fn verdict(
     // Built before the tags are decided, because the ceiling is one of the inputs:
     // a pass that reported more spans than a block carries is no longer the whole
     // picture, and the block is what says so.
-    let built = block(identity, status, spans, budgets, review);
+    let built = block(identity, status, spans, budgets, policy, review);
 
     let classified = if review == Review::Rejected {
         // The verdict was made about these spans and they have not moved: it binds
@@ -479,10 +552,10 @@ pub(crate) fn verdict(
         // An incomplete pass has no authority over what is personal data: it may add
         // the rescan marker, never retire the payload one.
         TagAction::Keep
-    } else if markable(spans) {
+    } else if markable(spans, policy) {
         TagAction::Pose
     } else {
-        // A completed pass that reports nothing a marker can rest on is the first of
+        // A completed pass that reports nothing the activation marks is the first of
         // the two legitimate removal paths.
         TagAction::Retire
     };
@@ -516,18 +589,6 @@ fn span_value(span: &PiiSpan) -> toml::Value {
         toml::Value::Integer(i64::from(score_m(span.score))),
     );
     toml::Value::Table(table)
-}
-
-/// Converts a score in `0.0..=1.0` into integer thousandths.
-///
-/// Clamped on both ends: a detector is a foreign process, and a score outside the
-/// contract must not be able to write a negative count or overflow the cast.
-#[must_use]
-pub(crate) fn score_m(score: f32) -> u16 {
-    if !score.is_finite() {
-        return 0;
-    }
-    (score.clamp(0.0, 1.0) * 1000.0).round() as u16
 }
 
 /// Counts of spans per category, over **every** span the pass reported.
@@ -581,15 +642,30 @@ pub(crate) fn spans_digest(spans: &[PiiSpan]) -> String {
 
 /// `policy` — the fingerprint of what this pass ran under.
 ///
-/// Projected over the two things the insertion point knows that change what a pass
-/// reports: the detector's declared identity, and the window/ceiling budget it was
-/// given. The activation thresholds, the enabled category set and the exceptions are
-/// server configuration and do not reach this point yet; when they do, they extend
-/// this projection and the digest moves with them — which is the intent, since a
-/// note scanned under a different policy should not claim to have been scanned
-/// under this one.
+/// Projected over everything that changes what a pass reports or what it marks: the
+/// detector's declared identity, the window/ceiling budget it was given, and the
+/// activation the pass applied — the enabled category set, each threshold in
+/// thousandths, and the exception patterns per tenant.
+///
+/// **Why the exceptions are covered without being published.** The exception lists
+/// are literal personal data by nature, and the digest is the one place they could
+/// leak: a fingerprint that rendered their text would put them in the `.md`, in
+/// `.history/`, in the index and in the object store. They go into the pre-image and
+/// never out of the result — the block carries the hash and nothing else, which is
+/// what makes "the same note scanned under a different activation" a visible
+/// difference and the activation itself unreadable.
+///
+/// The iteration order is canonical by construction: `BTreeMap` for the categories
+/// and for the tenants, declaration order for the patterns inside one tenant. Two
+/// policies that differ only in the order their configuration listed them are the
+/// same policy, and must fingerprint alike — otherwise every reload of an unchanged
+/// `server.toml` would look like a policy change.
 #[must_use]
-pub(crate) fn policy_digest(identity: &DetectorIdentity, budgets: &PrivacyBudgets) -> String {
+pub(crate) fn policy_digest(
+    identity: &DetectorIdentity,
+    budgets: &PrivacyBudgets,
+    policy: &PrivacyPolicy,
+) -> String {
     let mut canon = String::new();
     for (key, value) in [
         ("detector", identity.detector.as_str()),
@@ -612,6 +688,33 @@ pub(crate) fn policy_digest(identity: &DetectorIdentity, budgets: &PrivacyBudget
     canon.push_str("window_overlap_bytes=");
     canon.push_str(&budgets.window_overlap_bytes.to_string());
     canon.push('\n');
+    canon.push_str("mode=");
+    canon.push_str(if policy.masks() {
+        MODE_MASK
+    } else {
+        MODE_REPORT_ONLY
+    });
+    canon.push('\n');
+    for category in policy.enabled_categories() {
+        canon.push_str("category=");
+        canon.push_str(category.as_str());
+        canon.push(':');
+        // Unreachable for a category the policy enabled — every enabled category has
+        // a threshold by construction — and rendered as the uncalibrated point rather
+        // than skipped, so the pre-image's shape never depends on the map's contents.
+        canon.push_str(&policy.threshold_m(category).unwrap_or_default().to_string());
+        canon.push('\n');
+    }
+    for (tenant, patterns) in policy.exceptions() {
+        canon.push_str("exception_tenant=");
+        canon.push_str(tenant);
+        canon.push('\n');
+        for pattern in patterns {
+            canon.push_str("exception=");
+            canon.push_str(pattern);
+            canon.push('\n');
+        }
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(canon.as_bytes());
@@ -621,7 +724,7 @@ pub(crate) fn policy_digest(identity: &DetectorIdentity, budgets: &PrivacyBudget
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gradatum_core::pii::PiiCategory;
+    use gradatum_core::pii::{PiiCategory, THRESHOLD_MAX_M};
 
     fn identity() -> DetectorIdentity {
         DetectorIdentity::new(
@@ -636,6 +739,26 @@ mod tests {
 
     fn span(start: usize, len: usize) -> PiiSpan {
         PiiSpan::new(start, len, PiiCategory::Email, 0.5)
+    }
+
+    /// The activation the tests below run under.
+    ///
+    /// Marking is the policy's decision, so a test that stated none would run against
+    /// the empty policy — which marks nothing at all. This one enables the four
+    /// categories this suite exercises at a threshold of one thousandth: a span at
+    /// `0.5` clears it, and a span at `0.0` does not, which is the distinction the
+    /// `observation threshold ≠ marking threshold` rule rests on.
+    fn active_policy() -> PrivacyPolicy {
+        let mut thresholds = std::collections::BTreeMap::new();
+        for category in [
+            PiiCategory::Email,
+            PiiCategory::Phone,
+            PiiCategory::Secret,
+            PiiCategory::AccountNumber,
+        ] {
+            thresholds.insert(category, 1);
+        }
+        PrivacyPolicy::new(false, thresholds, std::collections::BTreeMap::new())
     }
 
     #[test]
@@ -659,20 +782,155 @@ mod tests {
     }
 
     #[test]
-    fn a_score_is_converted_to_integer_thousandths() {
-        assert_eq!(score_m(0.0), 0);
-        assert_eq!(score_m(1.0), 1000);
-        assert_eq!(score_m(0.94), 940);
-        assert_eq!(score_m(0.9399), 940);
-        assert_eq!(score_m(0.0004), 0);
+    fn a_threshold_above_the_span_score_leaves_the_note_unmarked() {
+        // A configuration that carries `thresholds` has to produce its effect: the
+        // same pass, the same span, and a different verdict on either side of the
+        // threshold. The comparison is on integer thousandths — 0.5 is 500 — and it is
+        // inclusive, so a threshold set exactly on the score still marks.
+        let marked = [PiiSpan::new(0, 3, PiiCategory::Email, 0.5)];
+        for (threshold, expected) in [
+            (0, TagAction::Retire), // not calibrated: observed, never marked
+            (1, TagAction::Pose),
+            (500, TagAction::Pose), // inclusive
+            (501, TagAction::Retire),
+            (THRESHOLD_MAX_M, TagAction::Retire),
+        ] {
+            let mut thresholds = std::collections::BTreeMap::new();
+            thresholds.insert(PiiCategory::Email, threshold);
+            let policy = PrivacyPolicy::new(false, thresholds, std::collections::BTreeMap::new());
+
+            let decided = verdict(
+                &identity(),
+                Status::Ok,
+                &marked,
+                &PrivacyBudgets::default(),
+                &policy,
+                None,
+            );
+            assert_eq!(
+                decided.classified, expected,
+                "a threshold of {threshold} thousandths against a span at 500"
+            );
+        }
     }
 
     #[test]
-    fn a_score_outside_the_contract_is_clamped_never_wrapped() {
-        assert_eq!(score_m(-3.0), 0, "a negative score is not a negative count");
-        assert_eq!(score_m(42.0), 1000);
-        assert_eq!(score_m(f32::NAN), 0);
-        assert_eq!(score_m(f32::INFINITY), 0, "an infinite score is no score");
+    fn a_category_the_configuration_does_not_enable_is_observed_but_never_marked() {
+        // The regex floor reports four categories whatever the configuration says.
+        // An operator whose activation list omits a category must not see the note
+        // tagged for a span of that category the detector happened to find in the
+        // same body — however unambiguous the pattern, and however high its score.
+        let spans = [PiiSpan::new(0, 3, PiiCategory::Address, 1.0)];
+        assert!(
+            active_policy().threshold_m(PiiCategory::Address).is_none(),
+            "the activation these tests run under does not enable this category"
+        );
+        let decided = verdict(
+            &identity(),
+            Status::Ok,
+            &spans,
+            &PrivacyBudgets::default(),
+            &active_policy(),
+            None,
+        );
+        assert_eq!(decided.classified, TagAction::Retire);
+        assert!(
+            markable_categories(&spans, &active_policy()).is_empty(),
+            "the reporter counts the categories the activation marks, not the ones the \
+             detector reported"
+        );
+
+        let enabled = [PiiSpan::new(0, 3, PiiCategory::Phone, 1.0)];
+        let mut thresholds = std::collections::BTreeMap::new();
+        thresholds.insert(PiiCategory::Phone, 900);
+        let policy = PrivacyPolicy::new(false, thresholds, std::collections::BTreeMap::new());
+        assert_eq!(
+            verdict(
+                &identity(),
+                Status::Ok,
+                &enabled,
+                &PrivacyBudgets::default(),
+                &policy,
+                None,
+            )
+            .classified,
+            TagAction::Pose,
+            "a regex span carries the top of the scale and is not subject to the threshold"
+        );
+    }
+
+    #[test]
+    fn the_block_records_the_mode_the_policy_ran_under() {
+        let report = block(
+            &identity(),
+            Status::Ok,
+            &[span(0, 3)],
+            &PrivacyBudgets::default(),
+            &active_policy(),
+            Review::Pending,
+        );
+        assert_eq!(
+            report.value.get("mode").and_then(toml::Value::as_str),
+            Some(MODE_REPORT_ONLY)
+        );
+
+        let masking = {
+            let mut thresholds = std::collections::BTreeMap::new();
+            thresholds.insert(PiiCategory::Email, 1);
+            PrivacyPolicy::new(true, thresholds, std::collections::BTreeMap::new())
+        };
+        let masked = block(
+            &identity(),
+            Status::Ok,
+            &[span(0, 3)],
+            &PrivacyBudgets::default(),
+            &masking,
+            Review::Pending,
+        );
+        assert_eq!(
+            masked.value.get("mode").and_then(toml::Value::as_str),
+            Some(MODE_MASK),
+            "the mode a note carries is the mode its pass actually ran under"
+        );
+    }
+
+    #[test]
+    fn the_policy_digest_moves_with_the_activation_but_never_spells_it() {
+        let budgets = PrivacyBudgets::default();
+        let base = policy_digest(&identity(), &budgets, &active_policy());
+
+        let mut other_threshold = std::collections::BTreeMap::new();
+        other_threshold.insert(PiiCategory::Email, 900);
+        assert_ne!(
+            base,
+            policy_digest(
+                &identity(),
+                &budgets,
+                &PrivacyPolicy::new(false, other_threshold, std::collections::BTreeMap::new())
+            ),
+            "a threshold the campaign moved is a policy the note did not run under"
+        );
+
+        let mut exceptions = std::collections::BTreeMap::new();
+        exceptions.insert("main".to_owned(), vec!["example.com".to_owned()]);
+        let mut thresholds = std::collections::BTreeMap::new();
+        thresholds.insert(PiiCategory::Email, 1);
+        let with_exception = policy_digest(
+            &identity(),
+            &budgets,
+            &PrivacyPolicy::new(false, thresholds, exceptions),
+        );
+        assert_ne!(base, with_exception, "the exceptions are covered");
+        assert!(
+            !with_exception.contains("example.com"),
+            "the digest is a hash: the patterns go into the pre-image, never out of \
+             the result"
+        );
+        assert_eq!(
+            base,
+            policy_digest(&identity(), &budgets, &active_policy()),
+            "the same activation fingerprints the same way"
+        );
     }
 
     #[test]
@@ -712,18 +970,21 @@ mod tests {
     #[test]
     fn the_policy_moves_with_the_identity_and_the_budget() {
         let budgets = PrivacyBudgets::default();
-        let base = policy_digest(&identity(), &budgets);
+        let base = policy_digest(&identity(), &budgets, &active_policy());
         assert!(base.starts_with("sha256:") && base.len() == 71);
 
         let mut renamed = identity();
         renamed.detector = "another-detector".to_owned();
-        assert_ne!(base, policy_digest(&renamed, &budgets));
+        assert_ne!(base, policy_digest(&renamed, &budgets, &active_policy()));
 
         let other_window = PrivacyBudgets::new(1_024, 512, 10_000, 2_000, 0, 20_000);
-        assert_ne!(base, policy_digest(&identity(), &other_window));
+        assert_ne!(
+            base,
+            policy_digest(&identity(), &other_window, &active_policy())
+        );
         assert_eq!(
             base,
-            policy_digest(&identity(), &PrivacyBudgets::default()),
+            policy_digest(&identity(), &PrivacyBudgets::default(), &active_policy()),
             "the same identity under the same budget is the same policy"
         );
     }
@@ -736,6 +997,7 @@ mod tests {
             Status::Ok,
             &spans,
             &PrivacyBudgets::default(),
+            &active_policy(),
             Review::Pending,
         );
         let root = built.value.as_table().expect("a table");
@@ -765,6 +1027,7 @@ mod tests {
             Status::DetectorUnavailable,
             &[],
             &PrivacyBudgets::default(),
+            &active_policy(),
             Review::Pending,
         );
         let root = built.value.as_table().expect("a table");
@@ -806,6 +1069,7 @@ mod tests {
             Status::Ok,
             &[PiiSpan::new(3, 5, PiiCategory::Email, 0.9399)],
             &PrivacyBudgets::default(),
+            &active_policy(),
             Review::Pending,
         );
         assert!(
@@ -822,6 +1086,7 @@ mod tests {
             status,
             spans,
             &PrivacyBudgets::default(),
+            &active_policy(),
             Review::Pending,
         )
         .value;
@@ -851,6 +1116,7 @@ mod tests {
             Status::Ok,
             &[span(0, 3)],
             &PrivacyBudgets::default(),
+            &active_policy(),
             None,
         );
         assert_eq!(decided.classified, TagAction::Pose);
@@ -868,6 +1134,7 @@ mod tests {
             Status::Ok,
             &[],
             &PrivacyBudgets::default(),
+            &active_policy(),
             None,
         );
         assert_eq!(
@@ -881,13 +1148,17 @@ mod tests {
     #[test]
     fn a_span_at_zero_score_does_not_mark_the_note() {
         let observation = [PiiSpan::new(0, 3, PiiCategory::Email, 0.0)];
-        assert!(!markable(&observation), "score_m == 0 clears no threshold");
+        assert!(
+            !markable(&observation, &active_policy()),
+            "score_m == 0 clears no threshold"
+        );
         assert_eq!(
             verdict(
                 &identity(),
                 Status::Ok,
                 &observation,
                 &PrivacyBudgets::default(),
+                &active_policy(),
                 None
             )
             .classified,
@@ -905,6 +1176,7 @@ mod tests {
                 status,
                 &[span(0, 3)],
                 &PrivacyBudgets::default(),
+                &active_policy(),
                 None,
             );
             assert_eq!(
@@ -926,6 +1198,7 @@ mod tests {
             Status::Ok,
             &spans,
             &PrivacyBudgets::default(),
+            &active_policy(),
             Some(&accepted),
         );
         assert_eq!(
@@ -940,6 +1213,7 @@ mod tests {
             Status::Ok,
             &[span(9, 3)],
             &PrivacyBudgets::default(),
+            &active_policy(),
             Some(&accepted),
         );
         assert_eq!(
@@ -959,6 +1233,7 @@ mod tests {
             Status::Ok,
             &spans,
             &PrivacyBudgets::default(),
+            &active_policy(),
             Some(&rejected),
         );
         assert_eq!(
@@ -972,6 +1247,7 @@ mod tests {
             Status::Ok,
             &[span(9, 3)],
             &PrivacyBudgets::default(),
+            &active_policy(),
             Some(&rejected),
         );
         assert_eq!(
@@ -1019,6 +1295,7 @@ mod tests {
             Status::Ok,
             &spans,
             &PrivacyBudgets::default(),
+            &active_policy(),
             None,
         );
         assert_eq!(

@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 #
-# run-upgrade-test.sh — harnais de montée de version 2.3.1 → 2.4.0.
+# run-upgrade-test.sh — harnais de montée de version 2.4.0 → 2.5.0.
 #
 # Il monte un état gradatum produit par la version PRÉCÉDENTE avec la version
 # COURANTE, et compare quatre relevés à tolérance nulle : migrations, listing,
 # recherche, export de cartes, comptes. Le retour arrière (redémarrage du
-# binaire 2.3.1 sur le répertoire MONTÉ) est exercé, pas supposé.
+# binaire 2.4.0 sur le répertoire MONTÉ) est exercé, pas supposé.
 #
 # Usage :
 #   bash tests/upgrade/run-upgrade-test.sh \
-#       --state <répertoire d'état 2.3.1> \
-#       --admin-bin-231 <chemin> --server-bin-231 <chemin> \
+#       --state <répertoire d'état 2.4.0> \
 #       --admin-bin-240 <chemin> --server-bin-240 <chemin> \
+#       --admin-bin-250 <chemin> --server-bin-250 <chemin> \
 #       [--port N] [--out <répertoire>] \
-#       [--worker-bin-240 <chemin>] [--fault-inject none|delete-note]
+#       [--worker-bin-250 <chemin>] [--fault-inject none|delete-note]
 #
 #   --state            état produit par `gen-fixture.sh` (hors dépôt).
-#   --admin-bin-231    `gradatum-admin` 2.3.1 — export des cartes du relevé AVANT.
-#   --server-bin-231   `gradatum-server` 2.3.1 — le serveur AVANT et le retour arrière.
-#   --admin-bin-240    `gradatum-admin` 2.4.0 — export des cartes des relevés APRÈS.
-#   --server-bin-240   `gradatum-server` 2.4.0 — le serveur MONTÉ.
+#   --admin-bin-240    `gradatum-admin` 2.4.0 — export des cartes du relevé AVANT.
+#   --server-bin-240   `gradatum-server` 2.4.0 — le serveur AVANT et le retour arrière.
+#   --admin-bin-250    `gradatum-admin` 2.5.0 — export des cartes des relevés APRÈS.
+#   --server-bin-250   `gradatum-server` 2.5.0 — le serveur MONTÉ.
 #   --port N           port d'API. Défaut : celui inscrit dans la configuration de
 #                      l'état (`<state>/config/server.toml`), qui fait foi — les
 #                      trois ports dérivés (métriques N+1, API interne N+2,
@@ -29,7 +29,7 @@
 #                      celui de l'état mesuré.
 #   --out              répertoire des mesures (hors dépôt). Défaut :
 #                      `<état>/../mesures-montee`.
-#   --worker-bin-240   OPTIONNEL, hors commande CI. Sans lui, l'axe F-XX (ruling
+#   --worker-bin-250   OPTIONNEL, hors commande CI. Sans lui, l'axe F-XX (ruling
 #                      E4) est exercé jusqu'à l'enfilement : l'allocation du
 #                      numéro et l'injection du rôle sont prouvées sur le travail
 #                      enfilé, la MATÉRIALISATION de la carte ne l'est pas (elle
@@ -39,6 +39,20 @@
 #                      de l'index entre le relevé AVANT et le relevé APRÈS : c'est
 #                      la preuve de rouge du brief (Step 5-ii), et elle doit
 #                      nommer la note. Jamais 0 dans ce mode.
+#
+# La clé (e) « export de cartes » est comparée selon le SENS de la comparaison,
+# et la force retenue est écrite dans chaque rapport de parité :
+#   montée (2.4.0 → 2.5.0)   force `additif` — l'export est un RAPPORT, son
+#                            dialecte peut GAGNER des clés. Chaque entrée du
+#                            relevé AVANT doit être égale à l'entrée du relevé
+#                            MONTÉ projetée sur les clés du dialecte AVANT (même
+#                            nombre de cartes, même ordre) ; une clé AVANT qui
+#                            disparaît ou change de valeur est un écart, et une
+#                            clé ajoutée est relevée puis exigée CITÉE dans le
+#                            guide de montée — sans guide lisible, la clé n'est
+#                            pas mesurée du tout (code 2).
+#   retour arrière (2.4.0)   force `strict` — c'est le MÊME binaire des deux
+#                            côtés : octet à octet (sha256 + cmp), rien ne bouge.
 #
 # Codes de retour :
 #   0  parité prouvée sur toutes les clés bloquantes, retour arrière exercé
@@ -70,12 +84,18 @@ readonly REPO_ROOT
 # que ceux de l'état mesuré.
 readonly -a FORBIDDEN_PORTS=(8436 19090 19091 19092 19094 19190)
 
+# Le manifeste de la fixture porte les attendus de l'état mesuré, dont le nombre
+# de cartes de fonctionnalité que l'export DOIT rendre. Il est LU — sans lui, le
+# seuil de non-vacuité de l'export serait postulé, et un seuil postulé ne
+# distingue pas « l'export est intact » de « l'export est vide ».
+readonly MANIFEST="$SCRIPT_DIR/fixture/manifest.jsonl"
+
 STATE=""
-ADMIN_231=""
-SERVER_231=""
 ADMIN_240=""
 SERVER_240=""
-WORKER_240=""
+ADMIN_250=""
+SERVER_250=""
+WORKER_250=""
 PORT=""
 OUT=""
 FAULT_INJECT="none"
@@ -84,6 +104,10 @@ SERVER_PID=""
 WORKER_PID=""
 RUN_RC=0
 PHASE_START=0
+# Relevés d'export pris, et combien d'entre eux n'ont PAS satisfait l'assertion
+# de non-vacuité. Comptés à part du verdict : ils disent sur quoi il a porté.
+EXPORT_RELEVES=0
+EXPORT_ECHECS=0
 
 log()  { printf '[montee] %s\n' "$*" >&2; }
 die()  { local rc="$1"; shift; printf '[montee] NON EXÉCUTÉ: %s\n' "$*" >&2; exit "$rc"; }
@@ -98,11 +122,11 @@ usage() {
 while (($#)); do
   case "$1" in
     --state)          STATE="${2-}";       shift 2 ;;
-    --admin-bin-231)  ADMIN_231="${2-}";   shift 2 ;;
-    --server-bin-231) SERVER_231="${2-}";  shift 2 ;;
     --admin-bin-240)  ADMIN_240="${2-}";   shift 2 ;;
     --server-bin-240) SERVER_240="${2-}";  shift 2 ;;
-    --worker-bin-240) WORKER_240="${2-}";  shift 2 ;;
+    --admin-bin-250)  ADMIN_250="${2-}";   shift 2 ;;
+    --server-bin-250) SERVER_250="${2-}";  shift 2 ;;
+    --worker-bin-250) WORKER_250="${2-}";  shift 2 ;;
     --port)           PORT="${2-}";        shift 2 ;;
     --out)            OUT="${2-}";         shift 2 ;;
     --fault-inject)   FAULT_INJECT="${2-}"; shift 2 ;;
@@ -112,10 +136,10 @@ while (($#)); do
 done
 
 [[ -n "$STATE"      ]] || die 2 "--state est requis"
-[[ -n "$ADMIN_231"  ]] || die 2 "--admin-bin-231 est requis"
-[[ -n "$SERVER_231" ]] || die 2 "--server-bin-231 est requis"
 [[ -n "$ADMIN_240"  ]] || die 2 "--admin-bin-240 est requis"
 [[ -n "$SERVER_240" ]] || die 2 "--server-bin-240 est requis"
+[[ -n "$ADMIN_250"  ]] || die 2 "--admin-bin-250 est requis"
+[[ -n "$SERVER_250" ]] || die 2 "--server-bin-250 est requis"
 case "$FAULT_INJECT" in
   none|delete-note) ;;
   *) die 2 "--fault-inject doit valoir none ou delete-note (reçu : $FAULT_INJECT)" ;;
@@ -131,10 +155,21 @@ for tool in curl jq python3 cmp sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || die 2 "outil requis absent : $tool"
 done
 
+[[ -f "$MANIFEST" ]] || die 2 "manifeste de la fixture introuvable : $MANIFEST"
+FEATURE_CARDS_EXPECTED="$(jq -r 'select(.type == "expected_counts") | .feature_cards // empty' \
+  "$MANIFEST" 2>/dev/null | tail -n 1)"
+[[ "$FEATURE_CARDS_EXPECTED" =~ ^[0-9]+$ ]] \
+  || die 2 "manifeste sans compte « feature_cards » exploitable : $MANIFEST"
+(( FEATURE_CARDS_EXPECTED > 0 )) \
+  || die 2 "le manifeste déclare $FEATURE_CARDS_EXPECTED carte(s) de fonctionnalité — \
+l'axe « export de cartes » serait alors vacue des deux côtés (parité vraie qui ne couvre rien) ; \
+la fixture doit en porter au moins une"
+readonly FEATURE_CARDS_EXPECTED
+
 # ── Binaires ─────────────────────────────────────────────────────────────────
 
-for pair in "admin 2.3.1:$ADMIN_231" "serveur 2.3.1:$SERVER_231" \
-            "admin 2.4.0:$ADMIN_240" "serveur 2.4.0:$SERVER_240"; do
+for pair in "admin 2.4.0:$ADMIN_240" "serveur 2.4.0:$SERVER_240" \
+            "admin 2.5.0:$ADMIN_250" "serveur 2.5.0:$SERVER_250"; do
   label="${pair%%:*}"; bin="${pair#*:}"
   [[ -f "$bin" ]] || die 2 "binaire $label introuvable : $bin"
   [[ -x "$bin" ]] || die 2 "binaire $label non exécutable : $bin"
@@ -145,8 +180,8 @@ for pair in "admin 2.3.1:$ADMIN_231" "serveur 2.3.1:$SERVER_231" \
 ce harnais ne doit jamais invoquer un binaire du parc" ;;
   esac
 done
-if [[ -n "$WORKER_240" ]]; then
-  [[ -x "$WORKER_240" ]] || die 2 "binaire travailleur 2.4.0 non exécutable : $WORKER_240"
+if [[ -n "$WORKER_250" ]]; then
+  [[ -x "$WORKER_250" ]] || die 2 "binaire travailleur 2.5.0 non exécutable : $WORKER_250"
 fi
 
 # ── État ─────────────────────────────────────────────────────────────────────
@@ -298,7 +333,7 @@ stop_pid() {  # $1 = pid, $2 = nom
 # `trap` est le seul appelant : l'analyse d'accessibilité de shellcheck ne le
 # compte pas comme un appel, d'où l'aveu explicite — la fonction EST atteinte,
 # sur EXIT, et c'est tout l'intérêt.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2407
 cleanup() {
   local rc=$?
   stop_pid "$WORKER_PID" travailleur
@@ -377,19 +412,31 @@ exchange() {
     -d '{}' | jq -r '.token // empty'
 }
 
-# ── Preset ACL : chemin lu, contrôle, réalignement documenté ─────────────────
+# ── Preset ACL : chemin lu, contrôle, garde du dialecte ─────────────────────
 #
-# La montée 2.4.0 n'est pas seulement un changement de binaire : le CONTRAT DU
-# PRESET ACL change aussi. sees_personal_classified disparaît (F-297) ; un
-# preset qui le porte encore NE PARSE PAS, et le serveur retombe alors sur le
-# moteur vide — DENY-ALL — tout en démarrant et en se déclarant sain. Le guide
-# `docs/UPGRADING-2.3.1-to-2.4.0.md` §« The ACL preset field removal » en fait
-# la procédure et en donne l'ordre : « re-align the preset *first*, confirm it
-# loads, *then* deploy 2.4.0 ».
+# ⚠️ La migration de configuration du preset ACL n'appartient PLUS à ce couple de
+# versions. Le champ `sees_personal_classified` a été retiré du schéma en 2.4.0
+# (procédure et raison d'être : `docs/UPGRADING-2.3.1-to-2.4.0.md` §« The ACL
+# preset field removal »). Un état produit par 2.4.0 porte donc DÉJÀ le dialecte
+# cible, et le chemin nominal de ce harnais est « preset déjà conforme ».
 #
-# Ce harnais suit cet ordre, et il MESURE la conséquence du non-respect : sans
-# réalignement, la montée sert DENY-ALL (toute lecture refusée en 403) — relevé,
-# nommé, ni vert ni divergence de données.
+# Ce qui reste ici, et pourquoi ce n'est pas du code mort :
+#
+#   1. le CONTRÔLE (2a) est joué quand même, avec le binaire qui monte
+#      (`gradatum-admin acl validate --preset`) : il prouve que le preset de
+#      l'état parse sous le parseur de la version cible. Un preset qui ne parse
+#      pas laisse le serveur DÉMARRER et servir DENY-ALL — toute lecture refusée
+#      en 403 — sans qu'aucun démarrage ne rate. C'est le mode d'échec le plus
+#      dangereux de ce produit, et il se contrôle hors serveur ;
+#
+#   2. la GARDE (2b/2c) s'arme si l'état porte encore la clé retirée — c'est-à-
+#      dire s'il vient d'une version ANTÉRIEURE à 2.4.0. Le harnais ne suppose
+#      alors rien : il MESURE la conséquence du non-réalignement, puis applique
+#      la procédure documentée et la contrôle. C'est ce qui permet de pointer ce
+#      harnais sur un état hérité sans qu'il rende un vert par vacuité.
+#
+# Le chemin qui compte pour 2.4.0 → 2.5.0 est le premier ; le second est un
+# filet, et il est NOMMÉ comme tel dans les relevés.
 
 # Le chemin du preset est LU dans la configuration de l'état (`[acl] preset_path`),
 # jamais supposé : c'est le chemin que le serveur lit réellement au démarrage.
@@ -400,7 +447,9 @@ preset_path() {
   printf '%s\n' "$p"
 }
 
-# Le preset porte-t-il encore la clé retirée ? (défaut 2.3.1 : oui)
+# Le preset porte-t-il encore la clé retirée ? Sur un état 2.4.0, NON — le
+# dialecte cible est déjà celui de la version qui a produit l'état. Un OUI
+# désigne un état antérieur à 2.4.0, que la garde 2b/2c prend en charge.
 preset_has_removed_key() {  # $1 = preset
   grep -qE '^[[:space:]]*sees_personal_classified[[:space:]]*=' "$1"
 }
@@ -420,12 +469,16 @@ acl_validate() {  # $1 = admin, $2 = preset, $3 = préfixe de sortie -> rc du co
   return "$rc"
 }
 
-# Réalignement documenté — guide §F-297, étapes 1 et 2, appliquées à la lettre :
+# Réalignement documenté — `docs/UPGRADING-2.3.1-to-2.4.0.md`, §« The ACL preset
+# field removal », étapes 1 et 2, appliquées à la lettre :
 #   1. la clé sees_personal_classified est RETIRÉE de chaque bloc `[[consumer]]` ;
 #   2. pour chaque consommateur qui la portait à `false` — explicitement OU par
-#      défaut, le défaut 2.3.1 étant `false` — les quatre négations de motif sont
-#      PRÉPENDues à `read_patterns` ET à `write_patterns`.
+#      défaut, le défaut d'avant 2.4.0 étant `false` — les quatre négations de
+#      motif sont PRÉPENDues à `read_patterns` ET à `write_patterns`.
 # Un consommateur à `true` ne reçoit aucune négation (guide, étape 3).
+#
+# Cette fonction sert la GARDE, pas le chemin nominal : elle n'est appelée que si
+# l'état porte encore la clé retirée, donc s'il est antérieur à 2.4.0.
 # Le remplacement n'est pas « au jugé » : le fichier produit est ensuite soumis à
 # `acl validate`, et le réalisé est comparé au source en `diff`.
 preset_realign() {  # $1 = preset source, $2 = preset destination
@@ -566,15 +619,44 @@ capture_searches() {  # $1 = dir, $2 = jeton
   done
 }
 
+# Ce verdict-ci n'est porté ni par le retour de la fonction, ni par `RUN_RC` sur
+# le moment : un échec est compté dans `EXPORT_ECHECS`, et c'est le verdict FINAL
+# qui le replie dans le code de retour. Le poser dans `RUN_RC` dès le Step 1
+# aurait sauté la montée (2d est gardé par `RUN_RC == 0`) : un export vide aurait
+# fait disparaître les trois autres relevés, en masquant ce que le harnais est là
+# pour mesurer.
 capture_export() {  # $1 = dir, $2 = admin
-  local dir="$1" admin="$2" rc=0
+  local dir="$1" admin="$2" rc=0 n="indisponible"
   : >"$dir/export-features.err"
   "$admin" project-map export-features --root "$STATE" --vault main --include-dropped \
     >"$dir/export-features.json" 2>"$dir/export-features.err" || rc=$?
   printf '%s\n' "$rc" >"$dir/export-features.rc"
   # Les diagnostics de dérivation vont sur stderr : ils sont conservés, jamais
   # fondus dans la sortie comparée octet à octet.
-  (( rc == 0 )) || bad "export-features a rendu rc=$rc (voir $dir/export-features.err)"
+  if (( rc == 0 )); then
+    n="$(jq 'length' "$dir/export-features.json" 2>/dev/null || printf 'illisible')"
+  fi
+  printf '%s\n' "$n" >"$dir/export-features.count"
+  EXPORT_RELEVES=$((EXPORT_RELEVES + 1))
+
+  # NON-VACUITÉ — l'axe « export de cartes » compare deux relevés octet à octet.
+  # Deux exports VIDES sont identiques : la comparaison serait satisfaite sans
+  # rien couvrir. Le seuil est LU dans le manifeste de la fixture (>= au nombre
+  # de cartes de fonctionnalité qu'elle a créées), jamais postulé. Un export vide
+  # des deux côtés est donc un ÉCHEC, jamais une parité.
+  if (( rc != 0 )); then
+    bad "export-features a rendu rc=$rc (voir $dir/export-features.err)"
+  elif [[ ! "$n" =~ ^[0-9]+$ ]]; then
+    bad "export-features illisible en JSON (count='$n' — voir $dir/export-features.err)"
+  elif (( n < FEATURE_CARDS_EXPECTED )); then
+    bad "export-features rend $n carte(s) pour $FEATURE_CARDS_EXPECTED attendue(s) par le \
+manifeste — la comparaison octet à octet porterait sur un export vide ou tronqué : \
+parité vacue, jamais un vert"
+  else
+    log "  export-features : $n carte(s) (≥ $FEATURE_CARDS_EXPECTED attendue(s))"
+    return 0
+  fi
+  EXPORT_ECHECS=$((EXPORT_ECHECS + 1))
   return 0
 }
 
@@ -723,33 +805,33 @@ phase_begin
     "$WORKER_HEALTH_PORT" "$FAULT_INJECT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '"binaries":{'
   first=1
-  for pair in "admin-231:$ADMIN_231" "server-231:$SERVER_231" \
-              "admin-240:$ADMIN_240" "server-240:$SERVER_240"; do
+  for pair in "admin-240:$ADMIN_240" "server-240:$SERVER_240" \
+              "admin-250:$ADMIN_250" "server-250:$SERVER_250"; do
     (( first )) || printf ','
     first=0
     printf '"%s":{"path":"%s","sha256":"%s"}' "${pair%%:*}" "${pair#*:}" \
       "$(sha256sum <"${pair#*:}" | cut -d' ' -f1)"
   done
-  if [[ -n "$WORKER_240" ]]; then
-    printf ',"worker-240":{"path":"%s","sha256":"%s"}' "$WORKER_240" \
-      "$(sha256sum <"$WORKER_240" | cut -d' ' -f1)"
+  if [[ -n "$WORKER_250" ]]; then
+    printf ',"worker-250":{"path":"%s","sha256":"%s"}' "$WORKER_250" \
+      "$(sha256sum <"$WORKER_250" | cut -d' ' -f1)"
   fi
   printf '}}\n'
 } >"$OUT/meta.json"
 phase_end "p0-metadonnees"
 
-# ── Step 1 : mesure AVANT, binaire 2.3.1 ─────────────────────────────────────
+# ── Step 1 : mesure AVANT, binaire 2.4.0 ─────────────────────────────────────
 phase_begin
-P1="$(fresh_dir "$OUT/1-avant-231")"
-log "Step 1 — mesure AVANT (2.3.1)"
-start_server "$SERVER_231" "$P1" "serveur 2.3.1 (AVANT)" \
-  || die 2 "le serveur 2.3.1 n'a pas démarré sur l'état — voir $P1/server.log et $P1/startup-rc.txt"
-JWT_231="$(exchange)" || { stop_server; die 2 "échange clé→jeton refusé par le serveur 2.3.1"; }
-[[ -n "$JWT_231" ]] || { stop_server; die 2 "jeton vide rendu par /auth/exchange (2.3.1)"; }
-measure "$P1" "$ADMIN_231" "$JWT_231" "" \
+P1="$(fresh_dir "$OUT/1-avant-240")"
+log "Step 1 — mesure AVANT (2.4.0)"
+start_server "$SERVER_240" "$P1" "serveur 2.4.0 (AVANT)" \
+  || die 2 "le serveur 2.4.0 n'a pas démarré sur l'état — voir $P1/server.log et $P1/startup-rc.txt"
+JWT_240="$(exchange)" || { stop_server; die 2 "échange clé→jeton refusé par le serveur 2.4.0"; }
+[[ -n "$JWT_240" ]] || { stop_server; die 2 "jeton vide rendu par /auth/exchange (2.4.0)"; }
+measure "$P1" "$ADMIN_240" "$JWT_240" "" \
   || { stop_server; die 2 "relevé AVANT incomplet — voir $OUT/run.log"; }
 stop_server
-phase_end "step1-avant-231"
+phase_end "step1-avant-240"
 
 # Injection de faute (diagnostic seulement) : entre les deux mesures.
 if [[ "$FAULT_INJECT" == "delete-note" ]]; then
@@ -785,67 +867,75 @@ PY
   phase_end "step1bis-injection"
 fi
 
-# ── Step 2 : montée 2.4.0 — LE PRESET D'ABORD, comme le prescrit le guide ────
+# ── Step 2 : montée 2.5.0 — contrôle du preset AVANT de monter ───────────────
 #
-# Décomposé en quatre temps NOMMÉS parce que ce sont quatre faits distincts :
-#   2a  contrôle du preset hérité, avec le binaire 2.4.0 (go/no-go du guide) ;
-#   2b  montée sur preset HÉRITÉ → le DENY-ALL, mesuré (ni vert, ni divergence) ;
-#   2c  réalignement documenté du preset, puis contrôle du preset réaligné ;
-#   2d  montée sur preset RÉALIGNÉ → c'est l'état que le Step 3 mesure.
-# Sans 2c, le Step 3 ne mesurerait rien : toute lecture est refusée en 403.
+# Quatre temps NOMMÉS parce que ce sont quatre faits distincts :
+#   2a  contrôle du preset de l'état, avec le binaire 2.5.0 — parse-t-il sous le
+#       parseur de la version cible ? Un preset qui ne parse pas laisse le
+#       serveur démarrer et servir DENY-ALL sans qu'aucun démarrage ne rate ;
+#   2b  GARDE seulement — montée sur un preset portant encore la clé retirée
+#       (état antérieur à 2.4.0) : le DENY-ALL est mesuré, ni vert ni divergence ;
+#   2c  GARDE seulement — réalignement documenté du preset, puis contrôle ;
+#   2d  montée sur le preset de l'état → c'est l'état que le Step 3 mesure.
+#
+# Sur le couple 2.4.0 → 2.5.0, le preset de l'état est DÉJÀ au dialecte cible :
+# 2b et 2c ne s'arment pas, 2a et 2d font tout le travail. C'est un chemin
+# explicite et consigné (`preset-deja-conforme`), pas une absence silencieuse.
 phase_begin
 P2H="$(fresh_dir "$OUT/2-montee-preset-herite")"
 P2C="$(fresh_dir "$OUT/2-controle-preset")"
-P2="$(fresh_dir "$OUT/2-montee-240")"
-P3="$(fresh_dir "$OUT/3-apres-240")"
+P2="$(fresh_dir "$OUT/2-montee-250")"
+P3="$(fresh_dir "$OUT/3-apres-250")"
 MOUNT_OK=0
 PRESET="$(preset_path)"
 printf '%s\n' "$PRESET" >"$P2C/preset-path.txt"
-log "Step 2 — montée 2.4.0 sur le même répertoire, même port (preset ACL : $PRESET)"
+log "Step 2 — montée 2.5.0 sur le même répertoire, même port (preset ACL : $PRESET)"
 
 if [[ ! -f "$PRESET" ]]; then
   die 2 "preset ACL introuvable : $PRESET (lu depuis [acl] preset_path de l'état)"
 fi
 
-# 2a — contrôle pré-déploiement. Le binaire 2.4.0 est celui qui porte le parseur
-# cible : `acl validate` N'EXISTE PAS dans le gradatum-admin 2.3.1 (fait relevé,
-# pas supposé — c'est aussi pourquoi le contrôle se fait avec le binaire neuf).
+# 2a — contrôle pré-déploiement. Le contrôle se fait avec le binaire qui MONTE,
+# parce que c'est SON parseur qui décidera : le preset doit charger sur la
+# version cible, pas seulement sur celle qui l'a produit.
 rc_va=0
 ACL_VALIDATE_OK=1
-acl_validate "$ADMIN_240" "$PRESET" "$P2C/validate-herite" || rc_va=$?
+acl_validate "$ADMIN_250" "$PRESET" "$P2C/validate-herite" || rc_va=$?
 if (( rc_va == 0 )); then
-  log "  2a contrôle du preset HÉRITÉ : VALIDE (rc=0) — $(cat "$P2C/validate-herite.out")"
+  log "  2a contrôle du preset de l'état : VALIDE (rc=0) — $(cat "$P2C/validate-herite.out")"
 elif grep -qi 'unrecognized subcommand' "$P2C/validate-herite.err" 2>/dev/null; then
-  # La sous-commande de contrôle n'existe qu'à partir de 2.4.0 : le contrôle est
-  # INDISPONIBLE, ce qui n'est ni un preset valide ni un preset refusé, et doit
-  # se lire comme tel. C'est une LIMITE DE CAPACITÉ du binaire fourni, pas une
-  # divergence du harnais : elle ne fait pas échouer la course — mais elle est
-  # consignée, et le filet reste le journal de 2d, qui refuse toute montée dont
-  # le preset n'a pas chargé.
+  # La sous-commande de contrôle est entrée dans le produit en 2.4.0 : elle est
+  # donc présente sur les deux binaires de ce couple. Ce cas ne se présente que
+  # si l'appelant fournit un admin ANTÉRIEUR (rejeu sur un état plus ancien), et
+  # il se lit alors comme une LIMITE DE CAPACITÉ du binaire fourni, jamais comme
+  # un preset valide ou refusé. Elle ne fait pas échouer la course — mais elle
+  # est consignée, et le filet reste le journal de 2d, qui refuse toute montée
+  # dont le preset n'a pas chargé.
   ACL_VALIDATE_OK=0
   printf 'controle=INDISPONIBLE — ce gradatum-admin ne porte pas la sous-commande « acl validate »\n' \
     >>"$P2C/validate-herite.txt"
-  log "  2a contrôle du preset HÉRITÉ : INDISPONIBLE — « acl validate » absente de ce gradatum-admin"
+  log "  2a contrôle du preset de l'état : INDISPONIBLE — « acl validate » absente de ce gradatum-admin"
 else
-  log "  2a contrôle du preset HÉRITÉ : REFUSÉ (rc=$rc_va) — le signal go/no-go du guide est ROUGE"
+  log "  2a contrôle du preset de l'état : REFUSÉ (rc=$rc_va) — le signal go/no-go du guide est ROUGE"
   log "     $(cat "$P2C/validate-herite.err")"
 fi
 
 if preset_has_removed_key "$PRESET"; then
+  PRESET_CHEMIN="garde (preset hors dialecte cible : la clé retirée est encore là)"
   DENY_ALL_MESURE=0
   cp -- "$PRESET" "$P2C/preset-herite.toml"
 
   # 2b — la montée telle qu'un opérateur la ferait SANS lire le guide : le preset
   # hérité est laissé en place. Le serveur démarre (c'est le fait dangereux), et
   # toute lecture est refusée. Relevé et nommé, jamais compté comme un vert.
-  log "  2b montée sur preset HÉRITÉ (la conséquence du non-réalignement, mesurée)"
-  if start_server "$SERVER_240" "$P2H" "serveur 2.4.0 (preset HÉRITÉ)"; then
+  log "  2b GARDE — montée sur preset PORTANT ENCORE LA CLÉ RETIRÉE (état antérieur à 2.4.0) ; la conséquence du non-réalignement, mesurée"
+  if start_server "$SERVER_250" "$P2H" "serveur 2.5.0 (preset HÉRITÉ)"; then
     jwt_h="$(exchange || true)"
     code_h="$(read_probe "$P2H/lecture" "$jwt_h")"
     preset_degrade_markers "$P2H/server.log" >"$P2H/journal-marqueurs.txt"
     DENY_ALL_MESURE=0
     {
-      printf 'preset=preset HÉRITÉ (2.3.1) — porte encore la clé retirée sees_personal_classified\n'
+      printf 'preset=preset ANTÉRIEUR à 2.4.0 — porte encore la clé retirée sees_personal_classified\n'
       printf 'controle_acl_validate=rc %s (attendu non nul : le guide l'\''annonce)\n' "$rc_va"
       printf 'demarrage=le serveur DÉMARRE (refus=non) — c'\''est le fait dangereux, pas le contraire\n'
       printf 'lecture_http=%s\n' "$code_h"
@@ -884,10 +974,10 @@ if preset_has_removed_key "$PRESET"; then
     fi
   else
     DENY_ALL_MESURE=0
-    printf 'NON MESURÉ — le serveur 2.4.0 n'\''a pas démarré sur le preset hérité (%s).\n' \
+    printf 'NON MESURÉ — le serveur 2.5.0 n'\''a pas démarré sur le preset hérité (%s).\n' \
       "$(cat "$P2H/startup-rc.txt" 2>/dev/null || echo 'motif indisponible')" \
       >"$P2H/conséquence-non-réalignement.txt"
-    log "  2b NON MESURÉ — le serveur 2.4.0 n'a pas démarré sur le preset hérité"
+    log "  2b NON MESURÉ — le serveur 2.5.0 n'a pas démarré sur le preset hérité"
   fi
   stop_server
 
@@ -920,7 +1010,7 @@ la montée n'a pas été tentée, aucune mesure de parité n'a été prise"
     >>"$P2C/realignement.txt"
   if (( ACL_VALIDATE_OK )); then
     rc_vr=0
-    acl_validate "$ADMIN_240" "$PRESET" "$P2C/validate-realigne" || rc_vr=$?
+    acl_validate "$ADMIN_250" "$PRESET" "$P2C/validate-realigne" || rc_vr=$?
     if (( rc_vr == 0 )); then
       log "     contrôle du preset RÉALIGNÉ : VALIDE (rc=0) — $(cat "$P2C/validate-realigne.out")"
     else
@@ -937,46 +1027,51 @@ la montée n'a pas été tentée, aucune mesure de parité n'a été prise"
     log "     contrôle du preset RÉALIGNÉ : NON MESURÉ (sous-commande absente de ce binaire)"
   fi
 else
+  PRESET_CHEMIN="deja-conforme (chemin nominal de ce couple)"
   DENY_ALL_MESURE=0
   {
-    printf 'NON MESURÉ — le preset hérité est déjà conforme au dialecte 2.4.0 : il ne porte\n'
-    printf 'aucune occurrence de sees_personal_classified. La conséquence du non-réalignement\n'
-    printf 'n'\''est donc pas mesurable sur cet état, et le harnais ne la simule pas.\n'
+    printf 'preset=celui de l état, déjà conforme au dialecte de la version cible\n'
+    printf 'fait=aucune occurrence de la clé retirée (retrait consommé en 2.4.0 ; la clé est\n'
+    printf 'sortie du schéma des entrées de consommateur, pas de celui de la version qui monte)\n'
+    printf 'NON MESURÉ — la conséquence du non-réalignement n est pas mesurable sur cet état :\n'
+    printf 'il n y a rien à réaligner. Le harnais ne simule pas ce cas.\n'
+    printf 'filet=le garde 2b/2c reste armé et s armerait sur un état antérieur à 2.4.0\n'
   } >"$P2C/preset-deja-conforme.txt"
-  log "  2a-2c : preset hérité déjà conforme (rc=0) — 2b non mesuré, 2c sans objet"
+  log "  2a-2c : preset de l'état déjà conforme (rc=0) — 2b non mesuré, 2c sans objet (chemin déjà-conforme consigné)"
 fi
 
-# 2d — la montée sur preset réaligné : c'est l'état que le Step 3 mesure.
+# 2d — la montée sur le preset de l'état (déjà conforme ici, réaligné si 2c s'est
+# armé) : c'est l'état que le Step 3 mesure.
 if [[ "$RUN_RC" == "0" ]]; then
-  if start_server "$SERVER_240" "$P2" "serveur 2.4.0 (MONTÉE)"; then
+  if start_server "$SERVER_250" "$P2" "serveur 2.5.0 (MONTÉE)"; then
     MOUNT_OK=1
     preset_degrade_markers "$P2/server.log" >"$P2/journal-marqueurs.txt"
     if [[ -s "$P2/journal-marqueurs.txt" ]]; then
       RUN_RC=1
-      bad "MONTÉE 2.4.0 : le journal porte encore un marqueur de dégradation du preset — \
+      bad "MONTÉE 2.5.0 : le journal porte encore un marqueur de dégradation du preset — \
 le réalignement n'a pas suffi. Voir $P2/journal-marqueurs.txt"
     fi
   else
     # Un refus de démarrage est un RÉSULTAT : il est nommé, écrit, et ne masque
     # pas la suite — le retour arrière reste exercé juste après.
-    bad "MONTÉE 2.4.0 : refus de démarrage — $(cat "$P2/startup-rc.txt")"
+    bad "MONTÉE 2.5.0 : refus de démarrage — $(cat "$P2/startup-rc.txt")"
     RUN_RC=1
     cp -- "$P2/startup-rc.txt" "$P3/startup-rc.txt" 2>/dev/null || true
   fi
 else
-  printf 'NON EXÉCUTÉ — le réalignement du preset a échoué : la montée sur preset réaligné\nn'\''a pas été tentée (aucun état non conforme n'\''a été monté en 2.4.0).\n' \
+  printf 'NON EXÉCUTÉ — le réalignement du preset a échoué : la montée sur le preset\n\nde l'\''état n'\''a pas été tentée (aucun état non conforme n'\''a été monté en 2.5.0).\n' \
     >"$P2/startup-rc.txt"
-  bad "MONTÉE 2.4.0 sur preset réaligné : NON TENTÉE (le réalignement a échoué)"
+  bad "MONTÉE 2.5.0 sur le preset de l'état : NON TENTÉE (le réalignement a échoué)"
 fi
-phase_end "step2-montee-240"
+phase_end "step2-montee-250"
 
 # ── Step 3 : mesure APRÈS + /health (plancher 60 s) ──────────────────────────
 phase_begin
 if (( MOUNT_OK )); then
-  log "Step 3 — mesure APRÈS (2.4.0), /health avec plancher de 60 s"
-  JWT_240="$(exchange)" || { RUN_RC=1; bad "échange clé→jeton refusé par le serveur 2.4.0"; JWT_240=""; }
-  if [[ -n "$JWT_240" ]]; then
-    measure "$P3" "$ADMIN_240" "$JWT_240" 60 \
+  log "Step 3 — mesure APRÈS (2.5.0), /health avec plancher de 60 s"
+  JWT_250="$(exchange)" || { RUN_RC=1; bad "échange clé→jeton refusé par le serveur 2.5.0"; JWT_250=""; }
+  if [[ -n "$JWT_250" ]]; then
+    measure "$P3" "$ADMIN_250" "$JWT_250" 60 \
       || { RUN_RC=1; bad "relevé APRÈS incomplet — voir $OUT/run.log"; }
     cp -- "$P2/build_sha.txt" "$P3/build_sha.txt" 2>/dev/null || true
     cp -- "$P2/version.txt"   "$P3/version.txt"   2>/dev/null || true
@@ -986,57 +1081,59 @@ if (( MOUNT_OK )); then
     bad "mesure APRÈS impossible : pas de jeton sur le serveur MONTÉ"
   fi
 else
-  log "Step 3 — NON MESURÉ : la montée 2.4.0 a refusé de démarrer (résultat consigné)"
+  log "Step 3 — NON MESURÉ : la montée 2.5.0 a refusé de démarrer (résultat consigné)"
 fi
 stop_server
-phase_end "step3-apres-240"
+phase_end "step3-apres-250"
 
-# ── Step 3bis : retour arrière — redémarrage 2.3.1 sur le répertoire monté ───
+# ── Step 3bis : retour arrière — redémarrage 2.4.0 sur le répertoire monté ───
 phase_begin
-P4="$(fresh_dir "$OUT/4-retour-231")"
-log "Step 3bis — retour arrière : redémarrage 2.3.1 sur le répertoire MONTÉ"
+P4="$(fresh_dir "$OUT/4-retour-240")"
+log "Step 3bis — retour arrière : redémarrage 2.4.0 sur le répertoire MONTÉ"
 ROLLBACK_OK=0
-if start_server "$SERVER_231" "$P4" "serveur 2.3.1 (RETOUR ARRIÈRE)"; then
+if start_server "$SERVER_240" "$P4" "serveur 2.4.0 (RETOUR ARRIÈRE)"; then
   JWT_RB="$(exchange)" || { RUN_RC=1; bad "échange clé→jeton refusé après retour arrière"; JWT_RB=""; }
   if [[ -n "$JWT_RB" ]]; then
-    measure "$P4" "$ADMIN_231" "$JWT_RB" "" \
+    measure "$P4" "$ADMIN_240" "$JWT_RB" "" \
       || { RUN_RC=1; bad "quatrième mesure incomplète — voir $OUT/run.log"; }
     ROLLBACK_OK=1
   fi
 else
   RUN_RC=1
-  bad "RETOUR ARRIÈRE : refus de démarrage du 2.3.1 sur le répertoire monté — \
+  bad "RETOUR ARRIÈRE : refus de démarrage du 2.4.0 sur le répertoire monté — \
 $(cat "$P4/startup-rc.txt")"
 fi
 stop_server
 
-# 3bis-0 — RÉVERSIBILITÉ DU RÉALIGNEMENT. Le retour arrière ci-dessus a tourné sur
-# l'état MONTÉ, dont le preset a été réécrit en 2.2c. La question opérationnelle
-# est donc : le retour arrière du BINAIRE exige-t-il aussi un retour arrière de la
-# CONFIGURATION ? Elle est tranchée par la mesure, pas par une intuition.
+# 3bis-0 — RÉVERSIBILITÉ DU PRESET DE L'ÉTAT. Le retour arrière ci-dessus a tourné
+# sur l'état MONTÉ, dont le preset est celui de l'état (déjà conforme au dialecte
+# cible ; réécrit en 2c SEULEMENT si le garde s'est armé — état antérieur à 2.4.0).
+# La question opérationnelle est donc : le retour arrière du BINAIRE exige-t-il
+# aussi un retour arrière de la CONFIGURATION ? Elle est tranchée par la mesure,
+# pas par une intuition.
 {
   if (( ROLLBACK_OK )); then
-    printf 'mesure=le 2.3.1 démarre ET lit le vault sur le preset RÉALIGNÉ (%s note(s) listée(s))\n' \
+    printf 'mesure=le 2.4.0 démarre ET lit le vault sur le preset de l état monté (%s note(s) listée(s))\n' \
       "$(wc -l <"$P4/vault_list.paths.txt" 2>/dev/null || echo 0)"
-    printf 'conclusion=le réalignement est compatible 2.3.1 : le retour arrière du binaire\n'
+    printf 'conclusion=le preset de l état est compatible 2.4.0 : le retour arrière du binaire\n'
     printf 'ne requiert PAS de retour arrière de la configuration. Une seule voie de retour.\n'
-    printf 'raison (source, non mesurée) : en 2.3.1 sees_personal_classified porte #[serde(default)],\n'
+    printf 'raison (source, non mesurée) : en 2.4.0 sees_personal_classified porte #[serde(default)],\n'
     printf 'et la négation ! y existe déjà (décision DenyExplicit, deny-wins).\n'
   else
-    printf 'mesure=le 2.3.1 N'\''A PAS redémarré sur le preset réaligné (%s)\n' \
+    printf 'mesure=le 2.4.0 N'\''A PAS redémarré sur le preset de l'\''état (%s)\n' \
       "$(cat "$P4/startup-rc.txt" 2>/dev/null || echo 'motif indisponible')"
     printf 'conclusion=ATTENTION : le retour arrière du binaire seul NE SUFFIT PAS sur cet état —\n'
-    printf 'le retour arrière doit aussi restaurer la configuration (preset de 2.3.1).\n'
-    printf 'configuration_de_2.3.1_conservee=%s\n' "$P2C/preset-herite.toml"
+    printf 'le retour arrière doit aussi restaurer la configuration (preset de 2.4.0).\n'
+    printf 'configuration_de_2.4.0_conservee=%s\n' "$P2C/preset-herite.toml"
   fi
 } >"$OUT/3bis-reversibilite-preset.txt"
 log "Step 3bis-0 réversibilité : $(head -1 "$OUT/3bis-reversibilite-preset.txt")"
-phase_end "step3bis-retour-231"
+phase_end "step3bis-retour-240"
 
 # ── Cas nommé `PrivacyRescan` (F-160) — POINT D'EXTENSION, ruling E6 ──────────
 #
-# Le brief (Step 3bis) demande d'enfiler, depuis 2.4.0, un `Job` de la variante
-# introduite par F-160 (`PrivacyRescan`), puis de redémarrer 2.3.1 et d'observer.
+# Le brief (Step 3bis) demande d'enfiler, depuis 2.5.0, un `Job` de la variante
+# introduite par F-160 (`PrivacyRescan`), puis de redémarrer 2.4.0 et d'observer.
 #
 # ⚠ CETTE VARIANTE N'EXISTE PAS DANS CET ARBRE. Le ruling E6 en fait le
 # périmètre de la Task 2bis, après fusion de F-160, et interdit de la SIMULER.
@@ -1059,7 +1156,7 @@ motif 'PrivacyRescan' sur *.rs). Le ruling E6 en fait le périmètre de la Task 
 fusion de F-160 : ce harnais expose le point d'extension, il ne le simule pas."
   else
     motif="NON EXÉCUTÉ — la variante \`PrivacyRescan\` est PRÉSENTE dans cet arbre, mais la mise \
-en œuvre du cas nommé (enfiler un job de cette variante depuis 2.4.0, redémarrer 2.3.1, \
+en œuvre du cas nommé (enfiler un job de cette variante depuis 2.5.0, redémarrer 2.4.0, \
 observer rc / message / sort de la file) reste le périmètre de la Task 2bis (ruling E6). \
 Point d'extension : \`rollback_named_case\` dans tests/upgrade/run-upgrade-test.sh. \
 Sources détectées : $found"
@@ -1080,20 +1177,37 @@ phase_end "step3ter-cas-nomme"
 
 # ── Step 4 : parité ──────────────────────────────────────────────────────────
 
-assert_phase() {  # $1 = dir avant, $2 = dir après, $3 = étiquette, $4 = fichier
+# La force de la clé (e) dépend du SENS de la comparaison, et le harnais le dit :
+#
+#   montée (2.4.0 → 2.5.0) — `additif` : l'export est un RAPPORT, son dialecte
+#     peut s'élargir d'une version à l'autre ; chaque entrée AVANT est comparée à
+#     l'entrée MONTÉE projetée sur le dialecte AVANT, les clés ajoutées sont
+#     relevées (`cles_ajoutees=…`) et doivent être citées dans le guide de montée,
+#     qui est donc passé ici. Une clé AVANT disparue ou modifiée reste un écart.
+#   retour arrière (2.4.0 → 2.4.0) — `strict` : le même binaire des deux côtés,
+#     donc rien ne doit bouger, pas même un octet.
+assert_phase() {  # $1 = dir avant, $2 = dir après, $3 = étiquette, $4 = fichier, $5 = force
   local rc=0
-  bash "$SCRIPT_DIR/assert-parity.sh" --before "$1" --after "$2" \
-    --label "$3" --out "$4" || rc=$?
+  local force="${5:-strict}"
+  if [[ "$force" == "additif" ]]; then
+    bash "$SCRIPT_DIR/assert-parity.sh" --before "$1" --after "$2" \
+      --label "$3" --out "$4" --export-mode additif \
+      --export-doc "$REPO_ROOT/docs/UPGRADING-2.4.0-to-2.5.0.md" || rc=$?
+  else
+    bash "$SCRIPT_DIR/assert-parity.sh" --before "$1" --after "$2" \
+      --label "$3" --out "$4" --export-mode strict || rc=$?
+  fi
   if (( rc == 0 )); then
-    log "parité $3 : ÉTABLIE"
+    log "parité $3 : ÉTABLIE (clé (e) : $force)"
   elif (( rc == 1 )); then
     log "parité $3 : DIVERGENCE (voir $4)"
     RUN_RC=1
   else
     # Une mesure absente n'est pas une non-exécution DU HARNAIS (le harnais a
-    # tourné) : c'est l'absence d'un relevé qu'il devait produire, donc un écart
-    # nommé, jamais un vert et jamais un `2` qui masquerait la cause.
-    log "parité $3 : NON CONCLUE — relevé absent (voir $4)"
+    # tourné) : c'est l'absence d'un relevé qu'il devait produire — ou une clé
+    # (e) non mesurable — donc un écart nommé, jamais un vert et jamais un `2`
+    # qui masquerait la cause.
+    log "parité $3 : NON CONCLUE — relevé absent ou clé (e) non mesurable (voir $4)"
     RUN_RC=1
   fi
   return 0
@@ -1103,9 +1217,9 @@ phase_begin
 P3_RECORDED=0
 [[ -f "$P3/vault_list.paths.txt" ]] && P3_RECORDED=1
 if (( P3_RECORDED )); then
-  assert_phase "$P1" "$P3" "AVANT 2.3.1 → APRÈS 2.4.0 (la montée)" "$OUT/parity-1v3.txt"
+  assert_phase "$P1" "$P3" "AVANT 2.4.0 → APRÈS 2.5.0 (la montée)" "$OUT/parity-1v3.txt" additif
 else
-  printf '%s\n' "NON CONCLUE — le relevé APRÈS (3-apres-240) n'existe pas : la montée 2.4.0 a \
+  printf '%s\n' "NON CONCLUE — le relevé APRÈS (3-apres-250) n'existe pas : la montée 2.5.0 a \
 refusé de démarrer ($(cat "$P2/startup-rc.txt" 2>/dev/null || echo 'motif indisponible')). \
 C'est un RÉSULTAT, consigné sans être contourné." >"$OUT/parity-1v3.txt"
   log "parité AVANT→APRÈS : NON CONCLUE — montée refusée"
@@ -1113,11 +1227,11 @@ C'est un RÉSULTAT, consigné sans être contourné." >"$OUT/parity-1v3.txt"
 fi
 
 if (( ROLLBACK_OK )); then
-  assert_phase "$P1" "$P4" "AVANT 2.3.1 → RETOUR ARRIÈRE 2.3.1 sur l'état monté" \
-    "$OUT/parity-1v4.txt"
+  assert_phase "$P1" "$P4" "AVANT 2.4.0 → RETOUR ARRIÈRE 2.4.0 sur l'état monté" \
+    "$OUT/parity-1v4.txt" strict
 else
-  printf '%s\n' "NON CONCLUE — le quatrième relevé (4-retour-231) n'existe pas : le binaire \
-2.3.1 n'a pas redémarré sur le répertoire monté \
+  printf '%s\n' "NON CONCLUE — le quatrième relevé (4-retour-240) n'existe pas : le binaire \
+2.4.0 n'a pas redémarré sur le répertoire monté \
 ($(cat "$P4/startup-rc.txt" 2>/dev/null || echo 'motif indisponible'))." >"$OUT/parity-1v4.txt"
   log "parité AVANT→RETOUR : NON CONCLUE — retour arrière refusé"
   RUN_RC=1
@@ -1126,26 +1240,31 @@ phase_end "step4-parite"
 
 # ── Axe F-XX (ruling E4) — APRÈS les quatre relevés, car il ÉCRIT dans l'état ─
 #
-# La fixture ne porte aucune carte `[[feature:F-XX]]` : l'axe n'est donc exercé
-# par aucune des mesures comparables ci-dessus, et c'est ici qu'il l'est. Il est
-# exécuté EN DERNIER parce qu'il ajoute une carte : l'inclure plus tôt aurait
-# pollué les quatre relevés que la parité compare.
+# La fixture porte ses PROPRES cartes `[[feature:F-XX]]` (au moins deux, créées
+# par la route serveur dans `gen-fixture.sh`) : c'est d'elles que vit l'axe
+# « export de cartes », et non de celle-ci. L'axe échappe donc par construction
+# aux quatre relevés comparables, puisqu'il en ajoute une APRÈS eux — l'exécuter
+# plus tôt aurait pollué ce que la parité compare.
+#
+# Le numéro qu'il alloue suit ceux de la fixture : c'est ce qui rend la
+# référence connue, et donc vérifiable. La comparaison porte sur le relevé AVANT
+# (le plus grand numéro exporté par la fixture), jamais sur un numéro postulé.
 phase_begin
 FX_DIR="$(fresh_dir "$OUT/6-axe-f-xx")"
 FX_RC=0
-log "Axe F-XX — create-feature sur le serveur 2.4.0 (ruling E4)"
+log "Axe F-XX — create-feature sur le serveur 2.5.0 (ruling E4)"
 {
   printf 'axe=F-XX (carte feature, numéro alloué par le serveur)\n'
   printf 'regle=assertion sur la PRÉSENCE de la carte et son rôle [[feature:F-N]] ; \
 J lu dans la réponse, JAMAIS asserté sur sa valeur\n'
 } >"$FX_DIR/verdict.txt"
 
-if start_server "$SERVER_240" "$FX_DIR" "serveur 2.4.0 (AXE F-XX)"; then
+if start_server "$SERVER_250" "$FX_DIR" "serveur 2.5.0 (AXE F-XX)"; then
   JWT_FX="$(exchange)" || { FX_RC=1; bad "axe F-XX : échange clé→jeton refusé"; JWT_FX=""; }
   if [[ -n "$JWT_FX" ]]; then
     FX_BODY="$(printf '%s' '[[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] [[release:planned]] [[version:gradatum/backlog]]
 
-Carte produite par le harnais de montee, apres la montee 2.4.0.')"
+Carte produite par le harnais de montee, apres la montee 2.5.0.')"
     FX_RESP="$(api_post /api/v1/project-map/create-feature \
       "$(jq -n --arg b "$FX_BODY" '{title:"Carte de montee (harnais)", body:$b}')" "$JWT_FX")" \
       || { FX_RESP=""; FX_RC=1; bad "axe F-XX : create-feature injoignable"; }
@@ -1183,10 +1302,34 @@ Carte produite par le harnais de montee, apres la montee 2.4.0.')"
         FX_RC=1
       fi
 
+      # Le compteur de cartes a-t-il SURVÉCU à la montée ? Le numéro alloué ici
+      # suit ceux que la fixture avait déjà consommés : s'il retombait dessous,
+      # la montée aurait remis le compteur à zéro — et deux cartes porteraient le
+      # même numéro, ce que l'identité d'une carte interdit. La référence est le
+      # plus grand numéro EXPORTÉ par la fixture (relevé AVANT), lu et non
+      # postulé : sur une base réelle les numéros sont arbitraires, ici ils sont
+      # le résultat de la fixture.
+      ref_max="$(jq -r '[.[].feature | sub("^F-"; "") | tonumber] | max // empty' \
+        "$P1/export-features.json" 2>/dev/null || printf '')"
+      if [[ "$ref_max" =~ ^[0-9]+$ && "$FX_NUMBER" =~ ^[0-9]+$ ]]; then
+        if (( 10#$FX_NUMBER > 10#$ref_max )); then
+          printf 'assertion_numero_superieur=ok (numéro %s > %s, plus grand numéro exporté par la fixture)\n' \
+            "$FX_NUMBER" "$ref_max" >>"$FX_DIR/verdict.txt"
+        else
+          printf 'assertion_numero_superieur=ÉCHEC (numéro %s ≤ %s — le compteur de cartes a reculé à la montée)\n' \
+            "$FX_NUMBER" "$ref_max" >>"$FX_DIR/verdict.txt"
+          FX_RC=1
+        fi
+      else
+        printf 'assertion_numero_superieur=NON CONCLUE (plus grand numéro de la fixture : %s ; \
+numéro alloué : %s)\n' "${ref_max:-indisponible}" "${FX_NUMBER:-indisponible}" >>"$FX_DIR/verdict.txt"
+        FX_RC=1
+      fi
+
       # L'assertion de rôle porte sur le travail ENFILÉ : `create-feature` écrit
       # la note par un `Curate` dont le corps porte le rôle injecté. C'est la
       # preuve la plus forte disponible SANS consommateur de file — et celle qui
-      # reste en CI, où aucun travailleur 2.4.0 n'est construit.
+      # reste en CI, où aucun travailleur 2.5.0 n'est construit.
       if [[ -n "$FX_JOB" ]]; then
         api_post "/api/v1/jobs/$FX_JOB/v2" '{}' "$JWT_FX" >"$FX_DIR/job-v2.json" 2>/dev/null \
           || curl -fsS --max-time 20 "$BASE_URL/api/v1/jobs/$FX_JOB/v2" \
@@ -1209,11 +1352,11 @@ job-enqueued-body.txt)\n' "$FX_FEATURE" >>"$FX_DIR/verdict.txt"
 
       # Matérialisation : elle exige un consommateur de file. Sans lui, la carte
       # n'est PAS dans l'index — le harnais le dit, il ne le suppose pas.
-      if [[ -n "$WORKER_240" ]]; then
-        log "axe F-XX : matérialisation demandée (--worker-bin-240 fourni)"
+      if [[ -n "$WORKER_250" ]]; then
+        log "axe F-XX : matérialisation demandée (--worker-bin-250 fourni)"
         GRADATUM_INTERNAL_URL="$INTERNAL_URL" \
         GRADATUM_INTERNAL_TOKEN="$INTERNAL_TOKEN" \
-          "$WORKER_240" --config "$SERVER_CONFIG" --db "$STATE/db/queue.sqlite" \
+          "$WORKER_250" --config "$SERVER_CONFIG" --db "$STATE/db/queue.sqlite" \
           >>"$FX_DIR/worker.log" 2>&1 &
         WORKER_PID=$!
         st=""; deadline=$((SECONDS + 120))
@@ -1233,18 +1376,18 @@ job-enqueued-body.txt)\n' "$FX_FEATURE" >>"$FX_DIR/verdict.txt"
             "$FX_NOTE" "$st" >>"$FX_DIR/verdict.txt"
           FX_RC=1
         fi
-        capture_export "$FX_DIR" "$ADMIN_240"
+        capture_export "$FX_DIR" "$ADMIN_250"
         printf 'export_features_apres=%s carte(s)\n' \
           "$(jq 'length' "$FX_DIR/export-features.json" 2>/dev/null || echo '?')" \
           >>"$FX_DIR/verdict.txt"
       else
-        printf '%s\n' "assertion_materialisation=NON ÉTABLIE — aucun travailleur 2.4.0 fourni \
-(--worker-bin-240) : l'axe est exercé jusqu'à l'ENFILEMENT (allocation du numéro + injection du \
+        printf '%s\n' "assertion_materialisation=NON ÉTABLIE — aucun travailleur 2.5.0 fourni \
+(--worker-bin-250) : l'axe est exercé jusqu'à l'ENFILEMENT (allocation du numéro + injection du \
 rôle, prouvées ci-dessus), pas jusqu'à la carte indexée. La commande CI gelée ne construit pas \
-de travailleur 2.4.0 ; l'ajouter est un changement de .forgejo/workflows/ci.yml (build \
--p gradatum-worker côté HEAD + --worker-bin-240 sur la ligne du harnais) et de la ligne couplée \
+de travailleur 2.5.0 ; l'ajouter est un changement de .forgejo/workflows/ci.yml (build \
+-p gradatum-worker côté HEAD + --worker-bin-250 sur la ligne du harnais) et de la ligne couplée \
 de RELEASE-MANIFEST.yaml." >>"$FX_DIR/verdict.txt"
-        log "axe F-XX : exercé jusqu'à l'enfilement ; matérialisation NON ÉTABLIE (pas de travailleur 2.4.0)"
+        log "axe F-XX : exercé jusqu'à l'enfilement ; matérialisation NON ÉTABLIE (pas de travailleur 2.5.0)"
       fi
     else
       printf 'reponse_http=aucune (create-feature n a pas repondu)\n' >>"$FX_DIR/verdict.txt"
@@ -1252,7 +1395,7 @@ de RELEASE-MANIFEST.yaml." >>"$FX_DIR/verdict.txt"
   fi
   stop_server
 else
-  printf 'statut=NON EXÉCUTÉ — le serveur 2.4.0 n a pas demarre pour l axe F-XX (%s)\n' \
+  printf 'statut=NON EXÉCUTÉ — le serveur 2.5.0 n a pas demarre pour l axe F-XX (%s)\n' \
     "$(cat "$FX_DIR/startup-rc.txt" 2>/dev/null || echo 'motif indisponible')" \
     >>"$FX_DIR/verdict.txt"
   FX_RC=1
@@ -1267,14 +1410,37 @@ phase_end "step4bis-axe-fxx"
 
 # ── Verdict ──────────────────────────────────────────────────────────────────
 
+# Le verdict de non-vacuité de l'export (Step 1) est replié ici, et non dans
+# `RUN_RC` au moment où il est constaté : posé trop tôt il aurait sauté la montée
+# (2d est gardé par `RUN_RC == 0`), donc supprimé les trois autres relevés — un
+# export vide aurait masqué ce que le harnais est là pour mesurer.
+# Les clés que 2.5.0 ajoute au dialecte de l'export sont LUES dans le rapport de
+# parité de la montée, jamais postulées : c'est la trace de ce qui a été relevé,
+# et de ce que le guide de montée doit citer.
+EXPORT_CLES_AJOUTEES="$(sed -n 's/.*cles_ajoutees=\([^ ]*\).*/\1/p' \
+  "$OUT/parity-1v3.txt" 2>/dev/null | head -n 1)"
+[[ -n "$EXPORT_CLES_AJOUTEES" ]] || EXPORT_CLES_AJOUTEES="indisponible"
+
+EXPORT_DETAIL=""
+if (( EXPORT_ECHECS > 0 )); then
+  RUN_RC=1
+  EXPORT_DETAIL=" ; $EXPORT_ECHECS relevé(s) d'export sur $EXPORT_RELEVES ne \
+satisfont pas l'assertion de non-vacuité (export vide, tronqué ou illisible) — une \
+parité octet à octet sur un export vide ne couvre rien"
+fi
+
 if (( RUN_RC == 0 )); then
-  verdict_write 0 "PARITÉ PROUVÉE — la montée 2.4.0, précédée du réalignement documenté du \
-preset ACL (guide §F-297), n'a bougé aucune clé bloquante ; le retour arrière 2.3.1 sur l'état \
-monté est exercé et identique au relevé AVANT."
+  verdict_write 0 "PARITÉ PROUVÉE — la montée 2.5.0, sur un preset ACL conforme au dialecte \
+cible (contrôlé en 2a), n'a bougé aucune clé bloquante ; le retour arrière 2.4.0 sur l'état \
+monté est exercé et IDENTIQUE AU BIT près au relevé AVANT (clé (e) en mode strict) ; les \
+$EXPORT_RELEVES relevés d'export de cartes portent chacun au moins $FEATURE_CARDS_EXPECTED \
+carte(s) — l'axe « export de cartes » compare, sur un état peuplé, chaque entrée du dialecte \
+AVANT à sa projection dans le relevé MONTÉ (règle additive), et relève les clés que 2.5.0 \
+ajoute : cles_ajoutees=$EXPORT_CLES_AJOUTEES, citées dans le guide de montée."
 else
   verdict_write 1 "DIVERGENCE — au moins un écart est nommé dans les rapports de parité \
-(parity-1v3.txt, parity-1v4.txt), les relevés de démarrage (2-montee-240/, 4-retour-231/) \
-ou le verdict de l'axe F-XX (6-axe-f-xx/verdict.txt)."
+(parity-1v3.txt, parity-1v4.txt), les relevés de démarrage (2-montee-250/, 4-retour-240/) \
+ou le verdict de l'axe F-XX (6-axe-f-xx/verdict.txt)$EXPORT_DETAIL."
 fi
 
 {
@@ -1286,14 +1452,19 @@ fi
   printf 'premier_healthy_s=%s\n' "$(cat "$P3/first-healthy-secs.txt" 2>/dev/null || echo 'n/a')"
   printf 'cas_nomme_privacy_rescan=NON EXECUTE (point d extension, ruling E6)\n'
   printf 'preset_acl=%s\n' "${PRESET:-indisponible}"
-  printf 'preset_controle_herite_rc=%s\n' \
+  printf 'preset_chemin=%s\n' "${PRESET_CHEMIN:-n/a}"
+  printf 'preset_controle_initial_rc=%s\n' \
     "$(cat "$P2C/validate-herite.rc" 2>/dev/null || echo 'n/a')"
   printf 'preset_controle_acl_validate=%s\n' \
     "$(if (( ${ACL_VALIDATE_OK:-0} )); then echo 'disponible'; else echo 'INDISPONIBLE (binaire fourni sans acl validate)'; fi)"
   printf 'preset_realigne_rc=%s\n' \
     "$(cat "$P2C/validate-realigne.rc" 2>/dev/null || echo 'n/a (sans objet)')"
   printf 'preset_deny_all_mesure=%s\n' "${DENY_ALL_MESURE:-0}"
-  printf 'preset_reversibilite_231=%s\n' "$(
+  printf 'export_features_min_attendu=%s\n' "$FEATURE_CARDS_EXPECTED"
+  printf 'export_features_releves=%s\n' "$EXPORT_RELEVES"
+  printf 'export_features_releves_non_conformes=%s\n' "$EXPORT_ECHECS"
+  printf 'export_features_cles_ajoutees=%s\n' "$EXPORT_CLES_AJOUTEES"
+  printf 'preset_reversibilite_240=%s\n' "$(
     if (( ${ROLLBACK_OK:-0} )); then echo 'compatible (retour binaire seul suffisant)';
     else echo 'INCOMPATIBLE (retour de configuration requis)'; fi)"
 } >>"$OUT/verdict.txt"

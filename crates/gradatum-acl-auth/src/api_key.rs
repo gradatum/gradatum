@@ -1166,6 +1166,18 @@ impl ApiKeyStore for SqliteApiKeyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Crate root, resolved at run time.
+    ///
+    /// The value baked in at compile time goes stale as soon as a test binary is reused
+    /// from another checkout directory (shared build artefacts): the environment variable
+    /// wins, and the compile-time value only serves as a fallback outside cargo.
+    fn manifest_dir() -> PathBuf {
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    }
 
     /// Crée un store in-memory pour les tests.
     async fn make_store() -> SqliteApiKeyStore {
@@ -1818,11 +1830,9 @@ mod tests {
     /// la preuve de non-rejeu repose sur l'identité des octets, pas sur une copie dérivée.
     #[test]
     fn embedded_migration_matches_disk_file() {
-        let disk = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/migrations/20260506000001_create_api_keys.sql"
-        ))
-        .expect("lire la migration sur disque");
+        let disk =
+            std::fs::read(manifest_dir().join("migrations/20260506000001_create_api_keys.sql"))
+                .expect("lire la migration sur disque");
         let disk_checksum = Sha384::digest(&disk).to_vec();
         let embedded_checksum = Sha384::digest(MIGRATION_SQL.as_bytes()).to_vec();
         assert_eq!(

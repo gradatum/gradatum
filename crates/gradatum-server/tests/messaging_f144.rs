@@ -1216,3 +1216,312 @@ async fn purged_delivery_acknowledged_by_non_recipient_is_silent_404() {
         .expect_err("un non-destinataire ne peut pas acquitter une livraison purgée");
     assert_mute_not_found(&err, &reference, "acquittement par un non-destinataire");
 }
+
+// ── lectures de notes bornées par page ─────────────────────────────────────────
+//
+// Le poll lisait la note de CHAQUE message sélectionné, un appel par note : une page
+// de 50 messages coûtait 50 lectures de notes, et le pire cas du balayage (20 pages)
+// jusqu'à 4 000. La note est désormais lue groupée, une fois par page.
+
+/// Enveloppe de [`gradatum_vault::Registry`] comptant les LECTURES de notes du
+/// serveur (`read_notes_many` / `read_note_by_id`) ; écritures et lectures de file ne
+/// sont pas comptées.
+///
+/// `read_notes_many` DOIT être surchargé et délégué : s'appuyer sur le défaut du trait
+/// recompterait N `read_note_by_id` et laisserait le test rouge après le correctif.
+struct CountingRegistry {
+    inner: Arc<dyn gradatum_vault::Registry>,
+    many_calls: AtomicUsize,
+    unit_calls: AtomicUsize,
+}
+
+impl CountingRegistry {
+    fn new(inner: Arc<dyn gradatum_vault::Registry>) -> Self {
+        Self {
+            inner,
+            many_calls: AtomicUsize::new(0),
+            unit_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn many_calls(&self) -> usize {
+        self.many_calls.load(Ordering::SeqCst)
+    }
+
+    fn unit_calls(&self) -> usize {
+        self.unit_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl gradatum_vault::Registry for CountingRegistry {
+    async fn tenant_count(&self) -> Result<u32, gradatum_core::error::GradatumError> {
+        self.inner.tenant_count().await
+    }
+
+    async fn locus_count(&self) -> Result<u32, gradatum_core::error::GradatumError> {
+        self.inner.locus_count().await
+    }
+
+    async fn ensure_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<(), gradatum_core::error::GradatumError> {
+        self.inner.ensure_tenant(tenant_id).await
+    }
+
+    async fn read_note_by_id(
+        &self,
+        note_id: &str,
+    ) -> Result<gradatum_core::note::Note, gradatum_core::error::GradatumError> {
+        // Toute lecture UNITAIRE de note est un retour au N+1 : comptée pour
+        // l'INTERDIRE, pas seulement pour la documenter.
+        self.unit_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_note_by_id(note_id).await
+    }
+
+    async fn read_notes_many(
+        &self,
+        note_ids: &[String],
+    ) -> Result<Vec<gradatum_core::note::Note>, gradatum_core::error::GradatumError> {
+        // LA lecture mesurée : une lecture groupée pour la page entière.
+        self.many_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_notes_many(note_ids).await
+    }
+
+    async fn note_indexed(
+        &self,
+        _note_id: &str,
+    ) -> Result<bool, gradatum_core::error::GradatumError> {
+        self.inner.note_indexed(_note_id).await
+    }
+
+    async fn history_versions(
+        &self,
+        note_id: &str,
+    ) -> Result<Vec<i64>, gradatum_core::error::GradatumError> {
+        self.inner.history_versions(note_id).await
+    }
+
+    async fn history_get(
+        &self,
+        note_id: &str,
+        ts_ms: i64,
+    ) -> Result<gradatum_core::note::Note, gradatum_core::error::GradatumError> {
+        self.inner.history_get(note_id, ts_ms).await
+    }
+
+    async fn history_restore(
+        &self,
+        checked: &gradatum_core::scope::AclCheckedVaultId,
+        note_id: &str,
+        ts_ms: i64,
+    ) -> Result<String, gradatum_core::error::GradatumError> {
+        self.inner.history_restore(checked, note_id, ts_ms).await
+    }
+
+    async fn history_diff(
+        &self,
+        note_id: &str,
+        a: &str,
+        b: &str,
+    ) -> Result<Vec<String>, gradatum_core::error::GradatumError> {
+        self.inner.history_diff(note_id, a, b).await
+    }
+
+    async fn update_note_status(
+        &self,
+        checked: &gradatum_core::scope::AclCheckedVaultId,
+        note_id: &str,
+        target: gradatum_core::status::NoteStatus,
+        reason: Option<String>,
+    ) -> Result<(), gradatum_core::error::GradatumError> {
+        self.inner
+            .update_note_status(checked, note_id, target, reason)
+            .await
+    }
+
+    async fn add_tags(
+        &self,
+        checked: &gradatum_core::scope::AclCheckedVaultId,
+        note_id: &str,
+        tags: &[String],
+    ) -> Result<(), gradatum_core::error::GradatumError> {
+        self.inner.add_tags(checked, note_id, tags).await
+    }
+
+    async fn move_locus(
+        &self,
+        checked: &gradatum_core::scope::AclCheckedVaultId,
+        note_id: &str,
+        new_locus: &gradatum_core::scope::LocusId,
+    ) -> Result<(), gradatum_core::error::GradatumError> {
+        self.inner.move_locus(checked, note_id, new_locus).await
+    }
+
+    async fn write_note_with_id_internal(
+        &self,
+        checked: &gradatum_core::scope::AclCheckedVaultId,
+        frontmatter: gradatum_core::frontmatter::Frontmatter,
+        body: String,
+        id: gradatum_core::identity::NoteId,
+    ) -> Result<gradatum_core::note::Note, gradatum_core::error::GradatumError> {
+        self.inner
+            .write_note_with_id_internal(checked, frontmatter, body, id)
+            .await
+    }
+
+    async fn write_if_match_internal(
+        &self,
+        checked: &gradatum_core::scope::AclCheckedVaultId,
+        frontmatter: gradatum_core::frontmatter::Frontmatter,
+        body: String,
+        id: gradatum_core::identity::NoteId,
+        expected_sha256: [u8; 32],
+    ) -> Result<gradatum_vault::write::WriteResult, gradatum_core::error::GradatumError> {
+        self.inner
+            .write_if_match_internal(checked, frontmatter, body, id, expected_sha256)
+            .await
+    }
+
+    async fn rescan_privacy_note(
+        &self,
+        vault_id: &str,
+        note_id: gradatum_core::identity::NoteId,
+    ) -> Result<gradatum_vault::PrivacyRescanOutcome, gradatum_core::error::GradatumError> {
+        self.inner.rescan_privacy_note(vault_id, note_id).await
+    }
+
+    async fn delete_note_by_id(
+        &self,
+        id: gradatum_core::identity::NoteId,
+    ) -> Result<(), gradatum_core::error::GradatumError> {
+        self.inner.delete_note_by_id(id).await
+    }
+
+    async fn delete_note_by_id_in(
+        &self,
+        vault_id: &str,
+        id: gradatum_core::identity::NoteId,
+    ) -> Result<(), gradatum_core::error::GradatumError> {
+        self.inner.delete_note_by_id_in(vault_id, id).await
+    }
+
+    async fn archive_note_by_id(
+        &self,
+        id: gradatum_core::identity::NoteId,
+        archived_by: Option<String>,
+        gc_due_ms: i64,
+    ) -> Result<gradatum_vault::lifecycle::ArchiveOutcome, gradatum_core::error::GradatumError>
+    {
+        self.inner
+            .archive_note_by_id(id, archived_by, gc_due_ms)
+            .await
+    }
+
+    async fn archive_note_by_id_in(
+        &self,
+        vault_id: &str,
+        id: gradatum_core::identity::NoteId,
+        archived_by: Option<String>,
+        gc_due_ms: i64,
+    ) -> Result<gradatum_vault::lifecycle::ArchiveOutcome, gradatum_core::error::GradatumError>
+    {
+        self.inner
+            .archive_note_by_id_in(vault_id, id, archived_by, gc_due_ms)
+            .await
+    }
+
+    async fn run_archive_gc(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<u64, gradatum_core::error::GradatumError> {
+        self.inner.run_archive_gc(now_ms, limit).await
+    }
+
+    async fn list_archives(
+        &self,
+        filter: &gradatum_index::ArchiveListFilter,
+    ) -> Result<Vec<gradatum_index::ArchiveEntry>, gradatum_core::error::GradatumError> {
+        self.inner.list_archives(filter).await
+    }
+
+    async fn get_active_archive(
+        &self,
+        note_id: &str,
+    ) -> Result<Option<gradatum_index::ArchiveEntry>, gradatum_core::error::GradatumError> {
+        self.inner.get_active_archive(note_id).await
+    }
+
+    async fn purge_archive_by_id(
+        &self,
+        note_id: &str,
+    ) -> Result<bool, gradatum_core::error::GradatumError> {
+        self.inner.purge_archive_by_id(note_id).await
+    }
+
+    async fn restore_archive_by_id(
+        &self,
+        note_id: &str,
+    ) -> Result<gradatum_vault::lifecycle::RestoreOutcome, gradatum_core::error::GradatumError>
+    {
+        self.inner.restore_archive_by_id(note_id).await
+    }
+}
+
+/// Une page de 50 messages coûte **une** lecture de notes, quel que soit le nombre de
+/// messages sélectionnés. Avant correctif : une lecture par message (50).
+///
+/// Le compteur porte sur le VRAI registre de vault (aucune duplication de fixture) :
+/// c'est le chemin réellement emprunté par le serveur qui est mesuré.
+#[tokio::test]
+async fn poll_page_reads_note_content_in_one_batched_call() {
+    let mut env = build_msg_env().await;
+
+    // Les envois sont hors mesure : le compteur n'est installé qu'ensuite.
+    let (trust, _recipient, ids) = send_n_to_self(&env, 50).await;
+    let counting = Arc::new(CountingRegistry::new(Arc::clone(&env.state.vault)));
+    env.state.vault = Arc::clone(&counting) as Arc<dyn gradatum_vault::Registry>;
+
+    let page = message_poll_impl(&env.state, &trust, Some("accepted"), 50, None)
+        .await
+        .expect("poll accepted");
+
+    assert_eq!(
+        page.messages.len(),
+        50,
+        "la page est pleine : le coût mesuré porte bien sur 50 notes"
+    );
+    assert!(
+        page.next_cursor.is_some(),
+        "page pleine → un curseur de reprise, jamais une fin de liste feinte"
+    );
+
+    // L'exactitude AVANT le coût : une lecture groupée qui perd du contenu reste
+    // « une seule lecture » — le vert par vacuité est ici explicitement écarté.
+    let rendus: Vec<String> = page.messages.iter().map(|m| m.message_id.clone()).collect();
+    assert_eq!(rendus, ids, "les 50 messages, dans l'ordre du locus");
+    for (msg, i) in page.messages.iter().zip(0..50) {
+        assert_eq!(
+            msg.subject.as_deref(),
+            Some(format!("sujet {i}").as_str()),
+            "le sujet vient de la note, pas d'une lecture perdue"
+        );
+        assert_eq!(msg.body, format!("corps {i}"));
+    }
+
+    // Plancher ET plafond, pas seulement un plafond : `many_calls == 1` seul resterait
+    // vert si le poll cessait de lire les notes (0 lecture) et rendait 0 message — mais
+    // l'assertion de page pleine ci-dessus l'interdit déjà. Le couple est néanmoins
+    // asserté tel quel, pour que la mesure soit lisible : 1 lecture groupée, 0 unitaire.
+    assert_eq!(
+        (counting.many_calls(), counting.unit_calls()),
+        (1, 0),
+        "une page de 50 messages = UNE lecture groupée de notes et AUCUNE lecture \
+         unitaire (avant correctif : 50 lectures unitaires) — obtenu {} groupée(s), \
+         {} unitaire(s)",
+        counting.many_calls(),
+        counting.unit_calls()
+    );
+}

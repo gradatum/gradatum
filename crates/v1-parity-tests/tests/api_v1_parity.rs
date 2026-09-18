@@ -22,6 +22,7 @@
 //! Arbitrage T12 Option α : design spec P2.0 — 2026-05-04.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gradatum_acl_policy::AclEngine;
@@ -136,12 +137,24 @@ const LEGACY_VAULT_TEST_PORT: u16 = 18462;
 #[allow(dead_code)]
 const GRADATUM_TEST_PORT: u16 = 19190;
 
+/// Racine du crate, résolue à l'exécution.
+///
+/// La valeur figée à la compilation devient périmée dès qu'un binaire de test est
+/// réutilisé depuis un autre répertoire de checkout (artefacts de build partagés) :
+/// la variable d'environnement prime, la valeur de compilation ne servant que de
+/// repli hors cargo.
+#[allow(dead_code)] // aucun test de ce fichier ne lit encore de chemin de fixture
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
 /// Chemin absolu vers le snapshot DB legacy vault v1.6.2.
 #[allow(dead_code)]
-const SNAPSHOT_DB_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/legacy-vault-snapshot.db"
-);
+fn snapshot_db_path() -> PathBuf {
+    manifest_dir().join("tests/fixtures/legacy-vault-snapshot.db")
+}
 
 // ── Tests shape parity — 10 méthodes read ─────────────────────────────────────
 //

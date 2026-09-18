@@ -296,7 +296,7 @@ pub async fn export_features(
             let outcome = if d.stored.is_some() {
                 "fell back to stored release"
             } else {
-                "skipped — no stored release either (dangling track anomaly)"
+                "skipped — no stored release either (nothing left to project)"
             };
             match &d.reason {
                 DerivationFallbackReason::NoTrack if d.stored.is_some() => tracing::debug!(
@@ -320,6 +320,12 @@ pub async fn export_features(
                     stored = ?d.stored,
                     err = %e,
                     "export_features(derived): structure status undeterminable — {outcome}"
+                ),
+                DerivationFallbackReason::UnterminatedCodeFence => tracing::warn!(
+                    feature = %d.feature,
+                    stored = ?d.stored,
+                    "export_features(derived): the card body opens a code fence that never \
+                     closes — every role below it was read as code and counted nowhere — {outcome}"
                 ),
                 // `DerivationFallbackReason` est #[non_exhaustive] : toute variante future
                 // reste VISIBLE (warn), jamais silencieuse.
@@ -348,9 +354,22 @@ pub struct ListCardsQuery {
     /// d'un jalon inclut donc sa propre carte de structure (F-211). Absent = toutes les cartes.
     #[serde(default)]
     pub version: Option<String>,
+
+    /// Filtre optionnel par **projet** — la valeur du rôle `[[project:…]]` de la carte.
+    ///
+    /// Absent = `gradatum`, le défaut du déploiement : une carte hors de ce projet n'est
+    /// pas rendue. Le défaut n'est **jamais** « tous les projets » — un listing sans
+    /// paramètre qui rendrait les cartes `project:system` d'un autre périmètre serait une
+    /// fuite, pas une commodité. Passer un nom explicite pour lister un autre projet ;
+    /// un nom sans porteur rend `[]`.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
-/// `GET /api/v1/project-map/cards?version=<v>`
+/// Projet retenu quand la requête ne nomme pas de `project` — la valeur du déploiement.
+const DEFAULT_PROJECT: &str = "gradatum";
+
+/// `GET /api/v1/project-map/cards?version=<v>&project=<p>`
 ///
 /// Listage sanctionné des cartes project-map en **une seule requête**, tous axes d'identification
 /// **nommés** (F-211, supersedes F-253). Résout le manque de longue date : il n'existait aucune
@@ -368,11 +387,13 @@ pub struct ListCardsQuery {
 ///
 /// | Méthode | Path | Auth | Query | Réponse |
 /// |---------|------|------|-------|---------|
-/// | GET | `/api/v1/project-map/cards` | Bearer JWT (Read) | `version` (str, opt) | `200` — `[ProjectMapCardEntry]` |
+/// | GET | `/api/v1/project-map/cards` | Bearer JWT (Read) | `version` (str, opt), `project` (str, opt, défaut `gradatum`) | `200` — `[ProjectMapCardEntry]` |
 ///
 /// Tri : cartes de structure d'abord, puis cartes de travail par `F-XX` croissant (égalités par
 /// ULID). Une version inexistante rend `[]`. Une carte de travail au `[[track:]]` irrésolu est
 /// listée avec `release: null` (le null est le signal visible de l'anomalie, jamais un drop).
+/// Les deux filtres se composent en ET. Le filtre projet n'est **jamais** désactivé par
+/// omission : absent, il vaut `gradatum`, et non « tous les projets ».
 ///
 /// # Errors
 ///
@@ -394,6 +415,7 @@ pub async fn list_cards(
 
     tracing::debug!(
         version = ?params.version,
+        project = ?params.project,
         "list_cards: access granted"
     );
 
@@ -408,7 +430,11 @@ pub async fn list_cards(
         .map(|r| (r.id, r.body_text, r.title.unwrap_or_default()))
         .collect();
 
-    let entries = project_map_card_index(&notes, params.version.as_deref(), Some("gradatum"));
+    let entries = project_map_card_index(
+        &notes,
+        params.version.as_deref(),
+        Some(params.project.as_deref().unwrap_or(DEFAULT_PROJECT)),
+    );
 
     Ok(Json(entries))
 }

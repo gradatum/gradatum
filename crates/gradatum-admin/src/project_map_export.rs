@@ -541,4 +541,103 @@ mod tests {
             out.diagnostics
         );
     }
+
+    /// The export's `version` column must read the **same source as the title**: the
+    /// `[[track:]]` pointer first, the card's own `[[version:]]` only as a fallback.
+    ///
+    /// A card can carry both — a stored `[[version:gradatum/0.0.0]]` surviving from a bootstrap
+    /// attachment while the track names the version actually being delivered. Reading the stored
+    /// role alone makes the CLI export a different version from the one the card's own title
+    /// advertises, and the wrong one is the field the website consumes.
+    #[test]
+    fn export_version_follows_the_track_like_the_title() {
+        let conn = Connection::open_in_memory().expect("DB mémoire");
+        create_schema(&conn);
+        insert_note(
+            &conn,
+            "f-42",
+            "main",
+            "project-map",
+            "[[feature:F-42]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+             [[release:planned]] [[version:gradatum/0.0.0]] [[track:gradatum/2.3.0]]",
+            "[PROJECT-MAP][gradatum] F-42 \u{2014} v2.3.0",
+            "live",
+        );
+
+        let entries =
+            export_features_from_conn(&conn, "main", ExportOptions::default()).expect("export");
+        assert_eq!(entries.len(), 1, "carte exportée : {entries:?}");
+        assert_eq!(
+            entries[0].version,
+            Some("v2.3.0".to_string()),
+            "le track primerait-il : jamais v0.0.0 quand la carte en tracke une autre"
+        );
+        assert!(
+            entries[0].title.contains("v2.3.0"),
+            "cohérence titre/colonne : {}",
+            entries[0].title
+        );
+    }
+
+    /// The visibility axis is rendered by the export, in both modes — the default mirror
+    /// **excludes** an `interne` card (F-256) while the audit mode includes it and shows why.
+    /// Without the field the two cards are indistinguishable in the output.
+    #[test]
+    fn export_renders_the_visibility_axis() {
+        let conn = Connection::open_in_memory().expect("DB mémoire");
+        create_schema(&conn);
+        insert_note(
+            &conn,
+            "f-interne",
+            "main",
+            "project-map",
+            "[[feature:F-70]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+             [[release:planned]] [[version:gradatum/2.3.0]] [[visibilite:interne]]",
+            "F-70 interne",
+            "live",
+        );
+        insert_note(
+            &conn,
+            "f-public",
+            "main",
+            "project-map",
+            "[[feature:F-71]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+             [[release:planned]] [[version:gradatum/2.3.0]] [[visibilite:public]]",
+            "F-71 publique",
+            "live",
+        );
+
+        // Miroir par défaut : la carte interne reste exclue — le champ rendu ne lève pas le
+        // filtre, il le rend lisible.
+        let mirror =
+            export_features_from_conn(&conn, "main", ExportOptions::default()).expect("export");
+        assert_eq!(
+            mirror
+                .iter()
+                .map(|e| e.feature.as_str())
+                .collect::<Vec<_>>(),
+            vec!["F-71"],
+            "la carte interne reste exclue du miroir : {mirror:?}"
+        );
+        assert_eq!(mirror[0].visibility, Some("public".to_string()));
+
+        // Mode audit : les deux sortent, et la visibilité les distingue.
+        let audit = export_features_from_conn(
+            &conn,
+            "main",
+            ExportOptions {
+                include_dropped: true,
+            },
+        )
+        .expect("export audit");
+        assert_eq!(audit.len(), 2, "{audit:?}");
+        let visibilites: Vec<Option<&str>> = audit
+            .iter()
+            .map(|e| e.visibility.as_deref())
+            .collect::<Vec<_>>();
+        assert!(
+            visibilites.contains(&Some("interne")) && visibilites.contains(&Some("public")),
+            "les deux valeurs de rôle sont rendues telles quelles : {visibilites:?}"
+        );
+    }
 }

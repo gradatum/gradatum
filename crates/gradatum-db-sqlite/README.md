@@ -2,7 +2,7 @@
 
 > Async SQLite queue store (`SqliteQueueStore`) — `rusqlite`-backed job queue for gradatum-worker.
 
-**Status**: v2.1.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.5.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -24,7 +24,7 @@ helpers.
 
 ```toml
 [dependencies]
-gradatum-db-sqlite = "2.1.0"
+gradatum-db-sqlite = "2.5.0"
 ```
 
 ```rust

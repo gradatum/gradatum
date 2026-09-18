@@ -1,0 +1,5 @@
+# Fixture inventory -- test data, NOT a release derogation list.
+# The key EXISTS and holds NO entry: an empty inventory was READ and authorizes
+# nothing. That state is distinct from an absent key, which was never read.
+expected_rank: minor
+semver_deviations:

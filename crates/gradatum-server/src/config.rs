@@ -4,7 +4,7 @@
 //! bind/TLS is fail-closed via [`ServerConfig::validate_bind_tls`].
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use figment::{
     Figment,
@@ -180,8 +180,9 @@ pub struct MultiTenantConfig {
 
 /// Mode of the personal-data frontier (F-160).
 ///
-/// `ReportOnly` observes and marks; `Mask` rewrites the body. 2.4.0 only ever runs
-/// in `ReportOnly`.
+/// `ReportOnly` observes and marks; `Mask` rewrites the body. The delivered default is
+/// the observing one, and a deployment runs in `Mask` only by writing it in its own
+/// configuration: nothing in the product selects it on an operator's behalf.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -189,7 +190,12 @@ pub enum PrivacyMode {
     /// Detect and report, never alter the body. The delivered default.
     #[default]
     ReportOnly,
-    /// Detect and rewrite the matched passages. Not reachable in 2.4.0.
+    /// Detect and rewrite the matched passages.
+    ///
+    /// The one setting in this product whose effect cannot be undone, so it is admitted
+    /// only over an activation that can actually perform a rewrite: a mode set while
+    /// every activated category sits at the observation point would promise redaction
+    /// and never perform one. See [`ServerConfig::validate_privacy_mode`].
     Mask,
 }
 
@@ -217,11 +223,18 @@ impl PrivacyMode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PrivacyThresholds {
     /// Threshold applied to a category that has no entry of its own.
-    /// Parsed but not yet wired (2.5.0): no threshold reaches the delivered detector.
+    ///
+    /// In thousandths, like every other threshold. It is the point a category sits at
+    /// until the campaign has measured its own curve, and the delivered value — zero —
+    /// is the observation point: the category is scanned and counted, and nothing it
+    /// reports can mark a note.
     #[serde(default)]
     pub default_m: u16,
     /// Per-category overrides, keyed by the canonical category label.
-    /// Parsed but not yet wired (2.5.0): no threshold reaches the delivered detector.
+    ///
+    /// A key is a category name, not a pattern: `email = 900` sets the e-mail
+    /// threshold. The names are checked against the product taxonomy at load, so a
+    /// misspelling is refused rather than read as a category that marks nothing.
     #[serde(flatten)]
     pub per_category: std::collections::BTreeMap<String, u16>,
 }
@@ -243,16 +256,24 @@ pub struct PrivacyThresholds {
 /// states that exceptions exist, never what they are.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PrivacyConfig {
-    /// `report_only` (default) or `mask`. Only `report_only` is delivered in 2.4.0:
-    /// a configuration that sets `mask` is refused at load
-    /// (see [`ServerConfig::validate_privacy_mode`]). In-place masking is not yet
-    /// wired (2.5.0) — the value is validated, never consumed by a masking path.
+    /// `report_only` (default) or `mask`.
+    ///
+    /// A configuration that sets `mask` is admitted only over an activation one of
+    /// whose categories is calibrated — that is, over thresholds that can mark
+    /// something (see [`ServerConfig::validate_privacy_mode`]). The reason is not
+    /// symmetry: `mask` is the one setting whose effect cannot be undone, and a mode
+    /// that rewrites nothing is the one state an operator cannot tell from a working
+    /// one by reading a note.
     #[serde(default)]
     pub mode: PrivacyMode,
-    /// Enabled categories. **Empty by default**: a category is enabled only with a
-    /// threshold read off its own curve, and none is calibrated in 2.4.0. Only the
-    /// *emptiness* of this list is read in 2.4.0 (it decides whether a detector is
-    /// mounted); the category set itself is not yet wired to the detector (2.5.0).
+    /// Activated categories, by canonical label. **Empty by default**: a category is
+    /// activated only with a threshold read off its own curve, and none is calibrated.
+    ///
+    /// This list *is* the activation: a category missing from it is scanned and its
+    /// spans are recorded — the detector reports what it sees — but nothing of that
+    /// category can pose a marker or mask a body, whatever score it carries. An empty
+    /// list is therefore the delivered default, and the reason a mounted detector
+    /// marks nothing until an operator activates a category.
     #[serde(default)]
     pub categories: Vec<String>,
     /// Largest body, in bytes, a single detector call may be handed.
@@ -262,13 +283,16 @@ pub struct PrivacyConfig {
     /// at least the length of the longest entity the detector is expected to report.
     #[serde(default = "PrivacyConfig::default_window_overlap_bytes")]
     pub window_overlap_bytes: usize,
-    /// Score thresholds, in integer thousandths. Parsed but not yet wired to the
-    /// detector (2.5.0): no threshold is read by the delivered regex floor.
+    /// Score thresholds, in integer thousandths. The comparison is made on the
+    /// integer `score_m` a note records, never on a float — see
+    /// [`PrivacyConfig::policy`], which is where the two meet.
     #[serde(default)]
     pub thresholds: PrivacyThresholds,
-    /// Literal exception patterns, per tenant. Parsed but not yet wired (2.5.0): **no
-    /// exception is applied to detection in 2.4.0** — the earlier "applied after
-    /// detection" was the planned behaviour, not the delivered one.
+    /// Literal exception patterns, per tenant, applied **last**: after fusion and
+    /// after the thresholds. A span a pattern covers is dropped from the pass's
+    /// output, because the declaration says the literal is not personal data.
+    ///
+    /// A missing tenant, or an empty list, excepts nothing.
     #[serde(default)]
     pub exceptions: std::collections::BTreeMap<String, Vec<String>>,
     /// Whether the deferred rescan pass does its work. The task itself is always
@@ -278,6 +302,15 @@ pub struct PrivacyConfig {
     /// Interval of the deferred rescan pass.
     #[serde(default = "PrivacyConfig::default_rescan_interval_secs")]
     pub rescan_interval_secs: u64,
+    /// How the out-of-process detector is reached, when this deployment runs one.
+    ///
+    /// Absent by default, and an absent block is not a degraded detector: it is a
+    /// deployment that mounts the in-process one. Present, it **replaces** the mounted
+    /// engine for every activated category, and the server refuses to start if the
+    /// sidecar is not there — see [`ServerConfig::load`] for the refusals taken from the
+    /// file itself, and `AppState::with_privacy` for the one taken from the deployment.
+    #[serde(default)]
+    pub sidecar: Option<PrivacySidecarConfig>,
 }
 
 impl PrivacyConfig {
@@ -316,6 +349,187 @@ impl PrivacyConfig {
             defaults.sync_cap_ms,
         )
     }
+
+    /// The activation this configuration describes.
+    ///
+    /// The single place the `[privacy]` block is resolved into the shape the write
+    /// path reads, so that the pass, the block, the tags and the health report all
+    /// answer from one value rather than from four readings of the file.
+    ///
+    /// ## What each field becomes
+    ///
+    /// - `categories` is the activation list. A label is turned into a taxonomy
+    ///   category; the threshold it is activated at is its own override when it has
+    ///   one, and [`PrivacyThresholds::default_m`] otherwise. A label the taxonomy
+    ///   does not know does not reach this method — [`ServerConfig::load`] refuses the
+    ///   configuration first — and is skipped here rather than guessed at, so a
+    ///   policy built from an unvalidated value enables strictly less than the file
+    ///   asked for, never more.
+    /// - `thresholds` reaches the policy as integer thousandths, untouched. No float
+    ///   is built, parsed or compared anywhere on this path: a span's score is
+    ///   converted once, by the detector contract, and both sides of the comparison
+    ///   are integers.
+    /// - `exceptions` is carried whole. The patterns are literal personal data by
+    ///   nature and are never rendered — see [`gradatum_core::pii::PrivacyPolicy`],
+    ///   which keys the report of a firing on a digest of the pattern instead.
+    /// - `mode` becomes the mask flag. It reaches the policy on the load path as well
+    ///   as on the refusal path, so that the one place that decides what a mode means
+    ///   is this method and not the validator: the validator decides whether an
+    ///   operator may run in that mode, never what the mode does.
+    #[must_use]
+    pub fn policy(&self) -> gradatum_core::pii::PrivacyPolicy {
+        let mut thresholds = std::collections::BTreeMap::new();
+        for label in &self.categories {
+            let Ok(category) = label.parse::<gradatum_core::pii::PiiCategory>() else {
+                continue;
+            };
+            let value = self
+                .thresholds
+                .per_category
+                .get(label)
+                .copied()
+                .unwrap_or(self.thresholds.default_m);
+            thresholds.insert(category, value);
+        }
+
+        gradatum_core::pii::PrivacyPolicy::new(
+            self.mode == PrivacyMode::Mask,
+            thresholds,
+            self.exceptions.clone(),
+        )
+    }
+}
+
+/// The `[privacy.sidecar]` block — where the out-of-process detector is reached, and
+/// what it is pinned to be.
+///
+/// ## The three values an operator supplies, and the rest
+///
+/// `socket_path`, `binary_digest` and `model_digest` are required and have no default: a
+/// location this product cannot guess, and two digests read off the artefacts that will
+/// run — the pair that decides whether the answering process is trusted at all. Every
+/// other key starts from the value the client's own configuration defines, and is
+/// narrowed here only when a deployment has a reason to.
+///
+/// ## Why the two byte budgets are not here
+///
+/// `max_input_bytes` and `window_overlap_bytes` live in [`PrivacyConfig`] and are handed
+/// to the client by [`to_sidecar_config`](Self::to_sidecar_config). Two keys for one
+/// ceiling would be two authorities on how a body is cut: an operator raising the
+/// sidecar's would leave the pass planning its windows against the other, and the two
+/// would only have to disagree once for a body to be scanned in windows neither figure
+/// describes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacySidecarConfig {
+    /// Path of the unix socket the sidecar listens on. Required.
+    ///
+    /// A path this product does not choose: the unit that runs the sidecar decides where
+    /// it listens, and the deployment tells the server where that is. It is rendered by
+    /// neither a refusal nor a log line.
+    ///
+    /// The directory it sits in is that unit's own `RuntimeDirectory=`: `bind` does not
+    /// create the parent, and a sidecar sharing the server's runtime directory would have
+    /// it re-chowned on every start of either unit.
+    pub socket_path: String,
+    /// Digest of the sidecar build this deployment pins. Required, 64 lowercase
+    /// hexadecimal characters.
+    ///
+    /// Bare, without a `sha256:` tag: this is the value the handshake is compared against,
+    /// and the comparison is an exact string equality. A pin written in another form is
+    /// refused at load rather than left to fail a handshake — a divergence that would
+    /// otherwise surface at start, naming a build the operator believes they pinned.
+    pub binary_digest: String,
+    /// Digest of the model weights this deployment pins. Required, in the same form as
+    /// [`binary_digest`](Self::binary_digest).
+    pub model_digest: String,
+    /// Aggregation mode of the reported scores this deployment pins.
+    #[serde(default = "PrivacySidecarConfig::default_score_mode")]
+    pub score_mode: String,
+    /// Per-kilobyte term of a synchronous call's allowance, in milliseconds.
+    #[serde(default = "PrivacySidecarConfig::default_timeout_ms_sync_per_kib")]
+    pub timeout_ms_sync_per_kib: u64,
+    /// Consecutive failures attributable to the detector that open its circuit breaker.
+    #[serde(default = "PrivacySidecarConfig::default_breaker_n")]
+    pub breaker_n: u32,
+    /// How long the breaker stays open before a probe is allowed, in seconds.
+    #[serde(default = "PrivacySidecarConfig::default_breaker_cooldown_s")]
+    pub breaker_cooldown_s: u64,
+}
+
+/// The client's own delivered values, read off the client rather than restated here.
+///
+/// The four defaults this block shares with [`gradatum_privacy::SidecarConfig`] are
+/// asked of the client's constructor instead of being copied into a constant: a copy
+/// would be a second statement of one calibration, and the two would drift the day the
+/// client moves its floor. Only the fields with no value behind them are read.
+fn sidecar_defaults() -> gradatum_privacy::SidecarConfig {
+    gradatum_privacy::SidecarConfig::new(String::new(), String::new(), String::new())
+}
+
+impl PrivacySidecarConfig {
+    /// Delivered aggregation mode, the one the protocol defines.
+    #[must_use]
+    pub fn default_score_mode() -> String {
+        sidecar_defaults().score_mode
+    }
+
+    /// Delivered per-kilobyte term of a call's allowance.
+    #[must_use]
+    pub fn default_timeout_ms_sync_per_kib() -> u64 {
+        sidecar_defaults().timeout_ms_sync_per_kib
+    }
+
+    /// Delivered breaker threshold.
+    #[must_use]
+    pub fn default_breaker_n() -> u32 {
+        sidecar_defaults().breaker_n
+    }
+
+    /// Delivered breaker cooldown.
+    #[must_use]
+    pub fn default_breaker_cooldown_s() -> u64 {
+        sidecar_defaults().cooldown_s
+    }
+
+    /// The client configuration this block describes, over the budgets of `privacy`.
+    ///
+    /// The one place the two halves are joined, so that a deployment's `[privacy]` byte
+    /// ceiling and the sidecar's reach are read together or not at all. The setters are
+    /// what carries the budgets across: the client's own constructor defaults are the
+    /// ones it defines, and a server that silently preferred them would be a second
+    /// authority on a value the file already states.
+    ///
+    /// `self` is expected to have passed [`ServerConfig::validate_privacy_sidecar`] — the
+    /// client refuses an empty socket path, an empty pin, a zero ceiling and a zero
+    /// breaker threshold on its own, so an unvalidated value fails at mount with a reason
+    /// that names the field rather than the file.
+    #[must_use]
+    pub fn to_sidecar_config(&self, privacy: &PrivacyConfig) -> gradatum_privacy::SidecarConfig {
+        gradatum_privacy::SidecarConfig::new(
+            &self.socket_path,
+            &self.binary_digest,
+            &self.model_digest,
+        )
+        .with_score_mode(&self.score_mode)
+        .with_timeout_ms_sync_per_kib(self.timeout_ms_sync_per_kib)
+        .with_max_input_bytes(privacy.max_input_bytes)
+        .with_window_overlap_bytes(privacy.window_overlap_bytes)
+        .with_breaker(self.breaker_n, self.breaker_cooldown_s)
+    }
+}
+
+impl Default for PrivacySidecarConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: String::new(),
+            binary_digest: String::new(),
+            model_digest: String::new(),
+            score_mode: Self::default_score_mode(),
+            timeout_ms_sync_per_kib: Self::default_timeout_ms_sync_per_kib(),
+            breaker_n: Self::default_breaker_n(),
+            breaker_cooldown_s: Self::default_breaker_cooldown_s(),
+        }
+    }
 }
 
 impl Default for PrivacyConfig {
@@ -329,6 +543,7 @@ impl Default for PrivacyConfig {
             exceptions: std::collections::BTreeMap::new(),
             rescan_enabled: false,
             rescan_interval_secs: Self::default_rescan_interval_secs(),
+            sidecar: None,
         }
     }
 }
@@ -346,6 +561,11 @@ impl std::fmt::Debug for PrivacyConfig {
             .field("exceptions", &"[REDACTED]")
             .field("rescan_enabled", &self.rescan_enabled)
             .field("rescan_interval_secs", &self.rescan_interval_secs)
+            // The sidecar block is rendered as it stands: a socket path, two digests and
+            // three bounds are a deployment location and a calibration, not personal
+            // data. Redacting it here would dilute the one redaction this rendering
+            // exists for.
+            .field("sidecar", &self.sidecar)
             .finish()
     }
 }
@@ -1000,7 +1220,43 @@ pub struct AuthConfig {
 /// ACL configuration — path to the presets file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AclConfig {
-    pub preset_path: PathBuf,
+    /// Path to the ACL preset file, **as the operator configured it**.
+    ///
+    /// `None` — the key is absent from the TOML — means *not configured*, and the entry
+    /// point then derives the effective path from the deployment's own root through
+    /// [`effective_acl_preset_path`]. An explicit value is honoured verbatim, the empty
+    /// string included: the empty path is the gate's "not configured" door, and no
+    /// default may close a door the operator opened on purpose.
+    ///
+    /// The key used to default to an absolute path outside `storage.root`. An instance
+    /// whose root was elsewhere still read that host-global path, and the boot gate read
+    /// it as a *configured* preset — so on a host where the path exists but is not
+    /// readable by the server's user, startup was refused for a deployment that had
+    /// configured no preset at all. Absence is not a path: it is a deployment that has
+    /// not answered the question, and the answer belongs to its own root, never to the
+    /// host it happens to run on.
+    #[serde(default)]
+    pub preset_path: Option<PathBuf>,
+}
+
+/// The ACL preset path a loaded configuration actually boots with.
+///
+/// The operator's explicit value wins, verbatim. When the key is absent the path is
+/// derived from `storage.root` — `<root>/config/bearer.toml`, the location
+/// `gradatum-admin init` materialises the preset at and the one `gradatum-admin` reads
+/// back — so a deployment is never pointed at a file belonging to another one, nor at a
+/// host-global path no instance owns.
+///
+/// Returning a value rather than a fallback *inside* the gate keeps the distinction the
+/// boot decision is made on: *was a preset configured?* is answered here, by the
+/// configuration, and *can that preset be turned into an engine?* is answered by
+/// `with_acl_preset_path`.
+#[must_use]
+pub fn effective_acl_preset_path(configured: Option<&Path>, root: &Path) -> PathBuf {
+    match configured {
+        Some(configured) => configured.to_path_buf(),
+        None => gradatum_core::paths::config_dir(root).join("bearer.toml"),
+    }
 }
 
 /// Logging configuration.
@@ -1508,7 +1764,11 @@ impl Default for ServerConfig {
                 api_keys_db_path: None,
             },
             acl: AclConfig {
-                preset_path: PathBuf::from("/var/lib/gradatum/config/bearer.toml"),
+                // None = not configured by the operator: the effective path is derived
+                // from storage.root in the entry point. An absolute default here would
+                // point every instance at one host-global file, which the boot gate then
+                // reads as a configured preset.
+                preset_path: None,
             },
             log: LogConfig {
                 format: "json".to_string(),
@@ -1566,16 +1826,81 @@ pub enum ConfigError {
         Advice: set [server.tls] or change bind to 127.0.0.1:19090"
     )]
     BindTlsRefused { bind: SocketAddr },
-    /// `[privacy] mode = "mask"` was requested, but in-place masking is not delivered in
-    /// 2.4.0 — it arrives in 2.5.0, together with the detection sidecar. Accepting it
-    /// silently would hand an operator a plain tagging pass while the posture document
-    /// promised redaction: a false assurance of protection. Only `report_only` is
-    /// accepted today. No configuration value is rendered in the message.
+    /// `[privacy] mode = "mask"` was requested over an activation that can mask nothing.
+    ///
+    /// Every category the configuration activates sits at the observation point, so the
+    /// pass would count spans and rewrite no body: the mode would promise redaction and
+    /// never perform one. Unlike an uncalibrated `report_only`, which observes by design,
+    /// this state is invisible in the artefacts — a masked note and an untouched one look
+    /// exactly alike when nothing matched — so it is refused at load instead of being left
+    /// for an operator to notice. No configuration value is rendered in the message.
     #[error(
-        "privacy mode `mask` is not available in 2.4.0 (in-place masking ships in 2.5.0); \
-        set [privacy] mode = \"report_only\""
+        "privacy mode `mask` requires at least one activated category with a strictly \
+        positive threshold; as configured, the pass would rewrite nothing — calibrate a \
+        category or set [privacy] mode = \"report_only\""
     )]
-    PrivacyMaskUnavailable,
+    PrivacyMaskWithoutActivation,
+    /// `[privacy] categories` named a label the product taxonomy does not know.
+    ///
+    /// Refused rather than dropped: an operator who wrote `categorie = "e-mails"`
+    /// believes a category is activated, and a load that silently enabled nothing
+    /// would leave them with an unmarked corpus and no reason to look. The label is
+    /// part of the product's own vocabulary, never a personal datum, so it is safe to
+    /// render.
+    #[error(
+        "privacy category `{label}` is not one of the product's personal-data categories; \
+        the configuration was refused rather than read as activating a category that does \
+        not exist"
+    )]
+    PrivacyUnknownCategory { label: String },
+    /// A `[privacy.thresholds]` value fell outside the thousandths scale.
+    ///
+    /// The scale is the one `score_m` uses in a note's frontmatter. A threshold above
+    /// its top would leave a category activated, paying for a detector pass, and
+    /// unable to ever mark or mask anything — a configuration an operator can only
+    /// have written by mistake.
+    #[error(
+        "privacy threshold for `{category}` is {value}, outside the 0..={max} thousandths \
+        scale the frontmatter uses"
+    )]
+    PrivacyThresholdOutOfRange {
+        category: String,
+        value: u16,
+        max: u16,
+    },
+    /// A per-category threshold was declared for a category the activation list omits.
+    ///
+    /// Refused for the same reason as an unknown label: the operator who wrote the
+    /// threshold believes that category is activated, and it is not — the activation
+    /// list is what activates, and a threshold alone would have marked nothing.
+    #[error(
+        "privacy threshold declared for `{category}`, which is not in [privacy] categories; \
+        the threshold would have activated nothing"
+    )]
+    PrivacyThresholdWithoutCategory { category: String },
+    /// A `[privacy.sidecar]` pin was written in a form the handshake cannot match.
+    ///
+    /// The two digests are compared to what the sidecar announces by exact string
+    /// equality, in the bare lowercase hexadecimal form `sha256sum` prints. A pin in any
+    /// other form cannot match anything, so a deployment carrying one would reach its
+    /// first write and find a detector it had pinned refusing the handshake — at start,
+    /// and naming a build the operator believes they pinned. Refused at load instead, so
+    /// the repair is a file edit and the message names the field rather than the value.
+    #[error(
+        "privacy sidecar `{field}` is not 64 lowercase hexadecimal characters; the value \
+        is compared to the handshake by exact equality and no other form can match"
+    )]
+    PrivacySidecarDigestNotHex { field: &'static str },
+    /// A `[privacy.sidecar]` block named no socket.
+    ///
+    /// An empty path describes no detector: the mount would refuse it on the client's own
+    /// validation, with a reason that names the field but arrives at start rather than at
+    /// load. The file is where the missing value is, so the file is where it is refused.
+    #[error(
+        "privacy sidecar `socket_path` is empty; a block that names no socket describes no \
+        detector to reach"
+    )]
+    PrivacySidecarSocketPathEmpty,
 }
 
 /// Hand-written `Debug` that never leaks configuration values.
@@ -1612,26 +1937,159 @@ impl ServerConfig {
         let cfg: Self = fig.extract()?;
         cfg.validate_bind_tls()?;
         cfg.validate_privacy_mode()?;
+        cfg.validate_privacy_policy()?;
+        cfg.validate_privacy_sidecar()?;
         Ok(cfg)
     }
 
-    /// Fail-loud on a personal-data mode the running version does not implement.
+    /// Fail-loud on a `[privacy.sidecar]` block that could not describe a detector.
     ///
-    /// `mode = "mask"` rewrites matched passages in place; the masking path is **not
-    /// shipped in 2.4.0** (it arrives in 2.5.0, with the detection sidecar). An operator
-    /// who set `mask` today would get a plain tagging pass while the security posture
-    /// promised redaction — a false assurance of protection. Reject the value at load
-    /// rather than accept it silently. The match is exhaustive (no wildcard): a future
-    /// mode variant forces a compile error here, so its acceptance is a deliberate
-    /// decision, never a default.
+    /// Two refusals, and both are about the file rather than the deployment: a pin
+    /// written in a form the handshake cannot match, and a block that names no socket.
+    /// Each is a value an operator can only have written by mistake, and each would
+    /// otherwise be discovered at start by a refusal that names the field but points at
+    /// the wrong document — the sidecar is fine, the file is wrong.
+    ///
+    /// The block is validated **whenever it is present**, whatever the activation list
+    /// holds. An empty `categories` mounts no detector, so an unreachable sidecar is not
+    /// an error there — but a malformed pin is a statement about the file, and a
+    /// deployment that loads it in silence would carry the mistake forward into the
+    /// change that finally activates a category.
+    ///
+    /// No refusals are taken here on the socket being *reachable*: whether a sidecar
+    /// answers is a property of the running deployment, not of the file, and it is
+    /// decided at mount — see `AppState::with_privacy`.
     ///
     /// # Errors
-    /// [`ConfigError::PrivacyMaskUnavailable`] if `[privacy] mode = "mask"`.
+    /// [`ConfigError::PrivacySidecarDigestNotHex`] or
+    /// [`ConfigError::PrivacySidecarSocketPathEmpty`].
+    pub fn validate_privacy_sidecar(&self) -> Result<(), ConfigError> {
+        let Some(sidecar) = self.privacy.sidecar.as_ref() else {
+            return Ok(());
+        };
+        if sidecar.socket_path.is_empty() {
+            return Err(ConfigError::PrivacySidecarSocketPathEmpty);
+        }
+        for (field, value) in [
+            ("binary_digest", &sidecar.binary_digest),
+            ("model_digest", &sidecar.model_digest),
+        ] {
+            let is_pin = value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            if !is_pin {
+                return Err(ConfigError::PrivacySidecarDigestNotHex { field });
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail-loud on a personal-data mode the running version cannot honour.
+    ///
+    /// `ReportOnly` observes and marks, and any activation is legitimate for it —
+    /// including none at all, which is the delivered default. `Mask` rewrites matched
+    /// passages in place, and it is admitted only over an activation able to mark: at
+    /// least one activated category whose threshold is **strictly positive**.
+    ///
+    /// The refusal is on the *value*, never on the mode, and it closes the one failure
+    /// this frontier cannot detect after the fact: a `mask` over uncalibrated
+    /// thresholds rewrites nothing, and its output is indistinguishable from a working
+    /// deployment's on a corpus where nothing matched. An operator would have to reason
+    /// about the thresholds to discover it; the load does it for them. The flag a
+    /// policy carries is not consulted here — `mask` is a mode, not a policy field, and
+    /// what a mode *does* is decided in [`PrivacyConfig::policy`] alone.
+    ///
+    /// A category label the taxonomy does not know **abstains**: such a configuration is
+    /// refused by [`ServerConfig::validate_privacy_policy`], which runs immediately after
+    /// this check and names the offending label — the more specific message, and the one
+    /// an operator needs. The match is exhaustive (no wildcard): a future mode variant
+    /// forces a compile error here, so its acceptance is a deliberate decision, never a
+    /// default.
+    ///
+    /// # Errors
+    /// [`ConfigError::PrivacyMaskWithoutActivation`] if `mask` was requested over an
+    /// activation that can mark nothing.
     pub fn validate_privacy_mode(&self) -> Result<(), ConfigError> {
         match self.privacy.mode {
             PrivacyMode::ReportOnly => Ok(()),
-            PrivacyMode::Mask => Err(ConfigError::PrivacyMaskUnavailable),
+            PrivacyMode::Mask => {
+                let unknown_label = self
+                    .privacy
+                    .categories
+                    .iter()
+                    .any(|label| label.parse::<gradatum_core::pii::PiiCategory>().is_err());
+                let policy = self.privacy.policy();
+                let masks_something = policy
+                    .enabled_categories()
+                    .into_iter()
+                    .any(|category| policy.threshold_m(category).unwrap_or(0) > 0);
+                if unknown_label || masks_something {
+                    Ok(())
+                } else {
+                    Err(ConfigError::PrivacyMaskWithoutActivation)
+                }
+            }
         }
+    }
+
+    /// Fail-loud on a `[privacy]` activation that could not do what it says.
+    ///
+    /// Three refusals, and each one closes the same gap: a configuration that a reader
+    /// would take for an active frontier and that the write path would silently read
+    /// as an inert one. The category labels are checked against the product taxonomy
+    /// and the thresholds against the thousandths scale — a category the taxonomy does
+    /// not know activates nothing, and a threshold above the scale marks nothing — and
+    /// a per-category threshold whose category is absent from the activation list is
+    /// refused because the list, not the threshold, is what activates.
+    ///
+    /// A threshold of `0` is **not** refused: it is the calibration's starting point,
+    /// and it is a legitimate declaration that a category is scanned and not marked.
+    /// The distinction the whole activation rests on is exactly that one.
+    ///
+    /// # Errors
+    /// [`ConfigError::PrivacyUnknownCategory`], [`ConfigError::PrivacyThresholdOutOfRange`],
+    /// or [`ConfigError::PrivacyThresholdWithoutCategory`].
+    pub fn validate_privacy_policy(&self) -> Result<(), ConfigError> {
+        use gradatum_core::pii::{PiiCategory, THRESHOLD_MAX_M};
+
+        for label in &self.privacy.categories {
+            if label.parse::<PiiCategory>().is_err() {
+                return Err(ConfigError::PrivacyUnknownCategory {
+                    label: label.clone(),
+                });
+            }
+        }
+
+        for (category, value) in &self.privacy.thresholds.per_category {
+            if category.parse::<PiiCategory>().is_err() {
+                return Err(ConfigError::PrivacyUnknownCategory {
+                    label: category.clone(),
+                });
+            }
+            if *value > THRESHOLD_MAX_M {
+                return Err(ConfigError::PrivacyThresholdOutOfRange {
+                    category: category.clone(),
+                    value: *value,
+                    max: THRESHOLD_MAX_M,
+                });
+            }
+            if !self.privacy.categories.iter().any(|held| held == category) {
+                return Err(ConfigError::PrivacyThresholdWithoutCategory {
+                    category: category.clone(),
+                });
+            }
+        }
+
+        if self.privacy.thresholds.default_m > THRESHOLD_MAX_M {
+            return Err(ConfigError::PrivacyThresholdOutOfRange {
+                category: "default_m".to_owned(),
+                value: self.privacy.thresholds.default_m,
+                max: THRESHOLD_MAX_M,
+            });
+        }
+
+        Ok(())
     }
 
     /// Fail-closed bind/TLS check: refuses startup if bind is non-loopback without TLS.
@@ -2960,13 +3418,15 @@ mod config_error_redaction_tests {
     }
 }
 
-/// F-160 — a personal-data mode the running version does not implement must be refused at
-/// config load, never accepted silently (fail-loud, ruling G34).
+/// F-160 — a personal-data mode must not be accepted at config load for a promise the
+/// running deployment cannot keep, never accepted silently (fail-loud, ruling G34).
 ///
-/// `mask` rewrites the body in place; the masking path ships in 2.5.0, not 2.4.0.
-/// Accepting it today would give a plain tagging pass while the posture document promised
-/// redaction. These tests pin the load-time refusal, the acceptance of the delivered mode,
-/// and the default.
+/// `mask` is refused over an activation that marks nothing, because that state is
+/// indistinguishable after the fact from a working deployment on a note where nothing
+/// matched: the posture reads as a running redaction while the pass rewrites no byte.
+/// The refusal is on the value, never on the mode — a calibrated `mask` loads.
+///
+/// These tests pin that refusal, the acceptance of the delivered mode, and its default.
 #[cfg(test)]
 mod privacy_mode_validation_tests {
     use super::*;
@@ -2979,13 +3439,54 @@ mod privacy_mode_validation_tests {
         ServerConfig::load(Some(file.path()))
     }
 
+    /// The refusal that does not depend on the delivered version: a mode that could
+    /// rewrite nothing, under any masking path.
     #[test]
-    fn mask_mode_is_refused_at_load() {
-        let err = load_toml("[privacy]\nmode = \"mask\"\ncategories = []\n")
-            .expect_err("mask must be refused at load in 2.4.0");
+    fn mask_over_an_activation_that_can_mask_nothing_is_refused() {
+        for (toml, case) in [
+            (
+                "[privacy]\nmode = \"mask\"\ncategories = []\n",
+                "no category activated",
+            ),
+            (
+                "[privacy]\nmode = \"mask\"\ncategories = [\"email\"]\n\
+                 [privacy.thresholds]\nemail = 0\n",
+                "activated at the observation point",
+            ),
+            (
+                "[privacy]\nmode = \"mask\"\ncategories = [\"email\"]\n",
+                "activated at the uncalibrated default",
+            ),
+        ] {
+            let err = load_toml(toml).expect_err("a mask that can mask nothing is refused");
+            assert!(
+                matches!(err, ConfigError::PrivacyMaskWithoutActivation),
+                "{case}: expected PrivacyMaskWithoutActivation, got: {err}"
+            );
+        }
+    }
+
+    /// The refusal is on the value, not on the mode: one thousandth above the
+    /// observation point is the whole distance between a refused file and an accepted one.
+    #[test]
+    fn mask_over_a_calibrated_category_loads() {
+        let cfg = load_toml(
+            "[privacy]\nmode = \"mask\"\ncategories = [\"email\"]\n\
+             [privacy.thresholds]\nemail = 1\n",
+        )
+        .expect("a calibrated mask loads");
+        assert_eq!(cfg.privacy.mode, PrivacyMode::Mask);
+    }
+
+    /// An unknown label is refused by the policy validator, which names it. The mode
+    /// check abstains rather than pre-empting that message with its own.
+    #[test]
+    fn an_unknown_label_under_mask_is_reported_as_an_unknown_label() {
+        let err = load_toml("[privacy]\nmode = \"mask\"\ncategories = [\"e-mails\"]\n")
+            .expect_err("an unknown label is refused");
         assert!(
-            matches!(err, ConfigError::PrivacyMaskUnavailable),
-            "expected PrivacyMaskUnavailable, got: {err}"
+            matches!(err, ConfigError::PrivacyUnknownCategory { ref label } if label == "e-mails"),
+            "expected PrivacyUnknownCategory, got: {err}"
         );
     }
 
@@ -3001,5 +3502,101 @@ mod privacy_mode_validation_tests {
         let cfg =
             load_toml("[privacy]\ncategories = []\n").expect("privacy without mode must load");
         assert_eq!(cfg.privacy.mode, PrivacyMode::ReportOnly);
+    }
+}
+
+/// The ACL preset path belongs to the **deployment**, never to the host.
+///
+/// The key used to default to an absolute path outside `storage.root`. An instance whose
+/// root was elsewhere therefore still read that host-global path, and the boot gate read
+/// it as a *configured* preset: on a host where the path exists but is not readable by
+/// the server's user, startup was refused for a deployment that had configured no preset
+/// at all — the refusal named a path that had nothing to do with the instance.
+///
+/// These tests pin the two halves of the correction: an absent key is **absent**
+/// (`None`, never a path the server invented for itself), and the effective path is then
+/// derived from the deployment's own root. The entry point consumes
+/// [`effective_acl_preset_path`], the same function asserted here, so what is tested is
+/// the value the boot actually uses — not a re-implementation of it.
+#[cfg(test)]
+mod acl_preset_path_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn load_toml(toml: &str) -> Result<ServerConfig, ConfigError> {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(toml.as_bytes()).expect("write TOML");
+        ServerConfig::load(Some(file.path()))
+    }
+
+    /// The effective path for a root the operator never pointed anywhere.
+    #[test]
+    fn absent_key_leaves_the_path_absent_and_follows_the_deployment_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cfg = load_toml(&format!(
+            "[storage]\nroot = \"{}\"\n",
+            root.path().display()
+        ))
+        .expect("une config sans section [acl] doit charger");
+
+        assert!(
+            cfg.acl.preset_path.is_none(),
+            "la clé absente doit rester absente : un chemin inventé ici est relu comme \
+             « configuré » par la porte de démarrage. Obtenu : {:?}",
+            cfg.acl.preset_path
+        );
+
+        let effective =
+            effective_acl_preset_path(cfg.acl.preset_path.as_deref(), &cfg.storage.root);
+        assert_eq!(
+            effective,
+            gradatum_core::paths::config_dir(root.path()).join("bearer.toml"),
+            "le chemin effectif doit être celui du déploiement, pas un chemin de l'hôte"
+        );
+        assert!(
+            effective.starts_with(root.path()),
+            "le chemin effectif doit rester sous la racine du déploiement : {}",
+            effective.display()
+        );
+    }
+
+    /// An explicit value is the operator's answer, and is never replaced by a default.
+    #[test]
+    fn explicit_key_is_honoured_verbatim() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let custom = root.path().join("elsewhere/preset.toml");
+        let cfg = load_toml(&format!(
+            "[storage]\nroot = \"{}\"\n[acl]\npreset_path = \"{}\"\n",
+            root.path().display(),
+            custom.display()
+        ))
+        .expect("une config avec preset_path explicite doit charger");
+
+        assert_eq!(cfg.acl.preset_path.as_deref(), Some(custom.as_path()));
+        assert_eq!(
+            effective_acl_preset_path(cfg.acl.preset_path.as_deref(), &cfg.storage.root),
+            custom,
+            "une valeur fournie par l'opérateur ne se voit jamais substituer un défaut"
+        );
+    }
+
+    /// An explicit empty value stays empty, so the gate's "not configured" door remains
+    /// reachable *through configuration* and not only through a direct call. Deriving a
+    /// path here would turn a deliberate DENY-ALL posture into a preset read.
+    #[test]
+    fn explicit_empty_value_stays_empty() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cfg = load_toml(&format!(
+            "[storage]\nroot = \"{}\"\n[acl]\npreset_path = \"\"\n",
+            root.path().display()
+        ))
+        .expect("une config avec preset_path vide doit charger");
+
+        assert_eq!(cfg.acl.preset_path.as_deref(), Some(Path::new("")));
+        assert_eq!(
+            effective_acl_preset_path(cfg.acl.preset_path.as_deref(), &cfg.storage.root),
+            PathBuf::from(""),
+            "vide reste vide : la porte « non configurée » ne doit pas être refermée par un défaut"
+        );
     }
 }

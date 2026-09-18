@@ -29,6 +29,7 @@ use gradatum_core::identity::{ContentHash, NoteId, NoteVersion};
 use gradatum_storage::Storage; // trait in scope: `self.storage` is the concrete NoteWriteGuard (F-176)
 // DocumentStore : write_note, get_content_hash, get_note, list_by_status (Étape 0.1).
 use gradatum_core::DocumentStore as _;
+use gradatum_core::index::NoteRecord;
 use gradatum_core::note::{EffectiveNote, Note, NoteBody};
 use gradatum_core::status::NoteStatus;
 
@@ -200,6 +201,37 @@ impl Vault {
             }
         };
 
+        // ── F-160 §5.4 — fail-closed, and only under `mask` ───────────────────────
+        // A detector that did not answer leaves the body unjudged. Under `report_only`
+        // that is an acceptable state, and the note is persisted with
+        // `privacy-unscanned` so the sweep comes back for it. Under `mask` it is not:
+        // the deployment has promised that what the frontier matches is destroyed, and
+        // writing the body anyway would persist exactly the text nothing judged, under
+        // a policy whose whole purpose is to destroy it. The two modes therefore part
+        // company here, and they part in the direction of refusing the write.
+        //
+        // Refused before the read-before-write, so the caller's body reaches neither
+        // the disk nor the version history, and the version already on disk stays the
+        // one a reader finds. The refusal is a typed error naming the frontier, never a
+        // silent skip: a write that did not happen must not look like one that did.
+        if self.privacy_policy.masks()
+            && pass_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.status == privacy_block::Status::DetectorUnavailable)
+        {
+            tracing::warn!(
+                section = frontmatter.section.as_str(),
+                "detection pass did not complete under the masking mode — write refused"
+            );
+            return Err(VaultError::Core(GradatumError::Validation(
+                gradatum_core::error::ValidationError::InvalidInput(
+                    "privacy mask: the detection pass did not complete (detector_unavailable) — \
+                     the body was not written rather than persisted unmasked"
+                        .to_owned(),
+                ),
+            )));
+        }
+
         // ── Phase 4 — Read-before-write (scopé au vault CIBLE — C4-1c) ────────────
         // Tenter de lire la version existante AVANT d'écrire.
         // `existing` est `None` pour une création, `Some(note)` pour une mise à jour.
@@ -242,6 +274,22 @@ impl Vault {
         // Mise à jour du timestamp de modification
         frontmatter.updated = Some(Utc::now());
 
+        // ── F-160 §5.3 — la réécriture, quand le mode détruit ─────────────────────
+        // Dernière étape avant que le corps ne devienne la note : le mode `mask` remplace
+        // les passages que l'activation a marqués. Elle vient ici, et pas plus tôt, parce
+        // que tout ce qui suit — l'empreinte, le fichier, la note rendue — doit décrire le
+        // texte réécrit, et pas celui que l'appelant a remis.
+        //
+        // `body_masked` n'est pas un ornement : c'est ce qui autorise l'écriture à ne PAS
+        // conserver de copie de la version qu'elle remplace (voir F-40 ci-dessous).
+        let (body, body_masked) = self.masked_body(body, pass_outcome.as_ref());
+        if body_masked {
+            tracing::debug!(
+                section = frontmatter.section.as_str(),
+                "masked write — the replaced text is not kept"
+            );
+        }
+
         let body_obj = NoteBody { markdown: body };
 
         // Calcul du ContentHash JCS (§2.2) — déterministe cross-langage
@@ -271,7 +319,41 @@ impl Vault {
         // qu'elle indexe les snapshots.
         if let Some(ref prev) = existing {
             // Comparer les hashes sémantiques (excluant updated, processed, etc.).
-            if sha256_for_history(prev) != sha256_for_history(&note) {
+            //
+            // F-160 : une écriture qui a masqué ne snapshote PAS la version qu'elle
+            // remplace — elle **détruit** celles qui étaient déjà là. Ce que `.history/`
+            // conserve n'est pas une version antérieure comme une autre : c'est le texte
+            // en clair que le mode vient de détruire, recopié à côté de la note dans le
+            // seul répertoire que le masquage n'atteint pas. Supprimer le seul instantané
+            // de la version remplacée ne suffirait pas — les versions d'avant, écrites
+            // sous un mode qui ne détruisait rien, portent le même texte et resteraient
+            // lisibles : une note masquée dont l'historique décrit encore ce qui a été
+            // retiré n'est pas masquée. Le mode est irréversible par contrat, et c'est la
+            // totalité de l'historique de la note que l'irréversibilité emporte.
+            //
+            // Le reste du chemin F-40 est inchangé : une écriture qui ne masque rien
+            // snapshote comme avant, y compris sous `mask`.
+            if body_masked {
+                let tenant = prev.frontmatter.vault_id.as_str();
+                let id_str = prev.id.to_string();
+                let (destroyed, failed) = self.purge_history_dir(note.id, &id_str, tenant).await;
+                // Le compte, jamais le texte : ce que l'écriture a détruit se dit en
+                // instantanés supprimés, et rien de ce qu'ils contenaient ne franchit
+                // cette ligne. Émis au niveau `warn` parce que le niveau par défaut du
+                // déploiement est `info` : une trace que personne ne lit ne rend pas
+                // compte d'un acte irréversible.
+                //
+                // `snapshots_failed` est à côté de `snapshots_destroyed`, et pas dans une
+                // ligne séparée : ce sont les deux moitiés d'un même compte, et un
+                // instantané qui a résisté est un texte en clair qui survit à l'acte que
+                // cette ligne annonce.
+                tracing::warn!(
+                    id = %id_str,
+                    snapshots_destroyed = destroyed,
+                    snapshots_failed = failed,
+                    "masked write — the replaced text is not kept, and neither is any version that preceded it"
+                );
+            } else if sha256_for_history(prev) != sha256_for_history(&note) {
                 // Timestamp de la version précédente — utilisé comme nom de fichier histoire.
                 // Priorité : updated (timestamp de dernière écriture connue), sinon created,
                 // sinon timestamp ULID de l'id (garanti non-nul, sortable).
@@ -521,6 +603,32 @@ impl Vault {
             .map_err(VaultError::Core)?
             .ok_or(VaultError::Core(GradatumError::NoteNotFound(id)))?;
 
+        self.read_note_from_record(vault_id, &record, id).await
+    }
+
+    /// Materialises the `Note` behind an already indexed record: resolves the
+    /// locus-aware `.md` path, reads it, decodes it and parses it.
+    ///
+    /// Split out of `read_note_in` so that a batched read can fetch a whole slice of
+    /// records with a single index query, then materialise each of them here without
+    /// re-querying the index per note.
+    ///
+    /// ## Errors
+    ///
+    /// - `VaultError::Core(GradatumError::NoteNotFound)` when the record is indexed but
+    ///   its `.md` is absent from disk (ghost note) — the absence stays TYPED, so every
+    ///   caller answers `404` and never `500`.
+    /// - `VaultError::Storage(...)` for any other storage failure (real IO, invalid path):
+    ///   a genuine disk fault is never masked as a missing note.
+    /// - `VaultError::Markdown(...)` if parsing fails.
+    pub(crate) async fn read_note_from_record(
+        &self,
+        vault_id: &str,
+        record: &NoteRecord,
+        id: NoteId,
+    ) -> Result<Note, VaultError> {
+        let id_str = id.to_string();
+
         // Construire le chemin disque (D1.1 — locus-aware).
         // Ordre : locus explicite (relocalisation physique) → racine tenant → section.
         let path_with_locus = record
@@ -598,6 +706,58 @@ impl Vault {
         };
 
         Ok(note)
+    }
+
+    /// Batched counterpart of `read_note_in`: **one** index query for the whole slice,
+    /// then one `.md` read per note.
+    ///
+    /// The number of index round-trips is bounded by the number of SQLite variable
+    /// chunks (999 bound variables, one slot taken by the vault id), never by the size
+    /// of `note_ids` — that is the whole point of the batched form. The `.md` reads stay
+    /// per note: they are filesystem reads, not index queries.
+    ///
+    /// Notes come back in the order of `note_ids`; a repeated identifier yields a single
+    /// note, at the position of its first occurrence. A note whose `.md` cannot be
+    /// materialised (ghost note, parse failure, malformed identifier) is **omitted** and
+    /// logged: the batch as a whole still succeeds, so one unreadable note cannot fail an
+    /// otherwise valid page.
+    ///
+    /// ## Errors
+    ///
+    /// - `GradatumError::Storage` if the index query itself fails — a batch that cannot
+    ///   be resolved at all is reported, never silently answered with an empty page.
+    pub(crate) async fn read_notes_many_inner(
+        &self,
+        note_ids: &[String],
+    ) -> Result<Vec<Note>, GradatumError> {
+        let records = self
+            .index
+            .get_notes_many(self.vault_id.as_str(), note_ids)
+            .await?;
+
+        let mut notes = Vec::with_capacity(records.len());
+        for record in &records {
+            let Ok(ulid) = ulid::Ulid::from_string(&record.id) else {
+                tracing::warn!(
+                    note_id = %record.id,
+                    "read_notes_many: indexed identifier is not a ULID — note omitted"
+                );
+                continue;
+            };
+            match self
+                .read_note_from_record(self.vault_id.as_str(), record, NoteId(ulid))
+                .await
+            {
+                Ok(note) => notes.push(note),
+                Err(err) => tracing::warn!(
+                    note_id = %record.id,
+                    error = %err,
+                    "read_notes_many: note unreadable — omitted from the batch"
+                ),
+            }
+        }
+
+        Ok(notes)
     }
 
     /// Updates a note's status with state-machine validation.
@@ -966,8 +1126,15 @@ impl Vault {
             .await
             .map_err(|e| VaultError::Storage(format!("delete md {md_path}: {e}")))?;
 
-        // Purger .history/<id>/ — non fatal.
-        self.purge_history_dir(id, &id_str, vault_id).await;
+        // Purger .history/<id>/ — non fatal. Le compte est journalisé : c'est ce que la
+        // suppression a effectivement détruit, et un instantané qui a résisté n'y figure pas.
+        let (destroyed, failed) = self.purge_history_dir(id, &id_str, vault_id).await;
+        tracing::debug!(
+            id = %id_str,
+            snapshots_destroyed = destroyed,
+            snapshots_failed = failed,
+            "delete_note: history purged"
+        );
 
         Ok(())
     }
@@ -1627,18 +1794,29 @@ impl Vault {
         }
     }
 
-    /// Recursively deletes the `.history/<id>/` directory.
+    /// Deletes every snapshot under `.history/<id>/`, and returns `(destroyed, failed)`.
     ///
-    /// Called during note deletion (`delete_note`) to avoid orphaned disk artefacts.
-    /// Non-fatal — any failure is logged as `warn!`.
+    /// Called by note deletion (`delete_note`) to avoid orphaned disk artefacts, and by a
+    /// write that masked something: the mode is irreversible, so the versions that
+    /// preceded the rewrite do not survive it.
+    ///
+    /// Non-fatal — any failure is logged as `warn!`, and the returned counts are the
+    /// number of snapshots **actually** removed and the number that resisted removal.
+    /// Both are returned because one figure does not describe the purge: a caller
+    /// reporting only `destroyed` renders a snapshot the filesystem kept as a directory
+    /// that was emptied.
     ///
     /// ## Algorithm
     ///
-    /// 1. Lists all files under `<tenant>/.history/<id>/`.
-    /// 2. Deletes each file via `storage.delete()`.
+    /// 1. Lists all files under `<tenant>/.history/<id>/` (`NotFound` → `(0, 0)`, nothing
+    ///    to do).
+    /// 2. Deletes each file via `storage.delete()`, counting successes and failures.
     /// 3. Attempts to delete the now-empty directory itself (may fail if non-empty
-    ///    or if the backend does not support directory deletion — non-fatal).
-    async fn purge_history_dir(&self, _id: NoteId, id_str: &str, tenant: &str) {
+    ///    or if the backend does not support directory deletion — non-fatal, uncounted).
+    ///
+    /// A directory that cannot be listed is not a failure count: nothing was attempted,
+    /// so nothing resisted, and the two zeros say exactly that.
+    async fn purge_history_dir(&self, _id: NoteId, id_str: &str, tenant: &str) -> (usize, usize) {
         let history_dir = format!("{}/.history/{}/", tenant, id_str);
 
         // Lister tous les entrées sous .history/<id>/.
@@ -1646,7 +1824,7 @@ impl Vault {
             Ok(e) => e,
             Err(gradatum_storage::StorageError::NotFound(_)) => {
                 // Pas de .history/ — rien à purger.
-                return;
+                return (0, 0);
             }
             Err(e) => {
                 tracing::warn!(
@@ -1655,20 +1833,28 @@ impl Vault {
                     err = %e,
                     "D1 purge: cannot list .history/ — non-fatal"
                 );
-                return;
+                return (0, 0);
             }
         };
 
         // Supprimer chaque fichier (pas les répertoires — OpenDAL delete ne supporte
         // pas les répertoires non vides ; on supprime les feuilles d'abord).
+        let mut destroyed = 0usize;
+        let mut failed = 0usize;
         for entry in entries.iter().filter(|e| !e.is_dir) {
-            if let Err(e) = self.storage.delete(&entry.path).await {
-                tracing::warn!(
-                    id = %id_str,
-                    path = %entry.path,
-                    err = %e,
-                    "D1 purge: .history/ file removal failed — non-fatal"
-                );
+            match self.storage.delete(&entry.path).await {
+                Ok(()) => destroyed += 1,
+                Err(e) => {
+                    // Compté autant que journalisé : le fichier est toujours là, et un
+                    // compte qui ne le dit pas décrit un historique vidé qui ne l'est pas.
+                    failed += 1;
+                    tracing::warn!(
+                        id = %id_str,
+                        path = %entry.path,
+                        err = %e,
+                        "D1 purge: .history/ file removal failed — non-fatal"
+                    );
+                }
             }
         }
 
@@ -1683,6 +1869,8 @@ impl Vault {
                 "D1 purge: .history/ directory removal — skipped (may remain non-empty)"
             );
         }
+
+        (destroyed, failed)
     }
 }
 
@@ -1798,5 +1986,76 @@ mod tests {
         let path = note_md_relative_path(&note);
         assert!(path.starts_with("main/my-locus/"));
         assert!(path.ends_with(".md"));
+    }
+
+    /// Whether this process runs as root, which bypasses the permission bits.
+    ///
+    /// Probed on a file the process itself creates: its owner is the effective uid, and
+    /// reading the owner of `/` would answer the wrong question.
+    fn runs_as_root() -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let probe = std::env::temp_dir().join(format!("gradatum-uid-probe-{}", std::process::id()));
+        if std::fs::write(&probe, b"").is_err() {
+            return false;
+        }
+        let uid = std::fs::metadata(&probe).map(|m| m.uid());
+        let _ = std::fs::remove_file(&probe);
+        matches!(uid, Ok(0))
+    }
+
+    /// A snapshot the filesystem refuses to unlink is counted as **failed**, not passed
+    /// over as if the purge had emptied the directory.
+    ///
+    /// The directory holding the snapshot is made read-only, so `unlink` fails on every
+    /// entry it contains. `purge_history_dir` is non-fatal by contract, so the only
+    /// place that failure can surface is the count it returns — and a purge that reports
+    /// `0` destroyed without saying `1` was left behind would read as a clean purge.
+    ///
+    /// The count is read off the returned value, and the WARN line carries both figures;
+    /// this crate has no tracing capture harness, so the line itself is not asserted here.
+    ///
+    /// Skipped as root: `CAP_DAC_OVERRIDE` makes the read-only directory writable, the
+    /// deletion succeeds, and the assertion would then be measuring the bypass rather
+    /// than the counter.
+    #[tokio::test]
+    async fn a_snapshot_that_resists_removal_is_counted_as_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if runs_as_root() {
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let vault = crate::Vault::create(root, VaultId::new("main"))
+            .await
+            .expect("vault creation");
+
+        let note_id = NoteId::new();
+        let id_str = note_id.to_string();
+        let history_dir = root.join("main").join(".history").join(&id_str);
+        std::fs::create_dir_all(&history_dir).expect("history directory");
+        let snapshot = history_dir.join("1700000000000.md");
+        std::fs::write(&snapshot, "clear text of a replaced version").expect("snapshot");
+
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only history directory");
+
+        let (destroyed, failed) = vault.purge_history_dir(note_id, &id_str, "main").await;
+
+        // Restored before asserting: a failing assertion must not leave a read-only
+        // directory for the TempDir cleanup to trip over.
+        let _ = std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o755));
+
+        assert_eq!(destroyed, 0, "a removal that failed is not a removal");
+        assert_eq!(
+            failed, 1,
+            "the snapshot that resisted removal must be counted, and the count is the \
+             only place that failure surfaces"
+        );
+        assert!(
+            snapshot.exists(),
+            "the count names a file that is still there"
+        );
     }
 }

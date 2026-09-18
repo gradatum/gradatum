@@ -538,6 +538,116 @@ impl SqliteIndex {
         }
     }
 
+    /// Batched counterpart of [`Self::get_note_inner`] — one `WHERE id IN (…)`
+    /// statement for the whole slice.
+    ///
+    /// Records come back in the order of `ids`, at most one per distinct identifier
+    /// (placed at the position of its first occurrence). Identifiers the vault does not
+    /// hold — unknown, sentinel, or owned by another vault — are omitted.
+    ///
+    /// Beyond SQLite's 999 bound-variable limit the slice is chunked (`vault_id` occupies
+    /// one slot, so 998 identifiers per chunk): a slice wider than one chunk costs one
+    /// statement per chunk, never one per identifier.
+    ///
+    /// Internal concrete method — called by `impl DocumentStore for SqliteIndex`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GradatumError::Storage` if the query fails.
+    pub(crate) async fn get_notes_many_inner(
+        &self,
+        vault_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<NoteRecord>, GradatumError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // SQLite limite SQLITE_LIMIT_VARIABLE_NUMBER à 999.
+        // vault_id occupe 1 slot → chaque lot peut contenir au plus 998 IDs.
+        const CHUNK_SIZE: usize = 998;
+
+        let conn = self.conn.lock().await;
+        let mut found: std::collections::HashMap<String, NoteRecord> =
+            std::collections::HashMap::with_capacity(ids.len());
+
+        for chunk in ids.chunks(CHUNK_SIZE) {
+            let placeholders: String = (2..=chunk.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let sql = format!(
+                "SELECT
+                     id,
+                     vault_id,
+                     section,
+                     status,
+                     body_text,
+                     COALESCE(author_display_name, author_id) AS author,
+                     tags,
+                     content_hash,
+                     created,
+                     updated,
+                     title,
+                     locus
+                 FROM notes
+                 WHERE vault_id = ?1
+                   AND id IN ({placeholders})
+                   AND id NOT LIKE '__sentinel__%'"
+            );
+
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| GradatumError::Storage(format!("get_notes_many prepare: {e}")))?;
+
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+            params.push(&vault_id);
+            params.extend(chunk.iter().map(|id| id as &dyn rusqlite::ToSql));
+
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(params), |row| {
+                    Ok(NoteRecord {
+                        id: row.get(0)?,
+                        vault_id: row.get(1)?,
+                        section: row.get(2)?,
+                        status: row.get(3)?,
+                        body_text: row.get(4)?,
+                        author: row.get(5)?,
+                        tags_raw: row.get(6)?,
+                        content_hash: row.get::<_, Vec<u8>>(7)?,
+                        created: row.get(8)?,
+                        updated: row.get(9)?,
+                        title: row.get(10)?,
+                        // D1.1 : locus pour permettre la résolution du chemin physique.
+                        locus: row.get(11)?,
+                    })
+                })
+                .map_err(|e| GradatumError::Storage(format!("get_notes_many query: {e}")))?;
+
+            for row in rows {
+                let record =
+                    row.map_err(|e| GradatumError::Storage(format!("get_notes_many row: {e}")))?;
+                // Un identifiant répété dans la tranche ne rend qu'une ligne : la première
+                // occurrence gagne, les suivantes n'écrasent rien.
+                found.entry(record.id.clone()).or_insert(record);
+            }
+        }
+
+        // Ordre DEMANDÉ, première occurrence d'un identifiant répété.
+        let mut out = Vec::with_capacity(found.len());
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            if let Some(record) = found.remove(id) {
+                out.push(record);
+            }
+        }
+        Ok(out)
+    }
+
     /// Inserts a wikilink between two notes (helper for tests and the worker).
     ///
     /// Idempotent via `INSERT OR IGNORE`.

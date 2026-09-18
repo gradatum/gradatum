@@ -52,6 +52,7 @@ use gradatum_core::section::Section;
 use gradatum_core::status::NoteStatus;
 use gradatum_core::tag::Tag;
 use gradatum_core::trust::TrustContext;
+use gradatum_server::config::{PrivacyConfig, PrivacyThresholds};
 use gradatum_server::state::AppState;
 use gradatum_vault::{Registry, Vault};
 use http_body_util::BodyExt;
@@ -141,12 +142,13 @@ write_patterns = ["main/*"]
 /// re-runs the pass. A detector that reports nothing is a **completed clean scan**, and a
 /// completed clean scan is the first of the two legitimate removal paths — it retires both
 /// names. A fixture that wants a marked note therefore has to make the pass *conclude*
-/// something, which is what these two scripts do.
+/// something, which is what these two scripts do — and the category it concludes about has
+/// to be activated, which is what [`marking_config`] does.
 #[derive(Clone, Copy)]
 enum Script {
-    /// Report one span above the marker threshold, **on the needle** — a body without it is
-    /// a completed clean scan that retires both names. Where the needle is, the pass poses
-    /// `personal-classified` and retires `privacy-unscanned`.
+    /// Report one span of an **activated** category, above its threshold, **on the needle**
+    /// — a body without it is a completed clean scan that retires both names. Where the
+    /// needle is, the pass poses `personal-classified` and retires `privacy-unscanned`.
     Marking,
     /// Fail the pass. An incomplete pass has no authority over what is personal data: it
     /// **poses** `privacy-unscanned` and **keeps** whatever `personal-classified` the note
@@ -172,6 +174,27 @@ impl PiiDetector for Scripted {
             }),
             Script::Failing => Err(PiiDetectError::Timeout { timeout_ms: 1 }),
         }
+    }
+}
+
+/// The activation these vaults are mounted with.
+///
+/// A span alone marks nothing: a category has to be **activated** by the configuration,
+/// with a strictly positive threshold, before a span of it can pose
+/// `personal-classified`. The scripted detector reports [`PiiCategory::Person`] at 0.9, so
+/// the fixture activates that single category at the smallest positive calibration — the
+/// delivered reading of the "one span above the marker threshold" these tests are built on.
+///
+/// Built from a [`PrivacyConfig`] rather than assembled by hand, so the fixture runs the
+/// delivered configuration→policy conversion: a drift there would show up here.
+fn marking_config() -> PrivacyConfig {
+    PrivacyConfig {
+        categories: vec!["person".to_owned()],
+        thresholds: PrivacyThresholds {
+            default_m: 1,
+            ..PrivacyThresholds::default()
+        },
+        ..PrivacyConfig::default()
     }
 }
 
@@ -205,7 +228,8 @@ async fn env_scripted(preset: &str, script: Script) -> Env {
         Vault::create(dir.path(), VaultId::new("main"))
             .await
             .expect("Vault::create")
-            .with_detector(Arc::new(Scripted(script)), PrivacyBudgets::default()),
+            .with_detector(Arc::new(Scripted(script)), PrivacyBudgets::default())
+            .with_privacy_policy(marking_config().policy()),
     );
     let acl = AclEngine::from_preset_str(preset).expect("a valid ACL preset");
     let mut state = AppState::with_jwt_and_acl(JwtService::new_ephemeral(), acl)

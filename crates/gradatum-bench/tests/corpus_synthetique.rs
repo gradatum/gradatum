@@ -42,11 +42,21 @@ struct ExpectedCounts {
     queries: Vec<ExpectedQuery>,
 }
 
-/// Chemin d'une fixture, ancré sur `CARGO_MANIFEST_DIR` (indépendant du cwd).
+/// Racine du crate, résolue à l'exécution.
+///
+/// La valeur figée à la compilation devient périmée dès qu'un binaire de test est
+/// réutilisé depuis un autre répertoire de checkout (artefacts de build partagés) :
+/// la variable d'environnement prime, la valeur de compilation ne servant que de
+/// repli hors cargo.
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+/// Chemin d'une fixture, ancré sur la racine du crate (indépendant du cwd).
 fn fixture(nom: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join(nom)
+    manifest_dir().join("fixtures").join(nom)
 }
 
 /// Charge le corpus JSONL (une note par ligne).

@@ -2332,6 +2332,21 @@ pub async fn vault_list_impl(
 /// signifie plus « tous vaults » (le scan global reste réservé à l'endpoint admin
 /// interne via [`list_archives_core`]) mais « le vault propre du tenant ».
 ///
+/// ## Garde de lecture sur l'étiquette réservée (D-14)
+///
+/// La réponse est filtrée par `PrivacyReadGuard`, la garde que portent déjà les autres
+/// surfaces de lecture : un consommateur que le preset n'autorise pas sur
+/// `{vault}/personal-classified` ne reçoit pas l'entrée d'une archive marquée. Cette
+/// fonction est le **seul** chemin public (HTTP et MCP) ; l'endpoint admin interne, qui
+/// appelle [`list_archives_core`] directement, garde la vue complète dont il a besoin pour
+/// préparer une commande CLI.
+///
+/// Le registre d'archives ne porte aucun tag — la note n'est plus dans l'index de
+/// recherche — donc les tags sont lus dans le `.md` archivé par
+/// [`Registry::archived_note_tags`](gradatum_vault::Registry::archived_note_tags), en un lot
+/// pour toute la page. La garde est **fail-closed** : une note dont les tags n'ont pas pu
+/// être établis est retenue, jamais servie.
+///
 /// # Errors
 ///
 /// - `GradatumError::Unauthorized` si non authentifié.
@@ -2389,7 +2404,46 @@ pub async fn vault_archives_list_impl(
     // atteindre le registre sans cible contrôlée (le scan tous-vaults n'existe que
     // sur le chemin admin interne, qui appelle `list_archives_core` directement).
     req.vault_filter = Some(checked.as_str().to_owned());
-    list_archives_core(state, req).await
+    let mut response = list_archives_core(state, req).await?;
+
+    // D-14 — garde de lecture sur l'étiquette réservée, appliquée ICI et non dans
+    // `list_archives_core` : le scan admin interne garde la vue complète qu'il doit avoir
+    // pour préparer une commande CLI, et cette fonction est le seul chemin public.
+    //
+    // Cette surface est la dernière qui ne portait pas la garde, et la plus exposée : une
+    // entrée d'archive nomme ULID, titre H1, section et chemin, donc un consommateur à qui
+    // la note est soustraite partout ailleurs pouvait encore l'énumérer ici. Le registre ne
+    // porte aucun tag — la seule source est le `.md` archivé — ce que
+    // `Registry::archived_note_tags` résout en un lot pour toute la page.
+    //
+    // Direction d'échec : une note absente de la réponse est RETENUE. Absence veut dire
+    // « rien n'a été établi » — archive d'un autre vault, fichier détruit par la rétention,
+    // contenu illisible — et jamais « aucun tag » ; retenir est la seule lecture qui ne
+    // serve pas une ligne non cautionnable. Le `?` ci-dessous porte la même direction à
+    // l'échelle de la page : une résolution en lot en échec fait échouer la requête plutôt
+    // que de rendre les entrées qu'elle n'a pas pu vérifier.
+    let mut privacy_guard = PrivacyReadGuard::new();
+    let vault = checked.as_str();
+    if !privacy_guard.allows(state, trust, vault) {
+        let ids: Vec<String> = response
+            .entries
+            .iter()
+            .map(|entry| entry.note_id.clone())
+            .collect();
+        let tags = state.vault.archived_note_tags(vault, &ids).await?;
+        response.entries.retain(|entry| {
+            let held = tags.get(&entry.note_id);
+            match held {
+                Some(tags) => !tags.iter().any(|t| t.as_str() == PERSONAL_CLASSIFIED_TAG),
+                None => false,
+            }
+        });
+        // Le décompte décrit ce que la réponse porte, jamais ce qui a été retenu : c'est
+        // aussi ce qui rend la retenue indistinguable d'une archive inexistante côté
+        // consommateur.
+        response.count = response.entries.len();
+    }
+    Ok(response)
 }
 
 /// Cœur du listing d'archives (filtres → registre → DTO), SANS auth ni ACL.

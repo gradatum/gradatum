@@ -2,7 +2,10 @@
 //!
 //! ## Effects
 //! - Creates `{root}/{md,db,config}` with mode 0750
-//! - Materializes the ACL preset TOML into `config/bearer.toml` 0640
+//! - Materializes the ACL preset TOML into `config/bearer.toml` 0640. A preset
+//!   already present is left untouched unless `--overwrite-preset` is passed:
+//!   the file carries the access policy the deployment enforces, and re-running
+//!   `init` must not replace a hand-maintained policy with the shipped template
 //! - Initializes `db/queue.sqlite`, `db/revocation.sqlite` and `db/api_keys.sqlite` in WAL mode
 //! - Mints the mandatory `main-agent` bootstrap key (R4) into the api-key store and
 //!   records its secret in `config/main-agent.apikey.txt` 0600
@@ -65,7 +68,13 @@ pub struct InitArgs {
     #[arg(long)]
     pub root: PathBuf,
 
-    /// Projects to substitute into `${PROJECT}` template placeholders (comma-separated).
+    /// Value substituted into the preset's template placeholders.
+    ///
+    /// A single project name fills the singular `${PROJECT}`. A comma-separated
+    /// list fills `${PROJECTS}`, and is refused for a preset that also uses
+    /// `${PROJECT}` — one placeholder cannot take several values. It is also
+    /// refused for a preset that declares no `${PROJECT}`/`${PROJECTS}`
+    /// placeholder in its values, since it would then change nothing.
     #[arg(long)]
     pub projects: Option<String>,
 
@@ -79,11 +88,32 @@ pub struct InitArgs {
     pub non_interactive: bool,
 
     /// Forces re-initialization even if `config/admin.bearer.txt` already exists.
+    ///
+    /// This re-mints the admin bearer and refreshes `server.toml`. It does
+    /// **not** touch `config/bearer.toml`: the ACL preset is left exactly as it
+    /// is on disk. Pass `--overwrite-preset` to replace it as well.
     #[arg(long)]
     pub force: bool,
+
+    /// Replaces an existing ACL preset with the requested one.
+    ///
+    /// Without this flag, `config/bearer.toml` is written only when it is
+    /// absent. With it, the current file is copied to
+    /// `config/bearer.toml.bak.<timestamp>` before the requested preset is
+    /// written. Has no effect on a root whose preset does not exist yet.
+    #[arg(long)]
+    pub overwrite_preset: bool,
 }
 
 /// Entry point for the `init` sub-command.
+///
+/// # The ACL preset
+///
+/// `config/bearer.toml` is written when the root is not initialised, and left
+/// byte-identical when it is — unless `--overwrite-preset` is passed, which
+/// backs the current file up before replacing it. `--force` does not change
+/// that: it re-mints the admin bearer and refreshes `server.toml`, not the
+/// access policy the deployment enforces.
 ///
 /// # Errors
 /// - Returns an error if `config/admin.bearer.txt` exists and `--force` is not set.
@@ -108,7 +138,25 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // The preset and the SQLite stores are materialised BEFORE the bootstrap mint:
     // the R4 mint validates `main-agent` against `config/bearer.toml` and writes into
     // `db/api_keys.sqlite`, so both must exist first.
-    materialize_preset(&args.root, &args.preset, args.projects.as_deref())?;
+    //
+    // The preset half is conditional: `--force` alone does not replace a preset that is
+    // already on disk, because that file is the access policy the deployment enforces.
+    // The guard is scoped to an *initialised* root — one carrying the
+    // `admin.bearer.txt` marker, read above and still present at this point. A root
+    // without it has no policy in force: it is either a first run or the retry after a
+    // failed one, which deliberately leaves no marker behind so the install stays
+    // repairable, and its preset must be (re)written. See `ExistingPreset`.
+    let existing_preset = if bearer_marker.exists() && !args.overwrite_preset {
+        ExistingPreset::Keep
+    } else {
+        ExistingPreset::Overwrite
+    };
+    materialize_preset(
+        &args.root,
+        &args.preset,
+        args.projects.as_deref(),
+        existing_preset,
+    )?;
     init_sqlite_dbs(&args.root)?;
 
     // R4 — the `main-agent` bootstrap key is mandatory. Minted BEFORE the admin bearer
@@ -211,7 +259,9 @@ async fn mint_bootstrap_key(root: &Path, non_interactive: bool) -> Result<()> {
     let owner = AgentId::parse(BOOTSTRAP_IDENTITY)
         .expect("BOOTSTRAP_IDENTITY 'main-agent' is a valid AgentId by construction");
 
-    // 1. Referential integrity against the freshly materialised preset.
+    // 1. Referential integrity against the preset in force — the one just materialised,
+    //    or the one kept in place because it was already there. Either way it is the
+    //    file the server will read, which is the only thing worth validating against.
     let preset_path = root.join("config/bearer.toml");
     let preset = fs::read_to_string(&preset_path).with_context(|| {
         format!(
@@ -416,26 +466,110 @@ fn resolve_preset(preset: &str) -> Result<String> {
     }
 }
 
-/// Loads the preset (embedded or filesystem), substitutes `${PROJECTS}`, `${AGENT}`,
-/// and `${THEME}` template variables, then writes the result to `config/bearer.toml` 0640.
+/// What to do with an ACL preset that is already on disk.
+///
+/// The distinction is the whole of the fix: `init` is re-run on a live root far
+/// more often than it is run on a new one (the installer refreshes an existing
+/// installation, and `--force` re-mints the admin bearer and `server.toml`), and
+/// `config/bearer.toml` is not a generated file an operator is expected to
+/// discard — it is the access policy the server enforces. Overwriting it by
+/// default silently replaces a hand-maintained policy with the shipped template,
+/// so the replacement is a decision the caller has to state.
+///
+/// Note that the policy governs *the root*, not a bare file test: a root that is
+/// not initialised has no policy in force, and its preset is written under
+/// either variant. `run` draws that line — this type only says what to do once
+/// the caller has decided there is something worth keeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingPreset {
+    /// Leave an existing file byte-identical and report it on stderr.
+    Keep,
+    /// Copy an existing file to `.bak.<timestamp>` first, then write the
+    /// requested preset. An absent file is simply written, as for `Keep`.
+    Overwrite,
+}
+
+/// Loads the preset (embedded or filesystem), substitutes its template variables,
+/// then writes the result to `config/bearer.toml` 0640.
+///
+/// Substitutions, in `projects` terms:
+/// - `${PROJECTS}` → the `projects` value verbatim (default `main`);
+/// - `${PROJECT}` → the same value when it names a single project. It is a
+///   **singular** placeholder: a comma-separated list has no one value to give
+///   it, so the token is left in place and `reject_unsubstituted_tokens`
+///   refuses the write rather than joining the list into a pattern;
+/// - `${AGENT}` and `${THEME}` → `*`, the wildcard default.
 ///
 /// The embedded preset is resolved independently of the working directory, so
 /// `gradatum-admin init --preset hierarchical` works from any directory.
 ///
-/// If `bearer.toml` already exists, an atomic backup `.bak.<ISO-TS>` is created
-/// before writing. Manual customizations can be recovered from the backup file.
-pub fn materialize_preset(root: &Path, preset: &str, projects: Option<&str>) -> Result<()> {
+/// `existing` decides what happens when the file is already there. Under
+/// [`ExistingPreset::Keep`] the call writes nothing at all: the requested preset
+/// is not even resolved, because a call that will not write has nothing to
+/// render, and the operator is told on stderr which file was kept and which flag
+/// replaces it. Under [`ExistingPreset::Overwrite`] an atomic backup
+/// `.bak.<ISO-TS>` is created before writing, and the message names the file and
+/// the backup.
+///
+/// # Errors
+///
+/// Returns an error if the preset cannot be resolved or read, if the rendered
+/// document is not valid TOML, or if a template token survives inside a *value*
+/// — a deployed preset whose patterns depend on a value nobody substituted is a
+/// policy the engine cannot evaluate, and writing it would leave the trap on
+/// disk. Tokens in comments are left alone: documenting the syntax is their job.
+///
+/// It also refuses `projects` when the preset declares no project-scoped
+/// placeholder in its values: the flag would be substituted nowhere, so writing a
+/// file that silently ignores it would hand back a per-project boundary that does
+/// not exist. That refusal comes before any backup or write.
+pub fn materialize_preset(
+    root: &Path,
+    preset: &str,
+    projects: Option<&str>,
+    existing: ExistingPreset,
+) -> Result<()> {
+    let bearer_toml = root.join("config/bearer.toml");
+
+    if bearer_toml.exists() && existing == ExistingPreset::Keep {
+        eprintln!(
+            "ACL preset kept: {} already exists and was not rewritten. \
+             Pass --overwrite-preset to replace it with the requested preset \
+             (the current file is then saved as {}.bak.<timestamp>).",
+            bearer_toml.display(),
+            bearer_toml.display()
+        );
+        return Ok(());
+    }
+
     let template = resolve_preset(preset)?;
 
+    // Fail loud on `--projects` for a preset whose values carry no project-scoped
+    // placeholder: the value would be substituted nowhere, and the operator would
+    // walk away believing they had configured a per-project boundary the file does
+    // not hold. The refusal precedes any backup or write, so a rejected init leaves
+    // nothing half-materialized behind.
+    if let Some(requested) = projects
+        && !template_declares_project_placeholder(&template)?
+    {
+        return Err(anyhow!(
+            "preset '{preset}' declares no project-scoped placeholder; \
+             --projects={requested} would have no effect. Add concrete \
+             [[consumer]] blocks per project (see the preset header) or drop \
+             --projects."
+        ));
+    }
+
     let projects_list = projects.unwrap_or("main");
-    // Substitute template variables.
-    // ${PROJECTS} → project list, ${AGENT}/${THEME} → wildcard defaults.
-    let materialized = template
+    let mut materialized = template
         .replace("${PROJECTS}", projects_list)
         .replace("${AGENT}", "*")
         .replace("${THEME}", "*");
-
-    let bearer_toml = root.join("config/bearer.toml");
+    // `${PROJECT}` is only substituted when `projects` names exactly one project.
+    if !projects_list.contains(',') {
+        materialized = materialized.replace("${PROJECT}", projects_list);
+    }
+    reject_unsubstituted_tokens(&materialized, preset)?;
 
     // Atomic backup if the file exists — consistent pattern with server.toml handling.
     if bearer_toml.exists() {
@@ -443,7 +577,12 @@ pub fn materialize_preset(root: &Path, preset: &str, projects: Option<&str>) -> 
         let backup = bearer_toml.with_extension(format!("toml.bak.{ts}"));
         fs::copy(&bearer_toml, &backup)
             .with_context(|| format!("backup {} → {}", bearer_toml.display(), backup.display()))?;
-        tracing::info!(backup = %backup.display(), "bearer.toml backed up before overwrite");
+        eprintln!(
+            "ACL preset overwritten: {} replaced by the requested preset; \
+             the previous content is saved in {}",
+            bearer_toml.display(),
+            backup.display()
+        );
     }
 
     fs::write(&bearer_toml, materialized.as_bytes())
@@ -452,6 +591,93 @@ pub fn materialize_preset(root: &Path, preset: &str, projects: Option<&str>) -> 
         .with_context(|| format!("chmod 0640 on {}", bearer_toml.display()))?;
 
     Ok(())
+}
+
+/// Refuses a rendered preset that still carries a template token inside a value.
+///
+/// The engine evaluates the *values* of a preset: a `read_patterns` entry holding
+/// `${PROJECT}` is a glob that matches nothing, so an installation given one is
+/// silently denied everything while its configuration looks complete. The
+/// document is never written in that state — the refusal comes before the write,
+/// so a failed `init` leaves no half-materialized preset behind.
+///
+/// Only values are inspected, and deliberately so: a **comment** naming the
+/// syntax is documentation, not an unsubstituted value, and refusing it would
+/// forbid presets from explaining their own placeholders. The document is parsed
+/// rather than scanned because that is exactly the distinction between the two.
+///
+/// # Errors
+///
+/// Returns an error naming the offending token if one survives, or if the
+/// rendered document is not valid TOML (a preset the server would refuse to boot
+/// on must not be written either).
+fn reject_unsubstituted_tokens(content: &str, preset: &str) -> Result<()> {
+    let doc: toml::Value = toml::from_str(content)
+        .with_context(|| format!("the materialized preset '{preset}' is not valid TOML"))?;
+
+    let mut offenders = Vec::new();
+    collect_template_tokens(&doc, String::new(), &mut offenders);
+    if let Some(offender) = offenders.first() {
+        return Err(anyhow!(
+            "preset '{preset}': the template token {} in '{offender}' was not \
+             substituted. A placeholder in a value has no meaning for the engine — \
+             replace it with the concrete value, or pass a single project name so \
+             the singular placeholder can take one",
+            template_token(offender).unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+/// Records every `${…}` token found in the string values of a parsed TOML document.
+fn collect_template_tokens(value: &toml::Value, path: String, out: &mut Vec<String>) {
+    match value {
+        toml::Value::String(s) => {
+            if template_token(s).is_some() {
+                out.push(format!("{path} = {s}"));
+            }
+        }
+        toml::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                collect_template_tokens(item, format!("{path}[{i}]"), out);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (key, item) in table {
+                collect_template_tokens(item, format!("{path}.{key}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Returns the first `${…}` token of `s`, if it carries one.
+fn template_token(s: &str) -> Option<&str> {
+    let start = s.find("${")?;
+    let rest = &s[start..];
+    let end = rest.find('}')?;
+    Some(&rest[..=end])
+}
+
+/// Reports whether the *values* of a preset template declare a project-scoped
+/// placeholder — `${PROJECT}` or `${PROJECTS}`.
+///
+/// The template is parsed as TOML so only values are inspected: a header comment
+/// documenting the placeholder syntax is not a declaration, because a comment is
+/// never substituted. This is the distinction `--projects` turns on — it can fill
+/// a value, never a comment.
+///
+/// # Errors
+///
+/// Returns an error if the template is not valid TOML.
+fn template_declares_project_placeholder(template: &str) -> Result<bool> {
+    let doc: toml::Value =
+        toml::from_str(template).context("the preset template is not valid TOML")?;
+    let mut tokens = Vec::new();
+    collect_template_tokens(&doc, String::new(), &mut tokens);
+    Ok(tokens
+        .iter()
+        .any(|token| token.contains("${PROJECT}") || token.contains("${PROJECTS}")))
 }
 
 /// Generates the `server.toml` template content with default values.
@@ -571,6 +797,28 @@ timeout_ms = 60000
 # compiled defaults; override any of them with a matching [apalis.workers.<kind>] table.
 concurrency = 1
 timeout_secs = 300
+
+[queue]
+# Periodic purge of terminal job payloads — read by gradatum-worker from this shared
+# server.toml. The payload of a terminal job IS the note body it carried: without this task
+# those bodies stay in db/queue.sqlite for good. The values below are the *compiled*
+# defaults written out, so a worker that finds no [queue] section applies the same 24 h / 1 h
+# — they are shown here because a retention nobody can read is a retention nobody reviews.
+# - purge_after_secs    : age beyond which a terminal job's payload is erased. Must be >= 1.
+#                         `0` is REFUSED at parse: it would set the cutoff to "now" and
+#                         erase everything outside the keep window on the next tick.
+# - purge_interval_secs : delay between two purges, floored at 60 s.
+#
+# The N most recent terminal rows are never touched, and N is deliberately NOT a key here
+# (it is gradatum_core::TERMINAL_PAYLOAD_KEEP): that window keeps a purge from racing a
+# reader still consuming a job's output, and widening it is a code change with a review,
+# never a deployment knob.
+#
+# Run it once by hand — or ask what it would take — with, respectively:
+#   gradatum-admin queue purge --older-than 12h
+#   gradatum-admin queue purge --dry-run
+purge_after_secs = 86400
+purge_interval_secs = 3600
 
 [internal_api]
 # Server↔worker loopback API (port 19092). WITHOUT this section gradatum-server never

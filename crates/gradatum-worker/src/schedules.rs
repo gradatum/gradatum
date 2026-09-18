@@ -677,6 +677,187 @@ pub async fn run_sweep_once(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Periodic purge of terminal payloads
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Configuration of the periodic purge of terminal job payloads, read from the top-level
+/// `[queue]` TOML section (extracted by figment separately from `[apalis]`).
+///
+/// **Active by default, unlike `[distill_cron]`.** The distill cron ships inert because
+/// acting would write jobs into the vault; this one only erases what the retention rule
+/// below already designates. Left off, every terminal job keeps its note body in
+/// `queue.sqlite` indefinitely — the payload of a `Curate` job *is* the note body.
+///
+/// # The keep window is not a key
+///
+/// The N most recent terminal rows are never touched, and N is **not** configurable here.
+/// It is `gradatum_core::TERMINAL_PAYLOAD_KEEP`, a product constant whose documentation
+/// states why no key, no environment variable and no CLI flag exists for it: the window
+/// exists so a purge cannot race a reader still consuming a job's output, and widening or
+/// narrowing it is a code change with a review. Adding a key here would contradict that
+/// invariant from the configuration side without removing it from the code.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct QueueConfig {
+    /// Age in **seconds** beyond which a terminal job's payload is erased.
+    ///
+    /// Defaults to `86400` (24 h). **Must be ≥ 1.** `0` would put the cutoff at "now" and
+    /// erase the payload of every terminal job outside the keep window on the very next
+    /// tick, irreversibly.
+    ///
+    /// The refusal is raised at **parse**, and not in a `validate()` method — same
+    /// mechanism and same reasoning as [`ScheduleConfig::retention_days`]: a validation
+    /// method is only as good as its call sites, and here no [`QueueConfig`] carrying `0`
+    /// can be produced by `serde` at all.
+    #[serde(
+        default = "QueueConfig::default_purge_after_secs",
+        deserialize_with = "deserialize_purge_after_secs"
+    )]
+    pub purge_after_secs: u64,
+
+    /// Interval in **seconds** between two purge ticks. Defaults to `3600` (1 h).
+    ///
+    /// Floored at 60 s by [`QueueConfig::purge_interval`] when the tick task is built: a
+    /// smaller value is a busy loop against the queue's write lock, and the purge is
+    /// idempotent — running it more often buys nothing.
+    #[serde(default = "QueueConfig::default_purge_interval_secs")]
+    pub purge_interval_secs: u64,
+}
+
+impl QueueConfig {
+    fn default_purge_after_secs() -> u64 {
+        86_400
+    }
+
+    fn default_purge_interval_secs() -> u64 {
+        3_600
+    }
+
+    /// The tick interval, floored at 60 s.
+    pub fn purge_interval(&self) -> Duration {
+        Duration::from_secs(self.purge_interval_secs.max(60))
+    }
+
+    /// The cutoff passed to the purge: `now - purge_after_secs`.
+    ///
+    /// A value too large for `chrono::Duration` saturates at its maximum rather than
+    /// wrapping — a saturated cutoff targets nothing, which is the harmless direction: the
+    /// alternative would be a cutoff near "now" erasing what the operator asked to keep.
+    ///
+    /// Public so a caller designating rows *before* the tick can state the same cutoff the
+    /// tick will use, instead of restating `now - purge_after_secs` and drifting from it.
+    pub fn purge_cutoff(&self) -> chrono::DateTime<Utc> {
+        let after = chrono::Duration::from_std(Duration::from_secs(self.purge_after_secs))
+            .unwrap_or(chrono::Duration::MAX);
+        Utc::now() - after
+    }
+}
+
+/// The values a **missing** `[queue]` section falls back to — [`ConfigHealth`]'s
+/// `T::default()` path, not serde's.
+///
+/// Written out rather than derived, and this is load-bearing. `#[derive(Default)]` would
+/// give `purge_after_secs = 0`, and `0` is precisely the value the deserializer refuses:
+/// the fallback path would then apply a cutoff of "now" and erase every terminal payload
+/// outside the keep window — the destructive behaviour, reached by omitting a section
+/// instead of by configuring it. Both fields must therefore name the same value their
+/// `serde` default names:
+///
+/// | Field | serde default | here |
+/// |---|---|---|
+/// | `purge_after_secs` | 86 400 | 86 400 |
+/// | `purge_interval_secs` | 3 600 | 3 600 |
+///
+/// [`ConfigHealth`]: crate::config_health::ConfigHealth
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            purge_after_secs: Self::default_purge_after_secs(),
+            purge_interval_secs: Self::default_purge_interval_secs(),
+        }
+    }
+}
+
+/// Deserializes [`QueueConfig::purge_after_secs`], refusing `0`.
+///
+/// `serde` does not invoke this function when the key is absent — the `default` attribute
+/// supplies 24 h — so an existing configuration is unaffected.
+///
+/// # Errors
+///
+/// `D::Error` if the value is not a `u64`, or if it is `0`.
+fn deserialize_purge_after_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    let secs = u64::deserialize(deserializer)?;
+    if secs == 0 {
+        return Err(serde::de::Error::custom(
+            "purge_after_secs must be >= 1: 0 sets the purge cutoff to \"now\" and erases \
+             every terminal payload outside the keep window irreversibly",
+        ));
+    }
+    Ok(secs)
+}
+
+/// Runs **one** purge tick and returns how many payloads it erased.
+///
+/// This is the body of the worker's periodic purge task, free-standing so the schedule can
+/// be exercised once by a test without waiting an interval: the loop in `main.rs` is a
+/// `tokio::time::interval` around this call and nothing else, so what the test runs is what
+/// the worker runs.
+///
+/// It erases the payloads of jobs that reached a terminal status more than
+/// [`QueueConfig::purge_after_secs`] ago, leaving the keep window untouched (the store
+/// applies it). What survives the rewrite is the row itself — lifecycle, timestamps,
+/// result note, retry history — so `job_status` keeps answering what it answered before.
+///
+/// # A failing tick is logged, not propagated
+///
+/// Returning an error would end the calling loop, and a queue whose payloads stop being
+/// purged is the defect this task exists to close. The failure is logged at `warn` with
+/// its `QueueError` and `0` is returned. `0` therefore means "nothing was purged this
+/// tick", never "the purge is absent" — the single counter alone cannot tell those apart,
+/// which is why **every** tick logs its count at `info`, including a zero.
+///
+/// # Returns
+///
+/// The number of payloads rewritten, as `purge_terminal_payloads` reports it.
+pub async fn run_queue_purge_once(
+    store: &(impl QueueStore + ?Sized),
+    cfg: &QueueConfig,
+    metrics: &WorkerMetrics,
+) -> u64 {
+    match store
+        .purge_terminal_payloads(Some(cfg.purge_cutoff()))
+        .await
+    {
+        Ok(purged) => {
+            if purged > 0 {
+                metrics.queue_payloads_purged.inc_by(purged);
+            }
+            // Journalisé à chaque tick, y compris à zéro : c'est la seule trace qui
+            // distingue « la purge tourne et n'a rien à faire » de « la purge n'est
+            // planifiée nulle part » — indistinguables sur un compteur à 0.
+            info!(
+                purged,
+                purge_after_secs = cfg.purge_after_secs,
+                "queue purge: terminal payloads erased"
+            );
+            purged
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "queue purge: purge_terminal_payloads failed — the next tick retries"
+            );
+            0
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Unit tests
 // ─────────────────────────────────────────────────────────────────────────────
 

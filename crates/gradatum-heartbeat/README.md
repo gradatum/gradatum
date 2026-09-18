@@ -2,7 +2,7 @@
 
 > Fire-and-forget fleet heartbeat client for gradatum — a fleet member announces liveness to the registry ingress.
 
-**Status**: v2.3.0 — public, Apache-2.0. Stable API under SemVer.
+**Status**: v2.5.0 — public, Apache-2.0. Stable API under SemVer.
 Part of **[gradatum](https://crates.io/crates/gradatum)** — memory backbone for AI agents. · [github](https://github.com/gradatum/gradatum) · [gradatum.org](https://gradatum.org)
 
 ## Overview
@@ -30,7 +30,7 @@ nothing.
 
 ```toml
 [dependencies]
-gradatum-heartbeat = "2.3.0"
+gradatum-heartbeat = "2.5.0"
 ```
 
 The common path spawns a producer from the environment at startup:

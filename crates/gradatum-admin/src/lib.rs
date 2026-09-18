@@ -55,6 +55,10 @@ pub mod feature_backfill;
 pub mod init;
 #[doc(hidden)]
 pub mod jobs_cmd;
+/// Sub-command `privacy history-purge` — destroys the version history of the notes a
+/// masking deployment rewrote.
+#[doc(hidden)]
+pub mod privacy_cmd;
 /// Rendering of schema-valid project-map cards from CHANGELOG entries.
 #[doc(hidden)]
 pub mod project_map_card;
@@ -67,6 +71,10 @@ pub mod project_map_render;
 /// Read-only summary view of a single project, read straight from the SQLite index.
 #[doc(hidden)]
 pub mod project_map_scope;
+/// Sub-command `queue purge` — erases the payload of terminal jobs past the retention
+/// window, the operator path to the maintenance the worker schedules on its own.
+#[doc(hidden)]
+pub mod queue_cmd;
 /// Sub-command `reindex-orphans` — re-indexes notes present on disk but absent from the
 /// index, converging with the write funnel (index + `file_checksums` + embed job) (F-166).
 #[doc(hidden)]
@@ -101,7 +109,11 @@ pub use downgrade_from_vault_trash::{
 #[doc(hidden)]
 pub use drift_scan::{DriftScanCliArgs, DriftScanCliReport};
 #[doc(hidden)]
-pub use init::{generate_server_toml_template, materialize_preset, merge_user_config};
+pub use init::{
+    ExistingPreset, generate_server_toml_template, materialize_preset, merge_user_config,
+};
+#[doc(hidden)]
+pub use privacy_cmd::{PrivacyHistoryPurgeArgs, PrivacyHistoryPurgeReport};
 #[doc(hidden)]
 pub use reindex_orphans::{ReindexOrphansArgs, ReindexOrphansReport};
 #[doc(hidden)]

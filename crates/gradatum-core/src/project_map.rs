@@ -2139,7 +2139,14 @@ pub fn derivable_track_target(body: &str) -> Option<String> {
 /// Produced by [`project_map_feature_entries`] from the raw notes of the
 /// `project-map` section. Used by the admin CLI and by the HTTP handler
 /// `GET /api/v1/project-map/export-features`.
+///
+/// `#[non_exhaustive]`: this is the mirror's **axis surface**, and a card axis that is currently
+/// silent may have to be rendered later — the visibility axis was exactly that case. Marking the
+/// struct here keeps each such addition additive for a downstream consumer instead of turning
+/// every one of them into a SemVer break, and it costs nothing in this crate, which is the only
+/// place the struct is ever constructed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FeatureEntry {
     /// Identifier of the feature card, of the form `F-<n>`.
     pub feature: String,
@@ -2147,7 +2154,20 @@ pub struct FeatureEntry {
     pub release: String,
     /// Target version in website format (a real `"v0.6.4"`), or the literal `"vX.Y.Z"`
     /// for backlog cards, so that they remain visible instead of being filtered out.
+    ///
+    /// Read from the **same structural source as the title**: the `[[track:]]` pointer for a work
+    /// card, its own `[[version:]]` only as a fallback. The two must agree — a card whose title
+    /// advertises `— v2.3.0` while this column carries another version is one card giving two
+    /// answers, and this is the one a machine reads.
     pub version: Option<String>,
+    /// Visibility wire value from `[[visibilite:]]` (`"interne"` / `"public"`), or `None`.
+    ///
+    /// **Rendered, not filtered**: the exit filter and this axis are two different jobs. The
+    /// default mirror excludes an `interne` card outright; this field is what makes the audit
+    /// mode readable, where the same card is present and its visibility is the only thing that
+    /// distinguishes it from a public neighbour. `None` is an explicit absence — the role is
+    /// absent, which reads as public by convention — never a value invented to fill the gap.
+    pub visibility: Option<String>,
     /// H1 title of the card.
     pub title: String,
 }
@@ -2290,6 +2310,7 @@ pub fn project_map_feature_entries_scoped(
         let mut feature_id: Option<String> = None;
         let mut release_wire: Option<String> = None;
         let mut version_raw: Option<String> = None;
+        let mut track_raw: Option<String> = None;
         let mut kind_wire: Option<&KindKind> = None;
         let mut project_name: Option<&str> = None;
         let mut visibility: Option<VisibilityKind> = None;
@@ -2300,6 +2321,9 @@ pub fn project_map_feature_entries_scoped(
                 ProjectMapLink::Release(r) => release_wire = Some(r.as_wire().to_string()),
                 ProjectMapLink::Version { project, version } => {
                     version_raw = Some(format!("{project}/{version}"));
+                }
+                ProjectMapLink::Track { project, target } => {
+                    track_raw = Some(format!("{project}/{target}"));
                 }
                 ProjectMapLink::Kind(k) => kind_wire = Some(k),
                 ProjectMapLink::Project(p) => project_name = Some(p),
@@ -2331,7 +2355,15 @@ pub fn project_map_feature_entries_scoped(
             None => continue, // carte-feature sans release — invalide, ignorée défensivement
         };
 
-        let version = version_raw.as_deref().and_then(map_version_raw);
+        // La version lit la MÊME source que le titre (`title_sources_of_body`), précédence
+        // comprise : le `[[track:]]` d'abord, le `[[version:]]` propre à la carte en repli.
+        // Une carte peut porter les deux — un `[[version:]]` hérité d'un rattachement de
+        // bootstrap survit souvent au track qui vise la version réellement livrée — et lire le
+        // rôle stocké seul fait alors diverger la colonne de son propre titre.
+        let version = track_raw
+            .or(version_raw)
+            .as_deref()
+            .and_then(map_version_raw);
 
         // Filtrage miroir-site : exclure release:dropped par défaut (Règle A).
         if !opts.include_dropped && release == "dropped" {
@@ -2358,6 +2390,7 @@ pub fn project_map_feature_entries_scoped(
             feature: feature_id,
             release,
             version,
+            visibility: visibility.map(|v| v.as_wire().to_string()),
             title: title.clone(),
         });
     }
@@ -2371,11 +2404,14 @@ pub fn project_map_feature_entries_scoped(
 /// Why a feature card's release could not be derived from its tracked structure, and therefore
 /// fell back to the stored `[[release:]]`.
 ///
-/// The three cases carry different operational meaning, so the caller can choose a log level:
+/// The cases carry different operational meaning, so the caller can choose a log level:
 /// [`DerivationFallbackReason::NoTrack`] is **expected** during the additive window (a
 /// card may not yet carry a `[[track:]]`, or is missing its `[[status:]]`) and warrants at most a
 /// debug line, whereas [`DerivationFallbackReason::Unresolved`] and
 /// [`DerivationFallbackReason::Undetermined`] are genuine anomalies to warn on.
+/// [`DerivationFallbackReason::UnterminatedCodeFence`] is an anomaly of a different kind — the
+/// card's **body** is malformed, not its graph — and is reported in place of the `NoTrack` it
+/// would otherwise be mistaken for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DerivationFallbackReason {
@@ -2386,6 +2422,15 @@ pub enum DerivationFallbackReason {
     Unresolved(TrackResolutionError),
     /// The tracked structure resolved, but its status has no release mapping.
     Undetermined(ReleaseDerivationError),
+    /// The card's body opens a code fence that never closes, and the roles below the opening
+    /// line were read as code — counted by neither the read projection nor the write validator.
+    /// Reported **instead of** the [`DerivationFallbackReason::NoTrack`] such a card would
+    /// otherwise raise: the role is present in the body, it is the reading that missed it, and
+    /// `NoTrack` would send a reader after a dangling pointer that does not exist.
+    ///
+    /// The swallowed role stays **uncounted** — the extraction is intentionally left untouched so
+    /// that read and write agree. Only the silence is repaired, not the reading.
+    UnterminatedCodeFence,
 }
 
 /// A single feature card whose `release` could **not** be derived from the tracked structure.
@@ -2474,9 +2519,11 @@ pub fn project_map_feature_entries_derived_scoped(
     let mut diagnostics: Vec<DerivationDiagnostic> = Vec::new();
 
     for (body, title) in notes {
-        let links: Vec<ProjectMapLink> = extract_structural_targets(body)
-            .into_iter()
-            .filter_map(|t| parse_link(&t).ok())
+        let scan = scan_structural_targets(body);
+        let links: Vec<ProjectMapLink> = scan
+            .targets
+            .iter()
+            .filter_map(|t| parse_link(t).ok())
             .collect();
 
         let mut feature_id: Option<String> = None;
@@ -2520,6 +2567,13 @@ pub fn project_map_feature_entries_derived_scoped(
             None => continue,
         };
 
+        // Source de version de repli : le MÊME axe que le titre (`title_sources_of_body`),
+        // `[[track:]]` d'abord, `[[version:]]` propre ensuite. Un track présent mais non résolu
+        // reste l'axe courant de la carte — replier sur un `[[version:]]` hérité ferait diverger
+        // la colonne du titre de la carte.
+        let track_raw: Option<String> = track.map(|(tp, tt)| format!("{tp}/{tt}"));
+        let version_fallback = track_raw.or(version_raw);
+
         // ── Dérivation depuis la structure pointée = source PRIMAIRE (post-retrait Phase 7) ──
         // `release` ET `version` viennent du `[[track:]]` ; le stocké n'est plus qu'un repli
         // OPTIONNEL. Résultat = `Ok((release, version_raw))` si dérivable, sinon `Err(reason)`.
@@ -2539,29 +2593,36 @@ pub fn project_map_feature_entries_derived_scoped(
 
         // Jamais de panic, jamais de drop silencieux, jamais de valeur inventée : tout échec de
         // dérivation est rendu VISIBLE via un diagnostic, puis retombe sur le stocké s'il existe,
-        // sinon la carte est ignorée (rien à projeter).
+        // sinon la carte est ignorée (rien à projeter). Le motif est d'abord confronté au corps :
+        // une marque de code non fermée explique un `NoTrack` et doit être nommée comme telle.
         let (release, version) = match derivation {
             Ok((rel, vraw)) => (rel, vraw.as_deref().and_then(map_version_raw)),
-            Err(reason) => match stored_release {
-                // Repli sur le release/version stockés (fenêtre additive de coexistence).
-                Some(stored) => {
-                    diagnostics.push(DerivationDiagnostic {
-                        feature: feature_id.clone(),
-                        stored: Some(stored.clone()),
-                        reason,
-                    });
-                    (stored, version_raw.as_deref().and_then(map_version_raw))
+            Err(reason) => {
+                let reason = fence_aware_reason(body, &scan, reason);
+                match stored_release {
+                    // Repli sur le release/version stockés (fenêtre additive de coexistence).
+                    Some(stored) => {
+                        diagnostics.push(DerivationDiagnostic {
+                            feature: feature_id.clone(),
+                            stored: Some(stored.clone()),
+                            reason,
+                        });
+                        (
+                            stored,
+                            version_fallback.as_deref().and_then(map_version_raw),
+                        )
+                    }
+                    // Ni dérivable ni stocké → rien à projeter : diagnostic + skip.
+                    None => {
+                        diagnostics.push(DerivationDiagnostic {
+                            feature: feature_id.clone(),
+                            stored: None,
+                            reason,
+                        });
+                        continue;
+                    }
                 }
-                // Ni dérivable ni stocké → rien à projeter : diagnostic + skip.
-                None => {
-                    diagnostics.push(DerivationDiagnostic {
-                        feature: feature_id.clone(),
-                        stored: None,
-                        reason,
-                    });
-                    continue;
-                }
-            },
+            }
         };
 
         // Filtrage miroir-site sur la valeur retenue (dérivée ou repli) pour rester comparable.
@@ -2582,6 +2643,7 @@ pub fn project_map_feature_entries_derived_scoped(
             feature: feature_id,
             release,
             version,
+            visibility: visibility.map(|v| v.as_wire().to_string()),
             title: title.clone(),
         });
     }
@@ -2844,43 +2906,113 @@ pub fn project_map_card_index(
 /// and is therefore skipped; role wikilinks the server injects on their own trailing line
 /// (`\n\n[[track:…]]`, `\n\n[[feature:…]]`) are kept, as their residue is empty.
 fn extract_structural_targets(body: &str) -> Vec<String> {
+    scan_structural_targets(body).targets
+}
+
+/// Outcome of a structural scan of a card body.
+struct StructuralScan {
+    /// Roles on structural lines outside any code fence — the counted set.
+    targets: Vec<String>,
+    /// Roles on structural lines **inside** a fence that is opened and never closed. Non-empty
+    /// only for a body missing its closing mark: everything below the opening line was read as
+    /// code, by the read projection and the write validator alike, so these roles count nowhere.
+    /// A fence that does close leaves this empty — the roles it held are legitimately cited, not
+    /// swallowed.
+    swallowed: Vec<String>,
+    /// Whether the body ends with a fence still open.
+    unterminated: bool,
+}
+
+/// Scans a body once, separating the roles that **count** from the roles an unclosed fence
+/// swallowed. Single pass, so the two sets can never disagree about where the fence state sits.
+fn scan_structural_targets(body: &str) -> StructuralScan {
+    let mut targets: Vec<String> = Vec::new();
+    let mut fenced: Vec<String> = Vec::new();
+    let mut in_fence = false;
+
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            // A closing mark makes everything it held legitimately fenced prose.
+            if !in_fence {
+                fenced.clear();
+            }
+            continue;
+        }
+        let line_targets = structural_targets_on_line(line);
+        if in_fence {
+            fenced.extend(line_targets);
+        } else {
+            targets.extend(line_targets);
+        }
+    }
+
+    StructuralScan {
+        swallowed: if in_fence { fenced } else { Vec::new() },
+        unterminated: in_fence,
+        targets,
+    }
+}
+
+/// Does `body` open a ```` ``` ```` fence that no later line closes? Pure, and the sole fence
+/// predicate of this module: the extractor and the diagnostic both read the fence state here
+/// rather than each keeping its own tally.
+fn has_unterminated_code_fence(body: &str) -> bool {
+    scan_structural_targets(body).unterminated
+}
+
+/// The wikilink targets of a **single line**, or nothing when the line is not structural.
+///
+/// A **structural line** is a line that, once every `[[…]]` token is removed, contains only
+/// whitespace and the separator punctuation actually used between role links.
+fn structural_targets_on_line(line: &str) -> Vec<String> {
     /// Separators tolerated between role wikilinks on a structural line. Deliberately excludes
     /// the backtick: a role cited as `` `[[release:planned]]` `` in prose must stay non-structural.
     const SEP: &[char] = &[
         ' ', '\t', '\u{00b7}', '\u{2022}', '|', ',', '\u{2014}', '\u{2013}', '-',
     ];
-    let mut result = Vec::new();
-    let mut in_fence = false;
-    for line in body.lines() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-        let mut line_targets: Vec<String> = Vec::new();
-        let mut residue = String::new();
-        let mut rest = line;
-        while let Some(start) = rest.find("[[") {
-            residue.push_str(&rest[..start]);
-            let after_open = &rest[start + 2..];
-            if let Some(end) = after_open.find("]]") {
-                line_targets.push(after_open[..end].trim().to_string());
-                rest = &after_open[end + 2..];
-            } else {
-                // `[[` non terminé sur la ligne : le reste est du texte, pas un lien.
-                residue.push_str(rest);
-                rest = "";
-                break;
-            }
-        }
-        residue.push_str(rest);
-        if !line_targets.is_empty() && residue.chars().all(|c| SEP.contains(&c)) {
-            result.extend(line_targets);
+    let mut line_targets: Vec<String> = Vec::new();
+    let mut residue = String::new();
+    let mut rest = line;
+    while let Some(start) = rest.find("[[") {
+        residue.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        if let Some(end) = after_open.find("]]") {
+            line_targets.push(after_open[..end].trim().to_string());
+            rest = &after_open[end + 2..];
+        } else {
+            // `[[` non terminé sur la ligne : le reste est du texte, pas un lien.
+            residue.push_str(rest);
+            rest = "";
+            break;
         }
     }
-    result
+    residue.push_str(rest);
+    if line_targets.is_empty() || !residue.chars().all(|c| SEP.contains(&c)) {
+        return Vec::new();
+    }
+    line_targets
+}
+
+/// Returns `reason` unchanged, except for the one case the body itself explains: a fallback
+/// reported as [`DerivationFallbackReason::NoTrack`] on a card whose unclosed fence swallowed
+/// roles is reclassified as [`DerivationFallbackReason::UnterminatedCodeFence`].
+///
+/// Deliberately narrow. A track that was present and resolved-but-failed, or that dangles, is not
+/// caused by the fence — reclassifying those would trade a visible anomaly for a wrong one, which
+/// is worse than the silence being repaired here.
+fn fence_aware_reason(
+    body: &str,
+    scan: &StructuralScan,
+    reason: DerivationFallbackReason,
+) -> DerivationFallbackReason {
+    if matches!(reason, DerivationFallbackReason::NoTrack)
+        && has_unterminated_code_fence(body)
+        && !scan.swallowed.is_empty()
+    {
+        return DerivationFallbackReason::UnterminatedCodeFence;
+    }
+    reason
 }
 
 /// Validates a project-map card from its **raw body** — the write-path entry point.
@@ -3957,6 +4089,90 @@ mod feature_entries_tests {
         );
     }
 
+    /// The `version` column reads the **same structural source as the title**, precedence
+    /// included: the `[[track:]]` pointer first, the card's own `[[version:]]` only as a
+    /// fallback.
+    ///
+    /// A work card can carry both — the stored `[[version:]]` surviving from a bootstrap
+    /// attachment while the track points at the version actually being delivered. The title
+    /// derivation already prefers the track (`derive_canonical_title` → `title_sources_of_body`),
+    /// so a card reading its version from the stored role alone renders a title saying `— v2.3.0`
+    /// beside a version column saying `v0.0.0`: one card, two answers, and the wrong one is the
+    /// machine-readable axis the website consumes.
+    #[test]
+    fn version_reads_the_same_source_as_the_title_track_first() {
+        let body = "[[feature:F-42]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+                    [[release:planned]] [[version:gradatum/0.0.0]] [[track:gradatum/2.3.0]]";
+        // Control: the title derivation, on the same body, names the tracked version.
+        assert_eq!(
+            title_sources_of_body(body).1.as_deref(),
+            Some("2.3.0"),
+            "le titre lit la version du track"
+        );
+
+        let notes = vec![note(body, "[PROJECT-MAP][gradatum] Sujet \u{2014} v2.3.0")];
+        let entries = project_map_feature_entries(&notes, ExportOptions::default());
+
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].version,
+            Some("v2.3.0".to_string()),
+            "la même source que le titre : jamais la version stockée périmée"
+        );
+    }
+
+    /// The visibility axis is **rendered**, not filtered away: the wire value of the role is
+    /// carried as-is, and an absent role stays an explicit `null` (absence = public by reader
+    /// convention). Rendering it is what lets a reader tell a card that *is* public from a card
+    /// that merely failed to say — the two were indistinguishable while the axis was silent.
+    #[test]
+    fn visibility_is_rendered_as_is_and_null_when_absent() {
+        let notes = vec![
+            note(
+                "[[feature:F-43]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+                 [[release:planned]] [[version:gradatum/2.3.0]] [[visibilite:interne]]",
+                "F-43 interne",
+            ),
+            note(
+                "[[feature:F-44]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+                 [[release:planned]] [[version:gradatum/2.3.0]] [[visibilite:public]]",
+                "F-44 publique",
+            ),
+            note(
+                "[[feature:F-45]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+                 [[release:planned]] [[version:gradatum/2.3.0]]",
+                "F-45 sans rôle",
+            ),
+        ];
+        // Audit mode: the default mirror excludes the `interne` card, so reading all three
+        // requires lifting the F-256 filter — the rendering is asserted on the same corpus.
+        let entries = project_map_feature_entries(
+            &notes,
+            ExportOptions {
+                include_dropped: true,
+            },
+        );
+        assert_eq!(entries.len(), 3, "{entries:?}");
+
+        let by_feature = |f: &str| {
+            entries
+                .iter()
+                .find(|e| e.feature == f)
+                .unwrap_or_else(|| panic!("{f} absente : {entries:?}"))
+        };
+        assert_eq!(
+            by_feature("F-43").visibility,
+            Some("interne".to_string()),
+            "valeur du rôle rendue telle quelle"
+        );
+        assert_eq!(by_feature("F-44").visibility, Some("public".to_string()));
+        assert_eq!(
+            by_feature("F-45").visibility,
+            None,
+            "absence de rôle = null explicite, jamais une valeur inventée"
+        );
+    }
+
     /// Carte `release:dropped` → **exclue** par défaut.
     #[test]
     fn dropped_card_excluded_by_default() {
@@ -4060,6 +4276,14 @@ mod feature_entries_tests {
             "carte interne incluse en mode audit include_dropped"
         );
         assert_eq!(entries[0].feature, "F-60");
+        // Non-régression du choix de visibilité : le mode audit **rend** l'axe au lieu de le
+        // taire. C'est la seule voie par laquelle un lecteur peut distinguer une carte interne
+        // d'une carte publique — sans le champ, les deux sorties seraient identiques.
+        assert_eq!(
+            entries[0].visibility,
+            Some("interne".to_string()),
+            "le mode audit rend la visibilité au lieu de la taire"
+        );
     }
 
     /// F-256 — le filtre interne s'applique EN PLUS, pas à la place : une carte interne ET
@@ -4357,6 +4581,74 @@ mod feature_entries_tests {
             out.diagnostics[0].reason,
             DerivationFallbackReason::Unresolved(TrackResolutionError::TargetNotFound { .. })
         ));
+    }
+
+    /// A body whose code fence is opened and never closed swallows every role below the opening
+    /// line: the extractor stays inside the fence to end-of-body, so those roles are counted by
+    /// **neither** the read projection nor the write validator. The card then looks like a card
+    /// that never carried the role — most often it reports `NoTrack`, which sends a reader after a
+    /// dangling track pointer that does not exist. The diagnostic must name the real cause.
+    #[test]
+    fn unterminated_code_fence_is_surfaced_as_a_diagnostic() {
+        let body = "[[feature:F-70]] [[project:gradatum]] [[status:OPEN]] [[kind:FEATURE]] \
+                    [[release:planned]] [[version:gradatum/2.2.0]]\n\
+                    ```\n[[track:gradatum/2.4.0]]";
+        let notes = vec![note(body, "F-70 marque non fermée")];
+
+        // Non-comptage, asserted on the extractor itself: the role below the opening mark is
+        // absent from the target list — read/write parity is what makes this invisible.
+        let targets = extract_structural_targets(body);
+        assert!(
+            !targets.iter().any(|t| t.starts_with("track:")),
+            "le rôle sous la marque ouverte ne doit pas être compté : {targets:?}"
+        );
+
+        let out =
+            project_map_feature_entries_derived_scoped(&notes, ExportOptions::default(), None);
+
+        assert_eq!(
+            out.entries.len(),
+            1,
+            "la carte reste projetée via le stocké"
+        );
+        assert_eq!(
+            out.entries[0].version,
+            Some("v2.2.0".to_string()),
+            "la version reste celle du stocké : le rôle avalé n'a rien piloté"
+        );
+        assert_eq!(out.diagnostics.len(), 1, "{:?}", out.diagnostics);
+        assert_eq!(out.diagnostics[0].feature, "F-70");
+        assert_eq!(
+            out.diagnostics[0].reason,
+            DerivationFallbackReason::UnterminatedCodeFence,
+            "le motif doit nommer la marque non fermée, pas un track absent"
+        );
+    }
+
+    /// Non-regression, the other side of the same guard: a fence that **is** closed is the
+    /// documented way to cite a role without counting it, so it must keep the plain reason and
+    /// raise no unterminated-fence diagnostic. Over-triggering here would make the new reason
+    /// unreadable on the corpus that uses fences correctly.
+    #[test]
+    fn closed_code_fence_keeps_the_plain_reason() {
+        let body = "[[feature:F-71]] [[project:gradatum]] [[kind:FEATURE]]\n\
+                    ```\n[[track:gradatum/2.4.0]]\n```";
+        let notes = vec![note(body, "F-71 marque fermée")];
+
+        let out =
+            project_map_feature_entries_derived_scoped(&notes, ExportOptions::default(), None);
+
+        assert_eq!(out.diagnostics.len(), 1, "{:?}", out.diagnostics);
+        assert_eq!(
+            out.diagnostics[0].reason,
+            DerivationFallbackReason::NoTrack,
+            "une marque correctement fermée n'est pas une marque non fermée"
+        );
+        assert!(
+            out.entries.is_empty(),
+            "sans track ni stocké, aucune valeur inventée : {entries:?}",
+            entries = out.entries
+        );
     }
 
     /// The mirror-site `dropped` filter is applied to the **derived** value: a card that derives
@@ -4899,6 +5191,59 @@ mod code_prose_exclusion_f296_tests {
             "collision order is independent of input order"
         );
     }
+
+    /// The fence predicate, exercised on its own: it is what decides whether a `NoTrack` fallback
+    /// is reclassified, so it must be right in both directions. An unclosed fence is the defect;
+    /// a closed one is the documented way to cite a role.
+    #[test]
+    fn unterminated_code_fence_predicate_discriminates() {
+        assert!(
+            !has_unterminated_code_fence("[[feature:F-50]] [[track:gradatum/2.4.0]]"),
+            "aucune marque ouverte"
+        );
+        assert!(
+            !has_unterminated_code_fence("[[feature:F-50]]\n```\n[[track:gradatum/9.9.9]]\n```"),
+            "marque ouverte puis fermée"
+        );
+        assert!(
+            has_unterminated_code_fence("[[feature:F-50]]\n```\n[[track:gradatum/2.4.0]]"),
+            "marque ouverte jamais fermée"
+        );
+        assert!(
+            !has_unterminated_code_fence("[[feature:F-50]]\n```\n```\n```\n```"),
+            "deux paires fermées : l'état revient à zéro"
+        );
+    }
+
+    /// The scan separates the two sets. A closed fence holds roles that are legitimately not
+    /// counted and must **not** be reported as swallowed; an unclosed one holds roles that are
+    /// counted nowhere, and those are the ones the diagnostic must name.
+    #[test]
+    fn scan_separates_counted_roles_from_swallowed_ones() {
+        let closed = scan_structural_targets(
+            "[[feature:F-50]] [[project:gradatum]]\n```\n[[track:gradatum/9.9.9]]\n```",
+        );
+        assert_eq!(
+            closed.targets.len(),
+            2,
+            "les deux rôles structurels comptés"
+        );
+        assert!(
+            closed.swallowed.is_empty(),
+            "une marque fermée n'avale rien : {:?}",
+            closed.swallowed
+        );
+
+        let unclosed = scan_structural_targets(
+            "[[feature:F-50]] [[project:gradatum]]\n```\n[[track:gradatum/2.4.0]]",
+        );
+        assert_eq!(unclosed.targets.len(), 2, "mêmes rôles comptés");
+        assert_eq!(
+            unclosed.swallowed,
+            vec!["track:gradatum/2.4.0".to_string()],
+            "le rôle sous la marque ouverte est nommé, pas seulement absent"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4946,6 +5291,27 @@ mod max_feature_number_tests {
     #[test]
     fn empty_body_returns_none() {
         assert_eq!(max_feature_number(""), None);
+    }
+
+    /// The allocation floor, pinned by two **separate** assertions.
+    ///
+    /// The seed card carries `[[feature:F-1]]` — a single-digit ident the parser rejects, so it
+    /// must not contribute a floor of `1`. The two facts are asserted apart on purpose: asserting
+    /// only `Some(50)` would also hold on a body where the seed leaked but was out-maxed by a
+    /// larger role, and asserting only "not 1" would hold on an empty result. Together they pin
+    /// both the exclusion and the value actually returned.
+    #[test]
+    fn max_feature_number_excludes_seed_and_returns_true_max() {
+        let body = "[[feature:F-1]] [[feature:F-50]]";
+
+        let got = max_feature_number(body);
+
+        assert_ne!(
+            got,
+            Some(1),
+            "la graine F-1 (1 chiffre) est rejetée : elle ne fixe pas le plancher"
+        );
+        assert_eq!(got, Some(50), "le vrai maximum de la carte");
     }
 }
 

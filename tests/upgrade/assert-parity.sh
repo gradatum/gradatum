@@ -20,7 +20,30 @@
 #   (c) `vault_list` — identifiants dans l'ordre rendu, PLUS le tri. BLOQUANT.
 #   (d) les 5 `vault_search` — identifiants dans l'ordre rendu, requête par
 #       requête. BLOQUANT.
-#   (e) `export-features` — octet à octet (sha256 + `cmp`). BLOQUANT.
+#   (e) `export-features` — deux forces, choisies par `--export-mode` :
+#
+#       `strict` (défaut) — octet à octet (sha256 + `cmp`). C'est la force du
+#         RETOUR ARRIÈRE : les deux relevés sont produits par le même binaire
+#         (2.4.0), donc rien ne doit bouger, pas même un champ. BLOQUANT.
+#
+#       `additif` — la force de la MONTÉE. L'export est un RAPPORT : entre deux
+#         versions son dialecte peut GAGNER des clés, et c'est une évolution
+#         voulue, pas une divergence. La règle appliquée :
+#
+#           • chaque entrée du relevé AVANT doit être ÉGALE à l'entrée du relevé
+#             MONTÉ **projetée sur les clés du dialecte AVANT** (même nombre de
+#             cartes, même ordre) ;
+#           • les clés que le MONTÉ ajoute sont RELEVÉES (`cles_ajoutees=…`) et
+#             doivent être citées dans le guide de montée (`--export-doc`) ;
+#           • une clé du dialecte AVANT qui DISPARAÎT côté MONTÉ, ou dont la
+#             valeur CHANGE, est une divergence nommée. BLOQUANT.
+#
+#       En mode `additif`, `--export-doc <guide de montée>` est REQUIS : sans lui
+#       la clé (e) n'est pas mesurée du tout (`2`), parce qu'un ajout non
+#       documenté est précisément ce que cette force existe pour attraper. En mode
+#       `strict`, `--export-doc` est REFUSÉ (une comparaison d'octets n'a pas de
+#       dialecte à documenter — l'accepter ferait croire à un contrôle qui n'a pas
+#       eu lieu).
 #   (f) comptes par table — `notes` et `gradatum_jobs` à tolérance zéro (lettre
 #       du brief), plus une liste NOMMÉE de tables dérivées du corpus. Toute
 #       autre table est REPORTÉE avec son delta, sans bloquer : leur contenu
@@ -38,12 +61,21 @@
 #
 # Usage :
 #   bash tests/upgrade/assert-parity.sh --before <dir> --after <dir> \
-#       [--label <texte>] [--out <fichier>]
+#       [--label <texte>] [--out <fichier>] \
+#       [--export-mode strict|additif] [--export-doc <guide>]
+#
+#   --export-mode strict (défaut) : la clé (e) compare les octets — la force du
+#       retour arrière.
+#   --export-mode additif : la clé (e) compare le dialecte AVANT projeté — la
+#       force de la montée ; `--export-doc` est alors REQUIS.
+#   --export-doc <fichier> : guide de montée où chaque clé ajoutée doit être
+#       citée. Refusé en mode `strict`.
 #
 # Codes de retour :
 #   0  parité établie sur toutes les clés bloquantes
 #   1  divergence — chaque écart est nommé, avec les deux valeurs
-#   2  NON EXÉCUTÉ — un relevé est absent ou illisible (jamais un vert)
+#   2  NON EXÉCUTÉ — un relevé est absent ou illisible, ou la clé (e) n'a pas pu
+#      être mesurée (mode `additif` sans guide) — jamais un vert
 
 set -euo pipefail
 umask 077
@@ -52,27 +84,37 @@ BEFORE=""
 AFTER=""
 LABEL=""
 OUT=""
+EXPORT_MODE="strict"
+EXPORT_DOC=""
 
 usage() {
   cat >&2 <<'EOF'
 Usage: bash tests/upgrade/assert-parity.sh --before <dir> --after <dir>
            [--label <texte>] [--out <fichier>]
+           [--export-mode strict|additif] [--export-doc <guide>]
 
   --before <dir>   relevé de référence (mesure AVANT)
   --after  <dir>   relevé à comparer (mesure APRÈS)
   --label  <txt>   étiquette de la comparaison (ex. « montée 2.4.0 »)
   --out    <file>  fichier de rapport (défaut : stdout seul)
+  --export-mode    force de la clé (e) — `strict` (octet à octet, défaut) ou
+                   `additif` (projection sur le dialecte AVANT, montée)
+  --export-doc     guide de montée exigeant la citation des clés ajoutées
+                   (requis avec `--export-mode additif`, refusé avec `strict`)
 
-Codes : 0 parité · 1 divergence nommée · 2 NON EXÉCUTÉ (relevé absent)
+Codes : 0 parité · 1 divergence nommée · 2 NON EXÉCUTÉ (relevé absent, ou
+clé (e) non mesurable)
 EOF
 }
 
 while (($#)); do
   case "$1" in
-    --before) BEFORE="${2-}"; shift 2 ;;
-    --after)  AFTER="${2-}";  shift 2 ;;
-    --label)  LABEL="${2-}";  shift 2 ;;
-    --out)    OUT="${2-}";    shift 2 ;;
+    --before)      BEFORE="${2-}";      shift 2 ;;
+    --after)       AFTER="${2-}";       shift 2 ;;
+    --label)       LABEL="${2-}";       shift 2 ;;
+    --out)         OUT="${2-}";         shift 2 ;;
+    --export-mode) EXPORT_MODE="${2-}"; shift 2 ;;
+    --export-doc)  EXPORT_DOC="${2-}";  shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'assert-parity: argument inconnu : %s\n' "$1" >&2; exit 2 ;;
   esac
@@ -82,6 +124,17 @@ done
 [[ -n "$AFTER"  ]] || { printf 'assert-parity: --after est requis\n' >&2;  exit 2; }
 [[ -d "$BEFORE" ]] || { printf 'assert-parity: NON EXÉCUTÉ — relevé AVANT illisible : %s\n' "$BEFORE" >&2; exit 2; }
 [[ -d "$AFTER"  ]] || { printf 'assert-parity: NON EXÉCUTÉ — relevé APRÈS illisible : %s\n' "$AFTER" >&2;  exit 2; }
+
+case "$EXPORT_MODE" in
+  strict|additif) ;;
+  *) printf 'assert-parity: --export-mode doit valoir strict ou additif (reçu : %s)\n' \
+       "$EXPORT_MODE" >&2; exit 2 ;;
+esac
+if [[ "$EXPORT_MODE" == "strict" && -n "$EXPORT_DOC" ]]; then
+  printf 'assert-parity: --export-doc est refusé en mode strict — une comparaison octet à octet \
+n a pas de dialecte à documenter ; l accepter ferait croire à un contrôle qui n a pas eu lieu\n' >&2
+  exit 2
+fi
 
 # Rapport : tout est accumulé dans un tampon, écrit à la fin sur stdout et dans
 # `--out`. Rien n'est affiché « seulement ».
@@ -132,6 +185,11 @@ json_scalar() {  # $1 = fichier json, $2 = chemin jq
 say "parité ${LABEL:+(}$LABEL${LABEL:+)}"
 say "  AVANT : $BEFORE"
 say "  APRÈS : $AFTER"
+if [[ "$EXPORT_MODE" == "additif" ]]; then
+  say "  clé (e) : mode additif — projection sur le dialecte AVANT ; guide : ${EXPORT_DOC:-AUCUN}"
+else
+  say "  clé (e) : mode strict — octet à octet (retour arrière)"
+fi
 say ""
 
 # ── (a) _sqlx_migrations ─────────────────────────────────────────────────────
@@ -241,30 +299,158 @@ la parité d'ordre y est vacue et ne prouve rien (même traitement que la clé (
 parité vraie mais vacue n'est pas une divergence)"
 fi
 
-# ── (e) export-features, octet à octet ───────────────────────────────────────
+# ── (e) export-features ──────────────────────────────────────────────────────
 say ""
-say "(e) export-features — octet à octet"
 b_ex="$BEFORE/export-features.json"
 a_ex="$AFTER/export-features.json"
-if [[ -f "$b_ex" && -f "$a_ex" ]]; then
+
+# Le programme de projection. Il ne juge RIEN : il rend les faits — dialecte du
+# relevé AVANT, clés ajoutées par le relevé APRÈS, clés disparues, et les entrées
+# dont la projection diverge. Le verdict, lui, se rend plus bas, en clair.
+# `unique` trie (ordre stable du rapport) ; l'ORDRE DES CARTES, lui, est celui du
+# tableau, et il est comparé tel quel — deux entrées permutées sont un écart.
+PROJECTION_JQ='
+  ($B[0]) as $b | ($A[0]) as $a |
+  if (($b | type) != "array") or (($a | type) != "array") then
+    {illisible: true}
+  else
+    ([$b[] | keys_unsorted[]] | unique) as $kb |
+    ([$a[] | keys_unsorted[]] | unique) as $ka |
+    {
+      nb: ($b | length),
+      na: ($a | length),
+      dialecte: $kb,
+      ajoutees: ($ka - $kb),
+      disparues: ($kb - $ka),
+      ecarts: [
+        range(0; ([($b | length), ($a | length)] | min)) as $i |
+        ($b[$i]) as $be | ($a[$i]) as $ae |
+        ($ae | with_entries(select(.key as $k | $kb | index($k)))) as $proj |
+        select($be != $proj) |
+        {
+          index: $i,
+          feature: ($be.feature // "?"),
+          manquantes: [$kb[] as $k | select(($ae | has($k)) | not) | $k],
+          valeurs: [
+            $kb[] as $k | select($ae | has($k)) |
+            select($ae[$k] != $be[$k]) |
+            {cle: $k, avant: $be[$k], apres: $ae[$k]}
+          ]
+        }
+      ]
+    }
+  end
+'
+readonly PROJECTION_JQ
+
+if [[ ! -f "$b_ex" || ! -f "$a_ex" ]]; then
+  MISSING=$((MISSING + 1))
+  printf -v g "export-features absent d'un côté (AVANT : %s, APRÈS : %s)" \
+    "$([[ -f $b_ex ]] && echo présent || echo absent)" \
+    "$([[ -f $a_ex ]] && echo présent || echo absent)"
+  info "$g"
+elif [[ "$EXPORT_MODE" == "strict" ]]; then
+  say "(e) export-features — octet à octet (retour arrière)"
   sb="$(sha256sum <"$b_ex" | cut -d' ' -f1)"
   sa="$(sha256sum <"$a_ex" | cut -d' ' -f1)"
   if cmp -s -- "$b_ex" "$a_ex"; then
     ok "octet à octet identique (sha256 ${sb:0:16}…, $(wc -c <"$b_ex") octets)"
     if [[ "$(jq 'length' <"$b_ex" 2>/dev/null || echo '?')" == "0" ]]; then
       info "⚠ l'export est VIDE des deux côtés — la parité (e) est satisfaite mais VACUE : \
-la fixture ne porte aucune carte [[feature:F-XX]]. C'est l'axe que le harnais exerce \
-après la montée (ruling E4), pas la fixture."
+les cartes de la fixture ne sont pas dans l'état mesuré. Ici c'est REPORTÉ (cette clé ne \
+juge que l'écart AVANT/APRÈS) ; c'est le harnais qui rend ce cas BLOQUANT, par son \
+assertion de non-vacuité — voir le point 4 de tests/upgrade/README.md."
     fi
   else
     gap "export-features diffère : sha256 AVANT=${sb:0:16}… APRÈS=${sa:0:16}… (${sb} / ${sa})"
   fi
 else
-  MISSING=$((MISSING + 1))
-  printf -v g "export-features absent d'un côté (AVANT : %s, APRÈS : %s)" \
-    "$([[ -f $b_ex ]] && echo présent || echo absent)" \
-    "$([[ -f $a_ex ]] && echo présent || echo absent)"
-  info "$g"
+  say "(e) export-features — mode additif : projection sur le dialecte AVANT"
+  if [[ ! -f "$EXPORT_DOC" ]]; then
+    # Pas de mesure plutôt qu'une mesure muette : le mode additif existe pour
+    # attraper un ajout de clé NON DOCUMENTÉ. Sans guide, cette moitié de la
+    # règle n'est pas mesurable — c'est une non-exécution, jamais un vert.
+    MISSING=$((MISSING + 1))
+    info "mode additif SANS guide de montée lisible (--export-doc : ${EXPORT_DOC:-absent}) — \
+la clé (e) n'est PAS mesurée : l'ajout de clé ne serait relevé que pour moitié"
+  else
+    e_rc=0
+    e_sum="$(jq -n --slurpfile B "$b_ex" --slurpfile A "$a_ex" "$PROJECTION_JQ" 2>/dev/null)" \
+      || e_rc=$?
+    if (( e_rc != 0 )) || [[ -z "$e_sum" ]] || [[ "$(jq -r '.illisible // false' <<<"$e_sum")" == "true" ]]; then
+      MISSING=$((MISSING + 1))
+      # L'absence de l'outil et l'illisibilité du relevé ne se disent pas de la
+      # même façon : la première envoie corriger l'environnement, la seconde le
+      # relevé. Les confondre ferait chercher au mauvais endroit.
+      if ! command -v jq >/dev/null 2>&1; then
+        info "mode additif : outil requis absent (jq) — la projection sur le dialecte AVANT \
+ne peut pas être calculée, la clé (e) n'est PAS mesurée"
+      else
+        info "export-features illisible en JSON d'un côté au moins — la projection ne peut pas \
+être calculée (AVANT : $b_ex, APRÈS : $a_ex)"
+      fi
+    else
+      e_nb="$(jq -r '.nb' <<<"$e_sum")"
+      e_na="$(jq -r '.na' <<<"$e_sum")"
+      e_nkb="$(jq -r '.dialecte | length' <<<"$e_sum")"
+      e_dial="$(jq -r '.dialecte | join(", ")' <<<"$e_sum")"
+      e_add="$(jq -r '.ajoutees | join(", ")' <<<"$e_sum")"
+      e_disp="$(jq -r '.disparues | join(", ")' <<<"$e_sum")"
+
+      say "  dialecte AVANT : $e_nkb clé(s) — ${e_dial:-aucune}"
+      if (( e_nb == 0 && e_na == 0 )); then
+        info "⚠ l'export est VIDE des deux côtés — la projection est satisfaite mais VACUE : \
+les cartes de la fixture ne sont pas dans l'état mesuré. REPORTÉ ici ; c'est le harnais qui \
+rend ce cas BLOQUANT, par son assertion de non-vacuité — voir le point 4 de tests/upgrade/README.md."
+      fi
+      if (( e_nb != e_na )); then
+        gap "nombre de cartes : AVANT=$e_nb APRÈS=$e_na — le relevé APRÈS doit porter les \
+mêmes cartes, dans le même ordre"
+      fi
+      if [[ -n "$e_disp" ]]; then
+        gap "clé(s) du dialecte AVANT absente(s) du relevé APRÈS : $e_disp"
+      fi
+      # Le relevé des clés ajoutées est TOUJOURS écrit — sans quoi la règle serait
+      # satisfaite sans rien dire de ce qu'elle a vu.
+      if [[ -n "$e_add" ]]; then
+        ok "clés ajoutées côté MONTÉ (dialecte qui s'élargit, relevé) : cles_ajoutees=$e_add"
+      else
+        info "aucune clé ajoutée par le relevé APRÈS : cles_ajoutees=aucune"
+      fi
+
+      e_necart="$(jq -r '.ecarts | length' <<<"$e_sum")"
+      if (( e_necart > 0 )); then
+        gap "$e_necart entrée(s) divergente(s) après projection sur le dialecte AVANT :"
+        while IFS=$'\t' read -r idx feat manq vals; do
+          printf -v g '    entrée %s (feature=%s)' "$idx" "${feat:-?}"; say "$g"
+          if [[ -n "$manq" ]]; then
+            printf -v g '      clé(s) du dialecte AVANT absente(s) : %s' "$manq"; say "$g"
+          fi
+          if [[ -n "$vals" ]]; then
+            printf -v g '      valeur(s) divergente(s) : %s' "$vals"; say "$g"
+          fi
+        done < <(jq -r '.ecarts[] | [
+                   (.index | tostring), .feature,
+                   (.manquantes | join(", ")),
+                   ([.valeurs[] | "\(.cle) : \(.avant | tojson) → \(.apres | tojson)"] | join(" ; "))
+                 ] | @tsv' <<<"$e_sum")
+      else
+        ok "$e_nb entrée(s) identique(s) à la projection du dialecte AVANT (ordre compris)"
+      fi
+
+      # Chaque clé ajoutée doit être CITÉE dans le guide de montée : une clé
+      # nouvelle non documentée est une évolution de contrat que personne ne lit.
+      while IFS= read -r k; do
+        [[ -n "$k" ]] || continue
+        if grep -qE -- "(^|[^A-Za-z0-9_])${k}([^A-Za-z0-9_]|\$)" "$EXPORT_DOC" 2>/dev/null; then
+          ok "clé ajoutée « $k » citée dans le guide ($EXPORT_DOC)"
+        else
+          gap "clé ajoutée « $k » ABSENTE du guide $EXPORT_DOC — une clé nouvelle non \
+documentée est une évolution de contrat non annoncée"
+        fi
+      done < <(jq -r '.ajoutees[]' <<<"$e_sum")
+    fi
+  fi
 fi
 
 # ── (f) comptes par table ────────────────────────────────────────────────────

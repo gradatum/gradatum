@@ -26,8 +26,20 @@ use gradatum_admin::code_cmd::{
 use gradatum_core::index_store::CodeSelector;
 use gradatum_index::SqliteIndex;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// Racine du crate, résolue à l'exécution.
+///
+/// La valeur figée à la compilation devient périmée dès qu'un binaire de test est
+/// réutilisé depuis un autre répertoire de checkout (artefacts de build partagés) :
+/// la variable d'environnement prime, la valeur de compilation ne servant que de
+/// repli hors cargo.
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
 
 /// Exécute une commande git dans le repo, panique sur échec.
 fn git(repo: &Path, args: &[&str]) {
@@ -490,8 +502,7 @@ async fn bench_update_under_3s() {
 #[ignore = "bench dogfood — ingère le repo gradatum réel"]
 async fn bench_dogfood_gradatum_repo() {
     // crates/gradatum-admin → ../.. = racine du repo.
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let repo = Path::new(manifest)
+    let repo = manifest_dir()
         .parent()
         .and_then(|p| p.parent())
         .expect("racine repo")

@@ -35,6 +35,11 @@ sqlite-vec    = { workspace = true, optional = true }
 tempfile = { workspace = true }
 tokio    = { workspace = true, features = ["full"] }
 smallvec = { workspace = true }
+# `trace` uniquement pour les tests : `Connection::trace_v2` est le seul point
+# d'observation du nombre de statements émis (lecture groupée vs N+1). Une
+# dev-dependency n'entre pas dans le graphe de features d'un `cargo build` —
+# aucun coût de trace en production.
+rusqlite = { workspace = true, features = ["trace"] }
 
 [features]
 # Active le module sqlite_vec (requêtes ANN sur note_embeddings_ann).

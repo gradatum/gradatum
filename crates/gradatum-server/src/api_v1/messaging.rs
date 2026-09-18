@@ -14,8 +14,8 @@
 //!    (vault of the sender's tenant — the shared `main` vault of the installation), whose
 //!    `locus = "messaging/<recipient_identity>"` is the C4 channel, `author` is the
 //!    credited sender identity and `extra["subject"]` the optional subject. The
-//!    content is read back through the standard vault registry (`read_note_by_id`,
-//!    same ACL point as `vault_read`, C5);
+//!    content is read back through the standard vault registry (`read_notes_many`,
+//!    the batched form of `read_note_by_id` — same ACL point as `vault_read`, C5);
 //! 2. the delivery = a **state-carrying** `Job::Message` row (Pending until ack,
 //!    never dequeued — see [`gradatum_core::job::JOB_KIND_MESSAGE`]). The job row id
 //!    IS the message id, so `message_ack` completes the delivery by id without any
@@ -618,6 +618,33 @@ pub async fn message_poll_impl(
             .map_err(|e| GradatumError::Storage(format!("delivery get_many: {e}")))?;
         let jobs: HashMap<Ulid, JobRecord> = jobs.into_iter().map(|job| (job.id, job)).collect();
 
+        // Sujet des notes de la page, en UNE lecture groupée : lire le sujet message par
+        // message ramenait une requête d'index par note, jusqu'à `MESSAGE_POLL_PAGE_MAX`
+        // par page. Le sujet reste lu via le registre vault (même point d'ACL que
+        // vault_read — C5). Les identifiants sont groupés par vault : en multi-tenant une
+        // page couvre plusieurs vaults, et le registre se résout par vault. Une note
+        // ghost (indexée, `.md` absent) est absente du lot — elle est ignorée
+        // silencieusement, exactement comme la lecture unitaire en échec l'était.
+        let mut subjects: HashMap<String, Option<String>> = HashMap::new();
+        let mut ids_by_vault: HashMap<&str, Vec<String>> = HashMap::new();
+        for rec in &records {
+            ids_by_vault
+                .entry(rec.vault_id.as_str())
+                .or_default()
+                .push(rec.id.clone());
+        }
+        for (vault_id, ids) in &ids_by_vault {
+            for note in read_registry(state, vault_id)?.read_notes_many(ids).await? {
+                let subject = note
+                    .frontmatter
+                    .extra
+                    .get("subject")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                subjects.insert(note.id.to_string(), subject);
+            }
+        }
+
         for rec in &records {
             // Statut de livraison (ligne état-porteuse) : Done → delivered, sinon accepted.
             let Ok(id) = Ulid::from_string(&rec.id) else {
@@ -635,21 +662,11 @@ pub async fn message_poll_impl(
                 continue;
             }
 
-            // Sujet porté dans le frontmatter extra de la note (lu via le registre vault,
-            // même point d'ACL que vault_read — C5). Une note ghost (impossible ici) est
-            // ignorée silencieusement.
-            let Ok(note) = read_registry(state, &rec.vault_id)?
-                .read_note_by_id(&rec.id)
-                .await
-            else {
+            // Sujet porté dans le frontmatter extra de la note, déjà résolu par la lecture
+            // groupée de la page. Absent du lot = note illisible (ghost) → ignorée.
+            let Some(subject) = subjects.get(&rec.id).cloned() else {
                 continue;
             };
-            let subject = note
-                .frontmatter
-                .extra
-                .get("subject")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
 
             let created_at = match chrono::DateTime::<Utc>::from_timestamp_millis(rec.created) {
                 Some(ts) => ts,

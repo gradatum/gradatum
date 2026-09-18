@@ -147,7 +147,7 @@ pub async fn run(cmd: JobsCmd) -> Result<()> {
 /// Opens the SQLite queue database from `<root>/db/queue.sqlite`.
 ///
 /// Applies WAL pragmas and runs migrations.
-async fn open_queue_pool(root: &std::path::Path) -> Result<QueueDb> {
+pub(crate) async fn open_queue_pool(root: &std::path::Path) -> Result<QueueDb> {
     // SSOT : chemin via helper canonique — jamais root.join(...) manuel.
     let db_path = queue_db_path(root);
     let db = open_queue_db(&db_path)
@@ -432,21 +432,39 @@ async fn replay_single(_store: &SqliteQueueStore, db: &QueueDb, id: Ulid) -> Res
     Ok(())
 }
 
-/// Parses an age window `<N>d` (e.g. `"30d"`) into a `DateTime<Utc>` cutoff.
+/// Parses an age window `<N>d` or `<N>h` (e.g. `"30d"`, `"12h"`) into a `DateTime<Utc>`
+/// cutoff.
 ///
-/// Returns `Utc::now() - N days`. Only the `d` (days) suffix is supported.
-fn parse_older_than(spec: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+/// Returns `Utc::now() - N days` (or `- N hours`). Days and hours are the two units the
+/// retention settings of this project are expressed in — the queue's own window is a day,
+/// and an operator inspecting it works in hours.
+pub(crate) fn parse_older_than(spec: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     let spec = spec.trim();
-    let days_str = spec.strip_suffix('d').with_context(|| {
-        format!("--older-than: expected format '<N>d' (e.g. '30d'), received '{spec}'")
-    })?;
-    let days: i64 = days_str
+    let (value, hours_per_unit) = match spec.strip_suffix('d') {
+        Some(value) => (value, 24i64),
+        None => {
+            let value = spec.strip_suffix('h').with_context(|| {
+                format!(
+                    "--older-than: expected format '<N>d' or '<N>h' (e.g. '30d'), received '{spec}'"
+                )
+            })?;
+            (value, 1i64)
+        }
+    };
+    let n: i64 = value
         .parse()
-        .with_context(|| format!("--older-than: invalid number of days in '{spec}'"))?;
-    if days < 0 {
-        anyhow::bail!("--older-than: the number of days must be positive (received '{spec}')");
+        .with_context(|| format!("--older-than: invalid number in '{spec}'"))?;
+    if n < 0 {
+        anyhow::bail!("--older-than: the value must be positive (received '{spec}')");
     }
-    Ok(chrono::Utc::now() - chrono::Duration::days(days))
+    let hours = n
+        .checked_mul(hours_per_unit)
+        .with_context(|| format!("--older-than: '{spec}' is out of range"))?;
+    let window = chrono::Duration::try_hours(hours)
+        .with_context(|| format!("--older-than: '{spec}' is out of range"))?;
+    chrono::Utc::now()
+        .checked_sub_signed(window)
+        .with_context(|| format!("--older-than: '{spec}' puts the cutoff out of range"))
 }
 
 /// `jobs dlq --prune` — permanently deletes DLQ jobs (irreversible).
@@ -573,6 +591,33 @@ mod tests {
         let cutoff = parse_older_than("0d").expect("0d doit parser");
         let delta = (chrono::Utc::now() - cutoff).num_seconds().abs();
         assert!(delta < 5, "0d → ~now (delta={delta}s)");
+    }
+
+    /// L'heure est la seconde unité : le fenêtrage de la file se règle en heures, et la
+    /// comparer à `Nd` est ce qui prouve que les deux suffixes ne se confondent pas.
+    #[test]
+    fn parse_older_than_valid_hours() {
+        let cutoff = parse_older_than("12h").expect("12h doit parser");
+        let expected = chrono::Utc::now() - chrono::Duration::hours(12);
+        let delta = (cutoff - expected).num_seconds().abs();
+        assert!(delta < 5, "cutoff ~ now-12h (delta={delta}s)");
+
+        // `1d` et `24h` désignent le même instant — la conversion est en heures, pas un
+        // nombre de jours réinterprété.
+        let day = parse_older_than("1d").expect("1d doit parser");
+        let hours = parse_older_than("24h").expect("24h doit parser");
+        assert!((day - hours).num_seconds().abs() < 5, "1d ≡ 24h");
+    }
+
+    /// Une unité absente est refusée, et le message nomme les deux unités admises.
+    #[test]
+    fn parse_older_than_rejects_an_unknown_unit() {
+        let err = parse_older_than("12w").expect_err("12w doit être refusé");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("<N>d") && msg.contains("<N>h"),
+            "le refus nomme les unités admises, obtenu : {msg}"
+        );
     }
 
     #[test]

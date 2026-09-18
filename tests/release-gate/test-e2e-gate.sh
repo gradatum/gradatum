@@ -1,49 +1,60 @@
 #!/usr/bin/env bash
-# Tache 5 bis -- eprouvette END-TO-END (bloquante). De VRAIES sorties de
-# cargo-semver-checks 0.50 (fixtures capturees) passent par le VRAI chemin de classement
-# du job semver, puis sont classees par regime. Couvre spec §5.3 et §5.4.
+# END-TO-END specimen (blocking). REAL cargo-semver-checks 0.50 output (captured fixtures)
+# goes through the REAL classification path of the semver job, then is classified per rank.
+# Covers spec §5.3 and §5.4.
 #
-# Ce qui est prouve : le triplet extraction (bloc `Failed in:`) + strip du suffixe volatil
-# <chemin>:<ligne> + appariement (crate,lint,rendered) rend le BON verdict sur la sortie
-# REELLE de l'outil -- pas sur une chaine d'inventaire reinjectee. C'est la faille P0-1.
+# What it proves: the triplet extraction (`Failed in:` block) + the strip of the volatile
+# <path>:<line> suffix + the (crate, lint, rendered) match yields the RIGHT verdict on the
+# tool's REAL output -- not on a re-injected inventory string.
 #
-# F-258 : le classement est DELEGUE a l'artefact UNIQUE
-# scripts/internal/classify-semver-output.sh — la source consommee aussi par le job
-# semver de .forgejo/workflows/ci.yml et par la gate G8 de release-readiness-scan.sh.
-# Ce test n'a plus SA PROPRE COPIE : il eprouve le code que la CI execute reellement.
-# L'eprouvette de non-divergence (test-non-divergence.sh) le prouve en cassant l'artefact
-# et en constatant que ce test ROUGIT.
+# The classification is DELEGATED to the single artefact
+# scripts/internal/classify-semver-output.sh -- the source also consumed by the semver job
+# of .forgejo/workflows/ci.yml and by the G8 gate of release-readiness-scan.sh. This test no
+# longer has a copy of its own: it exercises the code the CI actually runs. The
+# non-divergence specimen (test-non-divergence.sh) proves it by breaking the artefact and
+# asserting that this test turns RED.
 #
-# Fixtures (tests/release-gate/fixtures/), sorties reelles vs internal/2.0.8, 2026-08-23 :
-#   semver-inscrite.out     : KindKind::Chore + ::Spike RENOMMES -> 2 ruptures
-#                             enum_variant_missing, toutes deux INSCRITES a l'inventaire
-#                             (positions preservees : aucun decalage de discriminant).
-#   semver-non-inscrite.out : FIXTURE CONSTRUITE (son en-tete porte le detail). Chore +
-#                             Spike RETIRES -> 2 ruptures enum_variant_missing INSCRITES,
-#                             PLUS une 3e rupture enum_no_repr_variant_discriminant_changed
-#                             portant un symbole SYNTHETIQUE
-#                             `__FixtureNeverInventoried::Synthetic`, qui n'appartient a
-#                             aucune crate et ne peut donc jamais etre inscrit : sous un
-#                             mineur, une seule non-inscrite bloque. Elle citait
-#                             `variant KindKind::Task 5 -> 3` jusqu'a ce que le lot 2.1.0
-#                             l'inscrive legitimement au manifeste (F-220) — l'appariement
-#                             a alors reussi, le verdict est passe a PASS et l'epreuve
-#                             s'est videe EN SILENCE. La garde ci-dessous ferme la recidive.
-#   semver-majeur.out       : sortie reelle sous `--release-type major` (2026-08-26) —
-#                             l'outil ne compare rien : `0 checks: 0 pass, N skip`.
-#                             F-257 : sous major ce N==0 est ATTENDU (RAPPORT, pas echec) ;
-#                             sous patch/minor c'est une vacuite (NON EXECUTE, echec).
+# INVENTORY: this specimen brings ITS OWN, fixtures/inventaire-nomme.yaml, and points the
+# classifier at it through SEMVER_INVENTORY_PATH. It never reads the release inventory
+# (RELEASE-MANIFEST.yaml): an entry kept there for a test would make the shipped inventory
+# depend on the harness, and the harness on the shipped inventory, each hiding the other's
+# degradation.
+#
+# Fixtures (tests/release-gate/fixtures/), real output vs internal/2.0.8, 2026-08-23:
+#   semver-inscrite.out     : KindKind::Chore + ::Spike RENAMED -> 2 enum_variant_missing
+#                             breaks, both NAMED by the fixture inventory (positions
+#                             preserved: no discriminant shift).
+#   semver-non-inscrite.out : CONSTRUCTED FIXTURE (its header carries the detail). Chore +
+#                             Spike REMOVED -> 2 enum_variant_missing breaks NAMED by the
+#                             fixture inventory, PLUS a third
+#                             enum_no_repr_variant_discriminant_changed break carrying a
+#                             SYNTHETIC symbol, `__FixtureNeverInventoried::Synthetic`,
+#                             which belongs to no crate and can therefore never be
+#                             registered: under a minor rank, one unregistered break
+#                             blocks. It used to cite `variant KindKind::Task 5 -> 3` until
+#                             a release lot legitimately registered it in the manifest --
+#                             the break then matched, the verdict turned PASS, and the
+#                             specimen went QUIET. The guard below closes that recurrence.
+#   semver-majeur.out       : real output under `--release-type major` (2026-08-26) -- the
+#                             tool compares nothing: `0 checks: 0 pass, N skip`. Under
+#                             major, that N==0 is EXPECTED (REPORT, not a failure); under
+#                             patch/minor it is a vacuity (NOT EXECUTED, failure).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 CLASSIFY="${CLASSIFY_SEMVER_OUTPUT:-$ROOT/scripts/internal/classify-semver-output.sh}"
 [ -r "$CLASSIFY" ] || { echo "FAIL artefact introuvable : $CLASSIFY"; exit 2; }
+# The inventory interrogated by the delegated classifier (and by the matcher it spawns) is
+# this specimen's own fixture, exported so the whole chain reads it and nothing else.
+INVENTAIRE="$HERE/fixtures/inventaire-nomme.yaml"
+[ -r "$INVENTAIRE" ] || { echo "FAIL fixture inventory unreadable: $INVENTAIRE"; exit 2; }
+export SEMVER_INVENTORY_PATH="$INVENTAIRE"
 fail=0
 
-# Classe la sortie d'un `cargo semver-checks check-release` pour un rang donne, EN
-# DELEGUANT a l'artefact unique. Rend 0 si le gate PASSE, non-zero s'il BLOQUE ou est
-# NON EXECUTE — les memes regles que le corps du job semver (ci.yml).
+# Classify one `cargo semver-checks check-release` output for a given rank, DELEGATING to the
+# single artefact. Returns 0 if the gate PASSES, non-zero if it BLOCKS or is NOT EXECUTED --
+# the same rules as the body of the semver job (ci.yml).
 classer() { # $1=crate $2=rang $3=fichier-sortie
   bash "$CLASSIFY" "$1" "$2" "$3"; return $?
 }
@@ -59,31 +70,32 @@ NON="$HERE/fixtures/semver-non-inscrite.out"
 MAJ="$HERE/fixtures/semver-majeur.out"
 [ -f "$INS" ] && [ -f "$NON" ] && [ -f "$MAJ" ] || { echo "FAIL fixtures absentes ($INS / $NON / $MAJ)"; exit 2; }
 
-# ── GARDE MECANIQUE — l'epreuve du regime MINEUR ne peut pas se vider en silence ──
-# L'assertion « mineur + rupture NON INSCRITE -> BLOCK » ne vaut que si la fixture porte
-# une rupture que PERSONNE ne peut inscrire a l'inventaire. Elle a deja cesse de prouver
-# quoi que ce soit une fois : la fixture citait `variant KindKind::Task 5 -> 3`, une
-# rupture REELLE, que le lot 2.1.0 a legitimement inscrite au manifeste (F-220). Elle
-# s'est alors appariee, le verdict est devenu PASS, et RIEN N'A CASSE VISIBLEMENT.
-# Le commentaire d'invariant de la fixture n'a rien empeche : on n'edite pas le manifeste
-# en lisant les fixtures. D'ou une garde, qui mord dans les DEUX sens de la degradation :
-#   (a) le symbole synthetique a ete remplace par un symbole reel -> le marqueur disparait ;
-#   (b) le symbole synthetique a ete inscrit au manifeste       -> il s'apparie.
-# Le `rendered` est DERIVE de la fixture avec le meme strip que le classificateur, jamais
-# reecrit en dur : une garde qui verifie une chaine differente de celle qui est classee
-# mesurerait autre chose que ce qui tourne.
+# ── MECHANICAL GUARD — the MINOR-rank evidence cannot go quiet unnoticed ─────
+# The assertion "minor + UNREGISTERED break -> BLOCK" holds only if the fixture carries a
+# break NOBODY can register. It already stopped proving anything once: the fixture cited
+# `variant KindKind::Task 5 -> 3`, a REAL break, which a release lot legitimately registered
+# in the manifest. It then matched, the verdict turned PASS, and NOTHING BROKE VISIBLY. The
+# fixture's own invariant comment prevented nothing: nobody edits the manifest while reading
+# the fixtures. Hence a guard, biting in BOTH directions of degradation:
+#   (a) the synthetic symbol was replaced by a real one  -> the marker disappears;
+#   (b) the synthetic symbol was registered in the inventory -> it matches.
+# The guard reads the SAME inventory the classifier reads (SEMVER_INVENTORY_PATH, set
+# above), never the shipped one: a guard checking a different surface than the one being
+# classified would measure something other than what runs.
+# The `rendered` is DERIVED from the fixture with the same strip as the classifier, never
+# rewritten by hand: same reason.
 MARQUEUR='__FixtureNeverInventoried'
 SYNTH=$(sed -nE "s/^  (.*${MARQUEUR}.*) in +\/[^ ]*:[0-9]+$/\1/p" "$NON")
 if [ -z "$SYNTH" ]; then
   echo "FAIL garde : $NON ne porte plus de rupture marquee '$MARQUEUR'."
   echo "     Le regime mineur exige un symbole SYNTHETIQUE, inscriptible par personne."
-  echo "     Toute rupture REELLE finit inscrite au manifeste et rend l'epreuve muette."
+  echo "     Toute rupture REELLE finit inscrite a l'inventaire et rend l'epreuve muette."
   fail=1
-elif grep -qF -- "$SYNTH" RELEASE-MANIFEST.yaml; then
-  echo "FAIL garde : la rupture synthetique de la fixture est INSCRITE au manifeste."
+elif grep -qF -- "$SYNTH" "$INVENTAIRE"; then
+  echo "FAIL garde : la rupture synthetique de la fixture est INSCRITE a l'inventaire."
   echo "     rendered = $SYNTH"
   echo "     Elle s'apparie donc, le classificateur rend PASS, et l'assertion du regime"
-  echo "     mineur ne prouve plus rien. Retirer cette entree de RELEASE-MANIFEST.yaml."
+  echo "     mineur ne prouve plus rien. Retirer cette entree de $INVENTAIRE."
   fail=1
 else
   echo "OK   garde : rupture de fixture synthetique et absente de l'inventaire"

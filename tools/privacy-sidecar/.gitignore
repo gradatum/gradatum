@@ -1,0 +1,13 @@
+# Sidecar build tree — upstream clone, headers and CMake output are all fetched
+# or generated outside version control. No binary and no model weight is committed
+# here; the GGUF lives outside the repository entirely.
+build/
+third_party/
+*.gguf
+*.o
+*.a
+pf-sidecar
+pf-ref-cli
+# Python bytecode from importing the protocol client in a scratch check.
+__pycache__/
+*.pyc

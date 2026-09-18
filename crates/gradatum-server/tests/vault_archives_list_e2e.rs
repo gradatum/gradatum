@@ -585,3 +585,250 @@ async fn mutations_absent_from_public_router_present_internal() {
         );
     }
 }
+
+// ── D-14 — the read guard on the archives listing ────────────────────────────
+//
+// The archives listing is a read surface like any other, so the guard that withholds a
+// `personal-classified` note from a consumer the preset does not authorise applies to it
+// too. It was the one read surface that could not carry it: the registry row an archive is
+// listed from holds no tags, and the tags live in the archived `.md` alone — the note's own
+// index row is gone. A listing therefore answered with the ULID, the title, the section and
+// the path of a note the same consumer could not read anywhere else.
+
+/// The needle the marking detector reports a span on. ASCII, so a byte offset found in the
+/// body stays the span's `start` whatever the detector reports.
+const MARK: &str = "marqueur-de-test";
+
+/// Two consumers, one negated on the reserved name and one not — the shape the shipped
+/// preset gives an agent and an administrator.
+const ARCHIVES_PRESET: &str = r#"
+[[consumer]]
+identity = "arch-denied"
+read_patterns  = ["!personal-classified", "!personal-classified/**", "!**/personal-classified", "!**/personal-classified/**", "**"]
+write_patterns = ["main/*"]
+
+[[consumer]]
+identity = "arch-allowed"
+read_patterns  = ["**"]
+write_patterns = ["main/*"]
+"#;
+
+/// A detector that reports one span above the marker threshold, on the needle.
+///
+/// The fixture cannot seed a reserved tag by hand: the same write that carries it re-runs
+/// the pass, and a pass that concludes "nothing marked" is the first of the two legitimate
+/// removal paths. A marked note is therefore one whose pass *concluded* something, which is
+/// what this detector makes it do.
+struct Marking;
+
+impl gradatum_core::pii::PiiDetector for Marking {
+    fn detect(
+        &self,
+        input: &gradatum_core::pii::DetectInput<'_>,
+    ) -> Result<gradatum_core::pii::Detection, gradatum_core::pii::PiiDetectError> {
+        use gradatum_core::pii::{Detection, PiiCategory, PiiSpan};
+        Ok(match input.text.find(MARK) {
+            Some(start) => Detection::new(
+                vec![PiiSpan::new(start, MARK.len(), PiiCategory::Person, 0.9)],
+                0,
+            ),
+            None => Detection::new(Vec::new(), 0),
+        })
+    }
+}
+
+/// The activation [`Marking`] runs under: `person` is declared and calibrated below the
+/// 0.9 span the detector reports, so a body carrying the needle is marked.
+///
+/// Distinct from the default activation, which enables no category: a mounted detector
+/// alone poses nothing, and the fixture would then archive an unmarked note. The premise
+/// assertions of the two tests below would catch that — but only after a listing had been
+/// asserted on a corpus that never carried the marker under test.
+fn marking_policy() -> gradatum_core::pii::PrivacyPolicy {
+    use gradatum_core::pii::{PiiCategory, PrivacyPolicy};
+    PrivacyPolicy::new(
+        false,
+        std::collections::BTreeMap::from([(PiiCategory::Person, 900)]),
+        std::collections::BTreeMap::new(),
+    )
+}
+
+/// The same fixture as [`build_env`], with a detector mounted, the activation that makes it
+/// mark, and the caller's identity injected as trust: the guard's verdict is read off the
+/// identity, so the listing has to be driven as the consumer whose perimeter is under test.
+async fn build_marked_env_as(identity: &str) -> Env {
+    use gradatum_auth::jwt::JwtService;
+    use gradatum_core::pii::PrivacyBudgets;
+
+    let tmp = TempDir::new().expect("TempDir");
+    let vault = Arc::new(
+        Vault::create(&tmp.path().join("vault"), VaultId::new("main"))
+            .await
+            .expect("Vault::create")
+            .with_detector(Arc::new(Marking), PrivacyBudgets::default())
+            .with_privacy_policy(marking_policy()),
+    );
+    let idx = vault.index().clone();
+    let jwt = JwtService::new_ephemeral();
+    let acl = AclEngine::from_preset_str(ARCHIVES_PRESET).expect("preset ACL");
+
+    let vault_registry: Arc<dyn gradatum_vault::Registry> = vault.clone();
+    let mut state = AppState::with_jwt_and_acl(jwt, acl)
+        .with_vault_arc(vault_registry)
+        .with_admin_api_token(secrecy::SecretString::from(ADMIN_TOKEN.to_string()));
+    state.search = Arc::clone(&idx) as Arc<dyn Index>;
+
+    let subject = identity.to_owned();
+    let public = Router::new()
+        .nest("/api/v1", api_v1::router())
+        .layer(middleware::from_fn(move |req, next| {
+            trust_as(subject.clone(), req, next)
+        }))
+        .with_state(state.clone());
+    let internal = internal::build_internal_router(state);
+
+    Env {
+        public,
+        internal,
+        vault,
+        _tmp: tmp,
+    }
+}
+
+async fn trust_as(
+    identity: String,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    req.extensions_mut().insert(TrustContext::BearerToken {
+        kid: "test-kid".to_string(),
+        aud: "gradatum".to_string(),
+        sub: identity.into(),
+        scopes: vec!["read".to_string(), "write".to_string()],
+        tenant_id: "main".into(),
+        jti: None,
+    });
+    next.run(req).await
+}
+
+/// Writes a note through the mounted detector and returns it, so the fixture can assert the
+/// marker was actually posed before archiving it.
+async fn write_then_archive(env: &Env, body: &str) -> (String, Vec<String>) {
+    let note = env
+        .vault
+        .write_note(live_frontmatter(Section::Feedback), body.to_string())
+        .await
+        .expect("write_note");
+    let tags = note
+        .frontmatter
+        .tags
+        .iter()
+        .map(|t| t.as_str().to_owned())
+        .collect();
+    let id = note.id.to_string();
+    let archived = archive_by_id(env, &id).await;
+    assert!(archived, "archivage admin doit réussir");
+    (id, tags)
+}
+
+/// Archives an already-written note through the internal admin endpoint.
+async fn archive_by_id(env: &Env, id: &str) -> bool {
+    let req = Request::builder()
+        .uri("/internal/v1/admin/delete")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("X-Gradatum-Admin", format!("Bearer {ADMIN_TOKEN}"))
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "note_id": id, "dry_run": false, "confirm_ulids": [id]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let mut req = req;
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    env.internal.clone().oneshot(req).await.unwrap().status() == StatusCode::OK
+}
+
+fn listed_ids(json: &serde_json::Value) -> Vec<String> {
+    json["entries"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e["note_id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A consumer the preset does not authorise on the reserved locus is not shown a marked
+/// archive — while the listing itself still answers, and still lists what it may.
+///
+/// The archives listing is where a withheld note leaked most: the entry carries the ULID,
+/// the H1 title, the section and the archived path, so a consumer who could read the note
+/// nowhere else could still enumerate it here. The guard is the same one the other read
+/// surfaces carry (D-14), applied to the same reserved name.
+#[tokio::test]
+async fn archives_list_hides_classified_note_from_unauthorized_consumer() {
+    let env = build_marked_env_as("arch-denied").await;
+    let (marked_id, marked_tags) =
+        write_then_archive(&env, "# marque\ncorps marqueur-de-test").await;
+    assert!(
+        marked_tags.iter().any(|t| t == "personal-classified"),
+        "the fixture must archive a note the pass actually marked, otherwise the assertions \
+         below are green for the wrong reason — got {marked_tags:?}"
+    );
+    let (plain_id, plain_tags) = write_then_archive(&env, "# banal\ncorps sans marque").await;
+    assert!(
+        !plain_tags.iter().any(|t| t == "personal-classified"),
+        "the control note must stay unmarked — got {plain_tags:?}"
+    );
+
+    let (status, json) = list_archives(env.public.clone(), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "listing 200: {json}");
+
+    let ids = listed_ids(&json);
+    assert!(
+        !ids.contains(&marked_id),
+        "a consumer denied on the reserved locus must not be handed the ULID of a marked \
+         archive — got {ids:?}"
+    );
+    assert!(
+        ids.contains(&plain_id),
+        "…and the guard must not empty the listing: the unmarked archive is still the \
+         consumer's to see — got {ids:?}"
+    );
+    assert_eq!(
+        json["count"], 1,
+        "the count describes what the response carries, never what was withheld: {json}"
+    );
+}
+
+/// The symmetric half: the consumer the preset does authorise on the reserved locus is
+/// shown the marked archive, unchanged.
+///
+/// Without this arm the test above would be green on a listing that hides everything from
+/// everyone — a guard that withholds a note from its own administrator is not a guard, it
+/// is an outage.
+#[tokio::test]
+async fn archives_list_shows_classified_note_to_authorized_consumer() {
+    let env = build_marked_env_as("arch-allowed").await;
+    let (marked_id, marked_tags) =
+        write_then_archive(&env, "# marque\ncorps marqueur-de-test").await;
+    assert!(
+        marked_tags.iter().any(|t| t == "personal-classified"),
+        "the fixture must archive a note the pass actually marked — got {marked_tags:?}"
+    );
+    let (plain_id, _) = write_then_archive(&env, "# banal\ncorps sans marque").await;
+
+    let (status, json) = list_archives(env.public.clone(), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "listing 200: {json}");
+    let ids = listed_ids(&json);
+    assert!(
+        ids.contains(&marked_id) && ids.contains(&plain_id),
+        "a consumer allowed on the reserved locus sees both archives — got {ids:?}"
+    );
+    assert_eq!(json["count"], 2, "{json}");
+}

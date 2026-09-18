@@ -1,0 +1,4 @@
+# Fixture inventory -- test data, NOT a release derogation list.
+# Same state as inventaire-vide.yaml, written as an empty YAML flow sequence.
+expected_rank: minor
+semver_deviations: []

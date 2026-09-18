@@ -1040,6 +1040,19 @@ pub struct AppState {
     /// Défaut : [`crate::config::PrivacyConfig::default`] ⇒ aucun détecteur monté.
     pub privacy: Arc<crate::config::PrivacyConfig>,
 
+    /// The out-of-process detector this deployment mounted, when it mounted one.
+    ///
+    /// Set by [`AppState::with_privacy`], and set **only** when that call reached the
+    /// sidecar and took its handshake — the field is therefore also the proof that the
+    /// deployment answered at start. It is held rather than rebuilt per vault because a
+    /// detector carries live state a rebuild would discard: the socket, the announced
+    /// handshake and the circuit breaker's count. Two vaults of one deployment share one
+    /// sidecar, which is what an operator who started one process asked for.
+    ///
+    /// `None` in every other case, and `None` is not a degraded detector: it is a
+    /// deployment that mounts nothing, or the in-process engine.
+    pub privacy_sidecar: Option<Arc<gradatum_privacy::SidecarDetector>>,
+
     /// Configuration for the context assembly pipeline.
     ///
     /// Governs `assemble_assembled`: default budget, top_n candidates, max skills,
@@ -1076,8 +1089,34 @@ pub(crate) enum DetectorMount {
     /// No detector is mounted: the strict pass-through. The delivered default.
     Noop,
     /// The deterministic regex floor, mounted only on an explicit non-empty
-    /// `categories` list.
+    /// `categories` list, when no sidecar is configured.
     Regex,
+    /// The out-of-process detector, mounted on a non-empty `categories` list **and** a
+    /// `[privacy.sidecar]` block whose handshake was taken at start.
+    ///
+    /// The block alone is not enough, and the activation alone is not either: the first
+    /// names a detector nothing would ask for, the second asks for one nothing names.
+    Sidecar,
+}
+
+/// Why the personal-data detector could not be mounted.
+///
+/// Distinct from a configuration refusal ([`crate::config::ConfigError`]) because the
+/// two happen at different moments and on different evidence: a configuration is refused
+/// against the file, this one against the deployment. A file can be repaired by the
+/// operator who wrote it; a sidecar that does not answer is a running state, and the
+/// refusal is what makes it visible at start rather than at the first write.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PrivacyMountError {
+    /// The configured sidecar could not be reached, or did not pass its handshake.
+    ///
+    /// The inner error names the cause — an unreachable socket, a rejected handshake, a
+    /// timeout — and is rendered as it stands. No fallback to the in-process detector is
+    /// taken: a deployment that configured an out-of-process engine asked for it, and a
+    /// silent substitution would leave it scanning with an engine it did not choose.
+    #[error("the personal-data sidecar could not be mounted: {0}")]
+    Sidecar(#[from] gradatum_core::pii::PiiDetectError),
 }
 
 impl AppState {
@@ -1140,6 +1179,7 @@ impl AppState {
             server_config: Arc::new(crate::config::ServerConfig::default()),
             // F-160 : aucun détecteur monté par défaut (passe-through strict).
             privacy: Arc::new(crate::config::PrivacyConfig::default()),
+            privacy_sidecar: None,
             context: Arc::new(crate::config::ContextConfig::default()),
             health_snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::health::starting_report(
@@ -1197,6 +1237,7 @@ impl AppState {
             server_config: Arc::new(crate::config::ServerConfig::default()),
             // F-160 : aucun détecteur monté par défaut (passe-through strict).
             privacy: Arc::new(crate::config::PrivacyConfig::default()),
+            privacy_sidecar: None,
             context: Arc::new(crate::config::ContextConfig::default()),
             health_snapshot: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::health::starting_report(
@@ -1336,13 +1377,14 @@ impl AppState {
         // F-160 — injection du détecteur au point d'insertion unique. Le vault racine
         // est le seul vault `main` du chemin d'écriture ; sans [privacy] configuré,
         // c'est le détecteur no-op, donc une écriture inchangée à l'octet.
-        let (detector, budgets) = self.mounted_detector();
+        let (detector, budgets, policy) = self.mounted_detector();
         // F-160 L-D.2 — le même montage installe le rapporteur de passes : le vault
         // exécute la passe et n'a pas de registre, le serveur a le registre et n'exécute
         // pas de passe. Les deux sont posés ensemble parce qu'un détecteur monté sans
         // observateur serait une frontière qui travaille sans rendre de comptes.
         let vault = vault
             .with_detector(detector, budgets)
+            .with_privacy_policy(policy)
             .with_privacy_observer(Arc::new(
                 crate::privacy_observer::MetricsPrivacyObserver::new(self.metrics.clone()),
             ));
@@ -1388,12 +1430,13 @@ impl AppState {
         let vault = gradatum_vault::Vault::with_shared_index(&root, vault_id, shared_index).await?;
         // F-160 — même montage que le vault racine : un handle de 2e vault est un
         // chemin d'écriture à part entière, il n'a pas de détecteur implicite.
-        let (detector, budgets) = self.mounted_detector();
+        let (detector, budgets, policy) = self.mounted_detector();
         // …et le même rapporteur : les passes d'un 2e vault alimentent les mêmes séries
         // que celles du vault racine. Un observateur par handle serait une seconde
         // source pour un seul chiffre.
         let vault = vault
             .with_detector(detector, budgets)
+            .with_privacy_policy(policy)
             .with_privacy_observer(Arc::new(
                 crate::privacy_observer::MetricsPrivacyObserver::new(self.metrics.clone()),
             ));
@@ -1752,46 +1795,119 @@ impl AppState {
     /// Loads an ACL preset from `path` and injects it into the state (production wiring).
     ///
     /// The file at `path` must be an ACL preset TOML (`bearer.toml`).
-    /// If the file is absent, unreadable, or the path is empty → fallback DENY-ALL
-    /// (`AclEngine::from_preset_str("")`).
     ///
-    /// Used in `main.rs` after reading `cfg.acl.preset_path`.
+    /// # Decision — three doors, two outcomes
+    ///
+    /// The gate separates *why* the preset could not be turned into an engine,
+    /// because the two states are indistinguishable from the outside once the
+    /// server is up: an abandoned preset and a deliberately restrictive one both
+    /// answer `403` to everything.
+    ///
+    /// | door | outcome |
+    /// |---|---|
+    /// | path empty (not configured) | DENY-ALL fallback, structured `warn!` |
+    /// | `ErrorKind::NotFound` (fresh install) | DENY-ALL fallback, structured `warn!` |
+    /// | parse error, or I/O error other than `NotFound` | **boot refused** |
+    ///
+    /// The first two arms are preserved because refusing them would make a first
+    /// run impossible. The third arm refuses the boot: the operator expressed a
+    /// policy, the file is present, and discarding it silently converts a
+    /// configuration defect into a running server whose every request is denied —
+    /// a state that reads as a correct restrictive policy. The returned error
+    /// names the gate (`acl.preset_path`) and the offending path.
+    ///
+    /// Used in `main.rs`, with the path `cfg.acl.preset_path` names or — when the key is
+    /// absent — the one derived from `storage.root` by `effective_acl_preset_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the preset file exists but cannot be read, or when it
+    /// reads but does not compile into an engine.
     ///
     /// # Example
     ///
     /// ```rust,no_run
     /// use gradatum_server::state::AppState;
     /// // let state = AppState::new()
-    /// //     .with_acl_preset_path(std::path::Path::new("/var/lib/gradatum/config/bearer.toml"));
+    /// //     .with_acl_preset_path(std::path::Path::new("/var/lib/gradatum/config/bearer.toml"))?;
+    /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn with_acl_preset_path(mut self, path: &std::path::Path) -> Self {
+    pub fn with_acl_preset_path(mut self, path: &std::path::Path) -> anyhow::Result<Self> {
+        use std::io::ErrorKind;
+
+        // Door 1 — no gate configured. A fresh install has nothing to read; the
+        // deny-all engine stays in place.
         if path.as_os_str().is_empty() {
-            tracing::warn!("ACL preset absent or unreadable — DENY-ALL fallback (empty path)");
-            return self;
+            tracing::warn!(
+                gate = "acl.preset_path",
+                door = "not-configured",
+                "ACL preset gate: no path configured — DENY-ALL fallback"
+            );
+            return Ok(self);
         }
-        match std::fs::read_to_string(path) {
-            Ok(content) => match AclEngine::from_preset_str(&content) {
-                Ok(engine) => {
-                    tracing::info!(path = %path.display(), "AclEngine loaded from preset");
-                    self.acl = Arc::new(engine);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "ACL preset unreadable (parse error) — DENY-ALL fallback"
-                    );
-                }
-            },
-            Err(e) => {
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            // Door 2 — the file is not there. Refusing this would refuse a first
+            // run, which is the one moment the fallback is the intended answer.
+            Err(e) if e.kind() == ErrorKind::NotFound => {
                 tracing::warn!(
+                    gate = "acl.preset_path",
+                    door = "absent",
                     path = %path.display(),
                     error = %e,
-                    "ACL preset absent or unreadable — DENY-ALL fallback"
+                    "ACL preset gate: file absent — DENY-ALL fallback (fresh install)"
                 );
+                return Ok(self);
+            }
+            // Door 3a — the file is there and cannot be read (permissions, a
+            // directory where a file is expected, a broken mount). Fail-fast:
+            // this is a configuration defect, not a fresh install.
+            Err(e) => {
+                tracing::error!(
+                    gate = "acl.preset_path",
+                    door = "unreadable",
+                    path = %path.display(),
+                    error = %e,
+                    "ACL preset gate: file present but unreadable — refusing to start \
+                     rather than serving a silent DENY-ALL"
+                );
+                return Err(anyhow::anyhow!(
+                    "acl.preset_path: ACL preset file present but unreadable at {} — {}",
+                    path.display(),
+                    e
+                ));
+            }
+        };
+
+        // Door 3b — the file reads but does not compile. Same reasoning as door
+        // 3a: present and unusable is a defect, never a fallback.
+        match AclEngine::from_preset_str(&content) {
+            Ok(engine) => {
+                tracing::info!(
+                    gate = "acl.preset_path",
+                    path = %path.display(),
+                    "ACL preset gate: engine loaded from preset"
+                );
+                self.acl = Arc::new(engine);
+                Ok(self)
+            }
+            Err(e) => {
+                tracing::error!(
+                    gate = "acl.preset_path",
+                    door = "parse-error",
+                    path = %path.display(),
+                    error = %e,
+                    "ACL preset gate: file present but does not compile as a preset — \
+                     refusing to start rather than serving a silent DENY-ALL"
+                );
+                Err(anyhow::anyhow!(
+                    "acl.preset_path: ACL preset file present but does not compile at {} — {}",
+                    path.display(),
+                    e
+                ))
             }
         }
-        self
     }
 
     /// Creates a `JsonlFileSink` on `dir` and injects it as the audit sink (production wiring).
@@ -2059,25 +2175,90 @@ impl AppState {
     /// il n'existe pas de setter qui remplacerait un détecteur sous un écrivain
     /// vivant. Sans appel explicite, la frontière reste au défaut : aucun détecteur
     /// monté, écriture inchangée.
-    #[must_use]
-    pub fn with_privacy(mut self, privacy: crate::config::PrivacyConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrivacyMountError::Sidecar`] when the configuration names an
+    /// out-of-process detector over a non-empty activation and that detector could not
+    /// be mounted — unreachable socket, refused handshake, or a call that ran out of
+    /// time. The cause is the inner error, rendered as it stands.
+    ///
+    /// The call is fallible on purpose: a deployment that configured a sidecar is not
+    /// quietly served by the in-process detector. Substituting one engine for another
+    /// would leave the operator scanning with an engine they did not choose, and the
+    /// only trace would be a detector name in a report nobody had a reason to read.
+    /// The operator either starts the sidecar or removes the block; both are visible,
+    /// bounded, and leave the choice where the configuration put it.
+    pub fn with_privacy(
+        mut self,
+        privacy: crate::config::PrivacyConfig,
+    ) -> Result<Self, PrivacyMountError> {
+        // The block alone does not mount a detector, and the activation alone does not
+        // either — the mount decision is stated once, in `detector_mount`, and read here
+        // rather than restated. A block under an empty activation names a detector
+        // nothing would ask for, and building one would open a socket no write can
+        // reach: the mount tests read exactly that as zero connections.
+        if !privacy.categories.is_empty()
+            && let Some(block) = privacy.sidecar.as_ref()
+        {
+            let detector = Self::mount_sidecar(block, &privacy)?;
+            self.privacy_sidecar = Some(Arc::new(detector));
+        }
         self.privacy = Arc::new(privacy);
-        self
+        Ok(self)
+    }
+
+    /// Builds the out-of-process detector and takes its handshake.
+    ///
+    /// `connect` deliberately does not open the socket — it validates the configuration
+    /// and returns a detector whose first call is the one that reaches the sidecar. That
+    /// first call is taken here rather than left to the first write, because the two
+    /// moments do not cost the operator the same: at start the process refuses and the
+    /// deployment stays down, at the first write the note is already being written.
+    ///
+    /// The probe is a `detect` over an **empty body**. It is the smallest input the
+    /// protocol admits and it still exercises the whole path a real call takes: the
+    /// connection, the handshake read, the pin comparison and the reported verdict. The
+    /// body is empty, so nothing is classified and nothing is recorded; the zero
+    /// timeout asks the detector for its own floor, which bounds the probe whether the
+    /// sidecar answers, refuses or never accepts the connection.
+    fn mount_sidecar(
+        block: &crate::config::PrivacySidecarConfig,
+        privacy: &crate::config::PrivacyConfig,
+    ) -> Result<gradatum_privacy::SidecarDetector, PrivacyMountError> {
+        let detector =
+            gradatum_privacy::SidecarDetector::connect(block.to_sidecar_config(privacy))?;
+        let probe = gradatum_core::pii::DetectInput::new(
+            "",
+            gradatum_core::pii::Surface::Sync,
+            gradatum_core::pii::Budget::new(0, privacy.max_input_bytes),
+        );
+        // Called through the trait rather than as an inherent method: the trait is the
+        // surface the server holds a detector by, and the probe must take the same road
+        // a real call takes.
+        gradatum_core::pii::PiiDetector::detect(&detector, &probe)?;
+        Ok(detector)
     }
 
     /// Which detector the current configuration mounts.
     ///
     /// **Règle de montage (normative)** : `[privacy]` absent, ou `categories` vide
-    /// ⇒ `Noop`. Le détecteur regex n'est monté que sur une configuration explicite
-    /// à `categories` non vide. Aucune autre combinaison n'existe en 2.4.0 : le
-    /// sidecar est reporté, donc la règle ne comporte pas de troisième branche.
+    /// ⇒ `Noop`. Sur une configuration explicite à `categories` non vide, c'est le
+    /// sidecar qui est monté s'il est configuré, et le détecteur regex sinon.
     ///
     /// Le verdict est rendu sous forme d'énumération plutôt que de détecteur : les
-    /// deux détecteurs sont derrière un `Arc<dyn PiiDetector>`, qui ne se compare
+    /// détecteurs sont derrière un `Arc<dyn PiiDetector>`, qui ne se compare
     /// pas, et c'est la DÉCISION de montage qu'un test doit pouvoir observer.
+    ///
+    /// La troisième branche ne lit pas `privacy.sidecar` mais le détecteur effectivement
+    /// construit : un bloc `[privacy.sidecar]` écrit dans un fichier n'est pas un sidecar
+    /// qui tourne, et c'est le second — joint à l'activation — que cette méthode
+    /// rapporte.
     pub(crate) fn detector_mount(&self) -> DetectorMount {
         if self.privacy.categories.is_empty() {
             DetectorMount::Noop
+        } else if self.privacy_sidecar.is_some() {
+            DetectorMount::Sidecar
         } else {
             DetectorMount::Regex
         }
@@ -2091,33 +2272,120 @@ impl AppState {
     /// so a client can tell "no name" from "a name that happens to be blank".
     ///
     /// Spelling is the wire vocabulary of the mount point, not of the Rust type: the
-    /// two detectors are `noop` (nothing is mounted, writes are byte-identical to
-    /// pre-frontier) and `regex` (the delivered detector). A name is published for the
-    /// pass-through too — "nothing is mounted" is itself the answer an operator asks
-    /// for, and an absent field could not say it.
+    /// three detectors are `noop` (nothing is mounted, writes are byte-identical to
+    /// pre-frontier), `regex` (the delivered in-process detector) and `sidecar` (the
+    /// out-of-process one). A name is published for the pass-through too — "nothing is
+    /// mounted" is itself the answer an operator asks for, and an absent field could not
+    /// say it.
     pub(crate) fn mounted_detector_name(&self) -> &'static str {
         match self.detector_mount() {
             DetectorMount::Noop => "noop",
             DetectorMount::Regex => "regex",
+            DetectorMount::Sidecar => "sidecar",
         }
     }
 
-    /// Détecteur et budgets effectivement montés sur un vault de cet état.
+    /// Announces the personal-data mode at startup.
+    ///
+    /// A destroying mode has to be visible **at boot**, not only in the configuration
+    /// file: `mask` rewrites note bodies, and an operator who finds the setting late
+    /// finds it on notes that were already rewritten. The announcement is emitted
+    /// **once per start**, never once per vault — the mode is a deployment setting, and
+    /// N vaults are not N decisions.
+    ///
+    /// The delivered default, `report_only`, produces **neither a log line nor an audit
+    /// entry**: it changes no byte, and one event per start for an inert setting would
+    /// drown the journal that has to carry the active modes.
+    ///
+    /// The audit line renders **no configuration value**: the mode, the name of the
+    /// mounted detector, and the **count** of activated categories. The labels themselves
+    /// are product vocabulary and would be safe to publish, but a boot actor is not the
+    /// place to decide that — a count is enough to correlate a deployment.
+    ///
+    /// # Errors
+    /// The audit sink's I/O error is propagated so the caller sees it, and it must
+    /// **not** interrupt the start: the mode is already in force through the
+    /// configuration, and refusing to serve would not lift it — it would only take the
+    /// service down. `main.rs` logs it and carries on.
+    pub async fn announce_privacy_mode(&self) -> Result<(), std::io::Error> {
+        let policy = self.privacy.policy();
+        if !policy.masks() {
+            return Ok(());
+        }
+
+        let mode = self.privacy.mode.as_str();
+        let detector = self.mounted_detector_name();
+        tracing::warn!(
+            mode,
+            detector,
+            categories = policy.enabled_categories().len(),
+            "the personal-data frontier runs in a mode that rewrites note bodies: \
+             matched passages are replaced in place and the replaced text is not kept"
+        );
+
+        let event = gradatum_core::audit::http::HttpAuditEvent {
+            ts: chrono::Utc::now(),
+            event: "privacy_mode".to_owned(),
+            // Acteur synthétique : l'événement n'est déclenché par aucune requête, il
+            // est la trace de la configuration sous laquelle ce processus a démarré.
+            // Le préfixe marque la même chose que `mtls:` ou `studio` sur les autres
+            // chemins — une identité qui n'est pas un porteur de jeton.
+            actor: gradatum_core::audit::http::HttpAuditActor {
+                kid: "system".to_owned(),
+                sub: "gradatum-server".to_owned(),
+                aud: "gradatum".to_owned(),
+                jti: None,
+            },
+            // Réglage de déploiement, non d'un tenant : `"*"` plutôt qu'un vault élu,
+            // qui ferait lire la ligne comme une décision prise pour lui seul.
+            tenant_id: "*".to_owned(),
+            locus: String::new(),
+            note_id: None,
+            content_hash: None,
+            outcome: "announced".to_owned(),
+            curator: Some(serde_json::json!({
+                "mode": mode,
+                "detector": detector,
+                "categories": policy.enabled_categories().len(),
+            })),
+            request_id: "boot".to_owned(),
+        };
+        self.audit.record(event).await
+    }
+
+    /// Détecteur, budgets et activation effectivement montés sur un vault de cet état.
+    ///
+    /// Les trois viennent de la **même** configuration et sont rendus ensemble : un
+    /// détecteur monté sans son activation observerait sans jamais rien marquer, et
+    /// deux lectures séparées de `[privacy]` seraient deux autorités sur ce qui est
+    /// activé. `mode` en fait partie : le drapeau qu'il produit voyage avec la
+    /// politique jusqu'au chemin d'écriture, qui décide sur lui de réécrire un corps.
     fn mounted_detector(
         &self,
     ) -> (
         Arc<dyn gradatum_core::pii::PiiDetector>,
         gradatum_core::pii::PrivacyBudgets,
+        gradatum_core::pii::PrivacyPolicy,
     ) {
         let detector: Arc<dyn gradatum_core::pii::PiiDetector> = match self.detector_mount() {
             DetectorMount::Noop => Arc::new(gradatum_core::pii::NoopDetector),
             DetectorMount::Regex => Arc::new(gradatum_privacy::RegexDetector),
+            // Held, not rebuilt: the socket, the announced handshake and the breaker's
+            // count all live in this detector, and a rebuild per vault would hand each
+            // vault its own connection to a process the deployment started once. Absent
+            // here would mean `detector_mount` named a mount `with_privacy` never made,
+            // which no path can produce — the two read the same field of the same state.
+            DetectorMount::Sidecar => {
+                let held = self
+                    .privacy_sidecar
+                    .as_ref()
+                    .expect("a Sidecar mount implies a connected detector — static invariant");
+                // Cloned as what it is, then unsized by the arm's own type: the handle is
+                // an `Arc<SidecarDetector>`, and the vault is handed the trait object.
+                held.clone()
+            }
         };
-        // F-160: only the byte budgets are threaded to the detector in 2.4.0. The
-        // category set, `thresholds`, `exceptions` and `mode` are parsed but not yet
-        // wired here (2.5.0) — `mask` is refused at config load, and the regex floor runs
-        // report_only over every category it recognises regardless of the enabled set.
-        (detector, self.privacy.budgets())
+        (detector, self.privacy.budgets(), self.privacy.policy())
     }
 
     /// Injects the context assembly pipeline configuration.
@@ -2426,7 +2694,51 @@ mod vault_registry_tests {
 #[cfg(test)]
 mod privacy_mount_tests {
     use super::{AppState, DetectorMount};
-    use crate::config::PrivacyConfig;
+    use crate::config::{PrivacyConfig, PrivacySidecarConfig};
+
+    /// The fake sidecar, driven from here for the same reason the client tests drive it:
+    /// the mount decision is taken before a single byte is scanned, and the only way to
+    /// observe it against a detector that really answers is to have one that answers.
+    ///
+    /// Declared at the crate root rather than here: `#[path]` resolves against the
+    /// directory of the file it is written in, and this module's is virtual.
+    use crate::sidecar_fake as fake;
+
+    /// Digest of the sidecar build the configurations below pin.
+    const BINARY_DIGEST: &str = "3f1a5c0b7d9e246813579bdf0246ace813579bdf0246ace813579bdf0246ace8";
+
+    /// Digest of the model weights the configurations below pin.
+    const MODEL_DIGEST: &str = "b7d9e246b7d9e246b7d9e246b7d9e246b7d9e246b7d9e246b7d9e246b7d9e246";
+
+    /// Digest over the model's label vocabulary the fake announces.
+    const LABELS_V: &str =
+        "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+    /// A conformant sidecar, listening on a socket of its own.
+    fn a_conformant_sidecar() -> fake::FakeSidecar {
+        fake::FakeSidecar::start(
+            fake::handshake(BINARY_DIGEST, MODEL_DIGEST, LABELS_V, 0),
+            |_, _, _| fake::Reply::Spans(Vec::new()),
+        )
+    }
+
+    /// The `[privacy.sidecar]` block, over the activation list `categories` carries.
+    ///
+    /// The two are separate arguments because the pair is what the mount decision reads:
+    /// a block without an activation and an activation without a block are both states an
+    /// operator can write down, and neither mounts the out-of-process detector.
+    fn sidecar_block(socket: &std::path::Path, categories: &[&str]) -> PrivacyConfig {
+        PrivacyConfig {
+            categories: categories.iter().map(|label| (*label).to_owned()).collect(),
+            sidecar: Some(PrivacySidecarConfig {
+                socket_path: socket.to_string_lossy().into_owned(),
+                binary_digest: BINARY_DIGEST.to_owned(),
+                model_digest: MODEL_DIGEST.to_owned(),
+                ..PrivacySidecarConfig::default()
+            }),
+            ..PrivacyConfig::default()
+        }
+    }
 
     /// Sans `[privacy]` configuré — ou avec le bloc livré, dont `categories` est
     /// vide — le montage est le détecteur no-op : aucune écriture n'est modifiée.
@@ -2440,6 +2752,7 @@ mod privacy_mount_tests {
         assert_eq!(
             AppState::new()
                 .with_privacy(PrivacyConfig::default())
+                .expect("the delivered block asks for no sidecar: nothing can fail")
                 .detector_mount(),
             DetectorMount::Noop,
             "le bloc livré a `categories` vide ⇒ même cas"
@@ -2457,9 +2770,52 @@ mod privacy_mount_tests {
             ..PrivacyConfig::default()
         };
         assert_eq!(
-            AppState::new().with_privacy(explicit).detector_mount(),
+            AppState::new()
+                .with_privacy(explicit)
+                .expect("no sidecar is configured: nothing can fail")
+                .detector_mount(),
             DetectorMount::Regex
         );
+    }
+
+    /// A configured sidecar over a non-empty activation **is** what gets mounted.
+    ///
+    /// Both halves are asserted together because they are one answer to an operator: the
+    /// mount verdict, and the name `/health/detailed` publishes from it. A real detector
+    /// mounted under a name left at `regex` would be a false report about a live engine.
+    #[test]
+    fn a_sidecar_over_a_non_empty_activation_is_what_is_mounted() {
+        let sidecar = a_conformant_sidecar();
+        let state = AppState::new()
+            .with_privacy(sidecar_block(sidecar.path(), &["email"]))
+            .expect("a conformant sidecar mounts");
+
+        assert_eq!(state.detector_mount(), DetectorMount::Sidecar);
+        assert_eq!(state.mounted_detector_name(), "sidecar");
+    }
+
+    /// A configured sidecar over an **empty** activation mounts nothing, and reaches
+    /// nothing either.
+    ///
+    /// The empty activation is the delivered default: no detector is mounted, so nothing
+    /// is sent to a process no write will ever ask. The connection counter is what tells
+    /// "mounted and never called" from "never approached at all" — and the handshake
+    /// probe taken at mount would be an approach.
+    #[test]
+    fn a_sidecar_over_an_empty_activation_mounts_nothing_and_reaches_nothing() {
+        let sidecar = a_conformant_sidecar();
+        let state = AppState::new()
+            .with_privacy(sidecar_block(sidecar.path(), &[]))
+            .expect("nothing is mounted, so nothing can fail");
+
+        assert_eq!(state.detector_mount(), DetectorMount::Noop);
+        assert_eq!(state.mounted_detector_name(), "noop");
+        assert_eq!(
+            sidecar.connections(),
+            0,
+            "a detector that is not mounted must not be opened a connection"
+        );
+        assert_eq!(sidecar.requests(), 0, "nor be handed a request");
     }
 
     /// Les bornes de fenêtre et le plafond d'octets viennent de la config, jamais
