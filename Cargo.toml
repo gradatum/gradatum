@@ -152,7 +152,7 @@ axum-server = { version = "=0.8.0", default-features = false, features = ["tls-r
 # rustls is a direct dep solely to install the process-default crypto provider at boot.
 # Pinned exactly (=0.23.45, the RUSTSEC-2026-0285 floor) so a single rustls resolves
 # across the graph: a range here would let a second one in.
-rustls      = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+rustls      = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 http        = "=1.4.2"
 tower       = "=0.5.3"
 tower-http      = { version = "=0.7.0", features = ["cors", "trace", "fs", "set-header", "limit"] }
